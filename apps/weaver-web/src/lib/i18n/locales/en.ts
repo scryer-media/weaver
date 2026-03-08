@@ -41,6 +41,15 @@ const en: LocaleDictionary = {
   "confirm.cancelJobDismiss": "Keep Downloading",
   "confirm.deleteServer": "Delete this server?",
   "confirm.deleteServerMessage": "This server configuration will be permanently removed.",
+  "confirm.deleteHistory": "Delete this job from history?",
+  "confirm.deleteHistoryMessage": "This job and its events will be permanently removed.",
+  "confirm.deleteHistoryConfirm": "Delete",
+  "confirm.deleteHistoryDismiss": "Keep",
+  "confirm.deleteAllHistory": "Delete all history?",
+  "confirm.deleteAllHistoryMessage": "All completed and failed jobs will be permanently removed.",
+  "confirm.deleteAllHistoryConfirm": "Delete All",
+  "confirm.deleteAllHistoryDismiss": "Cancel",
+  "action.deleteAll": "Delete All",
 
   // Upload page
   "upload.title": "Upload NZB",

@@ -183,18 +183,25 @@ impl Pipeline {
         // For subsequent volumes, just mark them complete.
         if volume_number == 0 {
             let path = file_path.clone();
+            info!(job_id = job_id.0, filename = %filename, "parsing RAR first volume headers (spawn_blocking)");
             let topo_result = tokio::task::spawn_blocking(move || {
+                tracing::info!("RAR parse: opening file {:?}", path);
                 let file = std::fs::File::open(&path)?;
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                tracing::info!("RAR parse: file opened, size={}", file_len);
                 let archive = if let Some(ref pw) = password {
                     weaver_rar::RarArchive::open_with_password(file, pw)
                 } else {
                     weaver_rar::RarArchive::open(file)
                 }
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+                tracing::info!("RAR parse: archive opened, getting metadata");
                 let meta = archive.metadata();
+                tracing::info!("RAR parse: done, members={} volumes={:?}", meta.members.len(), meta.volume_count);
                 Ok::<_, std::io::Error>(meta)
             })
             .await;
+            info!(job_id = job_id.0, "RAR first volume parse complete");
 
             match topo_result {
                 Ok(Ok(meta)) => {
@@ -292,10 +299,78 @@ impl Pipeline {
                 }
             }
         } else {
-            // Non-first volume: just mark it complete.
+            // Non-first volume: mark it complete.
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.assembly.mark_volume_complete(&set_name, volume_number);
             }
+
+            // Parse headers to discover new members starting in this volume.
+            // (e.g., S01E02 starts after S01E01's data ends in a later volume.)
+            let has_topology = self.jobs.get(&job_id)
+                .is_some_and(|s| s.assembly.archive_topology_for(&set_name).is_some());
+
+            if has_topology {
+                let path = file_path.clone();
+                let pw = password.clone();
+                let parse_result = tokio::task::spawn_blocking(move || {
+                    let file = std::fs::File::open(&path)?;
+                    let archive = if let Some(ref pw) = pw {
+                        weaver_rar::RarArchive::open_with_password(file, pw)
+                    } else {
+                        weaver_rar::RarArchive::open(file)
+                    }
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    Ok::<_, std::io::Error>(archive.metadata())
+                }).await;
+
+                match parse_result {
+                    Ok(Ok(meta)) => {
+                        if let Some(state) = self.jobs.get_mut(&job_id)
+                            && let Some(topo) = state.assembly.archive_topology_for_mut(&set_name) {
+                                let existing_names: std::collections::HashSet<String> =
+                                    topo.members.iter().map(|m| m.name.clone()).collect();
+                                let mut added = 0u32;
+                                for member in &meta.members {
+                                    if member.is_directory { continue; }
+                                    let name = weaver_rar::sanitize_path(&member.name);
+                                    if existing_names.contains(&name) { continue; }
+                                    topo.members.push(weaver_assembly::ArchiveMember {
+                                        name,
+                                        first_volume: volume_number,
+                                        last_volume: volume_number, // unknown until parsed further
+                                        unpacked_size: member.unpacked_size.unwrap_or(0),
+                                    });
+                                    added += 1;
+                                }
+                                if added > 0 {
+                                    info!(
+                                        job_id = job_id.0,
+                                        volume = volume_number,
+                                        set_name = %set_name,
+                                        added,
+                                        "discovered new archive members from later volume"
+                                    );
+                                }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!(
+                            job_id = job_id.0,
+                            volume = volume_number,
+                            error = %e,
+                            "failed to parse later RAR volume (non-fatal)"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            job_id = job_id.0,
+                            error = %e,
+                            "RAR volume parse task panicked (non-fatal)"
+                        );
+                    }
+                }
+            }
+
             debug!(
                 job_id = job_id.0,
                 volume = volume_number,

@@ -103,6 +103,14 @@ impl Database {
         .map_err(db_err)?;
         Ok(())
     }
+
+    /// Delete all job events across all jobs.
+    pub fn delete_all_job_events(&self) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM job_events", [])
+            .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

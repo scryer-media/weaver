@@ -1,15 +1,21 @@
+import { useState } from "react";
 import { Link } from "react-router";
-import { useQuery } from "urql";
-import { HISTORY_JOBS_QUERY } from "@/graphql/queries";
+import { useMutation, useQuery } from "urql";
+import { DELETE_HISTORY_MUTATION, DELETE_ALL_HISTORY_MUTATION, HISTORY_JOBS_QUERY } from "@/graphql/queries";
 import { StatusBadge } from "@/components/StatusBadge";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
 
 export function History() {
   const t = useTranslate();
   const [{ data, fetching }] = useQuery({ query: HISTORY_JOBS_QUERY });
+  const [deleteResult, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
+  const [, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
 
-  const jobs: {
+  type HistoryJob = {
     id: number;
     name: string;
     status: string;
@@ -20,13 +26,26 @@ export function History() {
     hasPassword: boolean;
     category: string | null;
     outputDir: string | null;
-  }[] = data?.jobs ?? [];
+  };
+
+  // After a delete, use the mutation response; otherwise use the query data.
+  const jobs: HistoryJob[] = deleteResult.data?.deleteHistory ?? data?.jobs ?? [];
 
   return (
     <div className="p-4 sm:p-6">
-      <h1 className="mb-4 text-xl font-bold text-foreground sm:mb-6 sm:text-2xl">
-        {t("history.title")}
-      </h1>
+      <div className="mb-4 flex items-center justify-between sm:mb-6">
+        <h1 className="text-xl font-bold text-foreground sm:text-2xl">
+          {t("history.title")}
+        </h1>
+        {jobs.length > 0 && (
+          <button
+            onClick={() => setDeleteAllConfirm(true)}
+            className="rounded-md px-3 py-1.5 text-sm font-medium text-destructive hover:bg-accent"
+          >
+            {t("action.deleteAll")}
+          </button>
+        )}
+      </div>
 
       {fetching ? (
         <div className="py-12 text-center text-muted-foreground">
@@ -52,6 +71,7 @@ export function History() {
                     {t("table.size")}
                   </th>
                   <th className="w-32 px-4 py-3">{t("table.category")}</th>
+                  <th className="w-20 px-4 py-3 text-right">{t("table.actions")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -82,6 +102,14 @@ export function History() {
                     <td className="px-4 py-3 text-sm text-muted-foreground">
                       {job.category ?? "—"}
                     </td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        onClick={() => setDeleteConfirmId(job.id)}
+                        className="rounded px-2 py-1 text-xs text-destructive hover:bg-accent"
+                      >
+                        {t("action.delete")}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -101,7 +129,7 @@ export function History() {
                   </Link>
                   <StatusBadge status={job.status} />
                 </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                   <span>{formatBytes(job.totalBytes)}</span>
                   <span>Health: {(job.health / 10).toFixed(1)}%</span>
                   {job.category && <span>{job.category}</span>}
@@ -109,11 +137,47 @@ export function History() {
                     <span className="text-yellow-500">[PW]</span>
                   )}
                 </div>
+                <div className="flex items-center">
+                  <button
+                    onClick={() => setDeleteConfirmId(job.id)}
+                    className="rounded-md px-3 py-1.5 text-xs font-medium text-destructive hover:bg-accent"
+                  >
+                    {t("action.delete")}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
         </>
       )}
+
+      <ConfirmDialog
+        open={deleteConfirmId != null}
+        title={t("confirm.deleteHistory")}
+        message={t("confirm.deleteHistoryMessage")}
+        confirmLabel={t("confirm.deleteHistoryConfirm")}
+        cancelLabel={t("confirm.deleteHistoryDismiss")}
+        onConfirm={() => {
+          if (deleteConfirmId != null) {
+            deleteHistory({ id: deleteConfirmId });
+          }
+          setDeleteConfirmId(null);
+        }}
+        onCancel={() => setDeleteConfirmId(null)}
+      />
+
+      <ConfirmDialog
+        open={deleteAllConfirm}
+        title={t("confirm.deleteAllHistory")}
+        message={t("confirm.deleteAllHistoryMessage")}
+        confirmLabel={t("confirm.deleteAllHistoryConfirm")}
+        cancelLabel={t("confirm.deleteAllHistoryDismiss")}
+        onConfirm={() => {
+          deleteAllHistory({});
+          setDeleteAllConfirm(false);
+        }}
+        onCancel={() => setDeleteAllConfirm(false)}
+      />
     </div>
   );
 }

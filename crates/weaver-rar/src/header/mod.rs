@@ -12,11 +12,12 @@ pub mod file;
 pub mod main_archive;
 pub mod service;
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::error::{RarError, RarResult};
+use crate::vint;
 use common::{HeaderType, RawHeader};
 
 /// A parsed header from the archive.
@@ -38,6 +39,9 @@ pub struct FileEncryptionParams {
     pub salt: [u8; 16],
     pub iv: [u8; 16],
     pub check_data: Option<[u8; 12]>,
+    /// When true, CRC32 and BLAKE2 hashes in the header are HMAC-transformed
+    /// and cannot be verified without HashKey (from unrar's custom PBKDF2 chain).
+    pub use_hash_mac: bool,
 }
 
 /// A file header enriched with extra record data.
@@ -114,183 +118,237 @@ pub fn parse_all_headers<R: Read + Seek>(
         is_encrypted: false,
     };
 
-    // When archive-level encryption is active, all headers after the encryption
-    // header have their bodies encrypted with AES-256-CBC. We store the derived
-    // key/IV here once the encryption header is processed.
-    let mut decrypt_key: Option<([u8; 32], [u8; 16])> = None;
-
+    // Parse plaintext headers until we hit an encryption header or end.
     loop {
-        let mut raw = match common::read_raw_header(reader)? {
+        let raw = match common::read_raw_header(reader)? {
             Some(raw) => raw,
             None => {
                 debug!("reached EOF while reading headers");
-                break;
+                return Ok(result);
             }
         };
 
-        // If archive-level encryption is active, decrypt the header body.
-        // CRC32 was already validated against the encrypted bytes by read_raw_header.
-        if let Some((ref key, ref iv)) = decrypt_key {
-            let decrypted = crate::crypto::decrypt_data(key, iv, &raw.body)?;
-            // The decrypted body may have AES padding at the end; truncate
-            // to the declared header_size if the decrypted buffer is larger.
-            if decrypted.len() as u64 > raw.header_size {
-                raw.body = decrypted[..raw.header_size as usize].to_vec();
-            } else {
-                raw.body = decrypted;
-            }
-
-            // Re-parse the common fields from the decrypted body so that
-            // header_type, flags, extra_area_size, and data_area_size reflect
-            // the plaintext values.
-            let mut pos = 0;
-            let (header_type_val, n) = crate::vint::read_vint(&raw.body[pos..])?;
-            pos += n;
-            let (header_flags, n) = crate::vint::read_vint(&raw.body[pos..])?;
-            pos += n;
-            let extra_area_size = if header_flags & common::flags::EXTRA_AREA != 0 {
-                let (size, n) = crate::vint::read_vint(&raw.body[pos..])?;
-                pos += n;
-                size
-            } else {
-                0
-            };
-            let data_area_size = if header_flags & common::flags::DATA_AREA != 0 {
-                let (size, _n) = crate::vint::read_vint(&raw.body[pos..])?;
-                size
-            } else {
-                0
-            };
-            raw.header_type = HeaderType::from(header_type_val);
-            raw.flags = header_flags;
-            raw.extra_area_size = extra_area_size;
-            raw.data_area_size = data_area_size;
-        }
-
-        trace!(
+        debug!(
             "header type={:?} flags={:#x} size={} data_size={} at offset={}",
-            raw.header_type,
-            raw.flags,
-            raw.header_size,
-            raw.data_area_size,
-            raw.offset
+            raw.header_type, raw.flags, raw.header_size, raw.data_area_size, raw.offset
         );
 
-        // The data area starts right after the header bytes in the stream
-        let data_offset = raw.offset
-            + 4 // CRC32
-            + raw.header_size_vint_len as u64
-            + raw.header_size;
+        let data_offset = raw.offset + 4 + raw.header_size_vint_len as u64 + raw.header_size;
 
         match raw.header_type {
-            HeaderType::MainArchive => {
-                let main = main_archive::parse(&raw)?;
-                debug!(
-                    "main archive: volume={} solid={} vol_num={:?}",
-                    main.is_volume, main.is_solid, main.volume_number
-                );
-                result.main = Some(main);
-            }
-            HeaderType::File => {
-                let file_hdr = file::parse(&raw, data_offset)?;
-
-                // Extract enriched data from extra records
-                let (is_encrypted, file_encryption, hash, redirection) = extract_extra_info(&raw);
-
-                debug!(
-                    "file: name={:?} size={:?} method={:?} encrypted={}",
-                    file_hdr.name,
-                    file_hdr.unpacked_size,
-                    file_hdr.compression.method,
-                    is_encrypted
-                );
-
-                result.files.push(ParsedFile {
-                    header: file_hdr,
-                    is_encrypted,
-                    file_encryption,
-                    hash,
-                    redirection,
-                });
-            }
-            HeaderType::Service => {
-                let svc = service::parse(&raw, data_offset)?;
-                debug!("service: name={:?}", svc.service_name());
-                result.services.push(svc);
-            }
             HeaderType::Encryption => {
                 let enc = encryption::parse(&raw)?;
-                debug!(
-                    "encryption header: version={} kdf_count={}",
-                    enc.version, enc.kdf_count
-                );
+                debug!("encryption header: version={} kdf_count={}", enc.version, enc.kdf_count);
                 result.encryption = Some(enc.clone());
                 result.is_encrypted = true;
 
-                if let Some(pwd) = password {
-                    // Derive key/IV for decrypting subsequent headers.
-                    let (key, iv) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count);
+                let pwd = match password {
+                    Some(p) => p,
+                    None => return Err(RarError::EncryptedArchive),
+                };
 
-                    // If password check data is available, verify before proceeding.
-                    if enc.has_password_check {
-                        // Read the 12-byte check data that follows salt in the
-                        // encryption header. We need to re-parse it from the raw body.
-                        let offset = common::type_specific_offset(&raw)?;
-                        let body = &raw.body[offset..];
-                        let mut pos = 0;
-                        // Skip version vint
-                        let (_, n) = crate::vint::read_vint(&body[pos..])?;
-                        pos += n;
-                        // Skip enc_flags vint
-                        let (_, n) = crate::vint::read_vint(&body[pos..])?;
-                        pos += n;
-                        // Skip kdf_count (1) + salt (16)
-                        pos += 17;
-                        if body.len() >= pos + 12 {
-                            let mut check_data = [0u8; 12];
-                            check_data.copy_from_slice(&body[pos..pos + 12]);
-                            if !crate::crypto::verify_password_check(
-                                pwd,
-                                &enc.salt,
-                                enc.kdf_count,
-                                &check_data,
-                            ) {
-                                return Err(RarError::InvalidPassword);
-                            }
-                        }
-                    }
+                // Derive key (IV comes per-header from stream, not PBKDF2).
+                let (key, _) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count);
 
-                    decrypt_key = Some((key, iv));
-                    // Continue parsing — subsequent headers will be decrypted.
-                } else {
-                    // No password provided; cannot continue past encryption header.
-                    return Err(RarError::EncryptedArchive);
-                }
+                // Parse remaining headers — each has its own IV + padded encryption.
+                parse_encrypted_headers(reader, &key, &mut result)?;
+                return Ok(result);
             }
             HeaderType::EndArchive => {
                 let end = end_archive::parse(&raw)?;
                 debug!("end of archive: more_volumes={}", end.more_volumes);
                 result.end = Some(end);
-                // Don't skip data area for end header, just stop
+                return Ok(result);
+            }
+            _ => {
+                dispatch_header(&raw, data_offset, &mut result)?;
+                common::skip_data_area(reader, &raw)?;
+            }
+        }
+    }
+}
+
+/// Parse headers from an encrypted archive (after the encryption header).
+///
+/// Each encrypted header has its own layout:
+///   [16-byte IV] [header data padded to 16-byte boundary]
+/// The header data is AES-256-CBC encrypted using the archive key and per-header IV.
+fn parse_encrypted_headers<R: Read + Seek>(
+    reader: &mut R,
+    key: &[u8; 32],
+    result: &mut ParsedHeaders,
+) -> RarResult<()> {
+    loop {
+        let header_start = reader.stream_position().map_err(RarError::Io)?;
+
+        // Read per-header 16-byte IV.
+        let mut iv = [0u8; 16];
+        match reader.read_exact(&mut iv) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("reached EOF reading encrypted header IV");
                 break;
             }
-            HeaderType::Unknown(type_val) => {
-                warn!("unknown header type {} at offset {}", type_val, raw.offset);
-                if raw.flags & common::flags::SKIP_IF_UNKNOWN != 0 {
-                    // Skip and continue
-                } else {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("unknown header type {type_val} at offset {}", raw.offset),
-                    });
+            Err(e) => return Err(RarError::Io(e)),
+        }
+
+        // Read and decrypt first AES block (16 bytes) to determine header size.
+        let mut block0 = [0u8; 16];
+        reader.read_exact(&mut block0).map_err(RarError::Io)?;
+
+        let mut decryptor = crate::crypto::CbcDecryptor::new(key, &iv);
+        let mut dec0 = block0;
+        decryptor.decrypt_blocks(&mut dec0);
+
+        // Parse CRC32 (4 bytes LE) and header_size vint from decrypted data.
+        let stored_crc = u32::from_le_bytes(dec0[0..4].try_into().unwrap());
+        let (header_size, vint_len) = match vint::read_vint(&dec0[4..]) {
+            Ok(v) => v,
+            Err(_) => {
+                debug!("failed to parse header_size vint in encrypted header — likely end of headers");
+                break;
+            }
+        };
+
+        if header_size == 0 {
+            debug!("zero header size in encrypted header at offset {header_start} — likely end of headers");
+            break;
+        }
+
+        // Total header bytes = CRC(4) + vint_len + body(header_size).
+        let total = 4 + vint_len + header_size as usize;
+        let aligned = (total + 15) & !15;
+
+        // Read and decrypt remaining blocks if needed.
+        let mut decrypted = Vec::with_capacity(aligned);
+        decrypted.extend_from_slice(&dec0);
+
+        if aligned > 16 {
+            let remaining = aligned - 16;
+            let mut more = vec![0u8; remaining];
+            reader.read_exact(&mut more).map_err(RarError::Io)?;
+            decryptor.decrypt_blocks(&mut more);
+            decrypted.extend_from_slice(&more);
+        }
+
+        // Extract the body (header_size bytes after CRC + vint).
+        let body_start = 4 + vint_len;
+        let body_end = body_start + header_size as usize;
+        if body_end > decrypted.len() {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "encrypted header body extends beyond decrypted data ({body_end} > {})",
+                    decrypted.len()
+                ),
+            });
+        }
+        let body = decrypted[body_start..body_end].to_vec();
+
+        // CRC32 check over header_size vint encoding + body.
+        let vint_encoded = common::vint_encode_for_crc(header_size, vint_len);
+        let computed_crc = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&vint_encoded);
+            hasher.update(&body);
+            hasher.finalize()
+        };
+
+        if computed_crc != stored_crc {
+            debug!(
+                "CRC mismatch in encrypted header at offset {} (expected {:#x}, got {:#x}) — likely wrong password",
+                header_start, stored_crc, computed_crc
+            );
+            return Err(RarError::HeaderCrcMismatch {
+                expected: stored_crc,
+                actual: computed_crc,
+            });
+        }
+
+        // Build RawHeader from decrypted data.
+        let raw = common::parse_raw_header_from_parts(
+            header_start,
+            stored_crc,
+            header_size,
+            vint_len,
+            body,
+        )?;
+
+        debug!(
+            "encrypted header type={:?} flags={:#x} size={} data_size={} at offset={}",
+            raw.header_type, raw.flags, raw.header_size, raw.data_area_size, raw.offset
+        );
+
+        // Data offset: past the aligned encrypted header block, in the file stream.
+        let data_offset = header_start + 16 + aligned as u64;
+
+        match raw.header_type {
+            HeaderType::EndArchive => {
+                let end = end_archive::parse(&raw)?;
+                debug!("end of archive: more_volumes={}", end.more_volumes);
+                result.end = Some(end);
+                break;
+            }
+            _ => {
+                dispatch_header(&raw, data_offset, result)?;
+                // Skip data area (not part of the encrypted header block).
+                if raw.data_area_size > 0 {
+                    reader
+                        .seek(SeekFrom::Current(raw.data_area_size as i64))
+                        .map_err(RarError::Io)?;
                 }
             }
         }
-
-        // Skip data area if present
-        common::skip_data_area(reader, &raw)?;
     }
+    Ok(())
+}
 
-    Ok(result)
+/// Dispatch a parsed header to the appropriate type-specific handler.
+fn dispatch_header(
+    raw: &RawHeader,
+    data_offset: u64,
+    result: &mut ParsedHeaders,
+) -> RarResult<()> {
+    match raw.header_type {
+        HeaderType::MainArchive => {
+            let main = main_archive::parse(raw)?;
+            debug!(
+                "main archive: volume={} solid={} vol_num={:?}",
+                main.is_volume, main.is_solid, main.volume_number
+            );
+            result.main = Some(main);
+        }
+        HeaderType::File => {
+            let file_hdr = file::parse(raw, data_offset)?;
+            let (is_encrypted, file_encryption, hash, redirection) = extract_extra_info(raw);
+            debug!(
+                "file: name={:?} size={:?} method={:?} encrypted={}",
+                file_hdr.name, file_hdr.unpacked_size, file_hdr.compression.method, is_encrypted
+            );
+            result.files.push(ParsedFile {
+                header: file_hdr,
+                is_encrypted,
+                file_encryption,
+                hash,
+                redirection,
+            });
+        }
+        HeaderType::Service => {
+            let svc = service::parse(raw, data_offset)?;
+            debug!("service: name={:?}", svc.service_name());
+            result.services.push(svc);
+        }
+        HeaderType::Unknown(type_val) => {
+            warn!("unknown header type {} at offset {}", type_val, raw.offset);
+            if raw.flags & common::flags::SKIP_IF_UNKNOWN == 0 {
+                return Err(RarError::CorruptArchive {
+                    detail: format!("unknown header type {type_val} at offset {}", raw.offset),
+                });
+            }
+        }
+        // Encryption and EndArchive are handled by the caller.
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Extract encryption status, encryption params, BLAKE2 hash, and redirection info from extra records.
@@ -311,6 +369,7 @@ fn extract_extra_info(raw: &RawHeader) -> (bool, Option<FileEncryptionParams>, O
             salt,
             iv,
             check_data,
+            enc_flags,
             ..
         } = r
         {
@@ -319,6 +378,7 @@ fn extract_extra_info(raw: &RawHeader) -> (bool, Option<FileEncryptionParams>, O
                 salt: *salt,
                 iv: *iv,
                 check_data: *check_data,
+                use_hash_mac: enc_flags & 0x0002 != 0,
             })
         } else {
             None

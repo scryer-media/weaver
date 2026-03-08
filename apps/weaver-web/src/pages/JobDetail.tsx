@@ -30,7 +30,6 @@ export function JobDetail() {
   const [{ data, fetching }] = useQuery({
     query: JOB_QUERY,
     variables: { id: jobId },
-    requestPolicy: "network-only",
   });
 
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);

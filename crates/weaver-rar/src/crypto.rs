@@ -22,30 +22,22 @@ type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type HmacSha256 = Hmac<Sha256>;
 
-/// Derive AES-256 key and IV from password and salt using PBKDF2-HMAC-SHA256.
+/// Derive AES-256 key from password and salt using PBKDF2-HMAC-SHA256.
 ///
-/// RAR5 KDF: iterations = 1 << (kdf_count + 15)
-/// Derives 32 bytes for the key, then uses a second PBKDF2 call with a
-/// modified salt to derive the 16-byte IV.
+/// RAR5 KDF: iterations = 1 << kdf_count (confirmed against unrar source).
+/// Returns only the 32-byte key. IVs in RAR5 are read from the stream
+/// (each encrypted block is preceded by a 16-byte IV), not derived.
 pub fn derive_key(password: &str, salt: &[u8; 16], kdf_count: u8) -> ([u8; 32], [u8; 16]) {
-    let iterations = 1u32 << (kdf_count as u32 + 15);
+    let iterations = 1u32 << (kdf_count as u32);
 
-    // RAR5 derives key material by running PBKDF2 on password + salt.
-    // The key is 32 bytes, derived with the base salt.
     let mut key = [0u8; 32];
     pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut key)
         .expect("HMAC can be initialized with any key length");
 
-    // The IV is derived by running PBKDF2 again with salt + 1-byte suffix.
-    let mut iv_salt = Vec::with_capacity(salt.len() + 1);
-    iv_salt.extend_from_slice(salt);
-    iv_salt.push(1); // IV derivation marker
-
-    let mut iv = [0u8; 16];
-    pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), &iv_salt, iterations, &mut iv)
-        .expect("HMAC can be initialized with any key length");
-
-    (key, iv)
+    // IV is not derived — return zeros. Callers that need an IV read it
+    // from the stream (header encryption) or from the file header (file
+    // data encryption).
+    (key, [0u8; 16])
 }
 
 /// Decrypt data using AES-256-CBC.
@@ -80,29 +72,36 @@ pub fn decrypt_data(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> RarResult<Vec
 
 /// Verify a password using the optional check value from the encryption header.
 ///
-/// RAR5 password check: derive a check value from the password and compare
-/// against the stored 8-byte value (first 8 of the 12-byte check data).
+/// RAR5 uses a continuous PBKDF2 chain (reference: unrar crypt5.cpp):
+///   Key       = PBKDF2(password, salt, Count)       — AES-256 key
+///   V1        = PBKDF2(password, salt, Count + 16)   — HashKey (for HMAC CRC)
+///   V2        = PBKDF2(password, salt, Count + 32)   — PswCheckValue (for password check)
+///   PswCheck  = XOR-fold V2 from 32 bytes into 8 bytes
+///
+/// The check_data field is 12 bytes: first 8 = PswCheck, last 4 = SHA256 checksum.
 pub fn verify_password_check(
     password: &str,
     salt: &[u8; 16],
     kdf_count: u8,
     check_data: &[u8; 12],
 ) -> bool {
-    let mut check_salt = Vec::with_capacity(salt.len() + 1);
-    check_salt.extend_from_slice(salt);
-    check_salt.push(2); // Password check derivation marker
+    let iterations = (1u32 << (kdf_count as u32)) + 32;
 
-    let iterations = 1u32 << (kdf_count as u32 + 15);
-    let mut derived_check = [0u8; 8];
-    pbkdf2::pbkdf2::<HmacSha256>(
-        password.as_bytes(),
-        &check_salt,
-        iterations,
-        &mut derived_check,
-    )
-    .expect("HMAC can be initialized with any key length");
+    // Derive V2 (PswCheckValue) using standard PBKDF2 with Count+32 iterations.
+    // This is equivalent to unrar's continuous chain because the XOR accumulation
+    // in PBKDF2 (Fn = U1 ^ U2 ^ ... ^ U_n) is identical regardless of whether
+    // you do it in one call or three sequential segments.
+    let mut v2 = [0u8; 32];
+    pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut v2)
+        .expect("HMAC can be initialized with any key length");
 
-    derived_check == check_data[..8]
+    // XOR-fold V2 from 32 bytes to 8 bytes (unrar: PswCheck[I%8] ^= V2[I]).
+    let mut psw_check = [0u8; 8];
+    for (i, &byte) in v2.iter().enumerate() {
+        psw_check[i % 8] ^= byte;
+    }
+
+    psw_check == check_data[..8]
 }
 
 // =============================================================================
@@ -114,45 +113,57 @@ const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 
 /// Derive AES-128 key and IV from password and salt using RAR4's custom KDF.
 ///
-/// RAR4 KDF algorithm (reference: libarchive, BSD licensed):
+/// RAR4 KDF algorithm (reference: unrar crypt3.cpp SetKey30):
 /// - Encodes password as UTF-16LE
-/// - Iterates 262144 times, each time hashing: `password_utf16le + salt + iteration_le_bytes`
-/// - Every 16384th iteration (i.e. when `(i+1) % (RAR4_KDF_ITERATIONS/16) == 0`),
-///   the current SHA-1 digest's first byte is extracted as an IV byte
-/// - After all iterations, the final SHA-1 digest's first 16 bytes become the AES-128 key
+/// - Concatenates password_utf16le + salt into a single buffer
+/// - Iterates 262144 times, each time hashing: buffer + 3-byte iteration counter
+/// - At iterations 0, 16384, 32768, ... (i.e. `i % (262144/16) == 0`), the current
+///   SHA-1 intermediate digest word H4's low byte is extracted as an IV byte
+/// - After all iterations, the final SHA-1 digest words H0-H3 are extracted as the
+///   AES-128 key in little-endian byte order per word
 pub fn rar4_derive_key(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
     use sha1::Digest;
 
-    // Encode password as UTF-16LE.
-    let password_utf16: Vec<u8> = password
+    // Encode password as UTF-16LE, then append salt — matching unrar's RawPsw buffer.
+    let mut raw_psw: Vec<u8> = password
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect();
+    raw_psw.extend_from_slice(salt);
 
     let iv_interval = RAR4_KDF_ITERATIONS / 16;
     let mut iv = [0u8; 16];
     let mut sha = Sha1::new();
 
     for i in 0..RAR4_KDF_ITERATIONS {
-        sha.update(&password_utf16);
-        sha.update(salt);
+        sha.update(&raw_psw);
 
         // Append iteration counter as 3 bytes LE.
         let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
         sha.update(i_bytes);
 
-        // Extract IV byte at each interval boundary.
-        if (i + 1) % iv_interval == 0 {
-            // Clone the hasher to get intermediate digest without consuming it.
+        // Extract IV byte at each interval boundary (unrar: `I%(HashRounds/16)==0`).
+        if i % iv_interval == 0 {
             let intermediate = sha.clone().finalize();
-            let iv_index = ((i + 1) / iv_interval - 1) as usize;
-            iv[iv_index] = intermediate[19]; // last byte of SHA-1 digest
+            let iv_index = (i / iv_interval) as usize;
+            // (byte)digest[4] in unrar = low byte of H4 = last byte of big-endian output.
+            iv[iv_index] = intermediate[19];
         }
     }
 
     let digest = sha.finalize();
+
+    // unrar extracts key bytes in LE order per 32-bit digest word:
+    //   AESKey[I*4+J] = (byte)(digest[I] >> (J*8))
+    // The Rust sha1 crate outputs bytes in big-endian, so we reverse within each
+    // 4-byte group to match unrar's little-endian extraction.
     let mut key = [0u8; 16];
-    key.copy_from_slice(&digest[..16]);
+    for word in 0..4 {
+        key[word * 4]     = digest[word * 4 + 3]; // LSB
+        key[word * 4 + 1] = digest[word * 4 + 2];
+        key[word * 4 + 2] = digest[word * 4 + 1];
+        key[word * 4 + 3] = digest[word * 4];     // MSB
+    }
 
     (key, iv)
 }
@@ -475,23 +486,26 @@ mod tests {
         let salt = [0xBB; 16];
         let kdf_count = 0u8;
 
-        // Derive a check value
-        let iterations = 1u32 << (kdf_count as u32 + 15);
-        let mut check_salt = Vec::with_capacity(17);
-        check_salt.extend_from_slice(&salt);
-        check_salt.push(2);
-
-        let mut derived = [0u8; 8];
+        // Derive V2 (PswCheckValue) using PBKDF2 with Count+32 iterations,
+        // matching the continuous chain in unrar's crypt5.cpp.
+        let iterations = (1u32 << (kdf_count as u32)) + 32;
+        let mut v2 = [0u8; 32];
         pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(
             b"testpass",
-            &check_salt,
+            &salt,
             iterations,
-            &mut derived,
+            &mut v2,
         )
         .unwrap();
 
+        // XOR-fold V2 from 32 bytes to 8 bytes.
+        let mut psw_check = [0u8; 8];
+        for (i, &byte) in v2.iter().enumerate() {
+            psw_check[i % 8] ^= byte;
+        }
+
         let mut check_data = [0u8; 12];
-        check_data[..8].copy_from_slice(&derived);
+        check_data[..8].copy_from_slice(&psw_check);
 
         assert!(verify_password_check("testpass", &salt, kdf_count, &check_data));
         assert!(!verify_password_check("wrongpass", &salt, kdf_count, &check_data));

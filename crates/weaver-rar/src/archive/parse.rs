@@ -77,6 +77,7 @@ impl RarArchive {
                     salt: fe.salt,
                     iv: fe.iv,
                     check_data: fe.check_data,
+                    use_hash_mac: fe.use_hash_mac,
                 }),
                 rar4_salt: None,
                 hash: pf.hash,

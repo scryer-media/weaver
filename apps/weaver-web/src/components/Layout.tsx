@@ -4,6 +4,7 @@ import { useTheme } from "next-themes";
 import { useCallback, useState } from "react";
 import { JOB_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
 import { SpeedDisplay } from "@/components/SpeedDisplay";
+import { UploadModal } from "@/components/UploadModal";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LiveDataContext } from "@/lib/context/live-data-context";
 
@@ -69,6 +70,7 @@ export function Layout() {
   const t = useTranslate();
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   const handleSubscription = useCallback(
     (_prev: Snapshot | undefined, response: { jobUpdates: Snapshot }) => {
@@ -103,20 +105,31 @@ export function Layout() {
             <ThemeToggle />
           </div>
           <nav className="flex flex-1 flex-col gap-1 p-3">
-            {navItems.map((item) => (
-              <Link
-                key={item.to}
-                to={item.to}
-                className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-                  isActive(item.to)
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                }`}
-              >
-                <NavIcon icon={item.icon} size={18} />
-                {t(item.labelKey)}
-              </Link>
-            ))}
+            {navItems.map((item) =>
+              item.to === "/upload" ? (
+                <button
+                  key={item.to}
+                  onClick={() => setUploadOpen(true)}
+                  className="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                >
+                  <NavIcon icon={item.icon} size={18} />
+                  {t(item.labelKey)}
+                </button>
+              ) : (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                    isActive(item.to)
+                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                      : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                  }`}
+                >
+                  <NavIcon icon={item.icon} size={18} />
+                  {t(item.labelKey)}
+                </Link>
+              ),
+            )}
           </nav>
           <div className="border-t border-sidebar-border p-4">
             <div className="text-xs text-muted-foreground">{t("label.downloadSpeed")}</div>
@@ -149,21 +162,35 @@ export function Layout() {
           {/* Mobile nav dropdown */}
           {mobileMenuOpen && (
             <nav className="border-b border-border bg-sidebar p-2 md:hidden">
-              {navItems.map((item) => (
-                <Link
-                  key={item.to}
-                  to={item.to}
-                  onClick={() => setMobileMenuOpen(false)}
-                  className={`flex items-center gap-3 rounded-md px-3 py-3 text-sm font-medium transition-colors ${
-                    isActive(item.to)
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                      : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                  }`}
-                >
-                  <NavIcon icon={item.icon} size={18} />
-                  {t(item.labelKey)}
-                </Link>
-              ))}
+              {navItems.map((item) =>
+                item.to === "/upload" ? (
+                  <button
+                    key={item.to}
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      setUploadOpen(true);
+                    }}
+                    className="flex w-full items-center gap-3 rounded-md px-3 py-3 text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                  >
+                    <NavIcon icon={item.icon} size={18} />
+                    {t(item.labelKey)}
+                  </button>
+                ) : (
+                  <Link
+                    key={item.to}
+                    to={item.to}
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={`flex items-center gap-3 rounded-md px-3 py-3 text-sm font-medium transition-colors ${
+                      isActive(item.to)
+                        ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                        : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                    }`}
+                  >
+                    <NavIcon icon={item.icon} size={18} />
+                    {t(item.labelKey)}
+                  </Link>
+                ),
+              )}
               <div className="mt-2 border-t border-sidebar-border px-3 pt-2">
                 <div className="text-xs text-muted-foreground">{t("label.downloadSpeed")}</div>
                 <SpeedDisplay
@@ -179,6 +206,7 @@ export function Layout() {
           </main>
         </div>
       </div>
+      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
     </LiveDataContext.Provider>
   );
 }

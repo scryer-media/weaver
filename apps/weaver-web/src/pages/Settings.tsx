@@ -74,7 +74,7 @@ export function Settings() {
         maxRetries,
       },
     });
-    reexecute({ requestPolicy: "network-only" });
+    reexecute();
     setSettingsSaved(true);
     setTimeout(() => setSettingsSaved(false), 2000);
   };

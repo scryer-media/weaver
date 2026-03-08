@@ -385,17 +385,6 @@ impl Pipeline {
                 self.record_job_history(job_id);
             }
             ExtractionReadiness::Ready => {
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state.status = JobStatus::Extracting;
-                if let Err(e) = self.db.set_active_job_status(job_id, "extracting", None) {
-                    error!(error = %e, "db write failed for extracting status");
-                }
-                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionReady { job_id });
-                info!(job_id = job_id.0, "extraction ready");
-
                 // Collect sets that still need extraction (some may have been
                 // extracted during the partial extraction phase).
                 let already_extracted = self.extracted_sets.get(&job_id).cloned().unwrap_or_default();
@@ -410,109 +399,100 @@ impl Pipeline {
                         .collect()
                 };
 
-                let mut extract_outcome: Result<u32, String> = Ok(0);
-                for (set_name, archive_type) in &sets_to_extract {
-                    let result = match archive_type {
-                        weaver_assembly::ArchiveType::SevenZip => {
-                            self.extract_7z_set(job_id, set_name).await
+                if !sets_to_extract.is_empty() {
+                    // Spawn extraction tasks in the background.
+                    // handle_extraction_done will re-enter check_job_completion
+                    // when each set finishes, and we'll reach the empty branch below.
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    if state.status != JobStatus::Extracting {
+                        state.status = JobStatus::Extracting;
+                        if let Err(e) = self.db.set_active_job_status(job_id, "extracting", None) {
+                            error!(error = %e, "db write failed for extracting status");
                         }
-                        weaver_assembly::ArchiveType::Rar => {
-                            self.extract_rar_set(job_id, set_name).await
-                        }
-                    };
-                    match result {
-                        Ok(count) => {
-                            if let Ok(ref mut total) = extract_outcome {
-                                *total += count;
-                            }
-                        }
-                        Err(e) => {
-                            extract_outcome = Err(e);
-                            break;
-                        }
+                        self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+                        let _ = self.event_tx.send(PipelineEvent::ExtractionReady { job_id });
+                        info!(job_id = job_id.0, "extraction ready");
                     }
-                }
 
-                // If no sets needed extraction (all done in partial phase), still succeed.
-                if sets_to_extract.is_empty() {
-                    extract_outcome = Ok(0);
-                }
-
-                self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-
-                match extract_outcome {
-                    Ok(count) => {
-                        info!(job_id = job_id.0, members = count, "extraction complete");
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::ExtractionComplete { job_id });
-
-                        // Clean up archive source files before moving to complete.
-                        {
-                            let state = self.jobs.get(&job_id).unwrap();
-                            let cleanup_dir = state.working_dir.clone();
-                            let cleanup_files: Vec<String> = state
-                                .assembly
-                                .files()
-                                .filter(|f| {
-                                    matches!(
-                                        f.role(),
-                                        weaver_core::classify::FileRole::Par2 { .. }
-                                        | weaver_core::classify::FileRole::RarVolume { .. }
-                                        | weaver_core::classify::FileRole::SevenZipArchive
-                                        | weaver_core::classify::FileRole::SevenZipSplit { .. }
-                                    )
-                                })
-                                .map(|f| f.filename().to_string())
-                                .collect();
-                            let mut removed = 0u32;
-                            for filename in &cleanup_files {
-                                let path = cleanup_dir.join(filename);
-                                match tokio::fs::remove_file(&path).await {
-                                    Ok(()) => removed += 1,
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => {
-                                        warn!(
-                                            file = %path.display(),
-                                            error = %e,
-                                            "failed to clean up source file"
-                                        );
-                                    }
-                                }
+                    for (set_name, archive_type) in &sets_to_extract {
+                        let result = match archive_type {
+                            weaver_assembly::ArchiveType::SevenZip => {
+                                self.extract_7z_set(job_id, set_name).await
                             }
-                            info!(
-                                job_id = job_id.0,
-                                removed,
-                                total = cleanup_files.len(),
-                                "post-extraction cleanup complete"
-                            );
-                        }
-
-                        // Move extracted files to complete directory.
-                        self.move_to_complete(job_id).await;
-
-                        {
-                            let state = self.jobs.get_mut(&job_id).unwrap();
-                            state.status = JobStatus::Complete;
-                        }
-                        self.streaming_providers.retain(|(jid, _), _| *jid != job_id);
-                        self.job_order.retain(|id| *id != job_id);
-                        let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-                        self.record_job_history(job_id);
-                    }
-                    Err(error_str) => {
-                        warn!(job_id = job_id.0, error = %error_str, "extraction failed");
-                        let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
-                            job_id,
-                            error: error_str.clone(),
-                        });
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        state.status = JobStatus::Failed {
-                            error: error_str.clone(),
+                            weaver_assembly::ArchiveType::Rar => {
+                                self.extract_rar_set(job_id, set_name).await
+                            }
                         };
-                        self.record_job_history(job_id);
+                        if let Err(e) = result {
+                            warn!(job_id = job_id.0, set_name = %set_name, error = %e, "failed to start extraction");
+                        }
                     }
+                    // Return — extraction runs in background.
+                    // handle_extraction_done will call check_job_completion again.
+                    return;
                 }
+
+                // All sets extracted — finish the job.
+                if self.jobs.get(&job_id).is_some_and(|s| s.status == JobStatus::Extracting) {
+                    self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+                }
+                info!(job_id = job_id.0, "extraction complete");
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::ExtractionComplete { job_id });
+
+                // Clean up archive source files before moving to complete.
+                {
+                    let state = self.jobs.get(&job_id).unwrap();
+                    let cleanup_dir = state.working_dir.clone();
+                    let cleanup_files: Vec<String> = state
+                        .assembly
+                        .files()
+                        .filter(|f| {
+                            matches!(
+                                f.role(),
+                                weaver_core::classify::FileRole::Par2 { .. }
+                                | weaver_core::classify::FileRole::RarVolume { .. }
+                                | weaver_core::classify::FileRole::SevenZipArchive
+                                | weaver_core::classify::FileRole::SevenZipSplit { .. }
+                            )
+                        })
+                        .map(|f| f.filename().to_string())
+                        .collect();
+                    let mut removed = 0u32;
+                    for filename in &cleanup_files {
+                        let path = cleanup_dir.join(filename);
+                        match tokio::fs::remove_file(&path).await {
+                            Ok(()) => removed += 1,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                warn!(
+                                    file = %path.display(),
+                                    error = %e,
+                                    "failed to clean up source file"
+                                );
+                            }
+                        }
+                    }
+                    info!(
+                        job_id = job_id.0,
+                        removed,
+                        total = cleanup_files.len(),
+                        "post-extraction cleanup complete"
+                    );
+                }
+
+                // Move extracted files to complete directory.
+                self.move_to_complete(job_id).await;
+
+                {
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.status = JobStatus::Complete;
+                }
+                self.streaming_providers.retain(|(jid, _), _| *jid != job_id);
+                self.job_order.retain(|id| *id != job_id);
+                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
+                self.record_job_history(job_id);
             }
             ExtractionReadiness::Blocked { reason } => {
                 let state = self.jobs.get_mut(&job_id).unwrap();
@@ -539,40 +519,52 @@ impl Pipeline {
         }
     }
 
-    /// Extract a single RAR archive set. Only collects volumes belonging to the named set.
+    /// Extract a single RAR archive set using streaming extraction.
+    ///
+    /// Uses a `WaitingVolumeProvider` so volumes are opened on demand as the
+    /// decompressor needs them, rather than requiring all volumes upfront.
+    /// Already-complete volumes are fed immediately; if called during download,
+    /// remaining volumes will be fed as they complete via `feed_streaming_volumes`.
     pub(super) async fn extract_rar_set(&mut self, job_id: JobId, set_name: &str) -> Result<u32, String> {
-        let (volume_paths, password, working_dir) = {
+        let (first_vol_path, password, working_dir) = {
             let state = self.jobs.get(&job_id)
                 .ok_or_else(|| format!("job {job_id:?} not found"))?;
             let topo = state.assembly.archive_topology_for(set_name)
                 .ok_or_else(|| format!("no topology for RAR set '{set_name}'"))?;
 
-            // Collect only volumes belonging to this set via the topology's volume_map.
-            let set_filenames: std::collections::HashSet<&str> = topo.volume_map.keys().map(|s| s.as_str()).collect();
-            let mut vols: Vec<(u32, PathBuf)> = Vec::new();
-            for file_asm in state.assembly.files() {
-                if set_filenames.contains(file_asm.filename())
-                    && let weaver_core::classify::FileRole::RarVolume { volume_number } =
-                        file_asm.role()
-                    {
-                        vols.push((
-                            *volume_number,
-                            state.working_dir.join(file_asm.filename()),
-                        ));
-                    }
-            }
-            vols.sort_by_key(|(vn, _)| *vn);
-            let paths: Vec<PathBuf> = vols.into_iter().map(|(_, p)| p).collect();
-            (paths, state.spec.password.clone(), state.working_dir.clone())
+            // Find the first volume path.
+            let first_vol_filename = topo.volume_map.iter()
+                .find(|&(_, &vn)| vn == 0)
+                .map(|(name, _)| name.clone())
+                .ok_or_else(|| "no volume 0 in topology".to_string())?;
+
+            let path = state.working_dir.join(&first_vol_filename);
+            (path, state.spec.password.clone(), state.working_dir.clone())
         };
 
         let output_dir = working_dir;
         let event_tx = self.event_tx.clone();
 
-        // Mark streaming provider as finished (all volumes available).
+        // Create or reuse a WaitingVolumeProvider for this set.
         let set_key = (job_id, set_name.to_string());
-        if let Some(provider) = self.streaming_providers.get(&set_key) {
-            provider.mark_finished();
+        let provider = if let Some(existing) = self.streaming_providers.get(&set_key) {
+            Arc::clone(existing)
+        } else {
+            let p = Arc::new(weaver_rar::WaitingVolumeProvider::new());
+            self.streaming_providers.insert(set_key.clone(), Arc::clone(&p));
+            p
+        };
+
+        // Feed all currently-complete volumes into the provider.
+        self.feed_streaming_volumes(job_id, set_name);
+
+        // If all files are downloaded, mark provider finished so it doesn't block forever.
+        {
+            let state = self.jobs.get(&job_id).unwrap();
+            let all_done = state.assembly.files().all(|f| f.is_complete());
+            if all_done {
+                provider.mark_finished();
+            }
         }
 
         // Collect already-extracted members so we skip them.
@@ -584,13 +576,10 @@ impl Pipeline {
 
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_owned = set_name.to_string();
+        let extraction_provider = Arc::clone(&provider);
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                if volume_paths.is_empty() {
-                    return Err("no RAR volumes found".to_string());
-                }
-
-                let first_file = std::fs::File::open(&volume_paths[0])
+                let first_file = std::fs::File::open(&first_vol_path)
                     .map_err(|e| format!("failed to open first volume: {e}"))?;
                 let mut archive = if let Some(ref pw) = password {
                     weaver_rar::RarArchive::open_with_password(first_file, pw)
@@ -598,14 +587,6 @@ impl Pipeline {
                     weaver_rar::RarArchive::open(first_file)
                 }
                 .map_err(|e| format!("failed to open RAR archive: {e}"))?;
-
-                for (i, path) in volume_paths.iter().enumerate().skip(1) {
-                    let vol_file = std::fs::File::open(path)
-                        .map_err(|e| format!("failed to open volume {i}: {e}"))?;
-                    archive
-                        .add_volume(i, Box::new(vol_file))
-                        .map_err(|e| format!("failed to add volume {i}: {e}"))?;
-                }
 
                 let meta = archive.metadata();
                 let options = weaver_rar::ExtractOptions {
@@ -632,18 +613,25 @@ impl Pipeline {
                         std::fs::create_dir_all(parent)
                             .map_err(|e| format!("failed to create parent dir: {e}"))?;
                     }
-                    let bytes_written = archive
-                        .extract_member_to_file(idx, &options, None, &out_path)
-                        .map_err(|e| format!("failed to extract {}: {e}", member.name))?;
 
-                    let _ = event_tx.send(PipelineEvent::ExtractionProgress {
-                        job_id,
-                        member: member.name.clone(),
-                        bytes_written,
-                        total_bytes: member.unpacked_size.unwrap_or(0),
-                    });
-
-                    extracted_count += 1;
+                    let mut out_file = std::io::BufWriter::new(
+                        std::fs::File::create(&out_path)
+                            .map_err(|e| format!("failed to create {}: {e}", member.name))?
+                    );
+                    match archive.extract_member_streaming(idx, &options, extraction_provider.as_ref(), &mut out_file) {
+                        Ok(bytes_written) => {
+                            let _ = event_tx.send(PipelineEvent::ExtractionProgress {
+                                job_id,
+                                member: member.name.clone(),
+                                bytes_written,
+                                total_bytes: member.unpacked_size.unwrap_or(0),
+                            });
+                            extracted_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(member = %member.name, error = %e, "member extraction failed, continuing with remaining members");
+                        }
+                    }
                 }
 
                 Ok(extracted_count)
@@ -651,7 +639,8 @@ impl Pipeline {
             .await;
 
             let result = match result {
-                Ok(r) => r,
+                Ok(Ok(count)) => Ok(count),
+                Ok(Err(e)) => Err(e),
                 Err(e) => Err(format!("extraction task panicked: {e}")),
             };
             let _ = extract_done_tx.send(ExtractionDone::FullSet {
@@ -661,7 +650,7 @@ impl Pipeline {
             }).await;
         });
 
-        // Return Ok(0) for now — actual result comes through the channel.
+        // Extraction runs in background — result comes through extract_done_tx channel.
         Ok(0)
     }
 

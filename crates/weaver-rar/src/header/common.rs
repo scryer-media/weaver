@@ -218,7 +218,7 @@ pub fn skip_data_area<R: Read + Seek>(reader: &mut R, raw: &RawHeader) -> RarRes
 }
 
 /// Re-encode a vint value to the exact number of bytes for CRC calculation.
-fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
+pub(crate) fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
     // We need to produce exactly `byte_count` bytes encoding `value`.
     // Leading 0x80 padding bytes are allowed.
     let mut result = Vec::with_capacity(byte_count);
@@ -232,6 +232,54 @@ fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
         result.push(byte);
     }
     result
+}
+
+/// Build a RawHeader from pre-validated parts (used by encrypted header parser).
+pub(crate) fn parse_raw_header_from_parts(
+    offset: u64,
+    crc32: u32,
+    header_size: u64,
+    header_size_vint_len: usize,
+    body: Vec<u8>,
+) -> crate::error::RarResult<RawHeader> {
+    use crate::vint;
+
+    let mut pos = 0;
+    let (header_type_val, n) = vint::read_vint(&body[pos..])?;
+    pos += n;
+
+    let (header_flags, n) = vint::read_vint(&body[pos..])?;
+    pos += n;
+
+    let extra_area_size = if header_flags & flags::EXTRA_AREA != 0 {
+        let (size, n) = vint::read_vint(&body[pos..])?;
+        pos += n;
+        let _ = pos;
+        size
+    } else {
+        0
+    };
+
+    let data_area_size = if header_flags & flags::DATA_AREA != 0 {
+        let (size, n) = vint::read_vint(&body[pos..])?;
+        pos += n;
+        let _ = pos;
+        size
+    } else {
+        0
+    };
+
+    Ok(RawHeader {
+        offset,
+        crc32,
+        header_size,
+        header_size_vint_len,
+        header_type: HeaderType::from(header_type_val),
+        flags: header_flags,
+        extra_area_size,
+        data_area_size,
+        body,
+    })
 }
 
 /// Get the byte position within the body where type-specific fields start.

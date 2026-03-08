@@ -71,6 +71,25 @@ Vite + React 19 + React Router 7 + Tailwind v4. Uses `urql` with `graphql-ws` fo
 - **Structured errors**: Every failure is classified (corruption, missing volume, encryption, filesystem) — no subprocess stdout scraping
 - **Adaptive runtime**: Probes system capabilities (disk IOPS, CPU cores, SIMD support, available RAM) at startup and continuously monitors actual performance to dynamically tune concurrency, buffer sizes, and scheduling priorities
 
+### Streaming Extraction — CRITICAL Architecture
+
+**Extraction ALWAYS starts as soon as the first volume arrives. We NEVER wait for all volumes.**
+
+This is the entire point of Weaver vs traditional tools. The downloader and extractor run concurrently. Extraction begins the moment volume 1 is available and blocks (via `VolumeProvider`) when it needs the next volume, which may still be downloading.
+
+**How it works by compression mode:**
+
+- **Store (uncompressed):** Each volume's data segment is independently decryptable. Decrypt the segment, write it to disk, move on. When the next volume arrives, decrypt that segment and append. The file grows incrementally as volumes download.
+- **LZ (compressed):** The decompressor is a stateful streaming reader. It starts consuming bytes from volume 1 immediately. When it exhausts that segment, it asks the `VolumeProvider` for the next volume — that call blocks until the download finishes. The decompressor's state (Huffman tables, sliding window) stays live in memory during the wait. No serialization, no restart.
+
+**The `VolumeProvider` trait is the bridge between downloading and extraction.** `WaitingVolumeProvider` uses channels — the scheduler sends volumes as they complete, the extractor blocks on receive. `StaticVolumeProvider` is for tests where all volumes exist on disk.
+
+**Rules for all code touching extraction:**
+1. Never collect all segments/volumes into memory before starting extraction
+2. Never call `discover_volumes` or equivalent as a prerequisite to beginning work — use it lazily or not at all for Store mode
+3. The extraction loop should process one segment at a time, requesting the next volume only when needed
+4. `VolumeProvider::get_volume()` is expected to block — this is normal, not an error condition
+
 ## Build & Test
 
 ```bash

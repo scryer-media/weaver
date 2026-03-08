@@ -23,8 +23,8 @@ if [ $# -gt 0 ]; then
     else
         IFS=',' read -ra parts <<< "$targets"
         for target in "${parts[@]}"; do
-            # Bare name = crate (weaver_foo), dotted = module path (weaver::pipeline)
-            if [[ "$target" == *.* ]]; then
+            # Bare name = crate (weaver_foo), qualified = module path (weaver::pipeline)
+            if [[ "$target" == *::* || "$target" == *.* ]]; then
                 RUST_LOG="${RUST_LOG},${target}=${level}"
             else
                 RUST_LOG="${RUST_LOG},weaver_${target//-/_}=${level}"

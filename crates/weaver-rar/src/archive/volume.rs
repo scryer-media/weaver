@@ -89,6 +89,7 @@ impl RarArchive {
                     salt: fe.salt,
                     iv: fe.iv,
                     check_data: fe.check_data,
+                    use_hash_mac: fe.use_hash_mac,
                 }),
                 rar4_salt: None,
                 hash: pf.hash,
@@ -227,6 +228,17 @@ impl RarArchive {
             || existing.file_header.data_crc32.is_none()
         {
             existing.file_header.data_crc32 = entry.file_header.data_crc32;
+            // When we adopt the CRC from a different segment, also update
+            // use_hash_mac from that segment's encryption info. RAR7 sets
+            // HASHMAC (enc_flags & 0x0002) only on the final segment of
+            // encrypted multi-volume files, meaning the CRC there is
+            // HMAC-transformed. We must know this to skip verification.
+            if let Some(ref entry_enc) = entry.file_encryption
+                && entry_enc.use_hash_mac
+                && let Some(ref mut existing_enc) = existing.file_encryption
+            {
+                existing_enc.use_hash_mac = true;
+            }
         }
         if existing.file_header.unpacked_size.is_none() {
             existing.file_header.unpacked_size = entry.file_header.unpacked_size;

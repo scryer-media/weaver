@@ -203,14 +203,18 @@ impl Pipeline {
 
                     // If this is a RAR volume, update archive topology.
                     self.try_update_archive_topology(job_id, file_id).await;
+                    debug!(job_id = job_id.0, "post-topology");
 
                     // If this is a 7z file, update 7z topology.
                     self.try_update_7z_topology(job_id, file_id);
 
                     // Try partial extraction if some archive members are ready.
+                    debug!(job_id = job_id.0, "entering try_partial_extraction");
                     self.try_partial_extraction(job_id).await;
+                    debug!(job_id = job_id.0, "post-extraction");
 
                     self.check_job_completion(job_id).await;
+                    debug!(job_id = job_id.0, "post-completion-check");
                 }
             }
             Err(e) => {

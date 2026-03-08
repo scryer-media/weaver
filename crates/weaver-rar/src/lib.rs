@@ -49,3 +49,4 @@ pub use volume::{
     VolumeSet, VolumeProvider, VolumeProviderError,
     StaticVolumeProvider, WaitingVolumeProvider,
 };
+pub use path::sanitize_path;

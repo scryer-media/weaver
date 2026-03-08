@@ -40,6 +40,9 @@ pub enum RarError {
     #[error("invalid password for encrypted archive")]
     InvalidPassword,
 
+    #[error("wrong password for member {member}")]
+    WrongPassword { member: String },
+
     #[error("unsupported compression method {method} version {version}")]
     UnsupportedCompression { method: u8, version: u8 },
 

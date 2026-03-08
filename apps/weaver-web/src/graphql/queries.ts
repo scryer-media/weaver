@@ -150,6 +150,30 @@ export const REPROCESS_JOB_MUTATION = gql`
   }
 `;
 
+export const DELETE_HISTORY_MUTATION = gql`
+  mutation DeleteHistory($id: Int!) {
+    deleteHistory(id: $id) {
+      id
+      name
+      status
+      progress
+      totalBytes
+      downloadedBytes
+      failedBytes
+      health
+      hasPassword
+      category
+      outputDir
+    }
+  }
+`;
+
+export const DELETE_ALL_HISTORY_MUTATION = gql`
+  mutation DeleteAllHistory {
+    deleteAllHistory
+  }
+`;
+
 export const PAUSE_ALL_MUTATION = gql`
   mutation PauseAll {
     pauseAll

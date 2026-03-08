@@ -59,28 +59,15 @@ impl SubscriptionRoot {
         let merged = event_stream.merge(heartbeat);
         let throttled = throttle(merged, Duration::from_millis(100));
 
-        let stream = throttled.then(move |_| {
-            let h = handle.clone();
-            async move {
-                let jobs = h
-                    .list_jobs()
-                    .await
-                    .unwrap_or_default()
-                    .iter()
-                    .map(Job::from)
-                    .collect();
-                let metrics = h
-                    .get_metrics()
-                    .await
-                    .map(|s| Metrics::from(&s))
-                    .unwrap_or_else(|_| Metrics::default());
-                let is_paused = h.is_globally_paused().await.unwrap_or(false);
+        let stream = throttled.map(move |_| {
+            let jobs = handle.list_jobs().iter().map(Job::from).collect();
+            let metrics = Metrics::from(&handle.get_metrics());
+            let is_paused = handle.is_globally_paused();
 
-                JobsSnapshot {
-                    jobs,
-                    metrics,
-                    is_paused,
-                }
+            JobsSnapshot {
+                jobs,
+                metrics,
+                is_paused,
             }
         });
 

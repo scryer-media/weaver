@@ -18,7 +18,7 @@ impl QueryRoot {
         has_metadata_key: Option<String>,
     ) -> Result<Vec<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let infos = handle.list_jobs().await?;
+        let infos = handle.list_jobs();
         let jobs = infos
             .iter()
             .filter(|info| {
@@ -46,7 +46,7 @@ impl QueryRoot {
     /// Get a specific job by ID.
     async fn job(&self, ctx: &Context<'_>, id: u64) -> Result<Option<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        match handle.get_job(weaver_core::id::JobId(id)).await {
+        match handle.get_job(weaver_core::id::JobId(id)) {
             Ok(info) => Ok(Some(Job::from(&info))),
             Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
@@ -56,14 +56,14 @@ impl QueryRoot {
     /// Get current pipeline metrics.
     async fn metrics(&self, ctx: &Context<'_>) -> Result<Metrics> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let snapshot = handle.get_metrics().await?;
+        let snapshot = handle.get_metrics();
         Ok(Metrics::from(&snapshot))
     }
 
     /// Check whether the pipeline is globally paused.
     async fn is_paused(&self, ctx: &Context<'_>) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        Ok(handle.is_globally_paused().await?)
+        Ok(handle.is_globally_paused())
     }
 
     /// List all configured NNTP servers.

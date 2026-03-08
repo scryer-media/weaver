@@ -200,10 +200,12 @@ async fn run_download(
     detect_server_capabilities(config, db).await;
     let nntp = build_nntp_client(config);
 
-    // Set up scheduler channels.
+    // Set up scheduler channels and shared control-plane state.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone());
+    let metrics = weaver_scheduler::PipelineMetrics::new();
+    let shared_state = weaver_scheduler::SharedPipelineState::new(metrics, vec![]);
+    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
 
     // Subscribe to events for progress logging.
     let mut event_rx = event_tx.subscribe();
@@ -244,7 +246,7 @@ async fn run_download(
     // Create and start the pipeline.
     let total_connections: usize = config.servers.iter().map(|s| s.connections as usize).sum();
     let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir.to_path_buf(), intermediate_dir.to_path_buf(), complete_dir.to_path_buf(), total_connections, write_buf_max, vec![], db.clone())
+        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir.to_path_buf(), intermediate_dir.to_path_buf(), complete_dir.to_path_buf(), total_connections, write_buf_max, vec![], shared_state, db.clone())
             .await?;
 
     // Start the pipeline BEFORE submitting the job — add_job awaits a reply
@@ -334,10 +336,13 @@ async fn run_server_command(
     // Wrap config for shared runtime access.
     let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
-    // Set up scheduler channels.
+    // Set up scheduler channels and shared control-plane state.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone());
+    let metrics = weaver_scheduler::PipelineMetrics::new();
+    // SharedPipelineState starts empty; initial_history is published below after recovery.
+    let shared_state = weaver_scheduler::SharedPipelineState::new(metrics, vec![]);
+    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
 
     // One-time migration: convert binary journal to SQLite if it exists.
     let journal_path = data_dir.join(".weaver-journal");
@@ -453,12 +458,46 @@ async fn run_server_command(
         }
     }
 
+    // Also load archived job history from SQLite so the UI can show completed/failed jobs.
+    match db.list_job_history(&weaver_state::HistoryFilter::default()) {
+        Ok(history_rows) => {
+            for row in history_rows {
+                let job_id = weaver_core::id::JobId(row.job_id);
+                // Skip if we already have this job from active_jobs recovery.
+                if initial_history.iter().any(|j| j.job_id == job_id) {
+                    continue;
+                }
+                let status = status_str_to_job_status(&row.status, row.error_message.as_deref());
+                initial_history.push(weaver_scheduler::JobInfo {
+                    job_id,
+                    name: row.name,
+                    status,
+                    progress: 1.0,
+                    total_bytes: row.total_bytes,
+                    downloaded_bytes: row.downloaded_bytes,
+                    failed_bytes: row.failed_bytes,
+                    health: row.health,
+                    password: None,
+                    category: row.category,
+                    metadata: row.metadata.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default(),
+                    output_dir: row.output_dir,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load job history from database");
+        }
+    }
+
     if !initial_history.is_empty() {
         info!(count = initial_history.len(), "recovered finished jobs for history");
     }
     if !to_restore.is_empty() {
         info!(count = to_restore.len(), "recovering in-progress jobs");
     }
+
+    // Publish recovered history to shared state so the API has data immediately.
+    shared_state.publish_jobs(initial_history.clone());
 
     // Build GraphQL schema with shared config and database.
     let schema = weaver_api::build_schema(handle.clone(), shared_config, db.clone());
@@ -472,7 +511,7 @@ async fn run_server_command(
 
     // Create and start the pipeline.
     let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir, intermediate_dir, complete_dir, total_connections, write_buf_max, initial_history, db.clone()).await?;
+        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir, intermediate_dir, complete_dir, total_connections, write_buf_max, initial_history, shared_state, db.clone()).await?;
 
     let pipeline_task = tokio::spawn(async move {
         pipeline.run().await;

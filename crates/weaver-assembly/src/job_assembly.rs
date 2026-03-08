@@ -229,12 +229,14 @@ impl JobAssembly {
                 return ExtractionReadiness::Ready;
             }
         } else if !topo.members.is_empty() {
-            let max_volume = topo
+            let max_from_members = topo
                 .members
                 .iter()
                 .map(|m| m.last_volume)
                 .max()
                 .unwrap_or(0);
+            let max_from_map = topo.volume_map.values().max().copied().unwrap_or(0);
+            let max_volume = max_from_members.max(max_from_map);
             let all_complete = (0..=max_volume).all(|v| topo.complete_volumes.contains(&v));
             if all_complete {
                 return ExtractionReadiness::Ready;
@@ -306,6 +308,11 @@ impl JobAssembly {
     /// Get a specific archive set's topology.
     pub fn archive_topology_for(&self, set_name: &str) -> Option<&ArchiveTopology> {
         self.archive_topologies.get(set_name)
+    }
+
+    /// Get a mutable reference to a specific archive set's topology.
+    pub fn archive_topology_for_mut(&mut self, set_name: &str) -> Option<&mut ArchiveTopology> {
+        self.archive_topologies.get_mut(set_name)
     }
 
     /// Get all archive topologies.

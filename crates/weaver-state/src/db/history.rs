@@ -137,6 +137,15 @@ impl Database {
         Ok(changed > 0)
     }
 
+    /// Delete all job history entries. Returns the number of rows deleted.
+    pub fn delete_all_job_history(&self) -> Result<usize, StateError> {
+        let conn = self.conn();
+        let changed = conn
+            .execute("DELETE FROM job_history", [])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(changed)
+    }
+
     /// Return the highest job_id in history, or 0 if empty.
     pub fn max_job_id(&self) -> Result<u64, StateError> {
         let conn = self.conn();

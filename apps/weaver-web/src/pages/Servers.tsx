@@ -102,13 +102,13 @@ export function Servers() {
     } else {
       await addServer({ input });
     }
-    reexecute({ requestPolicy: "network-only" });
+    reexecute();
     closeForm();
   };
 
   const handleDelete = async (id: number) => {
     await removeServer({ id });
-    reexecute({ requestPolicy: "network-only" });
+    reexecute();
   };
 
   const handleTest = async () => {

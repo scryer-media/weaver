@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -10,7 +12,60 @@ use weaver_core::id::{JobId, SegmentId};
 
 use crate::error::SchedulerError;
 use crate::job::{JobSpec, JobStatus};
-use crate::metrics::MetricsSnapshot;
+use crate::metrics::{MetricsSnapshot, PipelineMetrics};
+
+/// Shared read-only view of pipeline state for the control plane.
+///
+/// Written by the pipeline loop after each event, read by API handlers
+/// without going through the command channel.
+#[derive(Clone)]
+pub struct SharedPipelineState {
+    jobs: Arc<RwLock<Vec<JobInfo>>>,
+    paused: Arc<AtomicBool>,
+    metrics: Arc<PipelineMetrics>,
+}
+
+impl SharedPipelineState {
+    pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
+        Self {
+            jobs: Arc::new(RwLock::new(initial_jobs)),
+            paused: Arc::new(AtomicBool::new(false)),
+            metrics,
+        }
+    }
+
+    // --- Reader methods (called by API handlers) ---
+
+    pub fn list_jobs(&self) -> Vec<JobInfo> {
+        self.jobs.read().unwrap().clone()
+    }
+
+    pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
+        self.jobs.read().unwrap().iter().find(|j| j.job_id == job_id).cloned()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn metrics(&self) -> &Arc<PipelineMetrics> {
+        &self.metrics
+    }
+
+    // --- Writer methods (called by pipeline loop only) ---
+
+    pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
+        *self.jobs.write().unwrap() = jobs;
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+}
 
 /// Commands sent to the scheduler's main loop.
 pub enum SchedulerCommand {
@@ -45,25 +100,10 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Get job status.
-    GetJobStatus {
-        job_id: JobId,
-        reply: oneshot::Sender<Result<JobInfo, SchedulerError>>,
-    },
-    /// List all jobs.
-    ListJobs {
-        reply: oneshot::Sender<Vec<JobInfo>>,
-    },
-    /// Get current metrics snapshot.
-    GetMetrics {
-        reply: oneshot::Sender<MetricsSnapshot>,
-    },
     /// Pause all jobs globally (pipeline-wide).
     PauseAll { reply: oneshot::Sender<()> },
     /// Resume all jobs globally.
     ResumeAll { reply: oneshot::Sender<()> },
-    /// Query global pause state.
-    GetGlobalPauseState { reply: oneshot::Sender<bool> },
     /// Set global speed limit (bytes/sec). 0 means unlimited.
     SetSpeedLimit {
         bytes_per_sec: u64,
@@ -79,6 +119,15 @@ pub enum SchedulerCommand {
     /// Reprocess a failed job (re-run post-download stages without re-downloading).
     ReprocessJob {
         job_id: JobId,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    /// Delete a completed/failed/cancelled job from history.
+    DeleteHistory {
+        job_id: JobId,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    /// Delete all completed/failed/cancelled jobs from history.
+    DeleteAllHistory {
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Shutdown the scheduler gracefully.
@@ -113,15 +162,18 @@ pub struct JobInfo {
 pub struct SchedulerHandle {
     cmd_tx: mpsc::Sender<SchedulerCommand>,
     event_tx: broadcast::Sender<PipelineEvent>,
+    state: SharedPipelineState,
 }
 
 impl SchedulerHandle {
-    /// Create a new handle from a command sender and event broadcast sender.
+    /// Create a new handle from a command sender, event broadcast sender,
+    /// and shared pipeline state.
     pub fn new(
         cmd_tx: mpsc::Sender<SchedulerCommand>,
         event_tx: broadcast::Sender<PipelineEvent>,
+        state: SharedPipelineState,
     ) -> Self {
-        Self { cmd_tx, event_tx }
+        Self { cmd_tx, event_tx, state }
     }
 
     /// Submit a new download job.
@@ -220,11 +272,11 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Get info about a specific job.
-    pub async fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
+    /// Delete a completed/failed/cancelled job from history.
+    pub async fn delete_history(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::GetJobStatus {
+            .send(SchedulerCommand::DeleteHistory {
                 job_id,
                 reply: tx,
             })
@@ -233,24 +285,29 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// List all jobs.
-    pub async fn list_jobs(&self) -> Result<Vec<JobInfo>, SchedulerError> {
+    /// Delete all completed/failed/cancelled jobs from history.
+    pub async fn delete_all_history(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::ListJobs { reply: tx })
+            .send(SchedulerCommand::DeleteAllHistory { reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Get current metrics.
-    pub async fn get_metrics(&self) -> Result<MetricsSnapshot, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::GetMetrics { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)
+    /// Get info about a specific job (reads from shared state, no channel round-trip).
+    pub fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
+        self.state.get_job(job_id).ok_or(SchedulerError::JobNotFound(job_id))
+    }
+
+    /// List all jobs (reads from shared state, no channel round-trip).
+    pub fn list_jobs(&self) -> Vec<JobInfo> {
+        self.state.list_jobs()
+    }
+
+    /// Get current metrics (reads from shared state, no channel round-trip).
+    pub fn get_metrics(&self) -> MetricsSnapshot {
+        self.state.metrics_snapshot()
     }
 
     /// Pause all download dispatch globally.
@@ -275,14 +332,9 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Check whether the pipeline is globally paused.
-    pub async fn is_globally_paused(&self) -> Result<bool, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::GetGlobalPauseState { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)
+    /// Check whether the pipeline is globally paused (reads from shared state).
+    pub fn is_globally_paused(&self) -> bool {
+        self.state.is_paused()
     }
 
     /// Set the global download speed limit. 0 means unlimited.
@@ -337,8 +389,6 @@ impl SchedulerHandle {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use weaver_assembly::JobAssembly;
     use weaver_core::event::PipelineEvent;
@@ -349,14 +399,33 @@ mod tests {
     use crate::job::{JobSpec, JobState, JobStatus};
     use crate::metrics::PipelineMetrics;
 
+    fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
+        jobs.values()
+            .map(|state| JobInfo {
+                job_id: state.job_id,
+                name: state.spec.name.clone(),
+                status: state.status.clone(),
+                progress: state.assembly.progress(),
+                total_bytes: state.spec.total_bytes,
+                downloaded_bytes: 0,
+                failed_bytes: 0,
+                health: 1000,
+                password: state.spec.password.clone(),
+                category: state.spec.category.clone(),
+                metadata: state.spec.metadata.clone(),
+                output_dir: None,
+            })
+            .collect()
+    }
+
     /// Create a test scheduler handle with a minimal background loop.
     fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
         let (event_tx, _) = broadcast::channel(256);
-
-        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone());
         let metrics = PipelineMetrics::new();
-        let downloaded_bytes = Arc::new(AtomicU64::new(0));
+        let shared_state = SharedPipelineState::new(metrics, vec![]);
+
+        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
 
         let task = tokio::spawn(async move {
             let mut jobs: HashMap<JobId, JobState> = HashMap::new();
@@ -427,57 +496,13 @@ mod tests {
                         };
                         let _ = reply.send(result);
                     }
-                    SchedulerCommand::GetJobStatus { job_id, reply } => {
-                        let result = match jobs.get(&job_id) {
-                            Some(state) => Ok(JobInfo {
-                                job_id: state.job_id,
-                                name: state.spec.name.clone(),
-                                status: state.status.clone(),
-                                progress: state.assembly.progress(),
-                                total_bytes: state.spec.total_bytes,
-                                downloaded_bytes: downloaded_bytes.load(Ordering::Relaxed),
-                                failed_bytes: 0,
-                                health: 1000,
-                                password: state.spec.password.clone(),
-                                category: state.spec.category.clone(),
-                                metadata: state.spec.metadata.clone(),
-                                output_dir: None,
-                            }),
-                            None => Err(SchedulerError::JobNotFound(job_id)),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    SchedulerCommand::ListJobs { reply } => {
-                        let list: Vec<JobInfo> = jobs
-                            .values()
-                            .map(|state| JobInfo {
-                                job_id: state.job_id,
-                                name: state.spec.name.clone(),
-                                status: state.status.clone(),
-                                progress: state.assembly.progress(),
-                                total_bytes: state.spec.total_bytes,
-                                downloaded_bytes: 0,
-                                failed_bytes: 0,
-                                health: 1000,
-                                password: state.spec.password.clone(),
-                                category: state.spec.category.clone(),
-                                metadata: state.spec.metadata.clone(),
-                                output_dir: None,
-                            })
-                            .collect();
-                        let _ = reply.send(list);
-                    }
-                    SchedulerCommand::GetMetrics { reply } => {
-                        let _ = reply.send(metrics.snapshot());
-                    }
                     SchedulerCommand::PauseAll { reply } => {
+                        shared_state.set_paused(true);
                         let _ = reply.send(());
                     }
                     SchedulerCommand::ResumeAll { reply } => {
+                        shared_state.set_paused(false);
                         let _ = reply.send(());
-                    }
-                    SchedulerCommand::GetGlobalPauseState { reply } => {
-                        let _ = reply.send(false);
                     }
                     SchedulerCommand::SetSpeedLimit { reply, .. } => {
                         let _ = reply.send(());
@@ -504,6 +529,12 @@ mod tests {
                         jobs.insert(job_id, state);
                         let _ = reply.send(Ok(()));
                     }
+                    SchedulerCommand::DeleteHistory { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    SchedulerCommand::DeleteAllHistory { reply } => {
+                        let _ = reply.send(Ok(()));
+                    }
                     SchedulerCommand::ReprocessJob { job_id, reply } => {
                         let result = match jobs.get_mut(&job_id) {
                             Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
@@ -519,6 +550,8 @@ mod tests {
                     }
                     SchedulerCommand::Shutdown => break,
                 }
+                // Publish updated job list to shared state after every command.
+                shared_state.publish_jobs(build_job_list(&jobs));
             }
         });
 
@@ -549,10 +582,10 @@ mod tests {
             .await
             .unwrap();
 
-        let jobs = handle.list_jobs().await.unwrap();
+        let jobs = handle.list_jobs();
         assert_eq!(jobs.len(), 2);
 
-        let info = handle.get_job(JobId(1)).await.unwrap();
+        let info = handle.get_job(JobId(1)).unwrap();
         assert_eq!(info.name, "Job 1");
         assert_eq!(info.status, JobStatus::Queued);
 
@@ -570,11 +603,11 @@ mod tests {
             .unwrap();
 
         handle.pause_job(JobId(1)).await.unwrap();
-        let info = handle.get_job(JobId(1)).await.unwrap();
+        let info = handle.get_job(JobId(1)).unwrap();
         assert_eq!(info.status, JobStatus::Paused);
 
         handle.resume_job(JobId(1)).await.unwrap();
-        let info = handle.get_job(JobId(1)).await.unwrap();
+        let info = handle.get_job(JobId(1)).unwrap();
         assert_eq!(info.status, JobStatus::Downloading);
 
         handle.shutdown().await.unwrap();
@@ -589,10 +622,10 @@ mod tests {
             .add_job(JobId(1), make_spec("To Cancel"), PathBuf::from("test.nzb"))
             .await
             .unwrap();
-        assert_eq!(handle.list_jobs().await.unwrap().len(), 1);
+        assert_eq!(handle.list_jobs().len(), 1);
 
         handle.cancel_job(JobId(1)).await.unwrap();
-        assert_eq!(handle.list_jobs().await.unwrap().len(), 0);
+        assert_eq!(handle.list_jobs().len(), 0);
 
         handle.shutdown().await.unwrap();
         task.await.unwrap();
@@ -602,7 +635,7 @@ mod tests {
     async fn job_not_found() {
         let (handle, task) = test_scheduler();
 
-        let err = handle.get_job(JobId(999)).await.unwrap_err();
+        let err = handle.get_job(JobId(999)).unwrap_err();
         assert!(matches!(err, SchedulerError::JobNotFound(_)));
 
         let err = handle.pause_job(JobId(999)).await.unwrap_err();
@@ -668,7 +701,7 @@ mod tests {
 
         handle.add_job(JobId(1), spec, PathBuf::from("test.nzb")).await.unwrap();
 
-        let info = handle.get_job(JobId(1)).await.unwrap();
+        let info = handle.get_job(JobId(1)).unwrap();
         assert_eq!(info.password, Some("secret123".to_string()));
 
         handle.shutdown().await.unwrap();

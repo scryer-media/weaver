@@ -13,6 +13,7 @@ use crate::decompress::lz::LzDecoder;
 use crate::decompress::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
 use crate::extract::{self, ExtractOptions};
+use crate::volume::VolumeProvider;
 use crate::header;
 use crate::header::file::FileHeader;
 use crate::limits::Limits;
@@ -30,6 +31,8 @@ pub(super) struct FileEncryptionInfo {
     pub(super) salt: [u8; 16],
     pub(super) iv: [u8; 16],
     pub(super) check_data: Option<[u8; 12]>,
+    /// When true, CRC32/BLAKE2 hashes are HMAC-transformed (enc_flags & 0x0002).
+    pub(super) use_hash_mac: bool,
 }
 
 /// Internal entry tracking a member and its data segments across volumes.
@@ -231,6 +234,17 @@ impl RarArchive {
             .position(|m| m.file_header.name == name)
     }
 
+    /// Find a member by sanitized name, returning its index into `self.members`.
+    ///
+    /// Unlike `find_member` (which matches raw header names), this sanitizes
+    /// each member's name before comparison. Use this when the caller has a
+    /// sanitized name (e.g., from the pipeline topology).
+    pub fn find_member_sanitized(&self, sanitized_name: &str) -> Option<usize> {
+        self.members
+            .iter()
+            .position(|m| crate::path::sanitize_path(&m.file_header.name) == sanitized_name)
+    }
+
     /// Get member info by index.
     pub fn member_info(&self, index: usize) -> Option<MemberInfo> {
         self.members.get(index).map(|entry| self.make_member_info(entry))
@@ -320,6 +334,51 @@ impl RarArchive {
     /// Whether a member is encrypted.
     pub fn member_is_encrypted(&self, index: usize) -> bool {
         self.members.get(index).is_some_and(|e| e.is_encrypted)
+    }
+
+    /// Discover all volumes via a `VolumeProvider`, parsing headers for each.
+    ///
+    /// Walks volumes sequentially starting from the first unknown volume,
+    /// calling `add_volume` for each until all members are complete (no
+    /// `split_after` remaining) or the provider signals no more volumes.
+    ///
+    /// This is used by streaming extraction to build the full segment list
+    /// before decompression begins. The `VolumeProvider` may block waiting
+    /// for volumes to finish downloading.
+    pub fn discover_volumes(&mut self, provider: &dyn VolumeProvider) -> RarResult<()> {
+        use crate::volume::VolumeProviderError;
+
+        let mut next_vol = self.volumes.len().max(1);
+
+        loop {
+            // Check if any member still needs continuation segments.
+            let needs_more = self.members.iter().any(|m| m.file_header.split_after);
+            if !needs_more {
+                break;
+            }
+
+            match provider.get_volume(next_vol) {
+                Ok(reader) => {
+                    self.add_volume(next_vol, Box::new(reader))?;
+                    next_vol += 1;
+                }
+                Err(VolumeProviderError::Unavailable { .. }) => {
+                    // No more volumes available — stop discovery.
+                    break;
+                }
+                Err(VolumeProviderError::Cancelled) => {
+                    return Err(RarError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "volume discovery cancelled",
+                    )));
+                }
+                Err(VolumeProviderError::Io(e)) => {
+                    return Err(RarError::Io(e));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

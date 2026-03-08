@@ -32,7 +32,7 @@ use weaver_par2::verify::{
 };
 use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
-    RuntimeTuner, SchedulerCommand, TokenBucket,
+    RuntimeTuner, SchedulerCommand, SharedPipelineState, TokenBucket,
 };
 use weaver_state::CommittedSegment;
 
@@ -69,11 +69,18 @@ pub(super) enum ExtractionDone {
         set_name: String,
         extracted: Result<Vec<String>, String>,
     },
-    /// Full set extraction completed (completion stage).
+    /// Full set extraction completed (all volumes present).
     FullSet {
         job_id: JobId,
         set_name: String,
         result: Result<u32, String>,
+    },
+    /// Streaming extraction of a single member completed.
+    Streaming {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+        result: Result<u64, String>,
     },
 }
 
@@ -152,8 +159,14 @@ pub struct Pipeline {
     /// Active streaming extraction providers per (job, archive set).
     /// The `WaitingVolumeProvider` is fed volume paths as they complete.
     pub(super) streaming_providers: HashMap<(JobId, String), Arc<weaver_rar::WaitingVolumeProvider>>,
+    /// Base volume number for each streaming provider, used to re-index volumes.
+    /// When extracting a member that starts at volume N, the provider's indices
+    /// are offset so that local index 0 maps to real volume N.
+    pub(super) streaming_volume_bases: HashMap<(JobId, String), u32>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
     pub(super) finished_jobs: Vec<JobInfo>,
+    /// Shared state for control plane reads (API handlers read without channel round-trip).
+    pub(super) shared_state: SharedPipelineState,
     /// SQLite database for durable history.
     pub(super) db: weaver_state::Database,
 }
@@ -173,9 +186,10 @@ impl Pipeline {
         total_connections: usize,
         write_buf_max_pending: usize,
         initial_history: Vec<JobInfo>,
+        shared_state: SharedPipelineState,
         db: weaver_state::Database,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let metrics = PipelineMetrics::new();
+        let metrics = Arc::clone(shared_state.metrics());
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
@@ -231,7 +245,9 @@ impl Pipeline {
             extracted_members: HashMap::new(),
             extracted_sets: HashMap::new(),
             streaming_providers: HashMap::new(),
+            streaming_volume_bases: HashMap::new(),
             finished_jobs: initial_history,
+            shared_state,
             db,
         })
     }
@@ -347,11 +363,21 @@ impl Pipeline {
                     }
                 }
             }
+
+            // Publish updated job snapshot to shared state so the control plane
+            // (API handlers, subscriptions) always has fresh data without
+            // going through the command channel.
+            self.publish_snapshot();
         }
 
         // Graceful shutdown: wait for in-flight work to drain.
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    /// Publish current job list to shared state for lock-free control plane reads.
+    fn publish_snapshot(&self) {
+        self.shared_state.publish_jobs(self.list_jobs());
     }
 
     /// Process a scheduler command.
@@ -465,29 +491,17 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
-            SchedulerCommand::GetJobStatus { job_id, reply } => {
-                let result = self.get_job_info(job_id);
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::ListJobs { reply } => {
-                let list = self.list_jobs();
-                let _ = reply.send(list);
-            }
-            SchedulerCommand::GetMetrics { reply } => {
-                let _ = reply.send(self.metrics.snapshot());
-            }
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
+                self.shared_state.set_paused(true);
                 let _ = self.event_tx.send(PipelineEvent::GlobalPaused);
                 let _ = reply.send(());
             }
             SchedulerCommand::ResumeAll { reply } => {
                 self.global_paused = false;
+                self.shared_state.set_paused(false);
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
                 let _ = reply.send(());
-            }
-            SchedulerCommand::GetGlobalPauseState { reply } => {
-                let _ = reply.send(self.global_paused);
             }
             SchedulerCommand::SetSpeedLimit { bytes_per_sec, reply } => {
                 self.rate_limiter.set_rate(bytes_per_sec);
@@ -504,6 +518,33 @@ impl Pipeline {
             SchedulerCommand::ReprocessJob { job_id, reply } => {
                 let result = self.reprocess_job(job_id).await;
                 let _ = reply.send(result);
+            }
+            SchedulerCommand::DeleteHistory { job_id, reply } => {
+                let result = if self.jobs.contains_key(&job_id) {
+                    Err(weaver_scheduler::SchedulerError::Other(
+                        "cannot delete active job — cancel it first".into(),
+                    ))
+                } else {
+                    self.finished_jobs.retain(|j| j.job_id != job_id);
+                    let db = self.db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = db.delete_job_history(job_id.0);
+                        let _ = db.delete_job_events(job_id.0);
+                    });
+                    self.publish_snapshot();
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::DeleteAllHistory { reply } => {
+                self.finished_jobs.clear();
+                let db = self.db.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = db.delete_all_job_history();
+                    let _ = db.delete_all_job_events();
+                });
+                self.publish_snapshot();
+                let _ = reply.send(Ok(()));
             }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }

@@ -51,13 +51,15 @@ impl MutationRoot {
         }
 
         let job_id = JobId(NEXT_API_JOB_ID.fetch_add(1, Ordering::Relaxed));
-        let name = nzb.meta.title.clone().unwrap_or_else(|| {
-            filename
-                .as_deref()
-                .and_then(|f| f.strip_suffix(".nzb"))
-                .unwrap_or("Untitled")
-                .to_string()
-        });
+        // Prefer the NZB filename over internal metadata — indexers use readable
+        // names for the .nzb file while subjects/titles inside are often obfuscated.
+        let name = filename
+            .as_deref()
+            .and_then(|f| f.strip_suffix(".nzb"))
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .or(nzb.meta.title.clone())
+            .unwrap_or_else(|| "Untitled".to_string());
 
         // Use provided password, or extract from NZB meta.
         let pw = password.or_else(|| {
@@ -167,6 +169,34 @@ impl MutationRoot {
     async fn reprocess_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.reprocess_job(JobId(id)).await?;
+        Ok(true)
+    }
+
+    /// Delete a completed/failed/cancelled job from history.
+    /// Returns the remaining history jobs after deletion.
+    async fn delete_history(&self, ctx: &Context<'_>, id: u64) -> Result<Vec<Job>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        handle.delete_history(JobId(id)).await?;
+
+        let jobs = handle
+            .list_jobs()
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.status,
+                    weaver_scheduler::JobStatus::Complete
+                        | weaver_scheduler::JobStatus::Failed { .. }
+                )
+            })
+            .map(Job::from)
+            .collect();
+        Ok(jobs)
+    }
+
+    /// Delete all completed/failed/cancelled jobs from history.
+    async fn delete_all_history(&self, ctx: &Context<'_>) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        handle.delete_all_history().await?;
         Ok(true)
     }
 

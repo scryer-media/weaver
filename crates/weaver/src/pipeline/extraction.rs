@@ -6,8 +6,9 @@ impl Pipeline {
     /// Try partial extraction: extract archive members whose volumes are all present.
     /// Called after each file completes, not just when all files are done.
     pub(super) async fn try_partial_extraction(&mut self, job_id: JobId) {
-        // Check for ready archive sets (7z or RAR) — extract each independently.
-        let ready_sets: Vec<(String, weaver_assembly::ArchiveType)> = {
+        // Check for ready 7z sets — extract each independently.
+        // RAR always goes through the streaming path below (no set readiness needed).
+        let ready_sets: Vec<String> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -15,71 +16,30 @@ impl Pipeline {
                 .assembly
                 .ready_archive_sets()
                 .into_iter()
-                .filter_map(|set_name| {
-                    let topo = state.assembly.archive_topology_for(&set_name)?;
-                    if self
-                        .extracted_sets
-                        .get(&job_id)
-                        .is_some_and(|s| s.contains(&set_name))
-                    {
-                        return None;
-                    }
-                    Some((set_name, topo.archive_type))
+                .filter(|set_name| {
+                    let dominated = state.assembly.archive_topology_for(set_name)
+                        .is_some_and(|t| t.archive_type == weaver_assembly::ArchiveType::SevenZip);
+                    dominated
+                        && !self
+                            .extracted_sets
+                            .get(&job_id)
+                            .is_some_and(|s| s.contains(set_name))
                 })
                 .collect()
         };
 
-        for (set_name, archive_type) in ready_sets {
-            match archive_type {
-                weaver_assembly::ArchiveType::SevenZip => {
-                    info!(job_id = job_id.0, set_name = %set_name, "extracting ready 7z set");
-                    match self.extract_7z_set(job_id, &set_name).await {
-                        Ok(count) => {
-                            info!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                members = count,
-                                "7z set extraction complete"
-                            );
-                            self.extracted_sets
-                                .entry(job_id)
-                                .or_default()
-                                .insert(set_name);
-                        }
-                        Err(e) => {
-                            warn!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                error = %e,
-                                "7z set extraction failed"
-                            );
-                        }
-                    }
-                }
-                weaver_assembly::ArchiveType::Rar => {
-                    info!(job_id = job_id.0, set_name = %set_name, "extracting ready RAR set");
-                    match self.extract_rar_set(job_id, &set_name).await {
-                        Ok(count) => {
-                            info!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                members = count,
-                                "RAR set extraction complete"
-                            );
-                            self.extracted_sets
-                                .entry(job_id)
-                                .or_default()
-                                .insert(set_name);
-                        }
-                        Err(e) => {
-                            warn!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                error = %e,
-                                "RAR set extraction failed"
-                            );
-                        }
-                    }
+        for set_name in ready_sets {
+            self.extracted_sets
+                .entry(job_id)
+                .or_default()
+                .insert(set_name.clone());
+
+            info!(job_id = job_id.0, set_name = %set_name, "spawning extraction for ready 7z set");
+            let result = self.extract_7z_set(job_id, &set_name).await;
+            if let Err(e) = result {
+                warn!(job_id = job_id.0, set_name = %set_name, error = %e, "set extraction failed to start");
+                if let Some(sets) = self.extracted_sets.get_mut(&job_id) {
+                    sets.remove(&set_name);
                 }
             }
         }
@@ -177,10 +137,13 @@ impl Pipeline {
         );
 
         // Create the WaitingVolumeProvider and feed all currently-complete volumes.
+        // Store the base volume offset so provider indices match the archive's local indices.
         let provider = Arc::new(weaver_rar::WaitingVolumeProvider::new());
         let provider_key = (job_id, set_name.clone());
         self.streaming_providers
-            .insert(provider_key, Arc::clone(&provider));
+            .insert(provider_key.clone(), Arc::clone(&provider));
+        self.streaming_volume_bases
+            .insert(provider_key, first_volume);
 
         // Feed all currently-complete volumes for this set into the provider.
         self.feed_streaming_volumes(job_id, &set_name);
@@ -205,8 +168,9 @@ impl Pipeline {
                 Some(p) => p,
                 None => {
                     warn!(job_id = job_id.0, "first volume path not found");
-                    self.streaming_providers
-                        .remove(&(job_id, set_name));
+                    let key = (job_id, set_name);
+                    self.streaming_providers.remove(&key);
+                    self.streaming_volume_bases.remove(&key);
                     return false;
                 }
             }
@@ -218,6 +182,9 @@ impl Pipeline {
 
         // Spawn the blocking extraction task.
         let extraction_provider = Arc::clone(&provider);
+        let extract_done_tx = self.extract_done_tx.clone();
+        let set_name_for_done = set_name.clone();
+        let member_for_done = member_name.clone();
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 // Open the first volume to parse headers.
@@ -230,27 +197,27 @@ impl Pipeline {
                 }
                 .map_err(|e| format!("failed to open RAR archive: {e}"))?;
 
-                let meta = archive.metadata();
                 let options = weaver_rar::ExtractOptions {
                     verify: true,
                     password: password.clone(),
                 };
 
-                // Find the target member.
-                let idx = meta
-                    .members
-                    .iter()
-                    .position(|m| m.name == target_member)
+                // Find the target member by sanitized name — this returns the
+                // correct index into self.members (not the filtered metadata list).
+                let idx = archive
+                    .find_member_sanitized(&target_member)
                     .ok_or_else(|| {
                         format!("member {} not found in archive", target_member)
                     })?;
 
-                let member = &meta.members[idx];
+                let member = archive.member_info(idx).ok_or_else(|| {
+                    format!("member index {} out of range", idx)
+                })?;
                 if member.is_directory {
                     let dir_path = output_dir.join(&member.name);
                     std::fs::create_dir_all(&dir_path)
                         .map_err(|e| format!("failed to create dir {}: {e}", member.name))?;
-                    return Ok((target_member.clone(), 0u64));
+                    return Ok(0u64);
                 }
 
                 let out_path = output_dir.join(&member.name);
@@ -280,30 +247,21 @@ impl Pipeline {
                     total_bytes: member.unpacked_size.unwrap_or(0),
                 });
 
-                Ok::<_, String>((target_member.clone(), bytes_written))
+                Ok(bytes_written)
             })
             .await;
 
-            match result {
-                Ok(Ok((member, bytes))) => {
-                    info!(
-                        job_id = job_id.0,
-                        member = %member,
-                        bytes,
-                        "streaming extraction complete"
-                    );
-                }
-                Ok(Err(e)) => {
-                    warn!(job_id = job_id.0, error = %e, "streaming extraction failed");
-                }
-                Err(e) => {
-                    warn!(
-                        job_id = job_id.0,
-                        error = %e,
-                        "streaming extraction task panicked"
-                    );
-                }
-            }
+            let result = match result {
+                Ok(Ok(bytes)) => Ok(bytes),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("streaming extraction task panicked: {e}")),
+            };
+            let _ = extract_done_tx.send(ExtractionDone::Streaming {
+                job_id,
+                set_name: set_name_for_done,
+                member: member_for_done,
+                result,
+            }).await;
         });
 
         // Mark the member as being extracted.
@@ -316,7 +274,7 @@ impl Pipeline {
     }
 
     /// Feed all currently-complete volume paths for a RAR set to its streaming provider.
-    fn feed_streaming_volumes(&self, job_id: JobId, set_name: &str) {
+    pub(super) fn feed_streaming_volumes(&self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
         let Some(provider) = self.streaming_providers.get(&key) else {
             return;
@@ -333,15 +291,23 @@ impl Pipeline {
         let set_filenames: HashSet<&str> =
             topo.volume_map.keys().map(|s| s.as_str()).collect();
 
+        // Re-index volumes by subtracting the base offset so the provider's
+        // indices match the archive's local volume indices (0, 1, 2, ...).
+        let base = self.streaming_volume_bases.get(&key).copied().unwrap_or(0);
+        let mut fed_count = 0u32;
         for file_asm in state.assembly.files() {
             if set_filenames.contains(file_asm.filename())
                 && let weaver_core::classify::FileRole::RarVolume { volume_number } =
                     file_asm.role()
-                    && file_asm.is_complete() {
+                    && file_asm.is_complete()
+                    && *volume_number >= base {
+                        let local_idx = (*volume_number - base) as usize;
                         let path = state.working_dir.join(file_asm.filename());
-                        provider.volume_ready(*volume_number as usize, path);
+                        provider.volume_ready(local_idx, path);
+                        fed_count += 1;
                     }
         }
+        info!(job_id = job_id.0, set_name = %set_name, fed_count, "fed streaming volumes");
 
         // If the job is complete/failed, mark the provider as finished.
         match &state.status {
@@ -573,6 +539,7 @@ impl Pipeline {
                         members = count,
                         "set extraction complete"
                     );
+                    // Set was pre-marked in extracted_sets; confirm it.
                     self.extracted_sets
                         .entry(job_id)
                         .or_default()
@@ -586,6 +553,57 @@ impl Pipeline {
                         error = %e,
                         "set extraction failed"
                     );
+                    // Remove the pre-mark so it doesn't look extracted.
+                    if let Some(sets) = self.extracted_sets.get_mut(&job_id) {
+                        sets.remove(&set_name);
+                    }
+                    // Fail the job.
+                    if let Some(state) = self.jobs.get_mut(&job_id) {
+                        state.status = JobStatus::Failed {
+                            error: e.clone(),
+                        };
+                        let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
+                            job_id,
+                            error: e,
+                        });
+                        self.record_job_history(job_id);
+                    }
+                }
+            },
+            ExtractionDone::Streaming {
+                job_id,
+                set_name,
+                member,
+                result,
+            } => {
+                // Clean up the streaming provider and its volume base offset.
+                let key = (job_id, set_name.clone());
+                self.streaming_providers.remove(&key);
+                self.streaming_volume_bases.remove(&key);
+
+                match result {
+                    Ok(bytes) => {
+                        info!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            member = %member,
+                            bytes,
+                            "streaming extraction complete"
+                        );
+                        // Re-trigger partial extraction for remaining members.
+                        self.try_partial_extraction(job_id).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            member = %member,
+                            error = %e,
+                            "streaming extraction failed"
+                        );
+                        // Still try remaining members — one failure shouldn't block others.
+                        self.try_partial_extraction(job_id).await;
+                    }
                 }
             },
         }

@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::io::{BufReader, BufWriter};
+use std::rc::Rc;
 
 use tracing::debug;
 
@@ -94,6 +96,9 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
+        // When HASHMAC is set, CRC/BLAKE2 values are HMAC-transformed and
+        // cannot be verified without HashKey from unrar's custom PBKDF2 chain.
+        let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
 
         // Report progress start.
         if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
@@ -124,16 +129,22 @@ impl RarArchive {
                     ),
                 })?;
 
-                // Optionally verify password against check data.
+                // Pre-check password using check_data if available.
+                // This catches wrong passwords before expensive decryption,
+                // and is the only detection mechanism for encrypted Store+HASHMAC
+                // (where CRC verification is skipped).
                 if let Some(ref check_data) = enc_info.check_data
                     && !crate::crypto::verify_password_check(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
                         check_data,
-                    ) {
-                        return Err(RarError::InvalidPassword);
-                    }
+                    )
+                {
+                    return Err(RarError::WrongPassword {
+                        member: fh.name.clone(),
+                    });
+                }
 
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
@@ -154,7 +165,7 @@ impl RarArchive {
         // Dispatch to decompressor.
         let output = match fh.compression.method {
             CompressionMethod::Store => {
-                let expected_crc = if options.verify {
+                let expected_crc = if options.verify && !skip_hash_verify {
                     fh.data_crc32
                 } else {
                     None
@@ -174,8 +185,8 @@ impl RarArchive {
                     )?
                 };
 
-                // Verify CRC32 of decompressed data.
-                if options.verify
+                // Verify CRC32 of decompressed data (skip if HASHMAC — CRC is HMAC-transformed).
+                if options.verify && !skip_hash_verify
                     && let Some(expected) = fh.data_crc32 {
                         let mut hasher = crc32fast::Hasher::new();
                         hasher.update(&decompressed);
@@ -198,8 +209,8 @@ impl RarArchive {
             p.on_member_progress(mi, output.len() as u64);
         }
 
-        // Verify BLAKE2sp hash if provided.
-        if options.verify
+        // Verify BLAKE2sp hash if provided (skip if HASHMAC — hash is HMAC-transformed).
+        if options.verify && !skip_hash_verify
             && let Some(FileHash::Blake2sp(expected)) = hash.as_ref()
                 && !extract::verify_blake2(&output, expected) {
                     return Err(RarError::Blake2Mismatch {
@@ -258,6 +269,7 @@ impl RarArchive {
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
         let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
 
         if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
             p.on_member_start(mi);
@@ -385,9 +397,10 @@ impl RarArchive {
                     detail: format!("member {} is marked encrypted but has no encryption parameters", fh.name),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data) {
-                        return Err(RarError::InvalidPassword);
-                    }
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data)
+                {
+                    return Err(RarError::WrongPassword { member: fh.name.clone() });
+                }
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
@@ -405,7 +418,7 @@ impl RarArchive {
         if is_solid {
             // Solid archives need the full Vec path since the decoder state persists.
             let decompressed = self.decompress_solid(index, &compressed, unpacked_size, &fh)?;
-            if options.verify
+            if options.verify && !skip_hash_verify
                 && let Some(expected) = fh.data_crc32 {
                     let mut hasher = crc32fast::Hasher::new();
                     hasher.update(&decompressed);
@@ -421,7 +434,7 @@ impl RarArchive {
             writer.write_all(&decompressed).map_err(RarError::Io)?;
             writer.flush().map_err(RarError::Io)?;
 
-            if options.verify
+            if options.verify && !skip_hash_verify
                 && let Some(FileHash::Blake2sp(expected)) = hash.as_ref()
                     && !extract::verify_blake2(&decompressed, expected) {
                         return Err(RarError::Blake2Mismatch { member: fh.name.clone() });
@@ -436,8 +449,9 @@ impl RarArchive {
 
         // Non-solid: stream decompressed output to writer.
         // For CRC verification, we wrap the writer in a hasher.
-        let mut crc_writer = CrcWriter::new(&mut writer, options.verify);
-        let expected_crc = if options.verify { fh.data_crc32 } else { None };
+        let do_crc = options.verify && !skip_hash_verify;
+        let mut crc_writer = CrcWriter::new(&mut writer, do_crc);
+        let expected_crc = if do_crc { fh.data_crc32 } else { None };
 
         crate::decompress::decompress_to_writer(
             &compressed,
@@ -453,7 +467,7 @@ impl RarArchive {
         crc_writer.flush().map_err(RarError::Io)?;
 
         // Verify CRC from streaming hasher.
-        if let Some(expected) = fh.data_crc32.filter(|_| options.verify) {
+        if let Some(expected) = fh.data_crc32.filter(|_| do_crc) {
             let actual = crc_writer.finalize_crc();
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
@@ -614,14 +628,12 @@ impl RarArchive {
         let rar4_salt = entry.rar4_salt;
         let unpacked_size = fh.unpacked_size.unwrap_or(0);
 
-        // Solid archives need sequential member state — can't stream.
         if is_solid {
             return Err(RarError::CorruptArchive {
                 detail: "streaming extraction not supported for solid archives".into(),
             });
         }
 
-        // Resolve password if encrypted.
         let member_password = if is_encrypted {
             let pwd = options
                 .password
@@ -635,36 +647,70 @@ impl RarArchive {
             None
         };
 
-        let segments = entry.segments.clone();
-        let mut sorted_segs = segments;
+        // For LZ, we need all compressed data before decompression.
+        // ChainedSegmentReader with continuation discovers volumes on demand.
+        if fh.compression.method != CompressionMethod::Store {
+            let entry = &self.members[index];
+            let split_after = entry.file_header.split_after;
+            let mut sorted_segs = entry.segments.clone();
+            sorted_segs.sort_by_key(|s| s.volume_index);
+            // Normalize volume indices to 0-based for the provider.
+            // Archive segments use absolute volume numbers (from main header),
+            // but the streaming provider uses 0-based local indices.
+            let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
+            for seg in &mut sorted_segs {
+                seg.volume_index -= vol_base;
+            }
+
+            debug!(
+                member = %fh.name,
+                method = ?fh.compression.method,
+                segments = sorted_segs.len(),
+                split_after,
+                unpacked_size,
+                "streaming LZ extraction starting"
+            );
+
+            return self.extract_member_streaming_lz(
+                &fh, options, provider, &sorted_segs, unpacked_size, writer,
+                member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
+                split_after,
+            );
+        }
+
+        // Store mode: stream through ChainedSegmentReader with on-demand volume discovery.
+        // One continuous reader → one DecryptingReader → maintains AES-CBC state across volumes.
+        let entry = &self.members[index];
+        let split_after = entry.file_header.split_after;
+        let mut sorted_segs = entry.segments.clone();
         sorted_segs.sort_by_key(|s| s.volume_index);
+        // Normalize volume indices to 0-based (see LZ path comment above).
+        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
+        for seg in &mut sorted_segs {
+            seg.volume_index -= vol_base;
+        }
 
         debug!(
             member = %fh.name,
-            method = ?fh.compression.method,
             encrypted = is_encrypted,
             segments = sorted_segs.len(),
+            split_after,
             unpacked_size,
-            "streaming extraction starting"
+            "streaming Store extraction starting"
         );
 
-        match fh.compression.method {
-            CompressionMethod::Store => {
-                self.extract_member_streaming_store(
-                    &fh, options, provider, &sorted_segs, unpacked_size, writer,
-                    member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
-                )
-            }
-            _ => {
-                self.extract_member_streaming_lz(
-                    &fh, options, provider, &sorted_segs, unpacked_size, writer,
-                    member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
-                )
-            }
-        }
+        self.extract_member_streaming_store(
+            &fh, options, provider, &sorted_segs, unpacked_size, writer,
+            member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
+            split_after,
+        )
     }
 
     /// Streaming extraction for Store (uncompressed) members.
+    ///
+    /// Uses `ChainedSegmentReader` with on-demand volume discovery. A single
+    /// `DecryptingReader` wraps the entire stream, maintaining continuous
+    /// AES-CBC state across volume boundaries.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_store<W: Write>(
         &self,
@@ -677,11 +723,16 @@ impl RarArchive {
         password: Option<&str>,
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
+        split_after: bool,
     ) -> RarResult<u64> {
-        let chained = ChainedSegmentReader::new(segments, provider);
+        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let chained = ChainedSegmentReader::new(segments, provider)
+            .with_continuation(split_after, self.format, self.password.clone())
+            .with_metadata_sink(Rc::clone(&cont_meta));
+        let skip_hash_verify = file_encryption.is_some_and(|fe| fe.use_hash_mac);
 
         // Wrap in DecryptingReader if encrypted, otherwise read directly.
-        let mut hasher = if options.verify {
+        let mut hasher = if options.verify && !skip_hash_verify {
             Some(crc32fast::Hasher::new())
         } else {
             None
@@ -710,6 +761,11 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data)
+                {
+                    return Err(RarError::WrongPassword { member: fh.name.clone() });
+                }
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
             }
@@ -735,9 +791,16 @@ impl RarArchive {
 
         writer.flush().map_err(RarError::Io)?;
 
-        // Verify CRC32.
+        // Use final volume's CRC and HMAC flag if continuations were discovered.
+        let final_meta = cont_meta.borrow();
+        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_skip_hash = final_meta.use_hash_mac;
+        drop(final_meta);
+
+        // Verify CRC32 (skip if final volume uses HMAC-transformed hashes).
         if let Some(h) = hasher
-            && let Some(expected) = fh.data_crc32 {
+            && !final_skip_hash
+            && let Some(expected) = effective_crc {
                 let actual = h.finalize();
                 if actual != expected {
                     return Err(RarError::DataCrcMismatch {
@@ -753,9 +816,9 @@ impl RarArchive {
 
     /// Streaming extraction for LZ-compressed (non-solid) members.
     ///
-    /// Uses a `ChainedSegmentReader` to provide the compressed bitstream to the
-    /// LZ decompressor, which may block on the `VolumeProvider` when it needs
-    /// the next volume. For encrypted members, wraps in `DecryptingReader`.
+    /// Uses a `ChainedSegmentReader` with on-demand volume discovery to provide
+    /// the compressed bitstream. Volumes are fetched as the decompressor consumes
+    /// data. For encrypted members, wraps in `DecryptingReader`.
     #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz<W: Write>(
         &self,
@@ -768,10 +831,15 @@ impl RarArchive {
         password: Option<&str>,
         file_encryption: Option<&FileEncryptionInfo>,
         rar4_salt: Option<[u8; 8]>,
+        split_after: bool,
     ) -> RarResult<u64> {
+        let skip_hash_verify = file_encryption.is_some_and(|fe| fe.use_hash_mac);
         // Read all compressed data through the chained reader.
         // The ChainedSegmentReader blocks on the VolumeProvider as needed.
-        let chained = ChainedSegmentReader::new(segments, provider);
+        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let chained = ChainedSegmentReader::new(segments, provider)
+            .with_continuation(split_after, self.format, self.password.clone())
+            .with_metadata_sink(Rc::clone(&cont_meta));
 
         // Wrap in DecryptingReader if encrypted.
         let inner: Box<dyn Read> = if let Some(pwd) = password {
@@ -791,6 +859,11 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data)
+                {
+                    return Err(RarError::WrongPassword { member: fh.name.clone() });
+                }
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
             }
@@ -811,7 +884,8 @@ impl RarArchive {
         );
 
         // Stream decompressed output through a CRC writer.
-        let mut crc_writer = CrcWriter::new(writer, options.verify);
+        let do_crc = options.verify && !skip_hash_verify;
+        let mut crc_writer = CrcWriter::new(writer, do_crc);
 
         crate::decompress::decompress_to_writer(
             &compressed,
@@ -823,8 +897,14 @@ impl RarArchive {
 
         crc_writer.flush().map_err(RarError::Io)?;
 
-        // Verify CRC32.
-        if let Some(expected) = fh.data_crc32.filter(|_| options.verify) {
+        // Use final volume's CRC and HMAC flag if continuations were discovered.
+        let final_meta = cont_meta.borrow();
+        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_skip_hash = final_meta.use_hash_mac;
+        drop(final_meta);
+
+        // Verify CRC32 (skip if final volume uses HMAC-transformed hashes).
+        if let Some(expected) = effective_crc.filter(|_| do_crc && !final_skip_hash) {
             let actual = crc_writer.finalize_crc();
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
@@ -839,32 +919,88 @@ impl RarArchive {
     }
 }
 
+/// Metadata captured from continuation headers discovered during streaming.
+///
+/// As `ChainedSegmentReader` discovers continuation volumes, it updates
+/// this with the latest header's CRC and encryption flags. After all
+/// segments are consumed, the values here are from the final volume —
+/// which is authoritative for whole-file CRC verification.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ContinuationMetadata {
+    /// CRC32 from the most recently discovered continuation header.
+    data_crc32: Option<u32>,
+    /// Whether the most recently discovered continuation has HASHMAC set.
+    use_hash_mac: bool,
+}
+
 /// A `Read` adapter that chains data segments across volumes.
 ///
 /// When the current segment is exhausted, it fetches the next volume from the
 /// `VolumeProvider` — which may block if that volume hasn't finished downloading.
+///
+/// If `split_after` is true, when all known segments are consumed it will
+/// fetch the next volume from the provider, parse its headers to discover
+/// the continuation segment, and keep reading. This enables incremental
+/// extraction — bytes flow to the output as each volume arrives.
 pub struct ChainedSegmentReader<'a> {
-    segments: &'a [DataSegment],
+    segments: Vec<DataSegment>,
     provider: &'a dyn VolumeProvider,
     current_seg: usize,
     current_reader: Option<Box<dyn ReadSeek>>,
     remaining_in_segment: u64,
+    /// Whether the member continues into more volumes.
+    split_after: bool,
+    /// Next volume index to discover.
+    next_discover_vol: usize,
+    /// Archive format (needed to parse continuation headers).
+    format: ArchiveFormat,
+    /// Password for encrypted header parsing.
+    password: Option<String>,
+    /// Shared metadata sink updated when continuation headers are discovered.
+    /// The caller holds an Rc clone to read final values after streaming.
+    metadata_sink: Option<Rc<RefCell<ContinuationMetadata>>>,
 }
 
 impl<'a> ChainedSegmentReader<'a> {
-    pub fn new(segments: &'a [DataSegment], provider: &'a dyn VolumeProvider) -> Self {
+    pub fn new(segments: &[DataSegment], provider: &'a dyn VolumeProvider) -> Self {
+        let next_vol = segments.iter().map(|s| s.volume_index).max().unwrap_or(0) + 1;
         Self {
-            segments,
+            segments: segments.to_vec(),
             provider,
             current_seg: 0,
             current_reader: None,
             remaining_in_segment: 0,
+            split_after: false,
+            next_discover_vol: next_vol,
+            format: ArchiveFormat::Rar5,
+            password: None,
+            metadata_sink: None,
         }
+    }
+
+    /// Enable on-demand volume discovery for multi-volume members.
+    pub fn with_continuation(mut self, split_after: bool, format: ArchiveFormat, password: Option<String>) -> Self {
+        self.split_after = split_after;
+        self.format = format;
+        self.password = password;
+        self
+    }
+
+    /// Attach a metadata sink that receives CRC/encryption info from continuation headers.
+    pub fn with_metadata_sink(mut self, sink: Rc<RefCell<ContinuationMetadata>>) -> Self {
+        self.metadata_sink = Some(sink);
+        self
     }
 
     fn advance_segment(&mut self) -> std::io::Result<bool> {
         if self.current_seg >= self.segments.len() {
-            return Ok(false);
+            if !self.split_after {
+                return Ok(false);
+            }
+            // Discover the next volume's continuation segment.
+            if !self.discover_next_segment()? {
+                return Ok(false);
+            }
         }
 
         let seg = &self.segments[self.current_seg];
@@ -878,6 +1014,70 @@ impl<'a> ChainedSegmentReader<'a> {
         self.remaining_in_segment = seg.data_size;
         self.current_seg += 1;
         Ok(true)
+    }
+
+    /// Fetch the next volume, parse its headers, and extract the continuation segment.
+    fn discover_next_segment(&mut self) -> std::io::Result<bool> {
+        let vol_idx = self.next_discover_vol;
+        let mut reader = self.provider.get_volume(vol_idx).map_err(|e| {
+            std::io::Error::other(format!("volume {vol_idx}: {e}"))
+        })?;
+
+        reader.seek(SeekFrom::Start(0)).map_err(std::io::Error::other)?;
+        let format = crate::signature::read_signature(&mut reader)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if format == ArchiveFormat::Rar4 {
+            // RAR4: parse headers to find the continuation file entry.
+            let parsed = crate::rar4::parse_rar4_headers(&mut reader)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Find the first file with split_before (continuation).
+            for fh in &parsed.files {
+                if fh.split_before {
+                    self.segments.push(DataSegment {
+                        volume_index: vol_idx,
+                        data_offset: fh.data_offset,
+                        data_size: fh.packed_size,
+                    });
+                    self.split_after = fh.split_after;
+                    self.next_discover_vol = vol_idx + 1;
+                    if let Some(ref sink) = self.metadata_sink {
+                        let mut meta = sink.borrow_mut();
+                        meta.data_crc32 = Some(fh.crc32);
+                        meta.use_hash_mac = false; // RAR4 has no HMAC
+                    }
+                    return Ok(true);
+                }
+            }
+        } else {
+            // RAR5: parse headers.
+            let parsed = crate::header::parse_all_headers(&mut reader, self.password.as_deref())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Find the first file header with split_before.
+            for pf in &parsed.files {
+                if pf.header.split_before {
+                    self.segments.push(DataSegment {
+                        volume_index: vol_idx,
+                        data_offset: pf.header.data_offset,
+                        data_size: pf.header.data_size,
+                    });
+                    self.split_after = pf.header.split_after;
+                    self.next_discover_vol = vol_idx + 1;
+                    if let Some(ref sink) = self.metadata_sink {
+                        let mut meta = sink.borrow_mut();
+                        meta.data_crc32 = pf.header.data_crc32;
+                        meta.use_hash_mac = pf.file_encryption
+                            .as_ref()
+                            .is_some_and(|fe| fe.use_hash_mac);
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+
+        // No continuation found — member is complete.
+        self.split_after = false;
+        Ok(false)
     }
 }
 
