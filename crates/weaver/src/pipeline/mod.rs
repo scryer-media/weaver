@@ -61,6 +61,22 @@ pub(super) struct ProbeUpdate {
     pub(super) done: bool,
 }
 
+/// Result of a background extraction task.
+pub(super) enum ExtractionDone {
+    /// Batch extraction of specific members completed.
+    Batch {
+        job_id: JobId,
+        set_name: String,
+        extracted: Result<Vec<String>, String>,
+    },
+    /// Full set extraction completed (completion stage).
+    FullSet {
+        job_id: JobId,
+        set_name: String,
+        result: Result<u32, String>,
+    },
+}
+
 /// Result of a decode task.
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
@@ -114,6 +130,9 @@ pub struct Pipeline {
     /// Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,
+    /// Channel for background extraction results.
+    pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
+    pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// Bandwidth rate limiter.
@@ -176,6 +195,7 @@ impl Pipeline {
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
+        let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
 
         Ok(Self {
             cmd_rx,
@@ -200,6 +220,8 @@ impl Pipeline {
             retry_rx,
             probe_result_tx,
             probe_result_rx,
+            extract_done_tx,
+            extract_done_rx,
             global_paused: false,
             connection_ramp: total_connections.min(5),
             rate_limiter: TokenBucket::new(0),
@@ -228,6 +250,19 @@ impl Pipeline {
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
 
+            // Drain all pending commands first to prevent starvation from
+            // high-throughput download/decode events.
+            loop {
+                match self.cmd_rx.try_recv() {
+                    Ok(SchedulerCommand::Shutdown) => {
+                        info!("pipeline shutting down");
+                        return;
+                    }
+                    Ok(cmd) => self.handle_command(cmd).await,
+                    Err(_) => break,
+                }
+            }
+
             tokio::select! {
                 // Commands from the SchedulerHandle.
                 cmd = self.cmd_rx.recv() => {
@@ -253,6 +288,11 @@ impl Pipeline {
                 // Health probe completed — check if job should be failed.
                 Some(update) = self.probe_result_rx.recv() => {
                     self.handle_probe_update(update);
+                }
+
+                // Background extraction completed.
+                Some(done) = self.extract_done_rx.recv() => {
+                    self.handle_extraction_done(done).await;
                 }
 
                 // Delayed retries arriving after backoff sleep.

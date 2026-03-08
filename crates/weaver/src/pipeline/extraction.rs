@@ -449,98 +449,145 @@ impl Pipeline {
             let event_tx = self.event_tx.clone();
             let members_to_extract = new_extractable.clone();
 
-            let extract_result = tokio::task::spawn_blocking(move || {
-                if volume_paths.is_empty() {
-                    return Err("no complete RAR volumes".to_string());
-                }
+            // Pre-mark members as being extracted so we don't re-trigger.
+            let already = self.extracted_members.entry(job_id).or_default();
+            for name in &new_extractable {
+                already.insert(name.clone());
+            }
 
-                let first_file = std::fs::File::open(&volume_paths[0])
-                    .map_err(|e| format!("failed to open first volume: {e}"))?;
-                let mut archive = if let Some(ref pw) = password {
-                    weaver_rar::RarArchive::open_with_password(first_file, pw)
-                } else {
-                    weaver_rar::RarArchive::open(first_file)
-                }
-                .map_err(|e| format!("failed to open RAR archive: {e}"))?;
+            let extract_done_tx = self.extract_done_tx.clone();
+            let set_name_owned = set_name.clone();
+            tokio::task::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    if volume_paths.is_empty() {
+                        return Err("no complete RAR volumes".to_string());
+                    }
 
-                for (i, path) in volume_paths.iter().enumerate().skip(1) {
-                    let vol_file = std::fs::File::open(path)
-                        .map_err(|e| format!("failed to open volume {i}: {e}"))?;
-                    archive
-                        .add_volume(i, Box::new(vol_file))
-                        .map_err(|e| format!("failed to add volume {i}: {e}"))?;
-                }
+                    let first_file = std::fs::File::open(&volume_paths[0])
+                        .map_err(|e| format!("failed to open first volume: {e}"))?;
+                    let mut archive = if let Some(ref pw) = password {
+                        weaver_rar::RarArchive::open_with_password(first_file, pw)
+                    } else {
+                        weaver_rar::RarArchive::open(first_file)
+                    }
+                    .map_err(|e| format!("failed to open RAR archive: {e}"))?;
 
-                let meta = archive.metadata();
-                let options = weaver_rar::ExtractOptions {
-                    verify: true,
-                    password: password.clone(),
-                };
+                    for (i, path) in volume_paths.iter().enumerate().skip(1) {
+                        let vol_file = std::fs::File::open(path)
+                            .map_err(|e| format!("failed to open volume {i}: {e}"))?;
+                        archive
+                            .add_volume(i, Box::new(vol_file))
+                            .map_err(|e| format!("failed to add volume {i}: {e}"))?;
+                    }
 
-                let mut extracted = Vec::new();
-                for member_name in &members_to_extract {
-                    let idx =
-                        match meta.members.iter().position(|m| &m.name == member_name)
-                        {
-                            Some(i) => i,
-                            None => continue,
-                        };
-                    let member = &meta.members[idx];
-                    if member.is_directory {
-                        let dir_path = output_dir.join(&member.name);
-                        std::fs::create_dir_all(&dir_path).map_err(|e| {
-                            format!("failed to create dir {}: {e}", member.name)
-                        })?;
+                    let meta = archive.metadata();
+                    let options = weaver_rar::ExtractOptions {
+                        verify: true,
+                        password: password.clone(),
+                    };
+
+                    let mut extracted = Vec::new();
+                    for member_name in &members_to_extract {
+                        let idx =
+                            match meta.members.iter().position(|m| &m.name == member_name)
+                            {
+                                Some(i) => i,
+                                None => continue,
+                            };
+                        let member = &meta.members[idx];
+                        if member.is_directory {
+                            let dir_path = output_dir.join(&member.name);
+                            std::fs::create_dir_all(&dir_path).map_err(|e| {
+                                format!("failed to create dir {}: {e}", member.name)
+                            })?;
+                            extracted.push(member_name.clone());
+                            continue;
+                        }
+
+                        let out_path = output_dir.join(&member.name);
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| format!("failed to create parent dir: {e}"))?;
+                        }
+                        let bytes_written = archive
+                            .extract_member_to_file(idx, &options, None, &out_path)
+                            .map_err(|e| {
+                                format!("failed to extract {}: {e}", member.name)
+                            })?;
+
+                        let _ = event_tx.send(PipelineEvent::ExtractionProgress {
+                            job_id,
+                            member: member.name.clone(),
+                            bytes_written,
+                            total_bytes: member.unpacked_size.unwrap_or(0),
+                        });
+
                         extracted.push(member_name.clone());
-                        continue;
                     }
 
-                    let out_path = output_dir.join(&member.name);
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("failed to create parent dir: {e}"))?;
-                    }
-                    let bytes_written = archive
-                        .extract_member_to_file(idx, &options, None, &out_path)
-                        .map_err(|e| {
-                            format!("failed to extract {}: {e}", member.name)
-                        })?;
+                    Ok(extracted)
+                })
+                .await;
 
-                    let _ = event_tx.send(PipelineEvent::ExtractionProgress {
-                        job_id,
-                        member: member.name.clone(),
-                        bytes_written,
-                        total_bytes: member.unpacked_size.unwrap_or(0),
-                    });
+                let extracted = match result {
+                    Ok(r) => r,
+                    Err(e) => Err(format!("extraction task panicked: {e}")),
+                };
+                let _ = extract_done_tx.send(ExtractionDone::Batch {
+                    job_id,
+                    set_name: set_name_owned,
+                    extracted,
+                }).await;
+            });
+        }
+    }
 
-                    extracted.push(member_name.clone());
-                }
-
-                Ok(extracted)
-            })
-            .await;
-
-            match extract_result {
-                Ok(Ok(extracted)) => {
-                    let already = self.extracted_members.get_mut(&job_id).unwrap();
-                    for name in &extracted {
+    /// Handle a completed background extraction task.
+    pub(super) async fn handle_extraction_done(&mut self, done: ExtractionDone) {
+        match done {
+            ExtractionDone::Batch {
+                job_id,
+                set_name,
+                extracted,
+            } => match extracted {
+                Ok(names) => {
+                    for name in &names {
                         info!(job_id = job_id.0, set_name = %set_name, member = %name, "batch extraction: member extracted");
-                        already.insert(name.clone());
                     }
+                    // Members were pre-marked; check completion.
+                    self.check_job_completion(job_id).await;
+                }
+                Err(e) => {
+                    warn!(job_id = job_id.0, set_name = %set_name, error = %e, "batch extraction failed");
+                }
+            },
+            ExtractionDone::FullSet {
+                job_id,
+                set_name,
+                result,
+            } => match result {
+                Ok(count) => {
                     info!(
                         job_id = job_id.0,
                         set_name = %set_name,
-                        extracted_count = already.len(),
-                        "batch extraction progress"
+                        members = count,
+                        "set extraction complete"
                     );
-                }
-                Ok(Err(e)) => {
-                    warn!(job_id = job_id.0, set_name = %set_name, error = %e, "batch extraction failed");
+                    self.extracted_sets
+                        .entry(job_id)
+                        .or_default()
+                        .insert(set_name);
+                    self.check_job_completion(job_id).await;
                 }
                 Err(e) => {
-                    warn!(job_id = job_id.0, set_name = %set_name, error = %e, "batch extraction task panicked");
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error = %e,
+                        "set extraction failed"
+                    );
                 }
-            }
+            },
         }
     }
 }

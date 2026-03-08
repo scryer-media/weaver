@@ -582,76 +582,87 @@ impl Pipeline {
             .cloned()
             .unwrap_or_default();
 
-        let extract_result = tokio::task::spawn_blocking(move || {
-            if volume_paths.is_empty() {
-                return Err("no RAR volumes found".to_string());
-            }
+        let extract_done_tx = self.extract_done_tx.clone();
+        let set_name_owned = set_name.to_string();
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                if volume_paths.is_empty() {
+                    return Err("no RAR volumes found".to_string());
+                }
 
-            let first_file = std::fs::File::open(&volume_paths[0])
-                .map_err(|e| format!("failed to open first volume: {e}"))?;
-            let mut archive = if let Some(ref pw) = password {
-                weaver_rar::RarArchive::open_with_password(first_file, pw)
-            } else {
-                weaver_rar::RarArchive::open(first_file)
-            }
-            .map_err(|e| format!("failed to open RAR archive: {e}"))?;
+                let first_file = std::fs::File::open(&volume_paths[0])
+                    .map_err(|e| format!("failed to open first volume: {e}"))?;
+                let mut archive = if let Some(ref pw) = password {
+                    weaver_rar::RarArchive::open_with_password(first_file, pw)
+                } else {
+                    weaver_rar::RarArchive::open(first_file)
+                }
+                .map_err(|e| format!("failed to open RAR archive: {e}"))?;
 
-            for (i, path) in volume_paths.iter().enumerate().skip(1) {
-                let vol_file = std::fs::File::open(path)
-                    .map_err(|e| format!("failed to open volume {i}: {e}"))?;
-                archive
-                    .add_volume(i, Box::new(vol_file))
-                    .map_err(|e| format!("failed to add volume {i}: {e}"))?;
-            }
+                for (i, path) in volume_paths.iter().enumerate().skip(1) {
+                    let vol_file = std::fs::File::open(path)
+                        .map_err(|e| format!("failed to open volume {i}: {e}"))?;
+                    archive
+                        .add_volume(i, Box::new(vol_file))
+                        .map_err(|e| format!("failed to add volume {i}: {e}"))?;
+                }
 
-            let meta = archive.metadata();
-            let options = weaver_rar::ExtractOptions {
-                verify: true,
-                password: password.clone(),
-            };
+                let meta = archive.metadata();
+                let options = weaver_rar::ExtractOptions {
+                    verify: true,
+                    password: password.clone(),
+                };
 
-            let mut extracted_count = 0u32;
-            for (idx, member) in meta.members.iter().enumerate() {
-                if already_extracted.contains(&member.name) {
+                let mut extracted_count = 0u32;
+                for (idx, member) in meta.members.iter().enumerate() {
+                    if already_extracted.contains(&member.name) {
+                        extracted_count += 1;
+                        continue;
+                    }
+
+                    if member.is_directory {
+                        let dir_path = output_dir.join(&member.name);
+                        std::fs::create_dir_all(&dir_path)
+                            .map_err(|e| format!("failed to create dir {}: {e}", member.name))?;
+                        continue;
+                    }
+
+                    let out_path = output_dir.join(&member.name);
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("failed to create parent dir: {e}"))?;
+                    }
+                    let bytes_written = archive
+                        .extract_member_to_file(idx, &options, None, &out_path)
+                        .map_err(|e| format!("failed to extract {}: {e}", member.name))?;
+
+                    let _ = event_tx.send(PipelineEvent::ExtractionProgress {
+                        job_id,
+                        member: member.name.clone(),
+                        bytes_written,
+                        total_bytes: member.unpacked_size.unwrap_or(0),
+                    });
+
                     extracted_count += 1;
-                    continue;
                 }
 
-                if member.is_directory {
-                    let dir_path = output_dir.join(&member.name);
-                    std::fs::create_dir_all(&dir_path)
-                        .map_err(|e| format!("failed to create dir {}: {e}", member.name))?;
-                    continue;
-                }
+                Ok(extracted_count)
+            })
+            .await;
 
-                let out_path = output_dir.join(&member.name);
-                if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("failed to create parent dir: {e}"))?;
-                }
-                let bytes_written = archive
-                    .extract_member_to_file(idx, &options, None, &out_path)
-                    .map_err(|e| format!("failed to extract {}: {e}", member.name))?;
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => Err(format!("extraction task panicked: {e}")),
+            };
+            let _ = extract_done_tx.send(ExtractionDone::FullSet {
+                job_id,
+                set_name: set_name_owned,
+                result,
+            }).await;
+        });
 
-                let _ = event_tx.send(PipelineEvent::ExtractionProgress {
-                    job_id,
-                    member: member.name.clone(),
-                    bytes_written,
-                    total_bytes: member.unpacked_size.unwrap_or(0),
-                });
-
-                extracted_count += 1;
-            }
-
-            Ok(extracted_count)
-        })
-        .await;
-
-        match extract_result {
-            Ok(Ok(count)) => Ok(count),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("extraction task panicked: {e}")),
-        }
+        // Return Ok(0) for now — actual result comes through the channel.
+        Ok(0)
     }
 
     /// Extract a single 7z archive set. Only collects files belonging to the named set.
@@ -681,83 +692,94 @@ impl Pipeline {
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
 
-        let extract_result = tokio::task::spawn_blocking(move || {
-            if file_paths.is_empty() {
-                return Err(format!("no 7z files found for set '{set_name_owned}'"));
-            }
+        let extract_done_tx = self.extract_done_tx.clone();
+        let set_name_for_channel = set_name.to_string();
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                if file_paths.is_empty() {
+                    return Err(format!("no 7z files found for set '{set_name_owned}'"));
+                }
 
-            let pw = if let Some(ref p) = password {
-                sevenz_rust2::Password::new(p)
-            } else {
-                sevenz_rust2::Password::empty()
-            };
-
-            let mut extracted_count = 0u32;
-            let extracted_count_ref = &mut extracted_count;
-            let event_tx_ref = &event_tx;
-            let output_dir_ref = &output_dir;
-
-            let extract_fn =
-                |entry: &sevenz_rust2::ArchiveEntry,
-                 reader: &mut dyn std::io::Read,
-                 _dest: &PathBuf|
-                 -> Result<bool, sevenz_rust2::Error> {
-                    if entry.is_directory() {
-                        let dir_path = output_dir_ref.join(entry.name());
-                        std::fs::create_dir_all(&dir_path)?;
-                        return Ok(true);
-                    }
-
-                    let out_path = output_dir_ref.join(entry.name());
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    let mut file = std::fs::File::create(&out_path)?;
-                    let bytes_written = std::io::copy(reader, &mut file)?;
-
-                    let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-                        job_id,
-                        member: entry.name().to_string(),
-                        bytes_written,
-                        total_bytes: entry.size(),
-                    });
-
-                    *extracted_count_ref += 1;
-                    Ok(true)
+                let pw = if let Some(ref p) = password {
+                    sevenz_rust2::Password::new(p)
+                } else {
+                    sevenz_rust2::Password::empty()
                 };
 
-            if file_paths.len() == 1 {
-                let file = std::fs::File::open(&file_paths[0])
-                    .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                sevenz_rust2::decompress_with_extract_fn_and_password(
-                    file,
-                    &output_dir,
-                    pw,
-                    extract_fn,
-                )
-                .map_err(|e| format!("7z extraction failed: {e}"))?;
-            } else {
-                let reader =
-                    weaver_core::split_reader::SplitFileReader::open(&file_paths)
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                sevenz_rust2::decompress_with_extract_fn_and_password(
-                    reader,
-                    &output_dir,
-                    pw,
-                    extract_fn,
-                )
-                .map_err(|e| format!("7z extraction failed: {e}"))?;
-            }
+                let mut extracted_count = 0u32;
+                let extracted_count_ref = &mut extracted_count;
+                let event_tx_ref = &event_tx;
+                let output_dir_ref = &output_dir;
 
-            Ok(extracted_count)
-        })
-        .await;
+                let extract_fn =
+                    |entry: &sevenz_rust2::ArchiveEntry,
+                     reader: &mut dyn std::io::Read,
+                     _dest: &PathBuf|
+                     -> Result<bool, sevenz_rust2::Error> {
+                        if entry.is_directory() {
+                            let dir_path = output_dir_ref.join(entry.name());
+                            std::fs::create_dir_all(&dir_path)?;
+                            return Ok(true);
+                        }
 
-        match extract_result {
-            Ok(Ok(count)) => Ok(count),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("7z extraction task panicked: {e}")),
-        }
+                        let out_path = output_dir_ref.join(entry.name());
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+
+                        let mut file = std::fs::File::create(&out_path)?;
+                        let bytes_written = std::io::copy(reader, &mut file)?;
+
+                        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
+                            job_id,
+                            member: entry.name().to_string(),
+                            bytes_written,
+                            total_bytes: entry.size(),
+                        });
+
+                        *extracted_count_ref += 1;
+                        Ok(true)
+                    };
+
+                if file_paths.len() == 1 {
+                    let file = std::fs::File::open(&file_paths[0])
+                        .map_err(|e| format!("failed to open 7z file: {e}"))?;
+                    sevenz_rust2::decompress_with_extract_fn_and_password(
+                        file,
+                        &output_dir,
+                        pw,
+                        extract_fn,
+                    )
+                    .map_err(|e| format!("7z extraction failed: {e}"))?;
+                } else {
+                    let reader =
+                        weaver_core::split_reader::SplitFileReader::open(&file_paths)
+                            .map_err(|e| format!("failed to open 7z split files: {e}"))?;
+                    sevenz_rust2::decompress_with_extract_fn_and_password(
+                        reader,
+                        &output_dir,
+                        pw,
+                        extract_fn,
+                    )
+                    .map_err(|e| format!("7z extraction failed: {e}"))?;
+                }
+
+                Ok(extracted_count)
+            })
+            .await;
+
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => Err(format!("7z extraction task panicked: {e}")),
+            };
+            let _ = extract_done_tx.send(ExtractionDone::FullSet {
+                job_id,
+                set_name: set_name_for_channel,
+                result,
+            }).await;
+        });
+
+        // Return Ok(0) for now — actual result comes through the channel.
+        Ok(0)
     }
 }

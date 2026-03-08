@@ -45,9 +45,19 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 echo "==> Stopping existing weaver..."
+# Kill by process name patterns (covers both path forms and bare command).
+pkill -f 'weaver serve' 2>/dev/null || true
 pkill -f 'target/release/weaver' 2>/dev/null || true
 pkill -f 'target/debug/weaver' 2>/dev/null || true
+# Also kill anything holding port 9090 as a fallback.
+lsof -ti:9090 | xargs kill 2>/dev/null || true
 sleep 1
+# Verify port is free — if something survived, force-kill it.
+if lsof -ti:9090 >/dev/null 2>&1; then
+    echo "    Port 9090 still in use, sending SIGKILL..."
+    lsof -ti:9090 | xargs kill -9 2>/dev/null || true
+    sleep 1
+fi
 
 echo "==> Cleaning old logs..."
 > "$LOG_FILE"
