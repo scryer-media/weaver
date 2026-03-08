@@ -1,6 +1,32 @@
 use super::*;
 
+/// Sanitize a job name into a safe directory name.
+/// Replaces dangerous characters, truncates to 200 chars, trims trailing dots/spaces.
+pub(super) fn sanitize_dirname(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | '?' | '*' | '|' | '"' | ':' => '_',
+            _ => c,
+        })
+        .take(200)
+        .collect();
+    sanitized.trim_end_matches(['.', ' ']).to_string()
+}
+
 impl Pipeline {
+    /// Compute the per-job working directory under intermediate_dir.
+    /// Uses `{sanitized_name}`, with `.#{job_id}` suffix on collision.
+    fn compute_working_dir(&self, job_id: JobId, name: &str) -> PathBuf {
+        let dir_name = sanitize_dirname(name);
+        let candidate = self.intermediate_dir.join(&dir_name);
+        if !candidate.exists() {
+            candidate
+        } else {
+            self.intermediate_dir.join(format!("{}.#{}", dir_name, job_id.0))
+        }
+    }
+
     /// Add a new job and populate the download queue.
     pub(super) async fn add_job(
         &mut self,
@@ -12,7 +38,16 @@ impl Pipeline {
             return Err(weaver_scheduler::SchedulerError::JobExists(job_id));
         }
 
-        // Write JobCreated to the journal for crash recovery.
+        // Create per-job working directory.
+        let working_dir = self.compute_working_dir(job_id, &spec.name);
+        tokio::fs::create_dir_all(&working_dir).await.map_err(|e| {
+            weaver_scheduler::SchedulerError::Other(format!(
+                "failed to create working dir {}: {e}",
+                working_dir.display()
+            ))
+        })?;
+
+        // Persist job creation to SQLite for crash recovery.
         let nzb_hash = {
             use sha2::{Sha256, Digest};
             let bytes = std::fs::read(&nzb_path).unwrap_or_default();
@@ -25,16 +60,16 @@ impl Pipeline {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Err(e) = self.journal.append(&JournalEntry::JobCreated {
+        if let Err(e) = self.db.create_active_job(&weaver_state::ActiveJob {
             job_id,
             nzb_hash,
             nzb_path,
-            output_dir: self.output_dir.clone(),
+            output_dir: working_dir.clone(),
             created_at,
             category: spec.category.clone(),
             metadata: spec.metadata.clone(),
-        }).await {
-            error!(error = %e, "journal write failed for JobCreated");
+        }) {
+            error!(error = %e, "db write failed for create_active_job");
         }
 
         // Create assembly and populate per-job download queues.
@@ -42,7 +77,7 @@ impl Pipeline {
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
 
         // Check available disk space and warn if insufficient.
-        check_disk_space(&self.output_dir, spec.total_bytes);
+        check_disk_space(&self.intermediate_dir, spec.total_bytes);
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 
@@ -59,6 +94,7 @@ impl Pipeline {
             status: JobStatus::Downloading,
             assembly,
             created_at: std::time::Instant::now(),
+            working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             failed_bytes: 0,
             health_probing: false,
@@ -72,6 +108,7 @@ impl Pipeline {
         info!(
             job_id = job_id.0,
             queue_depth,
+            working_dir = %working_dir.display(),
             "job added"
         );
         Ok(())
@@ -139,6 +176,197 @@ impl Pipeline {
         (assembly, download_queue, recovery_queue)
     }
 
+    /// Reprocess a failed job: rebuild assembly with all files complete,
+    /// reload metadata from disk, and re-run post-processing.
+    pub(super) async fn reprocess_job(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), weaver_scheduler::SchedulerError> {
+        // Check if job is in self.jobs (Case A) or only in history (Case B).
+        let in_jobs = self.jobs.contains_key(&job_id);
+
+        if in_jobs {
+            // Case A: job still in self.jobs — must be Failed.
+            let state = self.jobs.get(&job_id).unwrap();
+            if !matches!(state.status, JobStatus::Failed { .. }) {
+                return Err(weaver_scheduler::SchedulerError::Other(
+                    format!("job {} is not failed", job_id.0),
+                ));
+            }
+        } else {
+            // Case B: job only in history — rebuild from NZB on disk.
+            let history_entry = self.finished_jobs.iter().find(|j| j.job_id == job_id);
+            let Some(info) = history_entry else {
+                return Err(weaver_scheduler::SchedulerError::JobNotFound(job_id));
+            };
+            if !matches!(info.status, JobStatus::Failed { .. }) {
+                return Err(weaver_scheduler::SchedulerError::Other(
+                    format!("job {} is not failed", job_id.0),
+                ));
+            }
+
+            let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
+            let nzb_bytes = tokio::fs::read(&nzb_path).await.map_err(|e| {
+                weaver_scheduler::SchedulerError::Other(format!(
+                    "failed to read NZB for job {}: {e}",
+                    job_id.0
+                ))
+            })?;
+            let nzb = weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| {
+                weaver_scheduler::SchedulerError::Other(format!("failed to parse NZB: {e}"))
+            })?;
+
+            let spec = crate::import::nzb_to_spec(
+                &nzb,
+                &nzb_path,
+                info.category.clone(),
+                info.metadata.clone(),
+            );
+
+            // Reconstruct working_dir from history output_dir, or compute a new one.
+            let working_dir = info
+                .output_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.compute_working_dir(job_id, &spec.name));
+
+            // Build assembly with ALL segments in skip set (everything already on disk).
+            let all_segments = Self::all_segment_ids(job_id, &spec);
+            let (assembly, download_queue, recovery_queue) =
+                Self::build_job_assembly(job_id, &spec, &all_segments);
+
+            let state = JobState {
+                job_id,
+                spec,
+                status: JobStatus::Downloading,
+                assembly,
+                created_at: std::time::Instant::now(),
+                working_dir,
+                downloaded_bytes: info.downloaded_bytes,
+                failed_bytes: 0,
+                health_probing: false,
+                held_segments: Vec::new(),
+                download_queue,
+                recovery_queue,
+            };
+            self.jobs.insert(job_id, state);
+        }
+
+        // --- Common path for both cases ---
+
+        // For Case A, rebuild the assembly with all segments marked complete.
+        if in_jobs {
+            let state = self.jobs.get(&job_id).unwrap();
+            let all_segments = Self::all_segment_ids(job_id, &state.spec);
+            // Need to clone spec to avoid borrow conflict.
+            let spec_clone = state.spec.clone();
+            let (assembly, download_queue, recovery_queue) =
+                Self::build_job_assembly(job_id, &spec_clone, &all_segments);
+            let state = self.jobs.get_mut(&job_id).unwrap();
+            state.assembly = assembly;
+            state.status = JobStatus::Downloading;
+            state.download_queue = download_queue;
+            state.recovery_queue = recovery_queue;
+            state.held_segments.clear();
+            state.failed_bytes = 0;
+        }
+
+        // Remove old history entry.
+        self.finished_jobs.retain(|j| j.job_id != job_id);
+        let db = self.db.clone();
+        let jid = job_id.0;
+        tokio::task::spawn_blocking(move || {
+            let _ = db.delete_job_history(jid);
+        });
+
+        // Clear stale per-job caches from previous attempt.
+        self.par2_sets.remove(&job_id);
+        self.extracted_members.remove(&job_id);
+        self.extracted_sets.remove(&job_id);
+        self.streaming_providers.retain(|(jid, _), _| *jid != job_id);
+        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+
+        // Add to job_order so it shows as active.
+        if !self.job_order.contains(&job_id) {
+            self.job_order.push(job_id);
+        }
+
+        let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
+
+        info!(job_id = job_id.0, "reprocessing failed job");
+
+        // Reload metadata from disk files, then trigger post-processing.
+        self.reload_metadata_from_disk(job_id).await;
+        self.check_job_completion(job_id).await;
+
+        Ok(())
+    }
+
+    /// Reload PAR2 and RAR metadata from on-disk files for a reprocessed job.
+    async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
+        // Collect file IDs and roles to avoid borrow conflicts.
+        let files: Vec<(NzbFileId, weaver_core::classify::FileRole)> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            state
+                .assembly
+                .files()
+                .map(|f| (f.file_id(), f.role().clone()))
+                .collect()
+        };
+
+        // Load PAR2 index files first (needed before recovery volumes).
+        for (file_id, role) in &files {
+            if matches!(role, weaver_core::classify::FileRole::Par2 { is_index: true, .. }) {
+                self.try_load_par2_metadata(job_id, *file_id).await;
+            }
+        }
+
+        // Merge PAR2 recovery volumes.
+        for (file_id, role) in &files {
+            if matches!(role, weaver_core::classify::FileRole::Par2 { is_index: false, .. }) {
+                self.try_merge_par2_recovery(job_id, *file_id).await;
+            }
+        }
+
+        // Load archive topology from RAR volume 0.
+        for (file_id, role) in &files {
+            if matches!(role, weaver_core::classify::FileRole::RarVolume { .. }) {
+                self.try_update_archive_topology(job_id, *file_id).await;
+            }
+        }
+
+        // Load 7z topology from completed 7z files.
+        for (file_id, role) in &files {
+            if matches!(
+                role,
+                weaver_core::classify::FileRole::SevenZipArchive
+                    | weaver_core::classify::FileRole::SevenZipSplit { .. }
+            ) {
+                self.try_update_7z_topology(job_id, *file_id);
+            }
+        }
+    }
+
+    /// Collect all segment IDs for a job spec (used to mark everything as "already downloaded").
+    fn all_segment_ids(job_id: JobId, spec: &JobSpec) -> HashSet<SegmentId> {
+        let mut ids = HashSet::new();
+        for (file_index, file_spec) in spec.files.iter().enumerate() {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: file_index as u32,
+            };
+            for seg in &file_spec.segments {
+                ids.insert(SegmentId {
+                    file_id,
+                    segment_number: seg.number,
+                });
+            }
+        }
+        ids
+    }
+
     /// Restore a job from crash-recovery journal.
     pub(super) fn restore_job(
         &mut self,
@@ -146,6 +374,7 @@ impl Pipeline {
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
         status: JobStatus,
+        working_dir: PathBuf,
     ) -> Result<(), weaver_scheduler::SchedulerError> {
         if self.jobs.contains_key(&job_id) {
             return Err(weaver_scheduler::SchedulerError::JobExists(job_id));
@@ -180,6 +409,7 @@ impl Pipeline {
             status: status.clone(),
             assembly,
             created_at: std::time::Instant::now(),
+            working_dir,
             downloaded_bytes,
             failed_bytes: 0,
             health_probing: false,

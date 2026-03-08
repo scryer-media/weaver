@@ -55,7 +55,8 @@ pub struct TestConnectionResult {
 #[derive(Debug, Clone, SimpleObject)]
 pub struct GeneralSettings {
     pub data_dir: String,
-    pub output_dir: String,
+    pub intermediate_dir: String,
+    pub complete_dir: String,
     pub cleanup_after_extract: bool,
     pub max_download_speed: u64,
     pub max_retries: u32,
@@ -64,7 +65,8 @@ pub struct GeneralSettings {
 /// Input for updating general settings.
 #[derive(Debug, InputObject)]
 pub struct GeneralSettingsInput {
-    pub output_dir: Option<String>,
+    pub intermediate_dir: Option<String>,
+    pub complete_dir: Option<String>,
     pub cleanup_after_extract: Option<bool>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
@@ -143,13 +145,24 @@ pub struct Metrics {
     pub decode_rate_mbps: f64,
 }
 
-/// GraphQL representation of a pipeline event.
+/// GraphQL representation of a pipeline event (real-time subscription).
 #[derive(Debug, Clone, SimpleObject)]
 pub struct PipelineEventGql {
     pub kind: EventKind,
     pub job_id: Option<u64>,
     pub file_id: Option<String>,
     pub message: String,
+}
+
+/// GraphQL representation of a persisted job event (historical query).
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobEvent {
+    pub kind: EventKind,
+    pub job_id: u64,
+    pub file_id: Option<String>,
+    pub message: String,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: f64,
 }
 
 /// Event categories for subscriptions.
@@ -179,6 +192,39 @@ pub enum EventKind {
     SegmentFailedPermanent,
     GlobalPaused,
     GlobalResumed,
+}
+
+impl std::str::FromStr for EventKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "JobCreated" => Ok(Self::JobCreated),
+            "JobPaused" => Ok(Self::JobPaused),
+            "JobResumed" => Ok(Self::JobResumed),
+            "JobCompleted" => Ok(Self::JobCompleted),
+            "JobFailed" => Ok(Self::JobFailed),
+            "ArticleDownloaded" => Ok(Self::ArticleDownloaded),
+            "ArticleNotFound" => Ok(Self::ArticleNotFound),
+            "SegmentDecoded" => Ok(Self::SegmentDecoded),
+            "SegmentCommitted" => Ok(Self::SegmentCommitted),
+            "FileComplete" => Ok(Self::FileComplete),
+            "FileMissing" => Ok(Self::FileMissing),
+            "VerificationStarted" => Ok(Self::VerificationStarted),
+            "VerificationComplete" => Ok(Self::VerificationComplete),
+            "RepairStarted" => Ok(Self::RepairStarted),
+            "RepairComplete" => Ok(Self::RepairComplete),
+            "RepairFailed" => Ok(Self::RepairFailed),
+            "ExtractionReady" => Ok(Self::ExtractionReady),
+            "ExtractionProgress" => Ok(Self::ExtractionProgress),
+            "ExtractionComplete" => Ok(Self::ExtractionComplete),
+            "ExtractionFailed" => Ok(Self::ExtractionFailed),
+            "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),
+            "SegmentFailedPermanent" => Ok(Self::SegmentFailedPermanent),
+            "GlobalPaused" => Ok(Self::GlobalPaused),
+            "GlobalResumed" => Ok(Self::GlobalResumed),
+            _ => Err(()),
+        }
+    }
 }
 
 // --- Conversion from domain types ---

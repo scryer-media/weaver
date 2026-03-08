@@ -1,7 +1,10 @@
 [package]
 name = "weaver-state"
-version = "0.1.0"
-edition = "2024"
+description = "Persistent state store with resumable journal and crash recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }
@@ -11,6 +14,9 @@ tracing = { workspace = true }
 rmp-serde = { workspace = true }
 crc32fast = { workspace = true }
 tokio = { workspace = true }
+rusqlite = { workspace = true }
+toml = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -1,7 +1,10 @@
 [package]
 name = "weaver-assembly"
-version = "0.1.0"
-edition = "2024"
+description = "Segment and file completeness tracking for Usenet article assembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }

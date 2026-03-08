@@ -13,6 +13,10 @@ pub enum FileRole {
         is_index: bool,
         recovery_block_count: u32,
     },
+    /// 7z archive (single file, not split).
+    SevenZipArchive,
+    /// 7z split file: `.7z.001`, `.7z.002`, etc. (0-indexed).
+    SevenZipSplit { number: u32 },
     /// Standalone file (not part of an archive).
     Standalone,
     /// Could not determine role from filename.
@@ -47,6 +51,11 @@ impl FileRole {
             };
         }
 
+        // 7z detection
+        if let Some(role) = parse_7z_file(&lower) {
+            return role;
+        }
+
         // Known non-archive extensions -> standalone
         if is_standalone_extension(&lower) {
             return FileRole::Standalone;
@@ -68,7 +77,9 @@ impl FileRole {
                 is_index: true, ..
             } => 0,
             FileRole::RarVolume { volume_number: 0 } => 1,
+            FileRole::SevenZipArchive => 2,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
+            FileRole::SevenZipSplit { number } => 10 + *number,
             FileRole::Standalone => 5,
             FileRole::Unknown => 50,
             FileRole::Par2 {
@@ -102,8 +113,7 @@ fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {
 /// - New RAR5 multi-volume: `name.rar`, `name.part2.rar`, etc.
 fn parse_rar_volume(lower: &str) -> Option<u32> {
     // New style: .part01.rar, .part001.rar
-    if lower.ends_with(".rar") {
-        let stem = &lower[..lower.len() - 4];
+    if let Some(stem) = lower.strip_suffix(".rar") {
         if let Some(part_pos) = stem.rfind(".part") {
             let num_str = &stem[part_pos + 5..];
             if let Ok(n) = num_str.parse::<u32>() {
@@ -118,15 +128,82 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
     // Old style: .r00, .r01, .s00, .s01, etc.
     if lower.len() >= 4 {
         let ext = &lower[lower.len() - 4..];
-        if ext.starts_with(".r") || ext.starts_with(".s") {
-            if let Ok(n) = ext[2..].parse::<u32>() {
-                // .r00 = volume 1, .r01 = volume 2 (since .rar = volume 0)
-                return Some(n + 1);
-            }
+        if (ext.starts_with(".r") || ext.starts_with(".s"))
+            && let Ok(n) = ext[2..].parse::<u32>()
+        {
+            // .r00 = volume 1, .r01 = volume 2 (since .rar = volume 0)
+            return Some(n + 1);
         }
     }
 
     None
+}
+
+/// Parse 7z archive or split file from filename.
+///
+/// Supports:
+/// - Single archive: `name.7z`
+/// - Split files: `name.7z.001`, `name.7z.002`, etc. (0-indexed: .001 = number 0)
+fn parse_7z_file(lower: &str) -> Option<FileRole> {
+    // Split files: .7z.001, .7z.002, etc.
+    if let Some(pos) = lower.rfind(".7z.") {
+        let num_str = &lower[pos + 4..];
+        if let Ok(n) = num_str.parse::<u32>() {
+            return Some(FileRole::SevenZipSplit {
+                number: n.saturating_sub(1),
+            });
+        }
+    }
+
+    // Single archive: .7z
+    if lower.ends_with(".7z") {
+        return Some(FileRole::SevenZipArchive);
+    }
+
+    None
+}
+
+/// Extract the archive set base name from a filename and its role.
+///
+/// Groups files that belong to the same archive set. For example:
+/// - `Show.S01E01.7z.003` (SevenZipSplit) → `"Show.S01E01.7z"`
+/// - `archive.7z` (SevenZipArchive) → `"archive.7z"`
+/// - `movie.part01.rar` (RarVolume) → `"movie"`
+///
+/// Returns `None` for non-archive roles.
+pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
+    match role {
+        FileRole::SevenZipArchive => Some(filename.to_string()),
+        FileRole::SevenZipSplit { .. } => {
+            // Strip the `.NNN` suffix to get the base `.7z` name.
+            let lower = filename.to_ascii_lowercase();
+            if let Some(pos) = lower.rfind(".7z.") {
+                Some(filename[..pos + 3].to_string())
+            } else {
+                Some(filename.to_string())
+            }
+        }
+        FileRole::RarVolume { .. } => {
+            let lower = filename.to_ascii_lowercase();
+            // New style: strip .partNN.rar
+            if lower.ends_with(".rar") {
+                let stem = &filename[..filename.len() - 4];
+                let lower_stem = &lower[..lower.len() - 4];
+                if let Some(part_pos) = lower_stem.rfind(".part") {
+                    Some(stem[..part_pos].to_string())
+                } else {
+                    // Plain .rar — stem is the base
+                    Some(stem.to_string())
+                }
+            } else if lower.len() >= 4 {
+                // Old style: .r00, .s00
+                Some(filename[..filename.len() - 4].to_string())
+            } else {
+                Some(filename.to_string())
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Check if the file extension indicates a standalone (non-archive) file.
@@ -240,9 +317,83 @@ mod tests {
     }
 
     #[test]
+    fn sevenz_single() {
+        assert_eq!(
+            FileRole::from_filename("archive.7z"),
+            FileRole::SevenZipArchive
+        );
+        assert_eq!(
+            FileRole::from_filename("Movie.7Z"),
+            FileRole::SevenZipArchive
+        );
+    }
+
+    #[test]
+    fn sevenz_split() {
+        assert_eq!(
+            FileRole::from_filename("archive.7z.001"),
+            FileRole::SevenZipSplit { number: 0 }
+        );
+        assert_eq!(
+            FileRole::from_filename("archive.7z.002"),
+            FileRole::SevenZipSplit { number: 1 }
+        );
+        assert_eq!(
+            FileRole::from_filename("archive.7z.010"),
+            FileRole::SevenZipSplit { number: 9 }
+        );
+        assert_eq!(
+            FileRole::from_filename("Movie.7z.003"),
+            FileRole::SevenZipSplit { number: 2 }
+        );
+    }
+
+    #[test]
     fn unknown() {
         assert_eq!(FileRole::from_filename("data.bin"), FileRole::Unknown);
-        assert_eq!(FileRole::from_filename("archive.7z"), FileRole::Unknown);
+    }
+
+    #[test]
+    fn archive_base_name_7z() {
+        assert_eq!(
+            archive_base_name("archive.7z", &FileRole::SevenZipArchive),
+            Some("archive.7z".into())
+        );
+        assert_eq!(
+            archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 }),
+            Some("Show.S01E01.7z".into())
+        );
+        assert_eq!(
+            archive_base_name("Show.S01E01.7z.003", &FileRole::SevenZipSplit { number: 2 }),
+            Some("Show.S01E01.7z".into())
+        );
+        // Different episodes produce different base names.
+        assert_ne!(
+            archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 }),
+            archive_base_name("Show.S01E02.7z.001", &FileRole::SevenZipSplit { number: 0 }),
+        );
+    }
+
+    #[test]
+    fn archive_base_name_rar() {
+        assert_eq!(
+            archive_base_name("movie.part01.rar", &FileRole::RarVolume { volume_number: 0 }),
+            Some("movie".into())
+        );
+        assert_eq!(
+            archive_base_name("movie.rar", &FileRole::RarVolume { volume_number: 0 }),
+            Some("movie".into())
+        );
+        assert_eq!(
+            archive_base_name("movie.r00", &FileRole::RarVolume { volume_number: 1 }),
+            Some("movie".into())
+        );
+    }
+
+    #[test]
+    fn archive_base_name_non_archive() {
+        assert_eq!(archive_base_name("info.nfo", &FileRole::Standalone), None);
+        assert_eq!(archive_base_name("data.bin", &FileRole::Unknown), None);
     }
 
     #[test]

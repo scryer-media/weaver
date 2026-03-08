@@ -147,37 +147,34 @@ impl Par2FileSet {
                     duplicates_ignored += 1;
                 }
                 Packet::FileDescription(fd) => {
-                    if self.files.contains_key(&fd.file_id) {
-                        duplicates_ignored += 1;
-                    } else {
-                        self.files.insert(fd.file_id, FileDescription {
+                    if let std::collections::hash_map::Entry::Vacant(e) = self.files.entry(fd.file_id) {
+                        e.insert(FileDescription {
                             file_id: fd.file_id,
                             hash_full: fd.hash_full,
                             hash_16k: fd.hash_16k,
                             length: fd.file_length,
                             filename: fd.filename,
                         });
+                    } else {
+                        duplicates_ignored += 1;
                     }
                 }
                 Packet::InputFileSliceChecksum(ifsc) => {
-                    if self.slice_checksums.contains_key(&ifsc.file_id) {
-                        duplicates_ignored += 1;
+                    if let std::collections::hash_map::Entry::Vacant(e) = self.slice_checksums.entry(ifsc.file_id) {
+                        e.insert(ifsc.checksums);
                     } else {
-                        self.slice_checksums.insert(ifsc.file_id, ifsc.checksums);
+                        duplicates_ignored += 1;
                     }
                 }
                 Packet::RecoverySlice(rs) => {
-                    if self.recovery_slices.contains_key(&rs.exponent) {
-                        duplicates_ignored += 1;
-                    } else {
-                        self.recovery_slices.insert(
-                            rs.exponent,
-                            RecoverySlice {
+                    if let std::collections::btree_map::Entry::Vacant(e) = self.recovery_slices.entry(rs.exponent) {
+                        e.insert(RecoverySlice {
                                 exponent: rs.exponent,
                                 data: rs.data,
-                            },
-                        );
+                            });
                         new_recovery_slices += 1;
+                    } else {
+                        duplicates_ignored += 1;
                     }
                 }
                 Packet::Creator(c) => {
@@ -207,7 +204,7 @@ impl Par2FileSet {
         if file_length == 0 || self.slice_size == 0 {
             return 0;
         }
-        let count = (file_length + self.slice_size - 1) / self.slice_size;
+        let count = file_length.div_ceil(self.slice_size);
         // Saturate to u32::MAX rather than silently truncating.
         u32::try_from(count).unwrap_or(u32::MAX)
     }

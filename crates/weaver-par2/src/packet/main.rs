@@ -43,7 +43,7 @@ impl MainPacket {
             u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
 
         let file_id_area = &body[12..];
-        if file_id_area.len() % 16 != 0 {
+        if !file_id_area.len().is_multiple_of(16) {
             return Err(Par2Error::InvalidMainPacket {
                 reason: format!(
                     "file ID area length {} is not a multiple of 16",

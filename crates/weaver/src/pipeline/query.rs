@@ -58,7 +58,7 @@ impl Pipeline {
                     password: state.spec.password.clone(),
                     category: state.spec.category.clone(),
                     metadata: state.spec.metadata.clone(),
-                    output_dir: Some(self.output_dir.display().to_string()),
+                    output_dir: Some(state.working_dir.display().to_string()),
                 })
             }
             None => {
@@ -94,7 +94,7 @@ impl Pipeline {
                     password: state.spec.password.clone(),
                     category: state.spec.category.clone(),
                     metadata: state.spec.metadata.clone(),
-                    output_dir: Some(self.output_dir.display().to_string()),
+                    output_dir: Some(state.working_dir.display().to_string()),
                 }
             })
             .collect();

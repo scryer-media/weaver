@@ -98,7 +98,7 @@ impl FileAssembly {
     pub fn has_slice_states(&self) -> bool {
         self.slice_states
             .as_ref()
-            .map_or(false, |s| !s.is_empty())
+            .is_some_and(|s| !s.is_empty())
     }
 
     /// Metadata-only commit: updates segment tracking (marks received, byte counts,
@@ -202,8 +202,8 @@ impl FileAssembly {
 
             // Early damage detection: when CRC covers the full slice, check it.
             let slice_size = state.byte_end - state.byte_start;
-            if state.crc_bytes_covered >= slice_size {
-                if let Some(acc_crc) = state.accumulated_crc {
+            if state.crc_bytes_covered >= slice_size
+                && let Some(acc_crc) = state.accumulated_crc {
                     // CRC-only check (MD5 deferred to full verification).
                     let crc_matches = acc_crc == state.expected_crc32;
                     if !crc_matches {
@@ -214,7 +214,6 @@ impl FileAssembly {
                     // If CRC matches, we can't be certain (CRC32 collisions possible),
                     // so we don't mark as verified. Full MD5 check at file completion.
                 }
-            }
         }
 
         early_results
@@ -458,11 +457,10 @@ impl FileAssembly {
 
     /// Mark a slice as verified after disk-based re-verification.
     pub fn mark_slice_verified(&mut self, slice_index: u32, valid: bool) {
-        if let Some(states) = self.slice_states.as_mut() {
-            if let Some(state) = states.iter_mut().find(|s| s.slice_index == slice_index) {
+        if let Some(states) = self.slice_states.as_mut()
+            && let Some(state) = states.iter_mut().find(|s| s.slice_index == slice_index) {
                 state.verified = Some(valid);
             }
-        }
     }
 
     /// The byte offset within the target file where a given segment's data should be written.

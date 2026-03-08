@@ -21,7 +21,7 @@ impl Pipeline {
         }
 
         let filename = file_asm.filename().to_string();
-        let file_path = self.output_dir.join(&filename);
+        let file_path = state.working_dir.join(&filename);
 
         // Read the PAR2 file from disk.
         let par2_bytes = match tokio::fs::read(&file_path).await {
@@ -83,14 +83,9 @@ impl Pipeline {
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
 
-        // Journal entry.
-        let journal_entry = JournalEntry::Par2MetadataLoaded {
-            job_id,
-            slice_size,
-            recovery_block_count,
-        };
-        if let Err(e) = self.journal.append(&journal_entry).await {
-            error!(error = %e, "journal write failed");
+        // Persist PAR2 metadata to SQLite.
+        if let Err(e) = self.db.set_par2_metadata(job_id, slice_size, recovery_block_count) {
+            error!(error = %e, "db write failed for set_par2_metadata");
         }
     }
 
@@ -119,7 +114,7 @@ impl Pipeline {
         }
 
         let filename = file_asm.filename().to_string();
-        let file_path = self.output_dir.join(&filename);
+        let file_path = state.working_dir.join(&filename);
 
         let par2_bytes = match tokio::fs::read(&file_path).await {
             Ok(bytes) => bytes,
@@ -160,7 +155,7 @@ impl Pipeline {
     /// When a RAR volume file completes, parse its headers to build or update
     /// the archive topology on the job assembly.
     pub(super) async fn try_update_archive_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let (volume_number, filename) = {
+        let (volume_number, filename, password, working_dir) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -172,10 +167,17 @@ impl Pipeline {
                 weaver_core::classify::FileRole::RarVolume { volume_number } => *volume_number,
                 _ => return,
             };
-            (vol, file_asm.filename().to_string())
+            (vol, file_asm.filename().to_string(), state.spec.password.clone(), state.working_dir.clone())
         };
 
-        let file_path = self.output_dir.join(&filename);
+        // Derive set name from filename base (e.g., "movie" from "movie.part01.rar").
+        let set_name = weaver_core::classify::archive_base_name(
+            &filename,
+            &weaver_core::classify::FileRole::RarVolume { volume_number },
+        )
+        .unwrap_or_else(|| "rar".into());
+
+        let file_path = working_dir.join(&filename);
 
         // Only parse headers from the first volume (volume 0) to build topology.
         // For subsequent volumes, just mark them complete.
@@ -183,8 +185,12 @@ impl Pipeline {
             let path = file_path.clone();
             let topo_result = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&path)?;
-                let archive = weaver_rar::RarArchive::open(file)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let archive = if let Some(ref pw) = password {
+                    weaver_rar::RarArchive::open_with_password(file, pw)
+                } else {
+                    weaver_rar::RarArchive::open(file)
+                }
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
                 let meta = archive.metadata();
                 Ok::<_, std::io::Error>(meta)
             })
@@ -195,14 +201,21 @@ impl Pipeline {
                     let mut volume_map = std::collections::HashMap::new();
                     let mut members = Vec::new();
 
-                    // Map filenames in the NZB to volume numbers.
+                    // Map filenames in the NZB to volume numbers — only those
+                    // belonging to the same archive set (matching base name).
                     if let Some(state) = self.jobs.get(&job_id) {
                         for file_asm in state.assembly.files() {
                             if let weaver_core::classify::FileRole::RarVolume { volume_number: vn } =
                                 file_asm.role()
                             {
-                                volume_map
-                                    .insert(file_asm.filename().to_string(), *vn);
+                                let f_base = weaver_core::classify::archive_base_name(
+                                    file_asm.filename(),
+                                    file_asm.role(),
+                                );
+                                if f_base.as_deref() == Some(&set_name) {
+                                    volume_map
+                                        .insert(file_asm.filename().to_string(), *vn);
+                                }
                             }
                         }
                     }
@@ -222,6 +235,7 @@ impl Pipeline {
                     let expected_volume_count = meta.volume_count.map(|c| c as u32);
 
                     let topology = weaver_assembly::ArchiveTopology {
+                        archive_type: weaver_assembly::ArchiveType::Rar,
                         volume_map,
                         complete_volumes: std::collections::HashSet::new(),
                         expected_volume_count,
@@ -229,28 +243,34 @@ impl Pipeline {
                     };
 
                     if let Some(state) = self.jobs.get_mut(&job_id) {
-                        state.assembly.set_archive_topology(topology);
-                        // Mark this volume as complete.
-                        state.assembly.mark_volume_complete(volume_number);
+                        state.assembly.set_archive_topology(set_name.clone(), topology);
+                        state.assembly.mark_volume_complete(&set_name, volume_number);
 
                         // Retroactively mark volumes that completed before
-                        // topology was available. Without this, volumes that
-                        // finished before volume 0 are never tracked.
+                        // topology was available (same set only).
                         let completed_volumes: Vec<u32> = state.assembly.files()
                             .filter(|f| f.is_complete())
                             .filter_map(|f| match f.role() {
-                                weaver_core::classify::FileRole::RarVolume { volume_number: vn } => Some(*vn),
+                                weaver_core::classify::FileRole::RarVolume { volume_number: vn } => {
+                                    let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                                    if f_base.as_deref() == Some(&set_name) {
+                                        Some(*vn)
+                                    } else {
+                                        None
+                                    }
+                                }
                                 _ => None,
                             })
                             .collect();
                         for vn in &completed_volumes {
-                            state.assembly.mark_volume_complete(*vn);
+                            state.assembly.mark_volume_complete(&set_name, *vn);
                         }
                     }
 
                     info!(
                         job_id = job_id.0,
                         volume = volume_number,
+                        set_name = %set_name,
                         member_count = meta.members.len(),
                         "archive topology loaded from first RAR volume"
                     );
@@ -274,7 +294,7 @@ impl Pipeline {
         } else {
             // Non-first volume: just mark it complete.
             if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.assembly.mark_volume_complete(volume_number);
+                state.assembly.mark_volume_complete(&set_name, volume_number);
             }
             debug!(
                 job_id = job_id.0,
@@ -284,13 +304,143 @@ impl Pipeline {
         }
     }
 
+    /// When a 7z file completes, build or update the archive topology.
+    ///
+    /// Groups files by base name (e.g., "Show.S01E01.7z") so that multiple
+    /// independent archive sets within a single job are tracked separately.
+    pub(super) fn try_update_7z_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let Some(file_asm) = state.assembly.file(file_id) else {
+            return;
+        };
+
+        let role = file_asm.role().clone();
+        let filename = file_asm.filename().to_string();
+        let set_name = match weaver_core::classify::archive_base_name(&filename, &role) {
+            Some(name) => name,
+            None => return,
+        };
+
+        match role {
+            weaver_core::classify::FileRole::SevenZipArchive => {
+                // Single .7z file — topology has exactly one volume.
+                if state.assembly.archive_topology_for(&set_name).is_some() {
+                    return; // Already set.
+                }
+
+                let mut volume_map = std::collections::HashMap::new();
+                volume_map.insert(filename.clone(), 0);
+
+                let topology = weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::SevenZip,
+                    volume_map,
+                    complete_volumes: std::collections::HashSet::new(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: set_name.clone(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                };
+
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state.assembly.mark_volume_complete(&set_name, 0);
+
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    "7z topology set (single archive)"
+                );
+            }
+            weaver_core::classify::FileRole::SevenZipSplit { number } => {
+                let completing_number = number;
+
+                if state.assembly.archive_topology_for(&set_name).is_some() {
+                    // Topology already exists for this set — just mark this volume complete.
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.assembly.mark_volume_complete(&set_name, completing_number);
+                    debug!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        volume = completing_number,
+                        "7z split volume complete"
+                    );
+                    return;
+                }
+
+                // First split part for this set to complete — build topology
+                // from all known splits with the same base name.
+                let mut volume_map = std::collections::HashMap::new();
+                let mut max_number = 0u32;
+                for f in state.assembly.files() {
+                    if let weaver_core::classify::FileRole::SevenZipSplit { number: n } = f.role() {
+                        let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                        if f_base.as_deref() == Some(&set_name) {
+                            volume_map.insert(f.filename().to_string(), *n);
+                            max_number = max_number.max(*n);
+                        }
+                    }
+                }
+
+                let expected = max_number + 1;
+                let topology = weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::SevenZip,
+                    volume_map,
+                    complete_volumes: std::collections::HashSet::new(),
+                    expected_volume_count: Some(expected),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: set_name.clone(),
+                        first_volume: 0,
+                        last_volume: max_number,
+                        unpacked_size: 0,
+                    }],
+                };
+
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state.assembly.set_archive_topology(set_name.clone(), topology);
+
+                // Retroactively mark all already-complete split parts for this set.
+                let completed: Vec<u32> = state
+                    .assembly
+                    .files()
+                    .filter(|f| f.is_complete())
+                    .filter_map(|f| {
+                        if let weaver_core::classify::FileRole::SevenZipSplit { number: n } = f.role() {
+                            let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                            if f_base.as_deref() == Some(&set_name) {
+                                return Some(*n);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                for n in completed {
+                    state.assembly.mark_volume_complete(&set_name, n);
+                }
+
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    expected_volumes = expected,
+                    "7z topology set (split archive)"
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Re-read and verify slices that weren't verified incrementally during download.
     /// This happens when segments arrived before PAR2 metadata was loaded — their data
     /// was dropped via commit_segment_meta() without feeding slice checksums.
     /// Only reads the specific byte ranges of unverified slices, not entire files.
     pub(super) async fn verify_unverified_slices_from_disk(&mut self, job_id: JobId) {
         // Collect unverified slices across all files: (file_id, filename, slice descriptors).
-        let unverified: Vec<(NzbFileId, String, Vec<(u32, u64, u64, u32, [u8; 16])>)> = {
+        type SliceDescriptors = Vec<(u32, u64, u64, u32, [u8; 16])>;
+        let unverified: Vec<(NzbFileId, String, SliceDescriptors)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -336,8 +486,14 @@ impl Pipeline {
             .map(|m| m.slice_size)
             .unwrap_or(0);
 
+        let working_dir = self
+            .jobs
+            .get(&job_id)
+            .map(|s| s.working_dir.clone())
+            .unwrap_or_default();
+
         for (file_id, filename, slices) in unverified {
-            let file_path = self.output_dir.join(&filename);
+            let file_path = working_dir.join(&filename);
             let slice_size = par2_slice_size;
 
             // Read and verify each unverified slice from disk.

@@ -1,20 +1,21 @@
 //! LZ block decompression orchestrator for RAR5.
 //!
-//! Reads compressed data as a bitstream of LZ blocks. Each block contains
-//! Huffman-encoded symbols that represent either literal bytes or
-//! length-distance pairs referencing previous output.
+//! RAR5 compressed data is organized into blocks, each with a byte-aligned
+//! header followed by Huffman-encoded LZ data. Unlike RAR3, RAR5 uses only
+//! LZ+Huffman compression (no PPMd blocks).
 //!
-//! Block structure:
-//! - First bit of the compressed stream selects algorithm: 0 = LZ, 1 = PPMd
-//! - `keepOldTable` flag (1 bit): if 0, read new Huffman tables
-//! - Huffman-encoded symbol stream until block end
+//! Block header (byte-aligned):
+//! - `flags` (1 byte): bit_size[0:2], byte_count[3:4], is_last[6], table_present[7]
+//! - `checksum` (1 byte): XOR of flags and all size bytes, must equal 0x5A
+//! - `block_size_bytes` (1-3 bytes, LE): high part of block size
+//! - Extra bits from bitstream: low part of block size (bit_size+1 bits)
 //!
 //! Symbol interpretation (NC table, 306 symbols):
 //! - 0-255: literal bytes
 //! - 256: filter marker
-//! - 257: last-distance match with length from next symbol
-//! - 258-262: repeat distance cache references
-//! - 263-305: length codes with extra bits
+//! - 257: repeat previous match (same length, same distance[0])
+//! - 258-261: repeat distance cache references (length from RC table)
+//! - 262-305: inline length codes with extra bits (distance from DC/LDC tables)
 
 pub mod bitstream;
 pub mod filter;
@@ -35,37 +36,8 @@ use window::Window;
 /// Maximum dictionary size we'll allocate (256 MB).
 const MAX_DICT_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Length base values for length codes 263-305 (indices 0-42).
-/// Length code N (symbol 263+N) has base length LENGTH_BASE[N] and
-/// LENGTH_EXTRA_BITS[N] additional bits to read.
-///
-/// These values are derived from the RAR5 spec and libarchive reference.
-static LENGTH_BASE: [u32; 43] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 28, 36, 44, 52, 68, 84, 100, 132, 164, 196,
-    260, 324, 388, 516, 644, 772, 1028, 1284, 1540, 2052, 2564, 3076, 4100, 5124, 6148, 8196,
-    10244, 12292, 16388,
-];
-
-static LENGTH_EXTRA_BITS: [u8; 43] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8,
-    8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12,
-];
-
-/// Distance base values for distance codes 0-63.
-static DISTANCE_BASE: [u32; 64] = [
-    0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
-    2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072,
-    196608, 262144, 393216, 524288, 786432, 1048576, 1572864, 2097152, 3145728, 4194304, 6291456,
-    8388608, 12582912, 16777216, 25165824, 33554432, 50331648, 67108864, 100663296, 134217728,
-    201326592, 268435456, 402653184, 536870912, 805306368, 1073741824, 1610612736, 2147483648,
-    3221225472,
-];
-
-static DISTANCE_EXTRA_BITS: [u8; 64] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
-    13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 24,
-    24, 25, 25, 26, 26, 27, 27, 28, 28, 29, 29, 30, 30,
-];
+/// Maximum number of length slots.
+const NUM_LENGTH_SLOTS: usize = 44;
 
 /// Number of entries in the last-distance cache.
 const DIST_CACHE_SIZE: usize = 4;
@@ -76,33 +48,106 @@ pub struct LzDecoder {
     window: Window,
     /// Last-distance cache (4 entries for repeat matches).
     dist_cache: [usize; DIST_CACHE_SIZE],
-    /// Current Huffman tables (kept across blocks when keepOldTable is set).
+    /// Length of the last match (for symbol 257 repeat).
+    last_length: usize,
+    /// Current Huffman tables (kept across blocks when table_present is false).
     nc_table: Option<HuffmanTable>,
     dc_table: Option<HuffmanTable>,
     ldc_table: Option<HuffmanTable>,
     rc_table: Option<HuffmanTable>,
-    /// Whether we've read the initial block type bit.
-    block_started: bool,
+    /// Persistent code lengths for delta encoding across blocks.
+    code_lengths: Vec<u8>,
+    /// Number of compressed bits remaining in the current block.
+    /// When 0, a new block header must be read.
+    block_bits_remaining: i64,
+    /// Whether the current block is the last one.
+    is_last_block: bool,
     /// Filters pending application to ranges of the current output.
     pending_filters: Vec<PendingFilter>,
-    /// PPMd decoder for PPMd blocks (lazy-initialized on first PPMd block).
-    ppmd_decoder: Option<super::ppmd::PpmdDecoder>,
 }
 
 impl LzDecoder {
     /// Create a new LZ decoder with the specified dictionary size.
     pub fn new(dict_size: usize) -> Self {
+        let total_symbols = huffman::HUFF_NC + huffman::HUFF_DC + huffman::HUFF_LDC + huffman::HUFF_RC;
         Self {
             window: Window::new(dict_size),
             dist_cache: [0; DIST_CACHE_SIZE],
+            last_length: 0,
             nc_table: None,
             dc_table: None,
             ldc_table: None,
             rc_table: None,
-            block_started: false,
+            code_lengths: vec![0u8; total_symbols],
+            block_bits_remaining: 0,
+            is_last_block: false,
             pending_filters: Vec::new(),
-            ppmd_decoder: None,
         }
+    }
+
+    /// Read a RAR5 block header.
+    ///
+    /// The block header is byte-aligned:
+    /// - flags (1 byte): bit_size[0:2], byte_count[3:4], is_last[6], table_present[7]
+    /// - checksum (1 byte): must equal 0x5A ^ flags ^ size_byte_0 ^ ...
+    /// - size bytes (1-3 bytes, LE): block byte count
+    ///
+    /// Block size in bits = byte_count * 8 + ((flags & 7) + 1).
+    /// byte_count is full data bytes; the low 3 flag bits + 1 give additional valid bits.
+    fn read_block_header(&mut self, reader: &mut BitReader) -> RarResult<()> {
+        // Block header is byte-aligned.
+        reader.align_byte();
+
+        let flags = reader.read_bits(8)? as u8;
+        let checksum = reader.read_bits(8)? as u8;
+
+        let extra_bits = (flags & 0x07) as i64 + 1; // valid bits in last byte (1-8)
+        let num_size_bytes = ((flags >> 3) & 0x03) + 1;
+        if num_size_bytes > 3 {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 block header: invalid size byte count".into(),
+            });
+        }
+
+        self.is_last_block = (flags & 0x40) != 0;
+        let table_present = (flags & 0x80) != 0;
+
+        // Read block size bytes (little-endian) and validate checksum.
+        let mut block_bytes: i64 = 0;
+        let mut xor_sum = 0x5Au8 ^ flags;
+        for i in 0..num_size_bytes {
+            let b = reader.read_bits(8)? as u8;
+            xor_sum ^= b;
+            block_bytes |= (b as i64) << (i * 8);
+        }
+
+        if xor_sum != checksum {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
+                    checksum, xor_sum
+                ),
+            });
+        }
+
+        // Block size in bits = (block_bytes - 1) * 8 + extra_bits.
+        // The block_bytes value includes the last partial byte; extra_bits gives
+        // how many bits are valid in that last byte (1-8).
+        self.block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+
+        // Read new Huffman tables if present (consumes bits from the block).
+        if table_present || self.nc_table.is_none() {
+            let pos_before = reader.position();
+            let (nc, dc, ldc, rc) = huffman::read_tables(reader, &mut self.code_lengths)?;
+            let bits_used = (reader.position() - pos_before) as i64;
+            self.block_bits_remaining -= bits_used;
+            self.nc_table = Some(nc);
+            self.dc_table = Some(dc);
+            self.ldc_table = Some(ldc);
+            self.rc_table = Some(rc);
+        }
+
+        Ok(())
     }
 
     /// Decompress all LZ-compressed data from the input into the output buffer.
@@ -111,58 +156,24 @@ impl LzDecoder {
     /// `unpacked_size` is the expected uncompressed size.
     /// Returns the decompressed data.
     pub fn decompress(&mut self, input: &[u8], unpacked_size: u64) -> RarResult<Vec<u8>> {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
 
         while output_size < unpacked_size {
-            if reader.bits_remaining() < 2 {
-                break;
-            }
-
-            // Read block type bit if this is the first block.
-            if !self.block_started {
-                let block_type = reader.read_bit()?;
-                if block_type == 1 {
-                    // PPMd block: hand off remaining data to PPMd decoder.
-                    let ppmd = self.ppmd_decoder.get_or_insert_with(super::ppmd::PpmdDecoder::new);
-                    let remaining_bytes = reader.remaining_bytes();
-                    let ppmd_remaining = unpacked_size - output_size;
-                    let mut ppmd_output = Vec::new();
-                    ppmd.decode_block(remaining_bytes, ppmd_remaining, &mut ppmd_output)?;
-
-                    // Write PPMd output to the window (for potential LZ backreferences
-                    // in subsequent blocks) and accumulate output.
-                    for &b in &ppmd_output {
-                        self.window.put_byte(b);
-                    }
-
-                    // PPMd consumed the rest of this block's data.
-                    self.block_started = false;
+            // Read a new block header if we've exhausted the current block.
+            if self.block_bits_remaining <= 0 {
+                if reader.bits_remaining() < 16 {
                     break;
                 }
-                self.block_started = true;
+                self.read_block_header(&mut reader)?;
             }
 
-            // Read keepOldTable flag.
-            let keep_old = reader.read_bit()?;
-
-            if keep_old == 0 || self.nc_table.is_none() {
-                // Read new Huffman tables.
-                let (nc, dc, ldc, rc) = huffman::read_tables(&mut reader)?;
-                self.nc_table = Some(nc);
-                self.dc_table = Some(dc);
-                self.ldc_table = Some(ldc);
-                self.rc_table = Some(rc);
-            }
-
-            // Decode symbols until block end or unpacked_size reached.
+            // Decode symbols from the current block.
             output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
-
-            // After a block ends, the next block needs its type bit again.
-            // In RAR5, blocks within the same compressed stream share the
-            // initial block-type bit (all LZ or all PPMd). The keepOldTable
-            // flag is per-block. According to the spec, the block type bit
-            // only appears once at the very start.
         }
 
         // Extract output from the window.
@@ -172,9 +183,16 @@ impl LzDecoder {
         let mut output = self.window.copy_output(start, len);
 
         // Apply pending filters to the output buffer.
+        self.apply_filters(&mut output, start);
+
+        Ok(output)
+    }
+
+    /// Apply pending filters to an output buffer.
+    fn apply_filters(&mut self, output: &mut [u8], base_offset: u64) {
         for f in &self.pending_filters {
-            if f.block_start >= start && f.block_length > 0 {
-                let rel_start = (f.block_start - start) as usize;
+            if f.block_start >= base_offset && f.block_length > 0 {
+                let rel_start = (f.block_start - base_offset) as usize;
                 let rel_end = rel_start + f.block_length;
                 if rel_end <= output.len() {
                     let block = &mut output[rel_start..rel_end];
@@ -188,8 +206,26 @@ impl LzDecoder {
             }
         }
         self.pending_filters.clear();
+    }
 
-        Ok(output)
+    /// Apply distance-based length adjustment per RAR5 spec.
+    ///
+    /// Longer distances get +1 to the match length at each threshold:
+    /// - distance > 256 (0x100): +1
+    /// - distance > 8192 (0x2000): +1
+    /// - distance > 262144 (0x40000): +1
+    fn adjust_length_for_distance(length: usize, distance: usize) -> usize {
+        let mut len = length;
+        if distance > 0x100 {
+            len += 1;
+        }
+        if distance > 0x2000 {
+            len += 1;
+        }
+        if distance > 0x40000 {
+            len += 1;
+        }
+        len
     }
 
     /// Decode symbols from one LZ block.
@@ -201,10 +237,12 @@ impl LzDecoder {
         unpacked_size: u64,
         mut output_size: u64,
     ) -> RarResult<u64> {
-        while output_size < unpacked_size {
+        while output_size < unpacked_size && self.block_bits_remaining > 0 {
             if reader.bits_remaining() < 1 {
                 break;
             }
+
+            let pos_before = reader.position();
 
             let sym = self.nc_table.as_ref().unwrap().decode(reader)? as u32;
 
@@ -217,19 +255,19 @@ impl LzDecoder {
                 // Filter marker. Read full filter descriptor and enqueue.
                 output_size = self.handle_filter(reader, output_size)?;
             } else if sym == 257 {
-                // End of block marker - return to the outer loop
-                // which will read the next block's keepOldTable bit.
-                break;
-            } else if sym >= 258 && sym <= 262 {
-                // Repeat distance from cache.
-                // sym 258 = cache[0], 259 = cache[1], etc.
-                let cache_idx = (sym - 258) as usize;
-                if cache_idx >= DIST_CACHE_SIZE {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("invalid distance cache index: {cache_idx}"),
-                    });
+                // Repeat previous match (same length, same distance[0]).
+                if self.last_length != 0 {
+                    let distance = self.dist_cache[0];
+                    let mut length = self.last_length;
+                    let remaining = (unpacked_size - output_size) as usize;
+                    length = length.min(remaining);
+                    trace!("repeat last: dist={}, len={}", distance, length);
+                    self.window.copy(distance, length)?;
+                    output_size += length as u64;
                 }
-
+            } else if (258..=261).contains(&sym) {
+                // Repeat distance from cache.
+                let cache_idx = (sym - 258) as usize;
                 let distance = self.dist_cache[cache_idx];
                 if distance == 0 {
                     return Err(RarError::CorruptArchive {
@@ -237,9 +275,12 @@ impl LzDecoder {
                     });
                 }
 
-                // Read length from rc table.
+                // Read length from RC table.
+                // Note: cache references do NOT get distance-based length adjustment.
                 let rc = self.rc_table.as_ref().unwrap();
-                let length = self.decode_repeat_length(reader, rc)?;
+                let mut length = self.decode_rc_length(reader, rc)?;
+                let remaining = (unpacked_size - output_size) as usize;
+                length = length.min(remaining);
 
                 // Promote this cache entry to front.
                 if cache_idx > 0 {
@@ -250,16 +291,20 @@ impl LzDecoder {
                     self.dist_cache[0] = dist;
                 }
 
+                self.last_length = length;
                 trace!("repeat match: dist={}, len={}", distance, length);
                 self.window.copy(distance, length)?;
                 output_size += length as u64;
-            } else if sym >= 263 && sym <= 305 {
-                // Length-distance pair.
-                let length_idx = (sym - 263) as usize;
-                let length = self.decode_length(reader, length_idx)?;
+            } else if (262..=305).contains(&sym) {
+                // Inline length-distance pair.
+                let length_idx = (sym - 262) as usize;
+                let mut length = self.decode_inline_length(reader, length_idx)?;
                 let dc = self.dc_table.as_ref().unwrap();
                 let ldc = self.ldc_table.as_ref().unwrap();
-                let distance = self.decode_distance(reader, dc, ldc, length)?;
+                let distance = self.decode_distance(reader, dc, ldc)?;
+                length = Self::adjust_length_for_distance(length, distance);
+                let remaining = (unpacked_size - output_size) as usize;
+                length = length.min(remaining);
 
                 // Update distance cache.
                 self.dist_cache[3] = self.dist_cache[2];
@@ -267,6 +312,7 @@ impl LzDecoder {
                 self.dist_cache[1] = self.dist_cache[0];
                 self.dist_cache[0] = distance;
 
+                self.last_length = length;
                 trace!("match: dist={}, len={}", distance, length);
                 self.window.copy(distance, length)?;
                 output_size += length as u64;
@@ -275,81 +321,93 @@ impl LzDecoder {
                     detail: format!("invalid NC symbol: {sym}"),
                 });
             }
+
+            let bits_consumed = (reader.position() - pos_before) as i64;
+            self.block_bits_remaining -= bits_consumed;
         }
 
         Ok(output_size)
     }
 
-    /// Decode a length value from a length code index (0-42).
-    fn decode_length(&self, reader: &mut BitReader, idx: usize) -> RarResult<usize> {
-        if idx >= LENGTH_BASE.len() {
+    /// Convert a length slot (0-43) to a match length.
+    ///
+    /// Uses the same formula as unrar's SlotToLength:
+    /// - Slots 0-7: length = 2 + slot, no extra bits
+    /// - Slots 8+:  extra_bits = slot/4 - 1
+    ///   length = 2 + (4 | (slot & 3)) << extra_bits + read_bits(extra_bits)
+    fn slot_to_length(reader: &mut BitReader, slot: usize) -> RarResult<usize> {
+        if slot >= NUM_LENGTH_SLOTS {
             return Err(RarError::CorruptArchive {
-                detail: format!("length code index out of range: {idx}"),
+                detail: format!("length slot out of range: {slot}"),
             });
         }
-        let base = LENGTH_BASE[idx] as usize;
-        let extra = LENGTH_EXTRA_BITS[idx];
-        let extra_val = if extra > 0 {
-            reader.read_bits(extra)? as usize
+        let (base, extra_bits) = if slot < 8 {
+            (2 + slot, 0)
+        } else {
+            let lbits = slot / 4 - 1;
+            (2 + ((4 | (slot & 3)) << lbits), lbits)
+        };
+        let extra_val = if extra_bits > 0 {
+            reader.read_bits(extra_bits as u8)? as usize
         } else {
             0
         };
         Ok(base + extra_val)
     }
 
-    /// Decode a repeat-match length from the RC table.
-    fn decode_repeat_length(
+    /// Decode an inline length value from a length slot index (0-43).
+    fn decode_inline_length(&self, reader: &mut BitReader, idx: usize) -> RarResult<usize> {
+        Self::slot_to_length(reader, idx)
+    }
+
+    /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).
+    fn decode_rc_length(
         &self,
         reader: &mut BitReader,
         rc: &HuffmanTable,
     ) -> RarResult<usize> {
-        let sym = rc.decode(reader)? as usize;
-        if sym >= LENGTH_BASE.len() {
-            // For RC symbols that exceed our table, treat as base length.
-            return Ok(sym + 2);
-        }
-        let base = LENGTH_BASE[sym] as usize;
-        let extra = LENGTH_EXTRA_BITS[sym];
-        let extra_val = if extra > 0 {
-            reader.read_bits(extra)? as usize
-        } else {
-            0
-        };
-        Ok(base + extra_val)
+        let slot = rc.decode(reader)? as usize;
+        Self::slot_to_length(reader, slot)
     }
 
-    /// Decode a distance value from the DC and LDC tables.
+    /// Decode a distance value from the DC and LDC (AlignDecoder) tables.
+    ///
+    /// RAR5 distance decoding:
+    /// - dist_code < 4: distance = dist_code + 1
+    /// - dist_code >= 4: base + extra bits, where extra bits may be split
+    ///   between the bitstream (high) and AlignDecoder/LDC (low 4 bits)
     fn decode_distance(
         &self,
         reader: &mut BitReader,
         dc: &HuffmanTable,
         ldc: &HuffmanTable,
-        length: usize,
     ) -> RarResult<usize> {
         let dist_code = dc.decode(reader)? as usize;
-        if dist_code >= DISTANCE_BASE.len() {
+        if dist_code > 63 {
             return Err(RarError::CorruptArchive {
                 detail: format!("distance code out of range: {dist_code}"),
             });
         }
 
-        let base = DISTANCE_BASE[dist_code] as usize;
-        let extra_bits = DISTANCE_EXTRA_BITS[dist_code];
-
-        let distance = if extra_bits > 0 {
-            // For short distances (distance code < 4), the lower bits come
-            // from the LDC table. For larger distances, extra bits come
-            // from the bitstream directly.
-            if dist_code < 4 && length == 2 {
-                // Use LDC table for lower bits.
-                let low = ldc.decode(reader)? as usize;
-                base + low
-            } else {
-                let extra = reader.read_bits(extra_bits)? as usize;
-                base + extra
-            }
+        let distance = if dist_code < 4 {
+            dist_code
         } else {
-            base
+            let num_bits = (dist_code >> 1) - 1;
+            let base = (2 | (dist_code & 1)) << num_bits;
+
+            if num_bits >= 4 {
+                // Split: high bits from bitstream, low 4 bits from AlignDecoder (LDC).
+                let high = if num_bits > 4 {
+                    (reader.read_bits((num_bits - 4) as u8)? as usize) << 4
+                } else {
+                    0
+                };
+                let low = ldc.decode(reader)? as usize;
+                base + high + low
+            } else {
+                // All extra bits from bitstream.
+                base + reader.read_bits(num_bits as u8)? as usize
+            }
         };
 
         // Distance is 1-based for the window copy.
@@ -366,7 +424,7 @@ impl LzDecoder {
         output_size: u64,
     ) -> RarResult<u64> {
         // Read filter flags byte.
-        let flags = reader.read_bits(8)? as u32;
+        let flags = reader.read_bits(8)?;
         let filter_code = (flags & 0x07) as u8; // bits 0-2: filter type
         let use_counts = (flags >> 3) & 1; // bit 3: channel count follows (DELTA)
         let block_start_bits = ((flags >> 4) & 0x0F) as u8; // bits 4-7: size of block_start field
@@ -432,42 +490,19 @@ impl LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
+        if unpacked_size == 0 {
+            return Ok(0);
+        }
+
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
 
         while output_size < unpacked_size {
-            if reader.bits_remaining() < 2 {
-                break;
-            }
-
-            if !self.block_started {
-                let block_type = reader.read_bit()?;
-                if block_type == 1 {
-                    // PPMd block — decode and write directly.
-                    let ppmd = self.ppmd_decoder.get_or_insert_with(super::ppmd::PpmdDecoder::new);
-                    let remaining_bytes = reader.remaining_bytes();
-                    let ppmd_remaining = unpacked_size - output_size;
-                    let mut ppmd_output = Vec::new();
-                    ppmd.decode_block(remaining_bytes, ppmd_remaining, &mut ppmd_output)?;
-
-                    for &b in &ppmd_output {
-                        self.window.put_byte(b);
-                    }
-                    self.window.flush_to_writer(writer).map_err(RarError::Io)?;
-
-                    self.block_started = false;
+            if self.block_bits_remaining <= 0 {
+                if reader.bits_remaining() < 16 {
                     break;
                 }
-                self.block_started = true;
-            }
-
-            let keep_old = reader.read_bit()?;
-            if keep_old == 0 || self.nc_table.is_none() {
-                let (nc, dc, ldc, rc) = huffman::read_tables(&mut reader)?;
-                self.nc_table = Some(nc);
-                self.dc_table = Some(dc);
-                self.ldc_table = Some(ldc);
-                self.rc_table = Some(rc);
+                self.read_block_header(&mut reader)?;
             }
 
             output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
@@ -490,79 +525,52 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<()> {
         if self.pending_filters.is_empty() {
-            // No filters — just flush remaining window data.
             self.window.flush_to_writer(writer).map_err(RarError::Io)?;
             return Ok(());
         }
 
-        // When filters are present, we need the full output to apply them
-        // (filters reference absolute positions). Extract unflushed data,
-        // apply filters, and write.
         let total = self.window.total_written();
-
-        // We need to extract unflushed data from the window for filter application.
         let unflushed = self.window.unflushed_bytes();
         if unflushed == 0 {
             self.pending_filters.clear();
             return Ok(());
         }
 
-        // The absolute position of the first unflushed byte.
         let flushed_total = total - unflushed;
-
-        // Extract unflushed data from window.
         let mut buf = self.window.copy_output(flushed_total, unflushed as usize);
 
-        // Apply filters to the buffer (adjusting offsets relative to the buffer start).
-        for f in &self.pending_filters {
-            if f.block_start >= flushed_total && f.block_length > 0 {
-                let rel_start = (f.block_start - flushed_total) as usize;
-                let rel_end = rel_start + f.block_length;
-                if rel_end <= buf.len() {
-                    let block = &mut buf[rel_start..rel_end];
-                    match f.filter_type {
-                        FilterType::Delta => filter::apply_delta(block, f.channels),
-                        FilterType::E8 => filter::apply_e8(block, f.block_start),
-                        FilterType::E8E9 => filter::apply_e8e9(block, f.block_start),
-                        FilterType::Arm => filter::apply_arm(block, f.block_start),
-                    }
-                }
-            }
-        }
-        self.pending_filters.clear();
+        self.apply_filters(&mut buf, flushed_total);
 
         writer.write_all(&buf).map_err(RarError::Io)?;
-        // Mark as flushed so we don't double-write.
         self.window.mark_flushed(total);
 
         Ok(())
     }
 
     /// Reset the decoder for a new file (non-solid mode).
-    ///
-    /// Clears the window, distance cache, Huffman tables, and block state.
     pub fn reset(&mut self) {
         self.window.reset();
         self.dist_cache = [0; DIST_CACHE_SIZE];
+        self.last_length = 0;
         self.nc_table = None;
         self.dc_table = None;
         self.ldc_table = None;
         self.rc_table = None;
-        self.block_started = false;
+        self.code_lengths.fill(0);
+        self.block_bits_remaining = 0;
+        self.is_last_block = false;
         self.pending_filters.clear();
-        self.ppmd_decoder = None;
     }
 
     /// Prepare for the next member in a solid archive.
     ///
     /// In solid mode, the sliding window (dictionary) carries over between
     /// files, enabling cross-file back-references. The distance cache and
-    /// Huffman tables also persist. Only the block_started flag is reset
-    /// because each member has its own compressed bitstream.
+    /// Huffman tables also persist.
     pub fn prepare_solid_continuation(&mut self) {
-        self.block_started = false;
+        self.block_bits_remaining = 0;
+        self.is_last_block = false;
         self.pending_filters.clear();
-        // PPMd state carries over in solid mode (model retains learned contexts).
     }
 }
 
@@ -578,7 +586,6 @@ pub fn decompress_lz(
     unpacked_size: u64,
     info: &CompressionInfo,
 ) -> RarResult<Vec<u8>> {
-    // Validate dictionary size.
     if info.dict_size > MAX_DICT_SIZE {
         return Err(RarError::DictionaryTooLarge {
             size: info.dict_size,
@@ -618,22 +625,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_length_base_table() {
-        // Verify first few entries make sense.
-        assert_eq!(LENGTH_BASE[0], 2); // code 263: length 2
-        assert_eq!(LENGTH_BASE[1], 3); // code 264: length 3
-        assert_eq!(LENGTH_EXTRA_BITS[0], 0); // no extra bits for length 2
+    fn test_slot_to_length_formula() {
+        // Slots 0-7: base = 2 + slot, no extra bits
+        let data = [0u8; 8]; // unused, no bits needed for slots 0-7
+        for slot in 0..8 {
+            let mut reader = BitReader::new(&data);
+            let len = LzDecoder::slot_to_length(&mut reader, slot).unwrap();
+            assert_eq!(len, 2 + slot, "slot {slot}");
+        }
     }
 
     #[test]
-    fn test_distance_base_table() {
-        assert_eq!(DISTANCE_BASE[0], 0);
-        assert_eq!(DISTANCE_BASE[1], 1);
-        assert_eq!(DISTANCE_BASE[2], 2);
-        assert_eq!(DISTANCE_BASE[3], 3);
-        assert_eq!(DISTANCE_BASE[4], 4);
-        assert_eq!(DISTANCE_EXTRA_BITS[0], 0);
-        assert_eq!(DISTANCE_EXTRA_BITS[4], 1);
+    fn test_slot_to_length_groups_of_4() {
+        // Verify extra bits group in 4s (not 3s): slots 8-11 all have 1 extra bit
+        let data = [0xFF; 8]; // all 1s for extra bits
+        for slot in 8..12 {
+            let mut reader = BitReader::new(&data);
+            let len = LzDecoder::slot_to_length(&mut reader, slot).unwrap();
+            // With 1 extra bit = 1, check base + 1
+            let lbits = slot / 4 - 1;
+            let base = 2 + ((4 | (slot & 3)) << lbits);
+            assert_eq!(lbits, 1, "slots 8-11 should have 1 extra bit");
+            assert_eq!(len, base + 1, "slot {slot}"); // extra bit reads 1
+        }
+    }
+
+    #[test]
+    fn test_slot_to_length_max() {
+        // Slot 43 with max extra bits should give MAX_LZ_MATCH = 4097
+        let data = [0xFF; 8]; // all 1s
+        let mut reader = BitReader::new(&data);
+        let len = LzDecoder::slot_to_length(&mut reader, 43).unwrap();
+        // slot 43: lbits = 43/4-1 = 9, base = 2 + (4|3)<<9 = 2 + 7*512 = 3586
+        // extra = 9 bits of 1s = 511, total = 3586 + 511 = 4097
+        assert_eq!(len, 4097);
     }
 
     #[test]
@@ -646,6 +671,7 @@ mod tests {
     #[test]
     fn test_max_dict_size_enforcement() {
         let info = CompressionInfo {
+            format: crate::types::ArchiveFormat::Rar5,
             version: 0,
             solid: false,
             method: crate::types::CompressionMethod::Normal,
@@ -658,6 +684,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let info = CompressionInfo {
+            format: crate::types::ArchiveFormat::Rar5,
             version: 0,
             solid: false,
             method: crate::types::CompressionMethod::Normal,
@@ -669,30 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ppmd_block_dispatched() {
-        // First bit = 1 indicates PPMd block. With empty remaining data,
-        // decode_block returns Ok(0) and the decompressor finishes with empty output.
-        let data = [0x80]; // MSB first: bit 1 = PPMd
-        let info = CompressionInfo {
-            version: 0,
-            solid: false,
-            method: crate::types::CompressionMethod::Normal,
-            dict_size: 128 * 1024,
-        };
-        let result = decompress_lz(&data, 100, &info);
-        // With no PPMd data, we get an empty result (no error since block is empty).
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
-    }
-
-    #[test]
     fn test_decoder_reset() {
         let mut decoder = LzDecoder::new(128 * 1024);
         decoder.dist_cache = [10, 20, 30, 40];
-        decoder.block_started = true;
+        decoder.block_bits_remaining = 100;
         decoder.reset();
         assert_eq!(decoder.dist_cache, [0; 4]);
-        assert!(!decoder.block_started);
+        assert_eq!(decoder.block_bits_remaining, 0);
         assert!(decoder.nc_table.is_none());
     }
 
@@ -700,15 +710,15 @@ mod tests {
     fn test_prepare_solid_continuation() {
         let mut decoder = LzDecoder::new(128 * 1024);
         decoder.dist_cache = [10, 20, 30, 40];
-        decoder.block_started = true;
+        decoder.block_bits_remaining = 50;
         // Write some data to the window to simulate previous decompression.
         decoder.window.put_byte(0xAA);
         decoder.window.put_byte(0xBB);
 
         decoder.prepare_solid_continuation();
 
-        // block_started should be reset.
-        assert!(!decoder.block_started);
+        // block state should be reset.
+        assert_eq!(decoder.block_bits_remaining, 0);
         // dist_cache should be preserved.
         assert_eq!(decoder.dist_cache, [10, 20, 30, 40]);
         // Window state should be preserved.
@@ -718,64 +728,33 @@ mod tests {
     }
 
     #[test]
-    fn test_length_extra_bits_monotonic() {
-        // Extra bits should be non-decreasing
-        for i in 1..LENGTH_EXTRA_BITS.len() {
-            assert!(
-                LENGTH_EXTRA_BITS[i] >= LENGTH_EXTRA_BITS[i - 1],
-                "LENGTH_EXTRA_BITS[{}] = {} < LENGTH_EXTRA_BITS[{}] = {}",
-                i, LENGTH_EXTRA_BITS[i], i - 1, LENGTH_EXTRA_BITS[i - 1]
+    fn test_slot_ranges_contiguous() {
+        // Verify the length ranges from SlotToLength are contiguous (no gaps).
+        // Each slot covers [base, base + 2^extra_bits). Next slot's base = prev end.
+        let data = [0u8; 8];
+        let mut prev_end = 3; // slot 0 covers [2,3), slot 1 should start at 3
+        for slot in 1..NUM_LENGTH_SLOTS {
+            let mut reader = BitReader::new(&data);
+            let base = LzDecoder::slot_to_length(&mut reader, slot).unwrap();
+            assert_eq!(
+                base, prev_end,
+                "slot {slot}: base {base} != prev_end {prev_end}"
             );
-        }
-    }
-
-    #[test]
-    fn test_distance_extra_bits_monotonic() {
-        // Extra bits should be non-decreasing
-        for i in 1..DISTANCE_EXTRA_BITS.len() {
-            assert!(
-                DISTANCE_EXTRA_BITS[i] >= DISTANCE_EXTRA_BITS[i - 1],
-                "DISTANCE_EXTRA_BITS[{}] = {} < DISTANCE_EXTRA_BITS[{}] = {}",
-                i, DISTANCE_EXTRA_BITS[i], i - 1, DISTANCE_EXTRA_BITS[i - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn test_length_base_monotonic() {
-        // Length base values should be strictly increasing
-        for i in 1..LENGTH_BASE.len() {
-            assert!(
-                LENGTH_BASE[i] > LENGTH_BASE[i - 1],
-                "LENGTH_BASE[{}] = {} <= LENGTH_BASE[{}] = {}",
-                i, LENGTH_BASE[i], i - 1, LENGTH_BASE[i - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn test_distance_base_monotonic() {
-        // Distance base values should be strictly increasing
-        for i in 1..DISTANCE_BASE.len() {
-            assert!(
-                DISTANCE_BASE[i] > DISTANCE_BASE[i - 1],
-                "DISTANCE_BASE[{}] = {} <= DISTANCE_BASE[{}] = {}",
-                i, DISTANCE_BASE[i], i - 1, DISTANCE_BASE[i - 1]
-            );
+            let extra_bits = if slot < 8 { 0 } else { slot / 4 - 1 };
+            prev_end = base + (1 << extra_bits);
         }
     }
 
     #[test]
     fn test_all_compression_methods_accepted() {
-        // Methods 1-5 should all be accepted (they all use LZ)
         for method_code in 1..=5u8 {
             let info = CompressionInfo {
+                format: crate::types::ArchiveFormat::Rar5,
                 version: 0,
                 solid: false,
                 method: crate::types::CompressionMethod::from_code(method_code),
                 dict_size: 128 * 1024,
             };
-            // Empty input with 0 unpack size should succeed
             let result = decompress_lz(&[], 0, &info);
             assert!(result.is_ok(), "method {} failed", method_code);
         }

@@ -1,7 +1,10 @@
 [package]
 name = "weaver-core"
-version = "0.1.0"
-edition = "2024"
+description = "Shared types, errors, config, and buffer pool primitives for Weaver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -16,3 +19,6 @@ toml = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tempfile = { workspace = true }
+sevenz-rust2 = { workspace = true }
+weaver-assembly = { path = "../weaver-assembly" }

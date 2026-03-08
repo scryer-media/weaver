@@ -51,6 +51,13 @@ export const JOB_QUERY = gql`
       health
       hasPassword
     }
+    jobEvents(jobId: $id) {
+      kind
+      jobId
+      fileId
+      message
+      timestamp
+    }
   }
 `;
 
@@ -134,6 +141,12 @@ export const RESUME_JOB_MUTATION = gql`
 export const CANCEL_JOB_MUTATION = gql`
   mutation CancelJob($id: Int!) {
     cancelJob(id: $id)
+  }
+`;
+
+export const REPROCESS_JOB_MUTATION = gql`
+  mutation ReprocessJob($id: Int!) {
+    reprocessJob(id: $id)
   }
 `;
 
@@ -277,7 +290,8 @@ export const SETTINGS_QUERY = gql`
   query Settings {
     settings {
       dataDir
-      outputDir
+      intermediateDir
+      completeDir
       cleanupAfterExtract
       maxDownloadSpeed
       maxRetries
@@ -289,7 +303,8 @@ export const UPDATE_SETTINGS_MUTATION = gql`
   mutation UpdateSettings($input: GeneralSettingsInput!) {
     updateSettings(input: $input) {
       dataDir
-      outputDir
+      intermediateDir
+      completeDir
       cleanupAfterExtract
       maxDownloadSpeed
       maxRetries

@@ -21,6 +21,7 @@ pub fn decode_compression_info(raw: u64) -> CompressionInfo {
     let dict_size: u64 = 128 * 1024 * (1u64 << dict_code);
 
     CompressionInfo {
+        format: crate::types::ArchiveFormat::Rar5,
         version,
         solid,
         method,
@@ -104,6 +105,7 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let info = CompressionInfo {
+            format: crate::types::ArchiveFormat::Rar5,
             version: 0,
             solid: true,
             method: CompressionMethod::Best,

@@ -2,7 +2,14 @@
 //!
 //! - RAR5: AES-256-CBC with PBKDF2-HMAC-SHA256 key derivation
 //! - RAR4: AES-128-CBC with custom iterative SHA-1 key derivation
+//!
+//! Provides both batch decryption (`decrypt_data`) and streaming decryption
+//! via [`DecryptingReader`], which wraps any `Read` source and decrypts
+//! AES-CBC on-the-fly using manual block-level operations.
 
+use std::io::Read;
+
+use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use hmac::Hmac;
@@ -50,7 +57,7 @@ pub fn decrypt_data(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> RarResult<Vec
         return Ok(Vec::new());
     }
 
-    if data.len() % 16 != 0 {
+    if !data.len().is_multiple_of(16) {
         return Err(RarError::CorruptArchive {
             detail: format!(
                 "encrypted data length {} is not a multiple of AES block size (16)",
@@ -132,7 +139,7 @@ pub fn rar4_derive_key(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
 
         // Append iteration counter as 3 bytes LE.
         let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.update(&i_bytes);
+        sha.update(i_bytes);
 
         // Extract IV byte at each interval boundary.
         if (i + 1) % iv_interval == 0 {
@@ -159,7 +166,7 @@ pub fn rar4_decrypt_data(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> RarResul
         return Ok(Vec::new());
     }
 
-    if data.len() % 16 != 0 {
+    if !data.len().is_multiple_of(16) {
         return Err(RarError::CorruptArchive {
             detail: format!(
                 "RAR4 encrypted data length {} is not a multiple of AES block size (16)",
@@ -177,6 +184,231 @@ pub fn rar4_decrypt_data(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> RarResul
         })?;
 
     Ok(buf)
+}
+
+// =============================================================================
+// Streaming AES-CBC decryption
+// =============================================================================
+
+const AES_BLOCK: usize = 16;
+
+/// Stateful AES-256-CBC decryptor for incremental (streaming) decryption.
+///
+/// Unlike `decrypt_data` which requires all data at once, this carries the
+/// CBC IV state across calls to `decrypt_blocks`.
+pub struct CbcDecryptor {
+    cipher: Aes256,
+    iv: [u8; AES_BLOCK],
+}
+
+impl CbcDecryptor {
+    pub fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
+        Self {
+            cipher: Aes256::new(key.into()),
+            iv: *iv,
+        }
+    }
+
+    /// Decrypt `data` in-place. `data.len()` MUST be a multiple of 16.
+    /// Updates internal IV state for subsequent calls.
+    pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
+        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+        for block in data.chunks_exact_mut(AES_BLOCK) {
+            // Save ciphertext — it becomes the IV for the next block.
+            let mut ct = [0u8; AES_BLOCK];
+            ct.copy_from_slice(block);
+
+            // Decrypt in-place.
+            let gen_block = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+            self.cipher.decrypt_block(gen_block);
+
+            // XOR with IV to complete CBC.
+            for (b, iv_byte) in block.iter_mut().zip(self.iv.iter()) {
+                *b ^= iv_byte;
+            }
+
+            self.iv = ct;
+        }
+    }
+}
+
+/// Stateful AES-128-CBC decryptor for RAR4 archives.
+pub struct Rar4CbcDecryptor {
+    cipher: Aes128,
+    iv: [u8; AES_BLOCK],
+}
+
+impl Rar4CbcDecryptor {
+    pub fn new(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
+        Self {
+            cipher: Aes128::new(key.into()),
+            iv: *iv,
+        }
+    }
+
+    /// Decrypt `data` in-place. `data.len()` MUST be a multiple of 16.
+    pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
+        debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+        for block in data.chunks_exact_mut(AES_BLOCK) {
+            let mut ct = [0u8; AES_BLOCK];
+            ct.copy_from_slice(block);
+            let gen_block = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+            self.cipher.decrypt_block(gen_block);
+            for (b, iv_byte) in block.iter_mut().zip(self.iv.iter()) {
+                *b ^= iv_byte;
+            }
+            self.iv = ct;
+        }
+    }
+}
+
+/// Decryptor enum that handles both RAR5 (AES-256) and RAR4 (AES-128).
+pub enum CbcDecryptorAny {
+    Rar5(Box<CbcDecryptor>),
+    Rar4(Box<Rar4CbcDecryptor>),
+}
+
+impl CbcDecryptorAny {
+    pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
+        match self {
+            Self::Rar5(d) => d.decrypt_blocks(data),
+            Self::Rar4(d) => d.decrypt_blocks(data),
+        }
+    }
+}
+
+/// Decryption buffer size: 4096 bytes = 256 AES blocks.
+const DECRYPT_BUF_SIZE: usize = 4096;
+
+/// A `Read` adapter that decrypts AES-CBC on-the-fly.
+///
+/// Wraps an inner `Read` source (e.g. `ChainedSegmentReader`) and decrypts
+/// data as it flows through. Handles partial AES blocks at read boundaries
+/// by buffering internally.
+///
+/// The total data from the inner reader MUST be a multiple of 16 bytes
+/// (guaranteed by RAR's archive format for encrypted members).
+pub struct DecryptingReader<R: Read> {
+    inner: R,
+    decryptor: CbcDecryptorAny,
+    /// Bytes read from inner but not yet forming a complete AES block.
+    pending: [u8; AES_BLOCK],
+    pending_len: usize,
+    /// Decrypted data ready to be consumed by the caller.
+    out_buf: [u8; DECRYPT_BUF_SIZE],
+    out_pos: usize,
+    out_len: usize,
+    /// Inner reader hit EOF.
+    inner_eof: bool,
+}
+
+impl<R: Read> DecryptingReader<R> {
+    /// Create a new decrypting reader for RAR5 (AES-256-CBC).
+    pub fn new_rar5(inner: R, key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self {
+            inner,
+            decryptor: CbcDecryptorAny::Rar5(Box::new(CbcDecryptor::new(key, iv))),
+            pending: [0u8; AES_BLOCK],
+            pending_len: 0,
+            out_buf: [0u8; DECRYPT_BUF_SIZE],
+            out_pos: 0,
+            out_len: 0,
+            inner_eof: false,
+        }
+    }
+
+    /// Create a new decrypting reader for RAR4 (AES-128-CBC).
+    pub fn new_rar4(inner: R, key: &[u8; 16], iv: &[u8; 16]) -> Self {
+        Self {
+            inner,
+            decryptor: CbcDecryptorAny::Rar4(Box::new(Rar4CbcDecryptor::new(key, iv))),
+            pending: [0u8; AES_BLOCK],
+            pending_len: 0,
+            out_buf: [0u8; DECRYPT_BUF_SIZE],
+            out_pos: 0,
+            out_len: 0,
+            inner_eof: false,
+        }
+    }
+}
+
+impl<R: Read> Read for DecryptingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Return any buffered decrypted data first.
+        if self.out_pos < self.out_len {
+            let n = (self.out_len - self.out_pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + n]);
+            self.out_pos += n;
+            return Ok(n);
+        }
+
+        if self.inner_eof && self.pending_len == 0 {
+            return Ok(0);
+        }
+
+        // Read from inner into a temp buffer, prepending any pending bytes.
+        // We want to fill out_buf with complete AES blocks.
+        let mut raw = [0u8; DECRYPT_BUF_SIZE + AES_BLOCK];
+        let raw_start;
+        if self.pending_len > 0 {
+            raw[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+            raw_start = self.pending_len;
+            self.pending_len = 0;
+        } else {
+            raw_start = 0;
+        }
+
+        // Read more from inner.
+        let bytes_read = if !self.inner_eof {
+            let n = self.inner.read(&mut raw[raw_start..raw_start + DECRYPT_BUF_SIZE])?;
+            if n == 0 {
+                self.inner_eof = true;
+            }
+            n
+        } else {
+            0
+        };
+
+        let total = raw_start + bytes_read;
+        if total == 0 {
+            return Ok(0);
+        }
+
+        // How many complete AES blocks do we have?
+        let complete = (total / AES_BLOCK) * AES_BLOCK;
+        let leftover = total - complete;
+
+        // Save leftover for next call.
+        if leftover > 0 {
+            self.pending[..leftover].copy_from_slice(&raw[complete..total]);
+            self.pending_len = leftover;
+        }
+
+        if complete == 0 {
+            // Not enough data for a full block yet. If inner is EOF, this
+            // means the data wasn't block-aligned — shouldn't happen.
+            if self.inner_eof {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encrypted data not aligned to AES block size",
+                ));
+            }
+            // Try reading more.
+            return self.read(buf);
+        }
+
+        // Decrypt complete blocks in-place.
+        self.out_buf[..complete].copy_from_slice(&raw[..complete]);
+        self.decryptor.decrypt_blocks(&mut self.out_buf[..complete]);
+        self.out_pos = 0;
+        self.out_len = complete;
+
+        // Copy to caller.
+        let n = complete.min(buf.len());
+        buf[..n].copy_from_slice(&self.out_buf[..n]);
+        self.out_pos = n;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

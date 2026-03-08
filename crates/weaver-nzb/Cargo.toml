@@ -1,7 +1,10 @@
 [package]
 name = "weaver-nzb"
-version = "0.1.0"
-edition = "2024"
+description = "NZB XML parser for Usenet binary article references"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }

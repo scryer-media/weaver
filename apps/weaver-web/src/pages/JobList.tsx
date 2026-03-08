@@ -314,7 +314,8 @@ export function JobList() {
         open={cancelConfirmId != null}
         title={t("confirm.cancelJob")}
         message={t("confirm.cancelJobMessage")}
-        confirmLabel={t("action.cancel")}
+        confirmLabel={t("confirm.cancelJobConfirm")}
+        cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => {
           if (cancelConfirmId != null) cancelJob({ id: cancelConfirmId });
           setCancelConfirmId(null);

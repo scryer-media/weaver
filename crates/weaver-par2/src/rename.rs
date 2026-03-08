@@ -91,8 +91,8 @@ pub fn scan_for_renames(
         }
         let hash = checksum::md5(&data);
 
-        if let Some(&(file_id, correct_name)) = hash_lookup.get(&hash) {
-            if file_name != correct_name {
+        if let Some(&(file_id, correct_name)) = hash_lookup.get(&hash)
+            && file_name != correct_name {
                 debug!(
                     "rename match: {} -> {} (16k hash match)",
                     file_name, correct_name
@@ -104,7 +104,6 @@ pub fn scan_for_renames(
                     match_type: MatchType::Hash16k,
                 });
             }
-        }
     }
 
     Ok(suggestions)
@@ -141,12 +140,11 @@ pub fn identify_par2_files(
         }
 
         // Try to parse the header.
-        if let Ok(hdr) = PacketHeader::parse(&data, 0) {
-            if hdr.recovery_set_id == *expected_set_id {
+        if let Ok(hdr) = PacketHeader::parse(&data, 0)
+            && hdr.recovery_set_id == *expected_set_id {
                 debug!("identified par2 file: {}", path.display());
                 matches.push(path);
             }
-        }
     }
 
     Ok(matches)
@@ -186,16 +184,14 @@ pub fn detect_split_files(dir: &Path) -> io::Result<Vec<SplitFileGroup>> {
         };
 
         // Check if the extension is purely numeric.
-        if let Some((base, ext)) = file_name.rsplit_once('.') {
-            if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(num) = ext.parse::<u32>() {
+        if let Some((base, ext)) = file_name.rsplit_once('.')
+            && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_digit())
+                && let Ok(num) = ext.parse::<u32>() {
                     groups
                         .entry(base.to_string())
                         .or_default()
                         .push((num, path));
                 }
-            }
-        }
     }
 
     let mut result = Vec::new();

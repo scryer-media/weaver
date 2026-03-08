@@ -55,6 +55,7 @@ pub struct HuffmanTable {
     /// Value >= 0 means symbol; value < 0 means -(child_pair_index).
     decode_tree: Vec<i32>,
     /// Number of tree node pairs allocated.
+    #[allow(dead_code)]
     tree_nodes: usize,
     /// Maximum code length in the table.
     max_length: u8,
@@ -124,12 +125,13 @@ impl HuffmanTable {
             QUICK_TABLE_SIZE
         ];
 
-        // Pre-allocate a tree for longer codes.
-        // Worst case: each code longer than QUICK_BITS needs nodes.
-        let initial_tree_size = (num_symbols * 4).max(64);
-        let mut decode_tree = vec![0i32; initial_tree_size];
-        // Node 0 is the root pair.
-        let mut tree_nodes: usize = 1; // pairs allocated
+        // Pre-allocate tree for codes longer than QUICK_BITS.
+        // Each unique QUICK_BITS prefix gets its own subtree.
+        // Tree is stored as pairs: tree[idx*2] = left, tree[idx*2+1] = right.
+        // Positive value = symbol (leaf). Negative value = -(child pair index).
+        // Zero = uninitialized node.
+        let mut decode_tree: Vec<i32> = Vec::new();
+        let mut tree_nodes: usize = 0; // pairs allocated
 
         for (sym, &(code, length)) in symbol_codes.iter().enumerate() {
             if length == 0 {
@@ -151,58 +153,66 @@ impl HuffmanTable {
                     }
                 }
             } else {
-                // For codes longer than QUICK_BITS, store in the tree.
-                // The first QUICK_BITS direct us to a tree entry, then we
-                // walk bit by bit.
+                // Codes longer than QUICK_BITS: use tree.
+                // The QUICK_BITS prefix selects a tree root via the quick table.
                 let prefix = (code >> (length - QUICK_BITS)) as usize;
-                if prefix < QUICK_TABLE_SIZE {
-                    // Mark the quick entry as requiring tree walk.
-                    // Store the tree root node index negated.
-                    if quick[prefix].symbol == 0xFFFF && quick[prefix].length == 0 {
-                        // First time: create a tree root for this prefix.
-                        quick[prefix].length = QUICK_BITS + 1; // sentinel: means "use tree"
-                    }
-                }
 
-                // Walk the tree from the root for bits after QUICK_BITS.
-                let mut node_idx: usize = 0; // root pair
-                for bit_idx in (0..(length - QUICK_BITS)).rev() {
+                // Get or create a tree root for this prefix.
+                let tree_root = if prefix < QUICK_TABLE_SIZE
+                    && quick[prefix].length > QUICK_BITS
+                {
+                    // Already has a tree root.
+                    quick[prefix].symbol as usize
+                } else {
+                    // Allocate a new tree root pair.
+                    let root = tree_nodes;
+                    tree_nodes += 1;
+                    let needed = root * 2 + 2;
+                    if needed > decode_tree.len() {
+                        decode_tree.resize(needed, 0);
+                    }
+                    if prefix < QUICK_TABLE_SIZE {
+                        quick[prefix] = QuickEntry {
+                            symbol: root as u16,
+                            length: QUICK_BITS + 1, // sentinel: tree walk required
+                        };
+                    }
+                    root
+                };
+
+                // Walk the tree for bits after QUICK_BITS.
+                let suffix_len = length - QUICK_BITS;
+                let mut node_idx = tree_root;
+
+                for bit_idx in (0..suffix_len).rev() {
                     let bit = ((code >> bit_idx) & 1) as usize;
-                    let slot = node_idx.checked_mul(2).unwrap_or(usize::MAX)
-                        .checked_add(bit).unwrap_or(usize::MAX);
+                    let slot = node_idx * 2 + bit;
 
                     // Ensure tree is large enough.
-                    while slot >= decode_tree.len() {
-                        let new_len = decode_tree.len().saturating_mul(2).max(slot.saturating_add(2));
-                        decode_tree.resize(new_len, 0);
+                    if slot >= decode_tree.len() {
+                        decode_tree.resize(slot + 2, 0);
                     }
 
                     if bit_idx == 0 {
-                        // Leaf: store symbol.
-                        decode_tree[slot] = sym as i32;
-                    } else if decode_tree[slot] <= 0 && bit_idx > 0 {
-                        if decode_tree[slot] == 0 {
-                            // Allocate a new node pair.
-                            let new_node = tree_nodes;
-                            tree_nodes += 1;
-                            let needed = new_node.checked_mul(2)
-                                .unwrap_or(usize::MAX)
-                                .checked_add(2).unwrap_or(usize::MAX);
-                            while needed > decode_tree.len() {
-                                let new_len = decode_tree.len().saturating_mul(2).max(needed);
-                                decode_tree.resize(new_len, 0);
-                            }
-                            decode_tree[slot] = -(new_node as i32);
+                        // Leaf: store symbol (encoded as sym + 1 so 0 stays "empty").
+                        decode_tree[slot] = (sym as i32) + 1;
+                    } else if decode_tree[slot] == 0 {
+                        // Allocate a new child node pair.
+                        let new_node = tree_nodes;
+                        tree_nodes += 1;
+                        let needed = new_node * 2 + 2;
+                        if needed > decode_tree.len() {
+                            decode_tree.resize(needed, 0);
                         }
-                        node_idx = (-decode_tree[slot]) as usize;
+                        decode_tree[slot] = -(new_node as i32) - 1;
+                        node_idx = new_node;
                     } else {
-                        node_idx = (-decode_tree[slot]) as usize;
+                        // Existing internal node.
+                        node_idx = (-(decode_tree[slot] + 1)) as usize;
                     }
                 }
             }
         }
-
-        decode_tree.truncate(tree_nodes * 2);
 
         Ok(Self {
             quick,
@@ -219,8 +229,6 @@ impl HuffmanTable {
             return Err(RarError::InvalidHuffmanTable);
         }
 
-        // Try quick lookup first.
-        let peek_count = QUICK_BITS.min(self.max_length);
         let bits_avail = reader.bits_remaining();
         if bits_avail == 0 {
             return Err(RarError::CorruptArchive {
@@ -228,66 +236,64 @@ impl HuffmanTable {
             });
         }
 
-        let peek_len = peek_count.min(bits_avail as u8);
+        // Try quick lookup first.
+        let peek_len = (QUICK_BITS as usize).min(self.max_length as usize).min(bits_avail) as u8;
         let peeked = reader.peek_bits(peek_len)?;
-        // Pad to QUICK_BITS for table lookup.
         let index = if peek_len < QUICK_BITS {
             (peeked as usize) << (QUICK_BITS - peek_len)
         } else {
             peeked as usize
         };
 
-        if index < QUICK_TABLE_SIZE {
-            let entry = &self.quick[index];
-            if entry.symbol != 0xFFFF && entry.length > 0 && entry.length <= QUICK_BITS {
-                if (entry.length as usize) <= bits_avail {
-                    reader.skip_bits(entry.length as u32)?;
-                    return Ok(entry.symbol);
+        let entry = &self.quick[index];
+        if entry.length > 0 && entry.length <= QUICK_BITS {
+            // Direct hit in quick table.
+            if (entry.length as usize) <= bits_avail {
+                reader.skip_bits(entry.length as u32)?;
+                return Ok(entry.symbol);
+            }
+        } else if entry.length > QUICK_BITS {
+            // Tree walk required. Skip the QUICK_BITS prefix.
+            reader.skip_bits(peek_len as u32)?;
+            let mut node_idx = entry.symbol as usize; // tree root for this prefix
+
+            let remaining_bits = self.max_length - QUICK_BITS;
+            for _ in 0..remaining_bits {
+                if reader.bits_remaining() == 0 {
+                    return Err(RarError::CorruptArchive {
+                        detail: "huffman: truncated code".into(),
+                    });
+                }
+                let bit = reader.read_bit()? as usize;
+                let slot = node_idx * 2 + bit;
+                if slot >= self.decode_tree.len() {
+                    return Err(RarError::CorruptArchive {
+                        detail: "huffman: invalid code in tree".into(),
+                    });
+                }
+
+                let val = self.decode_tree[slot];
+                if val > 0 {
+                    // Leaf: symbol = val - 1.
+                    return Ok((val - 1) as u16);
+                } else if val < 0 {
+                    // Internal node: follow to child.
+                    node_idx = (-(val + 1)) as usize;
+                } else {
+                    // Uninitialized node — invalid code.
+                    return Err(RarError::CorruptArchive {
+                        detail: "huffman: invalid code (uninitialized tree node)".into(),
+                    });
                 }
             }
-        }
 
-        // Fall back to tree walk for longer codes.
-        // We need to read bit by bit past the quick prefix.
-        if self.tree_nodes <= 1 && self.max_length <= QUICK_BITS {
-            // No tree nodes and max_length fits in quick table -- symbol not found.
             return Err(RarError::CorruptArchive {
-                detail: "huffman: invalid code".into(),
+                detail: "huffman: code exceeds max length".into(),
             });
         }
 
-        // Skip the QUICK_BITS we already peeked, then walk the tree.
-        let mut node_idx: usize = 0;
-        reader.skip_bits(peek_len as u32)?;
-
-        // Walk remaining bits.
-        let remaining_bits = self.max_length - peek_len;
-        for _ in 0..remaining_bits {
-            if reader.bits_remaining() == 0 {
-                return Err(RarError::CorruptArchive {
-                    detail: "huffman: truncated code".into(),
-                });
-            }
-            let bit = reader.read_bit()? as usize;
-            let slot = node_idx * 2 + bit;
-            if slot >= self.decode_tree.len() {
-                return Err(RarError::CorruptArchive {
-                    detail: "huffman: invalid code in tree".into(),
-                });
-            }
-
-            let val = self.decode_tree[slot];
-            if val < 0 {
-                // Internal node: follow to child.
-                node_idx = (-val) as usize;
-            } else {
-                // Leaf: return symbol.
-                return Ok(val as u16);
-            }
-        }
-
         Err(RarError::CorruptArchive {
-            detail: "huffman: code exceeds max length".into(),
+            detail: "huffman: invalid code".into(),
         })
     }
 
@@ -295,23 +301,53 @@ impl HuffmanTable {
     pub fn num_symbols(&self) -> usize {
         self.num_symbols
     }
+
+    /// Returns the maximum code length.
+    pub fn max_length(&self) -> u8 {
+        self.max_length
+    }
 }
 
 /// Read the 5 Huffman tables from the bitstream (called at the start of an LZ block
-/// when keepOldTable is false).
+/// when table_present is set).
+///
+/// `prev_lengths` carries code lengths across blocks for delta encoding.
+/// On first call, pass a zero-initialized vec of length `HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC`.
 ///
 /// Returns (nc_table, dc_table, ldc_table, rc_table).
-pub fn read_tables(reader: &mut BitReader) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
+pub fn read_tables(reader: &mut BitReader, prev_lengths: &mut [u8]) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     // Step 1: Read 20 x 4-bit lengths for the BC (bit-length code) table.
+    // Special encoding: if a 4-bit value is 0xF, read 4 more bits as skip count.
+    // If count > 0, skip (count+1) entries (all zeros). If count == 0, value is 15.
     let mut bc_lengths = [0u8; HUFF_BC];
-    for bl in &mut bc_lengths {
-        *bl = reader.read_bits(4)? as u8;
+    let mut i = 0;
+    while i < HUFF_BC {
+        let n = reader.read_bits(4)? as u8;
+        if n == 0x0F {
+            let cnt = reader.read_bits(4)? as usize;
+            if cnt > 0 {
+                // Skip cnt+2 entries (zero-fill), matching 7-zip's zeroCount += 2.
+                i += cnt + 2;
+                continue;
+            }
+            // cnt == 0: value is literally 15.
+        }
+        if i < HUFF_BC {
+            bc_lengths[i] = n;
+        }
+        i += 1;
     }
     let bc_table = HuffmanTable::build(&bc_lengths)?;
 
     // Step 2: Use BC table to decode lengths for NC, DC, LDC, RC tables.
+    // Symbols 0-15: direct bit length values.
+    // Symbols 16-19 are RLE codes:
+    //   16: repeat previous, count = readBits(3) + 3  (3-10)
+    //   17: repeat previous, count = readBits(7) + 11 (11-138)
+    //   18: zero fill,       count = readBits(3) + 3  (3-10)
+    //   19: zero fill,       count = readBits(7) + 11 (11-138)
     let total_symbols = HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC;
-    let mut all_lengths = vec![0u8; total_symbols];
+    let all_lengths = prev_lengths;
     let mut i = 0;
 
     while i < total_symbols {
@@ -325,46 +361,31 @@ pub fn read_tables(reader: &mut BitReader) -> RarResult<(HuffmanTable, HuffmanTa
             // Direct bit length value.
             all_lengths[i] = sym as u8;
             i += 1;
-        } else if sym == 16 {
-            // Repeat previous length 3 + next 2 bits times.
-            if i == 0 {
-                return Err(RarError::CorruptArchive {
-                    detail: "huffman: repeat code at start of table".into(),
-                });
-            }
-            let count = 3 + reader.read_bits(2)? as usize;
-            let prev = all_lengths[i - 1];
-            for _ in 0..count {
-                if i >= total_symbols {
-                    break;
-                }
-                all_lengths[i] = prev;
-                i += 1;
-            }
-        } else if sym == 17 {
-            // Run of 3 + next 3 bits zeros.
-            let count = 3 + reader.read_bits(3)? as usize;
-            for _ in 0..count {
-                if i >= total_symbols {
-                    break;
-                }
-                all_lengths[i] = 0;
-                i += 1;
-            }
-        } else if sym == 18 {
-            // Run of 11 + next 7 bits zeros.
-            let count = 11 + reader.read_bits(7)? as usize;
-            for _ in 0..count {
-                if i >= total_symbols {
-                    break;
-                }
-                all_lengths[i] = 0;
-                i += 1;
-            }
         } else {
-            return Err(RarError::CorruptArchive {
-                detail: format!("huffman: invalid BC symbol {sym}"),
-            });
+            // RLE code: determine count and fill value.
+            let count = match sym {
+                16 | 18 => 3 + reader.read_bits(3)? as usize,   // short: 3-10
+                _       => 11 + reader.read_bits(7)? as usize,  // long: 11-138 (17, 19)
+            };
+            let value = if sym < 18 {
+                // Symbols 16-17: repeat previous value.
+                if i == 0 {
+                    return Err(RarError::CorruptArchive {
+                        detail: "huffman: repeat code at start of table".into(),
+                    });
+                }
+                all_lengths[i - 1]
+            } else {
+                // Symbols 18-19: fill with zeros.
+                0
+            };
+            for _ in 0..count {
+                if i >= total_symbols {
+                    break;
+                }
+                all_lengths[i] = value;
+                i += 1;
+            }
         }
     }
 
@@ -558,5 +579,27 @@ mod tests {
         assert_eq!(table.decode(&mut reader).unwrap(), 2);
         assert_eq!(table.decode(&mut reader).unwrap(), 3);
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn test_bc_table_sym14_vs_sym19() {
+        // Exact BC table from our test fixture.
+        let bc_lengths: [u8; 20] = [6,0,5,4,3,4,4,4,3,4,6,4,4,4,4,0,5,6,6,4];
+        let table = HuffmanTable::build(&bc_lengths).unwrap();
+
+        // sym 14: code=12=1100 (len 4), sym 19: code=13=1101 (len 4)
+        // Code 1101 → sym 19
+        let data_19 = [0b11010000]; // 1101 0000
+        let mut r = BitReader::new(&data_19);
+        let sym = table.decode(&mut r).unwrap();
+        assert_eq!(sym, 19, "code 1101 should be sym 19, got {}", sym);
+        assert_eq!(r.position(), 4);
+
+        // Code 1100 → sym 14
+        let data_14 = [0b11000000]; // 1100 0000
+        let mut r = BitReader::new(&data_14);
+        let sym = table.decode(&mut r).unwrap();
+        assert_eq!(sym, 14, "code 1100 should be sym 14, got {}", sym);
+        assert_eq!(r.position(), 4);
     }
 }

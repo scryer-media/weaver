@@ -30,7 +30,8 @@ export function Settings() {
   const [initialized, setInitialized] = useState(false);
 
   // General settings form state
-  const [outputDir, setOutputDir] = useState("");
+  const [intermediateDir, setIntermediateDir] = useState("");
+  const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
   const [settingsSaved, setSettingsSaved] = useState(false);
@@ -48,7 +49,8 @@ export function Settings() {
   // Populate general settings form from query data
   useEffect(() => {
     if (settings) {
-      setOutputDir(settings.outputDir ?? "");
+      setIntermediateDir(settings.intermediateDir ?? "");
+      setCompleteDir(settings.completeDir ?? "");
       setCleanup(settings.cleanupAfterExtract ?? true);
       setMaxRetries(settings.maxRetries ?? 3);
     }
@@ -65,7 +67,8 @@ export function Settings() {
   const handleSaveSettings = async () => {
     await updateSettings({
       input: {
-        outputDir: outputDir || null,
+        intermediateDir: intermediateDir || null,
+        completeDir: completeDir || null,
         cleanupAfterExtract: cleanup,
         maxDownloadSpeed: null,
         maxRetries,
@@ -147,14 +150,26 @@ export function Settings() {
                 </div>
               </div>
               <div>
-                <label className="mb-1 block text-sm text-muted-foreground">{t("settings.outputDir")}</label>
+                <label className="mb-1 block text-sm text-muted-foreground">{t("settings.intermediateDir")}</label>
                 <input
                   type="text"
-                  value={outputDir}
-                  onChange={(e) => setOutputDir(e.target.value)}
-                  placeholder={settings.dataDir}
+                  value={intermediateDir}
+                  onChange={(e) => setIntermediateDir(e.target.value)}
+                  placeholder={`${settings.dataDir}/intermediate`}
                   className="w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
                 />
+                <div className="mt-0.5 text-xs text-muted-foreground">{t("settings.intermediateDirDesc")}</div>
+              </div>
+              <div>
+                <label className="mb-1 block text-sm text-muted-foreground">{t("settings.completeDir")}</label>
+                <input
+                  type="text"
+                  value={completeDir}
+                  onChange={(e) => setCompleteDir(e.target.value)}
+                  placeholder={`${settings.dataDir}/complete`}
+                  className="w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
+                />
+                <div className="mt-0.5 text-xs text-muted-foreground">{t("settings.completeDirDesc")}</div>
               </div>
               <div className="flex items-center justify-between">
                 <div>

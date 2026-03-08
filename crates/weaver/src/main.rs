@@ -20,6 +20,7 @@ use weaver_core::system::*;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_nntp::pool::ServerPoolConfig;
 use weaver_scheduler::{SchedulerCommand, SchedulerHandle};
+use weaver_state::Database;
 
 #[derive(Parser)]
 #[command(name = "weaver", about = "Usenet binary downloader")]
@@ -70,9 +71,9 @@ async fn async_main() {
 
     let cli = Cli::parse();
 
-    // Load config.
-    let mut config = match load_config(&cli.config) {
-        Ok(c) => c,
+    // Open database and load config.
+    let (db, mut config) = match open_db_and_config(&cli.config) {
+        Ok(r) => r,
         Err(e) => {
             error!("failed to load config: {e}");
             std::process::exit(1);
@@ -88,14 +89,16 @@ async fn async_main() {
 
     match cli.command {
         Command::Download { nzb, output } => {
-            let output_dir = output.unwrap_or_else(|| PathBuf::from(&config.data_dir));
-            if let Err(e) = run_download(&mut config, &nzb, &output_dir).await {
+            let data_dir = PathBuf::from(&config.data_dir);
+            let intermediate_dir = output.unwrap_or_else(|| PathBuf::from(config.intermediate_dir()));
+            let complete_dir = PathBuf::from(config.complete_dir());
+            if let Err(e) = run_download(&mut config, &db, &nzb, &data_dir, &intermediate_dir, &complete_dir).await {
                 error!("download failed: {e}");
                 std::process::exit(1);
             }
         }
         Command::Serve { port } => {
-            if let Err(e) = run_server_command(config, port).await {
+            if let Err(e) = run_server_command(config, db, port).await {
                 error!("server failed: {e}");
                 std::process::exit(1);
             }
@@ -103,13 +106,43 @@ async fn async_main() {
     }
 }
 
-/// Load and parse the TOML config file.
-fn load_config(path: &PathBuf) -> Result<Config, Box<dyn std::error::Error>> {
-    let contents = std::fs::read_to_string(path)?;
-    let mut config: Config = toml::from_str(&contents)?;
-    config.config_path = Some(path.clone());
-    config.assign_server_ids();
-    Ok(config)
+/// Open the SQLite database and load config.
+///
+/// If `--config` points to a `.toml` file, the DB is created alongside it and
+/// the TOML content is migrated. Otherwise, `--config` is treated as the data
+/// directory containing `weaver.db`.
+fn open_db_and_config(
+    config_path: &Path,
+) -> Result<(Database, Config), Box<dyn std::error::Error>> {
+    let (db_path, toml_path) = if config_path.extension().is_some_and(|e| e == "toml") {
+        // --config weaver.toml → DB lives next to the TOML file.
+        let dir = config_path.parent().unwrap_or(Path::new("."));
+        (dir.join("weaver.db"), Some(config_path.to_path_buf()))
+    } else {
+        // --config <dir> → directory containing weaver.db.
+        let dir = config_path;
+        let toml_candidate = dir.join("weaver.toml");
+        let toml = if toml_candidate.exists() {
+            Some(toml_candidate)
+        } else {
+            None
+        };
+        (dir.join("weaver.db"), toml)
+    };
+
+    let db = Database::open(&db_path)?;
+
+    // Migrate from TOML if the DB is fresh.
+    if let Some(ref toml) = toml_path {
+        match db.migrate_from_toml(toml) {
+            Ok(true) => info!(toml = %toml.display(), "migrated config from TOML to SQLite"),
+            Ok(false) => {} // already migrated or TOML not found
+            Err(e) => error!(error = %e, "TOML migration failed"),
+        }
+    }
+
+    let config = db.load_config()?;
+    Ok((db, config))
 }
 
 /// Build a system profile by probing the host machine.
@@ -120,8 +153,11 @@ fn detect_system(output_dir: &Path) -> SystemProfile {
 /// Run a download job from an NZB file.
 async fn run_download(
     config: &mut Config,
-    nzb_path: &PathBuf,
-    output_dir: &PathBuf,
+    db: &Database,
+    nzb_path: &Path,
+    data_dir: &Path,
+    intermediate_dir: &Path,
+    complete_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read and parse NZB.
     let nzb_bytes = std::fs::read(nzb_path)?;
@@ -135,7 +171,7 @@ async fn run_download(
     );
 
     // Detect system capabilities.
-    let profile = detect_system(output_dir);
+    let profile = detect_system(intermediate_dir);
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
@@ -161,7 +197,7 @@ async fn run_download(
     let buffers = BufferPool::new(buf_config);
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
-    detect_server_capabilities(config).await;
+    detect_server_capabilities(config, db).await;
     let nntp = build_nntp_client(config);
 
     // Set up scheduler channels.
@@ -208,7 +244,7 @@ async fn run_download(
     // Create and start the pipeline.
     let total_connections: usize = config.servers.iter().map(|s| s.connections as usize).sum();
     let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, output_dir.clone(), total_connections, write_buf_max, vec![])
+        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir.to_path_buf(), intermediate_dir.to_path_buf(), complete_dir.to_path_buf(), total_connections, write_buf_max, vec![], db.clone())
             .await?;
 
     // Start the pipeline BEFORE submitting the job — add_job awaits a reply
@@ -218,7 +254,7 @@ async fn run_download(
     });
 
     // Submit the job via the handle.
-    handle.add_job(job_id, job_spec, nzb_path.clone()).await?;
+    handle.add_job(job_id, job_spec, nzb_path.to_path_buf()).await?;
 
     // Wait for shutdown signal.
     wait_for_shutdown().await;
@@ -249,61 +285,18 @@ async fn wait_for_shutdown() {
     }
 }
 
-/// Read all journal entries and compute the max job ID.
-/// Returns (max_id, entries). Returns (0, vec![]) if the journal doesn't exist.
-async fn read_journal(journal_path: &Path) -> (u64, Vec<weaver_state::JournalEntry>) {
-    use weaver_state::{JournalEntry, JournalReader};
-
-    if !journal_path.exists() {
-        return (0, vec![]);
-    }
-
-    let mut reader = match JournalReader::open(journal_path).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open journal");
-            return (0, vec![]);
-        }
-    };
-
-    let entries = match reader.read_all().await {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "journal read error");
-            return (0, vec![]);
-        }
-    };
-
-    let mut max_id: u64 = 0;
-    for entry in &entries {
-        let id = match entry {
-            JournalEntry::JobCreated { job_id, .. }
-            | JournalEntry::JobStatusChanged { job_id, .. }
-            | JournalEntry::Par2MetadataLoaded { job_id, .. }
-            | JournalEntry::MemberExtracted { job_id, .. }
-            | JournalEntry::ExtractionComplete { job_id, .. }
-            | JournalEntry::Checkpoint { job_id, .. } => job_id.0,
-            JournalEntry::SegmentCommitted { segment_id, .. } => segment_id.file_id.job_id.0,
-            JournalEntry::FileComplete { file_id, .. }
-            | JournalEntry::FileVerified { file_id, .. } => file_id.job_id.0,
-        };
-        if id > max_id {
-            max_id = id;
-        }
-    }
-
-    (max_id, entries)
-}
-
 /// Run the HTTP server with the GraphQL API.
 async fn run_server_command(
     mut config: Config,
+    db: Database,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir = PathBuf::from(&config.data_dir);
+    let data_dir = PathBuf::from(&config.data_dir);
+    let intermediate_dir = PathBuf::from(config.intermediate_dir());
+    let complete_dir = PathBuf::from(config.complete_dir());
 
     // Detect system capabilities.
-    let profile = detect_system(&output_dir);
+    let profile = detect_system(&intermediate_dir);
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
@@ -329,7 +322,7 @@ async fn run_server_command(
     let buffers = BufferPool::new(buf_config);
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
-    detect_server_capabilities(&mut config).await;
+    detect_server_capabilities(&mut config, &db).await;
     let nntp = build_nntp_client(&config);
     let total_connections: usize = config
         .servers
@@ -346,37 +339,41 @@ async fn run_server_command(
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone());
 
-    // Read journal and recover state.
-    let journal_path = output_dir.join(".weaver-journal");
-    let (max_id, journal_entries) = read_journal(&journal_path).await;
+    // One-time migration: convert binary journal to SQLite if it exists.
+    let journal_path = data_dir.join(".weaver-journal");
+    match db.migrate_from_journal(&journal_path) {
+        Ok(true) => info!("migrated journal to SQLite"),
+        Ok(false) => {}
+        Err(e) => error!(error = %e, "journal migration failed"),
+    }
+
+    // Recover active jobs from SQLite.
+    let max_id = db.max_job_id_all().unwrap_or(0);
     if max_id > 0 {
-        info!(max_id, "recovered max job ID from journal");
+        info!(max_id, "recovered max job ID");
     }
     weaver_api::init_job_counter(max_id + 1);
 
-    // Replay journal to recover job state.
-    let recovery = weaver_state::recover(journal_entries);
+    let active_jobs = db.load_active_jobs().unwrap_or_default();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
     let mut to_restore = Vec::new();
 
-    for (job_id, recovered) in recovery.jobs {
+    for (job_id, recovered) in active_jobs {
         let is_finished = matches!(
-            recovered.status,
-            weaver_state::PersistedJobStatus::Complete
-                | weaver_state::PersistedJobStatus::Failed { .. }
+            recovered.status.as_str(),
+            "complete" | "failed" | "cancelled"
         );
 
         if is_finished {
-            // Build a minimal JobInfo for history display.
             let name = recovered
                 .nzb_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-            let status = persisted_to_job_status(&recovered.status);
+            let status = status_str_to_job_status(&recovered.status, recovered.error.as_deref());
             initial_history.push(weaver_scheduler::JobInfo {
                 job_id,
                 name,
@@ -433,8 +430,8 @@ async fn run_server_command(
                                 recovered.category,
                                 recovered.metadata,
                             );
-                            let status = persisted_to_job_status(&recovered.status);
-                            to_restore.push((job_id, spec, recovered.committed_segments, status));
+                            let status = status_str_to_job_status(&recovered.status, recovered.error.as_deref());
+                            to_restore.push((job_id, spec, recovered.committed_segments, status, recovered.output_dir));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -463,21 +460,28 @@ async fn run_server_command(
         info!(count = to_restore.len(), "recovering in-progress jobs");
     }
 
-    // Build GraphQL schema with shared config.
-    let schema = weaver_api::build_schema(handle.clone(), shared_config);
+    // Build GraphQL schema with shared config and database.
+    let schema = weaver_api::build_schema(handle.clone(), shared_config, db.clone());
+
+    // Spawn event persistence subscriber (records meaningful events to SQLite).
+    {
+        let event_rx = event_tx.subscribe();
+        let db_for_events = db.clone();
+        tokio::spawn(persist_events(event_rx, db_for_events));
+    }
 
     // Create and start the pipeline.
     let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, output_dir, total_connections, write_buf_max, initial_history).await?;
+        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir, intermediate_dir, complete_dir, total_connections, write_buf_max, initial_history, db.clone()).await?;
 
     let pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
 
-    // Restore in-progress jobs from journal.
-    for (job_id, spec, committed, status) in to_restore {
+    // Restore in-progress jobs from SQLite.
+    for (job_id, spec, committed, status, working_dir) in to_restore {
         let committed_count = committed.len();
-        match handle.restore_job(job_id, spec, committed, status).await {
+        match handle.restore_job(job_id, spec, committed, status, working_dir).await {
             Ok(()) => info!(job_id = job_id.0, committed_count, "job restored"),
             Err(e) => error!(job_id = job_id.0, error = %e, "failed to restore job"),
         }
@@ -501,8 +505,8 @@ async fn run_server_command(
 /// Probe each server for capability detection (pipelining, etc.) and update config.
 ///
 /// Connects to each active server, checks CAPABILITIES, and saves the result.
-/// Runs at startup so servers loaded from TOML get their capabilities detected.
-async fn detect_server_capabilities(config: &mut Config) {
+/// Runs at startup so servers loaded from the database get their capabilities detected.
+async fn detect_server_capabilities(config: &mut Config, db: &Database) {
     for server in config.servers.iter_mut().filter(|s| s.active) {
         let nntp_config = weaver_nntp::ServerConfig {
             host: server.host.clone(),
@@ -533,25 +537,34 @@ async fn detect_server_capabilities(config: &mut Config) {
                 server.supports_pipelining = false;
             }
         }
-    }
 
-    if let Err(e) = config.save() {
-        error!(error = %e, "failed to save config after capability detection");
+        // Persist capability detection to database.
+        let s = server.clone();
+        let db = db.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || db.update_server(&s)).await {
+            error!(error = %e, "failed to persist server capabilities");
+        }
     }
 }
 
-/// Convert a persisted journal status to a scheduler JobStatus.
-fn persisted_to_job_status(status: &weaver_state::PersistedJobStatus) -> weaver_scheduler::JobStatus {
+/// Convert a status string (from SQLite) to a scheduler JobStatus.
+fn status_str_to_job_status(status: &str, error: Option<&str>) -> weaver_scheduler::JobStatus {
     match status {
-        weaver_state::PersistedJobStatus::Downloading => weaver_scheduler::JobStatus::Downloading,
-        weaver_state::PersistedJobStatus::Verifying => weaver_scheduler::JobStatus::Verifying,
-        weaver_state::PersistedJobStatus::Repairing => weaver_scheduler::JobStatus::Repairing,
-        weaver_state::PersistedJobStatus::Extracting => weaver_scheduler::JobStatus::Extracting,
-        weaver_state::PersistedJobStatus::Complete => weaver_scheduler::JobStatus::Complete,
-        weaver_state::PersistedJobStatus::Failed { error } => weaver_scheduler::JobStatus::Failed {
-            error: error.clone(),
+        "downloading" => weaver_scheduler::JobStatus::Downloading,
+        "verifying" => weaver_scheduler::JobStatus::Verifying,
+        "repairing" => weaver_scheduler::JobStatus::Repairing,
+        "extracting" => weaver_scheduler::JobStatus::Extracting,
+        "complete" => weaver_scheduler::JobStatus::Complete,
+        "failed" => weaver_scheduler::JobStatus::Failed {
+            error: error.unwrap_or("unknown error").to_string(),
         },
-        weaver_state::PersistedJobStatus::Paused => weaver_scheduler::JobStatus::Paused,
+        "paused" => weaver_scheduler::JobStatus::Paused,
+        "cancelled" => weaver_scheduler::JobStatus::Failed {
+            error: "cancelled".to_string(),
+        },
+        other => weaver_scheduler::JobStatus::Failed {
+            error: format!("unknown status: {other}"),
+        },
     }
 }
 
@@ -581,4 +594,91 @@ pub fn build_nntp_client(config: &Config) -> NntpClient {
     };
 
     NntpClient::new(client_config)
+}
+
+/// Background task that subscribes to pipeline events and persists meaningful
+/// ones to SQLite for the job event log.
+async fn persist_events(
+    mut rx: broadcast::Receiver<PipelineEvent>,
+    db: Database,
+) {
+    use weaver_api::PipelineEventGql;
+
+    // High-frequency per-segment events are not persisted.
+    fn is_noisy(event: &PipelineEvent) -> bool {
+        matches!(
+            event,
+            PipelineEvent::ArticleDownloaded { .. }
+                | PipelineEvent::SegmentDecoded { .. }
+                | PipelineEvent::SegmentCommitted { .. }
+                | PipelineEvent::SegmentQueued { .. }
+        )
+    }
+
+    let mut batch: Vec<weaver_state::JobEvent> = Vec::new();
+    let flush_interval = tokio::time::Duration::from_secs(1);
+
+    loop {
+        let recv = if batch.is_empty() {
+            // No pending events — wait indefinitely for the next one.
+            tokio::select! {
+                result = rx.recv() => result,
+            }
+        } else {
+            // Pending events — flush after 1s if nothing new arrives.
+            tokio::select! {
+                result = rx.recv() => result,
+                _ = tokio::time::sleep(flush_interval) => {
+                    let events = std::mem::take(&mut batch);
+                    let db = db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db.insert_job_events(&events) {
+                            tracing::warn!(error = %e, "failed to persist job events");
+                        }
+                    });
+                    continue;
+                }
+            }
+        };
+
+        match recv {
+            Ok(event) => {
+                if !is_noisy(&event) {
+                    let gql = PipelineEventGql::from(&event);
+                    if let Some(job_id) = gql.job_id {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        batch.push(weaver_state::JobEvent {
+                            job_id,
+                            timestamp: now,
+                            kind: format!("{:?}", gql.kind),
+                            message: gql.message,
+                            file_id: gql.file_id,
+                        });
+                    }
+                }
+
+                if batch.len() >= 50 {
+                    let events = std::mem::take(&mut batch);
+                    let db = db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db.insert_job_events(&events) {
+                            tracing::warn!(error = %e, "failed to persist job events");
+                        }
+                    });
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(skipped = n, "event persistence lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
+    // Flush remaining events on shutdown.
+    if !batch.is_empty() {
+        let _ = db.insert_job_events(&batch);
+    }
 }

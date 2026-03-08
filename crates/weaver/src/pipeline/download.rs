@@ -16,11 +16,16 @@ impl Pipeline {
         let max = tuner_max.min(self.connection_ramp);
         let recovery_slots = self.tuner.params().recovery_slots;
 
-        // Find the active job: first in job_order with Downloading status.
+        // Find the active job: first in job_order with Downloading status
+        // that still has work to do. Skip jobs whose queues are empty
+        // (they're waiting on retries or are effectively done).
         let active_id = self.job_order.iter()
             .find(|id| {
                 self.jobs.get(id)
-                    .map_or(false, |s| s.status == JobStatus::Downloading)
+                    .is_some_and(|s| {
+                        s.status == JobStatus::Downloading
+                            && (!s.download_queue.is_empty() || !s.recovery_queue.is_empty())
+                    })
             })
             .copied();
 
@@ -162,11 +167,10 @@ impl Pipeline {
                     let job_id = seg_id.file_id.job_id;
                     if let Some(state) = self.jobs.get_mut(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
-                        if let Some(file_spec) = state.spec.files.get(file_idx) {
-                            if let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
+                        if let Some(file_spec) = state.spec.files.get(file_idx)
+                            && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
                                 state.failed_bytes += seg_spec.bytes as u64;
                             }
-                        }
                     }
                     self.check_health(job_id);
                 } else {
@@ -188,17 +192,16 @@ impl Pipeline {
                         // Track failed bytes for health calculation.
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             let file_idx = seg_id.file_id.file_index as usize;
-                            if let Some(file_spec) = state.spec.files.get(file_idx) {
-                                if let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
+                            if let Some(file_spec) = state.spec.files.get(file_idx)
+                                && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
                                     state.failed_bytes += seg_spec.bytes as u64;
                                 }
-                            }
                         }
                         self.check_health(job_id);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
-                        if let Some(file_spec) = state.spec.files.get(file_idx) {
-                            if let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
+                        if let Some(file_spec) = state.spec.files.get(file_idx)
+                            && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
                                 let priority = file_spec.role.download_priority();
                                 let work = DownloadWork {
                                     segment_id: seg_id,
@@ -226,7 +229,6 @@ impl Pipeline {
                                     let _ = retry_tx.send(work).await;
                                 });
                             }
-                        }
                     } else {
                         warn!(
                             segment = %seg_id,

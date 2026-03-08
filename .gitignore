@@ -1,18 +1,44 @@
+# Build artifacts
 /target
 **/target
 **/*.rs.bk
+*.so
+*.dylib
+*.dll
+
+# IDE
 .idea
 .vscode
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Environment / secrets
 **/*.env
 /.env
-/.DS_Store
-.claude
 *.pem
+
+# Database
 *.db
-*.db-*
-tmp
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Internal
+.claude
 tasks/
-apps/weaver-web/node_modules
-apps/weaver-web/dist
 tmp/
 weaver.toml
+weaver.toml.*
+docker-rar/
+.7z-version
+AUDIT-*.md
+
+# Frontend
+apps/weaver-web/node_modules
+apps/weaver-web/dist
+apps/weaver-web/.vite

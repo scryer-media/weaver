@@ -313,7 +313,7 @@ pub fn dot_unstuff(data: &[u8]) -> BytesMut {
         }
 
         if data[i] == b'\n' {
-            result.extend_from_slice(&[b'\n']);
+            result.extend_from_slice(b"\n");
             line_start = true;
             i += 1;
         } else {

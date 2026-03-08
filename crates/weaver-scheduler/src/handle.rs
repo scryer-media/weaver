@@ -27,6 +27,7 @@ pub enum SchedulerCommand {
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
         status: JobStatus,
+        working_dir: PathBuf,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Pause a job.
@@ -74,6 +75,11 @@ pub enum SchedulerCommand {
         client: Box<dyn Any + Send>,
         total_connections: usize,
         reply: oneshot::Sender<()>,
+    },
+    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    ReprocessJob {
+        job_id: JobId,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Shutdown the scheduler gracefully.
     Shutdown,
@@ -145,6 +151,7 @@ impl SchedulerHandle {
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
         status: JobStatus,
+        working_dir: PathBuf,
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -153,6 +160,7 @@ impl SchedulerHandle {
                 spec,
                 committed_segments,
                 status,
+                working_dir,
                 reply: tx,
             })
             .await
@@ -199,6 +207,19 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
+    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ReprocessJob {
+                job_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
     /// Get info about a specific job.
     pub async fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -219,7 +240,7 @@ impl SchedulerHandle {
             .send(SchedulerCommand::ListJobs { reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(rx.await.map_err(|_| SchedulerError::ChannelClosed)?)
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
     /// Get current metrics.
@@ -229,7 +250,7 @@ impl SchedulerHandle {
             .send(SchedulerCommand::GetMetrics { reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(rx.await.map_err(|_| SchedulerError::ChannelClosed)?)
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
     /// Pause all download dispatch globally.
@@ -261,7 +282,7 @@ impl SchedulerHandle {
             .send(SchedulerCommand::GetGlobalPauseState { reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(rx.await.map_err(|_| SchedulerError::ChannelClosed)?)
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)
     }
 
     /// Set the global download speed limit. 0 means unlimited.
@@ -359,6 +380,7 @@ mod tests {
                             status: JobStatus::Queued,
                             assembly,
                             created_at: std::time::Instant::now(),
+                            working_dir: PathBuf::from("/tmp/test"),
                             downloaded_bytes: 0,
                             failed_bytes: 0,
                             health_probing: false,
@@ -463,7 +485,7 @@ mod tests {
                     SchedulerCommand::RebuildNntp { reply, .. } => {
                         let _ = reply.send(());
                     }
-                    SchedulerCommand::RestoreJob { job_id, spec, status, reply, .. } => {
+                    SchedulerCommand::RestoreJob { job_id, spec, status, working_dir, reply, .. } => {
                         let assembly = JobAssembly::new(job_id);
                         let state = JobState {
                             job_id,
@@ -471,6 +493,7 @@ mod tests {
                             status,
                             assembly,
                             created_at: std::time::Instant::now(),
+                            working_dir,
                             downloaded_bytes: 0,
                             failed_bytes: 0,
                             health_probing: false,
@@ -480,6 +503,19 @@ mod tests {
                         };
                         jobs.insert(job_id, state);
                         let _ = reply.send(Ok(()));
+                    }
+                    SchedulerCommand::ReprocessJob { job_id, reply } => {
+                        let result = match jobs.get_mut(&job_id) {
+                            Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
+                                state.status = JobStatus::Downloading;
+                                Ok(())
+                            }
+                            Some(_) => Err(SchedulerError::Other(
+                                format!("job {} is not failed", job_id.0),
+                            )),
+                            None => Err(SchedulerError::JobNotFound(job_id)),
+                        };
+                        let _ = reply.send(result);
                     }
                     SchedulerCommand::Shutdown => break,
                 }

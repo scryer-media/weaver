@@ -251,6 +251,7 @@ pub fn verify_slices_from_crcs(
 }
 
 /// Options controlling verification behavior.
+#[derive(Default)]
 pub struct VerifyOptions {
     /// If set, verification will check this token and stop early if cancelled.
     pub cancel: Option<CancellationToken>,
@@ -258,14 +259,6 @@ pub struct VerifyOptions {
     pub progress: Option<ProgressCallback>,
 }
 
-impl Default for VerifyOptions {
-    fn default() -> Self {
-        Self {
-            cancel: None,
-            progress: None,
-        }
-    }
-}
 
 /// Verify all files in a PAR2 set.
 pub fn verify_all(par2: &Par2FileSet, access: &dyn FileAccess) -> VerificationResult {
@@ -285,11 +278,10 @@ pub fn verify_all_with_options(
 
     for (file_index, file_id) in par2.recovery_file_ids.iter().enumerate() {
         // Check cancellation before each file.
-        if let Some(ref cancel) = options.cancel {
-            if cancel.is_cancelled() {
+        if let Some(ref cancel) = options.cancel
+            && cancel.is_cancelled() {
                 break;
             }
-        }
 
         let desc = match par2.file_description(file_id) {
             Some(d) => d,
@@ -329,8 +321,8 @@ pub fn verify_all_with_options(
         }
 
         // Check for files that should have content but are empty on disk.
-        if let Some(actual_len) = access.file_length(file_id) {
-            if actual_len == 0 && desc.length > 0 {
+        if let Some(actual_len) = access.file_length(file_id)
+            && actual_len == 0 && desc.length > 0 {
                 let slice_count = par2.slice_count_for_file(desc.length);
                 total_missing_blocks += slice_count;
                 files.push(FileVerification {
@@ -342,7 +334,6 @@ pub fn verify_all_with_options(
                 });
                 continue;
             }
-        }
 
         // If IFSC data is missing for this file, we can't do slice-level verification.
         // Fall back to full-file hash check only. This can happen with truncated PAR2 files.

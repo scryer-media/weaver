@@ -1,11 +1,12 @@
 import { useParams, Link } from "react-router";
 import { useQuery, useMutation, useSubscription } from "urql";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
   RESUME_JOB_MUTATION,
   CANCEL_JOB_MUTATION,
+  REPROCESS_JOB_MUTATION,
   EVENTS_SUBSCRIPTION,
 } from "@/graphql/queries";
 import { ProgressBar } from "@/components/ProgressBar";
@@ -35,9 +36,29 @@ export function JobDetail() {
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
+  const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
 
   const [events, setEvents] = useState<EventEntry[]>([]);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const seededRef = useRef(false);
+
+  // Seed events from historical query data when it first loads.
+  useEffect(() => {
+    if (data?.jobEvents && !seededRef.current) {
+      seededRef.current = true;
+      const historical: EventEntry[] = data.jobEvents.map(
+        (e: { kind: string; jobId: number; fileId: string | null; message: string; timestamp: number }) => ({
+          kind: e.kind,
+          jobId: e.jobId,
+          fileId: e.fileId,
+          message: e.message,
+          timestamp: e.timestamp,
+        }),
+      );
+      // Historical events are oldest-first from the DB; reverse for newest-first display.
+      setEvents(historical.reverse());
+    }
+  }, [data?.jobEvents]);
 
   const handleSubscription = useCallback(
     (_prev: EventEntry[] | undefined, data: { events: { kind: string; jobId: number | null; fileId: string | null; message: string } }) => {
@@ -53,7 +74,7 @@ export function JobDetail() {
         !noisy.has(event.kind)
       ) {
         const entry: EventEntry = { ...event, timestamp: Date.now() };
-        setEvents((prev) => [entry, ...prev].slice(0, 200));
+        setEvents((prev) => [entry, ...prev].slice(0, 500));
       }
       return [];
     },
@@ -117,6 +138,14 @@ export function JobDetail() {
               {t("action.pause")}
             </button>
           ) : null}
+          {job.status === "FAILED" && (
+            <button
+              onClick={() => reprocessJob({ id: job.id })}
+              className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 sm:px-4"
+            >
+              {t("action.reprocess")}
+            </button>
+          )}
           {job.status !== "COMPLETE" && (
             <button
               onClick={() => setShowCancelConfirm(true)}
@@ -203,7 +232,8 @@ export function JobDetail() {
         open={showCancelConfirm}
         title={t("confirm.cancelJob")}
         message={t("confirm.cancelJobMessage")}
-        confirmLabel={t("action.cancel")}
+        confirmLabel={t("confirm.cancelJobConfirm")}
+        cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => {
           cancelJob({ id: job.id });
           setShowCancelConfirm(false);

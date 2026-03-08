@@ -1,7 +1,10 @@
 [package]
 name = "weaver-scheduler"
-version = "0.1.0"
-edition = "2024"
+description = "Job graph scheduler with artifact dependency tracking and resource balancing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }

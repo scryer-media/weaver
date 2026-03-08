@@ -207,6 +207,12 @@ pub struct WaitingVolumeProvider {
     notify: Condvar,
 }
 
+impl Default for WaitingVolumeProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WaitingVolumeProvider {
     pub fn new() -> Self {
         Self {
@@ -253,14 +259,13 @@ impl VolumeProvider for WaitingVolumeProvider {
             .unwrap();
 
         // Check for cancellation first.
-        if let Some(ref err) = state.error {
-            if !state.available.contains_key(&index) {
+        if let Some(ref err) = state.error
+            && !state.available.contains_key(&index) {
                 return Err(VolumeProviderError::Unavailable {
                     volume: index,
                     reason: err.clone(),
                 });
             }
-        }
 
         let path = state.available.get(&index).ok_or_else(|| {
             if state.finished {

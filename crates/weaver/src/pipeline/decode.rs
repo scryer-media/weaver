@@ -24,8 +24,8 @@ impl Pipeline {
             state.downloaded_bytes += result.decoded_size as u64;
         }
 
-        // Look up the filename for disk I/O.
-        let filename = {
+        // Look up the filename and working dir for disk I/O.
+        let (filename, working_dir) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -33,7 +33,7 @@ impl Pipeline {
                 warn!(file_id = %file_id, "file assembly not found");
                 return;
             };
-            file_asm.filename().to_string()
+            (file_asm.filename().to_string(), state.working_dir.clone())
         };
 
         // Insert into the per-file write reorder buffer so segments are
@@ -45,7 +45,7 @@ impl Pipeline {
         let segments_to_write = write_buf.insert(result.file_offset, result.data.clone());
 
         // Write the sequentially-ordered segments to disk.
-        let file_path = self.output_dir.join(&filename);
+        let file_path = working_dir.join(&filename);
         let write_start = Instant::now();
         for (offset, data) in &segments_to_write {
             if let Err(e) = write_segment_to_disk(&file_path, *offset, data).await {
@@ -116,15 +116,23 @@ impl Pipeline {
                     segment_id: result.segment_id,
                 });
 
-                // Journal: record committed segment for crash recovery.
-                let journal_entry = JournalEntry::SegmentCommitted {
-                    segment_id: result.segment_id,
+                // Batch segment commit for SQLite persistence.
+                self.segment_batch.push(CommittedSegment {
+                    job_id,
+                    file_index: result.segment_id.file_id.file_index,
+                    segment_number: result.segment_id.segment_number,
                     file_offset: result.file_offset,
                     decoded_size: result.decoded_size,
                     crc32: result.crc32,
-                };
-                if let Err(e) = self.journal.append(&journal_entry).await {
-                    error!(error = %e, "journal write failed");
+                });
+                if self.segment_batch.len() >= 100 {
+                    let batch = std::mem::take(&mut self.segment_batch);
+                    let db = self.db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db.commit_segments(&batch) {
+                            tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+                        }
+                    });
                 }
 
                 // Check for newly verified slices (incremental PAR2 verification).
@@ -142,7 +150,7 @@ impl Pipeline {
                 if commit.file_complete {
                     // Flush any remaining buffered segments to disk.
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
-                        let file_path = self.output_dir.join(&filename);
+                        let file_path = working_dir.join(&filename);
                         for (offset, data) in write_buf.flush_all().iter() {
                             if let Err(e) =
                                 write_segment_to_disk(&file_path, *offset, data).await
@@ -167,15 +175,24 @@ impl Pipeline {
                         total_bytes,
                     });
 
-                    // Journal: record file completion.
+                    // Finalize hash while we still have the file assembly borrow.
                     let md5 = file_asm.finalize_hash().unwrap_or([0u8; 16]);
-                    let journal_entry = JournalEntry::FileComplete {
-                        file_id,
-                        filename,
-                        md5,
-                    };
-                    if let Err(e) = self.journal.append(&journal_entry).await {
-                        error!(error = %e, "journal write failed");
+
+                    // Flush pending segment batch before recording file completion
+                    // (inline to avoid borrow conflict with self.jobs).
+                    if !self.segment_batch.is_empty() {
+                        let batch = std::mem::take(&mut self.segment_batch);
+                        let db = self.db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db.commit_segments(&batch) {
+                                tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+                            }
+                        });
+                    }
+
+                    // Record file completion in SQLite.
+                    if let Err(e) = self.db.complete_file(job_id, file_id.file_index, &filename, &md5) {
+                        error!(error = %e, "db write failed for complete_file");
                     }
 
                     // If this is a PAR2 index file, parse and attach metadata.
@@ -186,6 +203,9 @@ impl Pipeline {
 
                     // If this is a RAR volume, update archive topology.
                     self.try_update_archive_topology(job_id, file_id).await;
+
+                    // If this is a 7z file, update 7z topology.
+                    self.try_update_7z_topology(job_id, file_id);
 
                     // Try partial extraction if some archive members are ready.
                     self.try_partial_extraction(job_id).await;

@@ -5,19 +5,13 @@ use crate::types::DecodeResult;
 
 /// Options for decoding.
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct DecodeOptions {
     /// If true, perform NNTP dot-unstuffing (strip leading dot from lines
     /// starting with `..`). Default: false (assumes transport layer handled it).
     pub dot_unstuffing: bool,
 }
 
-impl Default for DecodeOptions {
-    fn default() -> Self {
-        Self {
-            dot_unstuffing: false,
-        }
-    }
-}
 
 /// Decode a complete yEnc article (headers + data + trailer) from `input` into `output`.
 ///
@@ -50,26 +44,23 @@ pub fn decode_with_options(
     };
 
     // Validate decoded size against =yend size (like NZBGet's dsInvalidSize).
-    if let Some(expected_size) = yend_size {
-        if bytes_written as u64 != expected_size {
+    if let Some(expected_size) = yend_size
+        && bytes_written as u64 != expected_size {
             return Err(YencError::SizeMismatch {
                 expected: expected_size,
                 actual: bytes_written as u64,
             });
         }
-    }
 
     // For single-part articles, also validate =ybegin size vs =yend size.
-    if parsed.metadata.part.is_none() {
-        if let Some(expected_size) = yend_size {
-            if parsed.metadata.size != expected_size {
+    if parsed.metadata.part.is_none()
+        && let Some(expected_size) = yend_size
+            && parsed.metadata.size != expected_size {
                 return Err(YencError::SizeMismatch {
                     expected: parsed.metadata.size,
                     actual: expected_size,
                 });
             }
-        }
-    }
 
     // For single-part articles, the `crc32` field in =yend is the part CRC.
     // For multi-part articles, `pcrc32` is the part CRC.

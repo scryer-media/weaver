@@ -2,15 +2,17 @@
 //!
 //! SEE provides adaptive probability estimates for the "escape" symbol in
 //! contexts where the PPMd model needs to fall back to a lower-order context.
-//! It tracks the frequency of escape events and adjusts estimates accordingly.
 //!
 //! Reference: Shkarin's PPMd (public domain), 7-zip Ppmd7.c (public domain).
+
+/// Period bits for SEE scaling.
+const PERIOD_BITS: u8 = 7;
 
 /// A single SEE context that tracks escape probability.
 #[derive(Clone, Copy)]
 pub struct SeeContext {
-    /// Scaled sum of escape frequencies (numerator).
-    pub sum: u16,
+    /// Scaled sum of escape frequencies.
+    pub summ: u16,
     /// Right-shift count for extracting the mean estimate.
     pub shift: u8,
     /// Count of updates before adaptation.
@@ -18,103 +20,90 @@ pub struct SeeContext {
 }
 
 impl SeeContext {
-    /// Create a new SEE context with an initial escape frequency estimate.
-    pub fn new(init_val: u16, shift: u8) -> Self {
+    /// Create a new SEE context with initial value.
+    pub fn init(init_val: u16) -> Self {
+        let shift = PERIOD_BITS - 4;
         Self {
-            sum: init_val << shift,
+            summ: init_val << shift,
             shift,
-            count: 7,
+            count: 4,
         }
     }
 
-    /// Get the current escape frequency estimate.
-    #[inline]
-    pub fn mean(&self) -> u32 {
-        let m = (self.sum as u32) >> (self.shift as u32);
-        // Minimum of 1 to avoid zero-frequency issues in range coder.
-        m.max(1)
+    /// Create a zeroed SEE context (for the dummy context).
+    pub fn dummy() -> Self {
+        Self {
+            summ: 0,
+            shift: PERIOD_BITS,
+            count: 0,
+        }
     }
 
-    /// Update after an escape event occurred (symbol was NOT found in context).
+    /// Get the current escape frequency estimate (getMean in unrar).
+    ///
+    /// Returns the mean AND subtracts it from summ.
+    /// Minimum return value is 1 to avoid zero-frequency issues.
     #[inline]
-    pub fn update_escape(&mut self) {
-        self.sum = self.sum.wrapping_add(1 << self.shift as u16);
-        if self.count > 0 {
-            self.count -= 1;
-        }
-        if self.count == 0 && self.sum > 128 {
-            // Halve and potentially increase shift
-            if self.shift < 7 {
+    pub fn get_mean(&mut self) -> u32 {
+        // RetVal = Summ >> Shift; Summ -= RetVal; return RetVal + (RetVal == 0);
+        let ret = (self.summ >> self.shift) as i16;
+        self.summ = self.summ.wrapping_sub(ret as u16);
+        let ret = ret as u32;
+        if ret == 0 { 1 } else { ret }
+    }
+
+    /// Update after a successful symbol decode (SEE2.update in unrar).
+    #[inline]
+    pub fn update(&mut self) {
+        if self.shift < PERIOD_BITS {
+            self.count = self.count.wrapping_sub(1);
+            if self.count == 0 {
+                self.summ = self.summ.wrapping_add(self.summ);
+                self.count = 3 << self.shift;
                 self.shift += 1;
             }
-            self.sum = (self.sum + 1) >> 1;
-            self.count = 3 << self.shift;
-        }
-    }
-
-    /// Update after a successful symbol decode (symbol WAS found in context).
-    #[inline]
-    pub fn update_success(&mut self) {
-        // Decrease escape estimate slightly.
-        let m = self.mean() as u16;
-        self.sum = self.sum.saturating_sub(m);
-        if self.count > 0 {
-            self.count -= 1;
-        }
-        if self.count == 0 && self.sum > 128 {
-            if self.shift < 7 {
-                self.shift += 1;
-            }
-            self.sum = (self.sum + 1) >> 1;
-            self.count = 3 << self.shift;
         }
     }
 }
 
-/// Number of SEE context bins.
-/// Indexed by: (num_stats - 1, recent_escape_flag, suffix_order).
-pub const SEE_CONTEXTS: usize = 24;
-
-/// The SEE table: multiple contexts indexed by model state.
+/// The SEE table: 25 x 16 contexts indexed by model state.
 pub struct SeeTable {
-    pub contexts: [[SeeContext; SEE_CONTEXTS]; 4],
+    pub contexts: [[SeeContext; 16]; 25],
+    pub dummy: SeeContext,
+}
+
+impl Default for SeeTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SeeTable {
-    /// Initialize the SEE table with default values.
+    /// Initialize the SEE table matching unrar's init(5*i+10).
     pub fn new() -> Self {
-        let mut contexts = [[SeeContext::new(0, 0); SEE_CONTEXTS]; 4];
-
-        // Initialize with empirically-derived values from the PPMd spec.
-        for ns_idx in 0..4 {
-            for i in 0..SEE_CONTEXTS {
-                let init_val = match ns_idx {
-                    0 => 82,
-                    1 => 64,
-                    2 => 48,
-                    _ => 36,
-                };
-                contexts[ns_idx][i] = SeeContext::new(init_val, 7);
+        let mut contexts = [[SeeContext::init(0); 16]; 25];
+        for (i, row) in contexts.iter_mut().enumerate() {
+            for ctx in row.iter_mut() {
+                *ctx = SeeContext::init((5 * i + 10) as u16);
             }
         }
-
-        Self { contexts }
+        Self {
+            contexts,
+            dummy: SeeContext::dummy(),
+        }
     }
 
-    /// Look up a SEE context.
+    /// Look up a SEE context by index.
     ///
-    /// - `num_stats`: number of distinct symbols in the current context
-    /// - `suffix_order`: order of the suffix context
-    /// - `flags`: context flags (bit 0 = recent escape)
-    pub fn get(&mut self, num_stats: usize, suffix_order: usize, flags: u8) -> &mut SeeContext {
-        let ns_idx = match num_stats {
-            0..=2 => 0,
-            3..=4 => 1,
-            5..=8 => 2,
-            _ => 3,
-        };
-        let ctx_idx = ((suffix_order.min(11)) * 2 + (flags & 1) as usize).min(SEE_CONTEXTS - 1);
-        &mut self.contexts[ns_idx][ctx_idx]
+    /// `idx0` is NS2Indx[Diff-1] (0..24).
+    /// `idx1` is the combined index from context properties (0..15).
+    pub fn get(&mut self, idx0: usize, idx1: usize) -> &mut SeeContext {
+        &mut self.contexts[idx0.min(24)][idx1.min(15)]
+    }
+
+    /// Get the dummy context (for NumStats == 256).
+    pub fn get_dummy(&mut self) -> &mut SeeContext {
+        &mut self.dummy
     }
 }
 
@@ -123,30 +112,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_see_context_mean() {
-        let ctx = SeeContext::new(82, 7);
-        assert_eq!(ctx.mean(), 82); // 82 << 7 >> 7 = 82
+    fn test_see_context_init() {
+        let ctx = SeeContext::init(20);
+        // shift = PERIOD_BITS - 4 = 3
+        // summ = 20 << 3 = 160
+        assert_eq!(ctx.summ, 160);
+        assert_eq!(ctx.shift, 3);
+        assert_eq!(ctx.count, 4);
     }
 
     #[test]
-    fn test_see_context_min_mean() {
-        let ctx = SeeContext::new(0, 7);
-        assert_eq!(ctx.mean(), 1); // minimum is 1
+    fn test_see_get_mean() {
+        let mut ctx = SeeContext::init(20);
+        // summ=160, shift=3 → mean = 160 >> 3 = 20, summ = 160 - 20 = 140
+        let mean = ctx.get_mean();
+        assert_eq!(mean, 20);
+        assert_eq!(ctx.summ, 140);
     }
 
     #[test]
-    fn test_see_table_lookup() {
-        let mut table = SeeTable::new();
-        let ctx = table.get(3, 2, 0);
-        assert!(ctx.mean() > 0);
+    fn test_see_get_mean_min_one() {
+        let mut ctx = SeeContext {
+            summ: 0,
+            shift: 3,
+            count: 4,
+        };
+        assert_eq!(ctx.get_mean(), 1);
     }
 
     #[test]
-    fn test_see_context_update() {
-        let mut ctx = SeeContext::new(82, 7);
-        let initial_mean = ctx.mean();
-        ctx.update_escape();
-        // After escape, sum increases so mean should be >= initial
-        assert!(ctx.mean() >= initial_mean);
+    fn test_see_table_init() {
+        let table = SeeTable::new();
+        // contexts[0] should have init(10): summ = 10 << 3 = 80
+        assert_eq!(table.contexts[0][0].summ, 80);
+        // contexts[24] should have init(130): summ = 130 << 3 = 1040
+        assert_eq!(table.contexts[24][0].summ, 1040);
+    }
+
+    #[test]
+    fn test_see_update() {
+        let mut ctx = SeeContext::init(20);
+        // shift=3, count=4
+        ctx.update(); // count=3
+        ctx.update(); // count=2
+        ctx.update(); // count=1
+        ctx.update(); // count=0 → summ doubles, count = 3 << 3 = 24 (pre-increment), shift becomes 4
+        assert_eq!(ctx.shift, 4);
+        assert_eq!(ctx.count, 24);
     }
 }

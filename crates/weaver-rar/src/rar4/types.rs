@@ -17,6 +17,8 @@ pub enum Rar4HeaderType {
     Sub,
     /// Recovery record (0x78).
     Recovery,
+    /// New-style sub-header (0x7A) — comments, NTFS timestamps, ACL, streams.
+    NewSub,
     /// End of archive header (0x7B).
     EndArchive,
     /// Unknown header type.
@@ -33,6 +35,7 @@ impl From<u8> for Rar4HeaderType {
             0x76 => Self::Extra,
             0x77 => Self::Sub,
             0x78 => Self::Recovery,
+            0x7A => Self::NewSub,
             0x7B => Self::EndArchive,
             other => Self::Unknown(other),
         }

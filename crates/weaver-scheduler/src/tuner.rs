@@ -166,13 +166,12 @@ impl RuntimeTuner {
 
         const STREAK_THRESHOLD: u32 = 3;
 
-        if self.decode_pressure_streak >= STREAK_THRESHOLD {
-            if self.current.max_concurrent_downloads > 1 {
+        if self.decode_pressure_streak >= STREAK_THRESHOLD
+            && self.current.max_concurrent_downloads > 1 {
                 self.current.max_concurrent_downloads -= 1;
                 self.decode_pressure_streak = 0;
                 return true;
             }
-        }
 
         if self.download_idle_streak >= STREAK_THRESHOLD && self.pre_pp_max_downloads.is_none() {
             let limit = self.max_downloads_limit();

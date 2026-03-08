@@ -8,6 +8,7 @@ use tracing::info;
 use weaver_core::config::SharedConfig;
 use weaver_core::id::JobId;
 use weaver_scheduler::{FileSpec, JobSpec, SchedulerHandle, SegmentSpec};
+use weaver_state::Database;
 
 use crate::types::{GeneralSettings, GeneralSettingsInput, Job, Server, ServerInput, TestConnectionResult};
 
@@ -162,6 +163,13 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    async fn reprocess_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        handle.reprocess_job(JobId(id)).await?;
+        Ok(true)
+    }
+
     /// Pause all download dispatch globally.
     async fn pause_all(&self, ctx: &Context<'_>) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
@@ -191,31 +199,48 @@ impl MutationRoot {
     async fn add_server(&self, ctx: &Context<'_>, input: ServerInput) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
+        let db = ctx.data::<Database>()?;
+
+        let id = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.next_server_id())
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?
+        };
+
+        let server = weaver_core::config::ServerConfig {
+            id,
+            host: input.host,
+            port: input.port,
+            tls: input.tls,
+            username: input.username,
+            password: input.password,
+            connections: input.connections,
+            active: input.active,
+            supports_pipelining: false,
+        };
+
+        {
+            let db = db.clone();
+            let server = server.clone();
+            tokio::task::spawn_blocking(move || db.insert_server(&server))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
+        }
 
         {
             let mut cfg = config.write().await;
-            let id = cfg.next_server_id();
-            let server = weaver_core::config::ServerConfig {
-                id,
-                host: input.host,
-                port: input.port,
-                tls: input.tls,
-                username: input.username,
-                password: input.password,
-                connections: input.connections,
-                active: input.active,
-                supports_pipelining: false,
-            };
             cfg.servers.push(server);
-            cfg.save().map_err(|e| async_graphql::Error::new(format!("failed to save config: {e}")))?;
             info!(id, "server added");
         }
 
         // Rebuild pool — this also detects capabilities for all servers.
-        rebuild_nntp_from_config(config, handle).await;
+        rebuild_nntp_from_config(config, handle, db).await;
 
         let cfg = config.read().await;
-        let server = cfg.servers.iter().rev().next().unwrap();
+        let server = cfg.servers.iter().next_back().unwrap();
         Ok(Server::from(server))
     }
 
@@ -223,6 +248,7 @@ impl MutationRoot {
     async fn update_server(&self, ctx: &Context<'_>, id: u32, input: ServerInput) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
+        let db = ctx.data::<Database>()?;
 
         {
             let mut cfg = config.write().await;
@@ -238,12 +264,18 @@ impl MutationRoot {
             s.password = input.password;
             s.connections = input.connections;
             s.active = input.active;
-            cfg.save().map_err(|e| async_graphql::Error::new(format!("failed to save config: {e}")))?;
+
+            let server = s.clone();
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.update_server(&server))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
             info!(id, "server updated");
         }
 
         // Rebuild pool — this also detects capabilities for all servers.
-        rebuild_nntp_from_config(config, handle).await;
+        rebuild_nntp_from_config(config, handle, db).await;
 
         let cfg = config.read().await;
         let server = cfg.servers.iter().find(|s| s.id == id).unwrap();
@@ -254,6 +286,7 @@ impl MutationRoot {
     async fn remove_server(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
+        let db = ctx.data::<Database>()?;
 
         {
             let mut cfg = config.write().await;
@@ -262,11 +295,16 @@ impl MutationRoot {
             if cfg.servers.len() == before {
                 return Err(async_graphql::Error::new(format!("server {id} not found")));
             }
-            cfg.save().map_err(|e| async_graphql::Error::new(format!("failed to save config: {e}")))?;
+
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.delete_server(id))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
             info!(id, "server removed");
         }
 
-        rebuild_nntp_from_config(config, handle).await;
+        rebuild_nntp_from_config(config, handle, db).await;
         Ok(true)
     }
 
@@ -311,12 +349,16 @@ impl MutationRoot {
     ) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
+        let db = ctx.data::<Database>()?;
 
         let settings = {
             let mut cfg = config.write().await;
 
-            if let Some(output_dir) = input.output_dir {
-                cfg.output_dir = Some(output_dir);
+            if let Some(ref intermediate_dir) = input.intermediate_dir {
+                cfg.intermediate_dir = Some(intermediate_dir.clone());
+            }
+            if let Some(ref complete_dir) = input.complete_dir {
+                cfg.complete_dir = Some(complete_dir.clone());
             }
             if let Some(cleanup) = input.cleanup_after_extract {
                 cfg.cleanup_after_extract = Some(cleanup);
@@ -333,11 +375,41 @@ impl MutationRoot {
                 retry.max_retries = Some(retries);
             }
 
-            cfg.save().map_err(|e| async_graphql::Error::new(format!("failed to save config: {e}")))?;
+            // Persist to SQLite.
+            let db = db.clone();
+            let input_clone = (
+                input.intermediate_dir.clone(),
+                input.complete_dir.clone(),
+                input.cleanup_after_extract,
+                input.max_download_speed,
+                input.max_retries,
+            );
+            tokio::task::spawn_blocking(move || -> std::result::Result<(), weaver_state::StateError> {
+                if let Some(ref v) = input_clone.0 {
+                    db.set_setting("intermediate_dir", v)?;
+                }
+                if let Some(ref v) = input_clone.1 {
+                    db.set_setting("complete_dir", v)?;
+                }
+                if let Some(v) = input_clone.2 {
+                    db.set_setting("cleanup_after_extract", &v.to_string())?;
+                }
+                if let Some(v) = input_clone.3 {
+                    db.set_setting("max_download_speed", &v.to_string())?;
+                }
+                if let Some(v) = input_clone.4 {
+                    db.set_setting("retry.max_retries", &v.to_string())?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+            .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
 
             GeneralSettings {
                 data_dir: cfg.data_dir.clone(),
-                output_dir: cfg.output_dir().to_string(),
+                intermediate_dir: cfg.intermediate_dir(),
+                complete_dir: cfg.complete_dir(),
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
@@ -357,7 +429,7 @@ impl MutationRoot {
 ///
 /// Also probes each active server for capability detection (pipelining, etc.)
 /// and updates the stored config.
-async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandle) {
+async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandle, db: &Database) {
     use weaver_nntp::client::{NntpClient, NntpClientConfig};
     use weaver_nntp::pool::ServerPoolConfig;
 
@@ -392,8 +464,12 @@ async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandl
                     server.supports_pipelining = false;
                 }
             }
+
+            // Persist capabilities to DB.
+            let s = server.clone();
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || db.update_server(&s)).await;
         }
-        let _ = cfg.save();
     }
 
     let (client, total) = {

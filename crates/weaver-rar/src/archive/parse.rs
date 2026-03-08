@@ -105,6 +105,7 @@ impl RarArchive {
             more_volumes,
             volumes,
             solid_decoder: None,
+            solid_decoder_rar4: None,
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
@@ -169,6 +170,7 @@ impl RarArchive {
             more_volumes,
             volumes,
             solid_decoder: None,
+            solid_decoder_rar4: None,
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
@@ -184,7 +186,8 @@ impl RarArchive {
             data_offset: fh.data_offset,
             data_size: fh.packed_size,
             compression: crate::types::CompressionInfo {
-                version: 0,
+                format: crate::types::ArchiveFormat::Rar4,
+                version: 29,
                 solid: fh.is_solid,
                 method: match fh.method {
                     crate::rar4::types::Rar4Method::Store => CompressionMethod::Store,

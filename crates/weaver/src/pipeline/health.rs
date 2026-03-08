@@ -110,15 +110,14 @@ impl Pipeline {
         }
 
         // Project failed_bytes from the current sample ratio.
-        if missed > 0 {
-            if let Some(state) = self.jobs.get_mut(&job_id) {
+        if missed > 0
+            && let Some(state) = self.jobs.get_mut(&job_id) {
                 let projected = state.spec.total_bytes as u128 * missed as u128 / total as u128;
                 let projected = projected as u64;
                 if projected > state.failed_bytes {
                     state.failed_bytes = projected;
                 }
             }
-        }
 
         if done {
             // Restore to Downloading and re-enqueue held segments into job's queues.
@@ -153,6 +152,7 @@ impl Pipeline {
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
         }
+        self.record_job_history(job_id);
         self.job_order.retain(|id| *id != job_id);
         let _ = self.event_tx.send(PipelineEvent::JobFailed { job_id, error });
     }
@@ -310,7 +310,7 @@ impl Pipeline {
                         }
                     }
                     checked += 1;
-                    if checked % UPDATE_INTERVAL == 0 {
+                    if checked.is_multiple_of(UPDATE_INTERVAL) {
                         let _ = probe_tx.send(ProbeUpdate {
                             job_id, total: checked, missed, done: false,
                         }).await;

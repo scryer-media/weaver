@@ -117,8 +117,8 @@ where
     }
 
     // Verify CRC32
-    if options.verify {
-        if let Some(expected_crc) = file_header.data_crc32 {
+    if options.verify
+        && let Some(expected_crc) = file_header.data_crc32 {
             let actual_crc = crc_hasher.unwrap().finalize();
             if actual_crc != expected_crc {
                 return Err(RarError::DataCrcMismatch {
@@ -128,7 +128,6 @@ where
                 });
             }
         }
-    }
 
     Ok(total_written)
 }
@@ -207,8 +206,8 @@ pub fn extract_member<R: Read + Seek>(
             )?;
 
             // Verify CRC32 of decompressed data.
-            if options.verify {
-                if let Some(expected) = file_header.data_crc32 {
+            if options.verify
+                && let Some(expected) = file_header.data_crc32 {
                     let mut hasher = crc32fast::Hasher::new();
                     hasher.update(&decompressed);
                     let actual = hasher.finalize();
@@ -220,7 +219,6 @@ pub fn extract_member<R: Read + Seek>(
                         });
                     }
                 }
-            }
 
             decompressed
         }
@@ -232,15 +230,13 @@ pub fn extract_member<R: Read + Seek>(
     }
 
     // Verify BLAKE2sp hash if provided.
-    if options.verify {
-        if let Some(FileHash::Blake2sp(expected)) = hash {
-            if !verify_blake2(&output, expected) {
+    if options.verify
+        && let Some(FileHash::Blake2sp(expected)) = hash
+            && !verify_blake2(&output, expected) {
                 return Err(RarError::Blake2Mismatch {
                     member: file_header.name.clone(),
                 });
             }
-        }
-    }
 
     // Report completion.
     if let (Some(p), Some(mi)) = (progress, member_info) {
@@ -261,7 +257,7 @@ pub fn verify_blake2(data: &[u8], expected: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CompressionInfo, FileAttributes, HostOs};
+    use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
 
     fn make_stored_file_header(
         name: &str,
@@ -279,6 +275,7 @@ mod tests {
             mtime: None,
             data_crc32: Some(crc),
             compression: CompressionInfo {
+                format: ArchiveFormat::Rar5,
                 version: 0,
                 solid: false,
                 method: CompressionMethod::Store,

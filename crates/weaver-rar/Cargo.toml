@@ -1,7 +1,13 @@
 [package]
 name = "weaver-rar"
-version = "0.1.0"
-edition = "2024"
+description = "RAR archive parsing, decompression, and streaming extraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+slow-tests = []
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }

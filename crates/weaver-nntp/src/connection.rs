@@ -538,10 +538,9 @@ impl NntpConnection {
     /// If the response is an error or the connection times out, it is marked
     /// as poisoned and an error is returned.
     pub async fn ping(&mut self) -> Result<()> {
-        let resp = self.send_command(&Command::Date).await.map_err(|e| {
+        let resp = self.send_command(&Command::Date).await.inspect_err(|_e| {
             self.poisoned = true;
             self.current_group = None;
-            e
         })?;
 
         if resp.code.is_error() {

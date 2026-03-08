@@ -77,6 +77,7 @@ impl FileAccess for DiskFileAccess {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;

@@ -159,6 +159,7 @@ pub fn plan_repair(
 }
 
 /// Options controlling repair execution.
+#[derive(Default)]
 pub struct RepairOptions {
     /// If set, repair will check this token and stop early if cancelled.
     pub cancel: Option<CancellationToken>,
@@ -171,15 +172,6 @@ pub struct RepairOptions {
     pub memory_limit: Option<usize>,
 }
 
-impl Default for RepairOptions {
-    fn default() -> Self {
-        Self {
-            cancel: None,
-            progress: None,
-            memory_limit: None,
-        }
-    }
-}
 
 /// Execute a repair plan, reading recovery data and writing repaired slices.
 ///
@@ -208,11 +200,10 @@ pub fn prepare_recovery_buffers(
 
     let mut recovery_data: Vec<Vec<u8>> = Vec::with_capacity(n);
     for (i, &exp) in plan.recovery_exponents.iter().enumerate() {
-        if let Some(ref cancel) = options.cancel {
-            if cancel.is_cancelled() {
+        if let Some(ref cancel) = options.cancel
+            && cancel.is_cancelled() {
                 return Err(Par2Error::Cancelled);
             }
-        }
         let rs = par2_set.recovery_slices.get(&exp).ok_or_else(|| {
             Par2Error::ReedSolomonError {
                 reason: format!("recovery block with exponent {exp} not found"),
@@ -247,7 +238,7 @@ pub fn xor_out_slice(
 ) {
     let slice_size = plan.slice_size as usize;
     assert!(
-        slice_size % 2 == 0,
+        slice_size.is_multiple_of(2),
         "PAR2 slice_size must be a multiple of 2"
     );
     let word_count = slice_size / 2;
@@ -296,11 +287,10 @@ pub fn reconstruct_and_write(
     options: &RepairOptions,
 ) -> Result<()> {
     let check_cancel = |options: &RepairOptions| -> Result<()> {
-        if let Some(ref cancel) = options.cancel {
-            if cancel.is_cancelled() {
+        if let Some(ref cancel) = options.cancel
+            && cancel.is_cancelled() {
                 return Err(Par2Error::Cancelled);
             }
-        }
         Ok(())
     };
 
@@ -311,7 +301,7 @@ pub fn reconstruct_and_write(
 
     let slice_size = plan.slice_size as usize;
     assert!(
-        slice_size % 2 == 0,
+        slice_size.is_multiple_of(2),
         "PAR2 slice_size must be a multiple of 2"
     );
     let word_count = slice_size / 2;
@@ -350,10 +340,11 @@ pub fn reconstruct_and_write(
                     .map(|rd| u16::from_le_bytes([rd[w * 2], rd[w * 2 + 1]]))
                     .collect();
 
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..n {
                     let mut val = 0u16;
-                    for r in 0..n {
-                        val = gf::add(val, gf::mul(plan.decode_matrix[j][r], adjusted_words[r]));
+                    for (r, &word) in adjusted_words.iter().enumerate() {
+                        val = gf::add(val, gf::mul(plan.decode_matrix[j][r], word));
                     }
                     let bytes = val.to_le_bytes();
                     chunk_output[j][w_offset * 2] = bytes[0];
@@ -450,7 +441,7 @@ pub fn execute_repair_with_options(
 
     let slice_size = plan.slice_size as usize;
     assert!(
-        slice_size % 2 == 0,
+        slice_size.is_multiple_of(2),
         "PAR2 slice_size must be a multiple of 2"
     );
 
@@ -468,13 +459,11 @@ pub fn execute_repair_with_options(
         }
 
         // Check cancellation every 64 input slices.
-        if global_idx % 64 == 0 {
-            if let Some(ref cancel) = options.cancel {
-                if cancel.is_cancelled() {
+        if global_idx % 64 == 0
+            && let Some(ref cancel) = options.cancel
+                && cancel.is_cancelled() {
                     return Err(Par2Error::Cancelled);
                 }
-            }
-        }
 
         let (file_id, local_slice) = plan.global_to_file[global_idx];
         let offset = local_slice as u64 * plan.slice_size;

@@ -71,7 +71,14 @@ impl<'a> RangeDecoder<'a> {
     /// current code point falls within the probability range.
     #[inline]
     pub fn get_current_count(&self, scale: u32) -> u32 {
-        (self.code.wrapping_sub(self.low)) / (self.range / scale)
+        if scale == 0 {
+            return 0;
+        }
+        let r = self.range / scale;
+        if r == 0 {
+            return 0;
+        }
+        (self.code.wrapping_sub(self.low)) / r
     }
 
     /// Get the current "threshold" for binary symbol decisions.
@@ -89,9 +96,9 @@ impl<'a> RangeDecoder<'a> {
     /// - `freq`: frequency of this symbol
     /// - `scale`: total frequency scale
     pub fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
-        let r = self.range / scale;
+        let r = if scale > 0 { self.range / scale } else { self.range };
         self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
-        self.range = freq.wrapping_mul(r);
+        self.range = freq.max(1).wrapping_mul(r);
         self.normalize();
     }
 

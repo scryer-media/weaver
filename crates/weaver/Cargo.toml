@@ -1,7 +1,10 @@
 [package]
 name = "weaver"
-version = "0.1.0"
-edition = "2024"
+description = "Unified Usenet binary downloader, repair, and extraction engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "weaver"
@@ -24,6 +27,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 bytes = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
@@ -32,3 +36,4 @@ libc = "0.2"
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 sha2 = { workspace = true }
+sevenz-rust2 = { workspace = true }

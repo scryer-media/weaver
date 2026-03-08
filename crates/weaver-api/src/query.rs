@@ -3,7 +3,7 @@ use async_graphql::{Context, Object, Result};
 use weaver_core::config::SharedConfig;
 use weaver_scheduler::SchedulerHandle;
 
-use crate::types::{GeneralSettings, Job, JobStatusGql, Metrics, Server};
+use crate::types::{EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, Metrics, Server};
 
 pub struct QueryRoot;
 
@@ -28,16 +28,14 @@ impl QueryRoot {
                         return false;
                     }
                 }
-                if let Some(ref cat) = category {
-                    if info.category.as_ref() != Some(cat) {
+                if let Some(ref cat) = category
+                    && info.category.as_ref() != Some(cat) {
                         return false;
                     }
-                }
-                if let Some(ref key) = has_metadata_key {
-                    if !info.metadata.iter().any(|(k, _)| k == key) {
+                if let Some(ref key) = has_metadata_key
+                    && !info.metadata.iter().any(|(k, _)| k == key) {
                         return false;
                     }
-                }
                 true
             })
             .map(Job::from)
@@ -75,13 +73,34 @@ impl QueryRoot {
         Ok(cfg.servers.iter().map(Server::from).collect())
     }
 
+    /// Get the event log for a specific job.
+    async fn job_events(&self, ctx: &Context<'_>, job_id: u64) -> Result<Vec<JobEvent>> {
+        let db = ctx.data::<weaver_state::Database>()?;
+        let db = db.clone();
+        let events = tokio::task::spawn_blocking(move || db.get_job_events(job_id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(events
+            .into_iter()
+            .map(|e| JobEvent {
+                kind: e.kind.parse::<EventKind>().unwrap_or(EventKind::JobCreated),
+                job_id: e.job_id,
+                file_id: e.file_id,
+                message: e.message,
+                timestamp: e.timestamp as f64,
+            })
+            .collect())
+    }
+
     /// Get general settings.
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
         let cfg = config.read().await;
         Ok(GeneralSettings {
             data_dir: cfg.data_dir.clone(),
-            output_dir: cfg.output_dir().to_string(),
+            intermediate_dir: cfg.intermediate_dir(),
+            complete_dir: cfg.complete_dir(),
             cleanup_after_extract: cfg.cleanup_after_extract(),
             max_download_speed: cfg.max_download_speed.unwrap_or(0),
             max_retries: cfg

@@ -146,7 +146,7 @@ pub fn input_slice_constants(count: usize) -> Vec<u16> {
 /// A power of 2 has order 65535 iff its exponent is NOT divisible by any of these factors.
 #[inline]
 fn is_divisible_by_suborder_factor(exp: u32) -> bool {
-    exp % 3 == 0 || exp % 5 == 0 || exp % 17 == 0 || exp % 257 == 0
+    exp.is_multiple_of(3) || exp.is_multiple_of(5) || exp.is_multiple_of(17) || exp.is_multiple_of(257)
 }
 
 #[cfg(test)]

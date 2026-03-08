@@ -10,7 +10,12 @@ pub type SharedConfig = Arc<RwLock<Config>>;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub data_dir: String,
-    pub output_dir: Option<String>,
+    /// Directory for active downloads (per-job subdirectories).
+    /// Defaults to `{data_dir}/intermediate`.
+    pub intermediate_dir: Option<String>,
+    /// Directory for completed downloads (category subdirectories).
+    /// Defaults to `{data_dir}/complete`.
+    pub complete_dir: Option<String>,
     #[serde(default)]
     pub buffer_pool: Option<BufferPoolOverrides>,
     #[serde(default)]
@@ -33,9 +38,20 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns `output_dir` if explicitly set, otherwise falls back to `data_dir`.
-    pub fn output_dir(&self) -> &str {
-        self.output_dir.as_deref().unwrap_or(&self.data_dir)
+    /// Returns the intermediate directory for active downloads.
+    /// Defaults to `{data_dir}/intermediate`.
+    pub fn intermediate_dir(&self) -> String {
+        self.intermediate_dir
+            .clone()
+            .unwrap_or_else(|| format!("{}/intermediate", self.data_dir))
+    }
+
+    /// Returns the complete directory for finished downloads.
+    /// Defaults to `{data_dir}/complete`.
+    pub fn complete_dir(&self) -> String {
+        self.complete_dir
+            .clone()
+            .unwrap_or_else(|| format!("{}/complete", self.data_dir))
     }
 
     /// Whether to clean up intermediate files after successful extraction.
@@ -77,9 +93,9 @@ impl Config {
         let path = self
             .config_path
             .as_ref()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no config path set"))?;
+            .ok_or_else(|| std::io::Error::other("no config path set"))?;
         let toml_str = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, toml_str)
     }
 

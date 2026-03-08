@@ -21,7 +21,7 @@ pub struct ParsedHeaders {
 
 /// Find a line starting with the given prefix. Returns the byte offset of the
 /// prefix within `input`, or `None`.
-fn find_line_start<'a>(input: &'a [u8], prefix: &[u8]) -> Option<usize> {
+fn find_line_start(input: &[u8], prefix: &[u8]) -> Option<usize> {
     // Check if the input itself starts with the prefix.
     if input.starts_with(prefix) {
         return Some(0);
@@ -86,8 +86,7 @@ fn parse_fields(line: &str) -> Vec<(String, String)> {
         }
 
         // Check if this is the `name` field -- it must be last and consumes the rest.
-        if remaining.starts_with("name=") {
-            let value = &remaining[5..];
+        if let Some(value) = remaining.strip_prefix("name=") {
             // Trim trailing whitespace (e.g. trailing \r that wasn't stripped).
             let value = value.trim_end();
             fields.push(("name".to_string(), value.to_string()));
@@ -251,14 +250,13 @@ pub fn extract_filename_from_subject(subject: &str) -> Option<String> {
         let before_yenc = subject[..yenc_pos].trim();
 
         // Try to find a quoted string
-        if let Some(last_quote) = before_yenc.rfind('"') {
-            if let Some(first_quote) = before_yenc[..last_quote].rfind('"') {
+        if let Some(last_quote) = before_yenc.rfind('"')
+            && let Some(first_quote) = before_yenc[..last_quote].rfind('"') {
                 let filename = &before_yenc[first_quote + 1..last_quote];
                 if !filename.is_empty() {
                     return Some(filename.to_string());
                 }
             }
-        }
 
         // Strategy 2: Unquoted - take the last whitespace-delimited token before "yEnc"
         if let Some(last_token) = before_yenc.split_whitespace().next_back() {

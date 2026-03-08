@@ -92,23 +92,20 @@ pub fn nzb_to_spec(
 /// Extract password from NZB metadata or the {{password}} filename convention.
 fn extract_password(nzb: &Nzb, nzb_path: &Path) -> Option<String> {
     // 1. NZB meta password field.
-    if let Some(pw) = &nzb.meta.password {
-        if !pw.is_empty() {
+    if let Some(pw) = &nzb.meta.password
+        && !pw.is_empty() {
             return Some(pw.clone());
         }
-    }
 
     // 2. Filename convention: "Some.Release.{{password}}.nzb"
-    if let Some(stem) = nzb_path.file_stem().and_then(|s| s.to_str()) {
-        if let Some(start) = stem.find("{{") {
-            if let Some(end) = stem[start..].find("}}") {
+    if let Some(stem) = nzb_path.file_stem().and_then(|s| s.to_str())
+        && let Some(start) = stem.find("{{")
+            && let Some(end) = stem[start..].find("}}") {
                 let pw = &stem[start + 2..start + end];
                 if !pw.is_empty() {
                     return Some(pw.to_string());
                 }
             }
-        }
-    }
 
     None
 }

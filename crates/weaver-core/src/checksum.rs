@@ -44,12 +44,12 @@ impl SliceChecksumState {
     /// If `pad_to` is specified and greater than `bytes_fed`, zero bytes are
     /// fed to reach that length (for the last slice of a file).
     pub fn finalize(mut self, pad_to: Option<u64>) -> (u32, [u8; 16]) {
-        if let Some(target) = pad_to {
-            if target > self.bytes_fed {
-                let padding = vec![0u8; (target - self.bytes_fed) as usize];
-                self.crc32.update(&padding);
-                self.md5.update(&padding);
-            }
+        if let Some(target) = pad_to
+            && target > self.bytes_fed
+        {
+            let padding = vec![0u8; (target - self.bytes_fed) as usize];
+            self.crc32.update(&padding);
+            self.md5.update(&padding);
         }
         let crc = self.crc32.finalize();
         let md5: [u8; 16] = self.md5.finalize().into();
@@ -150,8 +150,8 @@ pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     let mut op = [0u32; 32];
     // Single-bit shift operator
     op[0] = POLY;
-    for n in 1..32 {
-        op[n] = 1 << (n - 1);
+    for (n, item) in op.iter_mut().enumerate().skip(1) {
+        *item = 1 << (n - 1);
     }
 
     // Square 3 times: 1-bit -> 2-bit -> 4-bit -> 8-bit operator

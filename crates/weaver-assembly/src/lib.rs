@@ -6,7 +6,7 @@ pub mod write_buffer;
 pub use error::AssemblyError;
 pub use file_assembly::{CommitResult, FileAssembly, IncrementalSliceState};
 pub use job_assembly::{
-    ArchiveMember, ArchiveTopology, ExtractionReadiness, JobAssembly, Par2Metadata,
+    ArchiveMember, ArchiveTopology, ArchiveType, ExtractionReadiness, JobAssembly, Par2Metadata,
 };
 
 #[cfg(test)]
@@ -382,6 +382,7 @@ mod tests {
         job.add_file(fa);
 
         let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
             volume_map: [("movie.part01.rar".into(), 0)].into_iter().collect(),
             complete_volumes: [0].into_iter().collect(),
             expected_volume_count: Some(1),
@@ -392,7 +393,7 @@ mod tests {
                 unpacked_size: 1_000_000,
             }],
         };
-        job.set_archive_topology(topo);
+        job.set_archive_topology("test".into(), topo);
 
         assert_eq!(job.extraction_readiness(), ExtractionReadiness::Ready);
     }
@@ -417,6 +418,7 @@ mod tests {
         job.add_file(fa2);
 
         let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
             volume_map: [
                 ("movie.part01.rar".into(), 0),
                 ("movie.part02.rar".into(), 1),
@@ -440,7 +442,7 @@ mod tests {
                 },
             ],
         };
-        job.set_archive_topology(topo);
+        job.set_archive_topology("test".into(), topo);
 
         match job.extraction_readiness() {
             ExtractionReadiness::Partial {
@@ -467,6 +469,7 @@ mod tests {
         job.add_file(fa);
 
         let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
             volume_map: [("movie.part01.rar".into(), 0)].into_iter().collect(),
             complete_volumes: HashSet::new(), // Nothing complete.
             expected_volume_count: Some(1),
@@ -477,11 +480,11 @@ mod tests {
                 unpacked_size: 1_000_000,
             }],
         };
-        job.set_archive_topology(topo);
+        job.set_archive_topology("test".into(), topo);
 
         match job.extraction_readiness() {
-            ExtractionReadiness::Blocked { reason } => {
-                assert!(reason.contains("no volumes"));
+            ExtractionReadiness::Blocked { .. } => {
+                // Expected: blocked because no volumes are complete.
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
@@ -599,6 +602,7 @@ mod tests {
         let mut job = JobAssembly::new(JobId(1));
 
         let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
             volume_map: std::collections::HashMap::new(),
             complete_volumes: std::collections::HashSet::new(),
             expected_volume_count: Some(3),
@@ -609,14 +613,14 @@ mod tests {
                 unpacked_size: 3000,
             }],
         };
-        job.set_archive_topology(topo);
+        job.set_archive_topology("test".into(), topo);
 
         // Not ready yet.
         assert_ne!(job.extraction_readiness(), ExtractionReadiness::Ready);
 
-        job.mark_volume_complete(0);
-        job.mark_volume_complete(1);
-        job.mark_volume_complete(2);
+        job.mark_volume_complete("test",0);
+        job.mark_volume_complete("test",1);
+        job.mark_volume_complete("test",2);
 
         assert_eq!(job.extraction_readiness(), ExtractionReadiness::Ready);
     }

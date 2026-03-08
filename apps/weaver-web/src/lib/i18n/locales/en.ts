@@ -32,10 +32,13 @@ const en: LocaleDictionary = {
   "action.uploading": "Uploading...",
   "action.backToJobs": "Back to jobs",
   "action.delete": "Delete",
+  "action.reprocess": "Reprocess",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Cancel this job?",
   "confirm.cancelJobMessage": "The download will be stopped and cannot be resumed.",
+  "confirm.cancelJobConfirm": "Cancel Download",
+  "confirm.cancelJobDismiss": "Keep Downloading",
   "confirm.deleteServer": "Delete this server?",
   "confirm.deleteServerMessage": "This server configuration will be permanently removed.",
 
@@ -122,7 +125,10 @@ const en: LocaleDictionary = {
 
   // General settings
   "settings.general": "General",
-  "settings.outputDir": "Output Directory",
+  "settings.intermediateDir": "Intermediate Directory",
+  "settings.intermediateDirDesc": "Active downloads are stored here in per-job subdirectories",
+  "settings.completeDir": "Complete Directory",
+  "settings.completeDirDesc": "Finished downloads are moved here, organized by category",
   "settings.dataDir": "Data Directory",
   "settings.cleanupAfterExtract": "Cleanup After Extract",
   "settings.cleanupDesc": "Delete intermediate files after successful extraction",

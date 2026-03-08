@@ -27,7 +27,7 @@ impl IfscPacket {
         let file_id = FileId::from_bytes(body[0..16].try_into().unwrap());
 
         let checksum_area = &body[16..];
-        if checksum_area.len() % CHECKSUM_ENTRY_SIZE != 0 {
+        if !checksum_area.len().is_multiple_of(CHECKSUM_ENTRY_SIZE) {
             return Err(Par2Error::InvalidIfscPacket {
                 reason: format!(
                     "checksum area length {} is not a multiple of {}",

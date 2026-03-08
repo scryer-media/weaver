@@ -135,12 +135,11 @@ impl ServerHealth {
     /// If the server is disabled and the backoff period has elapsed, transition
     /// back to Healthy. Otherwise this is a no-op.
     pub fn check_reenable(&mut self) {
-        if let ServerState::Disabled { until, .. } = self.state {
-            if Instant::now() >= until {
+        if let ServerState::Disabled { until, .. } = self.state
+            && Instant::now() >= until {
                 self.consecutive_failures = 0;
                 self.state = ServerState::Healthy;
             }
-        }
     }
 
     /// Compute the exponential backoff duration capped at `max_backoff`.

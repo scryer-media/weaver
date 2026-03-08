@@ -125,8 +125,8 @@ impl RarArchive {
                 })?;
 
                 // Optionally verify password against check data.
-                if let Some(ref check_data) = enc_info.check_data {
-                    if !crate::crypto::verify_password_check(
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -134,7 +134,6 @@ impl RarArchive {
                     ) {
                         return Err(RarError::InvalidPassword);
                     }
-                }
 
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
@@ -176,8 +175,8 @@ impl RarArchive {
                 };
 
                 // Verify CRC32 of decompressed data.
-                if options.verify {
-                    if let Some(expected) = fh.data_crc32 {
+                if options.verify
+                    && let Some(expected) = fh.data_crc32 {
                         let mut hasher = crc32fast::Hasher::new();
                         hasher.update(&decompressed);
                         let actual = hasher.finalize();
@@ -189,7 +188,6 @@ impl RarArchive {
                             });
                         }
                     }
-                }
 
                 decompressed
             }
@@ -201,15 +199,13 @@ impl RarArchive {
         }
 
         // Verify BLAKE2sp hash if provided.
-        if options.verify {
-            if let Some(FileHash::Blake2sp(expected)) = hash.as_ref() {
-                if !extract::verify_blake2(&output, expected) {
+        if options.verify
+            && let Some(FileHash::Blake2sp(expected)) = hash.as_ref()
+                && !extract::verify_blake2(&output, expected) {
                     return Err(RarError::Blake2Mismatch {
                         member: fh.name.clone(),
                     });
                 }
-            }
-        }
 
         // Report completion.
         if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
@@ -280,8 +276,8 @@ impl RarArchive {
             let mut hasher = if options.verify { Some(crc32fast::Hasher::new()) } else { None };
             let mut blake_hasher: Option<blake2::Blake2s256> = if options.verify {
                 use blake2::Digest;
-                hash.as_ref().and_then(|h| match h {
-                    FileHash::Blake2sp(_) => Some(blake2::Blake2s256::new()),
+                hash.as_ref().map(|h| match h {
+                    FileHash::Blake2sp(_) => blake2::Blake2s256::new(),
                 })
             } else {
                 None
@@ -340,8 +336,8 @@ impl RarArchive {
             writer.flush().map_err(RarError::Io)?;
 
             // Verify CRC32.
-            if let Some(h) = hasher {
-                if let Some(expected) = fh.data_crc32 {
+            if let Some(h) = hasher
+                && let Some(expected) = fh.data_crc32 {
                     let actual = h.finalize();
                     if actual != expected {
                         return Err(RarError::DataCrcMismatch {
@@ -351,11 +347,10 @@ impl RarArchive {
                         });
                     }
                 }
-            }
 
             // Verify BLAKE2sp.
-            if let Some(h) = blake_hasher {
-                if let Some(FileHash::Blake2sp(expected)) = hash.as_ref() {
+            if let Some(h) = blake_hasher
+                && let Some(FileHash::Blake2sp(expected)) = hash.as_ref() {
                     use blake2::Digest;
                     let actual: [u8; 32] = h.finalize().into();
                     if actual != *expected {
@@ -364,7 +359,6 @@ impl RarArchive {
                         });
                     }
                 }
-            }
 
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, written);
@@ -390,11 +384,10 @@ impl RarArchive {
                 let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
                     detail: format!("member {} is marked encrypted but has no encryption parameters", fh.name),
                 })?;
-                if let Some(ref check_data) = enc_info.check_data {
-                    if !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data) {
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data) {
                         return Err(RarError::InvalidPassword);
                     }
-                }
                 let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
@@ -412,8 +405,8 @@ impl RarArchive {
         if is_solid {
             // Solid archives need the full Vec path since the decoder state persists.
             let decompressed = self.decompress_solid(index, &compressed, unpacked_size, &fh)?;
-            if options.verify {
-                if let Some(expected) = fh.data_crc32 {
+            if options.verify
+                && let Some(expected) = fh.data_crc32 {
                     let mut hasher = crc32fast::Hasher::new();
                     hasher.update(&decompressed);
                     let actual = hasher.finalize();
@@ -425,17 +418,14 @@ impl RarArchive {
                         });
                     }
                 }
-            }
             writer.write_all(&decompressed).map_err(RarError::Io)?;
             writer.flush().map_err(RarError::Io)?;
 
-            if options.verify {
-                if let Some(FileHash::Blake2sp(expected)) = hash.as_ref() {
-                    if !extract::verify_blake2(&decompressed, expected) {
+            if options.verify
+                && let Some(FileHash::Blake2sp(expected)) = hash.as_ref()
+                    && !extract::verify_blake2(&decompressed, expected) {
                         return Err(RarError::Blake2Mismatch { member: fh.name.clone() });
                     }
-                }
-            }
 
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, decompressed.len() as u64);
@@ -530,6 +520,7 @@ impl RarArchive {
     ///
     /// On subsequent calls, prepares for solid continuation (keeps the
     /// sliding window / dictionary state but resets the bitstream block flag).
+    /// Dispatches to the correct decoder based on archive format.
     pub(super) fn run_solid_decoder(
         &mut self,
         compressed: &[u8],
@@ -548,14 +539,27 @@ impl RarArchive {
 
         let dict_size = dict_size as usize;
 
-        if let Some(decoder) = &mut self.solid_decoder {
-            // Prepare for next member: keep window state, reset block flag.
-            decoder.prepare_solid_continuation();
+        if fh.compression.format == ArchiveFormat::Rar4 {
+            if let Some(decoder) = &mut self.solid_decoder_rar4 {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
+            }
+            self.solid_decoder_rar4
+                .as_mut()
+                .unwrap()
+                .decompress(compressed, unpacked_size)
         } else {
-            self.solid_decoder = Some(LzDecoder::new(dict_size));
+            if let Some(decoder) = &mut self.solid_decoder {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder = Some(LzDecoder::new(dict_size));
+            }
+            self.solid_decoder
+                .as_mut()
+                .unwrap()
+                .decompress(compressed, unpacked_size)
         }
-
-        self.solid_decoder.as_mut().unwrap().decompress(compressed, unpacked_size)
     }
 
     /// Extract a member by name, handling any supported compression method.
@@ -584,10 +588,12 @@ impl RarArchive {
     ///
     /// Currently supports:
     /// - **Store** (uncompressed): streams directly, minimal memory.
-    /// - **LZ** (compressed, non-encrypted, non-solid): reads compressed data
-    ///   through a [`ChainedSegmentReader`], then streams decompressed output.
+    /// - **LZ** (compressed, non-solid): reads compressed data through a
+    ///   [`ChainedSegmentReader`], then streams decompressed output.
+    /// - **Encrypted** (Store or LZ): wraps the reader in [`DecryptingReader`]
+    ///   for on-the-fly AES-CBC decryption.
     ///
-    /// Falls back to the buffered path for encrypted or solid archives.
+    /// Falls back to the buffered path for solid archives.
     pub fn extract_member_streaming<W: Write>(
         &mut self,
         index: usize,
@@ -604,14 +610,30 @@ impl RarArchive {
         let fh = entry.file_header.clone();
         let is_encrypted = entry.is_encrypted;
         let is_solid = fh.compression.solid;
+        let file_encryption = entry.file_encryption.clone();
+        let rar4_salt = entry.rar4_salt;
         let unpacked_size = fh.unpacked_size.unwrap_or(0);
 
-        // For encrypted or solid archives, we can't stream — need all data upfront.
-        if is_encrypted || is_solid {
+        // Solid archives need sequential member state — can't stream.
+        if is_solid {
             return Err(RarError::CorruptArchive {
-                detail: "streaming extraction not supported for encrypted or solid archives".into(),
+                detail: "streaming extraction not supported for solid archives".into(),
             });
         }
+
+        // Resolve password if encrypted.
+        let member_password = if is_encrypted {
+            let pwd = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: fh.name.clone(),
+                })?;
+            Some(pwd.to_string())
+        } else {
+            None
+        };
 
         let segments = entry.segments.clone();
         let mut sorted_segs = segments;
@@ -620,6 +642,7 @@ impl RarArchive {
         debug!(
             member = %fh.name,
             method = ?fh.compression.method,
+            encrypted = is_encrypted,
             segments = sorted_segs.len(),
             unpacked_size,
             "streaming extraction starting"
@@ -629,26 +652,35 @@ impl RarArchive {
             CompressionMethod::Store => {
                 self.extract_member_streaming_store(
                     &fh, options, provider, &sorted_segs, unpacked_size, writer,
+                    member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
                 )
             }
             _ => {
                 self.extract_member_streaming_lz(
                     &fh, options, provider, &sorted_segs, unpacked_size, writer,
+                    member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
                 )
             }
         }
     }
 
     /// Streaming extraction for Store (uncompressed) members.
+    #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_store<W: Write>(
         &self,
         fh: &FileHeader,
         options: &ExtractOptions,
         provider: &dyn VolumeProvider,
         segments: &[DataSegment],
-        _unpacked_size: u64,
+        unpacked_size: u64,
         writer: &mut W,
+        password: Option<&str>,
+        file_encryption: Option<&FileEncryptionInfo>,
+        rar4_salt: Option<[u8; 8]>,
     ) -> RarResult<u64> {
+        let chained = ChainedSegmentReader::new(segments, provider);
+
+        // Wrap in DecryptingReader if encrypted, otherwise read directly.
         let mut hasher = if options.verify {
             Some(crc32fast::Hasher::new())
         } else {
@@ -657,51 +689,55 @@ impl RarArchive {
         let mut written = 0u64;
         let mut chunk = vec![0u8; 256 * 1024];
 
-        for seg in segments {
-            let mut vol_reader = provider.get_volume(seg.volume_index).map_err(|_| {
-                RarError::MissingVolume {
-                    volume: seg.volume_index,
-                    member: fh.name.clone(),
-                }
-            })?;
+        // For encrypted Store members, use unpacked_size to know when to stop
+        // (decrypted data may have AES padding at the end).
+        let max_bytes = if password.is_some() { unpacked_size } else { u64::MAX };
 
-            vol_reader
-                .seek(SeekFrom::Start(seg.data_offset))
-                .map_err(RarError::Io)?;
-
-            let mut remaining = seg.data_size as usize;
-            while remaining > 0 {
-                let to_read = chunk.len().min(remaining);
-                vol_reader.read_exact(&mut chunk[..to_read]).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        RarError::TruncatedData {
-                            offset: seg.data_offset,
-                        }
-                    } else {
-                        RarError::Io(e)
-                    }
+        let mut reader: Box<dyn Read> = if let Some(pwd) = password {
+            if self.format == ArchiveFormat::Rar4 {
+                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4 member {} is marked encrypted but has no salt",
+                        fh.name,
+                    ),
                 })?;
-                writer.write_all(&chunk[..to_read]).map_err(RarError::Io)?;
-                if let Some(ref mut h) = hasher {
-                    h.update(&chunk[..to_read]);
-                }
-                written += to_read as u64;
-                remaining -= to_read;
+                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                Box::new(crate::crypto::DecryptingReader::new_rar4(chained, &key, &iv))
+            } else {
+                let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "member {} is marked encrypted but has no encryption parameters",
+                        fh.name,
+                    ),
+                })?;
+                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
             }
+        } else {
+            Box::new(chained)
+        };
 
-            debug!(
-                volume = seg.volume_index,
-                segment_bytes = seg.data_size,
-                total_written = written,
-                "streaming store: volume consumed"
-            );
+        loop {
+            let to_read = chunk.len().min((max_bytes - written) as usize);
+            if to_read == 0 {
+                break;
+            }
+            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&chunk[..n]).map_err(RarError::Io)?;
+            if let Some(ref mut h) = hasher {
+                h.update(&chunk[..n]);
+            }
+            written += n as u64;
         }
 
         writer.flush().map_err(RarError::Io)?;
 
         // Verify CRC32.
-        if let Some(h) = hasher {
-            if let Some(expected) = fh.data_crc32 {
+        if let Some(h) = hasher
+            && let Some(expected) = fh.data_crc32 {
                 let actual = h.finalize();
                 if actual != expected {
                     return Err(RarError::DataCrcMismatch {
@@ -711,16 +747,16 @@ impl RarArchive {
                     });
                 }
             }
-        }
 
         Ok(written)
     }
 
-    /// Streaming extraction for LZ-compressed (non-encrypted, non-solid) members.
+    /// Streaming extraction for LZ-compressed (non-solid) members.
     ///
     /// Uses a `ChainedSegmentReader` to provide the compressed bitstream to the
     /// LZ decompressor, which may block on the `VolumeProvider` when it needs
-    /// the next volume.
+    /// the next volume. For encrypted members, wraps in `DecryptingReader`.
+    #[allow(clippy::too_many_arguments)]
     fn extract_member_streaming_lz<W: Write>(
         &self,
         fh: &FileHeader,
@@ -729,11 +765,40 @@ impl RarArchive {
         segments: &[DataSegment],
         unpacked_size: u64,
         writer: &mut W,
+        password: Option<&str>,
+        file_encryption: Option<&FileEncryptionInfo>,
+        rar4_salt: Option<[u8; 8]>,
     ) -> RarResult<u64> {
         // Read all compressed data through the chained reader.
         // The ChainedSegmentReader blocks on the VolumeProvider as needed.
         let chained = ChainedSegmentReader::new(segments, provider);
-        let mut buf_reader = BufReader::with_capacity(1024 * 1024, chained);
+
+        // Wrap in DecryptingReader if encrypted.
+        let inner: Box<dyn Read> = if let Some(pwd) = password {
+            if self.format == ArchiveFormat::Rar4 {
+                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4 member {} is marked encrypted but has no salt",
+                        fh.name,
+                    ),
+                })?;
+                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                Box::new(crate::crypto::DecryptingReader::new_rar4(chained, &key, &iv))
+            } else {
+                let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "member {} is marked encrypted but has no encryption parameters",
+                        fh.name,
+                    ),
+                })?;
+                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
+            }
+        } else {
+            Box::new(chained)
+        };
+
+        let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
         let mut compressed = Vec::new();
         std::io::Read::read_to_end(&mut buf_reader, &mut compressed).map_err(|e| {
             // Check if this is a VolumeProvider error wrapped in io::Error.
@@ -804,11 +869,11 @@ impl<'a> ChainedSegmentReader<'a> {
 
         let seg = &self.segments[self.current_seg];
         let mut reader = self.provider.get_volume(seg.volume_index).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            std::io::Error::other(e.to_string())
         })?;
         reader
             .seek(SeekFrom::Start(seg.data_offset))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         self.current_reader = Some(reader);
         self.remaining_in_segment = seg.data_size;
         self.current_seg += 1;

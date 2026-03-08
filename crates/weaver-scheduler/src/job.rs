@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use weaver_assembly::JobAssembly;
@@ -23,6 +25,7 @@ pub enum JobStatus {
 
 /// A job definition submitted to the scheduler.
 /// Contains everything needed to create and run a download job.
+#[derive(Clone)]
 pub struct JobSpec {
     /// Human-readable name for the job.
     pub name: String,
@@ -39,6 +42,7 @@ pub struct JobSpec {
 }
 
 /// Specification for a single file within a job.
+#[derive(Clone)]
 pub struct FileSpec {
     /// Filename (extracted from NZB subject).
     pub filename: String,
@@ -51,6 +55,7 @@ pub struct FileSpec {
 }
 
 /// Specification for a single segment to download.
+#[derive(Clone)]
 pub struct SegmentSpec {
     /// 0-indexed segment number.
     pub number: u32,
@@ -67,6 +72,9 @@ pub struct JobState {
     pub status: JobStatus,
     pub assembly: JobAssembly,
     pub created_at: std::time::Instant,
+    /// Per-job working directory (subdirectory under intermediate_dir).
+    /// All download/decode/verify/repair/extract I/O happens here.
+    pub working_dir: PathBuf,
     /// Bytes downloaded for this specific job.
     pub downloaded_bytes: u64,
     /// Bytes from segments that are permanently lost (430 / max retries exhausted).

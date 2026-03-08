@@ -156,16 +156,15 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                         }
                     }
                     b"group" if in_groups => {
-                        if let Some(ref mut f) = current_file {
-                            if !text_buf.is_empty() {
+                        if let Some(ref mut f) = current_file
+                            && !text_buf.is_empty() {
                                 f.groups.push(text_buf.clone());
                             }
-                        }
                     }
                     b"groups" => in_groups = false,
                     b"segment" if in_segments => {
-                        if let Some(seg) = current_segment.take() {
-                            if let Some(ref mut f) = current_file {
+                        if let Some(seg) = current_segment.take()
+                            && let Some(ref mut f) = current_file {
                                 let number = seg.number.unwrap_or(0);
                                 let bytes = seg.bytes.unwrap_or(0);
                                 // Strip angle brackets from message-ID if present
@@ -179,7 +178,6 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                                     message_id,
                                 });
                             }
-                        }
                     }
                     b"segments" => in_segments = false,
                     b"file" => {

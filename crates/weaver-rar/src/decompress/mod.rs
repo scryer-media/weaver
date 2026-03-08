@@ -1,22 +1,23 @@
-//! Decompression dispatcher for RAR5.
+//! Decompression dispatcher for RAR4 and RAR5.
 //!
 //! Routes compressed data to the appropriate decompressor based on the
-//! compression method (Store vs LZ).
+//! archive format and compression method.
 
 pub mod lz;
 pub mod ppmd;
+pub mod rar4;
 pub mod store;
 
 use std::io::Write;
 
 use crate::error::{RarError, RarResult};
-use crate::types::{CompressionInfo, CompressionMethod};
+use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod};
 
-/// Decompress data from a RAR5 file entry.
+/// Decompress data from a RAR file entry.
 ///
 /// `input` is the raw compressed data area.
 /// `unpacked_size` is the expected uncompressed size.
-/// `info` provides compression parameters.
+/// `info` provides compression parameters (including format for RAR4 vs RAR5).
 /// `expected_crc` is the CRC32 from the file header (for store verification).
 ///
 /// Returns the decompressed data.
@@ -37,10 +38,12 @@ pub fn decompress(
         | CompressionMethod::Fast
         | CompressionMethod::Normal
         | CompressionMethod::Good
-        | CompressionMethod::Best => {
-            // Methods 1-5: LZ compression.
-            lz::decompress_lz(input, unpacked_size, info)
-        }
+        | CompressionMethod::Best => match info.format {
+            ArchiveFormat::Rar4 => {
+                rar4::decompress_rar4_lz(input, unpacked_size, info.dict_size)
+            }
+            ArchiveFormat::Rar5 => lz::decompress_lz(input, unpacked_size, info),
+        },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
             method: code,
             version: info.version,
@@ -69,7 +72,14 @@ pub fn decompress_to_writer<W: Write>(
         | CompressionMethod::Fast
         | CompressionMethod::Normal
         | CompressionMethod::Good
-        | CompressionMethod::Best => lz::decompress_lz_to_writer(input, unpacked_size, info, writer),
+        | CompressionMethod::Best => match info.format {
+            ArchiveFormat::Rar4 => {
+                rar4::decompress_rar4_lz_to_writer(input, unpacked_size, info.dict_size, writer)
+            }
+            ArchiveFormat::Rar5 => {
+                lz::decompress_lz_to_writer(input, unpacked_size, info, writer)
+            }
+        },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
             method: code,
             version: info.version,
@@ -89,6 +99,7 @@ mod tests {
         let crc = hasher.finalize();
 
         let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
             version: 0,
             solid: false,
             method: CompressionMethod::Store,
@@ -102,6 +113,7 @@ mod tests {
     #[test]
     fn test_dispatch_unknown_method() {
         let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
             version: 0,
             solid: false,
             method: CompressionMethod::Unknown(7),
@@ -118,10 +130,25 @@ mod tests {
     #[test]
     fn test_dispatch_lz_empty() {
         let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
             version: 0,
             solid: false,
             method: CompressionMethod::Normal,
             dict_size: 128 * 1024,
+        };
+
+        let result = decompress(&[], 0, &info, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dispatch_rar4_lz_empty() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar4,
+            version: 29,
+            solid: false,
+            method: CompressionMethod::Normal,
+            dict_size: 4 * 1024 * 1024,
         };
 
         let result = decompress(&[], 0, &info, None).unwrap();

@@ -40,7 +40,7 @@ impl FileVerificationState {
         let num_slices = if file_length == 0 {
             0
         } else {
-            ((file_length + slice_size - 1) / slice_size) as usize
+            file_length.div_ceil(slice_size) as usize
         };
 
         Self {
@@ -179,14 +179,13 @@ impl VerificationSession {
                 let set = Arc::new(set);
                 // Initialize file states for any files we haven't seen yet.
                 for file_id in &set.recovery_file_ids {
-                    if !self.file_states.contains_key(file_id) {
-                        if let Some(desc) = set.file_description(file_id) {
+                    if !self.file_states.contains_key(file_id)
+                        && let Some(desc) = set.file_description(file_id) {
                             self.file_states.insert(
                                 *file_id,
                                 FileVerificationState::new(desc.length, set.slice_size),
                             );
                         }
-                    }
                 }
                 self.par2_set = Some(set);
             }
@@ -230,11 +229,10 @@ impl VerificationSession {
         // Try to finalize the slice that was just fed.
         if par2_set.slice_size > 0 {
             let slice_index = (offset / par2_set.slice_size) as usize;
-            if let Some(checksums) = par2_set.file_checksums(file_id) {
-                if slice_index < checksums.len() {
+            if let Some(checksums) = par2_set.file_checksums(file_id)
+                && slice_index < checksums.len() {
                     state.try_finalize_slice(slice_index, &checksums[slice_index]);
                 }
-            }
         }
     }
 

@@ -76,11 +76,10 @@ fn detect_rar5_encryption(data: &[u8]) -> EncryptionStatus {
     };
 
     // Type 2 = File, Type 3 = Service — both can have encryption extra records.
-    if header_type2 == 2 || header_type2 == 3 {
-        if has_rar5_encryption_extra(&header2_body) {
+    if (header_type2 == 2 || header_type2 == 3)
+        && has_rar5_encryption_extra(&header2_body) {
             return EncryptionStatus::FileEncrypted;
         }
-    }
 
     EncryptionStatus::None
 }

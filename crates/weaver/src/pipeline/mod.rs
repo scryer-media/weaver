@@ -34,7 +34,7 @@ use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
     RuntimeTuner, SchedulerCommand, TokenBucket,
 };
-use weaver_state::{JournalEntry, JournalWriter};
+use weaver_state::CommittedSegment;
 
 
 /// Maximum number of retries for a single segment before giving up.
@@ -81,6 +81,7 @@ pub struct Pipeline {
     /// NNTP client for fetching articles.
     pub(super) nntp: Arc<NntpClient>,
     /// Buffer pool for decode stage.
+    #[allow(dead_code)]
     pub(super) buffers: Arc<BufferPool>,
     /// Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
@@ -94,10 +95,14 @@ pub struct Pipeline {
     pub(super) active_downloads: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
-    /// Output directory for downloaded files.
-    pub(super) output_dir: PathBuf,
-    /// Crash-recovery journal.
-    pub(super) journal: JournalWriter,
+    /// Directory for active downloads (per-job subdirectories).
+    pub(super) intermediate_dir: PathBuf,
+    /// Directory for completed downloads (category subdirectories).
+    pub(super) complete_dir: PathBuf,
+    /// Directory where persisted NZB files live (for reprocessing after restart).
+    pub(super) nzb_dir: PathBuf,
+    /// Pending segment commits (flushed to SQLite in batches).
+    pub(super) segment_batch: Vec<CommittedSegment>,
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
@@ -123,25 +128,33 @@ pub struct Pipeline {
     pub(super) par2_sets: HashMap<JobId, Arc<Par2FileSet>>,
     /// Members already extracted per job (for partial extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
-    /// Active streaming extraction providers per job.
+    /// Archive sets already extracted per job (for multi-set 7z).
+    pub(super) extracted_sets: HashMap<JobId, HashSet<String>>,
+    /// Active streaming extraction providers per (job, archive set).
     /// The `WaitingVolumeProvider` is fed volume paths as they complete.
-    pub(super) streaming_providers: HashMap<JobId, Arc<weaver_rar::WaitingVolumeProvider>>,
+    pub(super) streaming_providers: HashMap<(JobId, String), Arc<weaver_rar::WaitingVolumeProvider>>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
     pub(super) finished_jobs: Vec<JobInfo>,
+    /// SQLite database for durable history.
+    pub(super) db: weaver_state::Database,
 }
 
 impl Pipeline {
     /// Create a new pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         cmd_rx: mpsc::Receiver<SchedulerCommand>,
         event_tx: broadcast::Sender<PipelineEvent>,
         nntp: NntpClient,
         buffers: Arc<BufferPool>,
         profile: SystemProfile,
-        output_dir: PathBuf,
+        data_dir: PathBuf,
+        intermediate_dir: PathBuf,
+        complete_dir: PathBuf,
         total_connections: usize,
         write_buf_max_pending: usize,
         initial_history: Vec<JobInfo>,
+        db: weaver_state::Database,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = PipelineMetrics::new();
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
@@ -151,13 +164,12 @@ impl Pipeline {
             "pipeline tuner initialized"
         );
 
-        // Ensure output directory exists.
-        tokio::fs::create_dir_all(&output_dir).await?;
+        // Ensure directories exist.
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(&intermediate_dir).await?;
+        tokio::fs::create_dir_all(&complete_dir).await?;
 
-        // Open state journal.
-        let journal_path = output_dir.join(".weaver-journal");
-        let journal = JournalWriter::open(&journal_path).await?;
-        info!(path = %journal_path.display(), "journal opened");
+        let nzb_dir = data_dir.join(".weaver-nzbs");
 
         // Internal channels for pipeline stage results.
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
@@ -176,8 +188,10 @@ impl Pipeline {
             job_order: Vec::new(),
             active_downloads: 0,
             active_recovery: 0,
-            output_dir,
-            journal,
+            intermediate_dir,
+            complete_dir,
+            nzb_dir,
+            segment_batch: Vec::new(),
             download_done_tx,
             download_done_rx,
             decode_done_tx,
@@ -193,8 +207,10 @@ impl Pipeline {
             write_buffers: HashMap::new(),
             par2_sets: HashMap::new(),
             extracted_members: HashMap::new(),
+            extracted_sets: HashMap::new(),
             streaming_providers: HashMap::new(),
             finished_jobs: initial_history,
+            db,
         })
     }
 
@@ -315,20 +331,19 @@ impl Pipeline {
                 spec,
                 committed_segments,
                 status,
+                working_dir,
                 reply,
             } => {
-                let result = self.restore_job(job_id, spec, committed_segments, status);
+                let result = self.restore_job(job_id, spec, committed_segments, status, working_dir);
                 let _ = reply.send(result);
             }
             SchedulerCommand::PauseJob { job_id, reply } => {
                 let result = self.set_job_status(job_id, JobStatus::Paused);
                 if result.is_ok() {
                     let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
-                    let _ = self.journal.append(&JournalEntry::JobStatusChanged {
-                        job_id,
-                        status: weaver_state::PersistedJobStatus::Paused,
-                        timestamp: timestamp_secs(),
-                    }).await;
+                    if let Err(e) = self.db.set_active_job_status(job_id, "paused", None) {
+                        error!(error = %e, "db write failed for PauseJob");
+                    }
                 }
                 let _ = reply.send(result);
             }
@@ -336,11 +351,9 @@ impl Pipeline {
                 let result = self.set_job_status(job_id, JobStatus::Downloading);
                 if result.is_ok() {
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
-                    let _ = self.journal.append(&JournalEntry::JobStatusChanged {
-                        job_id,
-                        status: weaver_state::PersistedJobStatus::Downloading,
-                        timestamp: timestamp_secs(),
-                    }).await;
+                    if let Err(e) = self.db.set_active_job_status(job_id, "downloading", None) {
+                        error!(error = %e, "db write failed for ResumeJob");
+                    }
                 }
                 let _ = reply.send(result);
             }
@@ -349,32 +362,61 @@ impl Pipeline {
                     // Per-job queues are dropped with the JobState.
                     self.job_order.retain(|id| *id != job_id);
 
+                    // Archive cancelled job: move to history + delete active state.
+                    let now = timestamp_secs() as i64;
+                    let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
+                    let created_at = now - elapsed_secs;
+                    let total = state.spec.total_bytes;
+                    let health = if total == 0 {
+                        1000
+                    } else {
+                        ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
+                    };
+                    let row = weaver_state::JobHistoryRow {
+                        job_id: job_id.0,
+                        name: state.spec.name.clone(),
+                        status: "cancelled".to_string(),
+                        error_message: None,
+                        total_bytes: total,
+                        downloaded_bytes: state.downloaded_bytes,
+                        failed_bytes: state.failed_bytes,
+                        health,
+                        category: state.spec.category.clone(),
+                        output_dir: Some(state.working_dir.display().to_string()),
+                        nzb_path: None,
+                        created_at,
+                        completed_at: now,
+                        metadata: if state.spec.metadata.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(&state.spec.metadata).ok()
+                        },
+                    };
+                    let db = self.db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = db.archive_job(job_id, &row) {
+                            tracing::error!(job_id = job_id.0, error = %e, "failed to archive cancelled job");
+                        }
+                    });
+
                     // Clean up per-job caches.
                     self.par2_sets.remove(&job_id);
                     self.extracted_members.remove(&job_id);
+                    self.extracted_sets.remove(&job_id);
                     self.cancel_streaming_extraction(job_id);
                     self.write_buffers.retain(|fid, _| fid.job_id != job_id);
 
-                    // Delete incomplete files from disk.
-                    let filenames: Vec<String> = state
-                        .assembly
-                        .files()
-                        .map(|f| f.filename().to_string())
-                        .collect();
-                    let output_dir = self.output_dir.clone();
+                    // Delete per-job working directory.
+                    let working_dir = state.working_dir.clone();
                     tokio::spawn(async move {
-                        for filename in filenames {
-                            let path = output_dir.join(&filename);
-                            if let Err(e) = tokio::fs::remove_file(&path).await {
-                                if e.kind() != std::io::ErrorKind::NotFound {
-                                    tracing::warn!(
-                                        file = %path.display(),
-                                        error = %e,
-                                        "failed to clean up cancelled job file"
-                                    );
-                                }
+                        if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
+                            && e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    dir = %working_dir.display(),
+                                    error = %e,
+                                    "failed to clean up cancelled job directory"
+                                );
                             }
-                        }
                     });
 
                     Ok(())
@@ -419,6 +461,10 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
+            SchedulerCommand::ReprocessJob { job_id, reply } => {
+                let result = self.reprocess_job(job_id).await;
+                let _ = reply.send(result);
+            }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }
     }
@@ -431,10 +477,22 @@ impl Pipeline {
                 "draining in-flight downloads"
             );
         }
-        // Flush the journal before exiting.
-        if let Err(e) = self.journal.sync().await {
-            error!(error = %e, "journal sync failed during shutdown");
+        // Flush any pending segment commits.
+        self.flush_segment_batch();
+    }
+
+    /// Flush the pending segment batch to SQLite.
+    pub(super) fn flush_segment_batch(&mut self) {
+        if self.segment_batch.is_empty() {
+            return;
         }
+        let batch = std::mem::take(&mut self.segment_batch);
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.commit_segments(&batch) {
+                tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+            }
+        });
     }
 }
 
@@ -448,6 +506,7 @@ pub(super) async fn write_segment_to_disk(
 
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(path)
         .await?;
@@ -498,20 +557,72 @@ pub(super) fn timestamp_secs() -> u64 {
         .as_secs()
 }
 
-/// Convert a scheduler JobStatus to a persisted journal status.
-#[allow(dead_code)]
-pub(super) fn to_persisted(status: &JobStatus) -> weaver_state::PersistedJobStatus {
-    match status {
-        JobStatus::Queued | JobStatus::Downloading | JobStatus::Checking => {
-            weaver_state::PersistedJobStatus::Downloading
-        }
-        JobStatus::Verifying => weaver_state::PersistedJobStatus::Verifying,
-        JobStatus::Repairing => weaver_state::PersistedJobStatus::Repairing,
-        JobStatus::Extracting => weaver_state::PersistedJobStatus::Extracting,
-        JobStatus::Complete => weaver_state::PersistedJobStatus::Complete,
-        JobStatus::Failed { error } => weaver_state::PersistedJobStatus::Failed {
-            error: error.clone(),
-        },
-        JobStatus::Paused => weaver_state::PersistedJobStatus::Paused,
+impl Pipeline {
+    /// Write a terminal job to SQLite history and add it to the finished_jobs list.
+    pub(super) fn record_job_history(&mut self, job_id: JobId) {
+        let state = match self.jobs.get(&job_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let (status_str, error_message) = match &state.status {
+            JobStatus::Complete => ("complete".to_string(), None),
+            JobStatus::Failed { error } => ("failed".to_string(), Some(error.clone())),
+            _ => return, // Not terminal — nothing to record.
+        };
+
+        let now = timestamp_secs() as i64;
+        let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
+        let created_at = now - elapsed_secs;
+        let total = state.spec.total_bytes;
+        let health = if total == 0 {
+            1000
+        } else {
+            ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
+        };
+
+        let row = weaver_state::JobHistoryRow {
+            job_id: job_id.0,
+            name: state.spec.name.clone(),
+            status: status_str,
+            error_message,
+            total_bytes: total,
+            downloaded_bytes: state.downloaded_bytes,
+            failed_bytes: state.failed_bytes,
+            health,
+            category: state.spec.category.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+            nzb_path: None,
+            created_at,
+            completed_at: now,
+            metadata: if state.spec.metadata.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&state.spec.metadata).ok()
+            },
+        };
+
+        // Also keep in finished_jobs for runtime queries.
+        self.finished_jobs.push(JobInfo {
+            job_id,
+            name: state.spec.name.clone(),
+            status: state.status.clone(),
+            progress: state.assembly.progress(),
+            total_bytes: total,
+            downloaded_bytes: state.downloaded_bytes,
+            failed_bytes: state.failed_bytes,
+            health,
+            password: state.spec.password.clone(),
+            category: state.spec.category.clone(),
+            metadata: state.spec.metadata.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+        });
+
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.archive_job(job_id, &row) {
+                tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
+            }
+        });
     }
 }

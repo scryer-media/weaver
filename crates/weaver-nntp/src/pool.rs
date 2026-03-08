@@ -329,7 +329,7 @@ impl Drop for PooledConnection {
             if conn.is_healthy() {
                 // tokio::spawn can fail during runtime shutdown; if so, the
                 // connection is simply dropped (permit released by _permit).
-                let _ = tokio::spawn(async move {
+                drop(tokio::spawn(async move {
                     {
                         let mut h = health.lock().await;
                         h.record_success(server_idx);
@@ -338,9 +338,9 @@ impl Drop for PooledConnection {
                     pool.active_count = pool.active_count.saturating_sub(1);
                     pool.idle.push_back(conn);
                     trace!("returned connection to pool");
-                });
+                }));
             } else {
-                let _ = tokio::spawn(async move {
+                drop(tokio::spawn(async move {
                     {
                         let mut h = health.lock().await;
                         h.record_failure(server_idx, false);
@@ -352,7 +352,7 @@ impl Drop for PooledConnection {
                     } else {
                         trace!("dropped unhealthy connection, recorded failure");
                     }
-                });
+                }));
             }
         }
     }

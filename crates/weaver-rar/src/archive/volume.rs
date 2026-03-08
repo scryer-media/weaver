@@ -158,48 +158,44 @@ impl RarArchive {
     /// Integrate a member entry from a new volume into the unified member list.
     ///
     /// Handles split_before/split_after reconciliation for files spanning volumes.
+    /// Continuation headers (split_before) in real RAR archives often have empty
+    /// names, so we match by split state and volume adjacency, not by name.
     pub(super) fn integrate_member(&mut self, vol_num: usize, entry: MemberEntry) {
         let segment = entry.segments[0].clone();
 
         if entry.file_header.split_before {
-            // Continuation segment — find existing member with same name.
-            if let Some(existing) = self.members.iter_mut().find(|m| {
-                m.file_header.name == entry.file_header.name
-            }) {
-                existing.segments.push(segment);
-                if !entry.file_header.split_after {
-                    existing.file_header.split_after = false;
+            // Continuation segment — find the existing member that expects a
+            // continuation. Match criteria:
+            // 1. The member still has split_after=true (waiting for more data)
+            // 2. Its last segment is from the preceding volume (or same name)
+            let existing = self.members.iter_mut().find(|m| {
+                m.file_header.split_after && {
+                    // Prefer volume-adjacency match.
+                    let last_vol = m.segments.last().map(|s| s.volume_index);
+                    last_vol == Some(vol_num.wrapping_sub(1))
+                        // Fall back to name match for out-of-order volumes.
+                        || (!entry.file_header.name.is_empty()
+                            && m.file_header.name == entry.file_header.name)
                 }
-                if existing.file_header.data_crc32.is_none() {
-                    existing.file_header.data_crc32 = entry.file_header.data_crc32;
-                }
-                if existing.file_header.unpacked_size.is_none() {
-                    existing.file_header.unpacked_size = entry.file_header.unpacked_size;
-                }
-                if !existing.is_encrypted && entry.is_encrypted {
-                    existing.is_encrypted = true;
-                }
-                if existing.file_encryption.is_none() {
-                    existing.file_encryption = entry.file_encryption;
-                }
-                if existing.rar4_salt.is_none() {
-                    existing.rar4_salt = entry.rar4_salt;
-                }
-                if existing.hash.is_none() {
-                    existing.hash = entry.hash;
-                }
-                if existing.redirection.is_none() {
-                    existing.redirection = entry.redirection;
-                }
+            });
+
+            if let Some(existing) = existing {
+                Self::merge_continuation(existing, &entry, segment);
             } else {
                 // No prior entry — volumes arrived out of order.
                 self.members.push(entry);
             }
         } else {
             // New member starting in this volume.
-            if let Some(existing) = self.members.iter_mut().find(|m| {
-                m.file_header.name == entry.file_header.name && m.segments[0].volume_index > vol_num
-            }) {
+            // Check if we already have a continuation-only entry from a later
+            // volume (out-of-order arrival).
+            let existing = self.members.iter_mut().find(|m| {
+                !entry.file_header.name.is_empty()
+                    && m.file_header.name == entry.file_header.name
+                    && m.segments[0].volume_index > vol_num
+            });
+
+            if let Some(existing) = existing {
                 // We already have a later continuation — insert this segment at front.
                 existing.segments.insert(0, segment);
                 existing.file_header = entry.file_header;
@@ -215,6 +211,45 @@ impl RarArchive {
             } else {
                 self.members.push(entry);
             }
+        }
+    }
+
+    /// Merge a continuation entry's metadata into an existing member.
+    fn merge_continuation(existing: &mut MemberEntry, entry: &MemberEntry, segment: DataSegment) {
+        existing.segments.push(segment);
+        if !entry.file_header.split_after {
+            existing.file_header.split_after = false;
+        }
+        // In multi-volume archives, each volume's file header stores the CRC of
+        // that volume's data segment. Only the LAST continuation (split_after=false)
+        // has the whole-file CRC. Always prefer the final segment's CRC.
+        if (!entry.file_header.split_after && entry.file_header.data_crc32.is_some())
+            || existing.file_header.data_crc32.is_none()
+        {
+            existing.file_header.data_crc32 = entry.file_header.data_crc32;
+        }
+        if existing.file_header.unpacked_size.is_none() {
+            existing.file_header.unpacked_size = entry.file_header.unpacked_size;
+        }
+        // Carry over the name if the existing entry still has an empty name
+        // (can happen with out-of-order volume arrival).
+        if existing.file_header.name.is_empty() && !entry.file_header.name.is_empty() {
+            existing.file_header.name = entry.file_header.name.clone();
+        }
+        if !existing.is_encrypted && entry.is_encrypted {
+            existing.is_encrypted = true;
+        }
+        if existing.file_encryption.is_none() {
+            existing.file_encryption = entry.file_encryption.clone();
+        }
+        if existing.rar4_salt.is_none() {
+            existing.rar4_salt = entry.rar4_salt;
+        }
+        if existing.hash.is_none() {
+            existing.hash = entry.hash.clone();
+        }
+        if existing.redirection.is_none() {
+            existing.redirection = entry.redirection.clone();
         }
     }
 

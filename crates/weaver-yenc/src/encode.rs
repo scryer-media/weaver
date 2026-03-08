@@ -35,6 +35,7 @@ pub fn encode(
 }
 
 /// Encode `input` bytes into a complete multi-part yEnc article, appending to `output`.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_part(
     input: &[u8],
     output: &mut Vec<u8>,

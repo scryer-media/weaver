@@ -39,11 +39,7 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
     let mut files = Vec::new();
     let mut end = None;
 
-    loop {
-        let raw = match header::read_raw_header(reader)? {
-            Some(raw) => raw,
-            None => break,
-        };
+    while let Some(raw) = header::read_raw_header(reader)? {
 
         match raw.header_type {
             Rar4HeaderType::Mark => {
@@ -75,7 +71,7 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
                 end = Some(e);
                 break;
             }
-            Rar4HeaderType::Comment | Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Recovery => {
+            Rar4HeaderType::Comment | Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Recovery | Rar4HeaderType::NewSub => {
                 debug!("RAR4 skipping header type {:?}", raw.header_type);
             }
             Rar4HeaderType::Unknown(t) => {
@@ -136,7 +132,8 @@ pub fn to_member_info(fh: &Rar4FileHeader, volume_index: usize) -> MemberInfo {
         mtime,
         host_os,
         compression: CompressionInfo {
-            version: 0,
+            format: crate::types::ArchiveFormat::Rar4,
+            version: 29,
             solid: fh.is_solid,
             method,
             dict_size: 4 * 1024 * 1024, // RAR4 default: 4 MB
@@ -170,7 +167,7 @@ fn dos_datetime_to_system_time(dos_dt: u32) -> Option<std::time::SystemTime> {
     // Calculate days since Unix epoch (1970-01-01).
     // Simplified: count days using a basic year/month calculation.
     let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = |y: u32| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let is_leap = |y: u32| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
 
     let mut total_days: i64 = 0;
     for y in 1970..year {

@@ -10,6 +10,7 @@ mod volume;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::decompress::lz::LzDecoder;
+use crate::decompress::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
 use crate::extract::{self, ExtractOptions};
 use crate::header;
@@ -96,8 +97,10 @@ pub struct RarArchive {
     pub(super) more_volumes: bool,
     /// Volume readers, indexed by volume number.
     pub(super) volumes: Vec<Option<VolumeData>>,
-    /// LZ decoder state for solid archive extraction (carries across members).
+    /// RAR5 LZ decoder state for solid archive extraction (carries across members).
     pub(super) solid_decoder: Option<LzDecoder>,
+    /// RAR4 LZ decoder state for solid archive extraction.
+    pub(super) solid_decoder_rar4: Option<Rar4LzDecoder>,
     /// Index of the next member that must be extracted in a solid archive.
     pub(super) solid_next_index: usize,
     /// Resource limits for archive processing.
@@ -298,6 +301,7 @@ impl RarArchive {
     /// Reset solid decoder state (e.g. if starting a fresh extraction pass).
     pub fn reset_solid_state(&mut self) {
         self.solid_decoder = None;
+        self.solid_decoder_rar4 = None;
         self.solid_next_index = 0;
     }
 

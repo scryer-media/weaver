@@ -1,13 +1,17 @@
 [package]
 name = "weaver-api"
-version = "0.1.0"
-edition = "2024"
+description = "GraphQL API with subscriptions for Weaver pipeline control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }
 weaver-nntp = { path = "../weaver-nntp" }
 weaver-nzb = { path = "../weaver-nzb" }
 weaver-scheduler = { path = "../weaver-scheduler" }
+weaver-state = { path = "../weaver-state" }
 base64 = "0.22"
 tokio = { workspace = true }
 serde = { workspace = true }

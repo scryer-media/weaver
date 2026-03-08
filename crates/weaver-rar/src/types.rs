@@ -75,6 +75,8 @@ impl CompressionMethod {
 /// Decoded compression information from the bit-packed vint field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressionInfo {
+    /// Archive format (RAR4 vs RAR5) — determines which decompressor to use.
+    pub format: ArchiveFormat,
     /// Algorithm version (currently 0).
     pub version: u8,
     /// Solid flag: continue dictionary from previous file.

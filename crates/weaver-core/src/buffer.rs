@@ -139,6 +139,7 @@ pub struct BufferPool {
 struct TierPool {
     slots: ArrayQueue<BufferSlot>,
     semaphore: Arc<Semaphore>,
+    #[allow(dead_code)]
     tier: BufferTier,
     total: usize,
     in_use: AtomicUsize,
