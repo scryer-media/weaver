@@ -1,0 +1,11 @@
+[package]
+name = "weaver-nzb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+quick-xml = { workspace = true }
+tracing = { workspace = true }

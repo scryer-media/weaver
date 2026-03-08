@@ -1,0 +1,19 @@
+[package]
+name = "weaver-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+weaver-nntp = { path = "../weaver-nntp" }
+weaver-nzb = { path = "../weaver-nzb" }
+weaver-scheduler = { path = "../weaver-scheduler" }
+base64 = "0.22"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-graphql = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+async-stream = "0.3"

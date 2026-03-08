@@ -1,0 +1,18 @@
+[package]
+name = "weaver-nntp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+pin-project-lite = { workspace = true }
+socket2 = { workspace = true }
+memchr = { workspace = true }

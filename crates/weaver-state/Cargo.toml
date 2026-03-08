@@ -1,0 +1,17 @@
+[package]
+name = "weaver-state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rmp-serde = { workspace = true }
+crc32fast = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }

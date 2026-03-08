@@ -1,0 +1,34 @@
+[package]
+name = "weaver"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "weaver"
+path = "src/main.rs"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+weaver-nntp = { path = "../weaver-nntp" }
+weaver-nzb = { path = "../weaver-nzb" }
+weaver-yenc = { path = "../weaver-yenc" }
+weaver-assembly = { path = "../weaver-assembly" }
+weaver-par2 = { path = "../weaver-par2" }
+weaver-rar = { path = "../weaver-rar" }
+weaver-scheduler = { path = "../weaver-scheduler" }
+weaver-state = { path = "../weaver-state" }
+weaver-api = { path = "../weaver-api" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+async-graphql-axum = { workspace = true }
+libc = "0.2"
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+sha2 = { workspace = true }

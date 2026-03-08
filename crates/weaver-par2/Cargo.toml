@@ -1,0 +1,16 @@
+[package]
+name = "weaver-par2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+md-5 = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

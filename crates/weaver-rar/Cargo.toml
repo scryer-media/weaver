@@ -1,0 +1,17 @@
+[package]
+name = "weaver-rar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+weaver-core = { path = "../weaver-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crc32fast = { workspace = true }
+blake2 = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+pbkdf2 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
