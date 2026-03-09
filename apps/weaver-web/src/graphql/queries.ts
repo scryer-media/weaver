@@ -335,3 +335,38 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
 `;
+
+// --- API Keys ---
+
+export const API_KEYS_QUERY = gql`
+  query ApiKeys {
+    apiKeys {
+      id
+      name
+      scope
+      createdAt
+      lastUsedAt
+    }
+  }
+`;
+
+export const CREATE_API_KEY_MUTATION = gql`
+  mutation CreateApiKey($name: String!, $scope: ApiKeyScope!) {
+    createApiKey(name: $name, scope: $scope) {
+      key {
+        id
+        name
+        scope
+        createdAt
+        lastUsedAt
+      }
+      rawKey
+    }
+  }
+`;
+
+export const DELETE_API_KEY_MUTATION = gql`
+  mutation DeleteApiKey($id: Int!) {
+    deleteApiKey(id: $id)
+  }
+`;

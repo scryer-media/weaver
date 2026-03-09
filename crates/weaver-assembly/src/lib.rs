@@ -4,16 +4,15 @@ pub mod job_assembly;
 pub mod write_buffer;
 
 pub use error::AssemblyError;
-pub use file_assembly::{CommitResult, FileAssembly, IncrementalSliceState};
+pub use file_assembly::{CommitResult, FileAssembly};
 pub use job_assembly::{
-    ArchiveMember, ArchiveTopology, ArchiveType, ExtractionReadiness, JobAssembly, Par2Metadata,
+    ArchiveMember, ArchiveTopology, ArchiveType, ExtractionReadiness, JobAssembly,
 };
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use weaver_core::checksum::{crc32, md5};
     use weaver_core::classify::FileRole;
     use weaver_core::id::{JobId, NzbFileId};
 
@@ -55,8 +54,7 @@ mod tests {
             vec![1000, 1000, 500],
         );
 
-        let data = vec![0u8; 1000];
-        let result = fa.commit_segment(0, &data).unwrap();
+        let result = fa.commit_segment(0, 1000).unwrap();
         assert!(!result.file_complete);
         assert!(!result.was_duplicate);
         assert_eq!(fa.missing_count(), 2);
@@ -72,9 +70,9 @@ mod tests {
             vec![1000, 1000, 500],
         );
 
-        fa.commit_segment(0, &vec![0u8; 1000]).unwrap();
-        fa.commit_segment(1, &vec![0u8; 1000]).unwrap();
-        let result = fa.commit_segment(2, &vec![0u8; 500]).unwrap();
+        fa.commit_segment(0, 1000).unwrap();
+        fa.commit_segment(1, 1000).unwrap();
+        let result = fa.commit_segment(2, 500).unwrap();
 
         assert!(result.file_complete);
         assert!(fa.is_complete());
@@ -91,14 +89,14 @@ mod tests {
             vec![1000, 1000, 500],
         );
 
-        fa.commit_segment(2, &vec![0u8; 500]).unwrap();
+        fa.commit_segment(2, 500).unwrap();
         assert_eq!(fa.missing_count(), 2);
         assert!(!fa.is_complete());
 
-        fa.commit_segment(0, &vec![0u8; 1000]).unwrap();
+        fa.commit_segment(0, 1000).unwrap();
         assert_eq!(fa.missing_count(), 1);
 
-        let result = fa.commit_segment(1, &vec![0u8; 1000]).unwrap();
+        let result = fa.commit_segment(1, 1000).unwrap();
         assert!(result.file_complete);
         assert!(fa.is_complete());
     }
@@ -112,10 +110,10 @@ mod tests {
             vec![1000, 1000],
         );
 
-        let result1 = fa.commit_segment(0, &vec![0u8; 1000]).unwrap();
+        let result1 = fa.commit_segment(0, 1000).unwrap();
         assert!(!result1.was_duplicate);
 
-        let result2 = fa.commit_segment(0, &vec![0u8; 1000]).unwrap();
+        let result2 = fa.commit_segment(0, 1000).unwrap();
         assert!(result2.was_duplicate);
 
         // Should still only count once.
@@ -131,7 +129,7 @@ mod tests {
             vec![1000, 1000],
         );
 
-        let err = fa.commit_segment(5, &vec![0u8; 100]).unwrap_err();
+        let err = fa.commit_segment(5, 100).unwrap_err();
         match err {
             AssemblyError::SegmentOutOfRange {
                 segment_number,
@@ -171,116 +169,14 @@ mod tests {
         assert_eq!(fa.progress(), 0.0);
 
         for i in 0..5 {
-            fa.commit_segment(i, &vec![0u8; 100]).unwrap();
+            fa.commit_segment(i, 100).unwrap();
         }
         assert!((fa.progress() - 0.5).abs() < 1e-10);
 
         for i in 5..10 {
-            fa.commit_segment(i, &vec![0u8; 100]).unwrap();
+            fa.commit_segment(i, 100).unwrap();
         }
         assert!((fa.progress() - 1.0).abs() < 1e-10);
-    }
-
-    // ========================================================================
-    // Incremental verification tests
-    // ========================================================================
-
-    #[test]
-    fn attach_par2_metadata() {
-        let mut fa = FileAssembly::new(
-            make_file_id(0),
-            "test.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![500, 500],
-        );
-
-        assert!(fa.slice_verification_results().is_none());
-
-        // 2 slices of 500 bytes each.
-        let checksums = vec![
-            (crc32(&[0u8; 500]), md5(&[0u8; 500])),
-            (crc32(&[0u8; 500]), md5(&[0u8; 500])),
-        ];
-        fa.attach_par2_metadata(500, &checksums);
-
-        let results = fa.slice_verification_results().unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0], (0, None));
-        assert_eq!(results[1], (1, None));
-    }
-
-    #[test]
-    fn incremental_verify_valid() {
-        // File with 2 segments of 500 bytes each, 1 PAR2 slice of 1000 bytes.
-        let seg0_data = vec![0xAAu8; 500];
-        let seg1_data = vec![0xBBu8; 500];
-
-        // Compute the expected checksum for the full 1000-byte slice.
-        let mut full_data = seg0_data.clone();
-        full_data.extend_from_slice(&seg1_data);
-        let expected_crc = crc32(&full_data);
-        let expected_md5 = md5(&full_data);
-
-        let mut fa = FileAssembly::new(
-            make_file_id(0),
-            "test.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![500, 500],
-        );
-
-        fa.attach_par2_metadata(1000, &[(expected_crc, expected_md5)]);
-
-        // Commit first segment -- slice not yet complete.
-        let r1 = fa.commit_segment(0, &seg0_data).unwrap();
-        assert!(r1.newly_verified_slices.is_empty());
-
-        // Commit second segment -- slice should now be verified as valid.
-        let r2 = fa.commit_segment(1, &seg1_data).unwrap();
-        assert_eq!(r2.newly_verified_slices.len(), 1);
-        assert_eq!(r2.newly_verified_slices[0], (0, true));
-
-        assert_eq!(fa.verified_slice_count(), 1);
-        assert_eq!(fa.damaged_slice_count(), 0);
-    }
-
-    #[test]
-    fn incremental_verify_damaged() {
-        // File with 1 segment of 500 bytes, 1 PAR2 slice.
-        let data = vec![0xAAu8; 500];
-
-        // Use wrong expected checksums.
-        let wrong_crc = 0xDEADBEEF;
-        let wrong_md5 = [0xFF; 16];
-
-        let mut fa = FileAssembly::new(
-            make_file_id(0),
-            "test.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![500],
-        );
-
-        fa.attach_par2_metadata(500, &[(wrong_crc, wrong_md5)]);
-
-        let result = fa.commit_segment(0, &data).unwrap();
-        assert_eq!(result.newly_verified_slices.len(), 1);
-        assert_eq!(result.newly_verified_slices[0], (0, false));
-
-        assert_eq!(fa.damaged_slice_count(), 1);
-        assert_eq!(fa.verified_slice_count(), 0);
-    }
-
-    #[test]
-    fn verify_without_metadata() {
-        let fa = FileAssembly::new(
-            make_file_id(0),
-            "test.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![500],
-        );
-
-        assert!(fa.slice_verification_results().is_none());
-        assert_eq!(fa.damaged_slice_count(), 0);
-        assert_eq!(fa.verified_slice_count(), 0);
     }
 
     // ========================================================================
@@ -341,7 +237,7 @@ mod tests {
         // Complete file 2 (1000 bytes out of 3000 total).
         job.file_mut(make_file_id(1))
             .unwrap()
-            .commit_segment(0, &vec![0u8; 1000])
+            .commit_segment(0, 1000)
             .unwrap();
 
         // Progress should be weighted: 1000/3000 = 1/3.
@@ -352,6 +248,32 @@ mod tests {
         );
 
         assert_eq!(job.complete_file_count(), 1);
+    }
+
+    #[test]
+    fn data_file_count_excludes_recovery() {
+        let mut job = JobAssembly::new(JobId(1));
+
+        job.add_file(FileAssembly::new(
+            make_file_id(0), "movie.part01.rar".into(),
+            FileRole::RarVolume { volume_number: 0 }, vec![1000],
+        ));
+        job.add_file(FileAssembly::new(
+            make_file_id(1), "movie.par2".into(),
+            FileRole::Par2 { is_index: true, recovery_block_count: 0 }, vec![500],
+        ));
+        job.add_file(FileAssembly::new(
+            make_file_id(2), "movie.vol00+01.par2".into(),
+            FileRole::Par2 { is_index: false, recovery_block_count: 1 }, vec![2000],
+        ));
+
+        assert_eq!(job.total_file_count(), 3);
+        assert_eq!(job.data_file_count(), 2); // RAR + PAR2 index
+        assert_eq!(job.complete_data_file_count(), 0);
+
+        // Complete the RAR volume.
+        job.file_mut(make_file_id(0)).unwrap().commit_segment(0, 1000).unwrap();
+        assert_eq!(job.complete_data_file_count(), 1);
     }
 
     #[test]
@@ -425,7 +347,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            complete_volumes: [0].into_iter().collect(), // Only volume 0 complete.
+            complete_volumes: [0].into_iter().collect(),
             expected_volume_count: Some(2),
             members: vec![
                 ArchiveMember {
@@ -471,7 +393,7 @@ mod tests {
         let topo = ArchiveTopology {
             archive_type: ArchiveType::Rar,
             volume_map: [("movie.part01.rar".into(), 0)].into_iter().collect(),
-            complete_volumes: HashSet::new(), // Nothing complete.
+            complete_volumes: HashSet::new(),
             expected_volume_count: Some(1),
             members: vec![ArchiveMember {
                 name: "movie.mkv".into(),
@@ -483,118 +405,9 @@ mod tests {
         job.set_archive_topology("test".into(), topo);
 
         match job.extraction_readiness() {
-            ExtractionReadiness::Blocked { .. } => {
-                // Expected: blocked because no volumes are complete.
-            }
+            ExtractionReadiness::Blocked { .. } => {}
             other => panic!("expected Blocked, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn repair_confidence() {
-        let mut job = JobAssembly::new(JobId(1));
-
-        let data_good = vec![0xAAu8; 1000];
-        let data_bad = vec![0xBBu8; 1000];
-
-        let expected_crc = crc32(&data_good);
-        let expected_md5 = md5(&data_good);
-
-        let fa = FileAssembly::new(
-            make_file_id(0),
-            "movie.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![1000, 1000],
-        );
-
-        job.add_file(fa);
-
-        // Use set_par2_metadata to attach checksums via the public API.
-        let mut file_checksums = std::collections::HashMap::new();
-        file_checksums.insert(
-            "movie.rar".into(),
-            vec![
-                (expected_crc, expected_md5),
-                (expected_crc, expected_md5), // second slice uses same expected but bad data
-            ],
-        );
-        let metadata = Par2Metadata {
-            slice_size: 1000,
-            recovery_block_count: 5,
-            file_checksums,
-        };
-        job.set_par2_metadata(metadata);
-
-        // Commit segment 0 (good data, covers slice 0).
-        job.file_mut(make_file_id(0))
-            .unwrap()
-            .commit_segment(0, &data_good)
-            .unwrap();
-        // Commit segment 1 (bad data, covers slice 1).
-        job.file_mut(make_file_id(0))
-            .unwrap()
-            .commit_segment(1, &data_bad)
-            .unwrap();
-
-        let (damaged, total, recovery) = job.repair_confidence().unwrap();
-        assert_eq!(damaged, 1);
-        assert_eq!(total, 2); // 1 good + 1 damaged
-        assert_eq!(recovery, 5);
-    }
-
-    #[test]
-    fn repair_confidence_none_without_par2() {
-        let job = JobAssembly::new(JobId(1));
-        assert!(job.repair_confidence().is_none());
-    }
-
-    #[test]
-    fn par2_metadata_attaches_to_files() {
-        let mut job = JobAssembly::new(JobId(1));
-
-        let fa1 = FileAssembly::new(
-            make_file_id(0),
-            "movie.rar".into(),
-            FileRole::RarVolume { volume_number: 0 },
-            vec![1000],
-        );
-        let fa2 = FileAssembly::new(
-            make_file_id(1),
-            "movie.r00".into(),
-            FileRole::RarVolume { volume_number: 1 },
-            vec![1000],
-        );
-        let fa3 = FileAssembly::new(
-            make_file_id(2),
-            "readme.nfo".into(),
-            FileRole::Standalone,
-            vec![200],
-        );
-
-        job.add_file(fa1);
-        job.add_file(fa2);
-        job.add_file(fa3);
-
-        let dummy_crc = crc32(&[0u8; 1000]);
-        let dummy_md5 = md5(&[0u8; 1000]);
-
-        let mut file_checksums = std::collections::HashMap::new();
-        file_checksums.insert("movie.rar".into(), vec![(dummy_crc, dummy_md5)]);
-        file_checksums.insert("movie.r00".into(), vec![(dummy_crc, dummy_md5)]);
-        // No entry for readme.nfo.
-
-        let metadata = Par2Metadata {
-            slice_size: 1000,
-            recovery_block_count: 3,
-            file_checksums,
-        };
-        job.set_par2_metadata(metadata);
-
-        // movie.rar and movie.r00 should have slice states attached.
-        assert!(job.file(make_file_id(0)).unwrap().slice_verification_results().is_some());
-        assert!(job.file(make_file_id(1)).unwrap().slice_verification_results().is_some());
-        // readme.nfo should not.
-        assert!(job.file(make_file_id(2)).unwrap().slice_verification_results().is_none());
     }
 
     #[test]
@@ -615,12 +428,11 @@ mod tests {
         };
         job.set_archive_topology("test".into(), topo);
 
-        // Not ready yet.
         assert_ne!(job.extraction_readiness(), ExtractionReadiness::Ready);
 
-        job.mark_volume_complete("test",0);
-        job.mark_volume_complete("test",1);
-        job.mark_volume_complete("test",2);
+        job.mark_volume_complete("test", 0);
+        job.mark_volume_complete("test", 1);
+        job.mark_volume_complete("test", 2);
 
         assert_eq!(job.extraction_readiness(), ExtractionReadiness::Ready);
     }

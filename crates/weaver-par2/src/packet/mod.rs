@@ -1,21 +1,21 @@
-pub mod header;
-pub mod main;
+pub mod creator;
 pub mod file_desc;
 pub mod file_verify;
+pub mod header;
+pub mod main;
 pub mod recovery;
-pub mod creator;
 
 use tracing::{debug, trace, warn};
 
 use crate::error::{Par2Error, Result};
 use crate::types::RecoverySetId;
 
-pub use header::{PacketHeader, PacketType, HEADER_SIZE, MAGIC};
-pub use main::MainPacket;
+pub use creator::CreatorPacket;
 pub use file_desc::FileDescriptionPacket;
 pub use file_verify::IfscPacket;
+pub use header::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
+pub use main::MainPacket;
 pub use recovery::RecoverySlicePacket;
-pub use creator::CreatorPacket;
 
 /// A parsed PAR2 packet (any type).
 #[derive(Debug, Clone)]
@@ -110,9 +110,7 @@ pub fn scan_packets(data: &[u8], base_offset: u64) -> Vec<(Packet, u64)> {
                 match find_next_magic(&data[pos + 1..]) {
                     Some(skip) => {
                         let skipped = skip + 1;
-                        warn!(
-                            "skipped {skipped} bytes at offset {offset} looking for next packet"
-                        );
+                        warn!("skipped {skipped} bytes at offset {offset} looking for next packet");
                         pos += skipped;
                     }
                     None => {
@@ -303,7 +301,10 @@ mod tests {
 
         let (packet, _) = parse_packet(&data, 0).unwrap();
         match packet {
-            Packet::Unknown { packet_type, body: b } => {
+            Packet::Unknown {
+                packet_type,
+                body: b,
+            } => {
                 assert_eq!(packet_type, *custom_type);
                 assert_eq!(b.len(), 16);
             }

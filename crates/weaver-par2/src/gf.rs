@@ -146,7 +146,10 @@ pub fn input_slice_constants(count: usize) -> Vec<u16> {
 /// A power of 2 has order 65535 iff its exponent is NOT divisible by any of these factors.
 #[inline]
 fn is_divisible_by_suborder_factor(exp: u32) -> bool {
-    exp.is_multiple_of(3) || exp.is_multiple_of(5) || exp.is_multiple_of(17) || exp.is_multiple_of(257)
+    exp.is_multiple_of(3)
+        || exp.is_multiple_of(5)
+        || exp.is_multiple_of(17)
+        || exp.is_multiple_of(257)
 }
 
 #[cfg(test)]
@@ -208,11 +211,7 @@ mod tests {
     fn inv_identity() {
         // a * inv(a) = 1 for all nonzero a
         for a in [1u16, 2, 3, 100, 0x1234, 0xFFFF, 0x8000] {
-            assert_eq!(
-                mul(a, inv(a)),
-                1,
-                "a * inv(a) should be 1 for a={a}"
-            );
+            assert_eq!(mul(a, inv(a)), 1, "a * inv(a) should be 1 for a={a}");
         }
     }
 
@@ -247,11 +246,7 @@ mod tests {
         let base = 0x1234u16;
         let mut product = 1u16;
         for exp in 0..20u32 {
-            assert_eq!(
-                pow(base, exp),
-                product,
-                "pow({base:#x}, {exp}) mismatch"
-            );
+            assert_eq!(pow(base, exp), product, "pow({base:#x}, {exp}) mismatch");
             product = mul(product, base);
         }
     }

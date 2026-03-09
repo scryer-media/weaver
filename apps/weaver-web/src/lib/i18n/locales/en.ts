@@ -163,6 +163,27 @@ const en: LocaleDictionary = {
   "metrics.extractActive": "Extract Active",
   "metrics.segmentsRetried": "Segments Retried",
   "metrics.failedPermanent": "Failed Permanent",
+
+  // API Keys
+  "settings.apiKeys": "API Keys",
+  "settings.apiKeysDesc": "Manage API keys for external integrations",
+  "settings.createApiKey": "Create API Key",
+  "settings.apiKeyName": "Name",
+  "settings.apiKeyNamePlaceholder": "e.g., Scryer",
+  "settings.apiKeyScope": "Scope",
+  "settings.scopeIntegration": "Integration",
+  "settings.scopeAdmin": "Admin",
+  "settings.apiKeyCreated": "API Key Created",
+  "settings.apiKeyCopyWarning": "Copy this key now. It will not be shown again.",
+  "settings.apiKeyNone": "No API keys configured.",
+  "settings.apiKeyLastUsed": "Last used",
+  "settings.apiKeyNeverUsed": "Never",
+  "confirm.deleteApiKey": "Delete this API key?",
+  "confirm.deleteApiKeyMessage": "Any integration using this key will lose access immediately.",
+  "confirm.deleteApiKeyConfirm": "Delete Key",
+  "confirm.deleteApiKeyDismiss": "Keep Key",
+  "action.copy": "Copy",
+  "action.copied": "Copied!",
 };
 
 export default en;

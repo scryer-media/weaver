@@ -7,7 +7,11 @@ import {
   UPDATE_SETTINGS_MUTATION,
   PAUSE_ALL_MUTATION,
   RESUME_ALL_MUTATION,
+  API_KEYS_QUERY,
+  CREATE_API_KEY_MUTATION,
+  DELETE_API_KEY_MUTATION,
 } from "@/graphql/queries";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
 
@@ -207,6 +211,9 @@ export function Settings() {
           </section>
         )}
 
+        {/* API Keys */}
+        <ApiKeysSection />
+
         {/* Metrics */}
         {metrics && (
           <section className="rounded-lg border border-border bg-card p-5">
@@ -234,6 +241,153 @@ export function Settings() {
         )}
       </div>
     </div>
+  );
+}
+
+function ApiKeysSection() {
+  const t = useTranslate();
+  const [{ data }, reexecuteQuery] = useQuery({ query: API_KEYS_QUERY });
+  const [, createApiKey] = useMutation(CREATE_API_KEY_MUTATION);
+  const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
+
+  const [newKeyName, setNewKeyName] = useState("");
+  const [newKeyScope, setNewKeyScope] = useState<"INTEGRATION" | "ADMIN">("INTEGRATION");
+  const [createdKey, setCreatedKey] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+
+  const keys = data?.apiKeys ?? [];
+
+  const handleCreate = async () => {
+    if (!newKeyName.trim()) return;
+    const result = await createApiKey({ name: newKeyName.trim(), scope: newKeyScope });
+    if (result.data?.createApiKey?.rawKey) {
+      setCreatedKey(result.data.createApiKey.rawKey);
+      setNewKeyName("");
+      reexecuteQuery({ requestPolicy: "network-only" });
+    }
+  };
+
+  const handleCopy = () => {
+    if (createdKey) {
+      navigator.clipboard.writeText(createdKey);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleDelete = (id: number) => {
+    deleteApiKey({ id }).then(() => {
+      reexecuteQuery({ requestPolicy: "network-only" });
+    });
+    setDeleteConfirmId(null);
+  };
+
+  const formatTime = (ms: number) => {
+    const d = new Date(ms);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  };
+
+  return (
+    <section className="rounded-lg border border-border bg-card p-5">
+      <h2 className="mb-1 text-lg font-semibold text-card-foreground">{t("settings.apiKeys")}</h2>
+      <p className="mb-4 text-xs text-muted-foreground">{t("settings.apiKeysDesc")}</p>
+
+      {/* Created key banner */}
+      {createdKey && (
+        <div className="mb-4 rounded-md border border-yellow-500/40 bg-yellow-500/10 p-3">
+          <div className="mb-1 text-sm font-medium text-foreground">{t("settings.apiKeyCreated")}</div>
+          <div className="mb-1 text-xs text-muted-foreground">{t("settings.apiKeyCopyWarning")}</div>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
+              {createdKey}
+            </code>
+            <button
+              onClick={handleCopy}
+              className="shrink-0 rounded bg-primary px-3 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            >
+              {copied ? t("action.copied") : t("action.copy")}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Key list */}
+      {keys.length === 0 ? (
+        <p className="mb-4 text-sm text-muted-foreground">{t("settings.apiKeyNone")}</p>
+      ) : (
+        <div className="mb-4 space-y-2">
+          {keys.map((key: { id: number; name: string; scope: string; createdAt: number; lastUsedAt: number | null }) => (
+            <div
+              key={key.id}
+              className="flex items-center justify-between rounded-md border border-border px-3 py-2"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-foreground">{key.name}</div>
+                <div className="flex gap-3 text-xs text-muted-foreground">
+                  <span className="rounded bg-muted px-1.5 py-0.5">
+                    {key.scope === "ADMIN" ? t("settings.scopeAdmin") : t("settings.scopeIntegration")}
+                  </span>
+                  <span>
+                    {t("settings.apiKeyLastUsed")}:{" "}
+                    {key.lastUsedAt ? formatTime(key.lastUsedAt) : t("settings.apiKeyNeverUsed")}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => setDeleteConfirmId(key.id)}
+                className="rounded px-2 py-1 text-xs text-destructive hover:bg-accent"
+              >
+                {t("action.delete")}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create form */}
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="flex-1">
+          <label className="mb-1 block text-xs text-muted-foreground">{t("settings.apiKeyName")}</label>
+          <input
+            type="text"
+            value={newKeyName}
+            onChange={(e) => setNewKeyName(e.target.value)}
+            placeholder={t("settings.apiKeyNamePlaceholder")}
+            className="w-full rounded-md border border-input bg-field px-3 py-1.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
+            onKeyDown={(e) => e.key === "Enter" && handleCreate()}
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-muted-foreground">{t("settings.apiKeyScope")}</label>
+          <select
+            value={newKeyScope}
+            onChange={(e) => setNewKeyScope(e.target.value as "INTEGRATION" | "ADMIN")}
+            className="rounded-md border border-input bg-field px-3 py-1.5 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="INTEGRATION">{t("settings.scopeIntegration")}</option>
+            <option value="ADMIN">{t("settings.scopeAdmin")}</option>
+          </select>
+        </div>
+        <button
+          onClick={handleCreate}
+          disabled={!newKeyName.trim()}
+          className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {t("settings.createApiKey")}
+        </button>
+      </div>
+
+      <ConfirmDialog
+        open={deleteConfirmId != null}
+        title={t("confirm.deleteApiKey")}
+        message={t("confirm.deleteApiKeyMessage")}
+        confirmLabel={t("confirm.deleteApiKeyConfirm")}
+        cancelLabel={t("confirm.deleteApiKeyDismiss")}
+        onConfirm={() => deleteConfirmId != null && handleDelete(deleteConfirmId)}
+        onCancel={() => setDeleteConfirmId(null)}
+      />
+    </section>
   );
 }
 

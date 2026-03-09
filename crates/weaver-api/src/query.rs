@@ -3,7 +3,8 @@ use async_graphql::{Context, Object, Result};
 use weaver_core::config::SharedConfig;
 use weaver_scheduler::SchedulerHandle;
 
-use crate::types::{EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, Metrics, Server};
+use crate::auth::AdminGuard;
+use crate::types::{ApiKey, ApiKeyScope, EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, Metrics, Server};
 
 pub struct QueryRoot;
 
@@ -67,6 +68,7 @@ impl QueryRoot {
     }
 
     /// List all configured NNTP servers.
+    #[graphql(guard = "AdminGuard")]
     async fn servers(&self, ctx: &Context<'_>) -> Result<Vec<Server>> {
         let config = ctx.data::<SharedConfig>()?;
         let cfg = config.read().await;
@@ -93,7 +95,32 @@ impl QueryRoot {
             .collect())
     }
 
+    /// List all API keys (without raw key values).
+    #[graphql(guard = "AdminGuard")]
+    async fn api_keys(&self, ctx: &Context<'_>) -> Result<Vec<ApiKey>> {
+        let db = ctx.data::<weaver_state::Database>()?;
+        let db = db.clone();
+        let rows = tokio::task::spawn_blocking(move || db.list_api_keys())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ApiKey {
+                id: r.id,
+                name: r.name,
+                scope: match r.scope.as_str() {
+                    "admin" => ApiKeyScope::Admin,
+                    _ => ApiKeyScope::Integration,
+                },
+                created_at: r.created_at as f64,
+                last_used_at: r.last_used_at.map(|t| t as f64),
+            })
+            .collect())
+    }
+
     /// Get general settings.
+    #[graphql(guard = "AdminGuard")]
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
         let cfg = config.read().await;

@@ -87,7 +87,9 @@ pub struct CancellationToken(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl CancellationToken {
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )))
     }
 
     pub fn cancel(&self) {

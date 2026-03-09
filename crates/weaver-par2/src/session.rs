@@ -67,8 +67,7 @@ impl FileVerificationState {
         }
 
         // Initialize accumulator if this is the first data for this slice.
-        let state = self.slice_states[slice_index]
-            .get_or_insert_with(SliceChecksumState::new);
+        let state = self.slice_states[slice_index].get_or_insert_with(SliceChecksumState::new);
         state.update(data);
         self.bytes_received += data.len() as u64;
 
@@ -81,11 +80,7 @@ impl FileVerificationState {
     }
 
     /// Try to finalize a slice if all its data has been received.
-    fn try_finalize_slice(
-        &mut self,
-        slice_index: usize,
-        expected: &SliceChecksum,
-    ) -> Option<bool> {
+    fn try_finalize_slice(&mut self, slice_index: usize, expected: &SliceChecksum) -> Option<bool> {
         // Already verified?
         if let Some(result) = self.verified_slices[slice_index] {
             return Some(result);
@@ -95,7 +90,11 @@ impl FileVerificationState {
         let expected_slice_len = if slice_index == self.slice_states.len() - 1 {
             // Last slice may be shorter.
             let remainder = self.file_length % self.slice_size;
-            if remainder == 0 { self.slice_size } else { remainder }
+            if remainder == 0 {
+                self.slice_size
+            } else {
+                remainder
+            }
         } else {
             self.slice_size
         };
@@ -120,12 +119,18 @@ impl FileVerificationState {
 
     /// Count how many slices have been verified as valid.
     fn verified_count(&self) -> usize {
-        self.verified_slices.iter().filter(|v| **v == Some(true)).count()
+        self.verified_slices
+            .iter()
+            .filter(|v| **v == Some(true))
+            .count()
     }
 
     /// Count how many slices have been verified as damaged.
     fn damaged_count(&self) -> usize {
-        self.verified_slices.iter().filter(|v| **v == Some(false)).count()
+        self.verified_slices
+            .iter()
+            .filter(|v| **v == Some(false))
+            .count()
     }
 
     /// Count how many slices are still pending (not yet finalized).
@@ -180,12 +185,13 @@ impl VerificationSession {
                 // Initialize file states for any files we haven't seen yet.
                 for file_id in &set.recovery_file_ids {
                     if !self.file_states.contains_key(file_id)
-                        && let Some(desc) = set.file_description(file_id) {
-                            self.file_states.insert(
-                                *file_id,
-                                FileVerificationState::new(desc.length, set.slice_size),
-                            );
-                        }
+                        && let Some(desc) = set.file_description(file_id)
+                    {
+                        self.file_states.insert(
+                            *file_id,
+                            FileVerificationState::new(desc.length, set.slice_size),
+                        );
+                    }
                 }
                 self.par2_set = Some(set);
             }
@@ -230,9 +236,10 @@ impl VerificationSession {
         if par2_set.slice_size > 0 {
             let slice_index = (offset / par2_set.slice_size) as usize;
             if let Some(checksums) = par2_set.file_checksums(file_id)
-                && slice_index < checksums.len() {
-                    state.try_finalize_slice(slice_index, &checksums[slice_index]);
-                }
+                && slice_index < checksums.len()
+            {
+                state.try_finalize_slice(slice_index, &checksums[slice_index]);
+            }
         }
     }
 
@@ -455,7 +462,10 @@ impl VerificationSession {
             .iter()
             .enumerate()
             .map(|(i, expected)| {
-                let valid = slice_crcs.get(i).map(|&crc| crc == expected.crc32).unwrap_or(false);
+                let valid = slice_crcs
+                    .get(i)
+                    .map(|&crc| crc == expected.crc32)
+                    .unwrap_or(false);
                 // Update the verified_slices state (only if not already verified).
                 if state.verified_slices[i].is_none() {
                     state.verified_slices[i] = Some(valid);
@@ -494,11 +504,7 @@ mod tests {
     use md5::{Digest, Md5};
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
         let mut hash_input = Vec::new();
         hash_input.extend_from_slice(&recovery_set_id);
@@ -517,10 +523,7 @@ mod tests {
     }
 
     /// Build PAR2 packets for a single file. Returns (packets_bytes, file_id, rsid).
-    fn build_par2_packets(
-        file_data: &[u8],
-        slice_size: u64,
-    ) -> (Vec<u8>, FileId, [u8; 16]) {
+    fn build_par2_packets(file_data: &[u8], slice_size: u64) -> (Vec<u8>, FileId, [u8; 16]) {
         let file_length = file_data.len() as u64;
         let hash_full = checksum::md5(file_data);
         let hash_16k_data = &file_data[..file_data.len().min(16384)];
@@ -575,8 +578,8 @@ mod tests {
         let mut ifsc_body = Vec::new();
         ifsc_body.extend_from_slice(&file_id_bytes);
         for cs in &checksums {
-            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
             ifsc_body.extend_from_slice(&cs.md5);
+            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
         }
 
         let mut stream = Vec::new();
@@ -613,7 +616,10 @@ mod tests {
 
         // All slices should pass.
         assert!(session.is_complete());
-        assert!(matches!(session.file_status(&file_id), Some(FileStatus::Complete)));
+        assert!(matches!(
+            session.file_status(&file_id),
+            Some(FileStatus::Complete)
+        ));
         assert!(matches!(session.repairability(), Repairability::NotNeeded));
 
         // verification_result should show all valid.
@@ -644,7 +650,10 @@ mod tests {
         assert!(!session.is_complete());
 
         // File should be damaged.
-        assert!(matches!(session.file_status(&file_id), Some(FileStatus::Damaged(1))));
+        assert!(matches!(
+            session.file_status(&file_id),
+            Some(FileStatus::Damaged(1))
+        ));
 
         let result = session.verification_result().unwrap();
         assert_eq!(result.total_missing_blocks, 1);
@@ -695,7 +704,9 @@ mod tests {
 
         // Before any data: all 4 slices are "missing" (no bytes received).
         match session.repairability() {
-            Repairability::Insufficient { blocks_needed: 4, .. } => {}
+            Repairability::Insufficient {
+                blocks_needed: 4, ..
+            } => {}
             other => panic!("expected Insufficient with 4 blocks needed, got {other:?}"),
         }
 
@@ -714,7 +725,11 @@ mod tests {
 
         // 1 damaged, file has data so not counted as fully missing.
         match session.repairability() {
-            Repairability::Insufficient { blocks_needed: 1, blocks_available: 0, .. } => {}
+            Repairability::Insufficient {
+                blocks_needed: 1,
+                blocks_available: 0,
+                ..
+            } => {}
             other => panic!("expected Insufficient with 1 block needed, got {other:?}"),
         }
     }
@@ -753,8 +768,7 @@ mod tests {
                             padded[i * ss + w * 2 + 1],
                         ]);
                         let contribution = gf::mul(input_word, factor);
-                        let rec_word =
-                            u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
+                        let rec_word = u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
                         let new_val = gf::add(rec_word, contribution);
                         let bytes = new_val.to_le_bytes();
                         recovery[w * 2] = bytes[0];
@@ -823,12 +837,17 @@ mod tests {
         let crc0 = checksum::crc32(&file_data[0..1024]);
         let crc1 = checksum::crc32(&file_data[1024..2048]);
 
-        let result = session.verify_from_slice_crcs(&file_id, &[crc0, crc1]).unwrap();
+        let result = session
+            .verify_from_slice_crcs(&file_id, &[crc0, crc1])
+            .unwrap();
         assert_eq!(result, vec![true, true]);
 
         // Session should now show file as complete.
         assert!(session.is_complete());
-        assert!(matches!(session.file_status(&file_id), Some(FileStatus::Complete)));
+        assert!(matches!(
+            session.file_status(&file_id),
+            Some(FileStatus::Complete)
+        ));
     }
 
     #[test]
@@ -844,11 +863,16 @@ mod tests {
         let crc0 = checksum::crc32(&file_data[0..1024]);
         let wrong_crc = 0xDEADBEEF;
 
-        let result = session.verify_from_slice_crcs(&file_id, &[crc0, wrong_crc]).unwrap();
+        let result = session
+            .verify_from_slice_crcs(&file_id, &[crc0, wrong_crc])
+            .unwrap();
         assert_eq!(result, vec![true, false]);
 
         assert!(!session.is_complete());
-        assert!(matches!(session.file_status(&file_id), Some(FileStatus::Damaged(1))));
+        assert!(matches!(
+            session.file_status(&file_id),
+            Some(FileStatus::Damaged(1))
+        ));
     }
 
     #[test]

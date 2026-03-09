@@ -10,7 +10,8 @@ use weaver_core::id::JobId;
 use weaver_scheduler::{FileSpec, JobSpec, SchedulerHandle, SegmentSpec};
 use weaver_state::Database;
 
-use crate::types::{GeneralSettings, GeneralSettingsInput, Job, Server, ServerInput, TestConnectionResult};
+use crate::auth::{AdminGuard, generate_api_key, hash_api_key};
+use crate::types::{ApiKey, ApiKeyScope, CreateApiKeyResult, GeneralSettings, GeneralSettingsInput, Job, Server, ServerInput, TestConnectionResult};
 
 /// Global counter for generating unique job IDs via the API.
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
@@ -119,7 +120,10 @@ impl MutationRoot {
             async_graphql::Error::new(format!("failed to create NZB storage dir: {e}"))
         })?;
         let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
-        tokio::fs::write(&nzb_path, &nzb_bytes).await.map_err(|e| {
+        let compressed = zstd::bulk::compress(&nzb_bytes, 19).map_err(|e| {
+            async_graphql::Error::new(format!("failed to compress NZB: {e}"))
+        })?;
+        tokio::fs::write(&nzb_path, &compressed).await.map_err(|e| {
             async_graphql::Error::new(format!("failed to save NZB: {e}"))
         })?;
 
@@ -129,6 +133,7 @@ impl MutationRoot {
             id: job_id.0,
             name,
             status: crate::types::JobStatusGql::Queued,
+            error: None,
             progress: 0.0,
             total_bytes,
             downloaded_bytes: 0,
@@ -141,6 +146,7 @@ impl MutationRoot {
                 .map(|(k, v)| crate::types::MetadataEntry { key: k, value: v })
                 .collect(),
             output_dir: None,
+            created_at: Some(weaver_scheduler::job::epoch_ms_now()),
         })
     }
 
@@ -226,6 +232,7 @@ impl MutationRoot {
     }
 
     /// Add a new NNTP server.
+    #[graphql(guard = "AdminGuard")]
     async fn add_server(&self, ctx: &Context<'_>, input: ServerInput) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
@@ -275,6 +282,7 @@ impl MutationRoot {
     }
 
     /// Update an existing NNTP server by ID.
+    #[graphql(guard = "AdminGuard")]
     async fn update_server(&self, ctx: &Context<'_>, id: u32, input: ServerInput) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
@@ -313,6 +321,7 @@ impl MutationRoot {
     }
 
     /// Remove an NNTP server by ID.
+    #[graphql(guard = "AdminGuard")]
     async fn remove_server(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
@@ -339,6 +348,7 @@ impl MutationRoot {
     }
 
     /// Test connectivity to an NNTP server without saving it.
+    #[graphql(guard = "AdminGuard")]
     async fn test_connection(&self, _ctx: &Context<'_>, input: ServerInput) -> Result<TestConnectionResult> {
         let nntp_config = weaver_nntp::ServerConfig {
             host: input.host,
@@ -372,6 +382,7 @@ impl MutationRoot {
     }
 
     /// Update general settings.
+    #[graphql(guard = "AdminGuard")]
     async fn update_settings(
         &self,
         ctx: &Context<'_>,
@@ -452,6 +463,63 @@ impl MutationRoot {
         }
 
         Ok(settings)
+    }
+
+    /// Create a new API key. Returns the raw key (shown only once).
+    #[graphql(guard = "AdminGuard")]
+    async fn create_api_key(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        scope: ApiKeyScope,
+    ) -> Result<CreateApiKeyResult> {
+        let db = ctx.data::<Database>()?;
+        let raw_key = generate_api_key();
+        let key_hash = hash_api_key(&raw_key);
+        let scope_str = match scope {
+            ApiKeyScope::Integration => "integration",
+            ApiKeyScope::Admin => "admin",
+        };
+        let db = db.clone();
+        let name_clone = name.clone();
+        let id = tokio::task::spawn_blocking(move || {
+            db.insert_api_key(&name_clone, &key_hash, scope_str)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        info!(id, name = %name, scope = scope_str, "API key created");
+
+        Ok(CreateApiKeyResult {
+            key: ApiKey {
+                id,
+                name,
+                scope,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as f64,
+                last_used_at: None,
+            },
+            raw_key,
+        })
+    }
+
+    /// Delete an API key by ID.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_api_key(&self, ctx: &Context<'_>, id: i64) -> Result<bool> {
+        let db = ctx.data::<Database>()?;
+        let db = db.clone();
+        let deleted = tokio::task::spawn_blocking(move || db.delete_api_key(id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        if deleted {
+            info!(id, "API key deleted");
+        }
+        Ok(deleted)
     }
 }
 

@@ -47,6 +47,11 @@ impl<'a> BitReader<'a> {
         self.byte_pos * 8 + self.bit_pos as usize
     }
 
+    /// Returns the current byte position (rounded down from bit position).
+    pub fn byte_position(&self) -> usize {
+        self.byte_pos
+    }
+
     /// Read a single bit. Returns 0 or 1.
     pub fn read_bit(&mut self) -> RarResult<u32> {
         if self.byte_pos >= self.data.len() {

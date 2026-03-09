@@ -34,7 +34,10 @@ impl FileDescriptionPacket {
 
         // Filename: everything after offset 56, strip null padding
         let name_bytes = &body[56..];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+        let name_end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
         let filename = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
 
         // Sanitize filename to prevent path traversal attacks.
@@ -163,10 +166,7 @@ mod tests {
 
     #[test]
     fn parse_path_traversal_filename() {
-        let body = make_file_desc_body(
-            [0; 16], [0; 16], [0; 16], 100,
-            b"../../etc/passwd\x00",
-        );
+        let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 100, b"../../etc/passwd\x00");
         let pkt = FileDescriptionPacket::parse(&body).unwrap();
         assert_eq!(pkt.filename, "passwd");
     }

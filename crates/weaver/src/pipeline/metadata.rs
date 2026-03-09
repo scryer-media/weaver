@@ -2,7 +2,8 @@ use super::*;
 
 impl Pipeline {
     /// If the completed file is a PAR2 index, read it from disk, parse it,
-    /// and attach PAR2 metadata to the job assembly for incremental verification.
+    /// and retain the Par2FileSet for repair. For obfuscated uploads, remap
+    /// PAR2 file descriptions to use deobfuscated filenames (matched by volume number).
     pub(super) async fn try_load_par2_metadata(&mut self, job_id: JobId, file_id: NzbFileId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -11,12 +12,24 @@ impl Pipeline {
             return;
         };
 
-        // Only process PAR2 index files.
-        let is_par2_index = matches!(
+        // Only process PAR2 files.
+        let is_par2 = matches!(
+            file_asm.role(),
+            weaver_core::classify::FileRole::Par2 { .. }
+        );
+        if !is_par2 {
+            return;
+        }
+        // If this is a recovery volume and we already have PAR2 metadata,
+        // let try_merge_par2_recovery handle it instead. But if no par2_set
+        // exists yet (no index file), treat this recovery volume as the
+        // initial source of PAR2 metadata — every PAR2 file contains the
+        // file descriptions and checksums needed for verification.
+        if !matches!(
             file_asm.role(),
             weaver_core::classify::FileRole::Par2 { is_index: true, .. }
-        );
-        if !is_par2_index {
+        ) && self.par2_sets.contains_key(&job_id)
+        {
             return;
         }
 
@@ -33,7 +46,7 @@ impl Pipeline {
         };
 
         // Parse PAR2 packets.
-        let par2_set = match weaver_par2::Par2FileSet::from_files(&[&par2_bytes]) {
+        let mut par2_set = match weaver_par2::Par2FileSet::from_files(&[&par2_bytes]) {
             Ok(set) => set,
             Err(e) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 index");
@@ -41,26 +54,63 @@ impl Pipeline {
             }
         };
 
-        // Build Par2Metadata from the parsed set.
-        let mut file_checksums = std::collections::HashMap::new();
-        for file_desc in par2_set.recovery_files() {
-            if let Some(checksums) = par2_set.file_checksums(&file_desc.file_id) {
-                let pairs: Vec<(u32, [u8; 16])> = checksums
-                    .iter()
-                    .map(|sc| (sc.crc32, sc.md5))
-                    .collect();
-                file_checksums.insert(file_desc.filename.clone(), pairs);
+        // Check if PAR2 filenames match assembly filenames (obfuscation check).
+        // Obfuscated uploads use random base names in PAR2 (e.g.,
+        // "6OLN1UG33OBhAM9rAfSUdX.part001.rar") while the NZB/assembly uses
+        // the deobfuscated names. Remap Par2FileSet descriptions so that
+        // DiskFileAccess will find the correct files at repair time.
+        let has_matches = self.jobs.get(&job_id).is_some_and(|state| {
+            par2_set.files.values().any(|desc| {
+                state
+                    .assembly
+                    .files()
+                    .any(|f| f.filename() == desc.filename)
+            })
+        });
+
+        if !has_matches && !par2_set.files.is_empty() {
+            // Build volume_number → deobfuscated filename from assembly.
+            let mut assembly_by_volume: std::collections::HashMap<u32, String> =
+                std::collections::HashMap::new();
+            if let Some(state) = self.jobs.get(&job_id) {
+                for file_asm in state.assembly.files() {
+                    if let weaver_core::classify::FileRole::RarVolume { volume_number } =
+                        file_asm.role()
+                    {
+                        assembly_by_volume.insert(*volume_number, file_asm.filename().to_string());
+                    }
+                }
+            }
+
+            // Remap PAR2 file descriptions: match by volume number, replace filename.
+            let mut remapped = 0u32;
+            for desc in par2_set.files.values_mut() {
+                let role = weaver_core::classify::FileRole::from_filename(&desc.filename);
+                if let weaver_core::classify::FileRole::RarVolume { volume_number } = role {
+                    if let Some(deobfuscated) = assembly_by_volume.get(&volume_number) {
+                        desc.filename = deobfuscated.clone();
+                        remapped += 1;
+                    }
+                }
+            }
+
+            if remapped > 0 {
+                info!(
+                    job_id = job_id.0,
+                    remapped,
+                    total = par2_set.files.len(),
+                    "PAR2 filenames obfuscated — remapped by volume number"
+                );
+            } else {
+                warn!(
+                    job_id = job_id.0,
+                    "PAR2 filenames don't match assembly and volume-number matching failed"
+                );
             }
         }
 
-        let metadata = weaver_assembly::Par2Metadata {
-            slice_size: par2_set.slice_size,
-            recovery_block_count: par2_set.recovery_block_count(),
-            file_checksums,
-        };
-
-        let slice_size = metadata.slice_size;
-        let recovery_block_count = metadata.recovery_block_count;
+        let slice_size = par2_set.slice_size;
+        let recovery_block_count = par2_set.recovery_block_count();
 
         info!(
             job_id = job_id.0,
@@ -73,18 +123,15 @@ impl Pipeline {
         // Retain the Par2FileSet for repair (avoids re-reading from disk).
         self.par2_sets.insert(job_id, Arc::new(par2_set));
 
-        // Attach to job assembly.
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
-        state.assembly.set_par2_metadata(metadata);
-
         let _ = self
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
 
         // Persist PAR2 metadata to SQLite.
-        if let Err(e) = self.db.set_par2_metadata(job_id, slice_size, recovery_block_count) {
+        if let Err(e) = self
+            .db
+            .set_par2_metadata(job_id, slice_size, recovery_block_count)
+        {
             error!(error = %e, "db write failed for set_par2_metadata");
         }
     }
@@ -102,7 +149,10 @@ impl Pipeline {
         // Only process PAR2 recovery volumes (not the index).
         let is_par2_volume = matches!(
             file_asm.role(),
-            weaver_core::classify::FileRole::Par2 { is_index: false, .. }
+            weaver_core::classify::FileRole::Par2 {
+                is_index: false,
+                ..
+            }
         );
         if !is_par2_volume {
             return;
@@ -167,7 +217,12 @@ impl Pipeline {
                 weaver_core::classify::FileRole::RarVolume { volume_number } => *volume_number,
                 _ => return,
             };
-            (vol, file_asm.filename().to_string(), state.spec.password.clone(), state.working_dir.clone())
+            (
+                vol,
+                file_asm.filename().to_string(),
+                state.spec.password.clone(),
+                state.working_dir.clone(),
+            )
         };
 
         // Derive set name from filename base (e.g., "movie" from "movie.part01.rar").
@@ -197,7 +252,11 @@ impl Pipeline {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
                 tracing::info!("RAR parse: archive opened, getting metadata");
                 let meta = archive.metadata();
-                tracing::info!("RAR parse: done, members={} volumes={:?}", meta.members.len(), meta.volume_count);
+                tracing::info!(
+                    "RAR parse: done, members={} volumes={:?}",
+                    meta.members.len(),
+                    meta.volume_count
+                );
                 Ok::<_, std::io::Error>(meta)
             })
             .await;
@@ -212,16 +271,16 @@ impl Pipeline {
                     // belonging to the same archive set (matching base name).
                     if let Some(state) = self.jobs.get(&job_id) {
                         for file_asm in state.assembly.files() {
-                            if let weaver_core::classify::FileRole::RarVolume { volume_number: vn } =
-                                file_asm.role()
+                            if let weaver_core::classify::FileRole::RarVolume {
+                                volume_number: vn,
+                            } = file_asm.role()
                             {
                                 let f_base = weaver_core::classify::archive_base_name(
                                     file_asm.filename(),
                                     file_asm.role(),
                                 );
                                 if f_base.as_deref() == Some(&set_name) {
-                                    volume_map
-                                        .insert(file_asm.filename().to_string(), *vn);
+                                    volume_map.insert(file_asm.filename().to_string(), *vn);
                                 }
                             }
                         }
@@ -250,16 +309,27 @@ impl Pipeline {
                     };
 
                     if let Some(state) = self.jobs.get_mut(&job_id) {
-                        state.assembly.set_archive_topology(set_name.clone(), topology);
-                        state.assembly.mark_volume_complete(&set_name, volume_number);
+                        state
+                            .assembly
+                            .set_archive_topology(set_name.clone(), topology);
+                        state
+                            .assembly
+                            .mark_volume_complete(&set_name, volume_number);
 
                         // Retroactively mark volumes that completed before
                         // topology was available (same set only).
-                        let completed_volumes: Vec<u32> = state.assembly.files()
+                        let completed_volumes: Vec<u32> = state
+                            .assembly
+                            .files()
                             .filter(|f| f.is_complete())
                             .filter_map(|f| match f.role() {
-                                weaver_core::classify::FileRole::RarVolume { volume_number: vn } => {
-                                    let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                                weaver_core::classify::FileRole::RarVolume {
+                                    volume_number: vn,
+                                } => {
+                                    let f_base = weaver_core::classify::archive_base_name(
+                                        f.filename(),
+                                        f.role(),
+                                    );
                                     if f_base.as_deref() == Some(&set_name) {
                                         Some(*vn)
                                     } else {
@@ -301,12 +371,36 @@ impl Pipeline {
         } else {
             // Non-first volume: mark it complete.
             if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.assembly.mark_volume_complete(&set_name, volume_number);
+                state
+                    .assembly
+                    .mark_volume_complete(&set_name, volume_number);
+            }
+
+            // Update last_volume for the member whose data continues through
+            // this volume. In a sequential multi-file RAR archive, the member
+            // with the highest first_volume <= volume_number is the one whose
+            // data fills this volume. This must happen for EVERY completed
+            // volume so deletable_volumes() knows the full span of each member.
+            if let Some(state) = self.jobs.get_mut(&job_id)
+                && let Some(topo) = state.assembly.archive_topology_for_mut(&set_name)
+            {
+                if let Some(continuing) = topo
+                    .members
+                    .iter_mut()
+                    .filter(|m| m.first_volume <= volume_number)
+                    .max_by_key(|m| m.first_volume)
+                {
+                    if volume_number > continuing.last_volume {
+                        continuing.last_volume = volume_number;
+                    }
+                }
             }
 
             // Parse headers to discover new members starting in this volume.
             // (e.g., S01E02 starts after S01E01's data ends in a later volume.)
-            let has_topology = self.jobs.get(&job_id)
+            let has_topology = self
+                .jobs
+                .get(&job_id)
                 .is_some_and(|s| s.assembly.archive_topology_for(&set_name).is_some());
 
             if has_topology {
@@ -321,36 +415,42 @@ impl Pipeline {
                     }
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Ok::<_, std::io::Error>(archive.metadata())
-                }).await;
+                })
+                .await;
 
                 match parse_result {
                     Ok(Ok(meta)) => {
                         if let Some(state) = self.jobs.get_mut(&job_id)
-                            && let Some(topo) = state.assembly.archive_topology_for_mut(&set_name) {
-                                let existing_names: std::collections::HashSet<String> =
-                                    topo.members.iter().map(|m| m.name.clone()).collect();
-                                let mut added = 0u32;
-                                for member in &meta.members {
-                                    if member.is_directory { continue; }
-                                    let name = weaver_rar::sanitize_path(&member.name);
-                                    if existing_names.contains(&name) { continue; }
-                                    topo.members.push(weaver_assembly::ArchiveMember {
-                                        name,
-                                        first_volume: volume_number,
-                                        last_volume: volume_number, // unknown until parsed further
-                                        unpacked_size: member.unpacked_size.unwrap_or(0),
-                                    });
-                                    added += 1;
+                            && let Some(topo) = state.assembly.archive_topology_for_mut(&set_name)
+                        {
+                            let existing_names: std::collections::HashSet<String> =
+                                topo.members.iter().map(|m| m.name.clone()).collect();
+                            let mut added = 0u32;
+                            for member in &meta.members {
+                                if member.is_directory {
+                                    continue;
                                 }
-                                if added > 0 {
-                                    info!(
-                                        job_id = job_id.0,
-                                        volume = volume_number,
-                                        set_name = %set_name,
-                                        added,
-                                        "discovered new archive members from later volume"
-                                    );
+                                let name = weaver_rar::sanitize_path(&member.name);
+                                if existing_names.contains(&name) {
+                                    continue;
                                 }
+                                topo.members.push(weaver_assembly::ArchiveMember {
+                                    name,
+                                    first_volume: volume_number,
+                                    last_volume: volume_number,
+                                    unpacked_size: member.unpacked_size.unwrap_or(0),
+                                });
+                                added += 1;
+                            }
+                            if added > 0 {
+                                info!(
+                                    job_id = job_id.0,
+                                    volume = volume_number,
+                                    set_name = %set_name,
+                                    added,
+                                    "discovered new archive members from later volume"
+                                );
+                            }
                         }
                     }
                     Ok(Err(e)) => {
@@ -422,7 +522,9 @@ impl Pipeline {
                 };
 
                 let state = self.jobs.get_mut(&job_id).unwrap();
-                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
                 state.assembly.mark_volume_complete(&set_name, 0);
 
                 info!(
@@ -437,7 +539,9 @@ impl Pipeline {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     // Topology already exists for this set — just mark this volume complete.
                     let state = self.jobs.get_mut(&job_id).unwrap();
-                    state.assembly.mark_volume_complete(&set_name, completing_number);
+                    state
+                        .assembly
+                        .mark_volume_complete(&set_name, completing_number);
                     debug!(
                         job_id = job_id.0,
                         set_name = %set_name,
@@ -453,7 +557,8 @@ impl Pipeline {
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
                     if let weaver_core::classify::FileRole::SevenZipSplit { number: n } = f.role() {
-                        let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                        let f_base =
+                            weaver_core::classify::archive_base_name(f.filename(), f.role());
                         if f_base.as_deref() == Some(&set_name) {
                             volume_map.insert(f.filename().to_string(), *n);
                             max_number = max_number.max(*n);
@@ -476,7 +581,9 @@ impl Pipeline {
                 };
 
                 let state = self.jobs.get_mut(&job_id).unwrap();
-                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
 
                 // Retroactively mark all already-complete split parts for this set.
                 let completed: Vec<u32> = state
@@ -484,8 +591,11 @@ impl Pipeline {
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
-                        if let weaver_core::classify::FileRole::SevenZipSplit { number: n } = f.role() {
-                            let f_base = weaver_core::classify::archive_base_name(f.filename(), f.role());
+                        if let weaver_core::classify::FileRole::SevenZipSplit { number: n } =
+                            f.role()
+                        {
+                            let f_base =
+                                weaver_core::classify::archive_base_name(f.filename(), f.role());
                             if f_base.as_deref() == Some(&set_name) {
                                 return Some(*n);
                             }
@@ -505,150 +615,6 @@ impl Pipeline {
                 );
             }
             _ => {}
-        }
-    }
-
-    /// Re-read and verify slices that weren't verified incrementally during download.
-    /// This happens when segments arrived before PAR2 metadata was loaded — their data
-    /// was dropped via commit_segment_meta() without feeding slice checksums.
-    /// Only reads the specific byte ranges of unverified slices, not entire files.
-    pub(super) async fn verify_unverified_slices_from_disk(&mut self, job_id: JobId) {
-        // Collect unverified slices across all files: (file_id, filename, slice descriptors).
-        type SliceDescriptors = Vec<(u32, u64, u64, u32, [u8; 16])>;
-        let unverified: Vec<(NzbFileId, String, SliceDescriptors)> = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
-            let par2_slice_size = state
-                .assembly
-                .par2_metadata()
-                .map(|m| m.slice_size)
-                .unwrap_or(0);
-            if par2_slice_size == 0 {
-                return;
-            }
-            state
-                .assembly
-                .files()
-                .filter_map(|f| {
-                    let slices = f.unverified_slices();
-                    if slices.is_empty() {
-                        None
-                    } else {
-                        Some((f.file_id(), f.filename().to_owned(), slices))
-                    }
-                })
-                .collect()
-        };
-
-        if unverified.is_empty() {
-            debug!(job_id = job_id.0, "all slices verified incrementally");
-            return;
-        }
-
-        let total_unverified: usize = unverified.iter().map(|(_, _, s)| s.len()).sum();
-        info!(
-            job_id = job_id.0,
-            unverified_slices = total_unverified,
-            files = unverified.len(),
-            "re-verifying slices from disk (segments arrived before PAR2 metadata)"
-        );
-
-        let par2_slice_size = self
-            .jobs
-            .get(&job_id)
-            .and_then(|s| s.assembly.par2_metadata())
-            .map(|m| m.slice_size)
-            .unwrap_or(0);
-
-        let working_dir = self
-            .jobs
-            .get(&job_id)
-            .map(|s| s.working_dir.clone())
-            .unwrap_or_default();
-
-        for (file_id, filename, slices) in unverified {
-            let file_path = working_dir.join(&filename);
-            let slice_size = par2_slice_size;
-
-            // Read and verify each unverified slice from disk.
-            let results: Vec<(u32, bool)> = match tokio::task::spawn_blocking({
-                let file_path = file_path.clone();
-                move || -> Result<Vec<(u32, bool)>, std::io::Error> {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut file = std::fs::File::open(&file_path)?;
-                    let file_len = file.metadata()?.len();
-
-                    let mut results = Vec::with_capacity(slices.len());
-                    for (slice_idx, byte_start, byte_end, expected_crc, expected_md5) in slices {
-                        if byte_start >= file_len {
-                            results.push((slice_idx, false));
-                            continue;
-                        }
-                        let read_end = byte_end.min(file_len);
-                        let read_len = (read_end - byte_start) as usize;
-                        let mut buf = vec![0u8; read_len];
-                        file.seek(SeekFrom::Start(byte_start))?;
-                        file.read_exact(&mut buf)?;
-
-                        let mut state = checksum::SliceChecksumState::new();
-                        state.update(&buf);
-
-                        // Pad last slice if needed (PAR2 spec).
-                        let pad_to = if (read_len as u64) < slice_size {
-                            Some(slice_size)
-                        } else {
-                            None
-                        };
-                        let (crc, md5) = state.finalize(pad_to);
-                        let valid = crc == expected_crc && md5 == expected_md5;
-                        results.push((slice_idx, valid));
-                    }
-                    Ok(results)
-                }
-            })
-            .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    warn!(
-                        file = %filename,
-                        error = %e,
-                        "failed to re-verify slices from disk"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        file = %filename,
-                        error = %e,
-                        "slice re-verification task panicked"
-                    );
-                    continue;
-                }
-            };
-
-            // Apply results back to assembly.
-            let state = self.jobs.get_mut(&job_id).unwrap();
-            let file_asm = state.assembly.file_mut(file_id).unwrap();
-            let mut damaged_count = 0u32;
-            for (slice_idx, valid) in &results {
-                file_asm.mark_slice_verified(*slice_idx, *valid);
-                if !valid {
-                    damaged_count += 1;
-                    info!(
-                        file = %filename,
-                        slice = slice_idx,
-                        "damaged slice detected during disk re-verification"
-                    );
-                }
-            }
-            info!(
-                file = %filename,
-                verified = results.len(),
-                damaged = damaged_count,
-                "disk re-verification complete"
-            );
         }
     }
 }

@@ -340,6 +340,12 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute("DELETE FROM active_extraction_chunks WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
@@ -361,12 +367,174 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute("DELETE FROM active_extraction_chunks WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         conn.execute_batch("PRAGMA incremental_vacuum").map_err(db_err)?;
         Ok(())
     }
+
+    // --- Extraction chunk tracking ---
+
+    /// Record an extraction chunk (per-volume temp file).
+    pub fn insert_extraction_chunk(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+        volume_index: u32,
+        bytes_written: u64,
+        temp_path: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO active_extraction_chunks
+             (job_id, set_name, member_name, volume_index, bytes_written, temp_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                job_id.0 as i64,
+                set_name,
+                member_name,
+                volume_index,
+                bytes_written as i64,
+                temp_path,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Mark a chunk as verified (CRC passed).
+    pub fn mark_chunk_verified(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+        volume_index: u32,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE active_extraction_chunks SET verified = 1
+             WHERE job_id = ?1 AND set_name = ?2 AND member_name = ?3 AND volume_index = ?4",
+            rusqlite::params![job_id.0 as i64, set_name, member_name, volume_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Get all extraction chunks for a job+set.
+    pub fn get_extraction_chunks(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Vec<ExtractionChunk>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT member_name, volume_index, bytes_written, temp_path, verified
+                 FROM active_extraction_chunks
+                 WHERE job_id = ?1 AND set_name = ?2
+                 ORDER BY member_name, volume_index",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![job_id.0 as i64, set_name], |row| {
+                Ok(ExtractionChunk {
+                    member_name: row.get(0)?,
+                    volume_index: row.get(1)?,
+                    bytes_written: row.get::<_, i64>(2)? as u64,
+                    temp_path: row.get(3)?,
+                    verified: row.get::<_, i64>(4)? != 0,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    // --- Archive header caching ---
+
+    /// Save serialized archive headers for a set.
+    pub fn save_archive_headers(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        headers: &[u8],
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO active_archive_headers (job_id, set_name, headers)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![job_id.0 as i64, set_name, headers],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Load cached archive headers for a set.
+    pub fn load_archive_headers(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Option<Vec<u8>>, StateError> {
+        let conn = self.conn();
+        let result = conn.query_row(
+            "SELECT headers FROM active_archive_headers
+             WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    // --- Volume status tracking ---
+
+    /// Set volume extraction/verification/deletion status.
+    pub fn set_volume_status(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        volume_index: u32,
+        extracted: bool,
+        par2_clean: bool,
+        deleted: bool,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO active_volume_status
+             (job_id, set_name, volume_index, extracted, par2_clean, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                job_id.0 as i64,
+                set_name,
+                volume_index,
+                extracted as i64,
+                par2_clean as i64,
+                deleted as i64,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+/// A recorded extraction chunk.
+#[derive(Debug, Clone)]
+pub struct ExtractionChunk {
+    pub member_name: String,
+    pub volume_index: u32,
+    pub bytes_written: u64,
+    pub temp_path: String,
+    pub verified: bool,
 }
 
 #[cfg(test)]

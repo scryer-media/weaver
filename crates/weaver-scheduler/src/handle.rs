@@ -154,6 +154,10 @@ pub struct JobInfo {
     pub metadata: Vec<(String, String)>,
     /// Output directory where extracted files land.
     pub output_dir: Option<String>,
+    /// Error message (only set when status is Failed).
+    pub error: Option<String>,
+    /// Wall-clock creation time (Unix epoch milliseconds).
+    pub created_at_epoch_ms: f64,
 }
 
 /// Handle for sending commands to the scheduler.
@@ -404,6 +408,7 @@ mod tests {
             .map(|state| JobInfo {
                 job_id: state.job_id,
                 name: state.spec.name.clone(),
+                error: if let JobStatus::Failed { error } = &state.status { Some(error.clone()) } else { None },
                 status: state.status.clone(),
                 progress: state.assembly.progress(),
                 total_bytes: state.spec.total_bytes,
@@ -414,6 +419,7 @@ mod tests {
                 category: state.spec.category.clone(),
                 metadata: state.spec.metadata.clone(),
                 output_dir: None,
+                created_at_epoch_ms: state.created_at_epoch_ms,
             })
             .collect()
     }
@@ -449,6 +455,7 @@ mod tests {
                             status: JobStatus::Queued,
                             assembly,
                             created_at: std::time::Instant::now(),
+                            created_at_epoch_ms: crate::job::epoch_ms_now(),
                             working_dir: PathBuf::from("/tmp/test"),
                             downloaded_bytes: 0,
                             failed_bytes: 0,
@@ -518,6 +525,7 @@ mod tests {
                             status,
                             assembly,
                             created_at: std::time::Instant::now(),
+                            created_at_epoch_ms: crate::job::epoch_ms_now(),
                             working_dir,
                             downloaded_bytes: 0,
                             failed_bytes: 0,

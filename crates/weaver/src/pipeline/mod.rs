@@ -27,15 +27,11 @@ use weaver_core::id::{JobId, NzbFileId, SegmentId};
 use weaver_core::system::SystemProfile;
 use weaver_nntp::NntpClient;
 use weaver_par2::par2_set::Par2FileSet;
-use weaver_par2::verify::{
-    FileStatus, FileVerification, Repairability, VerificationResult,
-};
 use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
     RuntimeTuner, SchedulerCommand, SharedPipelineState, TokenBucket,
 };
 use weaver_state::CommittedSegment;
-
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -70,17 +66,19 @@ pub(super) enum ExtractionDone {
         extracted: Result<Vec<String>, String>,
     },
     /// Full set extraction completed (all volumes present).
+    /// Result contains (extracted_count, failed_member_names).
     FullSet {
         job_id: JobId,
         set_name: String,
-        result: Result<u32, String>,
+        result: Result<(u32, Vec<String>), String>,
     },
     /// Streaming extraction of a single member completed.
+    /// Result contains (volume_index, bytes_written, temp_path) per chunk.
     Streaming {
         job_id: JobId,
         set_name: String,
         member: String,
-        result: Result<u64, String>,
+        result: Result<Vec<(usize, u64, String)>, String>,
     },
 }
 
@@ -92,6 +90,8 @@ pub(super) struct DecodeResult {
     pub(super) crc_valid: bool,
     pub(super) crc32: u32,
     pub(super) data: Vec<u8>,
+    /// Original filename from the yEnc header (for swap detection observability).
+    pub(super) yenc_name: String,
 }
 
 /// The pipeline engine. Owns the scheduler loop and drives work through
@@ -156,13 +156,35 @@ pub struct Pipeline {
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archive sets already extracted per job (for multi-set 7z).
     pub(super) extracted_sets: HashMap<JobId, HashSet<String>>,
-    /// Active streaming extraction providers per (job, archive set).
+    /// Members whose streaming extraction failed (corrupt volume, CRC error, etc).
+    /// Prevents immediate retry during download; cleared after PAR2 repair so
+    /// the post-repair extraction path can re-extract them.
+    pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
+    /// Recovery PAR2 file indices already promoted or completed for a job.
+    /// Used to avoid double-promotion and to count targeted recovery capacity.
+    pub(super) promoted_recovery_files: HashMap<JobId, HashSet<u32>>,
+    /// Active streaming extraction providers per (job, archive set, member).
     /// The `WaitingVolumeProvider` is fed volume paths as they complete.
-    pub(super) streaming_providers: HashMap<(JobId, String), Arc<weaver_rar::WaitingVolumeProvider>>,
+    /// Multiple providers can coexist for parallel member extraction.
+    pub(super) streaming_providers:
+        HashMap<(JobId, String, String), Arc<weaver_rar::WaitingVolumeProvider>>,
     /// Base volume number for each streaming provider, used to re-index volumes.
     /// When extracting a member that starts at volume N, the provider's indices
     /// are offset so that local index 0 maps to real volume N.
-    pub(super) streaming_volume_bases: HashMap<(JobId, String), u32>,
+    pub(super) streaming_volume_bases: HashMap<(JobId, String, String), u32>,
+    /// Filenames eagerly deleted per job after CRC-verified streaming extraction.
+    /// Used to distinguish truly-missing files from intentionally-deleted ones
+    /// during PAR2 verification.
+    pub(super) eagerly_deleted: HashMap<JobId, HashSet<String>>,
+    /// Volumes proven clean by CRC-verified extraction or authoritative PAR2 verify.
+    pub(super) clean_volumes: HashMap<(JobId, String), HashSet<u32>>,
+    /// Volumes touched by failed extraction or damaged in authoritative verify.
+    pub(super) suspect_volumes: HashMap<(JobId, String), HashSet<u32>>,
+    /// Jobs that have already attempted normalization retry (one-shot guard).
+    pub(super) normalization_retried: HashSet<JobId>,
+    /// Jobs where all archive members extracted with CRC pass — PAR2
+    /// verification/repair is unnecessary.
+    pub(super) par2_bypassed: HashSet<JobId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
     pub(super) finished_jobs: Vec<JobInfo>,
     /// Shared state for control plane reads (API handlers read without channel round-trip).
@@ -193,8 +215,7 @@ impl Pipeline {
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
-            total_connections,
-            "pipeline tuner initialized"
+            total_connections, "pipeline tuner initialized"
         );
 
         // Ensure directories exist.
@@ -244,8 +265,15 @@ impl Pipeline {
             par2_sets: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_sets: HashMap::new(),
+            failed_extractions: HashMap::new(),
+            promoted_recovery_files: HashMap::new(),
             streaming_providers: HashMap::new(),
             streaming_volume_bases: HashMap::new(),
+            eagerly_deleted: HashMap::new(),
+            clean_volumes: HashMap::new(),
+            suspect_volumes: HashMap::new(),
+            normalization_retried: HashSet::new(),
+            par2_bypassed: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
             db,
@@ -400,7 +428,8 @@ impl Pipeline {
                 working_dir,
                 reply,
             } => {
-                let result = self.restore_job(job_id, spec, committed_segments, status, working_dir);
+                let result =
+                    self.restore_job(job_id, spec, committed_segments, status, working_dir);
                 let _ = reply.send(result);
             }
             SchedulerCommand::PauseJob { job_id, reply } => {
@@ -459,9 +488,15 @@ impl Pipeline {
                         },
                     };
                     let db = self.db.clone();
+                    let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.archive_job(job_id, &row) {
                             tracing::error!(job_id = job_id.0, error = %e, "failed to archive cancelled job");
+                        }
+                        if let Err(e) = std::fs::remove_file(&nzb_path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
+                            }
                         }
                     });
 
@@ -469,6 +504,12 @@ impl Pipeline {
                     self.par2_sets.remove(&job_id);
                     self.extracted_members.remove(&job_id);
                     self.extracted_sets.remove(&job_id);
+                    self.failed_extractions.remove(&job_id);
+                    self.promoted_recovery_files.remove(&job_id);
+                    self.par2_bypassed.remove(&job_id);
+                    self.eagerly_deleted.remove(&job_id);
+                    self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+                    self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
                     self.cancel_streaming_extraction(job_id);
                     self.write_buffers.retain(|fid, _| fid.job_id != job_id);
 
@@ -476,13 +517,14 @@ impl Pipeline {
                     let working_dir = state.working_dir.clone();
                     tokio::spawn(async move {
                         if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
-                            && e.kind() != std::io::ErrorKind::NotFound {
-                                tracing::warn!(
-                                    dir = %working_dir.display(),
-                                    error = %e,
-                                    "failed to clean up cancelled job directory"
-                                );
-                            }
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(
+                                dir = %working_dir.display(),
+                                error = %e,
+                                "failed to clean up cancelled job directory"
+                            );
+                        }
                     });
 
                     Ok(())
@@ -503,15 +545,25 @@ impl Pipeline {
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
                 let _ = reply.send(());
             }
-            SchedulerCommand::SetSpeedLimit { bytes_per_sec, reply } => {
+            SchedulerCommand::SetSpeedLimit {
+                bytes_per_sec,
+                reply,
+            } => {
                 self.rate_limiter.set_rate(bytes_per_sec);
                 let _ = reply.send(());
             }
-            SchedulerCommand::RebuildNntp { client, total_connections, reply } => {
+            SchedulerCommand::RebuildNntp {
+                client,
+                total_connections,
+                reply,
+            } => {
                 if let Ok(new_client) = client.downcast::<NntpClient>() {
                     self.nntp = Arc::new(*new_client);
                     self.connection_ramp = total_connections.min(5);
-                    info!(total_connections, "NNTP client rebuilt with new server config");
+                    info!(
+                        total_connections,
+                        "NNTP client rebuilt with new server config"
+                    );
                 }
                 let _ = reply.send(());
             }
@@ -601,9 +653,7 @@ pub(super) async fn write_segment_to_disk(
 /// Logs a warning if space appears insufficient; does not hard-fail since
 /// estimates from NZB metadata may be inaccurate.
 pub(super) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    let path_cstr = match std::ffi::CString::new(
-        output_dir.to_str().unwrap_or(".").as_bytes(),
-    ) {
+    let path_cstr = match std::ffi::CString::new(output_dir.to_str().unwrap_or(".").as_bytes()) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -687,6 +737,11 @@ impl Pipeline {
         self.finished_jobs.push(JobInfo {
             job_id,
             name: state.spec.name.clone(),
+            error: if let JobStatus::Failed { error } = &state.status {
+                Some(error.clone())
+            } else {
+                None
+            },
             status: state.status.clone(),
             progress: state.assembly.progress(),
             total_bytes: total,
@@ -697,12 +752,20 @@ impl Pipeline {
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
+            created_at_epoch_ms: state.created_at_epoch_ms,
         });
 
         let db = self.db.clone();
+        let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
         tokio::task::spawn_blocking(move || {
             if let Err(e) = db.archive_job(job_id, &row) {
                 tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
+            }
+            // Clean up the stored NZB file — no longer needed after archival.
+            if let Err(e) = std::fs::remove_file(&nzb_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
+                }
             }
         });
     }

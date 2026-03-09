@@ -9,7 +9,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 
 export function History() {
   const t = useTranslate();
-  const [{ data, fetching }] = useQuery({ query: HISTORY_JOBS_QUERY });
+  const [{ data, fetching }, reexecuteQuery] = useQuery({ query: HISTORY_JOBS_QUERY });
   const [deleteResult, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
   const [, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
@@ -173,7 +173,9 @@ export function History() {
         confirmLabel={t("confirm.deleteAllHistoryConfirm")}
         cancelLabel={t("confirm.deleteAllHistoryDismiss")}
         onConfirm={() => {
-          deleteAllHistory({});
+          deleteAllHistory({}).then(() => {
+            reexecuteQuery({ requestPolicy: "network-only" });
+          });
           setDeleteAllConfirm(false);
         }}
         onCancel={() => setDeleteAllConfirm(false)}

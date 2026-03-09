@@ -46,7 +46,9 @@ pub enum Par2Error {
     },
 
     // --- Repair errors ---
-    #[error("insufficient recovery data: need {needed} blocks, have {available} (deficit: {deficit})")]
+    #[error(
+        "insufficient recovery data: need {needed} blocks, have {available} (deficit: {deficit})"
+    )]
     InsufficientRecoveryData {
         needed: u32,
         available: u32,

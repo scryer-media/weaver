@@ -292,16 +292,75 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
 
 fn detect_disk(output_dir: &Path) -> DiskProfile {
     let (storage_class, filesystem) = detect_disk_info(output_dir);
+    let iops = benchmark_random_read_iops(output_dir).unwrap_or(10_000.0);
 
-    debug!(?storage_class, ?filesystem, "disk probe");
+    debug!(?storage_class, ?filesystem, iops, "disk probe");
 
     DiskProfile {
         storage_class,
         filesystem,
-        // Benchmarking is deferred to a later phase; use conservative defaults.
         sequential_write_mbps: 500.0,
-        random_read_iops: 10_000.0,
+        random_read_iops: iops,
         same_filesystem: true,
+    }
+}
+
+/// Benchmark random 4 KB read IOPS on the given directory's filesystem.
+///
+/// Creates a temporary 4 MB file, issues 200 random `pread()` calls,
+/// and returns measured IOPS. Takes <1 ms on SSD, ~1 s on HDD.
+fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
+    use std::io::Write;
+
+    let tmp_path = dir.join(".weaver-iops-probe");
+
+    // Write a 4 MB file of zeros.
+    let mut file = std::fs::File::create(&tmp_path).ok()?;
+    let buf = vec![0u8; 4 * 1024 * 1024];
+    file.write_all(&buf).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+
+    // Re-open read-only and benchmark random reads.
+    let fd = std::fs::File::open(&tmp_path).ok()?;
+    use std::os::unix::io::AsRawFd;
+    let raw_fd = fd.as_raw_fd();
+
+    const READ_SIZE: usize = 4096;
+    const NUM_READS: usize = 200;
+    const FILE_SIZE: usize = 4 * 1024 * 1024;
+    const MAX_OFFSET: usize = FILE_SIZE - READ_SIZE;
+
+    // Simple deterministic pseudo-random offsets (aligned to 4 KB).
+    let mut read_buf = [0u8; READ_SIZE];
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
+
+    let start = std::time::Instant::now();
+    for _ in 0..NUM_READS {
+        // xorshift64
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let offset = ((rng_state as usize) % (MAX_OFFSET / READ_SIZE)) * READ_SIZE;
+
+        unsafe {
+            libc::pread(
+                raw_fd,
+                read_buf.as_mut_ptr() as *mut libc::c_void,
+                READ_SIZE,
+                offset as libc::off_t,
+            );
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+
+    drop(fd);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    if elapsed > 0.0 {
+        Some(NUM_READS as f64 / elapsed)
+    } else {
+        Some(NUM_READS as f64 * 1_000_000.0) // sub-microsecond → very fast
     }
 }
 

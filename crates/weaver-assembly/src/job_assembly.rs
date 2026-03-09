@@ -10,20 +10,9 @@ pub struct JobAssembly {
     job_id: JobId,
     files: HashMap<NzbFileId, FileAssembly>,
 
-    /// PAR2 metadata (populated once PAR2 index is parsed).
-    par2_metadata: Option<Par2Metadata>,
-
     /// Archive topologies keyed by archive set name (e.g., "Show.S01E01.7z").
     /// Supports multiple independent archive sets per job (e.g., season packs).
     archive_topologies: HashMap<String, ArchiveTopology>,
-}
-
-/// PAR2 metadata needed for verification.
-pub struct Par2Metadata {
-    pub slice_size: u64,
-    pub recovery_block_count: u32,
-    /// Maps filename -> slice checksums for that file.
-    pub file_checksums: HashMap<String, Vec<(u32, [u8; 16])>>,
 }
 
 /// Type of archive detected in a job.
@@ -45,6 +34,31 @@ pub struct ArchiveTopology {
     pub expected_volume_count: Option<u32>,
     /// Archive members and which volumes they span.
     pub members: Vec<ArchiveMember>,
+}
+
+impl ArchiveTopology {
+    /// Returns volume numbers that can be safely deleted because every member
+    /// that uses them has been extracted. `extracted` is the set of member names
+    /// that completed extraction successfully.
+    pub fn deletable_volumes(&self, extracted: &HashSet<String>) -> HashSet<u32> {
+        // For each volume, check if ALL members spanning it have been extracted.
+        // A volume is deletable only when no unextracted member needs it.
+        let max_vol = self.expected_volume_count
+            .unwrap_or_else(|| self.volume_map.values().max().copied().map_or(0, |v| v + 1));
+
+        let mut deletable: HashSet<u32> = (0..max_vol).collect();
+
+        for member in &self.members {
+            if !extracted.contains(&member.name) {
+                // This member still needs its volumes — remove them from deletable.
+                for v in member.first_volume..=member.last_volume {
+                    deletable.remove(&v);
+                }
+            }
+        }
+
+        deletable
+    }
 }
 
 /// A member (file) within an archive set.
@@ -79,7 +93,6 @@ impl JobAssembly {
         Self {
             job_id,
             files: HashMap::new(),
-            par2_metadata: None,
             archive_topologies: HashMap::new(),
         }
     }
@@ -97,25 +110,6 @@ impl JobAssembly {
     /// Get a file assembly by id (immutable).
     pub fn file(&self, file_id: NzbFileId) -> Option<&FileAssembly> {
         self.files.get(&file_id)
-    }
-
-    /// Set PAR2 metadata. This attaches slice checksums to all matching files.
-    pub fn set_par2_metadata(&mut self, metadata: Par2Metadata) {
-        let slice_size = metadata.slice_size;
-
-        // Attach checksums to matching files by filename.
-        for file in self.files.values_mut() {
-            if let Some(checksums) = metadata.file_checksums.get(file.filename()) {
-                file.attach_par2_metadata(slice_size, checksums);
-            }
-        }
-
-        self.par2_metadata = Some(metadata);
-    }
-
-    /// Get PAR2 metadata if loaded.
-    pub fn par2_metadata(&self) -> Option<&Par2Metadata> {
-        self.par2_metadata.as_ref()
     }
 
     /// Set archive topology for a named set.
@@ -320,6 +314,11 @@ impl JobAssembly {
         &self.archive_topologies
     }
 
+    /// Get all archive topologies (mutable).
+    pub fn archive_topologies_mut(&mut self) -> &mut HashMap<String, ArchiveTopology> {
+        &mut self.archive_topologies
+    }
+
     /// Overall job progress (average of file progresses, weighted by bytes).
     pub fn progress(&self) -> f64 {
         let total_bytes: u64 = self.files.values().map(|f| f.total_bytes()).sum();
@@ -336,42 +335,27 @@ impl JobAssembly {
         weighted_progress / total_bytes as f64
     }
 
-    /// Number of complete files.
+    /// Number of complete files (all types).
     pub fn complete_file_count(&self) -> usize {
         self.files.values().filter(|f| f.is_complete()).count()
     }
 
-    /// Total number of files.
+    /// Total number of files (all types).
     pub fn total_file_count(&self) -> usize {
         self.files.len()
     }
 
-    /// Repair confidence: (damaged_slices, total_verified_slices, recovery_blocks_available).
-    /// Returns None if no PAR2 metadata is available.
-    pub fn repair_confidence(&self) -> Option<(u32, u32, u32)> {
-        let metadata = self.par2_metadata.as_ref()?;
-
-        let mut damaged = 0u32;
-        let mut total_verified = 0u32;
-
-        for file in self.files.values() {
-            damaged += file.damaged_slice_count();
-            total_verified += file.verified_slice_count();
-        }
-
-        // Include damaged slices in total count.
-        total_verified += damaged;
-
-        Some((damaged, total_verified, metadata.recovery_block_count))
+    /// Number of data files (excludes PAR2 recovery volumes).
+    /// Includes PAR2 index, archive volumes, standalone files.
+    pub fn data_file_count(&self) -> usize {
+        self.files.values().filter(|f| !matches!(f.role(), FileRole::Par2 { is_index: false, .. })).count()
     }
 
-    /// Get all PAR2 filenames (index + recovery volumes) for re-reading during repair.
-    pub fn par2_filenames(&self) -> Vec<&str> {
-        self.files
-            .values()
-            .filter(|f| matches!(f.role(), FileRole::Par2 { .. }))
-            .map(|f| f.filename())
-            .collect()
+    /// Number of complete data files (excludes PAR2 recovery volumes).
+    pub fn complete_data_file_count(&self) -> usize {
+        self.files.values().filter(|f| {
+            !matches!(f.role(), FileRole::Par2 { is_index: false, .. }) && f.is_complete()
+        }).count()
     }
 
     /// Iterator over all files.

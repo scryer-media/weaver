@@ -80,21 +80,28 @@ impl Par2FileSet {
             let packets = scan_packets(data, 0);
 
             if packets.is_empty() && !data.is_empty() {
-                diagnostic.damaged_files.push((i, "no valid packets found".to_string()));
+                diagnostic
+                    .damaged_files
+                    .push((i, "no valid packets found".to_string()));
                 diagnostic.skipped_packets += 1;
                 continue;
             }
 
             for (packet, offset) in packets {
                 if let Err(e) = builder.add_packet(packet, offset) {
-                    diagnostic.damaged_files.push((i, format!("packet error at offset {offset}: {e}")));
+                    diagnostic
+                        .damaged_files
+                        .push((i, format!("packet error at offset {offset}: {e}")));
                     diagnostic.skipped_packets += 1;
                 }
             }
         }
 
         let file_set = builder.build()?;
-        Ok(Par2ParseResult { file_set, diagnostic })
+        Ok(Par2ParseResult {
+            file_set,
+            diagnostic,
+        })
     }
 
     /// Create from an already-parsed list of packets.
@@ -147,7 +154,9 @@ impl Par2FileSet {
                     duplicates_ignored += 1;
                 }
                 Packet::FileDescription(fd) => {
-                    if let std::collections::hash_map::Entry::Vacant(e) = self.files.entry(fd.file_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        self.files.entry(fd.file_id)
+                    {
                         e.insert(FileDescription {
                             file_id: fd.file_id,
                             hash_full: fd.hash_full,
@@ -160,18 +169,22 @@ impl Par2FileSet {
                     }
                 }
                 Packet::InputFileSliceChecksum(ifsc) => {
-                    if let std::collections::hash_map::Entry::Vacant(e) = self.slice_checksums.entry(ifsc.file_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        self.slice_checksums.entry(ifsc.file_id)
+                    {
                         e.insert(ifsc.checksums);
                     } else {
                         duplicates_ignored += 1;
                     }
                 }
                 Packet::RecoverySlice(rs) => {
-                    if let std::collections::btree_map::Entry::Vacant(e) = self.recovery_slices.entry(rs.exponent) {
+                    if let std::collections::btree_map::Entry::Vacant(e) =
+                        self.recovery_slices.entry(rs.exponent)
+                    {
                         e.insert(RecoverySlice {
-                                exponent: rs.exponent,
-                                data: rs.data,
-                            });
+                            exponent: rs.exponent,
+                            data: rs.data,
+                        });
                         new_recovery_slices += 1;
                     } else {
                         duplicates_ignored += 1;
@@ -270,13 +283,15 @@ impl Par2FileSetBuilder {
             }
             Packet::FileDescription(fd) => {
                 let file_id = fd.file_id;
-                self.files.entry(file_id).or_insert_with(|| FileDescription {
-                    file_id: fd.file_id,
-                    hash_full: fd.hash_full,
-                    hash_16k: fd.hash_16k,
-                    length: fd.file_length,
-                    filename: fd.filename,
-                });
+                self.files
+                    .entry(file_id)
+                    .or_insert_with(|| FileDescription {
+                        file_id: fd.file_id,
+                        hash_full: fd.hash_full,
+                        hash_16k: fd.hash_16k,
+                        length: fd.file_length,
+                        filename: fd.filename,
+                    });
             }
             Packet::InputFileSliceChecksum(ifsc) => {
                 // Use the first IFSC packet for each file ID
@@ -344,11 +359,7 @@ mod tests {
     use md5::{Digest, Md5};
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
 
         let mut hash_input = Vec::new();
@@ -402,8 +413,9 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&file_id);
         for &(crc, md5) in checksums {
-            body.extend_from_slice(&crc.to_le_bytes());
+            // PAR2 spec order: MD5 (16 bytes) then CRC32 (4 bytes)
             body.extend_from_slice(&md5);
+            body.extend_from_slice(&crc.to_le_bytes());
         }
         body
     }
@@ -435,7 +447,9 @@ mod tests {
         assert_eq!(set.recovery_file_ids.len(), 1);
         assert_eq!(*set.recovery_file_ids[0].as_bytes(), file_id_a);
 
-        let fd = set.file_description(&FileId::from_bytes(file_id_a)).unwrap();
+        let fd = set
+            .file_description(&FileId::from_bytes(file_id_a))
+            .unwrap();
         assert_eq!(fd.filename, "test.bin");
         assert_eq!(fd.length, 8192);
 
@@ -537,7 +551,11 @@ mod tests {
         recovery_body.extend_from_slice(&[0xAB; 1024]);
         let mut file2 = Vec::new();
         file2.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
-        file2.extend_from_slice(&make_full_packet(header::TYPE_RECOVERY, &recovery_body, rsid));
+        file2.extend_from_slice(&make_full_packet(
+            header::TYPE_RECOVERY,
+            &recovery_body,
+            rsid,
+        ));
 
         let packets: Vec<_> = crate::packet::scan_packets(&file2, 0)
             .into_iter()
@@ -585,7 +603,11 @@ mod tests {
 
         let mut stream = Vec::new();
         stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
-        stream.extend_from_slice(&make_full_packet(header::TYPE_RECOVERY, &recovery_body, rsid));
+        stream.extend_from_slice(&make_full_packet(
+            header::TYPE_RECOVERY,
+            &recovery_body,
+            rsid,
+        ));
 
         let mut set = Par2FileSet::from_files(&[&stream[..]]).unwrap();
         assert_eq!(set.recovery_block_count(), 1);

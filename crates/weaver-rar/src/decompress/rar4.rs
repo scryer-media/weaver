@@ -214,6 +214,83 @@ impl Rar4LzDecoder {
         Ok(output_size)
     }
 
+    /// Chunked variant: decompress with output split at compressed byte boundaries.
+    ///
+    /// Same as `decompress_to_writer` but switches output writers when the
+    /// compressed byte position crosses volume boundaries.
+    pub fn decompress_to_writer_chunked<F>(
+        &mut self,
+        input: &[u8],
+        unpacked_size: u64,
+        first_volume_index: usize,
+        boundaries: &[super::VolumeTransition],
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut reader = BitReader::new(input);
+        self.read_tables(&mut reader)?;
+
+        let mut output_size: u64 = 0;
+        let flush_threshold = self.window.dict_size() / 2;
+        let mut boundary_idx = 0;
+
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_volume_index;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+
+        while output_size < unpacked_size {
+            if reader.bits_remaining() < 1 {
+                break;
+            }
+
+            let prev_output = output_size;
+            match self.block_type {
+                BlockType::Lz => {
+                    output_size =
+                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                }
+                BlockType::Ppm => {
+                    output_size =
+                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                }
+            }
+            let decoded_this_round = output_size - prev_output;
+
+            let byte_pos = reader.byte_position() as u64;
+            if boundary_idx < boundaries.len()
+                && byte_pos >= boundaries[boundary_idx].compressed_offset
+            {
+                self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                chunk_bytes += decoded_this_round;
+                chunks.push((current_vol, chunk_bytes));
+
+                current_vol = boundaries[boundary_idx].volume_index;
+                boundary_idx += 1;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+            } else {
+                chunk_bytes += decoded_this_round;
+                if self.window.unflushed_bytes() as usize >= flush_threshold {
+                    self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                }
+            }
+        }
+
+        self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        Ok(chunks)
+    }
+
     /// Read Huffman tables from the bitstream (ReadTables30 equivalent).
     ///
     /// Byte-aligns first, then reads:

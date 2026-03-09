@@ -19,5 +19,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-graphql = { workspace = true }
+zstd = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 async-stream = "0.3"

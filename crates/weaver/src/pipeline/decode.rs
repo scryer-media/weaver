@@ -64,7 +64,6 @@ impl Pipeline {
             .store(write_us, Ordering::Relaxed);
 
         // Update assembly state.
-        let mut needs_recovery_promotion = false;
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -73,41 +72,14 @@ impl Pipeline {
         };
 
         let segment_number = result.segment_id.segment_number;
+        let decoded_size = result.decoded_size;
+        drop(result.data);
 
-        // When no PAR2 slice states are attached yet, use the metadata-only
-        // commit so the decoded data buffer can be dropped without waiting
-        // for slice checksum feeding.
-        // Accumulate per-segment CRC into slice accumulators for early damage
-        // detection (works without keeping the raw data alive).
-        let early_damage = file_asm.accumulate_segment_crc(
-            segment_number,
-            result.crc32,
-            result.decoded_size,
-        );
-        if !early_damage.is_empty() {
-            needs_recovery_promotion = true;
-            for (slice_idx, _valid) in &early_damage {
-                info!(
-                    file_id = %file_id,
-                    slice = slice_idx,
-                    "early CRC damage detected (pre-verification)"
-                );
-            }
-        }
-
-        let commit_result = if !file_asm.has_slice_states() {
-            let decoded_size = result.decoded_size;
-            drop(result.data);
-            file_asm.commit_segment_meta(segment_number, decoded_size)
-        } else {
-            file_asm.commit_segment(segment_number, &result.data)
-        };
-
-        match commit_result {
+        match file_asm.commit_segment(segment_number, decoded_size) {
             Ok(commit) => {
                 self.metrics
                     .bytes_committed
-                    .fetch_add(result.decoded_size as u64, Ordering::Relaxed);
+                    .fetch_add(decoded_size as u64, Ordering::Relaxed);
                 self.metrics
                     .segments_committed
                     .fetch_add(1, Ordering::Relaxed);
@@ -122,7 +94,7 @@ impl Pipeline {
                     file_index: result.segment_id.file_id.file_index,
                     segment_number: result.segment_id.segment_number,
                     file_offset: result.file_offset,
-                    decoded_size: result.decoded_size,
+                    decoded_size,
                     crc32: result.crc32,
                 });
                 if self.segment_batch.len() >= 100 {
@@ -135,26 +107,12 @@ impl Pipeline {
                     });
                 }
 
-                // Check for newly verified slices (incremental PAR2 verification).
-                for (slice_idx, valid) in &commit.newly_verified_slices {
-                    if !valid {
-                        needs_recovery_promotion = true;
-                        info!(
-                            file_id = %file_id,
-                            slice = slice_idx,
-                            "damaged slice detected during download"
-                        );
-                    }
-                }
-
                 if commit.file_complete {
                     // Flush any remaining buffered segments to disk.
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let file_path = working_dir.join(&filename);
                         for (offset, data) in write_buf.flush_all().iter() {
-                            if let Err(e) =
-                                write_segment_to_disk(&file_path, *offset, data).await
-                            {
+                            if let Err(e) = write_segment_to_disk(&file_path, *offset, data).await {
                                 warn!(
                                     file = %filename,
                                     offset = offset,
@@ -168,15 +126,22 @@ impl Pipeline {
                     let filename = file_asm.filename().to_string();
                     let total_bytes = file_asm.total_bytes();
 
+                    // Check for yEnc name mismatch (observability for NZB swap detection).
+                    if !result.yenc_name.is_empty() && result.yenc_name != filename {
+                        warn!(
+                            job_id = job_id.0,
+                            assembly = %filename,
+                            yenc = %result.yenc_name,
+                            "yEnc name disagrees with assembly filename"
+                        );
+                    }
+
                     info!(file_id = %file_id, filename = %filename, "file complete");
                     let _ = self.event_tx.send(PipelineEvent::FileComplete {
                         file_id,
                         filename: filename.clone(),
                         total_bytes,
                     });
-
-                    // Finalize hash while we still have the file assembly borrow.
-                    let md5 = file_asm.finalize_hash().unwrap_or([0u8; 16]);
 
                     // Flush pending segment batch before recording file completion
                     // (inline to avoid borrow conflict with self.jobs).
@@ -191,11 +156,14 @@ impl Pipeline {
                     }
 
                     // Record file completion in SQLite.
-                    if let Err(e) = self.db.complete_file(job_id, file_id.file_index, &filename, &md5) {
+                    if let Err(e) =
+                        self.db
+                            .complete_file(job_id, file_id.file_index, &filename, &[0u8; 16])
+                    {
                         error!(error = %e, "db write failed for complete_file");
                     }
 
-                    // If this is a PAR2 index file, parse and attach metadata.
+                    // If this is a PAR2 index file, parse and retain for repair.
                     self.try_load_par2_metadata(job_id, file_id).await;
 
                     // If this is a PAR2 recovery volume, merge its data into the retained set.
@@ -224,11 +192,6 @@ impl Pipeline {
                     "assembly commit failed"
                 );
             }
-        }
-
-        // Promote recovery segments after releasing the borrow on self.jobs.
-        if needs_recovery_promotion {
-            self.promote_recovery(job_id);
         }
     }
 }

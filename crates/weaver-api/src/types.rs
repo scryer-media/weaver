@@ -1,5 +1,32 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
 
+// --- API Key types ---
+
+/// Scope level for API keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum ApiKeyScope {
+    Integration,
+    Admin,
+}
+
+/// An API key entry (never includes the raw key).
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ApiKey {
+    pub id: i64,
+    pub name: String,
+    pub scope: ApiKeyScope,
+    pub created_at: f64,
+    pub last_used_at: Option<f64>,
+}
+
+/// Result of creating an API key — includes the raw key once.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct CreateApiKeyResult {
+    pub key: ApiKey,
+    /// The raw API key. Only shown once at creation time.
+    pub raw_key: String,
+}
+
 /// GraphQL representation of a configured NNTP server.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct Server {
@@ -92,6 +119,8 @@ pub struct Job {
     pub id: u64,
     pub name: String,
     pub status: JobStatusGql,
+    /// Error message (only set when status is FAILED).
+    pub error: Option<String>,
     pub progress: f64,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
@@ -103,6 +132,8 @@ pub struct Job {
     pub category: Option<String>,
     pub metadata: Vec<MetadataEntry>,
     pub output_dir: Option<String>,
+    /// Wall-clock creation time (Unix epoch milliseconds).
+    pub created_at: Option<f64>,
 }
 
 /// GraphQL-friendly job status.
@@ -235,6 +266,7 @@ impl From<&weaver_scheduler::JobInfo> for Job {
             id: info.job_id.0,
             name: info.name.clone(),
             status: JobStatusGql::from(&info.status),
+            error: info.error.clone(),
             progress: info.progress,
             total_bytes: info.total_bytes,
             downloaded_bytes: info.downloaded_bytes,
@@ -251,6 +283,7 @@ impl From<&weaver_scheduler::JobInfo> for Job {
                 })
                 .collect(),
             output_dir: info.output_dir.clone(),
+            created_at: Some(info.created_at_epoch_ms),
         }
     }
 }

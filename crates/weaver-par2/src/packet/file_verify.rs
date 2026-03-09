@@ -42,10 +42,10 @@ impl IfscPacket {
 
         for i in 0..count {
             let offset = i * CHECKSUM_ENTRY_SIZE;
-            let crc32 = u32::from_le_bytes(
-                checksum_area[offset..offset + 4].try_into().unwrap(),
-            );
-            let md5: [u8; 16] = checksum_area[offset + 4..offset + 20].try_into().unwrap();
+            // PAR2 spec: FILEVERIFICATIONENTRY is { MD5Hash hash (16 bytes), leu32 crc (4 bytes) }
+            let md5: [u8; 16] = checksum_area[offset..offset + 16].try_into().unwrap();
+            let crc32 =
+                u32::from_le_bytes(checksum_area[offset + 16..offset + 20].try_into().unwrap());
             checksums.push(SliceChecksum { crc32, md5 });
         }
 
@@ -61,8 +61,9 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&file_id);
         for &(crc, md5) in checksums {
-            body.extend_from_slice(&crc.to_le_bytes());
+            // PAR2 spec order: MD5 (16 bytes) then CRC32 (4 bytes)
             body.extend_from_slice(&md5);
+            body.extend_from_slice(&crc.to_le_bytes());
         }
         body
     }

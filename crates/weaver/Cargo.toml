@@ -31,9 +31,11 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
+async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
 libc = "0.2"
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 sha2 = { workspace = true }
+zstd = { workspace = true }
 sevenz-rust2 = { workspace = true }

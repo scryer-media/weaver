@@ -12,42 +12,48 @@
 //! - Streaming checksum computation
 //! - Graceful handling of malformed/truncated packets (scan for next valid packet)
 
-pub mod error;
-pub mod types;
-pub mod packet;
-pub mod par2_set;
 pub mod checksum;
-pub mod verify;
 pub mod disk;
-pub mod session;
+pub mod error;
 pub mod gf;
 pub mod matrix;
-pub mod repair;
+pub mod packet;
+pub mod par2_set;
+pub mod placement;
 pub mod rename;
+pub mod repair;
+pub mod session;
+pub mod types;
+pub mod verify;
 
 // Re-export key types for convenience.
+pub use checksum::{FileHashState, SliceChecksumState};
+pub use disk::{DiskFileAccess, MultiDirectoryFileAccess, PlacementFileAccess};
 pub use error::{Par2Error, Result};
-pub use types::{FileId, RecoverySetId, SliceChecksum, SliceIndex, RecoveryExponent};
-pub use packet::{
-    Packet, PacketHeader, PacketType,
-    MainPacket, FileDescriptionPacket, IfscPacket, RecoverySlicePacket, CreatorPacket,
-    scan_packets, parse_packet,
-};
-pub use par2_set::{Par2FileSet, FileDescription, RecoverySlice, MergeResult, Par2Diagnostic, Par2ParseResult};
-pub use checksum::{SliceChecksumState, FileHashState};
-pub use types::{CancellationToken, ProgressUpdate, ProgressStage, ProgressCallback};
-pub use verify::{
-    FileAccess, MemoryFileAccess, FileStatus, FileVerification,
-    Repairability, VerificationResult, VerifyOptions,
-    quick_check_16k, verify_full_hash, verify_slices, verify_slices_from_crcs,
-    verify_all, verify_all_with_options,
-};
-pub use gf::{add as gf_add, mul as gf_mul, pow as gf_pow, inv as gf_inv, input_slice_constants};
+pub use gf::{add as gf_add, input_slice_constants, inv as gf_inv, mul as gf_mul, pow as gf_pow};
 pub use matrix::{Matrix, build_decode_matrix};
-pub use disk::{DiskFileAccess, MultiDirectoryFileAccess};
-pub use session::VerificationSession;
-pub use repair::{RepairPlan, RepairOptions, plan_repair, execute_repair, execute_repair_with_options, prepare_recovery_buffers, xor_out_slice, reconstruct_and_write};
+pub use packet::{
+    CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, Packet, PacketHeader, PacketType,
+    RecoverySlicePacket, parse_packet, scan_packets,
+};
+pub use par2_set::{
+    FileDescription, MergeResult, Par2Diagnostic, Par2FileSet, Par2ParseResult, RecoverySlice,
+};
+pub use placement::{PlacementEntry, PlacementPlan, apply_placement_plan, scan_placement};
 pub use rename::{
-    RenameSuggestion, MatchType, scan_for_renames, identify_par2_files,
-    SplitFileGroup, detect_split_files,
+    MatchType, RenameSuggestion, SplitFileGroup, detect_split_files, identify_par2_files,
+    scan_for_renames,
+};
+pub use repair::{
+    RepairOptions, RepairPlan, execute_repair, execute_repair_with_options, plan_repair,
+    prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
+};
+pub use session::VerificationSession;
+pub use types::{CancellationToken, ProgressCallback, ProgressStage, ProgressUpdate};
+pub use types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum, SliceIndex};
+pub use verify::{
+    FileAccess, FileStatus, FileVerification, MemoryFileAccess, Repairability, VerificationResult,
+    VerifyOptions, quick_check_16k, verify_all, verify_all_with_options, verify_full_hash,
+    verify_selected_file_ids, verify_selected_file_ids_with_options, verify_slices,
+    verify_slices_from_crcs,
 };

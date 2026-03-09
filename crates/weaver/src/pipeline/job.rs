@@ -23,7 +23,8 @@ impl Pipeline {
         if !candidate.exists() {
             candidate
         } else {
-            self.intermediate_dir.join(format!("{}.#{}", dir_name, job_id.0))
+            self.intermediate_dir
+                .join(format!("{}.#{}", dir_name, job_id.0))
         }
     }
 
@@ -49,7 +50,7 @@ impl Pipeline {
 
         // Persist job creation to SQLite for crash recovery.
         let nzb_hash = {
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let bytes = std::fs::read(&nzb_path).unwrap_or_default();
             let hash = Sha256::digest(&bytes);
             let mut arr = [0u8; 32];
@@ -94,6 +95,7 @@ impl Pipeline {
             status: JobStatus::Downloading,
             assembly,
             created_at: std::time::Instant::now(),
+            created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             failed_bytes: 0,
@@ -126,6 +128,8 @@ impl Pipeline {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
         let mut recovery_queue = DownloadQueue::new();
+        let mut has_par2_index = false;
+        let mut recovery_files: Vec<(u32, u64)> = Vec::new(); // (file_index, total_bytes)
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -142,8 +146,21 @@ impl Pipeline {
                 segment_sizes,
             );
 
+            if matches!(
+                file_spec.role,
+                weaver_core::classify::FileRole::Par2 { is_index: true, .. }
+            ) {
+                has_par2_index = true;
+            }
+
             let priority = file_spec.role.download_priority();
             let is_recovery = file_spec.role.is_recovery();
+
+            if is_recovery {
+                let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
+                recovery_files.push((file_index as u32, total));
+            }
+
             let target_queue = if is_recovery {
                 &mut recovery_queue
             } else {
@@ -156,7 +173,7 @@ impl Pipeline {
                     segment_number: seg.number,
                 };
                 if skip.contains(&segment_id) {
-                    let _ = file_assembly.commit_segment_meta(seg.number, seg.bytes);
+                    let _ = file_assembly.commit_segment(seg.number, seg.bytes);
                 } else {
                     target_queue.push(DownloadWork {
                         segment_id,
@@ -171,6 +188,25 @@ impl Pipeline {
             }
 
             assembly.add_file(file_assembly);
+        }
+
+        // If no PAR2 index file exists, promote the smallest recovery volume
+        // to the download queue for early verification metadata. Every PAR2 file
+        // contains verification checksums; the smallest is essentially the index.
+        if !has_par2_index && !recovery_files.is_empty() {
+            recovery_files.sort_by_key(|&(_, size)| size);
+            let promoted_file_index = recovery_files[0].0;
+
+            let items = recovery_queue.drain_all();
+            for mut item in items {
+                if item.segment_id.file_id.file_index == promoted_file_index {
+                    item.priority = 0;
+                    item.is_recovery = false;
+                    download_queue.push(item);
+                } else {
+                    recovery_queue.push(item);
+                }
+            }
         }
 
         (assembly, download_queue, recovery_queue)
@@ -189,9 +225,10 @@ impl Pipeline {
             // Case A: job still in self.jobs — must be Failed.
             let state = self.jobs.get(&job_id).unwrap();
             if !matches!(state.status, JobStatus::Failed { .. }) {
-                return Err(weaver_scheduler::SchedulerError::Other(
-                    format!("job {} is not failed", job_id.0),
-                ));
+                return Err(weaver_scheduler::SchedulerError::Other(format!(
+                    "job {} is not failed",
+                    job_id.0
+                )));
             }
         } else {
             // Case B: job only in history — rebuild from NZB on disk.
@@ -200,18 +237,20 @@ impl Pipeline {
                 return Err(weaver_scheduler::SchedulerError::JobNotFound(job_id));
             };
             if !matches!(info.status, JobStatus::Failed { .. }) {
-                return Err(weaver_scheduler::SchedulerError::Other(
-                    format!("job {} is not failed", job_id.0),
-                ));
+                return Err(weaver_scheduler::SchedulerError::Other(format!(
+                    "job {} is not failed",
+                    job_id.0
+                )));
             }
 
             let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
-            let nzb_bytes = tokio::fs::read(&nzb_path).await.map_err(|e| {
+            let raw = tokio::fs::read(&nzb_path).await.map_err(|e| {
                 weaver_scheduler::SchedulerError::Other(format!(
                     "failed to read NZB for job {}: {e}",
                     job_id.0
                 ))
             })?;
+            let nzb_bytes = crate::decompress_nzb(&raw);
             let nzb = weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| {
                 weaver_scheduler::SchedulerError::Other(format!("failed to parse NZB: {e}"))
             })?;
@@ -241,6 +280,7 @@ impl Pipeline {
                 status: JobStatus::Downloading,
                 assembly,
                 created_at: std::time::Instant::now(),
+                created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
                 working_dir,
                 downloaded_bytes: info.downloaded_bytes,
                 failed_bytes: 0,
@@ -283,7 +323,16 @@ impl Pipeline {
         self.par2_sets.remove(&job_id);
         self.extracted_members.remove(&job_id);
         self.extracted_sets.remove(&job_id);
-        self.streaming_providers.retain(|(jid, _), _| *jid != job_id);
+        self.failed_extractions.remove(&job_id);
+        self.promoted_recovery_files.remove(&job_id);
+        self.eagerly_deleted.remove(&job_id);
+        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.normalization_retried.remove(&job_id);
+        self.streaming_providers
+            .retain(|(jid, _, _), _| *jid != job_id);
+        self.streaming_volume_bases
+            .retain(|(jid, _, _), _| *jid != job_id);
         self.write_buffers.retain(|fid, _| fid.job_id != job_id);
 
         // Add to job_order so it shows as active.
@@ -318,14 +367,23 @@ impl Pipeline {
 
         // Load PAR2 index files first (needed before recovery volumes).
         for (file_id, role) in &files {
-            if matches!(role, weaver_core::classify::FileRole::Par2 { is_index: true, .. }) {
+            if matches!(
+                role,
+                weaver_core::classify::FileRole::Par2 { is_index: true, .. }
+            ) {
                 self.try_load_par2_metadata(job_id, *file_id).await;
             }
         }
 
         // Merge PAR2 recovery volumes.
         for (file_id, role) in &files {
-            if matches!(role, weaver_core::classify::FileRole::Par2 { is_index: false, .. }) {
+            if matches!(
+                role,
+                weaver_core::classify::FileRole::Par2 {
+                    is_index: false,
+                    ..
+                }
+            ) {
                 self.try_merge_par2_recovery(job_id, *file_id).await;
             }
         }
@@ -386,13 +444,28 @@ impl Pipeline {
 
         // Compute downloaded bytes from committed segments.
         let committed_ref = &committed_segments;
-        let downloaded_bytes: u64 = spec.files.iter().enumerate().flat_map(|(fi, file_spec)| {
-            let file_id = NzbFileId { job_id, file_index: fi as u32 };
-            file_spec.segments.iter().filter_map(move |seg| {
-                let sid = SegmentId { file_id, segment_number: seg.number };
-                if committed_ref.contains(&sid) { Some(seg.bytes as u64) } else { None }
+        let downloaded_bytes: u64 = spec
+            .files
+            .iter()
+            .enumerate()
+            .flat_map(|(fi, file_spec)| {
+                let file_id = NzbFileId {
+                    job_id,
+                    file_index: fi as u32,
+                };
+                file_spec.segments.iter().filter_map(move |seg| {
+                    let sid = SegmentId {
+                        file_id,
+                        segment_number: seg.number,
+                    };
+                    if committed_ref.contains(&sid) {
+                        Some(seg.bytes as u64)
+                    } else {
+                        None
+                    }
+                })
             })
-        }).sum();
+            .sum();
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 
@@ -409,6 +482,7 @@ impl Pipeline {
             status: status.clone(),
             assembly,
             created_at: std::time::Instant::now(),
+            created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
             working_dir,
             downloaded_bytes,
             failed_bytes: 0,

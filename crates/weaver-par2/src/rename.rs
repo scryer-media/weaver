@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::checksum;
-use crate::packet::header::{self, PacketHeader, MAGIC};
+use crate::packet::header::{self, MAGIC, PacketHeader};
 use crate::par2_set::Par2FileSet;
 use crate::types::{FileId, RecoverySetId};
 
@@ -45,10 +45,7 @@ pub enum MatchType {
 /// for files whose names don't match the PAR2 metadata.
 ///
 /// Does **not** perform any actual renames — the caller decides what to do.
-pub fn scan_for_renames(
-    dir: &Path,
-    par2_set: &Par2FileSet,
-) -> io::Result<Vec<RenameSuggestion>> {
+pub fn scan_for_renames(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<RenameSuggestion>> {
     // Build lookup: hash_16k -> (FileId, correct_filename)
     let mut hash_lookup: HashMap<[u8; 16], (FileId, &str)> = HashMap::new();
     for (file_id, desc) in &par2_set.files {
@@ -92,18 +89,19 @@ pub fn scan_for_renames(
         let hash = checksum::md5(&data);
 
         if let Some(&(file_id, correct_name)) = hash_lookup.get(&hash)
-            && file_name != correct_name {
-                debug!(
-                    "rename match: {} -> {} (16k hash match)",
-                    file_name, correct_name
-                );
-                suggestions.push(RenameSuggestion {
-                    current_path: path,
-                    correct_name: correct_name.to_string(),
-                    file_id,
-                    match_type: MatchType::Hash16k,
-                });
-            }
+            && file_name != correct_name
+        {
+            debug!(
+                "rename match: {} -> {} (16k hash match)",
+                file_name, correct_name
+            );
+            suggestions.push(RenameSuggestion {
+                current_path: path,
+                correct_name: correct_name.to_string(),
+                file_id,
+                match_type: MatchType::Hash16k,
+            });
+        }
     }
 
     Ok(suggestions)
@@ -141,10 +139,11 @@ pub fn identify_par2_files(
 
         // Try to parse the header.
         if let Ok(hdr) = PacketHeader::parse(&data, 0)
-            && hdr.recovery_set_id == *expected_set_id {
-                debug!("identified par2 file: {}", path.display());
-                matches.push(path);
-            }
+            && hdr.recovery_set_id == *expected_set_id
+        {
+            debug!("identified par2 file: {}", path.display());
+            matches.push(path);
+        }
     }
 
     Ok(matches)
@@ -185,13 +184,15 @@ pub fn detect_split_files(dir: &Path) -> io::Result<Vec<SplitFileGroup>> {
 
         // Check if the extension is purely numeric.
         if let Some((base, ext)) = file_name.rsplit_once('.')
-            && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_digit())
-                && let Ok(num) = ext.parse::<u32>() {
-                    groups
-                        .entry(base.to_string())
-                        .or_default()
-                        .push((num, path));
-                }
+            && !ext.is_empty()
+            && ext.chars().all(|c| c.is_ascii_digit())
+            && let Ok(num) = ext.parse::<u32>()
+        {
+            groups
+                .entry(base.to_string())
+                .or_default()
+                .push((num, path));
+        }
     }
 
     let mut result = Vec::new();
@@ -205,10 +206,7 @@ pub fn detect_split_files(dir: &Path) -> io::Result<Vec<SplitFileGroup>> {
         let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
 
         // Check contiguity: starts at 1 and no gaps.
-        let contiguous = part_numbers[0] == 1
-            && part_numbers
-                .windows(2)
-                .all(|w| w[1] == w[0] + 1);
+        let contiguous = part_numbers[0] == 1 && part_numbers.windows(2).all(|w| w[1] == w[0] + 1);
 
         result.push(SplitFileGroup {
             base_name,
@@ -243,11 +241,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
         let mut hash_input = Vec::new();
         hash_input.extend_from_slice(&recovery_set_id);
@@ -266,11 +260,7 @@ mod tests {
     }
 
     /// Build a Par2FileSet for a single file with known content.
-    fn setup_par2_set(
-        file_data: &[u8],
-        slice_size: u64,
-        filename: &str,
-    ) -> (Par2FileSet, FileId) {
+    fn setup_par2_set(file_data: &[u8], slice_size: u64, filename: &str) -> (Par2FileSet, FileId) {
         let file_length = file_data.len() as u64;
         let hash_full = checksum::md5(file_data);
         let hash_16k_data = &file_data[..file_data.len().min(16384)];
@@ -324,8 +314,8 @@ mod tests {
         let mut ifsc_body = Vec::new();
         ifsc_body.extend_from_slice(&file_id_bytes);
         for cs in &checksums {
-            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
             ifsc_body.extend_from_slice(&cs.md5);
+            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
         }
 
         let mut stream = Vec::new();

@@ -49,9 +49,10 @@ impl Default for MemoryFileAccess {
 
 impl FileAccess for MemoryFileAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        let data = self.files.get(file_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file not found")
-        })?;
+        let data = self
+            .files
+            .get(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
         let offset = offset as usize;
         let end = (offset + len as usize).min(data.len());
         if offset >= data.len() {
@@ -69,15 +70,17 @@ impl FileAccess for MemoryFileAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
-        self.files.get(file_id).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file not found")
-        })
+        self.files
+            .get(file_id)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
-        let file_data = self.files.get_mut(file_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "file not found")
-        })?;
+        let file_data = self
+            .files
+            .get_mut(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
         let offset = offset as usize;
         let end = offset + data.len();
         // Extend the file if needed.
@@ -243,7 +246,10 @@ pub fn verify_slices_from_crcs(
         .iter()
         .enumerate()
         .map(|(i, expected)| {
-            slice_crcs.get(i).map(|&crc| crc == expected.crc32).unwrap_or(false)
+            slice_crcs
+                .get(i)
+                .map(|&crc| crc == expected.crc32)
+                .unwrap_or(false)
         })
         .collect();
 
@@ -259,10 +265,18 @@ pub struct VerifyOptions {
     pub progress: Option<ProgressCallback>,
 }
 
-
 /// Verify all files in a PAR2 set.
 pub fn verify_all(par2: &Par2FileSet, access: &dyn FileAccess) -> VerificationResult {
     verify_all_with_options(par2, access, &VerifyOptions::default())
+}
+
+/// Verify only the selected PAR2 file IDs.
+pub fn verify_selected_file_ids(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    file_ids: &[FileId],
+) -> VerificationResult {
+    verify_selected_file_ids_with_options(par2, access, file_ids, &VerifyOptions::default())
 }
 
 /// Verify all files in a PAR2 set with cancellation and progress support.
@@ -271,17 +285,28 @@ pub fn verify_all_with_options(
     access: &dyn FileAccess,
     options: &VerifyOptions,
 ) -> VerificationResult {
+    verify_selected_file_ids_with_options(par2, access, &par2.recovery_file_ids, options)
+}
+
+/// Verify selected PAR2 file IDs with cancellation and progress support.
+pub fn verify_selected_file_ids_with_options(
+    par2: &Par2FileSet,
+    access: &dyn FileAccess,
+    file_ids: &[FileId],
+    options: &VerifyOptions,
+) -> VerificationResult {
     let mut files = Vec::new();
     let mut total_missing_blocks = 0u32;
-    let total_files = par2.recovery_file_ids.len() as u32;
+    let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
 
-    for (file_index, file_id) in par2.recovery_file_ids.iter().enumerate() {
+    for (file_index, file_id) in file_ids.iter().enumerate() {
         // Check cancellation before each file.
         if let Some(ref cancel) = options.cancel
-            && cancel.is_cancelled() {
-                break;
-            }
+            && cancel.is_cancelled()
+        {
+            break;
+        }
 
         let desc = match par2.file_description(file_id) {
             Some(d) => d,
@@ -322,18 +347,20 @@ pub fn verify_all_with_options(
 
         // Check for files that should have content but are empty on disk.
         if let Some(actual_len) = access.file_length(file_id)
-            && actual_len == 0 && desc.length > 0 {
-                let slice_count = par2.slice_count_for_file(desc.length);
-                total_missing_blocks += slice_count;
-                files.push(FileVerification {
-                    file_id: *file_id,
-                    filename: desc.filename.clone(),
-                    status: FileStatus::Damaged(slice_count),
-                    valid_slices: vec![false; slice_count as usize],
-                    missing_slice_count: slice_count,
-                });
-                continue;
-            }
+            && actual_len == 0
+            && desc.length > 0
+        {
+            let slice_count = par2.slice_count_for_file(desc.length);
+            total_missing_blocks += slice_count;
+            files.push(FileVerification {
+                file_id: *file_id,
+                filename: desc.filename.clone(),
+                status: FileStatus::Damaged(slice_count),
+                valid_slices: vec![false; slice_count as usize],
+                missing_slice_count: slice_count,
+            });
+            continue;
+        }
 
         // If IFSC data is missing for this file, we can't do slice-level verification.
         // Fall back to full-file hash check only. This can happen with truncated PAR2 files.
@@ -377,11 +404,10 @@ pub fn verify_all_with_options(
         let quick_ok = quick_check_16k(par2, file_id, access).unwrap_or(false);
         if !quick_ok {
             // 16k hash failed; do slice-level check to find which slices are bad
-            let valid = verify_slices(par2, file_id, access)
-                .unwrap_or_else(|| {
-                    let n = par2.slice_count_for_file(desc.length) as usize;
-                    vec![false; n]
-                });
+            let valid = verify_slices(par2, file_id, access).unwrap_or_else(|| {
+                let n = par2.slice_count_for_file(desc.length) as usize;
+                vec![false; n]
+            });
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
             total_missing_blocks += damaged;
             let status = if damaged == 0 {
@@ -412,11 +438,10 @@ pub fn verify_all_with_options(
             });
         } else {
             // Full hash failed but 16k passed; check slice by slice
-            let valid = verify_slices(par2, file_id, access)
-                .unwrap_or_else(|| {
-                    let n = par2.slice_count_for_file(desc.length) as usize;
-                    vec![false; n]
-                });
+            let valid = verify_slices(par2, file_id, access).unwrap_or_else(|| {
+                let n = par2.slice_count_for_file(desc.length) as usize;
+                vec![false; n]
+            });
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
             total_missing_blocks += damaged;
             files.push(FileVerification {
@@ -467,17 +492,13 @@ pub fn verify_all_with_options(
 mod tests {
     use super::*;
     use crate::checksum;
-    use crate::par2_set::Par2FileSet;
     use crate::packet::header;
+    use crate::par2_set::Par2FileSet;
     use crate::types::SliceChecksum;
     use md5::{Digest, Md5};
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
         let mut hash_input = Vec::new();
         hash_input.extend_from_slice(&recovery_set_id);
@@ -562,8 +583,8 @@ mod tests {
         let mut ifsc_body = Vec::new();
         ifsc_body.extend_from_slice(&file_id_bytes);
         for cs in &checksums {
-            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
             ifsc_body.extend_from_slice(&cs.md5);
+            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
         }
 
         // Build stream
@@ -578,6 +599,93 @@ mod tests {
         access.add_file(file_id, file_data.to_vec());
 
         (set, access, file_id)
+    }
+
+    fn setup_test_set_multi(
+        files: &[(&[u8], &str)],
+        slice_size: u64,
+    ) -> (Par2FileSet, MemoryFileAccess, Vec<FileId>) {
+        let mut file_ids = Vec::new();
+        let mut fd_bodies = Vec::new();
+        let mut ifsc_bodies = Vec::new();
+        let mut access = MemoryFileAccess::new();
+
+        for &(file_data, filename) in files {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16384)]);
+
+            let mut id_input = Vec::new();
+            id_input.extend_from_slice(&hash_16k);
+            id_input.extend_from_slice(&file_length.to_le_bytes());
+            id_input.extend_from_slice(filename.as_bytes());
+            let file_id_bytes: [u8; 16] = Md5::digest(&id_input).into();
+            let file_id = FileId::from_bytes(file_id_bytes);
+            file_ids.push(file_id);
+            access.add_file(file_id, file_data.to_vec());
+
+            let num_slices = if file_length == 0 {
+                0
+            } else {
+                ((file_length + slice_size - 1) / slice_size) as usize
+            };
+
+            let mut checksums = Vec::new();
+            for i in 0..num_slices {
+                let offset = i as u64 * slice_size;
+                let end = ((offset + slice_size) as usize).min(file_data.len());
+                let slice_data = &file_data[offset as usize..end];
+
+                let mut state = SliceChecksumState::new();
+                state.update(slice_data);
+                let pad_to = if (slice_data.len() as u64) < slice_size {
+                    Some(slice_size)
+                } else {
+                    None
+                };
+                let (crc, md5) = state.finalize(pad_to);
+                checksums.push(SliceChecksum { crc32: crc, md5 });
+            }
+
+            let mut fd_body = Vec::new();
+            fd_body.extend_from_slice(&file_id_bytes);
+            fd_body.extend_from_slice(&hash_full);
+            fd_body.extend_from_slice(&hash_16k);
+            fd_body.extend_from_slice(&file_length.to_le_bytes());
+            fd_body.extend_from_slice(filename.as_bytes());
+            while fd_body.len() % 4 != 0 {
+                fd_body.push(0);
+            }
+            fd_bodies.push(fd_body);
+
+            let mut ifsc_body = Vec::new();
+            ifsc_body.extend_from_slice(&file_id_bytes);
+            for cs in &checksums {
+                ifsc_body.extend_from_slice(&cs.md5);
+                ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
+            }
+            ifsc_bodies.push(ifsc_body);
+        }
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&(file_ids.len() as u32).to_le_bytes());
+        for file_id in &file_ids {
+            main_body.extend_from_slice(file_id.as_bytes());
+        }
+        let rsid: [u8; 16] = Md5::digest(&main_body).into();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
+        for fd_body in &fd_bodies {
+            stream.extend_from_slice(&make_full_packet(header::TYPE_FILE_DESC, fd_body, rsid));
+        }
+        for ifsc_body in &ifsc_bodies {
+            stream.extend_from_slice(&make_full_packet(header::TYPE_IFSC, ifsc_body, rsid));
+        }
+
+        let set = Par2FileSet::from_files(&[&stream]).unwrap();
+        (set, access, file_ids)
     }
 
     #[test]
@@ -713,22 +821,31 @@ mod tests {
         access.add_file(file_id, corrupted);
 
         // Add some recovery blocks
-        use bytes::Bytes;
         use crate::par2_set::RecoverySlice;
-        set.recovery_slices.insert(0, RecoverySlice {
-            exponent: 0,
-            data: Bytes::from(vec![0u8; 1024]),
-        });
-        set.recovery_slices.insert(1, RecoverySlice {
-            exponent: 1,
-            data: Bytes::from(vec![0u8; 1024]),
-        });
+        use bytes::Bytes;
+        set.recovery_slices.insert(
+            0,
+            RecoverySlice {
+                exponent: 0,
+                data: Bytes::from(vec![0u8; 1024]),
+            },
+        );
+        set.recovery_slices.insert(
+            1,
+            RecoverySlice {
+                exponent: 1,
+                data: Bytes::from(vec![0u8; 1024]),
+            },
+        );
 
         let result = verify_all(&set, &access);
         // 1 damaged slice, 2 recovery blocks available
         assert!(matches!(
             result.repairable,
-            Repairability::Repairable { blocks_needed: 1, blocks_available: 2 }
+            Repairability::Repairable {
+                blocks_needed: 1,
+                blocks_available: 2
+            }
         ));
     }
 
@@ -739,7 +856,10 @@ mod tests {
         let access = MemoryFileAccess::new(); // file missing = 4 slices needed, 0 available
 
         let result = verify_all(&set, &access);
-        assert!(matches!(result.repairable, Repairability::Insufficient { .. }));
+        assert!(matches!(
+            result.repairable,
+            Repairability::Insufficient { .. }
+        ));
     }
 
     #[test]
@@ -764,5 +884,30 @@ mod tests {
         access.add_file(file_id, corrupted);
 
         assert_eq!(quick_check_16k(&set, &file_id, &access), Some(false));
+    }
+
+    #[test]
+    fn verify_selected_file_ids_only_counts_requested_files() {
+        let good = vec![0x11u8; 2048];
+        let damaged = vec![0x22u8; 2048];
+        let (set, mut access, file_ids) =
+            setup_test_set_multi(&[(&good, "good.rar"), (&damaged, "damaged.rar")], 1024);
+
+        let mut corrupted = damaged.clone();
+        corrupted[0] ^= 0xFF;
+        access.add_file(file_ids[1], corrupted);
+
+        let selected = verify_selected_file_ids(&set, &access, &[file_ids[0]]);
+        assert_eq!(selected.files.len(), 1);
+        assert_eq!(selected.total_missing_blocks, 0);
+        assert!(matches!(selected.repairable, Repairability::NotNeeded));
+
+        let damaged_only = verify_selected_file_ids(&set, &access, &[file_ids[1]]);
+        assert_eq!(damaged_only.files.len(), 1);
+        assert_eq!(damaged_only.total_missing_blocks, 1);
+        assert!(matches!(
+            damaged_only.files[0].status,
+            FileStatus::Damaged(1)
+        ));
     }
 }

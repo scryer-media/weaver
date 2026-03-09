@@ -3,9 +3,12 @@
 //! Supports single-volume and multi-volume archives. For multi-volume
 //! archives, volumes can be added incrementally as they become available.
 
+mod cache;
 mod member;
 mod parse;
 mod volume;
+
+pub use cache::CachedArchiveHeaders;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 

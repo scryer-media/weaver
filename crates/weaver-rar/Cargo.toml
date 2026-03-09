@@ -21,6 +21,8 @@ pbkdf2 = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

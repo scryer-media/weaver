@@ -199,6 +199,27 @@ impl RuntimeTuner {
         &self.profile
     }
 
+    /// Maximum concurrent streaming member extractions, adaptive to disk type.
+    ///
+    /// SSD: no seek penalty, scale with CPU cores (2-6).
+    /// HDD: seeking between concurrent read positions kills throughput (1-2).
+    /// Network/Unknown: moderate (2).
+    pub fn max_concurrent_extractions(&self) -> usize {
+        match self.profile.disk.storage_class {
+            StorageClass::Ssd => {
+                // SSD: bottleneck is CPU decompression, not I/O
+                let cores = self.profile.cpu.physical_cores;
+                cores.clamp(2, 6)
+            }
+            StorageClass::Hdd => {
+                // HDD: head seeks between concurrent streams are devastating.
+                // Allow 2 only if IOPS suggests a decent drive.
+                if self.profile.disk.random_read_iops > 500.0 { 2 } else { 1 }
+            }
+            _ => 2,
+        }
+    }
+
     /// Current bandwidth estimate (bytes/sec, exponential moving average).
     pub fn bandwidth_ema(&self) -> f64 {
         self.bandwidth_ema

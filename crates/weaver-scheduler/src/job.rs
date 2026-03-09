@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,8 @@ pub struct JobState {
     pub status: JobStatus,
     pub assembly: JobAssembly,
     pub created_at: std::time::Instant,
+    /// Wall-clock creation time (Unix epoch milliseconds).
+    pub created_at_epoch_ms: f64,
     /// Per-job working directory (subdirectory under intermediate_dir).
     /// All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,
@@ -88,4 +91,12 @@ pub struct JobState {
     pub download_queue: DownloadQueue,
     /// Recovery download queue (PAR2 repair blocks, spare bandwidth).
     pub recovery_queue: DownloadQueue,
+}
+
+/// Current wall-clock time as Unix epoch milliseconds.
+pub fn epoch_ms_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f64
 }

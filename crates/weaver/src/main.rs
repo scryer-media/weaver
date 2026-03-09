@@ -22,6 +22,17 @@ use weaver_nntp::pool::ServerPoolConfig;
 use weaver_scheduler::{SchedulerCommand, SchedulerHandle};
 use weaver_state::Database;
 
+/// Decompress a stored NZB file. Handles both zstd-compressed and legacy
+/// uncompressed files transparently (detects zstd magic bytes).
+pub(crate) fn decompress_nzb(raw: &[u8]) -> Vec<u8> {
+    // zstd magic: 0x28 0xB5 0x2F 0xFD
+    if raw.len() >= 4 && raw[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+        zstd::bulk::decompress(raw, 64 * 1024 * 1024).unwrap_or_else(|_| raw.to_vec())
+    } else {
+        raw.to_vec()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "weaver", about = "Usenet binary downloader")]
 struct Cli {
@@ -175,6 +186,7 @@ async fn run_download(
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
+        iops = format!("{:.0}", profile.disk.random_read_iops),
         "system profile"
     );
 
@@ -302,6 +314,7 @@ async fn run_server_command(
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
+        iops = format!("{:.0}", profile.disk.random_read_iops),
         "system profile"
     );
 
@@ -382,6 +395,7 @@ async fn run_server_command(
             initial_history.push(weaver_scheduler::JobInfo {
                 job_id,
                 name,
+                error: if let weaver_scheduler::JobStatus::Failed { error } = &status { Some(error.clone()) } else { None },
                 status,
                 progress: 1.0,
                 total_bytes: 0,
@@ -392,6 +406,7 @@ async fn run_server_command(
                 category: recovered.category,
                 metadata: recovered.metadata,
                 output_dir: Some(recovered.output_dir.display().to_string()),
+                created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             });
         } else {
             // In-progress job — need to re-parse NZB and restore.
@@ -409,6 +424,7 @@ async fn run_server_command(
                         .and_then(|s| s.to_str())
                         .unwrap_or("Unknown")
                         .to_string(),
+                    error: Some("NZB file missing after restart".to_string()),
                     status: weaver_scheduler::JobStatus::Failed {
                         error: "NZB file missing after restart".to_string(),
                     },
@@ -421,12 +437,14 @@ async fn run_server_command(
                     category: recovered.category,
                     metadata: recovered.metadata,
                     output_dir: Some(recovered.output_dir.display().to_string()),
+                    created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
                 });
                 continue;
             }
 
             match std::fs::read(&recovered.nzb_path) {
-                Ok(nzb_bytes) => {
+                Ok(raw) => {
+                    let nzb_bytes = decompress_nzb(&raw);
                     match weaver_nzb::parse_nzb(&nzb_bytes) {
                         Ok(nzb) => {
                             let spec = import::nzb_to_spec(
@@ -471,6 +489,7 @@ async fn run_server_command(
                 initial_history.push(weaver_scheduler::JobInfo {
                     job_id,
                     name: row.name,
+                    error: if let weaver_scheduler::JobStatus::Failed { error } = &status { Some(error.clone()) } else { None },
                     status,
                     progress: 1.0,
                     total_bytes: row.total_bytes,
@@ -481,6 +500,7 @@ async fn run_server_command(
                     category: row.category,
                     metadata: row.metadata.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default(),
                     output_dir: row.output_dir,
+                    created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
             }
         }
@@ -528,7 +548,7 @@ async fn run_server_command(
 
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let server_task = tokio::spawn(server::run_server(schema, addr));
+    let server_task = tokio::spawn(server::run_server(schema, db.clone(), addr));
 
     // Wait for shutdown signal.
     wait_for_shutdown().await;

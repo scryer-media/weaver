@@ -27,16 +27,6 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
     }
   }, [open]);
 
-  // Close on Escape
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onClose]);
-
   const handleFile = useCallback(
     (f: File) => {
       setError(null);
@@ -88,6 +78,20 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
       setError(err instanceof Error ? err.message : "Upload failed");
     }
   }, [file, password, submitNzb, onClose]);
+
+  // Close on Escape, submit on Enter
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "Enter" && file && !fetching) {
+        e.preventDefault();
+        handleSubmit();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [open, onClose, file, fetching, handleSubmit]);
 
   if (!open) return null;
 

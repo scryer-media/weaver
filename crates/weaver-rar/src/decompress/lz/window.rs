@@ -149,7 +149,7 @@ impl Window {
     /// Writes all bytes between `total_flushed` and `total_written` to the
     /// provided writer. Handles ring buffer wrap-around correctly.
     /// Returns the number of bytes written.
-    pub fn flush_to_writer<W: Write>(&mut self, writer: &mut W) -> std::io::Result<u64> {
+    pub fn flush_to_writer<W: Write + ?Sized>(&mut self, writer: &mut W) -> std::io::Result<u64> {
         let unflushed = self.total_written - self.total_flushed;
         if unflushed == 0 {
             return Ok(0);

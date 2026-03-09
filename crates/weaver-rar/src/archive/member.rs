@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::io::{BufReader, BufWriter};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracing::debug;
 
@@ -917,6 +919,366 @@ impl RarArchive {
 
         Ok(unpacked_size)
     }
+
+    /// Extract a member with per-volume output splitting.
+    ///
+    /// Calls `writer_factory(volume_index)` at each volume transition to get a
+    /// new writer. Each writer receives that volume's decompressed contribution.
+    /// Returns `Vec<(volume_index, bytes_written)>` for each chunk.
+    ///
+    /// For Store mode: detects volume transitions via the volume tracker and
+    /// switches writers at each boundary.
+    ///
+    /// For LZ mode: wraps the compressed reader in a `VolumeTrackingReader`
+    /// to record compressed byte offsets at volume transitions, then uses
+    /// `decompress_to_writer_chunked` to split output at those boundaries.
+    pub fn extract_member_streaming_chunked<F>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        provider: &dyn VolumeProvider,
+        writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let entry = self.members.get(index).ok_or_else(|| {
+            RarError::CorruptArchive {
+                detail: format!("member index {index} out of range"),
+            }
+        })?;
+
+        let fh = entry.file_header.clone();
+        let is_encrypted = entry.is_encrypted;
+        let is_solid = fh.compression.solid;
+        let file_encryption = entry.file_encryption.clone();
+        let rar4_salt = entry.rar4_salt;
+        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+
+        if is_solid {
+            return Err(RarError::CorruptArchive {
+                detail: "streaming extraction not supported for solid archives".into(),
+            });
+        }
+
+        let member_password = if is_encrypted {
+            let pwd = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: fh.name.clone(),
+                })?;
+            Some(pwd.to_string())
+        } else {
+            None
+        };
+
+        let entry = &self.members[index];
+        let split_after = entry.file_header.split_after;
+        let mut sorted_segs = entry.segments.clone();
+        sorted_segs.sort_by_key(|s| s.volume_index);
+        let vol_base = sorted_segs.first().map_or(0, |s| s.volume_index);
+        for seg in &mut sorted_segs {
+            seg.volume_index -= vol_base;
+        }
+        let first_vol = sorted_segs.first().map_or(0, |s| s.volume_index);
+
+        if fh.compression.method != CompressionMethod::Store {
+            debug!(
+                member = %fh.name,
+                method = ?fh.compression.method,
+                segments = sorted_segs.len(),
+                split_after,
+                unpacked_size,
+                "streaming chunked LZ extraction starting"
+            );
+            return self.extract_member_streaming_lz_chunked(
+                &fh, options, provider, &sorted_segs, unpacked_size,
+                first_vol, writer_factory,
+                member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
+                split_after,
+            );
+        }
+
+        debug!(
+            member = %fh.name,
+            encrypted = is_encrypted,
+            segments = sorted_segs.len(),
+            split_after,
+            unpacked_size,
+            "streaming chunked Store extraction starting"
+        );
+        self.extract_member_streaming_store_chunked(
+            &fh, options, provider, &sorted_segs, unpacked_size,
+            first_vol, writer_factory,
+            member_password.as_deref(), file_encryption.as_ref(), rar4_salt,
+            split_after,
+        )
+    }
+
+    /// Chunked Store extraction: switches writers at volume boundaries.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_member_streaming_store_chunked<F>(
+        &self,
+        fh: &FileHeader,
+        options: &ExtractOptions,
+        provider: &dyn VolumeProvider,
+        segments: &[DataSegment],
+        unpacked_size: u64,
+        first_vol: usize,
+        mut writer_factory: F,
+        password: Option<&str>,
+        file_encryption: Option<&FileEncryptionInfo>,
+        rar4_salt: Option<[u8; 8]>,
+        split_after: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
+        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let chained = ChainedSegmentReader::new(segments, provider)
+            .with_continuation(split_after, self.format, self.password.clone())
+            .with_metadata_sink(Rc::clone(&cont_meta))
+            .with_volume_tracker(Arc::clone(&volume_tracker));
+        let skip_hash_verify = file_encryption.is_some_and(|fe| fe.use_hash_mac);
+
+        let mut hasher = if options.verify && !skip_hash_verify {
+            Some(crc32fast::Hasher::new())
+        } else {
+            None
+        };
+
+        let max_bytes = if password.is_some() { unpacked_size } else { u64::MAX };
+
+        let mut reader: Box<dyn Read> = if let Some(pwd) = password {
+            if self.format == ArchiveFormat::Rar4 {
+                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!("RAR4 member {} is marked encrypted but has no salt", fh.name),
+                })?;
+                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                Box::new(crate::crypto::DecryptingReader::new_rar4(chained, &key, &iv))
+            } else {
+                let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!("member {} is marked encrypted but has no encryption parameters", fh.name),
+                })?;
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data)
+                {
+                    return Err(RarError::WrongPassword { member: fh.name.clone() });
+                }
+                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
+            }
+        } else {
+            Box::new(chained)
+        };
+
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_vol;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+        let mut total_written = 0u64;
+        let mut chunk = vec![0u8; 256 * 1024];
+
+        loop {
+            let to_read = chunk.len().min((max_bytes - total_written) as usize);
+            if to_read == 0 {
+                break;
+            }
+            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
+            if n == 0 {
+                break;
+            }
+
+            if let Some(ref mut h) = hasher {
+                h.update(&chunk[..n]);
+            }
+
+            // Check for volume transition.
+            let new_vol = volume_tracker.load(Ordering::Acquire);
+            if new_vol != current_vol {
+                current_writer.flush().map_err(RarError::Io)?;
+                chunks.push((current_vol, chunk_bytes));
+                current_vol = new_vol;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+            }
+
+            current_writer.write_all(&chunk[..n]).map_err(RarError::Io)?;
+            chunk_bytes += n as u64;
+            total_written += n as u64;
+        }
+
+        current_writer.flush().map_err(RarError::Io)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        // Verify CRC32.
+        let final_meta = cont_meta.borrow();
+        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_skip_hash = final_meta.use_hash_mac;
+        drop(final_meta);
+
+        if let Some(h) = hasher
+            && !final_skip_hash
+            && let Some(expected) = effective_crc {
+                let actual = h.finalize();
+                if actual != expected {
+                    return Err(RarError::DataCrcMismatch {
+                        member: fh.name.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
+
+        Ok(chunks)
+    }
+
+    /// Chunked LZ extraction: records volume transitions during compressed read,
+    /// then splits decompressed output at those boundaries.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_member_streaming_lz_chunked<F>(
+        &self,
+        fh: &FileHeader,
+        options: &ExtractOptions,
+        provider: &dyn VolumeProvider,
+        segments: &[DataSegment],
+        unpacked_size: u64,
+        first_vol: usize,
+        mut writer_factory: F,
+        password: Option<&str>,
+        file_encryption: Option<&FileEncryptionInfo>,
+        rar4_salt: Option<[u8; 8]>,
+        split_after: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let skip_hash_verify = file_encryption.is_some_and(|fe| fe.use_hash_mac);
+        let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
+        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let chained = ChainedSegmentReader::new(segments, provider)
+            .with_continuation(split_after, self.format, self.password.clone())
+            .with_metadata_sink(Rc::clone(&cont_meta))
+            .with_volume_tracker(Arc::clone(&volume_tracker));
+
+        // Build reader chain, wrapping in DecryptingReader if encrypted.
+        let inner: Box<dyn Read> = if let Some(pwd) = password {
+            if self.format == ArchiveFormat::Rar4 {
+                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!("RAR4 member {} is marked encrypted but has no salt", fh.name),
+                })?;
+                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                Box::new(crate::crypto::DecryptingReader::new_rar4(chained, &key, &iv))
+            } else {
+                let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!("member {} is marked encrypted but has no encryption parameters", fh.name),
+                })?;
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(pwd, &enc_info.salt, enc_info.kdf_count, check_data)
+                {
+                    return Err(RarError::WrongPassword { member: fh.name.clone() });
+                }
+                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                Box::new(crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv))
+            }
+        } else {
+            Box::new(chained)
+        };
+
+        // Wrap in VolumeTrackingReader to capture transitions during read_to_end.
+        let mut tracking_reader = VolumeTrackingReader::new(
+            BufReader::with_capacity(1024 * 1024, inner),
+            volume_tracker,
+        );
+        let mut compressed = Vec::new();
+        std::io::Read::read_to_end(&mut tracking_reader, &mut compressed)
+            .map_err(RarError::Io)?;
+
+        let transitions = tracking_reader.into_transitions();
+
+        debug!(
+            compressed_bytes = compressed.len(),
+            transitions = transitions.len(),
+            "streaming chunked LZ: compressed data read"
+        );
+
+        // Decompress with chunked output splitting.
+        let do_crc = options.verify && !skip_hash_verify;
+        let shared_hasher: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>> = if do_crc {
+            Some(Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())))
+        } else {
+            None
+        };
+
+        let chunks = {
+            let hasher_clone = shared_hasher.clone();
+            crate::decompress::decompress_to_writer_chunked(
+                &compressed,
+                unpacked_size,
+                &fh.compression,
+                first_vol,
+                &transitions,
+                |vol_idx| {
+                    let writer = writer_factory(vol_idx)?;
+                    if let Some(ref h) = hasher_clone {
+                        Ok(Box::new(CrcTrackingWriter {
+                            inner: writer,
+                            hasher: Arc::clone(h),
+                        }))
+                    } else {
+                        Ok(writer)
+                    }
+                },
+            )?
+        };
+
+        // Verify CRC32.
+        let final_meta = cont_meta.borrow();
+        let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let final_skip_hash = final_meta.use_hash_mac;
+        drop(final_meta);
+
+        if let Some(hasher_arc) = shared_hasher {
+            if !final_skip_hash {
+                if let Some(expected) = effective_crc {
+                    let h = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
+                    let actual = h.finalize();
+                    if actual != expected {
+                        return Err(RarError::DataCrcMismatch {
+                            member: fh.name.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(chunks)
+    }
+}
+
+/// Writer wrapper that updates a shared CRC hasher.
+struct CrcTrackingWriter<W: Write> {
+    inner: W,
+    hasher: Arc<std::sync::Mutex<crc32fast::Hasher>>,
+}
+
+impl<W: Write> Write for CrcTrackingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.lock().unwrap().update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Metadata captured from continuation headers discovered during streaming.
@@ -959,6 +1321,10 @@ pub struct ChainedSegmentReader<'a> {
     /// Shared metadata sink updated when continuation headers are discovered.
     /// The caller holds an Rc clone to read final values after streaming.
     metadata_sink: Option<Rc<RefCell<ContinuationMetadata>>>,
+    /// Shared volume index tracker. Updated whenever the reader advances to a
+    /// new segment, allowing callers (even behind wrapper layers like
+    /// DecryptingReader) to observe which volume is currently being read.
+    volume_tracker: Option<Arc<AtomicUsize>>,
 }
 
 impl<'a> ChainedSegmentReader<'a> {
@@ -975,6 +1341,7 @@ impl<'a> ChainedSegmentReader<'a> {
             format: ArchiveFormat::Rar5,
             password: None,
             metadata_sink: None,
+            volume_tracker: None,
         }
     }
 
@@ -992,6 +1359,13 @@ impl<'a> ChainedSegmentReader<'a> {
         self
     }
 
+    /// Attach a shared volume tracker that is updated with the current
+    /// volume index each time the reader advances to a new segment.
+    pub fn with_volume_tracker(mut self, tracker: Arc<AtomicUsize>) -> Self {
+        self.volume_tracker = Some(tracker);
+        self
+    }
+
     fn advance_segment(&mut self) -> std::io::Result<bool> {
         if self.current_seg >= self.segments.len() {
             if !self.split_after {
@@ -1004,6 +1378,9 @@ impl<'a> ChainedSegmentReader<'a> {
         }
 
         let seg = &self.segments[self.current_seg];
+        if let Some(ref tracker) = self.volume_tracker {
+            tracker.store(seg.volume_index, Ordering::Release);
+        }
         let mut reader = self.provider.get_volume(seg.volume_index).map_err(|e| {
             std::io::Error::other(e.to_string())
         })?;
@@ -1103,5 +1480,55 @@ impl Read for ChainedSegmentReader<'_> {
                 return Ok(0); // All segments consumed — EOF.
             }
         }
+    }
+}
+
+/// A `Read` wrapper that monitors a shared volume tracker and records
+/// compressed byte offsets at each volume transition.
+///
+/// Used in the LZ extraction path: wraps the reader chain (ChainedSegmentReader
+/// + optional DecryptingReader), runs `read_to_end`, then provides the recorded
+/// transitions for splitting decompressed output at volume boundaries.
+pub struct VolumeTrackingReader<R: Read> {
+    inner: R,
+    volume_tracker: Arc<AtomicUsize>,
+    bytes_read: u64,
+    last_volume: usize,
+    transitions: Vec<crate::decompress::VolumeTransition>,
+}
+
+impl<R: Read> VolumeTrackingReader<R> {
+    pub fn new(inner: R, volume_tracker: Arc<AtomicUsize>) -> Self {
+        let initial_vol = volume_tracker.load(Ordering::Acquire);
+        Self {
+            inner,
+            volume_tracker,
+            bytes_read: 0,
+            last_volume: initial_vol,
+            transitions: Vec::new(),
+        }
+    }
+
+    /// Consume the wrapper and return the recorded volume transitions.
+    pub fn into_transitions(self) -> Vec<crate::decompress::VolumeTransition> {
+        self.transitions
+    }
+}
+
+impl<R: Read> Read for VolumeTrackingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.bytes_read += n as u64;
+            let current_vol = self.volume_tracker.load(Ordering::Acquire);
+            if current_vol != self.last_volume {
+                self.transitions.push(crate::decompress::VolumeTransition {
+                    volume_index: current_vol,
+                    compressed_offset: self.bytes_read - n as u64,
+                });
+                self.last_volume = current_vol;
+            }
+        }
+        Ok(n)
     }
 }

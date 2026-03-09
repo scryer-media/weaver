@@ -168,7 +168,10 @@ mod tests {
         let header = PacketHeader::parse(&data, 0).unwrap();
         assert_eq!(header.length, HEADER_SIZE as u64);
         assert_eq!(header.packet_type, PacketType::Main);
-        assert_eq!(header.recovery_set_id, RecoverySetId::from_bytes([0xAA; 16]));
+        assert_eq!(
+            header.recovery_set_id,
+            RecoverySetId::from_bytes([0xAA; 16])
+        );
     }
 
     #[test]

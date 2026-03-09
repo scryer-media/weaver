@@ -519,8 +519,87 @@ impl LzDecoder {
         Ok(output_size)
     }
 
+    /// Chunked variant: decompress with output split at compressed byte boundaries.
+    ///
+    /// `boundaries` lists compressed byte offsets where volume transitions occur,
+    /// paired with the new volume index. At each boundary crossing, the current
+    /// writer is flushed and a new one is obtained from `writer_factory`.
+    ///
+    /// Returns a list of `(volume_index, bytes_written)` for each chunk. The first
+    /// chunk starts at `first_volume_index`.
+    pub fn decompress_to_writer_chunked<F>(
+        &mut self,
+        input: &[u8],
+        unpacked_size: u64,
+        first_volume_index: usize,
+        boundaries: &[super::VolumeTransition],
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut reader = BitReader::new(input);
+        let mut output_size: u64 = 0;
+        let mut boundary_idx = 0;
+
+        // Track per-chunk output.
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_volume_index;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+
+        while output_size < unpacked_size {
+            if self.block_bits_remaining <= 0 {
+                if reader.bits_remaining() < 16 {
+                    break;
+                }
+                self.read_block_header(&mut reader)?;
+            }
+
+            let prev_output = output_size;
+            output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
+            let decoded_this_round = output_size - prev_output;
+
+            // Check if we crossed a volume boundary in compressed space.
+            let byte_pos = reader.byte_position() as u64;
+            if boundary_idx < boundaries.len()
+                && byte_pos >= boundaries[boundary_idx].compressed_offset
+            {
+                // Flush current writer and record chunk.
+                self.flush_filters_and_write(&mut *current_writer)?;
+                chunk_bytes += decoded_this_round;
+                chunks.push((current_vol, chunk_bytes));
+
+                // Switch to new volume's writer.
+                current_vol = boundaries[boundary_idx].volume_index;
+                boundary_idx += 1;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+            } else {
+                chunk_bytes += decoded_this_round;
+
+                // Flush window periodically — but only up to filter boundaries.
+                if self.pending_filters.is_empty() {
+                    self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                }
+            }
+        }
+
+        // Final flush.
+        self.flush_filters_and_write(&mut *current_writer)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        Ok(chunks)
+    }
+
     /// Flush pending filters and remaining window data to a writer.
-    fn flush_filters_and_write<W: Write>(
+    fn flush_filters_and_write<W: Write + ?Sized>(
         &mut self,
         writer: &mut W,
     ) -> RarResult<()> {

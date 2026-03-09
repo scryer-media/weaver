@@ -34,7 +34,7 @@ pub mod vint;
 pub mod volume;
 
 // Re-export primary public API types
-pub use archive::{DataSegment, RarArchive, ReadSeek};
+pub use archive::{CachedArchiveHeaders, DataSegment, RarArchive, ReadSeek};
 pub use error::{RarError, RarResult};
 pub use extract::ExtractOptions;
 pub use progress::{NoProgress, ProgressHandler};

@@ -6,16 +6,18 @@ use rusqlite::Connection;
 use crate::StateError;
 
 mod active;
+mod api_keys;
 mod config;
 mod events;
 mod history;
 mod migration;
 
-pub use active::{ActiveJob, CommittedSegment, RecoveredJob};
+pub use active::{ActiveJob, CommittedSegment, ExtractionChunk, RecoveredJob};
+pub use api_keys::ApiKeyRow;
 pub use events::JobEvent;
 pub use history::{HistoryFilter, JobHistoryRow};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 /// SQLite-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
@@ -161,7 +163,44 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_job_events_job_id
-                ON job_events(job_id);",
+                ON job_events(job_id);
+
+            CREATE TABLE IF NOT EXISTS active_extraction_chunks (
+                job_id        INTEGER NOT NULL,
+                set_name      TEXT NOT NULL,
+                member_name   TEXT NOT NULL,
+                volume_index  INTEGER NOT NULL,
+                bytes_written INTEGER NOT NULL,
+                temp_path     TEXT NOT NULL,
+                verified      INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (job_id, set_name, member_name, volume_index)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS active_archive_headers (
+                job_id    INTEGER NOT NULL,
+                set_name  TEXT NOT NULL,
+                headers   BLOB NOT NULL,
+                PRIMARY KEY (job_id, set_name)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS active_volume_status (
+                job_id       INTEGER NOT NULL,
+                set_name     TEXT NOT NULL,
+                volume_index INTEGER NOT NULL,
+                extracted    INTEGER NOT NULL DEFAULT 0,
+                par2_clean   INTEGER NOT NULL DEFAULT 0,
+                deleted      INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (job_id, set_name, volume_index)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                key_hash     BLOB NOT NULL UNIQUE,
+                scope        TEXT NOT NULL DEFAULT 'integration',
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER
+            );",
         )
         .map_err(|e| StateError::Database(e.to_string()))?;
 
@@ -183,10 +222,18 @@ impl Database {
                 .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(1) => {
-                // v1→v2: tables already created above via IF NOT EXISTS.
+                // v1→v3: tables already created above via IF NOT EXISTS.
                 // VACUUM to enable auto_vacuum=INCREMENTAL retroactively.
                 conn.execute_batch("VACUUM")
                     .map_err(|e| StateError::Database(e.to_string()))?;
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [SCHEMA_VERSION],
+                )
+                .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(2) | Some(3) => {
+                // v2/v3→v4: new tables created above via IF NOT EXISTS.
                 conn.execute(
                     "UPDATE schema_version SET version = ?1",
                     [SCHEMA_VERSION],
@@ -227,6 +274,6 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
     }
 }

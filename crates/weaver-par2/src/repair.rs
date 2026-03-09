@@ -93,10 +93,7 @@ pub fn plan_repair(
         let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
 
         // Find this file's verification result.
-        let file_verif = verification
-            .files
-            .iter()
-            .find(|fv| fv.file_id == *file_id);
+        let file_verif = verification.files.iter().find(|fv| fv.file_id == *file_id);
 
         for s in 0..slice_count {
             let is_valid = file_verif
@@ -134,11 +131,8 @@ pub fn plan_repair(
     let constants = gf::input_slice_constants(total_input_slices);
 
     // Build and invert the decode matrix.
-    let decode = matrix::build_decode_matrix(
-        &missing_global_indices,
-        &recovery_exponents,
-        &constants,
-    )?;
+    let decode =
+        matrix::build_decode_matrix(&missing_global_indices, &recovery_exponents, &constants)?;
 
     info!(
         "repair plan: {} missing slices, {} recovery blocks selected",
@@ -172,7 +166,6 @@ pub struct RepairOptions {
     pub memory_limit: Option<usize>,
 }
 
-
 /// Execute a repair plan, reading recovery data and writing repaired slices.
 ///
 /// The algorithm:
@@ -201,14 +194,16 @@ pub fn prepare_recovery_buffers(
     let mut recovery_data: Vec<Vec<u8>> = Vec::with_capacity(n);
     for (i, &exp) in plan.recovery_exponents.iter().enumerate() {
         if let Some(ref cancel) = options.cancel
-            && cancel.is_cancelled() {
-                return Err(Par2Error::Cancelled);
-            }
-        let rs = par2_set.recovery_slices.get(&exp).ok_or_else(|| {
-            Par2Error::ReedSolomonError {
+            && cancel.is_cancelled()
+        {
+            return Err(Par2Error::Cancelled);
+        }
+        let rs = par2_set
+            .recovery_slices
+            .get(&exp)
+            .ok_or_else(|| Par2Error::ReedSolomonError {
                 reason: format!("recovery block with exponent {exp} not found"),
-            }
-        })?;
+            })?;
         let mut data = rs.data.to_vec();
         data.resize(slice_size, 0);
         recovery_data.push(data);
@@ -265,11 +260,9 @@ pub fn xor_out_slice(
         }
         let recovery = &mut recovery_buffers[r];
         for w in 0..word_count {
-            let input_word =
-                u16::from_le_bytes([data[w * 2], data[w * 2 + 1]]);
+            let input_word = u16::from_le_bytes([data[w * 2], data[w * 2 + 1]]);
             let contribution = gf::mul(input_word, factor);
-            let rec_word =
-                u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
+            let rec_word = u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
             let adjusted = gf::add(rec_word, contribution);
             let bytes = adjusted.to_le_bytes();
             recovery[w * 2] = bytes[0];
@@ -288,9 +281,10 @@ pub fn reconstruct_and_write(
 ) -> Result<()> {
     let check_cancel = |options: &RepairOptions| -> Result<()> {
         if let Some(ref cancel) = options.cancel
-            && cancel.is_cancelled() {
-                return Err(Par2Error::Cancelled);
-            }
+            && cancel.is_cancelled()
+        {
+            return Err(Par2Error::Cancelled);
+        }
         Ok(())
     };
 
@@ -312,7 +306,11 @@ pub fn reconstruct_and_write(
     // Determine chunk size (for memory budget support).
     let base_chunk_size = 4096usize;
     let chunk_size = if let Some(limit) = options.memory_limit {
-        let max_chunk_words = if n > 0 { limit / (n * 2) } else { base_chunk_size };
+        let max_chunk_words = if n > 0 {
+            limit / (n * 2)
+        } else {
+            base_chunk_size
+        };
         max_chunk_words.max(1).min(word_count)
     } else {
         base_chunk_size
@@ -387,11 +385,12 @@ pub fn reconstruct_and_write(
 
         let offset = *local_slice as u64 * plan.slice_size;
 
-        let desc = par2_set.file_description(file_id).ok_or_else(|| {
-            Par2Error::ReedSolomonError {
-                reason: format!("file description not found for {file_id}"),
-            }
-        })?;
+        let desc =
+            par2_set
+                .file_description(file_id)
+                .ok_or_else(|| Par2Error::ReedSolomonError {
+                    reason: format!("file description not found for {file_id}"),
+                })?;
         let file_end = desc.length;
         let slice_end = offset + plan.slice_size;
         let write_len = if slice_end > file_end {
@@ -461,9 +460,10 @@ pub fn execute_repair_with_options(
         // Check cancellation every 64 input slices.
         if global_idx % 64 == 0
             && let Some(ref cancel) = options.cancel
-                && cancel.is_cancelled() {
-                    return Err(Par2Error::Cancelled);
-                }
+            && cancel.is_cancelled()
+        {
+            return Err(Par2Error::Cancelled);
+        }
 
         let (file_id, local_slice) = plan.global_to_file[global_idx];
         let offset = local_slice as u64 * plan.slice_size;
@@ -491,11 +491,7 @@ mod tests {
     use md5::{Digest, Md5};
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
         let mut hash_input = Vec::new();
         hash_input.extend_from_slice(&recovery_set_id);
@@ -576,8 +572,8 @@ mod tests {
         let mut ifsc_body = Vec::new();
         ifsc_body.extend_from_slice(&file_id_bytes);
         for cs in &checksums {
-            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
             ifsc_body.extend_from_slice(&cs.md5);
+            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
         }
 
         let mut stream = Vec::new();
@@ -603,13 +599,10 @@ mod tests {
             for (i, &constant) in constants.iter().enumerate() {
                 let factor = gf::pow(constant, exp);
                 for w in 0..word_count {
-                    let input_word = u16::from_le_bytes([
-                        padded[i * ss + w * 2],
-                        padded[i * ss + w * 2 + 1],
-                    ]);
+                    let input_word =
+                        u16::from_le_bytes([padded[i * ss + w * 2], padded[i * ss + w * 2 + 1]]);
                     let contribution = gf::mul(input_word, factor);
-                    let rec_word =
-                        u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
+                    let rec_word = u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
                     let new_val = gf::add(rec_word, contribution);
                     let bytes = new_val.to_le_bytes();
                     recovery[w * 2] = bytes[0];
@@ -648,7 +641,10 @@ mod tests {
         // Verify.
         let result = verify::verify_all(&par2_set, &access);
         assert_eq!(result.total_missing_blocks, 1);
-        assert!(matches!(result.repairable, Repairability::Repairable { .. }));
+        assert!(matches!(
+            result.repairable,
+            Repairability::Repairable { .. }
+        ));
 
         // Plan repair.
         let plan = plan_repair(&par2_set, &result).unwrap();

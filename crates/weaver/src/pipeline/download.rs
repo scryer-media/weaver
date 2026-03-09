@@ -14,41 +14,44 @@ impl Pipeline {
 
         let tuner_max = self.tuner.params().max_concurrent_downloads;
         let max = tuner_max.min(self.connection_ramp);
-        let recovery_slots = self.tuner.params().recovery_slots;
 
         // Find the active job: first in job_order with Downloading status
         // that still has work to do. Skip jobs whose queues are empty
         // (they're waiting on retries or are effectively done).
-        let active_id = self.job_order.iter()
+        let active_id = self
+            .job_order
+            .iter()
             .find(|id| {
-                self.jobs.get(id)
-                    .is_some_and(|s| {
-                        s.status == JobStatus::Downloading
-                            && (!s.download_queue.is_empty() || !s.recovery_queue.is_empty())
-                    })
+                self.jobs.get(id).is_some_and(|s| {
+                    s.status == JobStatus::Downloading
+                        && (!s.download_queue.is_empty() || !s.recovery_queue.is_empty())
+                })
             })
             .copied();
 
         if let Some(job_id) = active_id {
-            // Phase 1: Primary segments.
+            // Phase 1: Primary segments (from download_queue).
+            // Recovery segments promoted by promote_recovery() also land here.
             while self.active_downloads < max {
-                if self.rate_limiter.should_wait() { break; }
-                let Some(state) = self.jobs.get_mut(&job_id) else { break };
-                let Some(work) = state.download_queue.pop() else { break };
+                if self.rate_limiter.should_wait() {
+                    break;
+                }
+                let Some(state) = self.jobs.get_mut(&job_id) else {
+                    break;
+                };
+                let Some(work) = state.download_queue.pop() else {
+                    break;
+                };
                 let estimate = work.byte_estimate as u64;
-                self.spawn_download(work, false);
+                let is_recovery = work.is_recovery;
+                self.spawn_download(work, is_recovery);
                 self.rate_limiter.consume(estimate);
             }
 
-            // Phase 2: Recovery segments using spare bandwidth.
-            while self.active_recovery < recovery_slots && self.active_downloads < max {
-                if self.rate_limiter.should_wait() { break; }
-                let Some(state) = self.jobs.get_mut(&job_id) else { break };
-                let Some(work) = state.recovery_queue.pop() else { break };
-                let estimate = work.byte_estimate as u64;
-                self.spawn_download(work, true);
-                self.rate_limiter.consume(estimate);
-            }
+            // Recovery files are NOT downloaded proactively. They are only
+            // downloaded when CRC failures trigger promote_recovery(), which
+            // moves needed recovery segments from recovery_queue into
+            // download_queue (handled by Phase 1 above).
         }
 
         self.update_queue_metrics();
@@ -57,10 +60,17 @@ impl Pipeline {
     /// Update shared atomic queue depth metrics from per-job queues.
     pub(super) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {
-            (t + s.download_queue.len() + s.recovery_queue.len(), r + s.recovery_queue.len())
+            (
+                t + s.download_queue.len() + s.recovery_queue.len(),
+                r + s.recovery_queue.len(),
+            )
         });
-        self.metrics.download_queue_depth.store(total, Ordering::Relaxed);
-        self.metrics.recovery_queue_depth.store(recovery, Ordering::Relaxed);
+        self.metrics
+            .download_queue_depth
+            .store(total, Ordering::Relaxed);
+        self.metrics
+            .recovery_queue_depth
+            .store(recovery, Ordering::Relaxed);
     }
 
     /// Spawn a download task for a single segment.
@@ -83,7 +93,14 @@ impl Pipeline {
                 .await
                 .map_err(|e| e.to_string());
 
-            let _ = tx.send(DownloadResult { segment_id, data, is_recovery, retry_count }).await;
+            let _ = tx
+                .send(DownloadResult {
+                    segment_id,
+                    data,
+                    is_recovery,
+                    retry_count,
+                })
+                .await;
         });
     }
 
@@ -141,6 +158,7 @@ impl Pipeline {
                                 crc_valid: decode_result.crc_valid,
                                 crc32,
                                 data: output,
+                                yenc_name: decode_result.metadata.name,
                             });
                         }
                         Err(e) => {
@@ -168,9 +186,13 @@ impl Pipeline {
                     if let Some(state) = self.jobs.get_mut(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)
-                            && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
-                                state.failed_bytes += seg_spec.bytes as u64;
-                            }
+                            && let Some(seg_spec) = file_spec
+                                .segments
+                                .iter()
+                                .find(|s| s.number == seg_id.segment_number)
+                        {
+                            state.failed_bytes += seg_spec.bytes as u64;
+                        }
                     }
                     self.check_health(job_id);
                 } else {
@@ -193,42 +215,50 @@ impl Pipeline {
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             let file_idx = seg_id.file_id.file_index as usize;
                             if let Some(file_spec) = state.spec.files.get(file_idx)
-                                && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
-                                    state.failed_bytes += seg_spec.bytes as u64;
-                                }
+                                && let Some(seg_spec) = file_spec
+                                    .segments
+                                    .iter()
+                                    .find(|s| s.number == seg_id.segment_number)
+                            {
+                                state.failed_bytes += seg_spec.bytes as u64;
+                            }
                         }
                         self.check_health(job_id);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)
-                            && let Some(seg_spec) = file_spec.segments.iter().find(|s| s.number == seg_id.segment_number) {
-                                let priority = file_spec.role.download_priority();
-                                let work = DownloadWork {
-                                    segment_id: seg_id,
-                                    message_id: weaver_core::id::MessageId::new(&seg_spec.message_id),
-                                    groups: file_spec.groups.clone(),
-                                    priority,
-                                    byte_estimate: seg_spec.bytes,
-                                    retry_count: next_retry,
-                                    is_recovery: file_spec.role.is_recovery(),
-                                };
-                                self.metrics
-                                    .segments_retried
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let delay = std::time::Duration::from_secs(1 << (next_retry - 1));
-                                debug!(
-                                    segment = %seg_id,
-                                    error = %e,
-                                    retry = next_retry,
-                                    delay_secs = delay.as_secs(),
-                                    "download failed, scheduling retry"
-                                );
-                                let retry_tx = self.retry_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(delay).await;
-                                    let _ = retry_tx.send(work).await;
-                                });
-                            }
+                            && let Some(seg_spec) = file_spec
+                                .segments
+                                .iter()
+                                .find(|s| s.number == seg_id.segment_number)
+                        {
+                            let priority = file_spec.role.download_priority();
+                            let work = DownloadWork {
+                                segment_id: seg_id,
+                                message_id: weaver_core::id::MessageId::new(&seg_spec.message_id),
+                                groups: file_spec.groups.clone(),
+                                priority,
+                                byte_estimate: seg_spec.bytes,
+                                retry_count: next_retry,
+                                is_recovery: file_spec.role.is_recovery(),
+                            };
+                            self.metrics
+                                .segments_retried
+                                .fetch_add(1, Ordering::Relaxed);
+                            let delay = std::time::Duration::from_secs(1 << (next_retry - 1));
+                            debug!(
+                                segment = %seg_id,
+                                error = %e,
+                                retry = next_retry,
+                                delay_secs = delay.as_secs(),
+                                "download failed, scheduling retry"
+                            );
+                            let retry_tx = self.retry_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = retry_tx.send(work).await;
+                            });
+                        }
                     } else {
                         warn!(
                             segment = %seg_id,

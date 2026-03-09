@@ -1,9 +1,9 @@
 import { Link, useLocation, Outlet } from "react-router";
 import { useSubscription } from "urql";
 import { useTheme } from "next-themes";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { JOB_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
-import { SpeedDisplay } from "@/components/SpeedDisplay";
+import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LiveDataContext } from "@/lib/context/live-data-context";
@@ -89,6 +89,48 @@ export function Layout() {
     speed: data?.metrics?.currentDownloadSpeed ?? 0,
     isPaused: data?.isPaused ?? false,
   };
+
+  // Update browser tab title with download status (throttled to every 2.5s)
+  const lastTitleUpdate = useRef(0);
+  useEffect(() => {
+    const now = Date.now();
+    const hasActive = liveData.jobs.some(
+      (j) => j.status !== "COMPLETE" && j.status !== "FAILED",
+    );
+
+    // State changes (pause/idle) update immediately; speed/ETA throttled
+    const isIdle = !liveData.isPaused && liveData.speed === 0;
+    const isPaused = liveData.isPaused && hasActive;
+    if (!isPaused && !isIdle && now - lastTitleUpdate.current < 2500) return;
+    lastTitleUpdate.current = now;
+
+    if (isPaused) {
+      document.title = "Paused - Weaver";
+    } else if (liveData.speed > 0) {
+      const downloading = liveData.jobs.filter((j) => j.status === "DOWNLOADING");
+      const remaining = downloading.reduce(
+        (sum, j) => sum + (j.totalBytes - j.downloadedBytes),
+        0,
+      );
+      const etaSecs = remaining > 0 ? Math.ceil(remaining / liveData.speed) : 0;
+      let eta = "";
+      if (etaSecs > 0 && etaSecs < 360000) {
+        if (etaSecs < 60) eta = ` - ${etaSecs}s`;
+        else if (etaSecs < 3600) {
+          const m = Math.floor(etaSecs / 60);
+          const s = etaSecs % 60;
+          eta = ` - ${m}m ${s}s`;
+        } else {
+          const h = Math.floor(etaSecs / 3600);
+          const m = Math.floor((etaSecs % 3600) / 60);
+          eta = ` - ${h}h ${m}m`;
+        }
+      }
+      document.title = `${formatSpeed(liveData.speed)}${eta} - Weaver`;
+    } else {
+      document.title = "Weaver";
+    }
+  }, [liveData.jobs, liveData.speed, liveData.isPaused]);
 
   const isActive = (to: string) =>
     to === "/"

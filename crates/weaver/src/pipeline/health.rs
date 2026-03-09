@@ -42,7 +42,9 @@ impl Pipeline {
                 0
             } else {
                 let denom = total.saturating_sub(par2_bytes);
-                if denom == 0 { 0 } else {
+                if denom == 0 {
+                    0
+                } else {
                     ((total.saturating_sub(par2_bytes * 2)) * 1000 / denom) as u32
                 }
             };
@@ -82,7 +84,12 @@ impl Pipeline {
     /// UI shows health declining in real time. The final update additionally
     /// restores held segments (or fails the job).
     pub(super) fn handle_probe_update(&mut self, update: ProbeUpdate) {
-        let ProbeUpdate { job_id, total, missed, done } = update;
+        let ProbeUpdate {
+            job_id,
+            total,
+            missed,
+            done,
+        } = update;
 
         if let Some(state) = self.jobs.get(&job_id) {
             if matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete) {
@@ -95,7 +102,10 @@ impl Pipeline {
         let miss_pct = if total > 0 { missed * 100 / total } else { 0 };
 
         if done {
-            info!(job_id = job_id.0, total, missed, miss_pct, "health probe complete");
+            info!(
+                job_id = job_id.0,
+                total, missed, miss_pct, "health probe complete"
+            );
         }
 
         // All probes missed → release is completely gone.
@@ -111,13 +121,14 @@ impl Pipeline {
 
         // Project failed_bytes from the current sample ratio.
         if missed > 0
-            && let Some(state) = self.jobs.get_mut(&job_id) {
-                let projected = state.spec.total_bytes as u128 * missed as u128 / total as u128;
-                let projected = projected as u64;
-                if projected > state.failed_bytes {
-                    state.failed_bytes = projected;
-                }
+            && let Some(state) = self.jobs.get_mut(&job_id)
+        {
+            let projected = state.spec.total_bytes as u128 * missed as u128 / total as u128;
+            let projected = projected as u64;
+            if projected > state.failed_bytes {
+                state.failed_bytes = projected;
             }
+        }
 
         if done {
             // Restore to Downloading and re-enqueue held segments into job's queues.
@@ -127,7 +138,11 @@ impl Pipeline {
                 }
                 let held = std::mem::take(&mut state.held_segments);
                 if !held.is_empty() {
-                    info!(job_id = job_id.0, restored = held.len(), "restoring held segments");
+                    info!(
+                        job_id = job_id.0,
+                        restored = held.len(),
+                        "restoring held segments"
+                    );
                     for work in held {
                         if work.is_recovery {
                             state.recovery_queue.push(work);
@@ -146,15 +161,26 @@ impl Pipeline {
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.status = JobStatus::Failed { error: error.clone() };
+            state.status = JobStatus::Failed {
+                error: error.clone(),
+            };
             state.held_segments.clear();
             // Clear per-job queues to free memory.
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
         }
+        // Cancel any active streaming extractions so providers aren't orphaned.
+        self.cancel_streaming_extraction(job_id);
+        self.failed_extractions.remove(&job_id);
+        self.promoted_recovery_files.remove(&job_id);
+        self.eagerly_deleted.remove(&job_id);
+        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
         self.record_job_history(job_id);
         self.job_order.retain(|id| *id != job_id);
-        let _ = self.event_tx.send(PipelineEvent::JobFailed { job_id, error });
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::JobFailed { job_id, error });
     }
 
     /// Spawn a dedicated STAT probe task to quickly estimate job health.
@@ -288,9 +314,14 @@ impl Pipeline {
                     batches_since_update += 1;
                     if batches_since_update >= UPDATE_INTERVAL {
                         batches_since_update = 0;
-                        let _ = probe_tx.send(ProbeUpdate {
-                            job_id, total: checked, missed, done: false,
-                        }).await;
+                        let _ = probe_tx
+                            .send(ProbeUpdate {
+                                job_id,
+                                total: checked,
+                                missed,
+                                done: false,
+                            })
+                            .await;
                     }
                 }
             } else {
@@ -311,17 +342,32 @@ impl Pipeline {
                     }
                     checked += 1;
                     if checked.is_multiple_of(UPDATE_INTERVAL) {
-                        let _ = probe_tx.send(ProbeUpdate {
-                            job_id, total: checked, missed, done: false,
-                        }).await;
+                        let _ = probe_tx
+                            .send(ProbeUpdate {
+                                job_id,
+                                total: checked,
+                                missed,
+                                done: false,
+                            })
+                            .await;
                     }
                 }
             }
 
-            info!(job_id = job_id.0, probes = probe_count, missed, "health probe complete");
-            let _ = probe_tx.send(ProbeUpdate {
-                job_id, total: probe_count, missed, done: true,
-            }).await;
+            info!(
+                job_id = job_id.0,
+                probes = probe_count,
+                missed,
+                "health probe complete"
+            );
+            let _ = probe_tx
+                .send(ProbeUpdate {
+                    job_id,
+                    total: probe_count,
+                    missed,
+                    done: true,
+                })
+                .await;
         });
     }
 }

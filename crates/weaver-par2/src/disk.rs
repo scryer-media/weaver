@@ -6,6 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::par2_set::Par2FileSet;
+use crate::placement::PlacementPlan;
 use crate::types::FileId;
 use crate::verify::FileAccess;
 
@@ -35,15 +36,17 @@ impl DiskFileAccess {
 
     /// Resolve the full path for a given file ID.
     fn path_for(&self, file_id: &FileId) -> Option<PathBuf> {
-        self.file_map.get(file_id).map(|name| self.base_dir.join(name))
+        self.file_map
+            .get(file_id)
+            .map(|name| self.base_dir.join(name))
     }
 }
 
 impl FileAccess for DiskFileAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        let path = self.path_for(file_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "unknown file ID")
-        })?;
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len as usize];
@@ -53,9 +56,7 @@ impl FileAccess for DiskFileAccess {
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
-        self.path_for(file_id)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
 
     fn file_length(&self, file_id: &FileId) -> Option<u64> {
@@ -64,16 +65,110 @@ impl FileAccess for DiskFileAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
-        let path = self.path_for(file_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "unknown file ID")
-        })?;
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
         fs::read(&path)
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
-        let path = self.path_for(file_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "unknown file ID")
-        })?;
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)?;
+        Ok(())
+    }
+}
+
+/// A [`FileAccess`] that reads files through placement overrides.
+///
+/// Verification can use this to resolve a PAR2 file ID to the file currently
+/// holding that content without mutating filenames on disk.
+pub struct PlacementFileAccess {
+    base_dir: PathBuf,
+    file_map: HashMap<FileId, String>,
+    overrides: HashMap<FileId, String>,
+}
+
+impl PlacementFileAccess {
+    pub fn new(
+        base_dir: PathBuf,
+        par2_set: &Par2FileSet,
+        overrides: HashMap<FileId, String>,
+    ) -> Self {
+        let mut file_map = HashMap::new();
+        for (file_id, desc) in &par2_set.files {
+            file_map.insert(*file_id, desc.filename.clone());
+        }
+        Self {
+            base_dir,
+            file_map,
+            overrides,
+        }
+    }
+
+    pub fn from_plan(base_dir: PathBuf, par2_set: &Par2FileSet, plan: &PlacementPlan) -> Self {
+        let mut overrides = HashMap::new();
+
+        for (a, b) in &plan.swaps {
+            overrides.insert(a.file_id, a.current_name.clone());
+            overrides.insert(b.file_id, b.current_name.clone());
+        }
+        for entry in &plan.renames {
+            overrides.insert(entry.file_id, entry.current_name.clone());
+        }
+
+        Self::new(base_dir, par2_set, overrides)
+    }
+
+    fn path_for(&self, file_id: &FileId) -> Option<PathBuf> {
+        let name = self
+            .overrides
+            .get(file_id)
+            .or_else(|| self.file_map.get(file_id))?;
+        Some(self.base_dir.join(name))
+    }
+}
+
+impl FileAccess for PlacementFileAccess {
+    fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len as usize];
+        let n = file.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    fn file_exists(&self, file_id: &FileId) -> bool {
+        self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    fn file_length(&self, file_id: &FileId) -> Option<u64> {
+        let path = self.path_for(file_id)?;
+        fs::metadata(&path).ok().map(|m| m.len())
+    }
+
+    fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        fs::read(&path)
+    }
+
+    fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -101,11 +196,7 @@ impl MultiDirectoryFileAccess {
     /// `primary_dir` is the main directory for reads and writes.
     /// `search_dirs` are additional directories to search when a file isn't found
     /// in the primary (e.g., directories from duplicate NZB downloads).
-    pub fn new(
-        primary_dir: PathBuf,
-        search_dirs: Vec<PathBuf>,
-        par2_set: &Par2FileSet,
-    ) -> Self {
+    pub fn new(primary_dir: PathBuf, search_dirs: Vec<PathBuf>, par2_set: &Par2FileSet) -> Self {
         let primary = DiskFileAccess::new(primary_dir, par2_set);
         let search = search_dirs
             .into_iter()
@@ -130,7 +221,10 @@ impl FileAccess for MultiDirectoryFileAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         match self.find_reader(file_id) {
             Some(accessor) => accessor.read_file_range(file_id, offset, len),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "file not found in any directory")),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found in any directory",
+            )),
         }
     }
 
@@ -145,7 +239,10 @@ impl FileAccess for MultiDirectoryFileAccess {
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
         match self.find_reader(file_id) {
             Some(accessor) => accessor.read_file(file_id),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "file not found in any directory")),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found in any directory",
+            )),
         }
     }
 
@@ -158,19 +255,17 @@ impl FileAccess for MultiDirectoryFileAccess {
 mod tests {
     use super::*;
     use crate::checksum;
-    use crate::par2_set::Par2FileSet;
-    use crate::packet::header;
-    use crate::types::SliceChecksum;
     use crate::checksum::SliceChecksumState;
+    use crate::packet::header;
+    use crate::par2_set::Par2FileSet;
+    use crate::placement::scan_placement;
+    use crate::types::SliceChecksum;
+    use crate::verify::{FileStatus, verify_all};
     use md5::{Digest, Md5};
     use tempfile::TempDir;
 
     /// Helper to build a complete valid packet (header + body).
-    fn make_full_packet(
-        packet_type: &[u8; 16],
-        body: &[u8],
-        recovery_set_id: [u8; 16],
-    ) -> Vec<u8> {
+    fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
         let length = (header::HEADER_SIZE + body.len()) as u64;
         let mut hash_input = Vec::new();
         hash_input.extend_from_slice(&recovery_set_id);
@@ -189,11 +284,7 @@ mod tests {
     }
 
     /// Build a Par2FileSet for testing with a known filename.
-    fn setup_par2_set(
-        file_data: &[u8],
-        slice_size: u64,
-        filename: &str,
-    ) -> (Par2FileSet, FileId) {
+    fn setup_par2_set(file_data: &[u8], slice_size: u64, filename: &str) -> (Par2FileSet, FileId) {
         let file_length = file_data.len() as u64;
         let hash_full = checksum::md5(file_data);
         let hash_16k_data = &file_data[..file_data.len().min(16384)];
@@ -247,8 +338,8 @@ mod tests {
         let mut ifsc_body = Vec::new();
         ifsc_body.extend_from_slice(&file_id_bytes);
         for cs in &checksums {
-            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
             ifsc_body.extend_from_slice(&cs.md5);
+            ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
         }
 
         let mut stream = Vec::new();
@@ -258,6 +349,89 @@ mod tests {
 
         let set = Par2FileSet::from_files(&[&stream]).unwrap();
         (set, file_id)
+    }
+
+    fn setup_par2_set_multi(
+        files: &[(&[u8], &str)],
+        slice_size: u64,
+    ) -> (Par2FileSet, Vec<FileId>) {
+        let mut file_ids = Vec::new();
+        let mut fd_bodies = Vec::new();
+        let mut ifsc_bodies = Vec::new();
+
+        for &(file_data, filename) in files {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16384)]);
+
+            let mut id_input = Vec::new();
+            id_input.extend_from_slice(&hash_16k);
+            id_input.extend_from_slice(&file_length.to_le_bytes());
+            id_input.extend_from_slice(filename.as_bytes());
+            let file_id_bytes: [u8; 16] = Md5::digest(&id_input).into();
+            file_ids.push(FileId::from_bytes(file_id_bytes));
+
+            let num_slices = if file_length == 0 {
+                0
+            } else {
+                ((file_length + slice_size - 1) / slice_size) as usize
+            };
+
+            let mut checksums = Vec::new();
+            for i in 0..num_slices {
+                let offset = i as u64 * slice_size;
+                let end = ((offset + slice_size) as usize).min(file_data.len());
+                let slice_data = &file_data[offset as usize..end];
+                let mut state = SliceChecksumState::new();
+                state.update(slice_data);
+                let pad_to = if (slice_data.len() as u64) < slice_size {
+                    Some(slice_size)
+                } else {
+                    None
+                };
+                let (crc, md5) = state.finalize(pad_to);
+                checksums.push(SliceChecksum { crc32: crc, md5 });
+            }
+
+            let mut fd_body = Vec::new();
+            fd_body.extend_from_slice(&file_id_bytes);
+            fd_body.extend_from_slice(&hash_full);
+            fd_body.extend_from_slice(&hash_16k);
+            fd_body.extend_from_slice(&file_length.to_le_bytes());
+            fd_body.extend_from_slice(filename.as_bytes());
+            while fd_body.len() % 4 != 0 {
+                fd_body.push(0);
+            }
+            fd_bodies.push(fd_body);
+
+            let mut ifsc_body = Vec::new();
+            ifsc_body.extend_from_slice(&file_id_bytes);
+            for cs in &checksums {
+                ifsc_body.extend_from_slice(&cs.md5);
+                ifsc_body.extend_from_slice(&cs.crc32.to_le_bytes());
+            }
+            ifsc_bodies.push(ifsc_body);
+        }
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&(file_ids.len() as u32).to_le_bytes());
+        for file_id in &file_ids {
+            main_body.extend_from_slice(file_id.as_bytes());
+        }
+        let rsid: [u8; 16] = Md5::digest(&main_body).into();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
+        for fd_body in &fd_bodies {
+            stream.extend_from_slice(&make_full_packet(header::TYPE_FILE_DESC, fd_body, rsid));
+        }
+        for ifsc_body in &ifsc_bodies {
+            stream.extend_from_slice(&make_full_packet(header::TYPE_IFSC, ifsc_body, rsid));
+        }
+
+        let set = Par2FileSet::from_files(&[&stream]).unwrap();
+        (set, file_ids)
     }
 
     #[test]
@@ -418,5 +592,30 @@ mod tests {
 
         assert!(!access.file_exists(&file_id));
         assert!(access.read_file(&file_id).is_err());
+    }
+
+    #[test]
+    fn placement_access_verifies_swapped_valid_names() {
+        let dir = TempDir::new().unwrap();
+        let data_a = b"placement-aware file A data";
+        let data_b = b"placement-aware file B data";
+
+        let (par2_set, _ids) =
+            setup_par2_set_multi(&[(data_a, "file_a.rar"), (data_b, "file_b.rar")], 1024);
+
+        std::fs::write(dir.path().join("file_a.rar"), data_b).unwrap();
+        std::fs::write(dir.path().join("file_b.rar"), data_a).unwrap();
+
+        let plan = scan_placement(dir.path(), &par2_set).unwrap();
+        let access = PlacementFileAccess::from_plan(dir.path().to_path_buf(), &par2_set, &plan);
+        let result = verify_all(&par2_set, &access);
+
+        assert_eq!(result.total_missing_blocks, 0);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|file| matches!(file.status, FileStatus::Complete))
+        );
     }
 }

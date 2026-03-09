@@ -39,8 +39,7 @@ impl MainPacket {
             });
         }
 
-        let recovery_file_count =
-            u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+        let recovery_file_count = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
 
         let file_id_area = &body[12..];
         if !file_id_area.len().is_multiple_of(16) {
@@ -89,7 +88,11 @@ impl MainPacket {
 mod tests {
     use super::*;
 
-    fn make_main_body(slice_size: u64, recovery_ids: &[[u8; 16]], non_recovery_ids: &[[u8; 16]]) -> Vec<u8> {
+    fn make_main_body(
+        slice_size: u64,
+        recovery_ids: &[[u8; 16]],
+        non_recovery_ids: &[[u8; 16]],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&slice_size.to_le_bytes());
         body.extend_from_slice(&(recovery_ids.len() as u32).to_le_bytes());

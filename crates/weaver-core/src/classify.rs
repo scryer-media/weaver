@@ -96,12 +96,14 @@ impl FileRole {
 }
 
 /// Parse PAR2 recovery block count from filenames like `name.vol00+05.par2`.
+///
+/// Supports both `+` separator (standard: `.vol00+05.par2`) and `-` separator
+/// (alternate: `.vol-01.par2`). NZBGet handles both formats.
 fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {
-    // Pattern: .vol<start>+<count>.par2
     let vol_pos = lower.rfind(".vol")?;
     let between = &lower[vol_pos + 4..lower.len() - 5]; // strip ".vol" and ".par2"
-    let plus_pos = between.find('+')?;
-    let count_str = &between[plus_pos + 1..];
+    let sep_pos = between.find('+').or_else(|| between.find('-'))?;
+    let count_str = &between[sep_pos + 1..];
     count_str.parse().ok()
 }
 
@@ -241,6 +243,24 @@ mod tests {
         );
         assert_eq!(
             FileRole::from_filename("movie.vol03+05.par2"),
+            FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: 5
+            }
+        );
+    }
+
+    #[test]
+    fn par2_recovery_dash_format() {
+        assert_eq!(
+            FileRole::from_filename("movie.vol-01.par2"),
+            FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: 1
+            }
+        );
+        assert_eq!(
+            FileRole::from_filename("movie.vol-05.par2"),
             FileRole::Par2 {
                 is_index: false,
                 recovery_block_count: 5

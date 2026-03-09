@@ -13,6 +13,18 @@ use std::io::Write;
 use crate::error::{RarError, RarResult};
 use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod};
 
+/// A volume transition boundary used for chunked decompression.
+///
+/// Represents the compressed byte offset at which the reader switched to a new
+/// volume. Used by `decompress_to_writer_chunked` to split decompressed output.
+#[derive(Debug, Clone)]
+pub struct VolumeTransition {
+    /// The new volume index after the transition.
+    pub volume_index: usize,
+    /// Compressed byte offset at which the transition occurred.
+    pub compressed_offset: u64,
+}
+
 /// Decompress data from a RAR file entry.
 ///
 /// `input` is the raw compressed data area.
@@ -78,6 +90,55 @@ pub fn decompress_to_writer<W: Write>(
             }
             ArchiveFormat::Rar5 => {
                 lz::decompress_lz_to_writer(input, unpacked_size, info, writer)
+            }
+        },
+        CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
+            method: code,
+            version: info.version,
+        }),
+    }
+}
+
+/// Chunked variant: decompress with output split at compressed byte boundaries.
+///
+/// At each volume boundary crossing (from `VolumeTrackingReader`), the current
+/// writer is flushed and `writer_factory` is called to get a new writer for
+/// the next volume's chunk. Returns `(volume_index, bytes_written)` per chunk.
+///
+/// Only supports LZ methods (Store is handled directly in the extraction path).
+pub fn decompress_to_writer_chunked<F>(
+    input: &[u8],
+    unpacked_size: u64,
+    info: &CompressionInfo,
+    first_volume_index: usize,
+    boundaries: &[VolumeTransition],
+    writer_factory: F,
+) -> RarResult<Vec<(usize, u64)>>
+where
+    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+{
+    match info.method {
+        CompressionMethod::Store => {
+            Err(RarError::CorruptArchive {
+                detail: "chunked decompression not needed for Store mode".into(),
+            })
+        }
+        CompressionMethod::Fastest
+        | CompressionMethod::Fast
+        | CompressionMethod::Normal
+        | CompressionMethod::Good
+        | CompressionMethod::Best => match info.format {
+            ArchiveFormat::Rar4 => {
+                let mut decoder = rar4::Rar4LzDecoder::new(info.dict_size as usize);
+                decoder.decompress_to_writer_chunked(
+                    input, unpacked_size, first_volume_index, boundaries, writer_factory,
+                )
+            }
+            ArchiveFormat::Rar5 => {
+                let mut decoder = lz::LzDecoder::new(info.dict_size as usize);
+                decoder.decompress_to_writer_chunked(
+                    input, unpacked_size, first_volume_index, boundaries, writer_factory,
+                )
             }
         },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {

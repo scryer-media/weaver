@@ -1,3 +1,4 @@
+pub mod auth;
 mod mutation;
 mod query;
 mod subscription;
