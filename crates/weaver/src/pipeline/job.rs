@@ -351,7 +351,7 @@ impl Pipeline {
             .retain(|(jid, _, _), _| *jid != job_id);
         self.streaming_volume_bases
             .retain(|(jid, _, _), _| *jid != job_id);
-        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+        self.clear_job_write_backlog(job_id);
 
         // Add to job_order so it shows as active.
         if !self.job_order.contains(&job_id) {

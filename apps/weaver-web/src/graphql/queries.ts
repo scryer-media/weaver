@@ -115,6 +115,51 @@ const API_KEY_FIELDS = `
   }
 `;
 
+const RSS_RULE_FIELDS = `
+  fragment RssRuleFields on RssRule {
+    id
+    feedId
+    sortOrder
+    enabled
+    action
+    titleRegex
+    itemCategories
+    minSizeBytes
+    maxSizeBytes
+    categoryOverride
+    metadata {
+      key
+      value
+    }
+  }
+`;
+
+const RSS_FEED_FIELDS = `
+  fragment RssFeedFields on RssFeed {
+    id
+    name
+    url
+    enabled
+    pollIntervalSecs
+    username
+    hasPassword
+    defaultCategory
+    defaultMetadata {
+      key
+      value
+    }
+    etag
+    lastModified
+    lastPolledAt
+    lastSuccessAt
+    lastError
+    consecutiveFailures
+    rules {
+      ...RssRuleFields
+    }
+  }
+`;
+
 export const JOBS_QUERY = gql`
   query Jobs {
     jobs {
@@ -464,4 +509,94 @@ export const DELETE_API_KEY_MUTATION = gql`
     }
   }
   ${API_KEY_FIELDS}
+`;
+
+// --- RSS ---
+
+export const RSS_SETTINGS_QUERY = gql`
+  query RssSettings {
+    rssFeeds {
+      ...RssFeedFields
+    }
+    categories {
+      ...CategoryFields
+    }
+  }
+  ${RSS_RULE_FIELDS}
+  ${RSS_FEED_FIELDS}
+  ${CATEGORY_FIELDS}
+`;
+
+export const ADD_RSS_FEED_MUTATION = gql`
+  mutation AddRssFeed($input: RssFeedInput!) {
+    addRssFeed(input: $input) {
+      ...RssFeedFields
+    }
+  }
+  ${RSS_RULE_FIELDS}
+  ${RSS_FEED_FIELDS}
+`;
+
+export const UPDATE_RSS_FEED_MUTATION = gql`
+  mutation UpdateRssFeed($id: Int!, $input: RssFeedInput!) {
+    updateRssFeed(id: $id, input: $input) {
+      ...RssFeedFields
+    }
+  }
+  ${RSS_RULE_FIELDS}
+  ${RSS_FEED_FIELDS}
+`;
+
+export const DELETE_RSS_FEED_MUTATION = gql`
+  mutation DeleteRssFeed($id: Int!) {
+    deleteRssFeed(id: $id)
+  }
+`;
+
+export const ADD_RSS_RULE_MUTATION = gql`
+  mutation AddRssRule($feedId: Int!, $input: RssRuleInput!) {
+    addRssRule(feedId: $feedId, input: $input) {
+      ...RssRuleFields
+    }
+  }
+  ${RSS_RULE_FIELDS}
+`;
+
+export const UPDATE_RSS_RULE_MUTATION = gql`
+  mutation UpdateRssRule($id: Int!, $input: RssRuleInput!) {
+    updateRssRule(id: $id, input: $input) {
+      ...RssRuleFields
+    }
+  }
+  ${RSS_RULE_FIELDS}
+`;
+
+export const DELETE_RSS_RULE_MUTATION = gql`
+  mutation DeleteRssRule($id: Int!) {
+    deleteRssRule(id: $id)
+  }
+`;
+
+export const RUN_RSS_SYNC_MUTATION = gql`
+  mutation RunRssSync($feedId: Int) {
+    runRssSync(feedId: $feedId) {
+      feedsPolled
+      itemsFetched
+      itemsNew
+      itemsAccepted
+      itemsSubmitted
+      itemsIgnored
+      errors
+      feedResults {
+        feedId
+        feedName
+        itemsFetched
+        itemsNew
+        itemsAccepted
+        itemsSubmitted
+        itemsIgnored
+        errors
+      }
+    }
+  }
 `;

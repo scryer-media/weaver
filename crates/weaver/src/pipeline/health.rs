@@ -179,7 +179,7 @@ impl Pipeline {
         self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
         self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
-        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+        self.clear_job_write_backlog(job_id);
         self.record_job_history(job_id);
         self.job_order.retain(|id| *id != job_id);
         let _ = self

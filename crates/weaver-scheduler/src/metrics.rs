@@ -70,8 +70,12 @@ pub struct PipelineMetrics {
 
     // Queue depths
     pub download_queue_depth: AtomicUsize,
+    /// Raw article bodies waiting for decode scheduling or decode completion.
     pub decode_pending: AtomicUsize,
     pub commit_pending: AtomicUsize,
+    pub write_buffered_bytes: AtomicU64,
+    pub write_buffered_segments: AtomicUsize,
+    pub direct_write_evictions: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -112,6 +116,9 @@ impl PipelineMetrics {
             download_queue_depth: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
             commit_pending: AtomicUsize::new(0),
+            write_buffered_bytes: AtomicU64::new(0),
+            write_buffered_segments: AtomicUsize::new(0),
+            direct_write_evictions: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -149,6 +156,9 @@ impl PipelineMetrics {
             download_queue_depth: self.download_queue_depth.load(Ordering::Relaxed),
             decode_pending: self.decode_pending.load(Ordering::Relaxed),
             commit_pending: self.commit_pending.load(Ordering::Relaxed),
+            write_buffered_bytes: self.write_buffered_bytes.load(Ordering::Relaxed),
+            write_buffered_segments: self.write_buffered_segments.load(Ordering::Relaxed),
+            direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
             segments_committed: self.segments_committed.load(Ordering::Relaxed),
@@ -178,6 +188,9 @@ pub struct MetricsSnapshot {
     pub download_queue_depth: usize,
     pub decode_pending: usize,
     pub commit_pending: usize,
+    pub write_buffered_bytes: u64,
+    pub write_buffered_segments: usize,
+    pub direct_write_evictions: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -208,11 +221,15 @@ mod tests {
         m.bytes_downloaded.store(1024, Ordering::Relaxed);
         m.segments_downloaded.store(5, Ordering::Relaxed);
         m.decode_pending.store(3, Ordering::Relaxed);
+        m.write_buffered_bytes.store(2048, Ordering::Relaxed);
+        m.write_buffered_segments.store(2, Ordering::Relaxed);
 
         let snap = m.snapshot();
         assert_eq!(snap.bytes_downloaded, 1024);
         assert_eq!(snap.segments_downloaded, 5);
         assert_eq!(snap.decode_pending, 3);
+        assert_eq!(snap.write_buffered_bytes, 2048);
+        assert_eq!(snap.write_buffered_segments, 2);
         assert_eq!(snap.bytes_decoded, 0);
     }
 

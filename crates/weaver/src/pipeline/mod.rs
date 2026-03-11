@@ -7,7 +7,7 @@ mod job;
 mod metadata;
 mod query;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -44,6 +44,12 @@ pub(super) struct DownloadResult {
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
     pub(super) retry_count: u32,
+}
+
+/// Successful download payload waiting for decode scheduling.
+pub(super) struct PendingDecodeWork {
+    pub(super) segment_id: SegmentId,
+    pub(super) raw: Bytes,
 }
 
 /// Progress update from a health probe task.
@@ -89,28 +95,50 @@ pub(super) struct DecodeResult {
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
     pub(super) crc32: u32,
-    pub(super) data: DecodedData,
+    pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
 }
 
-pub(super) enum DecodedData {
-    Pooled(BufferHandle),
-    Owned(Vec<u8>),
+/// Completion of a decode task, including explicit failures so backlog
+/// accounting is always drained.
+pub(super) enum DecodeDone {
+    Success(DecodeResult),
+    Failed {
+        segment_id: SegmentId,
+        error: String,
+    },
 }
 
-impl DecodedData {
+pub(super) struct DecodedChunk(Box<[u8]>);
+
+impl DecodedChunk {
     pub(super) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Pooled(buffer) => buffer.as_slice(),
-            Self::Owned(data) => data.as_slice(),
-        }
+        &self.0
+    }
+
+    pub(super) fn len_bytes(&self) -> usize {
+        self.0.len()
     }
 }
 
-impl BufferedChunk for DecodedData {
+impl From<Vec<u8>> for DecodedChunk {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value.into_boxed_slice())
+    }
+}
+
+pub(super) struct BufferedDecodedSegment {
+    pub(super) segment_id: SegmentId,
+    pub(super) decoded_size: u32,
+    pub(super) crc32: u32,
+    pub(super) data: DecodedChunk,
+    pub(super) yenc_name: String,
+}
+
+impl BufferedChunk for BufferedDecodedSegment {
     fn len_bytes(&self) -> usize {
-        self.as_slice().len()
+        self.data.len_bytes()
     }
 }
 
@@ -123,7 +151,7 @@ pub struct Pipeline {
     pub(super) event_tx: broadcast::Sender<PipelineEvent>,
     /// NNTP client for fetching articles.
     pub(super) nntp: Arc<NntpClient>,
-    /// Buffer pool shared across decode and write stages.
+    /// Buffer pool used as decode scratch space only.
     pub(super) buffers: Arc<BufferPool>,
     /// Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
@@ -145,11 +173,13 @@ pub struct Pipeline {
     pub(super) nzb_dir: PathBuf,
     /// Pending segment commits (flushed to SQLite in batches).
     pub(super) segment_batch: Vec<CommittedSegment>,
+    /// Downloaded article bodies waiting for decode scheduling.
+    pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
-    pub(super) decode_done_tx: mpsc::Sender<DecodeResult>,
-    pub(super) decode_done_rx: mpsc::Receiver<DecodeResult>,
+    pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
+    pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel for delayed retries — segments sleep then come back here.
     pub(super) retry_tx: mpsc::Sender<DownloadWork>,
     pub(super) retry_rx: mpsc::Receiver<DownloadWork>,
@@ -167,8 +197,14 @@ pub struct Pipeline {
     pub(super) connection_ramp: usize,
     /// Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
-    /// Per-file write reorder buffers for sequential disk writes.
-    pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<DecodedData>>,
+    /// Max in-memory decoded backlog before degrading to direct offset writes.
+    pub(super) write_backlog_budget_bytes: usize,
+    /// Current in-memory decoded backlog retained for sequential write ordering.
+    pub(super) write_buffered_bytes: usize,
+    /// Current in-memory decoded segment count retained for sequential write ordering.
+    pub(super) write_buffered_segments: usize,
+    /// Per-file write reorder buffers for decoded segments waiting on write order.
+    pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Retained PAR2 file sets per job, avoiding re-read/re-parse from disk.
     pub(super) par2_sets: HashMap<JobId, Arc<Par2FileSet>>,
     /// Members already extracted per job (for partial extraction).
@@ -240,10 +276,13 @@ impl Pipeline {
         config: weaver_core::config::SharedConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
+        let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
-            total_connections, "pipeline tuner initialized"
+            write_backlog_budget_mb = write_backlog_budget_bytes / (1024 * 1024),
+            total_connections,
+            "pipeline tuner initialized"
         );
 
         // Ensure directories exist.
@@ -275,6 +314,7 @@ impl Pipeline {
             complete_dir,
             nzb_dir,
             segment_batch: Vec::new(),
+            pending_decode: VecDeque::new(),
             download_done_tx,
             download_done_rx,
             decode_done_tx,
@@ -289,6 +329,9 @@ impl Pipeline {
             connection_ramp: total_connections.min(5),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
+            write_backlog_budget_bytes,
+            write_buffered_bytes: 0,
+            write_buffered_segments: 0,
             write_buffers: HashMap::new(),
             par2_sets: HashMap::new(),
             extracted_members: HashMap::new(),
@@ -319,6 +362,10 @@ impl Pipeline {
         info!("pipeline started");
 
         loop {
+            // Drain pending decode backlog first so buffer pressure relieves
+            // before dispatching more downloads.
+            self.pump_decode_queue();
+
             // Dispatch pending downloads up to concurrency limit.
             self.dispatch_downloads();
 
@@ -402,6 +449,9 @@ impl Pipeline {
                         downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
                         segments = snapshot.segments_downloaded,
                         decode_pending = snapshot.decode_pending,
+                        write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
+                        write_backlog_segments = snapshot.write_buffered_segments,
+                        direct_write_evictions = snapshot.direct_write_evictions,
                         not_found,
                         health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                         "pipeline tick"
@@ -422,6 +472,8 @@ impl Pipeline {
                     }
                 }
             }
+
+            self.pump_decode_queue();
 
             // Publish updated job snapshot to shared state so the control plane
             // (API handlers, subscriptions) always has fresh data without
@@ -449,6 +501,9 @@ impl Pipeline {
                 reply,
             } => {
                 let result = self.add_job(job_id, spec, nzb_path).await;
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
                 let _ = reply.send(result);
             }
             SchedulerCommand::RestoreJob {
@@ -461,6 +516,9 @@ impl Pipeline {
             } => {
                 let result =
                     self.restore_job(job_id, spec, committed_segments, status, working_dir);
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
                 let _ = reply.send(result);
             }
             SchedulerCommand::PauseJob { job_id, reply } => {
@@ -544,7 +602,7 @@ impl Pipeline {
                     self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
                     self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
                     self.cancel_streaming_extraction(job_id);
-                    self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+                    self.clear_job_write_backlog(job_id);
 
                     // Delete per-job working directory.
                     let working_dir = state.working_dir.clone();
@@ -724,6 +782,28 @@ pub(super) async fn write_segment_to_disk(
     Ok(())
 }
 
+fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<BufferPool>) -> usize {
+    use weaver_core::buffer::BufferTier;
+    use weaver_core::system::StorageClass;
+
+    let metrics = buffers.metrics();
+    let scratch_bytes = metrics.small_total * BufferTier::Small.size_bytes()
+        + metrics.medium_total * BufferTier::Medium.size_bytes()
+        + metrics.large_total * BufferTier::Large.size_bytes();
+    let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024) as usize;
+    let base = scratch_bytes
+        .max(64 * 1024 * 1024)
+        .min((available_bytes / 8).max(64 * 1024 * 1024));
+
+    match profile.disk.storage_class {
+        StorageClass::Ssd => base,
+        StorageClass::Hdd => (base.saturating_mul(2)).min((available_bytes / 4).max(base)),
+        StorageClass::Network | StorageClass::Unknown => {
+            (base.saturating_mul(3) / 2).min((available_bytes / 5).max(base))
+        }
+    }
+}
+
 /// Check if the output directory has enough free disk space for the job.
 /// Logs a warning if space appears insufficient; does not hard-fail since
 /// estimates from NZB metadata may be inaccurate.
@@ -768,6 +848,62 @@ pub(super) fn is_terminal_status(status: &JobStatus) -> bool {
 }
 
 impl Pipeline {
+    pub(super) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
+        self.write_buffered_bytes += bytes;
+        self.write_buffered_segments += segments;
+        self.publish_write_backlog_metrics();
+    }
+
+    pub(super) fn release_write_buffered(&mut self, bytes: usize, segments: usize) {
+        self.write_buffered_bytes = self.write_buffered_bytes.saturating_sub(bytes);
+        self.write_buffered_segments = self.write_buffered_segments.saturating_sub(segments);
+        self.publish_write_backlog_metrics();
+    }
+
+    pub(super) fn publish_write_backlog_metrics(&self) {
+        self.metrics
+            .write_buffered_bytes
+            .store(self.write_buffered_bytes as u64, Ordering::Relaxed);
+        self.metrics
+            .write_buffered_segments
+            .store(self.write_buffered_segments, Ordering::Relaxed);
+    }
+
+    pub(super) fn clear_job_write_backlog(&mut self, job_id: JobId) {
+        let file_ids: Vec<NzbFileId> = self
+            .write_buffers
+            .keys()
+            .copied()
+            .filter(|file_id| file_id.job_id == job_id)
+            .collect();
+
+        let mut released_bytes = 0usize;
+        let mut released_segments = 0usize;
+        for file_id in file_ids {
+            if let Some(buf) = self.write_buffers.remove(&file_id) {
+                released_bytes += buf.buffered_bytes();
+                released_segments += buf.buffered_len();
+            }
+        }
+
+        if released_bytes > 0 || released_segments > 0 {
+            self.release_write_buffered(released_bytes, released_segments);
+        }
+    }
+
+    pub(super) fn write_target_for_file(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<(JobId, String, PathBuf, PathBuf)> {
+        let job_id = file_id.job_id;
+        let state = self.jobs.get(&job_id)?;
+        let file_asm = state.assembly.file(file_id)?;
+        let filename = file_asm.filename().to_string();
+        let working_dir = state.working_dir.clone();
+        let file_path = working_dir.join(&filename);
+        Some((job_id, filename, working_dir, file_path))
+    }
+
     fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
@@ -784,7 +920,7 @@ impl Pipeline {
         self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
         self.cancel_streaming_extraction(job_id);
-        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+        self.clear_job_write_backlog(job_id);
     }
 
     /// Write a terminal job to SQLite history and add it to the finished_jobs list.
@@ -877,16 +1013,19 @@ mod tests {
     use std::time::Duration;
 
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, oneshot};
     use weaver_api::submit_nzb_bytes;
     use weaver_core::buffer::{BufferPool, BufferPoolConfig};
+    use weaver_core::classify::FileRole;
     use weaver_core::config::{Config, SharedConfig};
     use weaver_core::system::{
         CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
         SystemProfile,
     };
     use weaver_nntp::client::{NntpClient, NntpClientConfig};
-    use weaver_scheduler::{PipelineMetrics, SchedulerHandle, SharedPipelineState};
+    use weaver_scheduler::{
+        FileSpec, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
+    };
     use weaver_state::Database;
 
     struct TestHarness {
@@ -1029,7 +1168,11 @@ mod tests {
         }
     }
 
-    async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+    async fn new_direct_pipeline_with_buffers(
+        temp_dir: &TempDir,
+        buffer_config: BufferPoolConfig,
+        total_connections: usize,
+    ) -> (Pipeline, PathBuf, PathBuf) {
         let data_dir = temp_dir.path().join("data");
         let intermediate_dir = temp_dir.path().join("intermediate");
         let complete_dir = temp_dir.path().join("complete");
@@ -1076,11 +1219,7 @@ mod tests {
                 same_filesystem: true,
             },
         };
-        let buffers = BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        });
+        let buffers = BufferPool::new(buffer_config);
 
         let pipeline = Pipeline::new(
             cmd_rx,
@@ -1091,7 +1230,7 @@ mod tests {
             data_dir,
             intermediate_dir.clone(),
             complete_dir.clone(),
-            0,
+            total_connections,
             4,
             vec![],
             shared_state,
@@ -1102,6 +1241,126 @@ mod tests {
         .unwrap();
 
         (pipeline, intermediate_dir, complete_dir)
+    }
+
+    async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+        new_direct_pipeline_with_buffers(
+            temp_dir,
+            BufferPoolConfig {
+                small_count: 8,
+                medium_count: 4,
+                large_count: 2,
+            },
+            0,
+        )
+        .await
+    }
+
+    fn encode_article_part(
+        filename: &str,
+        payload: &[u8],
+        part: u32,
+        total: u32,
+        begin: u64,
+        file_size: u64,
+    ) -> Bytes {
+        let mut encoded = Vec::new();
+        weaver_yenc::encode_part(
+            payload,
+            &mut encoded,
+            128,
+            filename,
+            part,
+            total,
+            begin,
+            begin + payload.len() as u64 - 1,
+            file_size,
+        )
+        .unwrap();
+        Bytes::from(encoded)
+    }
+
+    fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
+        JobSpec {
+            name: name.to_string(),
+            password: None,
+            total_bytes: files.iter().map(|(_, bytes)| *bytes as u64).sum(),
+            category: None,
+            metadata: vec![],
+            files: files
+                .iter()
+                .enumerate()
+                .map(|(index, (filename, bytes))| FileSpec {
+                    filename: filename.clone(),
+                    role: FileRole::Standalone,
+                    groups: vec!["alt.binaries.test".to_string()],
+                    segments: vec![SegmentSpec {
+                        number: 0,
+                        bytes: *bytes,
+                        message_id: format!("segment-{index}@example.com"),
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
+        JobSpec {
+            name: name.to_string(),
+            password: None,
+            total_bytes: segment_sizes.iter().map(|size| *size as u64).sum(),
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: filename.to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: segment_sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, bytes)| SegmentSpec {
+                        number: index as u32,
+                        bytes: *bytes,
+                        message_id: format!("segment-{index}@example.com"),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
+        let dir_name = job::sanitize_dirname(&spec.name);
+        let candidate = pipeline.intermediate_dir.join(&dir_name);
+        let working_dir = if candidate.exists() {
+            pipeline
+                .intermediate_dir
+                .join(format!("{}.#{}", dir_name, job_id.0))
+        } else {
+            candidate
+        };
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        let (assembly, download_queue, recovery_queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        pipeline.jobs.insert(
+            job_id,
+            JobState {
+                job_id,
+                spec,
+                status: JobStatus::Downloading,
+                assembly,
+                created_at: std::time::Instant::now(),
+                created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+                working_dir: working_dir.clone(),
+                downloaded_bytes: 0,
+                failed_bytes: 0,
+                health_probing: false,
+                held_segments: Vec::new(),
+                download_queue,
+                recovery_queue,
+            },
+        );
+        pipeline.job_order.push(job_id);
+        working_dir
     }
 
     async fn wait_until(
@@ -1117,6 +1376,16 @@ mod tests {
                 return Err("condition timed out");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
+        for _ in 0..expected {
+            let done = tokio::time::timeout(Duration::from_secs(5), pipeline.decode_done_rx.recv())
+                .await
+                .expect("decode result should arrive")
+                .expect("decode channel should stay open");
+            pipeline.handle_decode_done(done).await;
         }
     }
 
@@ -1260,101 +1529,361 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_workdir_fails_job_and_does_not_block_future_commands() {
-        let harness = TestHarness::new().await;
-        let nzb_bytes = sample_nzb_bytes();
-        let mut events = harness.handle.subscribe_events();
-
-        let first = tokio::time::timeout(
-            Duration::from_secs(2),
-            submit_nzb_bytes(
-                &harness.handle,
-                &harness.config,
-                &nzb_bytes,
-                Some("Frieren.Broken.nzb".to_string()),
-                None,
-                None,
-                vec![],
-            ),
+    async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 1,
+                medium_count: 1,
+                large_count: 1,
+            },
+            4,
         )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let output_dir = loop {
-            if let Ok(info) = harness.handle.get_job(first.job_id)
-                && let Some(output_dir) = info.output_dir
-            {
-                break PathBuf::from(output_dir);
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
-        tokio::fs::remove_dir_all(&output_dir).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), harness.handle.pause_all())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let failure = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match events.recv().await {
-                    Ok(PipelineEvent::JobFailed { job_id, error }) if job_id == first.job_id => {
-                        break error;
-                    }
-                    Ok(_) => {}
-                    Err(_) => continue,
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(failure.contains("working directory missing"));
-
-        wait_until(Duration::from_secs(2), || {
-            matches!(
-                harness.handle.get_job(first.job_id).map(|info| info.status),
-                Ok(JobStatus::Failed { .. })
-            )
-        })
-        .await
-        .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), harness.handle.resume_all())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let second = tokio::time::timeout(
-            Duration::from_secs(2),
-            submit_nzb_bytes(
-                &harness.handle,
-                &harness.config,
-                &nzb_bytes,
-                Some("Frieren.Recovery.nzb".to_string()),
-                None,
-                None,
-                vec![],
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        wait_until(Duration::from_secs(2), || {
-            harness
-                .db
-                .load_active_jobs()
-                .map(|jobs| jobs.contains_key(&second.job_id))
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            harness.handle.get_job(second.job_id).unwrap().status,
-            JobStatus::Downloading
+        .await;
+        let job_id = JobId(20001);
+        let filename = "episode.bin";
+        let payload_size =
+            (weaver_core::buffer::BufferTier::Small.size_bytes() + 256 * 1024) as u32;
+        let spec = segmented_job_spec(
+            "Write Backlog Budget",
+            filename,
+            &[payload_size, payload_size, payload_size],
         );
-        assert!(!harness.handle.is_globally_paused());
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline.write_backlog_budget_bytes = payload_size as usize;
 
-        harness.shutdown().await;
+        let total_size = payload_size as u64 * 3;
+        for segment_number in [1u32, 2u32] {
+            let payload = vec![segment_number as u8 + 1; payload_size as usize];
+            let raw = encode_article_part(
+                filename,
+                &payload,
+                segment_number + 1,
+                3,
+                segment_number as u64 * payload_size as u64 + 1,
+                total_size,
+            );
+            let segment_id = SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number,
+            };
+
+            pipeline.active_downloads += 1;
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                pipeline.handle_download_done(DownloadResult {
+                    segment_id,
+                    data: Ok(raw),
+                    is_recovery: false,
+                    retry_count: 0,
+                }),
+            )
+            .await
+            .expect("download completion should not block");
+        }
+
+        drain_decode_results(&mut pipeline, 2).await;
+
+        assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            pipeline
+                .buffers
+                .available(weaver_core::buffer::BufferTier::Medium),
+            1
+        );
+        assert!(
+            pipeline
+                .metrics
+                .direct_write_evictions
+                .load(Ordering::Relaxed)
+                >= 1,
+            "tiny write budget should degrade to direct writes"
+        );
+        assert!(
+            pipeline
+                .metrics
+                .write_buffered_bytes
+                .load(Ordering::Relaxed)
+                <= payload_size as u64
+        );
+
+        let payload = vec![1u8; payload_size as usize];
+        let raw = encode_article_part(filename, &payload, 1, 3, 1, total_size);
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                    segment_number: 0,
+                },
+                data: Ok(raw),
+                is_recovery: false,
+                retry_count: 0,
+            })
+            .await;
+        drain_decode_results(&mut pipeline, 1).await;
+
+        assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pipeline.write_buffered_bytes, 0);
+        assert_eq!(pipeline.write_buffered_segments, 0);
+        assert_eq!(
+            pipeline
+                .metrics
+                .write_buffered_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(matches!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Complete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_downloads_respects_decode_backpressure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 2,
+                medium_count: 1,
+                large_count: 1,
+            },
+            4,
+        )
+        .await;
+        let job_id = JobId(20002);
+        let files = vec![("queued.bin".to_string(), 512u32)];
+        let spec = standalone_job_spec("Decode Queue Limit", &files);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        pipeline
+            .metrics
+            .decode_pending
+            .store(pipeline.tuner.params().max_decode_queue, Ordering::Relaxed);
+        pipeline.dispatch_downloads();
+
+        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(
+            pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+            files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 1,
+                medium_count: 1,
+                large_count: 1,
+            },
+            2,
+        )
+        .await;
+        let job_id = JobId(20004);
+        let spec = standalone_job_spec(
+            "Write Backlog Does Not Gate Dispatch",
+            &[("queued.bin".to_string(), 512u32)],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline.connection_ramp = 1;
+
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let buffered = BufferedDecodedSegment {
+            segment_id: SegmentId {
+                file_id,
+                segment_number: 99,
+            },
+            decoded_size: 4096,
+            crc32: 0,
+            data: DecodedChunk::from(vec![7u8; 4096]),
+            yenc_name: "queued.bin".to_string(),
+        };
+        let buffered_len = buffered.len_bytes();
+        pipeline
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(4))
+            .insert(4096, buffered);
+        pipeline.note_write_buffered(buffered_len, 1);
+
+        pipeline.dispatch_downloads();
+
+        assert_eq!(pipeline.active_downloads, 1);
+        assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            pipeline
+                .metrics
+                .write_buffered_segments
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 1,
+                medium_count: 1,
+                large_count: 1,
+            },
+            4,
+        )
+        .await;
+        let job_id = JobId(20003);
+        let files = vec![("broken.bin".to_string(), 64u32)];
+        let spec = standalone_job_spec("Decode Failure", &files);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        let segment_id = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        };
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id,
+                data: Ok(Bytes::from_static(b"not a yenc article")),
+                is_recovery: false,
+                retry_count: 0,
+            })
+            .await;
+
+        assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 1);
+
+        let done = tokio::time::timeout(Duration::from_secs(2), pipeline.decode_done_rx.recv())
+            .await
+            .expect("decode failure should arrive")
+            .expect("decode channel should stay open");
+        let DecodeDone::Failed {
+            segment_id: failed_segment,
+            ..
+        } = &done
+        else {
+            panic!("expected decode failure");
+        };
+        assert_eq!(*failed_segment, segment_id);
+
+        pipeline.handle_decode_done(done).await;
+
+        assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
+
+        let (reply, recv) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::PauseAll { reply })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), recv)
+            .await
+            .expect("pause reply should arrive")
+            .unwrap();
+        assert!(pipeline.global_paused);
+    }
+
+    #[test]
+    fn hdd_profile_allocates_more_write_backlog_than_ssd() {
+        let profile = SystemProfile {
+            cpu: CpuProfile {
+                physical_cores: 4,
+                logical_cores: 4,
+                simd: SimdSupport::default(),
+                cgroup_limit: None,
+            },
+            memory: MemoryProfile {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                available_bytes: 8 * 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: DiskProfile {
+                storage_class: StorageClass::Ssd,
+                filesystem: FilesystemType::Apfs,
+                sequential_write_mbps: 1000.0,
+                random_read_iops: 50_000.0,
+                same_filesystem: true,
+            },
+        };
+        let mut hdd_profile = profile.clone();
+        hdd_profile.disk.storage_class = StorageClass::Hdd;
+        let buffers = BufferPool::new(BufferPoolConfig {
+            small_count: 64,
+            medium_count: 8,
+            large_count: 2,
+        });
+
+        let ssd_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
+        let hdd_budget = compute_write_backlog_budget_bytes(&hdd_profile, &buffers);
+
+        assert!(hdd_budget > ssd_budget);
+    }
+
+    #[tokio::test]
+    async fn fail_job_clears_write_backlog_accounting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(20005);
+        let spec =
+            standalone_job_spec("Fail Clears Backlog", &[("stalled.bin".to_string(), 64u32)]);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let buffered = BufferedDecodedSegment {
+            segment_id: SegmentId {
+                file_id,
+                segment_number: 0,
+            },
+            decoded_size: 4096,
+            crc32: 0,
+            data: DecodedChunk::from(vec![3u8; 4096]),
+            yenc_name: "stalled.bin".to_string(),
+        };
+        let buffered_len = buffered.len_bytes();
+        pipeline
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(4))
+            .insert(8192, buffered);
+        pipeline.note_write_buffered(buffered_len, 1);
+
+        pipeline.fail_job(job_id, "forced failure".to_string());
+
+        assert!(!pipeline.write_buffers.contains_key(&file_id));
+        assert_eq!(pipeline.write_buffered_bytes, 0);
+        assert_eq!(pipeline.write_buffered_segments, 0);
+        assert_eq!(
+            pipeline
+                .metrics
+                .write_buffered_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            pipeline
+                .metrics
+                .write_buffered_segments
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

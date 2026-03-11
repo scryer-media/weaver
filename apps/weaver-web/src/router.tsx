@@ -10,6 +10,7 @@ import { SettingsLayout } from "@/pages/settings/SettingsLayout";
 import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
 import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
 import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
+import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
 
 export const router = createBrowserRouter([
   {
@@ -29,6 +30,7 @@ export const router = createBrowserRouter([
           { path: "general", element: <GeneralSettingsPage /> },
           { path: "security", element: <SecuritySettingsPage /> },
           { path: "backup", element: <BackupSettingsPage /> },
+          { path: "rss", element: <RssSettingsPage /> },
           { path: "categories", element: <Categories embedded /> },
           { path: "servers", element: <Servers embedded /> },
         ],

@@ -289,7 +289,7 @@ async fn run_download(
 
     // Start the pipeline BEFORE submitting the job — add_job awaits a reply
     // from the pipeline loop, so the loop must be running first.
-    let pipeline_task = tokio::spawn(async move {
+    let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
 
@@ -298,15 +298,22 @@ async fn run_download(
         .add_job(job_id, job_spec, nzb_path.to_path_buf())
         .await?;
 
-    // Wait for shutdown signal.
-    wait_for_shutdown().await;
-    info!("received shutdown signal, shutting down");
-    handle.shutdown().await.ok();
-
-    pipeline_task.await.ok();
-    log_task.abort();
-
-    Ok(())
+    tokio::select! {
+        _ = wait_for_shutdown() => {
+            info!("received shutdown signal, shutting down");
+            handle.shutdown().await.ok();
+            if let Err(join_error) = pipeline_task.await {
+                error!(error = %join_error, "pipeline task failed during shutdown");
+            }
+            log_task.abort();
+            Ok(())
+        }
+        result = &mut pipeline_task => {
+            let error = pipeline_exit_error(result);
+            log_task.abort();
+            Err(error.into())
+        }
+    }
 }
 
 /// Wait for either SIGTERM or ctrl-c.
@@ -324,6 +331,19 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         ctrl_c.await.ok();
+    }
+}
+
+fn pipeline_exit_error(result: Result<(), tokio::task::JoinError>) -> std::io::Error {
+    match result {
+        Ok(()) => {
+            error!("pipeline task exited unexpectedly");
+            std::io::Error::other("pipeline task exited unexpectedly")
+        }
+        Err(join_error) => {
+            error!(error = %join_error, "pipeline task exited unexpectedly");
+            std::io::Error::other(format!("pipeline task exited unexpectedly: {join_error}"))
+        }
     }
 }
 
@@ -608,7 +628,7 @@ async fn run_server_command(
     )
     .await?;
 
-    let pipeline_task = tokio::spawn(async move {
+    let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
 
@@ -630,16 +650,24 @@ async fn run_server_command(
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let server_task = tokio::spawn(server::run_server(schema, db.clone(), backup, addr));
 
-    // Wait for shutdown signal.
-    wait_for_shutdown().await;
-    info!("received shutdown signal, shutting down");
-    handle.shutdown().await.ok();
-
-    pipeline_task.await.ok();
-    server_task.abort();
-    rss_task.abort();
-
-    Ok(())
+    tokio::select! {
+        _ = wait_for_shutdown() => {
+            info!("received shutdown signal, shutting down");
+            handle.shutdown().await.ok();
+            if let Err(join_error) = pipeline_task.await {
+                error!(error = %join_error, "pipeline task failed during shutdown");
+            }
+            server_task.abort();
+            rss_task.abort();
+            Ok(())
+        }
+        result = &mut pipeline_task => {
+            let error = pipeline_exit_error(result);
+            server_task.abort();
+            rss_task.abort();
+            Err(error.into())
+        }
+    }
 }
 
 /// Probe each server for capability detection (pipelining, etc.) and update config.

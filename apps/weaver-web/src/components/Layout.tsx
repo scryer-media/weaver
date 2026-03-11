@@ -148,7 +148,7 @@ export function Layout() {
   return (
     <LiveDataContext.Provider value={liveData}>
       <div className="min-h-screen bg-background text-foreground">
-        <div className="mx-auto w-full max-w-[1380px] px-3 py-3 sm:px-4 sm:py-4">
+        <div className="mx-auto w-full max-w-[1587px] px-3 py-3 sm:px-4 sm:py-4">
           <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
             <div className="pointer-events-none absolute inset-x-0 top-0 h-56 bg-gradient-to-br from-primary/10 via-transparent to-transparent" />
             <div className="relative grid min-h-[calc(100vh-1.5rem)] md:grid-cols-[224px_minmax(0,1fr)]">

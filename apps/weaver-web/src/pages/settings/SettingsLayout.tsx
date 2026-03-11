@@ -17,6 +17,11 @@ export const settingsNav = [
     descriptionKey: "settings.backupPageDesc",
   },
   {
+    to: "/settings/rss",
+    labelKey: "settings.rss",
+    descriptionKey: "settings.rssDesc",
+  },
+  {
     to: "/settings/categories",
     labelKey: "categories.title",
     descriptionKey: "settings.categoriesDesc",

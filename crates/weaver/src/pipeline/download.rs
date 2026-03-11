@@ -1,6 +1,133 @@
 use super::*;
 
 impl Pipeline {
+    fn spawn_decode_task(&self, work: PendingDecodeWork, output: Option<BufferHandle>) {
+        let tx = self.decode_done_tx.clone();
+        let segment_id = work.segment_id;
+        let metrics = Arc::clone(&self.metrics);
+
+        tokio::task::spawn_blocking(move || {
+            if let Some(mut output) = output {
+                let Some(output_buf) = output.as_mut_slice() else {
+                    let error = "failed to get unique pooled decode buffer".to_string();
+                    metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(segment = %segment_id, error, "yEnc decode failed");
+                    let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                    return;
+                };
+
+                match weaver_yenc::decode(&work.raw, output_buf) {
+                    Ok(decode_result) => {
+                        output.set_len(decode_result.bytes_written);
+                        metrics
+                            .bytes_decoded
+                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
+                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
+
+                        let file_offset = decode_result
+                            .metadata
+                            .begin
+                            .map(|b| b.saturating_sub(1))
+                            .unwrap_or(0);
+
+                        let crc32 = checksum::crc32(output.as_slice());
+                        let decoded = DecodedChunk::from(output.as_slice().to_vec());
+
+                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
+                            segment_id,
+                            file_offset,
+                            decoded_size: decode_result.bytes_written as u32,
+                            crc_valid: decode_result.crc_valid,
+                            crc32,
+                            data: decoded,
+                            yenc_name: decode_result.metadata.name,
+                        }));
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(segment = %segment_id, error = %error, "yEnc decode failed");
+                        let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                    }
+                }
+            } else {
+                let mut output = vec![0u8; work.raw.len()];
+                match weaver_yenc::decode(&work.raw, &mut output) {
+                    Ok(decode_result) => {
+                        output.truncate(decode_result.bytes_written);
+                        metrics
+                            .bytes_decoded
+                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
+                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
+
+                        let file_offset = decode_result
+                            .metadata
+                            .begin
+                            .map(|b| b.saturating_sub(1))
+                            .unwrap_or(0);
+
+                        let crc32 = checksum::crc32(&output);
+
+                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
+                            segment_id,
+                            file_offset,
+                            decoded_size: decode_result.bytes_written as u32,
+                            crc_valid: decode_result.crc_valid,
+                            crc32,
+                            data: DecodedChunk::from(output),
+                            yenc_name: decode_result.metadata.name,
+                        }));
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(segment = %segment_id, error = %error, "yEnc decode failed");
+                        let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                    }
+                }
+            }
+        });
+    }
+
+    pub(super) fn pump_decode_queue(&mut self) {
+        if self.pending_decode.is_empty() {
+            return;
+        }
+
+        let mut remaining = VecDeque::with_capacity(self.pending_decode.len());
+        while let Some(work) = self.pending_decode.pop_front() {
+            let job_id = work.segment_id.file_id.job_id;
+            if self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| is_terminal_status(&state.status))
+            {
+                self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
+                debug!(
+                    job_id = job_id.0,
+                    segment = %work.segment_id,
+                    "discarding queued decode work for inactive job"
+                );
+                continue;
+            }
+
+            if work.raw.len() > weaver_core::buffer::BufferTier::Large.size_bytes() {
+                self.spawn_decode_task(work, None);
+                continue;
+            }
+
+            let tier = weaver_core::buffer::BufferTier::for_size(work.raw.len());
+            let Some(output) = self.buffers.try_acquire(tier) else {
+                remaining.push_back(work);
+                continue;
+            };
+
+            self.spawn_decode_task(work, Some(output));
+        }
+
+        self.pending_decode = remaining;
+    }
+
     /// Dispatch downloads using job-sequential scheduling.
     ///
     /// Picks the first job in `job_order` that is Downloading and serves only
@@ -12,7 +139,14 @@ impl Pipeline {
             return;
         }
 
-        let tuner_max = self.tuner.params().max_concurrent_downloads;
+        let params = self.tuner.params();
+        let decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed);
+        if decode_pending >= params.max_decode_queue {
+            self.update_queue_metrics();
+            return;
+        }
+
+        let tuner_max = params.max_concurrent_downloads;
         let max = tuner_max.min(self.connection_ramp);
 
         // Find the active job: first in job_order with Downloading status
@@ -142,104 +276,12 @@ impl Pipeline {
                     raw_size,
                 });
 
-                // Queue decode on blocking thread pool using a pooled output
-                // buffer so decode exerts real memory backpressure.
-                let tx = self.decode_done_tx.clone();
-                let segment_id = result.segment_id;
-                let metrics = Arc::clone(&self.metrics);
-                let use_pool = raw.len() <= weaver_core::buffer::BufferTier::Large.size_bytes();
-
-                if use_pool {
-                    let mut output = self
-                        .buffers
-                        .acquire(weaver_core::buffer::BufferTier::for_size(raw.len()))
-                        .await;
-
-                    tokio::task::spawn_blocking(move || {
-                        let Some(output_buf) = output.as_mut_slice() else {
-                            metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                            warn!(segment = %segment_id, "failed to get unique pooled decode buffer");
-                            return;
-                        };
-
-                        match weaver_yenc::decode(&raw, output_buf) {
-                            Ok(decode_result) => {
-                                output.set_len(decode_result.bytes_written);
-                                metrics.bytes_decoded.fetch_add(
-                                    decode_result.bytes_written as u64,
-                                    Ordering::Relaxed,
-                                );
-                                metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                                let file_offset = decode_result
-                                    .metadata
-                                    .begin
-                                    .map(|b| b.saturating_sub(1)) // yEnc begin is 1-based
-                                    .unwrap_or(0);
-
-                                let crc32 = checksum::crc32(output.as_slice());
-
-                                let _ = tx.blocking_send(DecodeResult {
-                                    segment_id,
-                                    file_offset,
-                                    decoded_size: decode_result.bytes_written as u32,
-                                    crc_valid: decode_result.crc_valid,
-                                    crc32,
-                                    data: DecodedData::Pooled(output),
-                                    yenc_name: decode_result.metadata.name,
-                                });
-                            }
-                            Err(e) => {
-                                metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                                warn!(
-                                    segment = %segment_id,
-                                    error = %e,
-                                    "yEnc decode failed"
-                                );
-                            }
-                        }
-                    });
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        let mut output = vec![0u8; raw.len()];
-                        match weaver_yenc::decode(&raw, &mut output) {
-                            Ok(decode_result) => {
-                                output.truncate(decode_result.bytes_written);
-                                metrics.bytes_decoded.fetch_add(
-                                    decode_result.bytes_written as u64,
-                                    Ordering::Relaxed,
-                                );
-                                metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                                let file_offset = decode_result
-                                    .metadata
-                                    .begin
-                                    .map(|b| b.saturating_sub(1)) // yEnc begin is 1-based
-                                    .unwrap_or(0);
-
-                                let crc32 = checksum::crc32(&output);
-
-                                let _ = tx.blocking_send(DecodeResult {
-                                    segment_id,
-                                    file_offset,
-                                    decoded_size: decode_result.bytes_written as u32,
-                                    crc_valid: decode_result.crc_valid,
-                                    crc32,
-                                    data: DecodedData::Owned(output),
-                                    yenc_name: decode_result.metadata.name,
-                                });
-                            }
-                            Err(e) => {
-                                metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                                warn!(
-                                    segment = %segment_id,
-                                    error = %e,
-                                    "yEnc decode failed"
-                                );
-                            }
-                        }
-                    });
-                }
+                self.metrics.decode_pending.fetch_add(1, Ordering::Relaxed);
+                self.pending_decode.push_back(PendingDecodeWork {
+                    segment_id: result.segment_id,
+                    raw,
+                });
+                self.pump_decode_queue();
             }
             Err(e) => {
                 if e.contains("no such article") || e.contains("article not found") {
