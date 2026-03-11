@@ -20,15 +20,9 @@ impl RarArchive {
         // Parse all headers (RAR5)
         let parsed = header::parse_all_headers(&mut reader, password)?;
 
-        let is_solid = parsed
-            .main
-            .as_ref()
-            .is_some_and(|m| m.is_solid);
+        let is_solid = parsed.main.as_ref().is_some_and(|m| m.is_solid);
 
-        let is_volume = parsed
-            .main
-            .as_ref()
-            .is_some_and(|m| m.is_volume);
+        let is_volume = parsed.main.as_ref().is_some_and(|m| m.is_volume);
 
         let volume_number = parsed
             .main
@@ -44,10 +38,7 @@ impl RarArchive {
             VolumeSet::single()
         };
 
-        let more_volumes = parsed
-            .end
-            .as_ref()
-            .is_some_and(|e| e.more_volumes);
+        let more_volumes = parsed.end.as_ref().is_some_and(|e| e.more_volumes);
 
         if !more_volumes {
             volume_set.set_last_volume_seen();
@@ -156,10 +147,7 @@ impl RarArchive {
             });
         }
 
-        let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData {
-            reader,
-            index: 0,
-        })];
+        let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData { reader, index: 0 })];
 
         Ok(RarArchive {
             format: ArchiveFormat::Rar4,
@@ -209,7 +197,9 @@ impl RarArchive {
                 crate::rar4::types::Rar4HostOs::Unix
                 | crate::rar4::types::Rar4HostOs::MacOs
                 | crate::rar4::types::Rar4HostOs::BeOs => crate::types::HostOs::Unix,
-                crate::rar4::types::Rar4HostOs::Unknown(v) => crate::types::HostOs::Unknown(v as u64),
+                crate::rar4::types::Rar4HostOs::Unknown(v) => {
+                    crate::types::HostOs::Unknown(v as u64)
+                }
             },
             attributes: crate::types::FileAttributes(fh.attributes as u64),
             mtime: None,

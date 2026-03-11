@@ -1,81 +1,89 @@
-import { Link, useLocation, Outlet } from "react-router";
-import { useSubscription } from "urql";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { JOB_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
+import {
+  Clock3,
+  Download,
+  FolderUp,
+  Menu,
+  Monitor,
+  MoonStar,
+  Settings,
+  Sun,
+  Workflow,
+} from "lucide-react";
+import { useQuery, useSubscription } from "urql";
+import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY } from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
-import { useTranslate } from "@/lib/context/translate-context";
 import { LiveDataContext } from "@/lib/context/live-data-context";
+import type { JobData } from "@/lib/job-types";
+import { useTranslate } from "@/lib/context/translate-context";
+import { settingsNav } from "@/pages/settings/SettingsLayout";
+import { Button } from "@/components/ui/button";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 
 const navItems = [
-  { to: "/", labelKey: "nav.jobs", icon: "jobs" },
-  { to: "/history", labelKey: "nav.history", icon: "history" },
-  { to: "/upload", labelKey: "nav.upload", icon: "upload" },
-  { to: "/servers", labelKey: "nav.servers", icon: "servers" },
-  { to: "/settings", labelKey: "nav.settings", icon: "settings" },
+  { to: "/", labelKey: "nav.jobs", icon: Workflow },
+  { to: "/history", labelKey: "nav.history", icon: Clock3 },
+  { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
 interface Snapshot {
-  jobs: { id: number; name: string; status: string; progress: number; totalBytes: number; downloadedBytes: number; hasPassword: boolean; category: string | null }[];
+  jobs: JobData[];
   metrics: { currentDownloadSpeed: number };
   isPaused: boolean;
-}
-
-function NavIcon({ icon, size = 20 }: { icon: string; size?: number }) {
-  const props = { xmlns: "http://www.w3.org/2000/svg", width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
-  switch (icon) {
-    case "jobs":
-      return <svg {...props}><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /><polyline points="3.27 6.96 12 12.01 20.73 6.96" /><line x1="12" y1="22.08" x2="12" y2="12" /></svg>;
-    case "history":
-      return <svg {...props}><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>;
-    case "upload":
-      return <svg {...props}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>;
-    case "servers":
-      return <svg {...props}><rect x="2" y="2" width="20" height="8" rx="2" ry="2" /><rect x="2" y="14" width="20" height="8" rx="2" ry="2" /><line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" /></svg>;
-    case "settings":
-      return <svg {...props}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>;
-    default:
-      return null;
-  }
 }
 
 function ThemeToggle() {
   const { theme, setTheme } = useTheme();
 
-  const cycle = () => {
-    if (theme === "dark") setTheme("light");
-    else if (theme === "light") setTheme("system");
-    else setTheme("dark");
-  };
-
   return (
-    <button
-      onClick={cycle}
-      className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={() => {
+        if (theme === "dark") {
+          setTheme("light");
+          return;
+        }
+        if (theme === "light") {
+          setTheme("system");
+          return;
+        }
+        setTheme("dark");
+      }}
       title={theme === "dark" ? "Dark" : theme === "light" ? "Light" : "System"}
     >
       {theme === "dark" ? (
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" /></svg>
+        <MoonStar className="size-4" />
       ) : theme === "light" ? (
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4" /><path d="M12 2v2" /><path d="M12 20v2" /><path d="m4.93 4.93 1.41 1.41" /><path d="m17.66 17.66 1.41 1.41" /><path d="M2 12h2" /><path d="M20 12h2" /><path d="m6.34 17.66-1.41 1.41" /><path d="m19.07 4.93-1.41 1.41" /></svg>
+        <Sun className="size-4" />
       ) : (
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="20" height="14" x="2" y="3" rx="2" /><line x1="8" x2="16" y1="21" y2="21" /><line x1="12" x2="12" y1="17" y2="21" /></svg>
+        <Monitor className="size-4" />
       )}
-    </button>
+    </Button>
   );
 }
 
 export function Layout() {
   const t = useTranslate();
   const location = useLocation();
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
+  const [{ data: queryData }] = useQuery<Snapshot>({
+    query: JOBS_PAGE_QUERY,
+  });
   const handleSubscription = useCallback(
-    (_prev: Snapshot | undefined, response: { jobUpdates: Snapshot }) => {
-      return response.jobUpdates;
-    },
+    (_prev: Snapshot | undefined, response: { jobUpdates: Snapshot }) =>
+      response.jobUpdates,
     [],
   );
 
@@ -84,21 +92,23 @@ export function Layout() {
     handleSubscription,
   );
 
-  const liveData = {
-    jobs: data?.jobs ?? [],
-    speed: data?.metrics?.currentDownloadSpeed ?? 0,
-    isPaused: data?.isPaused ?? false,
-  };
+  const snapshot = data ?? queryData;
+  const liveData = useMemo(
+    () => ({
+      jobs: snapshot?.jobs ?? [],
+      speed: snapshot?.metrics?.currentDownloadSpeed ?? 0,
+      isPaused: snapshot?.isPaused ?? false,
+    }),
+    [snapshot],
+  );
 
-  // Update browser tab title with download status (throttled to every 2.5s)
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
     const now = Date.now();
     const hasActive = liveData.jobs.some(
-      (j) => j.status !== "COMPLETE" && j.status !== "FAILED",
+      (job) => job.status !== "COMPLETE" && job.status !== "FAILED",
     );
 
-    // State changes (pause/idle) update immediately; speed/ETA throttled
     const isIdle = !liveData.isPaused && liveData.speed === 0;
     const isPaused = liveData.isPaused && hasActive;
     if (!isPaused && !isIdle && now - lastTitleUpdate.current < 2500) return;
@@ -106,149 +116,223 @@ export function Layout() {
 
     if (isPaused) {
       document.title = "Paused - Weaver";
-    } else if (liveData.speed > 0) {
-      const downloading = liveData.jobs.filter((j) => j.status === "DOWNLOADING");
+      return;
+    }
+
+    if (liveData.speed > 0) {
+      const downloading = liveData.jobs.filter((job) => job.status === "DOWNLOADING");
       const remaining = downloading.reduce(
-        (sum, j) => sum + (j.totalBytes - j.downloadedBytes),
+        (sum, job) => sum + (job.totalBytes - job.downloadedBytes),
         0,
       );
       const etaSecs = remaining > 0 ? Math.ceil(remaining / liveData.speed) : 0;
       let eta = "";
       if (etaSecs > 0 && etaSecs < 360000) {
         if (etaSecs < 60) eta = ` - ${etaSecs}s`;
-        else if (etaSecs < 3600) {
-          const m = Math.floor(etaSecs / 60);
-          const s = etaSecs % 60;
-          eta = ` - ${m}m ${s}s`;
-        } else {
-          const h = Math.floor(etaSecs / 3600);
-          const m = Math.floor((etaSecs % 3600) / 60);
-          eta = ` - ${h}h ${m}m`;
-        }
+        else if (etaSecs < 3600) eta = ` - ${Math.floor(etaSecs / 60)}m ${etaSecs % 60}s`;
+        else eta = ` - ${Math.floor(etaSecs / 3600)}h ${Math.floor((etaSecs % 3600) / 60)}m`;
       }
       document.title = `${formatSpeed(liveData.speed)}${eta} - Weaver`;
-    } else {
-      document.title = "Weaver";
+      return;
     }
-  }, [liveData.jobs, liveData.speed, liveData.isPaused]);
+
+    document.title = "Weaver";
+  }, [liveData]);
 
   const isActive = (to: string) =>
     to === "/"
       ? location.pathname === "/" || location.pathname.startsWith("/jobs")
       : location.pathname.startsWith(to);
+  const settingsOpen = location.pathname.startsWith("/settings");
 
   return (
     <LiveDataContext.Provider value={liveData}>
-      <div className="flex min-h-screen bg-background text-foreground">
-        {/* Desktop sidebar */}
-        <aside className="hidden w-56 flex-col border-r border-sidebar-border bg-sidebar md:flex">
-          <div className="flex h-14 items-center justify-between border-b border-sidebar-border px-5">
-            <span className="text-lg font-bold tracking-tight text-foreground">Weaver</span>
-            <ThemeToggle />
+      <div className="min-h-screen bg-background text-foreground">
+        <div className="mx-auto w-full max-w-[1380px] px-3 py-3 sm:px-4 sm:py-4">
+          <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-56 bg-gradient-to-br from-primary/10 via-transparent to-transparent" />
+            <div className="relative grid min-h-[calc(100vh-1.5rem)] md:grid-cols-[224px_minmax(0,1fr)]">
+              <aside className="hidden border-r border-border/60 bg-background/90 md:flex md:flex-col">
+                <div className="flex items-center justify-between border-b border-border/60 px-4 py-4">
+                  <div>
+                    <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
+                      Weaver
+                    </div>
+                    <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                      Queue Control
+                    </div>
+                  </div>
+                  <ThemeToggle />
+                </div>
+
+                <nav className="flex-1 px-2 py-3">
+                  <div className="space-y-1">
+                    {navItems.map((item) => {
+                      const Icon = item.icon;
+                      const topLevelActive = isActive(item.to);
+                      return (
+                        <div key={item.to}>
+                          <Link
+                            to={item.to}
+                            className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${
+                              topLevelActive
+                                ? "bg-primary/14 font-medium text-foreground"
+                                : "text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                            }`}
+                          >
+                            <Icon className="size-4" />
+                            <span>{t(item.labelKey)}</span>
+                          </Link>
+
+                          {item.to === "/settings" && settingsOpen ? (
+                            <div className="mt-1 ml-4 space-y-1 border-l border-border/50 pl-3">
+                              {settingsNav.map((entry) => {
+                                const childActive = location.pathname === entry.to;
+                                return (
+                                  <Link
+                                    key={entry.to}
+                                    to={entry.to}
+                                    className={`block rounded-lg px-2.5 py-1.5 text-sm transition ${
+                                      childActive
+                                        ? "bg-primary/10 font-medium text-foreground"
+                                        : "text-muted-foreground hover:bg-accent/30 hover:text-foreground"
+                                    }`}
+                                  >
+                                    {t(entry.labelKey)}
+                                  </Link>
+                                );
+                              })}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </nav>
+
+                <div className="mt-auto space-y-3 border-t border-border/60 px-3 py-3">
+                  <div className="rounded-2xl border border-border/70 bg-background/70 px-3 py-2.5">
+                    <div className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+                      {t("label.downloadSpeed")}
+                    </div>
+                    <SpeedDisplay
+                      bytesPerSec={liveData.speed}
+                      className="mt-1 text-base font-semibold text-foreground"
+                    />
+                  </div>
+                  <Button onClick={() => setUploadOpen(true)} className="w-full">
+                    <FolderUp className="size-4" />
+                    {t("nav.upload")}
+                  </Button>
+                </div>
+              </aside>
+
+              <main className="min-w-0 bg-transparent">
+                <header className="sticky top-0 z-10 flex items-center justify-between border-b border-border/60 bg-background/75 px-4 py-3 backdrop-blur md:hidden">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setMobileNavOpen(true)}
+                    >
+                      <Menu className="size-4" />
+                    </Button>
+                    <span className="font-space-grotesk text-lg font-semibold tracking-tight">
+                      Weaver
+                    </span>
+                  </div>
+                  <ThemeToggle />
+                </header>
+
+                <div className="w-full px-4 py-6 sm:px-6 md:px-8 md:py-8">
+                  <Outlet />
+                </div>
+              </main>
+            </div>
           </div>
-          <nav className="flex flex-1 flex-col gap-1 p-3">
-            {navItems.map((item) =>
-              item.to === "/upload" ? (
-                <button
-                  key={item.to}
-                  onClick={() => setUploadOpen(true)}
-                  className="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                >
-                  <NavIcon icon={item.icon} size={18} />
-                  {t(item.labelKey)}
-                </button>
-              ) : (
-                <Link
-                  key={item.to}
-                  to={item.to}
-                  className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
-                    isActive(item.to)
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                      : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                  }`}
-                >
-                  <NavIcon icon={item.icon} size={18} />
-                  {t(item.labelKey)}
-                </Link>
-              ),
-            )}
-          </nav>
-          <div className="border-t border-sidebar-border p-4">
-            <div className="text-xs text-muted-foreground">{t("label.downloadSpeed")}</div>
-            <SpeedDisplay
-              bytesPerSec={liveData.speed}
-              className="text-foreground"
-            />
-          </div>
-        </aside>
-
-        {/* Mobile header */}
-        <div className="flex flex-1 flex-col md:overflow-hidden">
-          <header className="flex h-14 items-center justify-between border-b border-border bg-sidebar px-4 md:hidden">
-            <button
-              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-              className="rounded-md p-2 text-foreground hover:bg-accent"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                {mobileMenuOpen ? (
-                  <><path d="M18 6 6 18" /><path d="m6 6 12 12" /></>
-                ) : (
-                  <><line x1="4" x2="20" y1="12" y2="12" /><line x1="4" x2="20" y1="6" y2="6" /><line x1="4" x2="20" y1="18" y2="18" /></>
-                )}
-              </svg>
-            </button>
-            <span className="text-lg font-bold tracking-tight text-foreground">Weaver</span>
-            <ThemeToggle />
-          </header>
-
-          {/* Mobile nav dropdown */}
-          {mobileMenuOpen && (
-            <nav className="border-b border-border bg-sidebar p-2 md:hidden">
-              {navItems.map((item) =>
-                item.to === "/upload" ? (
-                  <button
-                    key={item.to}
-                    onClick={() => {
-                      setMobileMenuOpen(false);
-                      setUploadOpen(true);
-                    }}
-                    className="flex w-full items-center gap-3 rounded-md px-3 py-3 text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                  >
-                    <NavIcon icon={item.icon} size={18} />
-                    {t(item.labelKey)}
-                  </button>
-                ) : (
-                  <Link
-                    key={item.to}
-                    to={item.to}
-                    onClick={() => setMobileMenuOpen(false)}
-                    className={`flex items-center gap-3 rounded-md px-3 py-3 text-sm font-medium transition-colors ${
-                      isActive(item.to)
-                        ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                        : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-                    }`}
-                  >
-                    <NavIcon icon={item.icon} size={18} />
-                    {t(item.labelKey)}
-                  </Link>
-                ),
-              )}
-              <div className="mt-2 border-t border-sidebar-border px-3 pt-2">
-                <div className="text-xs text-muted-foreground">{t("label.downloadSpeed")}</div>
-                <SpeedDisplay
-                  bytesPerSec={liveData.speed}
-                  className="text-foreground"
-                />
-              </div>
-            </nav>
-          )}
-
-          <main className="flex-1 overflow-auto">
-            <Outlet />
-          </main>
         </div>
+
+        <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+          <SheetContent side="left" className="w-[280px] p-0 sm:max-w-[280px]">
+            <SheetHeader className="border-b border-border/60 px-5 py-5 text-left">
+              <SheetTitle className="font-space-grotesk text-lg">Weaver</SheetTitle>
+              <SheetDescription>Queue Control</SheetDescription>
+            </SheetHeader>
+            <div className="flex h-full flex-col bg-background">
+              <nav className="flex-1 px-3 py-4">
+                <div className="space-y-1">
+                  {navItems.map((item) => {
+                    const Icon = item.icon;
+                    const topLevelActive = isActive(item.to);
+                    return (
+                      <div key={item.to}>
+                        <Link
+                          to={item.to}
+                          onClick={() => setMobileNavOpen(false)}
+                          className={`flex items-center gap-3 rounded-xl px-4 py-3 text-sm transition ${
+                            topLevelActive
+                              ? "bg-primary/14 font-medium text-foreground"
+                              : "text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                          }`}
+                        >
+                          <Icon className="size-4" />
+                          <span>{t(item.labelKey)}</span>
+                        </Link>
+
+                        {item.to === "/settings" && settingsOpen ? (
+                          <div className="mt-1 ml-5 space-y-1 border-l border-border/50 pl-4">
+                            {settingsNav.map((entry) => {
+                              const childActive = location.pathname === entry.to;
+                              return (
+                                <Link
+                                  key={entry.to}
+                                  to={entry.to}
+                                  onClick={() => setMobileNavOpen(false)}
+                                  className={`block rounded-lg px-3 py-2 text-sm transition ${
+                                    childActive
+                                      ? "bg-primary/10 font-medium text-foreground"
+                                      : "text-muted-foreground hover:bg-accent/30 hover:text-foreground"
+                                  }`}
+                                >
+                                  {t(entry.labelKey)}
+                                </Link>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              </nav>
+
+              <div className="space-y-4 border-t border-border/60 px-4 py-4">
+                <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3">
+                  <div className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+                    {t("label.downloadSpeed")}
+                  </div>
+                  <SpeedDisplay
+                    bytesPerSec={liveData.speed}
+                    className="mt-1 text-base font-semibold text-foreground"
+                  />
+                </div>
+                <Button
+                  onClick={() => {
+                    setMobileNavOpen(false);
+                    setUploadOpen(true);
+                  }}
+                  className="w-full"
+                >
+                  <FolderUp className="size-4" />
+                  {t("nav.upload")}
+                </Button>
+              </div>
+            </div>
+          </SheetContent>
+        </Sheet>
+
+        <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
       </div>
-      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
     </LiveDataContext.Provider>
   );
 }

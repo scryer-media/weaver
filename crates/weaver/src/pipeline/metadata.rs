@@ -5,18 +5,27 @@ impl Pipeline {
     /// and retain the Par2FileSet for repair. For obfuscated uploads, remap
     /// PAR2 file descriptions to use deobfuscated filenames (matched by volume number).
     pub(super) async fn try_load_par2_metadata(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let Some(file_asm) = state.assembly.file(file_id) else {
-            return;
+        let (filename, file_path, is_par2, is_index) = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            let Some(file_asm) = state.assembly.file(file_id) else {
+                return;
+            };
+
+            let is_par2 = matches!(
+                file_asm.role(),
+                weaver_core::classify::FileRole::Par2 { .. }
+            );
+            let is_index = matches!(
+                file_asm.role(),
+                weaver_core::classify::FileRole::Par2 { is_index: true, .. }
+            );
+            let filename = file_asm.filename().to_string();
+            let file_path = state.working_dir.join(&filename);
+            (filename, file_path, is_par2, is_index)
         };
 
-        // Only process PAR2 files.
-        let is_par2 = matches!(
-            file_asm.role(),
-            weaver_core::classify::FileRole::Par2 { .. }
-        );
         if !is_par2 {
             return;
         }
@@ -25,16 +34,9 @@ impl Pipeline {
         // exists yet (no index file), treat this recovery volume as the
         // initial source of PAR2 metadata — every PAR2 file contains the
         // file descriptions and checksums needed for verification.
-        if !matches!(
-            file_asm.role(),
-            weaver_core::classify::FileRole::Par2 { is_index: true, .. }
-        ) && self.par2_sets.contains_key(&job_id)
-        {
+        if !is_index && self.par2_sets.contains_key(&job_id) {
             return;
         }
-
-        let filename = file_asm.filename().to_string();
-        let file_path = state.working_dir.join(&filename);
 
         // Read the PAR2 file from disk.
         let par2_bytes = match tokio::fs::read(&file_path).await {
@@ -112,6 +114,8 @@ impl Pipeline {
         let slice_size = par2_set.slice_size;
         let recovery_block_count = par2_set.recovery_block_count();
 
+        self.note_recovery_block_count(job_id, file_id.file_index, recovery_block_count);
+
         info!(
             job_id = job_id.0,
             filename = %filename,
@@ -139,21 +143,25 @@ impl Pipeline {
     /// When a PAR2 recovery volume completes, parse it and merge recovery
     /// slices into the retained Par2FileSet (avoids re-reading at repair time).
     pub(super) async fn try_merge_par2_recovery(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let Some(file_asm) = state.assembly.file(file_id) else {
-            return;
-        };
+        let (filename, file_path, is_par2_volume) = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            let Some(file_asm) = state.assembly.file(file_id) else {
+                return;
+            };
 
-        // Only process PAR2 recovery volumes (not the index).
-        let is_par2_volume = matches!(
-            file_asm.role(),
-            weaver_core::classify::FileRole::Par2 {
-                is_index: false,
-                ..
-            }
-        );
+            let is_par2_volume = matches!(
+                file_asm.role(),
+                weaver_core::classify::FileRole::Par2 {
+                    is_index: false,
+                    ..
+                }
+            );
+            let filename = file_asm.filename().to_string();
+            let file_path = state.working_dir.join(&filename);
+            (filename, file_path, is_par2_volume)
+        };
         if !is_par2_volume {
             return;
         }
@@ -162,9 +170,6 @@ impl Pipeline {
         if !self.par2_sets.contains_key(&job_id) {
             return;
         }
-
-        let filename = file_asm.filename().to_string();
-        let file_path = state.working_dir.join(&filename);
 
         let par2_bytes = match tokio::fs::read(&file_path).await {
             Ok(bytes) => bytes,
@@ -179,18 +184,28 @@ impl Pipeline {
         let packet_list: Vec<_> = packets.into_iter().map(|(p, _)| p).collect();
 
         // Merge into the retained set (Arc::make_mut clones only if shared).
-        let par2_set = Arc::make_mut(self.par2_sets.get_mut(&job_id).unwrap());
-        match par2_set.merge_packets(packet_list) {
-            Ok(result) if result.new_recovery_slices > 0 => {
+        let merge_result = {
+            let par2_set = Arc::make_mut(self.par2_sets.get_mut(&job_id).unwrap());
+            let merge = par2_set.merge_packets(packet_list);
+            let total_recovery = par2_set.recovery_block_count();
+            (merge, total_recovery)
+        };
+        match merge_result {
+            (Ok(result), total_recovery) if result.new_recovery_slices > 0 => {
+                self.note_recovery_block_count(
+                    job_id,
+                    file_id.file_index,
+                    result.new_recovery_slices,
+                );
                 info!(
                     job_id = job_id.0,
                     filename = %filename,
                     recovery_blocks_merged = result.new_recovery_slices,
-                    total_recovery = par2_set.recovery_block_count(),
+                    total_recovery,
                     "merged PAR2 recovery volume"
                 );
             }
-            Err(e) => {
+            (Err(e), _) => {
                 warn!(
                     job_id = job_id.0,
                     filename = %filename,

@@ -53,10 +53,7 @@ impl Window {
         let dict_size = self.buf.len();
         if distance == 0 || distance > dict_size {
             return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "invalid LZ distance {} (dict_size={})",
-                    distance, dict_size
-                ),
+                detail: format!("invalid LZ distance {} (dict_size={})", distance, dict_size),
             });
         }
 
@@ -156,6 +153,14 @@ impl Window {
         }
 
         let dict_size = self.buf.len();
+        if unflushed > dict_size as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "window overrun: {unflushed} unflushed bytes exceeds dictionary size {dict_size}"
+                ),
+            ));
+        }
         let count = unflushed as usize;
 
         // Calculate the start position in the ring buffer.
@@ -411,5 +416,17 @@ mod tests {
         // Last 8 bytes written
         let output = w.copy_output(6, 8);
         assert_eq!(&output, b"ABCDEFAB");
+    }
+
+    #[test]
+    fn test_flush_to_writer_rejects_overfull_unflushed_region() {
+        let mut w = Window::new(8);
+        for i in 0..16u8 {
+            w.put_byte(i);
+        }
+
+        let mut out = Vec::new();
+        let err = w.flush_to_writer(&mut out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

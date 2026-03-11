@@ -27,6 +27,7 @@ impl NntpClientConfig {
             servers: vec![ServerPoolConfig {
                 server,
                 max_connections,
+                group: 0,
             }],
             max_idle_age: Duration::from_secs(300),
             max_retries_per_server: 1,
@@ -95,7 +96,13 @@ impl NntpClient {
         let server_count = self.pool.server_count();
         let mut last_error: Option<NntpError> = None;
 
-        for idx in 0..server_count {
+        // Sort servers by priority group so all primary servers are tried
+        // before any backfill server.
+        let mut order: Vec<usize> = (0..server_count).collect();
+        let server_groups = self.pool.server_groups();
+        order.sort_by_key(|&i| server_groups[i]);
+
+        for idx in order {
             let server = ServerId(idx);
 
             match self
@@ -108,8 +115,7 @@ impl NntpClient {
                 | Err(NntpError::NoArticleWithNumber) => {
                     debug!(
                         server = idx,
-                        message_id,
-                        "article not found, trying next server"
+                        message_id, "article not found, trying next server"
                     );
                     last_error = Some(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
@@ -121,8 +127,7 @@ impl NntpClient {
                 | Err(NntpError::AccessDenied) => {
                     warn!(
                         server = idx,
-                        message_id,
-                        "authentication/access failure, recording on health tracker"
+                        message_id, "authentication/access failure, recording on health tracker"
                     );
                     {
                         let mut health = self.pool.health().lock().await;
@@ -169,15 +174,17 @@ impl NntpClient {
     }
 
     /// Internal: fetch with multi-server failover logic.
-    async fn fetch_with_failover(
-        &self,
-        message_id: &str,
-        kind: FetchKind,
-    ) -> Result<Bytes> {
+    async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
         let server_count = self.pool.server_count();
         let mut last_error: Option<NntpError> = None;
 
-        for idx in 0..server_count {
+        // Sort servers by priority group so all primary servers are tried
+        // before any backfill server.
+        let mut order: Vec<usize> = (0..server_count).collect();
+        let groups = self.pool.server_groups();
+        order.sort_by_key(|&i| groups[i]);
+
+        for idx in order {
             let server = ServerId(idx);
 
             match self.fetch_from_server(server, message_id, kind).await {
@@ -187,8 +194,7 @@ impl NntpClient {
                 | Err(NntpError::NoArticleWithNumber) => {
                     debug!(
                         server = idx,
-                        message_id,
-                        "article not found, trying next server"
+                        message_id, "article not found, trying next server"
                     );
                     last_error = Some(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
@@ -200,8 +206,7 @@ impl NntpClient {
                 | Err(NntpError::AccessDenied) => {
                     warn!(
                         server = idx,
-                        message_id,
-                        "authentication/access failure, recording on health tracker"
+                        message_id, "authentication/access failure, recording on health tracker"
                     );
                     {
                         let mut health = self.pool.health().lock().await;
@@ -234,10 +239,7 @@ impl NntpClient {
     ///
     /// Returns `Ok(true)` if a group was selected, `Ok(false)` if none were
     /// accepted, or `Err` on a connection-level error.
-    async fn try_select_group(
-        conn: &mut PooledConnection,
-        groups: &[String],
-    ) -> Result<bool> {
+    async fn try_select_group(conn: &mut PooledConnection, groups: &[String]) -> Result<bool> {
         for group in groups {
             match conn.select_group(group).await {
                 Ok(()) => return Ok(true),
@@ -271,6 +273,7 @@ impl NntpClient {
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
                         conn.discard();
+                        self.pool.drain_all_idle().await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
@@ -310,6 +313,7 @@ impl NntpClient {
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
                         conn.discard();
+                        self.pool.drain_all_idle().await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
@@ -328,6 +332,7 @@ impl NntpClient {
                 Err(e) => {
                     if is_connection_error(&e) {
                         conn.discard();
+                        self.pool.drain_all_idle().await;
                     }
                     return Err(e);
                 }
@@ -362,6 +367,7 @@ impl NntpClient {
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
                         conn.discard();
+                        self.pool.drain_all_idle().await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
@@ -380,6 +386,7 @@ impl NntpClient {
                 Err(e) => {
                     if is_connection_error(&e) {
                         conn.discard();
+                        self.pool.drain_all_idle().await;
                     }
                     return Err(e);
                 }

@@ -4,8 +4,9 @@ pub mod classify;
 pub mod config;
 pub mod error;
 pub mod event;
-pub mod split_reader;
 pub mod id;
+pub mod release_name;
+pub mod split_reader;
 pub mod system;
 
 pub use error::Error;

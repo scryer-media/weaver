@@ -46,9 +46,7 @@ impl FileRole {
 
         // RAR volume detection (multiple naming schemes)
         if let Some(vol) = parse_rar_volume(&lower) {
-            return FileRole::RarVolume {
-                volume_number: vol,
-            };
+            return FileRole::RarVolume { volume_number: vol };
         }
 
         // 7z detection
@@ -73,9 +71,7 @@ impl FileRole {
     /// - PAR2 recovery blocks last (only needed if damage detected)
     pub fn download_priority(&self) -> u32 {
         match self {
-            FileRole::Par2 {
-                is_index: true, ..
-            } => 0,
+            FileRole::Par2 { is_index: true, .. } => 0,
             FileRole::RarVolume { volume_number: 0 } => 1,
             FileRole::SevenZipArchive => 2,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
@@ -91,7 +87,13 @@ impl FileRole {
     /// Whether this file role is a recovery/repair file that should be
     /// routed to the recovery queue (downloaded only with spare bandwidth).
     pub fn is_recovery(&self) -> bool {
-        matches!(self, FileRole::Par2 { is_index: false, .. })
+        matches!(
+            self,
+            FileRole::Par2 {
+                is_index: false,
+                ..
+            }
+        )
     }
 }
 
@@ -211,8 +213,8 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
 /// Check if the file extension indicates a standalone (non-archive) file.
 fn is_standalone_extension(lower: &str) -> bool {
     let standalone = [
-        ".nfo", ".txt", ".jpg", ".jpeg", ".png", ".gif", ".nzb", ".sfv", ".md5", ".url",
-        ".srr", ".srs",
+        ".nfo", ".txt", ".jpg", ".jpeg", ".png", ".gif", ".nzb", ".sfv", ".md5", ".url", ".srr",
+        ".srs",
     ];
     standalone.iter().any(|ext| lower.ends_with(ext))
 }
@@ -330,10 +332,7 @@ mod tests {
     fn standalone() {
         assert_eq!(FileRole::from_filename("info.nfo"), FileRole::Standalone);
         assert_eq!(FileRole::from_filename("readme.txt"), FileRole::Standalone);
-        assert_eq!(
-            FileRole::from_filename("cover.jpg"),
-            FileRole::Standalone
-        );
+        assert_eq!(FileRole::from_filename("cover.jpg"), FileRole::Standalone);
     }
 
     #[test]
@@ -397,7 +396,10 @@ mod tests {
     #[test]
     fn archive_base_name_rar() {
         assert_eq!(
-            archive_base_name("movie.part01.rar", &FileRole::RarVolume { volume_number: 0 }),
+            archive_base_name(
+                "movie.part01.rar",
+                &FileRole::RarVolume { volume_number: 0 }
+            ),
             Some("movie".into())
         );
         assert_eq!(

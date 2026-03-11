@@ -159,10 +159,10 @@ pub fn rar4_derive_key(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
     // 4-byte group to match unrar's little-endian extraction.
     let mut key = [0u8; 16];
     for word in 0..4 {
-        key[word * 4]     = digest[word * 4 + 3]; // LSB
+        key[word * 4] = digest[word * 4 + 3]; // LSB
         key[word * 4 + 1] = digest[word * 4 + 2];
         key[word * 4 + 2] = digest[word * 4 + 1];
-        key[word * 4 + 3] = digest[word * 4];     // MSB
+        key[word * 4 + 3] = digest[word * 4]; // MSB
     }
 
     (key, iv)
@@ -371,7 +371,9 @@ impl<R: Read> Read for DecryptingReader<R> {
 
         // Read more from inner.
         let bytes_read = if !self.inner_eof {
-            let n = self.inner.read(&mut raw[raw_start..raw_start + DECRYPT_BUF_SIZE])?;
+            let n = self
+                .inner
+                .read(&mut raw[raw_start..raw_start + DECRYPT_BUF_SIZE])?;
             if n == 0 {
                 self.inner_eof = true;
             }
@@ -490,13 +492,8 @@ mod tests {
         // matching the continuous chain in unrar's crypt5.cpp.
         let iterations = (1u32 << (kdf_count as u32)) + 32;
         let mut v2 = [0u8; 32];
-        pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(
-            b"testpass",
-            &salt,
-            iterations,
-            &mut v2,
-        )
-        .unwrap();
+        pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(b"testpass", &salt, iterations, &mut v2)
+            .unwrap();
 
         // XOR-fold V2 from 32 bytes to 8 bytes.
         let mut psw_check = [0u8; 8];
@@ -507,8 +504,18 @@ mod tests {
         let mut check_data = [0u8; 12];
         check_data[..8].copy_from_slice(&psw_check);
 
-        assert!(verify_password_check("testpass", &salt, kdf_count, &check_data));
-        assert!(!verify_password_check("wrongpass", &salt, kdf_count, &check_data));
+        assert!(verify_password_check(
+            "testpass",
+            &salt,
+            kdf_count,
+            &check_data
+        ));
+        assert!(!verify_password_check(
+            "wrongpass",
+            &salt,
+            kdf_count,
+            &check_data
+        ));
     }
 
     // RAR4 crypto tests

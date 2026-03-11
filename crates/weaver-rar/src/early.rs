@@ -54,7 +54,11 @@ fn detect_rar5_encryption(data: &[u8]) -> EncryptionStatus {
     // Parse the first header to check if it's an encryption header (type 4).
     let (header_type, header_end) = match parse_rar5_header_envelope(data) {
         Ok(v) => v,
-        Err(need) => return EncryptionStatus::Insufficient { min_bytes: 8 + need },
+        Err(need) => {
+            return EncryptionStatus::Insufficient {
+                min_bytes: 8 + need,
+            };
+        }
     };
 
     // RAR5 header type 4 = Encryption — all subsequent headers are encrypted.
@@ -72,14 +76,17 @@ fn detect_rar5_encryption(data: &[u8]) -> EncryptionStatus {
     let remaining = &data[header_end..];
     let (header_type2, header2_body, _header2_end) = match parse_rar5_header_with_body(remaining) {
         Ok(v) => v,
-        Err(need) => return EncryptionStatus::Insufficient { min_bytes: 8 + header_end + need },
+        Err(need) => {
+            return EncryptionStatus::Insufficient {
+                min_bytes: 8 + header_end + need,
+            };
+        }
     };
 
     // Type 2 = File, Type 3 = Service — both can have encryption extra records.
-    if (header_type2 == 2 || header_type2 == 3)
-        && has_rar5_encryption_extra(&header2_body) {
-            return EncryptionStatus::FileEncrypted;
-        }
+    if (header_type2 == 2 || header_type2 == 3) && has_rar5_encryption_extra(&header2_body) {
+        return EncryptionStatus::FileEncrypted;
+    }
 
     EncryptionStatus::None
 }
@@ -146,11 +153,15 @@ fn has_rar5_encryption_extra(body: &[u8]) -> bool {
     let mut pos = 0;
 
     // header_type vint
-    let Ok((_, n)) = vint::read_vint(&body[pos..]) else { return false };
+    let Ok((_, n)) = vint::read_vint(&body[pos..]) else {
+        return false;
+    };
     pos += n;
 
     // header_flags vint
-    let Ok((flags, n)) = vint::read_vint(&body[pos..]) else { return false };
+    let Ok((flags, n)) = vint::read_vint(&body[pos..]) else {
+        return false;
+    };
     pos += n;
 
     let has_extra = flags & 0x0001 != 0; // EXTRA_AREA flag
@@ -159,7 +170,9 @@ fn has_rar5_encryption_extra(body: &[u8]) -> bool {
     }
 
     // extra_area_size vint
-    let Ok((extra_area_size, _)) = vint::read_vint(&body[pos..]) else { return false };
+    let Ok((extra_area_size, _)) = vint::read_vint(&body[pos..]) else {
+        return false;
+    };
 
     // Extra area is the last `extra_area_size` bytes of the body.
     let ea_size = extra_area_size as usize;
@@ -171,7 +184,9 @@ fn has_rar5_encryption_extra(body: &[u8]) -> bool {
     // Walk extra records looking for encryption (type 1).
     let mut ea_pos = 0;
     while ea_pos < extra_area.len() {
-        let Ok((record_size, n)) = vint::read_vint(&extra_area[ea_pos..]) else { break };
+        let Ok((record_size, n)) = vint::read_vint(&extra_area[ea_pos..]) else {
+            break;
+        };
         ea_pos += n;
 
         let record_end = ea_pos + record_size as usize;
@@ -179,7 +194,9 @@ fn has_rar5_encryption_extra(body: &[u8]) -> bool {
             break;
         }
 
-        let Ok((record_type, _)) = vint::read_vint(&extra_area[ea_pos..]) else { break };
+        let Ok((record_type, _)) = vint::read_vint(&extra_area[ea_pos..]) else {
+            break;
+        };
 
         // File encryption extra record type = 1.
         if record_type == 1 {
@@ -215,13 +232,17 @@ fn detect_rar4_encryption(data: &[u8]) -> EncryptionStatus {
 
     // Skip to the first file header.
     if data.len() < header_size {
-        return EncryptionStatus::Insufficient { min_bytes: 7 + header_size + 7 };
+        return EncryptionStatus::Insufficient {
+            min_bytes: 7 + header_size + 7,
+        };
     }
     let file_data = &data[header_size..];
 
     // File header: CRC16(2) + type(1) + flags(2) + size(2) = 7 bytes minimum
     if file_data.len() < 7 {
-        return EncryptionStatus::Insufficient { min_bytes: 7 + header_size + 7 };
+        return EncryptionStatus::Insufficient {
+            min_bytes: 7 + header_size + 7,
+        };
     }
 
     let file_type = file_data[2];

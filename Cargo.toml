@@ -41,7 +41,7 @@ hmac = "0.12"
 getrandom = "0.3"
 hex = "0.4"
 rayon = "1.10"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", features = ["ring"] }
 rustls-pemfile = "2"
 webpki-roots = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -63,3 +63,9 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = "3"
 zstd = "0.13"
 sevenz-rust2 = { version = "0.20", features = ["aes256", "bzip2", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+feed-rs = "2.3"
+regex = "1.11"
+tar = "0.4"
+age = "0.11"
+scryer-release-parser = { git = "https://github.com/scryer-media/scryer.git", package = "scryer-release-parser", rev = "114688d" }

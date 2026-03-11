@@ -126,8 +126,7 @@ fn parse_crc_hex(s: &str) -> Result<u32, YencError> {
 /// Returns parsed metadata, the byte range of encoded data, and =yend fields.
 pub fn parse_headers(input: &[u8]) -> Result<ParsedHeaders, YencError> {
     // Find =ybegin line.
-    let ybegin_start =
-        find_line_start(input, b"=ybegin ").ok_or(YencError::MissingHeader)?;
+    let ybegin_start = find_line_start(input, b"=ybegin ").ok_or(YencError::MissingHeader)?;
     let (ybegin_line_end, after_ybegin) = line_end(input, ybegin_start);
 
     let ybegin_content = &input[ybegin_start + 8..ybegin_line_end];
@@ -251,12 +250,13 @@ pub fn extract_filename_from_subject(subject: &str) -> Option<String> {
 
         // Try to find a quoted string
         if let Some(last_quote) = before_yenc.rfind('"')
-            && let Some(first_quote) = before_yenc[..last_quote].rfind('"') {
-                let filename = &before_yenc[first_quote + 1..last_quote];
-                if !filename.is_empty() {
-                    return Some(filename.to_string());
-                }
+            && let Some(first_quote) = before_yenc[..last_quote].rfind('"')
+        {
+            let filename = &before_yenc[first_quote + 1..last_quote];
+            if !filename.is_empty() {
+                return Some(filename.to_string());
             }
+        }
 
         // Strategy 2: Unquoted - take the last whitespace-delimited token before "yEnc"
         if let Some(last_token) = before_yenc.split_whitespace().next_back() {
@@ -466,7 +466,11 @@ mod tests {
         let fields = parse_fields("  line=128  size=100  name=test file.bin");
         assert!(fields.iter().any(|(k, v)| k == "line" && v == "128"));
         assert!(fields.iter().any(|(k, v)| k == "size" && v == "100"));
-        assert!(fields.iter().any(|(k, v)| k == "name" && v == "test file.bin"));
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "name" && v == "test file.bin")
+        );
     }
 
     #[test]

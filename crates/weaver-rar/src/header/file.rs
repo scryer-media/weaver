@@ -251,16 +251,7 @@ mod tests {
 
     #[test]
     fn test_directory_entry() {
-        let data = build_file_header(
-            flags::DIRECTORY,
-            0,
-            0o755,
-            None,
-            None,
-            0,
-            1,
-            "subdir/",
-        );
+        let data = build_file_header(flags::DIRECTORY, 0, 0o755, None, None, 0, 1, "subdir/");
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
         let data_offset = cursor.position();

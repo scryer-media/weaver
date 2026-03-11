@@ -153,7 +153,12 @@ mod tests {
             job_id: JobId(1),
             file_index: 0,
         };
-        FileAssembly::new(file_id, "test.rar".into(), FileRole::RarVolume { volume_number: 0 }, segment_sizes)
+        FileAssembly::new(
+            file_id,
+            "test.rar".into(),
+            FileRole::RarVolume { volume_number: 0 },
+            segment_sizes,
+        )
     }
 
     #[test]

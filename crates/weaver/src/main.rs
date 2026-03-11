@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -101,9 +101,19 @@ async fn async_main() {
     match cli.command {
         Command::Download { nzb, output } => {
             let data_dir = PathBuf::from(&config.data_dir);
-            let intermediate_dir = output.unwrap_or_else(|| PathBuf::from(config.intermediate_dir()));
+            let intermediate_dir =
+                output.unwrap_or_else(|| PathBuf::from(config.intermediate_dir()));
             let complete_dir = PathBuf::from(config.complete_dir());
-            if let Err(e) = run_download(&mut config, &db, &nzb, &data_dir, &intermediate_dir, &complete_dir).await {
+            if let Err(e) = run_download(
+                &mut config,
+                &db,
+                &nzb,
+                &data_dir,
+                &intermediate_dir,
+                &complete_dir,
+            )
+            .await
+            {
                 error!("download failed: {e}");
                 std::process::exit(1);
             }
@@ -257,9 +267,25 @@ async fn run_download(
 
     // Create and start the pipeline.
     let total_connections: usize = config.servers.iter().map(|s| s.connections as usize).sum();
-    let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir.to_path_buf(), intermediate_dir.to_path_buf(), complete_dir.to_path_buf(), total_connections, write_buf_max, vec![], shared_state, db.clone())
-            .await?;
+    let standalone_config: weaver_core::config::SharedConfig =
+        std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
+    let mut pipeline = pipeline::Pipeline::new(
+        cmd_rx,
+        event_tx,
+        nntp,
+        buffers,
+        profile,
+        data_dir.to_path_buf(),
+        intermediate_dir.to_path_buf(),
+        complete_dir.to_path_buf(),
+        total_connections,
+        write_buf_max,
+        vec![],
+        shared_state,
+        db.clone(),
+        standalone_config,
+    )
+    .await?;
 
     // Start the pipeline BEFORE submitting the job — add_job awaits a reply
     // from the pipeline loop, so the loop must be running first.
@@ -268,7 +294,9 @@ async fn run_download(
     });
 
     // Submit the job via the handle.
-    handle.add_job(job_id, job_spec, nzb_path.to_path_buf()).await?;
+    handle
+        .add_job(job_id, job_spec, nzb_path.to_path_buf())
+        .await?;
 
     // Wait for shutdown signal.
     wait_for_shutdown().await;
@@ -395,7 +423,11 @@ async fn run_server_command(
             initial_history.push(weaver_scheduler::JobInfo {
                 job_id,
                 name,
-                error: if let weaver_scheduler::JobStatus::Failed { error } = &status { Some(error.clone()) } else { None },
+                error: if let weaver_scheduler::JobStatus::Failed { error } = &status {
+                    Some(error.clone())
+                } else {
+                    None
+                },
                 status,
                 progress: 1.0,
                 total_bytes: 0,
@@ -453,8 +485,17 @@ async fn run_server_command(
                                 recovered.category,
                                 recovered.metadata,
                             );
-                            let status = status_str_to_job_status(&recovered.status, recovered.error.as_deref());
-                            to_restore.push((job_id, spec, recovered.committed_segments, status, recovered.output_dir));
+                            let status = status_str_to_job_status(
+                                &recovered.status,
+                                recovered.error.as_deref(),
+                            );
+                            to_restore.push((
+                                job_id,
+                                spec,
+                                recovered.committed_segments,
+                                status,
+                                recovered.output_dir,
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -489,7 +530,11 @@ async fn run_server_command(
                 initial_history.push(weaver_scheduler::JobInfo {
                     job_id,
                     name: row.name,
-                    error: if let weaver_scheduler::JobStatus::Failed { error } = &status { Some(error.clone()) } else { None },
+                    error: if let weaver_scheduler::JobStatus::Failed { error } = &status {
+                        Some(error.clone())
+                    } else {
+                        None
+                    },
                     status,
                     progress: 1.0,
                     total_bytes: row.total_bytes,
@@ -498,7 +543,10 @@ async fn run_server_command(
                     health: row.health,
                     password: None,
                     category: row.category,
-                    metadata: row.metadata.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default(),
+                    metadata: row
+                        .metadata
+                        .and_then(|m| serde_json::from_str(&m).ok())
+                        .unwrap_or_default(),
                     output_dir: row.output_dir,
                     created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
@@ -510,7 +558,10 @@ async fn run_server_command(
     }
 
     if !initial_history.is_empty() {
-        info!(count = initial_history.len(), "recovered finished jobs for history");
+        info!(
+            count = initial_history.len(),
+            "recovered finished jobs for history"
+        );
     }
     if !to_restore.is_empty() {
         info!(count = to_restore.len(), "recovering in-progress jobs");
@@ -519,8 +570,17 @@ async fn run_server_command(
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.publish_jobs(initial_history.clone());
 
+    let rss = weaver_api::RssService::new(handle.clone(), shared_config.clone(), db.clone());
+    let backup = weaver_api::BackupService::new(
+        handle.clone(),
+        shared_config.clone(),
+        db.clone(),
+        rss.clone(),
+    );
+
     // Build GraphQL schema with shared config and database.
-    let schema = weaver_api::build_schema(handle.clone(), shared_config, db.clone());
+    let pipeline_config = shared_config.clone();
+    let schema = weaver_api::build_schema(handle.clone(), shared_config, db.clone(), rss.clone());
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
     {
@@ -530,8 +590,23 @@ async fn run_server_command(
     }
 
     // Create and start the pipeline.
-    let mut pipeline =
-        pipeline::Pipeline::new(cmd_rx, event_tx, nntp, buffers, profile, data_dir, intermediate_dir, complete_dir, total_connections, write_buf_max, initial_history, shared_state, db.clone()).await?;
+    let mut pipeline = pipeline::Pipeline::new(
+        cmd_rx,
+        event_tx,
+        nntp,
+        buffers,
+        profile,
+        data_dir,
+        intermediate_dir,
+        complete_dir,
+        total_connections,
+        write_buf_max,
+        initial_history,
+        shared_state,
+        db.clone(),
+        pipeline_config,
+    )
+    .await?;
 
     let pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
@@ -540,15 +615,20 @@ async fn run_server_command(
     // Restore in-progress jobs from SQLite.
     for (job_id, spec, committed, status, working_dir) in to_restore {
         let committed_count = committed.len();
-        match handle.restore_job(job_id, spec, committed, status, working_dir).await {
+        match handle
+            .restore_job(job_id, spec, committed, status, working_dir)
+            .await
+        {
             Ok(()) => info!(job_id = job_id.0, committed_count, "job restored"),
             Err(e) => error!(job_id = job_id.0, error = %e, "failed to restore job"),
         }
     }
 
+    let rss_task = rss.start_background_loop();
+
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let server_task = tokio::spawn(server::run_server(schema, db.clone(), addr));
+    let server_task = tokio::spawn(server::run_server(schema, db.clone(), backup, addr));
 
     // Wait for shutdown signal.
     wait_for_shutdown().await;
@@ -557,6 +637,7 @@ async fn run_server_command(
 
     pipeline_task.await.ok();
     server_task.abort();
+    rss_task.abort();
 
     Ok(())
 }
@@ -629,10 +710,11 @@ fn status_str_to_job_status(status: &str, error: Option<&str>) -> weaver_schedul
 
 /// Build an NntpClient from the config's active server list.
 pub fn build_nntp_client(config: &Config) -> NntpClient {
-    let servers: Vec<ServerPoolConfig> = config
-        .servers
+    let mut active: Vec<&weaver_core::config::ServerConfig> =
+        config.servers.iter().filter(|s| s.active).collect();
+    active.sort_by_key(|s| (s.priority, s.id));
+    let servers: Vec<ServerPoolConfig> = active
         .iter()
-        .filter(|s| s.active)
         .map(|s| ServerPoolConfig {
             server: weaver_nntp::ServerConfig {
                 host: s.host.clone(),
@@ -643,6 +725,7 @@ pub fn build_nntp_client(config: &Config) -> NntpClient {
                 ..Default::default()
             },
             max_connections: s.connections as usize,
+            group: s.priority,
         })
         .collect();
 
@@ -657,20 +740,30 @@ pub fn build_nntp_client(config: &Config) -> NntpClient {
 
 /// Background task that subscribes to pipeline events and persists meaningful
 /// ones to SQLite for the job event log.
-async fn persist_events(
-    mut rx: broadcast::Receiver<PipelineEvent>,
-    db: Database,
-) {
+async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database) {
     use weaver_api::PipelineEventGql;
 
-    // High-frequency per-segment events are not persisted.
+    // Only persist job-level milestones. Per-segment and per-file events go to
+    // system logs (tracing) only — they're too numerous for SQLite on large NZBs.
     fn is_noisy(event: &PipelineEvent) -> bool {
         matches!(
             event,
+            // Per-segment download/decode events
             PipelineEvent::ArticleDownloaded { .. }
-                | PipelineEvent::SegmentDecoded { .. }
-                | PipelineEvent::SegmentCommitted { .. }
+                | PipelineEvent::ArticleNotFound { .. }
                 | PipelineEvent::SegmentQueued { .. }
+                | PipelineEvent::SegmentDecoded { .. }
+                | PipelineEvent::SegmentDecodeFailed { .. }
+                | PipelineEvent::SegmentCommitted { .. }
+                | PipelineEvent::SegmentRetryScheduled { .. }
+                | PipelineEvent::SegmentFailedPermanent { .. }
+                // Per-file events
+                | PipelineEvent::FileComplete { .. }
+                | PipelineEvent::FileClassified { .. }
+                | PipelineEvent::VerificationStarted { .. }
+                | PipelineEvent::VerificationComplete { .. }
+                | PipelineEvent::ExtractionProgress { .. }
+                | PipelineEvent::RepairConfidenceUpdated { .. }
         )
     }
 

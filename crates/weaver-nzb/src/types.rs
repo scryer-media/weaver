@@ -53,12 +53,13 @@ impl NzbFile {
 
         // Strategy 1: extract from double-quoted string (most common Usenet pattern).
         if let Some(start) = subject.find('"')
-            && let Some(end) = subject[start + 1..].find('"') {
-                let name = &subject[start + 1..start + 1 + end];
-                if !name.is_empty() {
-                    return Some(name);
-                }
+            && let Some(end) = subject[start + 1..].find('"')
+        {
+            let name = &subject[start + 1..start + 1 + end];
+            if !name.is_empty() {
+                return Some(name);
             }
+        }
 
         // Strategy 2: grab the last filename-like token before yEnc or (N/N).
         // Strip trailing " yEnc ..." or " (N/N)" and take the last whitespace-delimited token.
@@ -76,7 +77,9 @@ impl NzbFile {
         }
 
         // Take the last whitespace-delimited token if it looks like a filename (has a dot).
-        let last_token = trimmed.rsplit_once(char::is_whitespace).map_or(trimmed, |(_, t)| t);
+        let last_token = trimmed
+            .rsplit_once(char::is_whitespace)
+            .map_or(trimmed, |(_, t)| t);
         if last_token.contains('.') && !last_token.is_empty() {
             return Some(last_token);
         }

@@ -1,11 +1,15 @@
-import { createBrowserRouter } from "react-router";
+import { createBrowserRouter, Navigate } from "react-router";
 import { Layout } from "@/components/Layout";
 import { JobList } from "@/pages/JobList";
 import { JobDetail } from "@/pages/JobDetail";
 import { Upload } from "@/pages/Upload";
 import { Servers } from "@/pages/Servers";
-import { Settings } from "@/pages/Settings";
+import { Categories } from "@/pages/Categories";
 import { History } from "@/pages/History";
+import { SettingsLayout } from "@/pages/settings/SettingsLayout";
+import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
+import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
+import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 
 export const router = createBrowserRouter([
   {
@@ -15,8 +19,20 @@ export const router = createBrowserRouter([
       { path: "jobs/:id", element: <JobDetail /> },
       { path: "upload", element: <Upload /> },
       { path: "history", element: <History /> },
-      { path: "servers", element: <Servers /> },
-      { path: "settings", element: <Settings /> },
+      { path: "servers", element: <Navigate to="/settings/servers" replace /> },
+      { path: "categories", element: <Navigate to="/settings/categories" replace /> },
+      {
+        path: "settings",
+        element: <SettingsLayout />,
+        children: [
+          { index: true, element: <Navigate to="general" replace /> },
+          { path: "general", element: <GeneralSettingsPage /> },
+          { path: "security", element: <SecuritySettingsPage /> },
+          { path: "backup", element: <BackupSettingsPage /> },
+          { path: "categories", element: <Categories embedded /> },
+          { path: "servers", element: <Servers embedded /> },
+        ],
+      },
     ],
   },
 ]);

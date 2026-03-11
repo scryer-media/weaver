@@ -17,7 +17,7 @@ impl Default for Limits {
             max_header_size: 16 * 1024 * 1024,         // 16 MB
             max_data_segment: 2 * 1024 * 1024 * 1024,  // 2 GB
             max_unpacked_size: 4 * 1024 * 1024 * 1024, // 4 GB
-            max_dict_size: 256 * 1024 * 1024,           // 256 MB
+            max_dict_size: 256 * 1024 * 1024,          // 256 MB
         }
     }
 }

@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 /// Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub data_dir: String,
     /// Directory for active downloads (per-job subdirectories).
@@ -22,6 +22,8 @@ pub struct Config {
     pub tuner: Option<TunerOverrides>,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    #[serde(default)]
+    pub categories: Vec<CategoryConfig>,
     #[serde(default)]
     pub retry: Option<RetryOverrides>,
     /// Maximum download speed in bytes/sec. 0 or absent means unlimited.
@@ -94,8 +96,7 @@ impl Config {
             .config_path
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no config path set"))?;
-        let toml_str = toml::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let toml_str = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, toml_str)
     }
 
@@ -110,6 +111,22 @@ impl Config {
         for server in &mut self.servers {
             if server.id == 0 {
                 server.id = next;
+                next += 1;
+            }
+        }
+    }
+
+    /// Return the next available category ID.
+    pub fn next_category_id(&self) -> u32 {
+        self.categories.iter().map(|c| c.id).max().unwrap_or(0) + 1
+    }
+
+    /// Assign IDs to any categories that have id == 0.
+    pub fn assign_category_ids(&mut self) {
+        let mut next = self.next_category_id();
+        for cat in &mut self.categories {
+            if cat.id == 0 {
+                cat.id = next;
                 next += 1;
             }
         }
@@ -138,23 +155,105 @@ pub struct ServerConfig {
     /// Auto-detected when the server is added or tested.
     #[serde(default)]
     pub supports_pipelining: bool,
+    /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
+    #[serde(default)]
+    pub priority: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryConfig {
+    /// Stable identifier for CRUD operations.
+    #[serde(default)]
+    pub id: u32,
+    /// Unique category name (canonical form).
+    pub name: String,
+    /// Optional destination directory override. If absent, uses
+    /// `{complete_dir}/{name}/` as the default.
+    #[serde(default)]
+    pub dest_dir: Option<String>,
+    /// Comma-separated aliases for matching from RSS/URL/API submissions.
+    /// Supports glob-style wildcards (`*` and `?`).
+    #[serde(default)]
+    pub aliases: String,
+}
+
+/// Resolve a category string to a canonical category name.
+///
+/// 1. Exact case-insensitive match on category names.
+/// 2. Glob match against comma-separated aliases.
+///
+/// Returns the canonical name of the first match, or `None`.
+pub fn resolve_category(categories: &[CategoryConfig], input: &str) -> Option<String> {
+    let input_lower = input.trim();
+    if input_lower.is_empty() {
+        return None;
+    }
+
+    // Exact name match (case-insensitive).
+    for cat in categories {
+        if cat.name.eq_ignore_ascii_case(input_lower) {
+            return Some(cat.name.clone());
+        }
+    }
+
+    // Alias glob match.
+    for cat in categories {
+        for alias in cat.aliases.split(',') {
+            let alias = alias.trim();
+            if !alias.is_empty() && glob_match_ci(alias, input_lower) {
+                return Some(cat.name.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Simple case-insensitive glob matcher supporting `*` (any sequence) and `?` (any single char).
+fn glob_match_ci(pattern: &str, input: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = input.chars().collect();
+    let (mut pi, mut si) = (0, 0);
+    let (mut star_pi, mut star_si) = (usize::MAX, 0);
+
+    while si < s.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star_pi = pi;
+            star_si = si;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&s[si])) {
+            pi += 1;
+            si += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferPoolOverrides {
     pub small_count: Option<usize>,
     pub medium_count: Option<usize>,
     pub large_count: Option<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryOverrides {
     pub max_retries: Option<u32>,
     pub base_delay_secs: Option<f64>,
     pub multiplier: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunerOverrides {
     pub max_concurrent_downloads: Option<usize>,
     pub max_decode_queue: Option<usize>,

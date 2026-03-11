@@ -100,7 +100,7 @@ pub mod common_flags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rar4Method {
     /// Store (no compression).
-    Store,   // 0x30
+    Store, // 0x30
     Fastest, // 0x31
     Fast,    // 0x32
     Normal,  // 0x33
@@ -214,7 +214,10 @@ mod tests {
         assert_eq!(Rar4HeaderType::from(0x73), Rar4HeaderType::Archive);
         assert_eq!(Rar4HeaderType::from(0x74), Rar4HeaderType::File);
         assert_eq!(Rar4HeaderType::from(0x7B), Rar4HeaderType::EndArchive);
-        assert!(matches!(Rar4HeaderType::from(0xFF), Rar4HeaderType::Unknown(0xFF)));
+        assert!(matches!(
+            Rar4HeaderType::from(0xFF),
+            Rar4HeaderType::Unknown(0xFF)
+        ));
     }
 
     #[test]

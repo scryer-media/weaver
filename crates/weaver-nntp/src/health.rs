@@ -16,7 +16,10 @@ pub enum ServerState {
     /// Server is experiencing transient failures but is still usable.
     Degraded { consecutive_failures: u32 },
     /// Server is temporarily disabled and should not be used.
-    Disabled { until: Instant, reason: DisableReason },
+    Disabled {
+        until: Instant,
+        reason: DisableReason,
+    },
 }
 
 /// Why a server was disabled.
@@ -136,10 +139,11 @@ impl ServerHealth {
     /// back to Healthy. Otherwise this is a no-op.
     pub fn check_reenable(&mut self) {
         if let ServerState::Disabled { until, .. } = self.state
-            && Instant::now() >= until {
-                self.consecutive_failures = 0;
-                self.state = ServerState::Healthy;
-            }
+            && Instant::now() >= until
+        {
+            self.consecutive_failures = 0;
+            self.state = ServerState::Healthy;
+        }
     }
 
     /// Compute the exponential backoff duration capped at `max_backoff`.
@@ -252,7 +256,9 @@ mod tests {
         health.record_failure(false);
         assert!(matches!(
             health.state(),
-            ServerState::Degraded { consecutive_failures: 3 }
+            ServerState::Degraded {
+                consecutive_failures: 3
+            }
         ));
         assert!(health.is_available());
     }
@@ -268,7 +274,10 @@ mod tests {
 
         assert!(matches!(
             health.state(),
-            ServerState::Disabled { reason: DisableReason::ConsecutiveFailures, .. }
+            ServerState::Disabled {
+                reason: DisableReason::ConsecutiveFailures,
+                ..
+            }
         ));
         assert!(!health.is_available());
         assert_eq!(health.failure_count, 5);
@@ -283,7 +292,10 @@ mod tests {
 
         assert!(matches!(
             health.state(),
-            ServerState::Disabled { reason: DisableReason::AuthFailure, .. }
+            ServerState::Disabled {
+                reason: DisableReason::AuthFailure,
+                ..
+            }
         ));
         assert!(!health.is_available());
         assert_eq!(health.failure_count, 1);

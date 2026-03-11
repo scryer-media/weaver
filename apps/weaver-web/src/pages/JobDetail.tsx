@@ -1,17 +1,32 @@
-import { useParams, Link } from "react-router";
-import { useQuery, useMutation, useSubscription } from "urql";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router";
+import { useMutation, useQuery, useSubscription } from "urql";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { JobProgress } from "@/components/JobProgress";
+import { JobStatusBadge } from "@/components/JobStatusBadge";
+import { PageHeader } from "@/components/PageHeader";
+import { ParsedReleaseDetails } from "@/components/ParsedReleaseDetails";
+import { formatBytes } from "@/components/SpeedDisplay";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  CANCEL_JOB_MUTATION,
+  DELETE_HISTORY_MUTATION,
+  EVENTS_SUBSCRIPTION,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
-  RESUME_JOB_MUTATION,
-  CANCEL_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
-  EVENTS_SUBSCRIPTION,
+  RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { ProgressBar } from "@/components/ProgressBar";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { formatBytes } from "@/components/SpeedDisplay";
+import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 
 interface EventEntry {
@@ -26,55 +41,89 @@ export function JobDetail() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);
+  const navigate = useNavigate();
+  const { jobs: liveJobs } = useLiveData();
 
-  const [{ data, fetching }] = useQuery({
-    query: JOB_QUERY,
-    variables: { id: jobId },
-  });
-
+  const [{ data, fetching }] = useQuery({ query: JOB_QUERY, variables: { id: jobId } });
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
 
   const [events, setEvents] = useState<EventEntry[]>([]);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [lastLiveJob, setLastLiveJob] = useState<(typeof liveJobs)[number] | null>(null);
   const seededRef = useRef(false);
+  const liveJob = liveJobs.find((candidate) => candidate.id === jobId) ?? null;
 
-  // Seed events from historical query data when it first loads.
   useEffect(() => {
-    if (data?.jobEvents && !seededRef.current) {
+    setLastLiveJob(null);
+    seededRef.current = false;
+    setEvents([]);
+  }, [jobId]);
+
+  useEffect(() => {
+    if (liveJob) {
+      setLastLiveJob(liveJob);
+    }
+  }, [liveJob]);
+
+  useEffect(() => {
+    if (data?.job?.id === jobId && data.jobEvents && !seededRef.current) {
       seededRef.current = true;
-      const historical: EventEntry[] = data.jobEvents.map(
-        (e: { kind: string; jobId: number; fileId: string | null; message: string; timestamp: number }) => ({
-          kind: e.kind,
-          jobId: e.jobId,
-          fileId: e.fileId,
-          message: e.message,
-          timestamp: e.timestamp,
-        }),
+      setEvents(
+        data.jobEvents
+          .map(
+            (event: {
+              kind: string;
+              jobId: number;
+              fileId: string | null;
+              message: string;
+              timestamp: number;
+            }) => ({
+              kind: event.kind,
+              jobId: event.jobId,
+              fileId: event.fileId,
+              message: event.message,
+              timestamp: event.timestamp,
+            }),
+          )
+          .reverse(),
       );
-      // Historical events are oldest-first from the DB; reverse for newest-first display.
-      setEvents(historical.reverse());
     }
   }, [data?.jobEvents]);
 
   const handleSubscription = useCallback(
-    (_prev: EventEntry[] | undefined, data: { events: { kind: string; jobId: number | null; fileId: string | null; message: string } }) => {
-      const event = data.events;
-      // Only show meaningful job-level events, not per-segment noise.
+    (
+      _prev: EventEntry[] | undefined,
+      result: {
+        events: { kind: string; jobId: number | null; fileId: string | null; message: string };
+      },
+    ) => {
+      const event = result.events;
       const noisy = new Set([
         "ARTICLE_DOWNLOADED",
+        "ARTICLE_NOT_FOUND",
+        "SEGMENT_QUEUED",
         "SEGMENT_DECODED",
+        "SEGMENT_DECODE_FAILED",
         "SEGMENT_COMMITTED",
+        "SEGMENT_RETRY_SCHEDULED",
+        "SEGMENT_FAILED_PERMANENT",
+        "FILE_COMPLETE",
+        "FILE_CLASSIFIED",
+        "VERIFICATION_STARTED",
+        "VERIFICATION_COMPLETE",
+        "EXTRACTION_PROGRESS",
+        "REPAIR_CONFIDENCE_UPDATED",
       ]);
-      if (
-        (event.jobId === jobId || event.jobId === null) &&
-        !noisy.has(event.kind)
-      ) {
-        const entry: EventEntry = { ...event, timestamp: Date.now() };
-        setEvents((prev) => [entry, ...prev].slice(0, 500));
+
+      if ((event.jobId === jobId || event.jobId === null) && !noisy.has(event.kind)) {
+        setEvents((current) => [{ ...event, timestamp: Date.now() }, ...current].slice(0, 500));
       }
+
       return [];
     },
     [jobId],
@@ -82,150 +131,148 @@ export function JobDetail() {
 
   useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
 
-  const job = data?.job;
+  const queryJob = data?.job?.id === jobId ? data.job : null;
+  const job = liveJob ?? lastLiveJob ?? queryJob;
 
   if (fetching && !job) {
-    return <div className="p-6 text-muted-foreground">{t("label.loading")}</div>;
+    return <div className="text-muted-foreground">{t("label.loading")}</div>;
   }
 
   if (!job) {
     return (
-      <div className="p-6">
-        <p className="text-muted-foreground">{t("job.notFound")}</p>
-        <Link to="/" className="mt-2 inline-block text-primary hover:underline">
-          {t("action.backToJobs")}
-        </Link>
-      </div>
+      <Card>
+        <CardContent className="space-y-3 py-8">
+          <p className="text-muted-foreground">{t("job.notFound")}</p>
+          <Button asChild variant="outline">
+            <Link to="/">{t("action.backToJobs")}</Link>
+          </Button>
+        </CardContent>
+      </Card>
     );
   }
 
   return (
-    <div className="p-4 sm:p-6">
-      <div className="mb-4 sm:mb-6">
-        <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
-          {t("action.backToJobs")}
-        </Link>
-      </div>
-
-      <div className="mb-4 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="truncate text-xl font-bold text-foreground sm:text-2xl">{job.name}</h1>
-          <div className="mt-1 flex items-center gap-3">
-            <span
-              className={`inline-block rounded px-2 py-0.5 text-xs font-medium ${statusColor(job.status)}`}
-            >
-              {job.status}
-            </span>
-            {job.hasPassword && (
-              <span className="text-xs text-yellow-500">{t("job.passwordProtected")}</span>
-            )}
-          </div>
-        </div>
-        <div className="flex gap-2">
-          {job.status === "PAUSED" ? (
-            <button
-              onClick={() => resumeJob({ id: job.id })}
-              className="rounded-md bg-green-600 px-3 py-2 text-sm font-medium text-white hover:bg-green-500 sm:px-4"
-            >
-              {t("action.resume")}
-            </button>
-          ) : job.status !== "COMPLETE" && job.status !== "FAILED" ? (
-            <button
-              onClick={() => pauseJob({ id: job.id })}
-              className="rounded-md bg-yellow-600 px-3 py-2 text-sm font-medium text-white hover:bg-yellow-500 sm:px-4"
-            >
-              {t("action.pause")}
-            </button>
-          ) : null}
-          {job.status === "FAILED" && (
-            <button
-              onClick={() => reprocessJob({ id: job.id })}
-              className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 sm:px-4"
-            >
-              {t("action.reprocess")}
-            </button>
-          )}
-          {job.status !== "COMPLETE" && (
-            <button
-              onClick={() => setShowCancelConfirm(true)}
-              className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 sm:px-4"
-            >
-              {t("action.cancel")}
-            </button>
-          )}
-        </div>
-      </div>
-
-      <div className="mb-4 rounded-lg border border-border bg-card p-4 sm:mb-6 sm:p-5">
-        <div className="mb-4">
-          <ProgressBar progress={job.progress} status={job.status} />
-        </div>
-        <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-          <div>
-            <div className="text-muted-foreground">{t("label.downloaded")}</div>
-            <div className="text-foreground">{formatBytes(job.downloadedBytes)}</div>
-          </div>
-          <div>
-            <div className="text-muted-foreground">{t("label.totalSize")}</div>
-            <div className="text-foreground">{formatBytes(job.totalBytes)}</div>
-          </div>
-          <div>
-            <div className="text-muted-foreground">{t("label.progress")}</div>
-            <div className="text-foreground">{(job.progress * 100).toFixed(1)}%</div>
-          </div>
-          <div>
-            <div className="text-muted-foreground">Health</div>
-            <div className={healthColor(job.health)}>{(job.health / 10).toFixed(1)}%</div>
-          </div>
-        </div>
-      </div>
-
+    <div className="space-y-6">
       <div>
-        <h2 className="mb-3 text-lg font-semibold text-foreground">{t("job.eventLog")}</h2>
-        <div className="max-h-96 overflow-auto rounded-lg border border-border bg-card">
+        <Button asChild variant="ghost" size="sm" className="-ml-3">
+          <Link to="/">{t("action.backToJobs")}</Link>
+        </Button>
+      </div>
+
+      <PageHeader
+        title={job.displayTitle}
+        description={
+          job.originalTitle !== job.displayTitle ? `Original NZB title: ${job.originalTitle}` : undefined
+        }
+        actions={
+          <>
+            {job.status === "PAUSED" ? (
+              <Button onClick={() => void resumeJob({ id: job.id })}>{t("action.resume")}</Button>
+            ) : job.status !== "COMPLETE" && job.status !== "FAILED" ? (
+              <Button variant="outline" onClick={() => void pauseJob({ id: job.id })}>
+                {t("action.pause")}
+              </Button>
+            ) : null}
+            {job.status === "FAILED" ? (
+              <Button variant="outline" onClick={() => void reprocessJob({ id: job.id })}>
+                {t("action.reprocess")}
+              </Button>
+            ) : null}
+            {job.status !== "COMPLETE" && job.status !== "FAILED" ? (
+              <Button variant="destructive" onClick={() => setShowCancelConfirm(true)}>
+                {t("action.cancel")}
+              </Button>
+            ) : (
+              <Button variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
+                {t("action.delete")}
+              </Button>
+            )}
+          </>
+        }
+      />
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-wrap items-center gap-3">
+            <JobStatusBadge status={job.status} />
+            {job.hasPassword ? (
+              <span className="text-xs text-amber-500">{t("job.passwordProtected")}</span>
+            ) : null}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          <JobProgress progress={job.progress} status={job.status} />
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <MetricTile label={t("label.downloaded")} value={formatBytes(job.downloadedBytes)} />
+            <MetricTile label={t("label.totalSize")} value={formatBytes(job.totalBytes)} />
+            <MetricTile label={t("label.progress")} value={`${(job.progress * 100).toFixed(1)}%`} />
+            <MetricTile
+              label="Health"
+              value={`${(job.health / 10).toFixed(1)}%`}
+              className={healthColor(job.health)}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Release Details</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ParsedReleaseDetails
+            originalTitle={job.originalTitle}
+            parsedRelease={job.parsedRelease}
+          />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("job.eventLog")}</CardTitle>
+        </CardHeader>
+        <CardContent className="px-0 pb-0">
           {events.length === 0 ? (
-            <div className="p-4 text-center text-sm text-muted-foreground">
-              {t("job.waitingForEvents")}
-            </div>
+            <div className="px-6 pb-6 text-sm text-muted-foreground">{t("job.waitingForEvents")}</div>
           ) : (
             <>
-              {/* Desktop event table */}
-              <table className="hidden w-full text-sm sm:table">
-                <thead>
-                  <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                    <th className="px-4 py-2">{t("table.time")}</th>
-                    <th className="px-4 py-2">{t("table.kind")}</th>
-                    <th className="px-4 py-2">{t("table.message")}</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border/50">
-                  {events.map((event, i) => (
-                    <tr key={i} className="text-foreground">
-                      <td className="whitespace-nowrap px-4 py-1.5 font-mono text-xs text-muted-foreground">
-                        {new Date(event.timestamp).toLocaleTimeString()}
-                      </td>
-                      <td className="px-4 py-1.5 text-xs">{event.kind}</td>
-                      <td className="px-4 py-1.5">{event.message}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {/* Mobile event list */}
+              <div className="hidden sm:block">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead>{t("table.time")}</TableHead>
+                      <TableHead>{t("table.kind")}</TableHead>
+                      <TableHead>{t("table.message")}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {events.map((event, index) => (
+                      <TableRow key={`${event.timestamp}-${index}`}>
+                        <TableCell className="font-mono text-xs text-muted-foreground">
+                          {new Date(event.timestamp).toLocaleTimeString()}
+                        </TableCell>
+                        <TableCell className="text-xs">{event.kind}</TableCell>
+                        <TableCell>{event.message}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
               <div className="divide-y divide-border/50 sm:hidden">
-                {events.map((event, i) => (
-                  <div key={i} className="px-3 py-2">
+                {events.map((event, index) => (
+                  <div key={`${event.timestamp}-${index}`} className="px-6 py-3">
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <span className="font-mono">{new Date(event.timestamp).toLocaleTimeString()}</span>
                       <span className="text-foreground">{event.kind}</span>
                     </div>
-                    <div className="mt-0.5 text-sm text-foreground">{event.message}</div>
+                    <div className="mt-1 text-sm text-foreground">{event.message}</div>
                   </div>
                 ))}
               </div>
             </>
           )}
-        </div>
-      </div>
+        </CardContent>
+      </Card>
 
       <ConfirmDialog
         open={showCancelConfirm}
@@ -234,31 +281,47 @@ export function JobDetail() {
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => {
-          cancelJob({ id: job.id });
+          void cancelJob({ id: job.id }).then(() => navigate("/"));
           setShowCancelConfirm(false);
         }}
         onCancel={() => setShowCancelConfirm(false)}
+      />
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title={t("confirm.deleteHistory")}
+        message={t("confirm.deleteHistoryMessage")}
+        confirmLabel={t("confirm.deleteHistoryConfirm")}
+        cancelLabel={t("confirm.deleteHistoryDismiss")}
+        onConfirm={() => {
+          void deleteHistory({ id: job.id }).then(() => navigate("/history"));
+          setShowDeleteConfirm(false);
+        }}
+        onCancel={() => setShowDeleteConfirm(false)}
       />
     </div>
   );
 }
 
-function statusColor(status: string): string {
-  const colors: Record<string, string> = {
-    QUEUED: "bg-zinc-600 text-zinc-200",
-    DOWNLOADING: "bg-blue-600 text-blue-100",
-    VERIFYING: "bg-yellow-600 text-yellow-100",
-    REPAIRING: "bg-orange-600 text-orange-100",
-    EXTRACTING: "bg-purple-600 text-purple-100",
-    COMPLETE: "bg-green-600 text-green-100",
-    FAILED: "bg-red-600 text-red-100",
-    PAUSED: "bg-zinc-600 text-zinc-300",
-  };
-  return colors[status] ?? "bg-zinc-700 text-zinc-300";
+function MetricTile({
+  label,
+  value,
+  className,
+}: {
+  label: string;
+  value: string;
+  className?: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+      <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
+      <div className={`mt-2 text-lg font-semibold ${className ?? "text-foreground"}`}>{value}</div>
+    </div>
+  );
 }
 
 function healthColor(health: number): string {
-  if (health >= 950) return "text-green-400";
-  if (health >= 850) return "text-yellow-400";
-  return "text-red-400";
+  if (health >= 980) return "text-emerald-600 dark:text-emerald-300";
+  if (health >= 950) return "text-amber-600 dark:text-amber-300";
+  return "text-red-600 dark:text-red-300";
 }

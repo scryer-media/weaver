@@ -51,9 +51,7 @@ pub fn decompress(
         | CompressionMethod::Normal
         | CompressionMethod::Good
         | CompressionMethod::Best => match info.format {
-            ArchiveFormat::Rar4 => {
-                rar4::decompress_rar4_lz(input, unpacked_size, info.dict_size)
-            }
+            ArchiveFormat::Rar4 => rar4::decompress_rar4_lz(input, unpacked_size, info.dict_size),
             ArchiveFormat::Rar5 => lz::decompress_lz(input, unpacked_size, info),
         },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
@@ -88,9 +86,7 @@ pub fn decompress_to_writer<W: Write>(
             ArchiveFormat::Rar4 => {
                 rar4::decompress_rar4_lz_to_writer(input, unpacked_size, info.dict_size, writer)
             }
-            ArchiveFormat::Rar5 => {
-                lz::decompress_lz_to_writer(input, unpacked_size, info, writer)
-            }
+            ArchiveFormat::Rar5 => lz::decompress_lz_to_writer(input, unpacked_size, info, writer),
         },
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
             method: code,
@@ -118,11 +114,9 @@ where
     F: FnMut(usize) -> RarResult<Box<dyn Write>>,
 {
     match info.method {
-        CompressionMethod::Store => {
-            Err(RarError::CorruptArchive {
-                detail: "chunked decompression not needed for Store mode".into(),
-            })
-        }
+        CompressionMethod::Store => Err(RarError::CorruptArchive {
+            detail: "chunked decompression not needed for Store mode".into(),
+        }),
         CompressionMethod::Fastest
         | CompressionMethod::Fast
         | CompressionMethod::Normal
@@ -131,13 +125,21 @@ where
             ArchiveFormat::Rar4 => {
                 let mut decoder = rar4::Rar4LzDecoder::new(info.dict_size as usize);
                 decoder.decompress_to_writer_chunked(
-                    input, unpacked_size, first_volume_index, boundaries, writer_factory,
+                    input,
+                    unpacked_size,
+                    first_volume_index,
+                    boundaries,
+                    writer_factory,
                 )
             }
             ArchiveFormat::Rar5 => {
                 let mut decoder = lz::LzDecoder::new(info.dict_size as usize);
                 decoder.decompress_to_writer_chunked(
-                    input, unpacked_size, first_volume_index, boundaries, writer_factory,
+                    input,
+                    unpacked_size,
+                    first_volume_index,
+                    boundaries,
+                    writer_factory,
                 )
             }
         },

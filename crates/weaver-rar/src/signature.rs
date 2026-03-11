@@ -281,8 +281,7 @@ mod tests {
         let sig_offset = SCAN_CHUNK_SIZE - 3;
         let total_size = sig_offset + RAR5_SIGNATURE.len() + 16;
         let mut data = vec![0xDDu8; total_size];
-        data[sig_offset..sig_offset + RAR5_SIGNATURE.len()]
-            .copy_from_slice(&RAR5_SIGNATURE);
+        data[sig_offset..sig_offset + RAR5_SIGNATURE.len()].copy_from_slice(&RAR5_SIGNATURE);
 
         let mut cursor = Cursor::new(data);
         let result = read_signature(&mut cursor);
@@ -313,8 +312,8 @@ mod tests {
         data.extend_from_slice(&[0x00; 16]);
 
         let mut cursor = Cursor::new(data);
-        let offset = scan_for_signature(&mut cursor, DEFAULT_SFX_MAX_SCAN)
-            .expect("scan should not error");
+        let offset =
+            scan_for_signature(&mut cursor, DEFAULT_SFX_MAX_SCAN).expect("scan should not error");
         assert_eq!(offset, Some(stub_size as u64));
     }
 
@@ -322,8 +321,8 @@ mod tests {
     fn test_scan_for_signature_none_when_absent() {
         let data = vec![0xFFu8; 2048];
         let mut cursor = Cursor::new(data);
-        let offset = scan_for_signature(&mut cursor, DEFAULT_SFX_MAX_SCAN)
-            .expect("scan should not error");
+        let offset =
+            scan_for_signature(&mut cursor, DEFAULT_SFX_MAX_SCAN).expect("scan should not error");
         assert_eq!(offset, None);
     }
 }

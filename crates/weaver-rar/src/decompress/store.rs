@@ -11,7 +11,11 @@ use crate::error::{RarError, RarResult};
 ///
 /// If `expected_crc` is `Some`, the CRC32 of the output is verified.
 /// Returns the number of bytes written.
-pub fn decompress_store(input: &[u8], output: &mut Vec<u8>, expected_crc: Option<u32>) -> RarResult<()> {
+pub fn decompress_store(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    expected_crc: Option<u32>,
+) -> RarResult<()> {
     output.extend_from_slice(input);
 
     if let Some(expected) = expected_crc {

@@ -1,21 +1,42 @@
-import { useRef, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { Link } from "react-router";
+import { ChevronDown, ChevronRight, Pause, Play, X } from "lucide-react";
 import { useMutation } from "urql";
 import {
-  PAUSE_ALL_MUTATION,
-  RESUME_ALL_MUTATION,
-  PAUSE_JOB_MUTATION,
-  RESUME_JOB_MUTATION,
   CANCEL_JOB_MUTATION,
+  PAUSE_ALL_MUTATION,
+  PAUSE_JOB_MUTATION,
+  RESUME_ALL_MUTATION,
+  RESUME_JOB_MUTATION,
   SET_SPEED_LIMIT_MUTATION,
 } from "@/graphql/queries";
-import { ProgressBar } from "@/components/ProgressBar";
-import { StatusBadge } from "@/components/StatusBadge";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
+import { JobProgress } from "@/components/JobProgress";
+import { JobStatusBadge } from "@/components/JobStatusBadge";
+import { PageHeader } from "@/components/PageHeader";
+import { ParsedReleaseDetails } from "@/components/ParsedReleaseDetails";
 import { SpeedDisplay, formatBytes } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { useTranslate } from "@/lib/context/translate-context";
 import { useLiveData } from "@/lib/context/live-data-context";
+import { useTranslate } from "@/lib/context/translate-context";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 const SPEED_LIMIT_PRESETS = [
   { label: "Unlimited", value: 0 },
@@ -27,23 +48,30 @@ const SPEED_LIMIT_PRESETS = [
   { label: "100 MB/s", value: 100 * 1024 * 1024 },
 ];
 
+function getJobPriority(job: { metadata: { key: string; value: string }[] }): "LOW" | "NORMAL" | "HIGH" {
+  const rawPriority = job.metadata.find((entry) => entry.key === "priority")?.value?.toUpperCase();
+  if (rawPriority === "LOW" || rawPriority === "HIGH") {
+    return rawPriority;
+  }
+  return "NORMAL";
+}
+
+function formatJobPriority(priority: "LOW" | "NORMAL" | "HIGH") {
+  if (priority === "LOW") return "Low";
+  if (priority === "HIGH") return "High";
+  return "Normal";
+}
+
 function formatEta(remainingBytes: number, speed: number): string {
-  if (speed <= 0 || remainingBytes <= 0) return "—";
+  if (speed <= 0 || remainingBytes <= 0) return "\u2014";
   const secs = Math.ceil(remainingBytes / speed);
   if (secs < 60) return `${secs}s`;
-  if (secs < 3600) {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m}m ${s}s`;
-  }
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  return `${h}h ${m}m`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
 const ETA_UPDATE_INTERVAL_MS = 2500;
 
-/** Returns a stable ETA string that only recomputes every 2.5s per job. */
 function useThrottledEta() {
   const cache = useRef(new Map<number, { eta: string; at: number }>());
   return (jobId: number, remainingBytes: number, jobSpeed: number): string => {
@@ -60,9 +88,7 @@ function useThrottledEta() {
 
 export function JobList() {
   const { jobs: allJobs, speed, isPaused } = useLiveData();
-  const jobs = allJobs.filter(
-    (j) => j.status !== "COMPLETE" && j.status !== "FAILED",
-  );
+  const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
@@ -72,243 +98,284 @@ export function JobList() {
   const [, setSpeedLimit] = useMutation(SET_SPEED_LIMIT_MUTATION);
 
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [speedLimitValue, setSpeedLimitValue] = useState(0);
+  const [speedLimitValue, setSpeedLimitValue] = useState("0");
   const [cancelConfirmId, setCancelConfirmId] = useState<number | null>(null);
+  const [expandedJobIds, setExpandedJobIds] = useState<Set<number>>(new Set());
   const getEta = useThrottledEta();
-
   const t = useTranslate();
 
-  // Compute per-job speed proportionally based on remaining bytes.
+  const toggleExpanded = (jobId: number) => {
+    setExpandedJobIds((current) => {
+      const next = new Set(current);
+      if (next.has(jobId)) {
+        next.delete(jobId);
+      } else {
+        next.add(jobId);
+      }
+      return next;
+    });
+  };
+
   const totalRemaining = jobs.reduce(
-    (sum, j) =>
-      j.status === "DOWNLOADING"
-        ? sum + (j.totalBytes - j.downloadedBytes)
-        : sum,
+    (sum, job) => (job.status === "DOWNLOADING" ? sum + (job.totalBytes - job.downloadedBytes) : sum),
     0,
   );
 
   return (
-    <div className="p-4 sm:p-6">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6">
-        <h1 className="text-xl font-bold text-foreground sm:text-2xl">{t("jobs.title")}</h1>
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <SpeedDisplay bytesPerSec={speed} className="text-lg font-bold text-foreground sm:text-2xl" />
-          <select
-            value={speedLimitValue}
-            onChange={(e) => {
-              const v = Number(e.target.value);
-              setSpeedLimitValue(v);
-              setSpeedLimit({ bytesPerSec: v });
-            }}
-            className="rounded-md border border-border bg-card px-2 py-1.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-ring"
-          >
-            {SPEED_LIMIT_PRESETS.map((p) => (
-              <option key={p.value} value={p.value}>{p.label}</option>
-            ))}
-          </select>
-          <button
-            onClick={() => setUploadOpen(true)}
-            className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 sm:px-4"
-          >
-            {t("nav.upload")}
-          </button>
-          <button
-            onClick={() => (isPaused ? resumeAll() : pauseAll())}
-            className={`rounded-md px-3 py-2 text-sm font-medium transition-colors sm:px-4 ${
-              isPaused
-                ? "bg-green-600 text-white hover:bg-green-500"
-                : "bg-yellow-600 text-white hover:bg-yellow-500"
-            }`}
-          >
-            {isPaused ? t("action.resumeAll") : t("action.pauseAll")}
-          </button>
-        </div>
-      </div>
+    <div className="space-y-6">
+      <PageHeader
+        title={t("jobs.title")}
+        description={jobs.length === 0 ? t("jobs.emptyHint") : undefined}
+        actions={
+          <>
+            <div className="rounded-xl border border-border/70 bg-background/70 px-4 py-2">
+              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                {t("label.downloadSpeed")}
+              </div>
+              <SpeedDisplay bytesPerSec={speed} className="text-lg font-semibold text-foreground" />
+            </div>
+            <Select
+              value={speedLimitValue}
+              onValueChange={(value) => {
+                setSpeedLimitValue(value);
+                void setSpeedLimit({ bytesPerSec: Number(value) });
+              }}
+            >
+              <SelectTrigger className="w-36">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SPEED_LIMIT_PRESETS.map((preset) => (
+                  <SelectItem key={preset.value} value={String(preset.value)}>
+                    {preset.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button variant="outline" onClick={() => void (isPaused ? resumeAll({}) : pauseAll({}))}>
+              {isPaused ? t("action.resumeAll") : t("action.pauseAll")}
+            </Button>
+            <Button onClick={() => setUploadOpen(true)}>{t("nav.upload")}</Button>
+          </>
+        }
+      />
 
       {jobs.length === 0 ? (
-        <div className="py-12 text-center text-muted-foreground">
-          {t("jobs.empty")}{" "}
-          <button onClick={() => setUploadOpen(true)} className="text-primary hover:underline">
-            {t("jobs.emptyAction")}
-          </button>{" "}
-          {t("jobs.emptyHint")}
-        </div>
+        <EmptyState
+          title={t("jobs.empty")}
+          description={t("jobs.emptyHint")}
+          actionLabel={t("jobs.emptyAction")}
+          onAction={() => setUploadOpen(true)}
+        />
       ) : (
         <>
-          {/* Desktop table */}
-          <div className="hidden overflow-hidden rounded-lg border border-border lg:block">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-border bg-card text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  <th className="max-w-48 px-4 py-3">{t("table.name")}</th>
-                  <th className="w-28 px-4 py-3 text-center">{t("table.status")}</th>
-                  <th className="w-28 px-4 py-3">{t("table.category")}</th>
-                  <th className="w-64 px-4 py-3 text-center">{t("table.progress")}</th>
-                  <th className="w-48 px-4 py-3 text-center">{t("table.size")}</th>
-                  <th className="w-24 px-4 py-3 text-center">{t("table.eta")}</th>
-                  <th className="w-40 px-4 py-3 text-right">{t("table.actions")}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {jobs.map((job) => {
-                  const remaining = job.totalBytes - job.downloadedBytes;
-                  const jobSpeed =
-                    job.status === "DOWNLOADING" && totalRemaining > 0
-                      ? (remaining / totalRemaining) * speed
-                      : 0;
-                  return (
-                    <tr key={job.id} className="hover:bg-accent/30">
-                      <td className="max-w-48 truncate px-4 py-3">
-                        <Link
-                          to={`/jobs/${job.id}`}
-                          className="text-sm font-medium text-foreground hover:text-primary hover:underline"
-                        >
-                          {job.name}
-                        </Link>
-                        {job.health < 1000 && (
-                          <span
-                            className={`ml-2 inline-block rounded px-1.5 py-0.5 text-xs font-medium ${
-                              job.health >= 950
-                                ? "bg-yellow-600/20 text-yellow-400"
-                                : "bg-red-600/20 text-red-400"
-                            }`}
-                          >
-                            {(job.health / 10).toFixed(1)}%
-                          </span>
-                        )}
-                        {job.hasPassword && (
-                          <span className="ml-2 text-xs text-yellow-500" title={t("job.passwordProtected")}>
-                            {t("jobs.passwordProtected")}
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <StatusBadge status={job.status} />
-                      </td>
-                      <td className="px-4 py-3 text-sm text-muted-foreground">
-                        {job.category ?? "—"}
-                      </td>
-                      <td className="px-4 py-3">
-                        <ProgressBar progress={job.progress} status={job.status} />
-                      </td>
-                      <td className="px-4 py-3 text-center text-sm text-muted-foreground">
-                        {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
-                      </td>
-                      <td className="px-4 py-3 text-center text-sm tabular-nums text-muted-foreground">
-                        {job.status === "DOWNLOADING"
-                          ? getEta(job.id, remaining, jobSpeed)
-                          : "—"}
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          {job.status === "PAUSED" ? (
-                            <button
-                              onClick={() => resumeJob({ id: job.id })}
-                              className="rounded px-2 py-1 text-xs text-green-400 hover:bg-accent"
-                            >
-                              {t("action.resume")}
-                            </button>
-                          ) : job.status !== "COMPLETE" && job.status !== "FAILED" ? (
-                            <button
-                              onClick={() => pauseJob({ id: job.id })}
-                              className="rounded px-2 py-1 text-xs text-yellow-400 hover:bg-accent"
-                            >
-                              {t("action.pause")}
-                            </button>
-                          ) : null}
-                          {job.status !== "COMPLETE" && (
-                            <button
-                              onClick={() => setCancelConfirmId(job.id)}
-                              className="rounded px-2 py-1 text-xs text-destructive hover:bg-accent"
-                            >
-                              {t("action.cancel")}
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Card className="hidden lg:block">
+            <CardContent className="px-0 pb-0">
+              <Table className="table-fixed">
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="h-7 w-[36%] px-2 text-[9px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[9%] px-2 text-[9px]">{t("table.status")}</TableHead>
+                    <TableHead className="h-7 w-[7%] px-2 text-[9px]">{t("table.priority")}</TableHead>
+                    <TableHead className="h-7 w-[8%] px-2 text-[9px]">{t("table.category")}</TableHead>
+                    <TableHead className="h-7 w-[15%] px-2 text-[9px]">{t("table.progress")}</TableHead>
+                    <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
+                    <TableHead className="h-7 w-[6%] px-2 text-right text-[9px]">{t("table.eta")}</TableHead>
+                    <TableHead className="h-7 w-[7%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {jobs.map((job) => {
+                    const remaining = job.totalBytes - job.downloadedBytes;
+                    const priority = getJobPriority(job);
+                    const displayName = job.displayTitle;
+                    const expanded = expandedJobIds.has(job.id);
+                    const jobSpeed =
+                      job.status === "DOWNLOADING" && totalRemaining > 0
+                        ? (remaining / totalRemaining) * speed
+                        : 0;
+                    return (
+                      <Fragment key={job.id}>
+                        <TableRow key={job.id} className="text-[11px]">
+                          <TableCell className="min-w-0 px-2 py-1.5">
+                            <div className="flex min-w-0 items-center gap-1.5">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="size-5 shrink-0"
+                                title={expanded ? "Collapse details" : "Expand details"}
+                                aria-label={expanded ? "Collapse details" : "Expand details"}
+                                onClick={() => toggleExpanded(job.id)}
+                              >
+                                {expanded ? (
+                                  <ChevronDown className="size-3.5" />
+                                ) : (
+                                  <ChevronRight className="size-3.5" />
+                                )}
+                              </Button>
+                              <Link
+                                to={`/jobs/${job.id}`}
+                                title={job.originalTitle}
+                                className="block min-w-0 truncate text-[11px] font-medium leading-tight transition hover:text-primary"
+                              >
+                                {displayName}
+                              </Link>
+                              {job.hasPassword ? (
+                                <span className="shrink-0 text-[9px] text-amber-500">{t("jobs.passwordProtected")}</span>
+                              ) : null}
+                            </div>
+                          </TableCell>
+                          <TableCell className="overflow-hidden px-2 py-1.5">
+                            <JobStatusBadge status={job.status} compact className="px-1.5" />
+                          </TableCell>
+                          <TableCell className="truncate px-2 py-1.5 text-[10px]" title={formatJobPriority(priority)}>
+                            {formatJobPriority(priority)}
+                          </TableCell>
+                          <TableCell className="truncate px-2 py-1.5 text-[10px]" title={job.category ?? "\u2014"}>
+                            {job.category ?? "\u2014"}
+                          </TableCell>
+                          <TableCell className="min-w-0 px-2 py-1.5" title={`${(job.progress * 100).toFixed(1)}%`}>
+                            <JobProgress progress={job.progress} status={job.status} compact showLabel={false} />
+                          </TableCell>
+                          <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
+                            {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
+                          </TableCell>
+                          <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
+                            {job.status === "DOWNLOADING"
+                              ? getEta(job.id, remaining, jobSpeed)
+                              : "\u2014"}
+                          </TableCell>
+                          <TableCell className="px-2 py-1.5">
+                            <div className="flex justify-end gap-0.5">
+                              {job.status === "PAUSED" ? (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title={t("action.resume")}
+                                  aria-label={t("action.resume")}
+                                  className="size-6"
+                                  onClick={() => void resumeJob({ id: job.id })}
+                                >
+                                  <Play className="size-3.5" />
+                                </Button>
+                              ) : (
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  title={t("action.pause")}
+                                  aria-label={t("action.pause")}
+                                  className="size-6"
+                                  onClick={() => void pauseJob({ id: job.id })}
+                                >
+                                  <Pause className="size-3.5" />
+                                </Button>
+                              )}
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title={t("action.cancel")}
+                                aria-label={t("action.cancel")}
+                                className="size-6"
+                                onClick={() => setCancelConfirmId(job.id)}
+                              >
+                                <X className="size-3.5" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                        {expanded ? (
+                          <TableRow className="bg-accent/10 hover:bg-accent/10">
+                            <TableCell colSpan={8} className="px-4 py-4">
+                              <ParsedReleaseDetails
+                                originalTitle={job.originalTitle}
+                                parsedRelease={job.parsedRelease}
+                                compact
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ) : null}
+                      </Fragment>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
 
-          {/* Mobile card layout */}
           <div className="space-y-3 lg:hidden">
             {jobs.map((job) => {
               const remaining = job.totalBytes - job.downloadedBytes;
+              const priority = getJobPriority(job);
+              const displayName = job.displayTitle;
+              const expanded = expandedJobIds.has(job.id);
               const jobSpeed =
                 job.status === "DOWNLOADING" && totalRemaining > 0
                   ? (remaining / totalRemaining) * speed
                   : 0;
               return (
-                <div key={job.id} className="rounded-lg border border-border bg-card p-4">
-                  <div className="mb-2 flex items-start justify-between gap-2">
-                    <Link
-                      to={`/jobs/${job.id}`}
-                      className="min-w-0 flex-1 truncate text-sm font-medium text-foreground hover:text-primary hover:underline"
-                    >
-                      {job.name}
-                    </Link>
-                    <StatusBadge status={job.status} />
-                  </div>
-                  {job.health < 1000 && (
-                    <span
-                      className={`mb-2 inline-block rounded px-1.5 py-0.5 text-xs font-medium ${
-                        job.health >= 950
-                          ? "bg-yellow-600/20 text-yellow-400"
-                          : "bg-red-600/20 text-red-400"
-                      }`}
-                    >
-                      {(job.health / 10).toFixed(1)}%
-                    </span>
-                  )}
-                  <div className="mb-3">
-                    <ProgressBar progress={job.progress} status={job.status} />
-                  </div>
-                  <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    <span>{formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}</span>
-                    {job.status === "DOWNLOADING" && (
-                      <span className="tabular-nums">ETA: {getEta(job.id, remaining, jobSpeed)}</span>
-                    )}
-                    {job.category && <span>{job.category}</span>}
-                    {job.hasPassword && (
-                      <span className="text-yellow-500">{t("jobs.passwordProtected")}</span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {job.status === "PAUSED" ? (
-                      <button
-                        onClick={() => resumeJob({ id: job.id })}
-                        className="rounded-md px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-accent"
-                      >
-                        {t("action.resume")}
-                      </button>
-                    ) : job.status !== "COMPLETE" && job.status !== "FAILED" ? (
-                      <button
-                        onClick={() => pauseJob({ id: job.id })}
-                        className="rounded-md px-3 py-1.5 text-xs font-medium text-yellow-400 hover:bg-accent"
-                      >
-                        {t("action.pause")}
-                      </button>
+                <Card key={job.id}>
+                  <CardContent className="space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 shrink-0"
+                            onClick={() => toggleExpanded(job.id)}
+                          >
+                            {expanded ? (
+                              <ChevronDown className="size-4" />
+                            ) : (
+                              <ChevronRight className="size-4" />
+                            )}
+                          </Button>
+                          <Link
+                            to={`/jobs/${job.id}`}
+                            title={job.originalTitle}
+                            className="block min-w-0 truncate font-medium transition hover:text-primary"
+                          >
+                            {displayName}
+                          </Link>
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                          <span>{formatJobPriority(priority)}</span>
+                          <span>{job.category ?? "\u2014"}</span>
+                          <span>{formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}</span>
+                          <span>{job.status === "DOWNLOADING" ? getEta(job.id, remaining, jobSpeed) : "\u2014"}</span>
+                        </div>
+                      </div>
+                      <JobStatusBadge status={job.status} compact />
+                    </div>
+                    <JobProgress progress={job.progress} status={job.status} compact />
+                    {expanded ? (
+                      <ParsedReleaseDetails
+                        originalTitle={job.originalTitle}
+                        parsedRelease={job.parsedRelease}
+                        compact
+                      />
                     ) : null}
-                    {job.status !== "COMPLETE" && (
-                      <button
-                        onClick={() => setCancelConfirmId(job.id)}
-                        className="rounded-md px-3 py-1.5 text-xs font-medium text-destructive hover:bg-accent"
-                      >
+                    <div className="flex justify-end gap-2">
+                      {job.status === "PAUSED" ? (
+                        <Button variant="ghost" size="sm" onClick={() => void resumeJob({ id: job.id })}>
+                          {t("action.resume")}
+                        </Button>
+                      ) : (
+                        <Button variant="ghost" size="sm" onClick={() => void pauseJob({ id: job.id })}>
+                          {t("action.pause")}
+                        </Button>
+                      )}
+                      <Button variant="ghost" size="sm" onClick={() => setCancelConfirmId(job.id)}>
                         {t("action.cancel")}
-                      </button>
-                    )}
-                  </div>
-                </div>
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
               );
             })}
           </div>
         </>
       )}
-
-      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
 
       <ConfirmDialog
         open={cancelConfirmId != null}
@@ -317,11 +384,15 @@ export function JobList() {
         confirmLabel={t("confirm.cancelJobConfirm")}
         cancelLabel={t("confirm.cancelJobDismiss")}
         onConfirm={() => {
-          if (cancelConfirmId != null) cancelJob({ id: cancelConfirmId });
+          if (cancelConfirmId != null) {
+            void cancelJob({ id: cancelConfirmId });
+          }
           setCancelConfirmId(null);
         }}
         onCancel={() => setCancelConfirmId(null)}
       />
+
+      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
     </div>
   );
 }

@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -41,7 +40,12 @@ impl SharedPipelineState {
     }
 
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
-        self.jobs.read().unwrap().iter().find(|j| j.job_id == job_id).cloned()
+        self.jobs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|j| j.job_id == job_id)
+            .cloned()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -116,6 +120,13 @@ pub enum SchedulerCommand {
         total_connections: usize,
         reply: oneshot::Sender<()>,
     },
+    /// Update runtime storage directories after a restore.
+    UpdateRuntimePaths {
+        data_dir: PathBuf,
+        intermediate_dir: PathBuf,
+        complete_dir: PathBuf,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Reprocess a failed job (re-run post-download stages without re-downloading).
     ReprocessJob {
         job_id: JobId,
@@ -177,7 +188,11 @@ impl SchedulerHandle {
         event_tx: broadcast::Sender<PipelineEvent>,
         state: SharedPipelineState,
     ) -> Self {
-        Self { cmd_tx, event_tx, state }
+        Self {
+            cmd_tx,
+            event_tx,
+            state,
+        }
     }
 
     /// Submit a new download job.
@@ -228,10 +243,7 @@ impl SchedulerHandle {
     pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::PauseJob {
-                job_id,
-                reply: tx,
-            })
+            .send(SchedulerCommand::PauseJob { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -241,10 +253,7 @@ impl SchedulerHandle {
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::ResumeJob {
-                job_id,
-                reply: tx,
-            })
+            .send(SchedulerCommand::ResumeJob { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -254,10 +263,7 @@ impl SchedulerHandle {
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::CancelJob {
-                job_id,
-                reply: tx,
-            })
+            .send(SchedulerCommand::CancelJob { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -267,10 +273,7 @@ impl SchedulerHandle {
     pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::ReprocessJob {
-                job_id,
-                reply: tx,
-            })
+            .send(SchedulerCommand::ReprocessJob { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -280,10 +283,7 @@ impl SchedulerHandle {
     pub async fn delete_history(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::DeleteHistory {
-                job_id,
-                reply: tx,
-            })
+            .send(SchedulerCommand::DeleteHistory { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -301,7 +301,9 @@ impl SchedulerHandle {
 
     /// Get info about a specific job (reads from shared state, no channel round-trip).
     pub fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
-        self.state.get_job(job_id).ok_or(SchedulerError::JobNotFound(job_id))
+        self.state
+            .get_job(job_id)
+            .ok_or(SchedulerError::JobNotFound(job_id))
     }
 
     /// List all jobs (reads from shared state, no channel round-trip).
@@ -374,6 +376,31 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    /// Update the pipeline's runtime directories for future jobs.
+    pub async fn update_runtime_paths(
+        &self,
+        data_dir: PathBuf,
+        intermediate_dir: PathBuf,
+        complete_dir: PathBuf,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateRuntimePaths {
+                data_dir,
+                intermediate_dir,
+                complete_dir,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Replace the shared job snapshot without a pipeline command round-trip.
+    pub fn replace_jobs_snapshot(&self, jobs: Vec<JobInfo>) {
+        self.state.publish_jobs(jobs);
+    }
+
     /// Subscribe to pipeline events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.event_tx.subscribe()
@@ -408,7 +435,11 @@ mod tests {
             .map(|state| JobInfo {
                 job_id: state.job_id,
                 name: state.spec.name.clone(),
-                error: if let JobStatus::Failed { error } = &state.status { Some(error.clone()) } else { None },
+                error: if let JobStatus::Failed { error } = &state.status {
+                    Some(error.clone())
+                } else {
+                    None
+                },
                 status: state.status.clone(),
                 progress: state.assembly.progress(),
                 total_bytes: state.spec.total_bytes,
@@ -517,7 +548,17 @@ mod tests {
                     SchedulerCommand::RebuildNntp { reply, .. } => {
                         let _ = reply.send(());
                     }
-                    SchedulerCommand::RestoreJob { job_id, spec, status, working_dir, reply, .. } => {
+                    SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    SchedulerCommand::RestoreJob {
+                        job_id,
+                        spec,
+                        status,
+                        working_dir,
+                        reply,
+                        ..
+                    } => {
                         let assembly = JobAssembly::new(job_id);
                         let state = JobState {
                             job_id,
@@ -549,9 +590,10 @@ mod tests {
                                 state.status = JobStatus::Downloading;
                                 Ok(())
                             }
-                            Some(_) => Err(SchedulerError::Other(
-                                format!("job {} is not failed", job_id.0),
-                            )),
+                            Some(_) => Err(SchedulerError::Other(format!(
+                                "job {} is not failed",
+                                job_id.0
+                            ))),
                             None => Err(SchedulerError::JobNotFound(job_id)),
                         };
                         let _ = reply.send(result);
@@ -663,15 +705,17 @@ mod tests {
         let mut rx = handle.subscribe_events();
 
         handle
-            .add_job(JobId(1), make_spec("Evented Job"), PathBuf::from("test.nzb"))
+            .add_job(
+                JobId(1),
+                make_spec("Evented Job"),
+                PathBuf::from("test.nzb"),
+            )
             .await
             .unwrap();
 
         let event = rx.recv().await.unwrap();
         match event {
-            PipelineEvent::JobCreated {
-                job_id, name, ..
-            } => {
+            PipelineEvent::JobCreated { job_id, name, .. } => {
                 assert_eq!(job_id, JobId(1));
                 assert_eq!(name, "Evented Job");
             }
@@ -707,7 +751,10 @@ mod tests {
         let mut spec = make_spec("Protected");
         spec.password = Some("secret123".to_string());
 
-        handle.add_job(JobId(1), spec, PathBuf::from("test.nzb")).await.unwrap();
+        handle
+            .add_job(JobId(1), spec, PathBuf::from("test.nzb"))
+            .await
+            .unwrap();
 
         let info = handle.get_job(JobId(1)).unwrap();
         assert_eq!(info.password, Some("secret123".to_string()));

@@ -34,8 +34,8 @@ const HUFF_TABLE_SIZE: usize = NC + DC + LDC + RC;
 
 /// Length decode base values (28 entries).
 const LDECODE: [u16; 28] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112,
-    128, 160, 192, 224,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+    160, 192, 224,
 ];
 
 /// Length extra bits (28 entries).
@@ -267,7 +267,9 @@ impl Rar4LzDecoder {
             if boundary_idx < boundaries.len()
                 && byte_pos >= boundaries[boundary_idx].compressed_offset
             {
-                self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                self.window
+                    .flush_to_writer(&mut *current_writer)
+                    .map_err(RarError::Io)?;
                 chunk_bytes += decoded_this_round;
                 chunks.push((current_vol, chunk_bytes));
 
@@ -278,12 +280,16 @@ impl Rar4LzDecoder {
             } else {
                 chunk_bytes += decoded_this_round;
                 if self.window.unflushed_bytes() as usize >= flush_threshold {
-                    self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                    self.window
+                        .flush_to_writer(&mut *current_writer)
+                        .map_err(RarError::Io)?;
                 }
             }
         }
 
-        self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+        self.window
+            .flush_to_writer(&mut *current_writer)
+            .map_err(RarError::Io)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -411,13 +417,21 @@ impl Rar4LzDecoder {
 
         // Build the four main tables.
         let mut offset = 0;
-        self.ld_table = Some(HuffmanTable::build(&self.code_lengths[offset..offset + NC])?);
+        self.ld_table = Some(HuffmanTable::build(
+            &self.code_lengths[offset..offset + NC],
+        )?);
         offset += NC;
-        self.dd_table = Some(HuffmanTable::build(&self.code_lengths[offset..offset + DC])?);
+        self.dd_table = Some(HuffmanTable::build(
+            &self.code_lengths[offset..offset + DC],
+        )?);
         offset += DC;
-        self.ldd_table = Some(HuffmanTable::build(&self.code_lengths[offset..offset + LDC])?);
+        self.ldd_table = Some(HuffmanTable::build(
+            &self.code_lengths[offset..offset + LDC],
+        )?);
         offset += LDC;
-        self.rd_table = Some(HuffmanTable::build(&self.code_lengths[offset..offset + RC])?);
+        self.rd_table = Some(HuffmanTable::build(
+            &self.code_lengths[offset..offset + RC],
+        )?);
 
         Ok(())
     }
@@ -541,7 +555,10 @@ impl Rar4LzDecoder {
                 self.last_length = length;
                 let remaining = (unpacked_size - output_size) as usize;
                 let copy_len = length.min(remaining);
-                trace!("rar4 cache ref: idx={}, dist={}, len={}", cache_idx, distance, copy_len);
+                trace!(
+                    "rar4 cache ref: idx={}, dist={}, len={}",
+                    cache_idx, distance, copy_len
+                );
                 self.window.copy(distance, copy_len)?;
                 output_size += copy_len as u64;
                 continue;
@@ -680,7 +697,9 @@ impl Rar4LzDecoder {
             reader.read_bits(8)?;
         }
 
-        warn!("RAR4: VM filter skipped ({length} bytes) — output may be incorrect for filtered data");
+        warn!(
+            "RAR4: VM filter skipped ({length} bytes) — output may be incorrect for filtered data"
+        );
         Ok(())
     }
 
@@ -872,9 +891,12 @@ impl Rar4LzDecoder {
     /// Same structure as skip_vm_code but reads bytes via PPMd model
     /// instead of from the bitstream.
     fn skip_vm_code_ppm(&mut self, rc: &mut RangeDecoder) -> RarResult<()> {
-        let model = self.ppm_model.as_mut().ok_or_else(|| RarError::CorruptArchive {
-            detail: "RAR4: PPMd model missing during VM skip".into(),
-        })?;
+        let model = self
+            .ppm_model
+            .as_mut()
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR4: PPMd model missing during VM skip".into(),
+            })?;
 
         let first_byte = model.decode_char(rc);
         if first_byte == -1 {
@@ -914,7 +936,9 @@ impl Rar4LzDecoder {
             }
         }
 
-        warn!("RAR4: PPMd VM filter skipped ({length} bytes) — output may be incorrect for filtered data");
+        warn!(
+            "RAR4: PPMd VM filter skipped ({length} bytes) — output may be incorrect for filtered data"
+        );
         Ok(())
     }
 
@@ -946,11 +970,7 @@ impl Rar4LzDecoder {
 }
 
 /// Decompress RAR4 LZ data.
-pub fn decompress_rar4_lz(
-    input: &[u8],
-    unpacked_size: u64,
-    dict_size: u64,
-) -> RarResult<Vec<u8>> {
+pub fn decompress_rar4_lz(input: &[u8], unpacked_size: u64, dict_size: u64) -> RarResult<Vec<u8>> {
     if dict_size > MAX_DICT_SIZE {
         return Err(RarError::DictionaryTooLarge {
             size: dict_size,

@@ -848,8 +848,7 @@ impl Model {
                 }
 
                 // Free the stats array.
-                self.alloc
-                    .free_units(off_to_ref(stats), (old_ns + 1) >> 1);
+                self.alloc.free_units(off_to_ref(stats), (old_ns + 1) >> 1);
 
                 // Write OneState inline.
                 self.set_one_sym(ctx, tmp_sym);
@@ -923,12 +922,7 @@ impl Model {
                 if f < 32 {
                     self.set_one_freq(suffix, f + 1);
                 }
-                self.do_update_model_core(
-                    fs_sym,
-                    fs_freq,
-                    fs_succ,
-                    suffix + CTX_ONE_SYM as u32,
-                );
+                self.do_update_model_core(fs_sym, fs_freq, fs_succ, suffix + CTX_ONE_SYM as u32);
             }
         } else {
             self.do_update_model_core(fs_sym, fs_freq, fs_succ, 0);
@@ -1003,9 +997,9 @@ impl Model {
                 // Multi-symbol context: expand stats array if needed.
                 if (ns1 & 1) == 0 {
                     let old_stats = self.ctx_stats(pc);
-                    let new_stats =
-                        self.alloc
-                            .expand_units(off_to_ref(old_stats), (ns1 >> 1) as usize);
+                    let new_stats = self
+                        .alloc
+                        .expand_units(off_to_ref(old_stats), (ns1 >> 1) as usize);
                     if new_stats.is_null() {
                         self.restart();
                         self.esc_count = 0;
@@ -1016,11 +1010,7 @@ impl Model {
                 // Adjust SummFreq.
                 let sf = self.ctx_summ_freq(pc) as u32;
                 let adj = (if 2 * ns1 < ns { 1u32 } else { 0 })
-                    + 2 * (if 4 * ns1 <= ns && sf <= 8 * ns1 {
-                        1
-                    } else {
-                        0
-                    });
+                    + 2 * (if 4 * ns1 <= ns && sf <= 8 * ns1 { 1 } else { 0 });
                 self.set_ctx_summ_freq(pc, (sf + adj) as u16);
             } else {
                 // Single-state: promote to multi-state.
@@ -1056,8 +1046,7 @@ impl Model {
             let sf = s0 + sf_pc;
             let new_freq;
             if cf < 6 * sf {
-                new_freq =
-                    1 + (if cf > sf { 1 } else { 0 }) + (if cf >= 4 * sf { 1 } else { 0 });
+                new_freq = 1 + (if cf > sf { 1 } else { 0 }) + (if cf >= 4 * sf { 1 } else { 0 });
                 let new_sf = sf_pc + 3;
                 self.set_ctx_summ_freq(pc, new_sf as u16);
             } else {

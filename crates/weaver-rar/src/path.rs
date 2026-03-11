@@ -73,7 +73,11 @@ pub fn is_safe_link_target(member_path: &str, target: &str) -> bool {
     // Count the directory depth of the member's parent directory.
     let member_depth = member_path.split('/').filter(|s| !s.is_empty()).count();
     // The member itself is a file, so its parent has depth - 1.
-    let parent_depth = if member_depth > 0 { member_depth - 1 } else { 0 };
+    let parent_depth = if member_depth > 0 {
+        member_depth - 1
+    } else {
+        0
+    };
 
     // Walk the target path and track depth relative to the member's parent.
     let mut depth: i64 = parent_depth as i64;
@@ -112,7 +116,10 @@ mod tests {
 
     #[test]
     fn already_clean_path_unchanged() {
-        assert_eq!(sanitize_path("documents/report.pdf"), "documents/report.pdf");
+        assert_eq!(
+            sanitize_path("documents/report.pdf"),
+            "documents/report.pdf"
+        );
     }
 
     #[test]
@@ -122,7 +129,10 @@ mod tests {
 
     #[test]
     fn leading_backslash_stripped() {
-        assert_eq!(sanitize_path("\\Windows\\system32\\cmd.exe"), "Windows/system32/cmd.exe");
+        assert_eq!(
+            sanitize_path("\\Windows\\system32\\cmd.exe"),
+            "Windows/system32/cmd.exe"
+        );
     }
 
     #[test]
@@ -167,7 +177,10 @@ mod tests {
 
     #[test]
     fn mixed_separators_normalized() {
-        assert_eq!(sanitize_path("foo\\bar/baz\\qux.txt"), "foo/bar/baz/qux.txt");
+        assert_eq!(
+            sanitize_path("foo\\bar/baz\\qux.txt"),
+            "foo/bar/baz/qux.txt"
+        );
     }
 
     #[test]
@@ -193,10 +206,7 @@ mod tests {
 
     #[test]
     fn complex_traversal() {
-        assert_eq!(
-            sanitize_path("/../.././foo/../bar/./baz"),
-            "foo/bar/baz"
-        );
+        assert_eq!(sanitize_path("/../.././foo/../bar/./baz"), "foo/bar/baz");
     }
 
     // Link target validation tests

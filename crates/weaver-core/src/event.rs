@@ -123,10 +123,7 @@ pub enum PipelineEvent {
     RepairStarted { job_id: JobId },
 
     /// PAR2 repair completed.
-    RepairComplete {
-        job_id: JobId,
-        slices_repaired: u32,
-    },
+    RepairComplete { job_id: JobId, slices_repaired: u32 },
 
     /// PAR2 repair failed.
     RepairFailed { job_id: JobId, error: String },
@@ -151,10 +148,7 @@ pub enum PipelineEvent {
 
     // ---- File classification (discovered during download) ----
     /// A file's role was identified or updated.
-    FileClassified {
-        file_id: NzbFileId,
-        role: FileRole,
-    },
+    FileClassified { file_id: NzbFileId, role: FileRole },
 }
 
 /// Result of verifying a file against PAR2 checksums.

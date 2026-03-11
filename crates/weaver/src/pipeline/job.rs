@@ -35,6 +35,7 @@ impl Pipeline {
         spec: JobSpec,
         nzb_path: PathBuf,
     ) -> Result<(), weaver_scheduler::SchedulerError> {
+        let started = std::time::Instant::now();
         if self.jobs.contains_key(&job_id) {
             return Err(weaver_scheduler::SchedulerError::JobExists(job_id));
         }
@@ -47,6 +48,13 @@ impl Pipeline {
                 working_dir.display()
             ))
         })?;
+        info!(
+            job_id = job_id.0,
+            working_dir = %working_dir.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            stage = "working_dir_ready",
+            "pipeline add_job stage"
+        );
 
         // Persist job creation to SQLite for crash recovery.
         let nzb_hash = {
@@ -72,6 +80,12 @@ impl Pipeline {
         }) {
             error!(error = %e, "db write failed for create_active_job");
         }
+        info!(
+            job_id = job_id.0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            stage = "active_job_persisted",
+            "pipeline add_job stage"
+        );
 
         // Create assembly and populate per-job download queues.
         let (assembly, download_queue, recovery_queue) =
@@ -111,6 +125,8 @@ impl Pipeline {
             job_id = job_id.0,
             queue_depth,
             working_dir = %working_dir.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            stage = "runtime_state_inserted",
             "job added"
         );
         Ok(())
@@ -324,6 +340,8 @@ impl Pipeline {
         self.extracted_members.remove(&job_id);
         self.extracted_sets.remove(&job_id);
         self.failed_extractions.remove(&job_id);
+        self.pending_concat.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
         self.promoted_recovery_files.remove(&job_id);
         self.eagerly_deleted.remove(&job_id);
         self.clean_volumes.retain(|(jid, _), _| *jid != job_id);

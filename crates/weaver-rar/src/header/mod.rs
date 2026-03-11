@@ -138,7 +138,10 @@ pub fn parse_all_headers<R: Read + Seek>(
         match raw.header_type {
             HeaderType::Encryption => {
                 let enc = encryption::parse(&raw)?;
-                debug!("encryption header: version={} kdf_count={}", enc.version, enc.kdf_count);
+                debug!(
+                    "encryption header: version={} kdf_count={}",
+                    enc.version, enc.kdf_count
+                );
                 result.encryption = Some(enc.clone());
                 result.is_encrypted = true;
 
@@ -205,13 +208,17 @@ fn parse_encrypted_headers<R: Read + Seek>(
         let (header_size, vint_len) = match vint::read_vint(&dec0[4..]) {
             Ok(v) => v,
             Err(_) => {
-                debug!("failed to parse header_size vint in encrypted header — likely end of headers");
+                debug!(
+                    "failed to parse header_size vint in encrypted header — likely end of headers"
+                );
                 break;
             }
         };
 
         if header_size == 0 {
-            debug!("zero header size in encrypted header at offset {header_start} — likely end of headers");
+            debug!(
+                "zero header size in encrypted header at offset {header_start} — likely end of headers"
+            );
             break;
         }
 
@@ -303,11 +310,7 @@ fn parse_encrypted_headers<R: Read + Seek>(
 }
 
 /// Dispatch a parsed header to the appropriate type-specific handler.
-fn dispatch_header(
-    raw: &RawHeader,
-    data_offset: u64,
-    result: &mut ParsedHeaders,
-) -> RarResult<()> {
+fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders) -> RarResult<()> {
     match raw.header_type {
         HeaderType::MainArchive => {
             let main = main_archive::parse(raw)?;
@@ -352,7 +355,14 @@ fn dispatch_header(
 }
 
 /// Extract encryption status, encryption params, BLAKE2 hash, and redirection info from extra records.
-fn extract_extra_info(raw: &RawHeader) -> (bool, Option<FileEncryptionParams>, Option<crate::types::FileHash>, Option<Redirection>) {
+fn extract_extra_info(
+    raw: &RawHeader,
+) -> (
+    bool,
+    Option<FileEncryptionParams>,
+    Option<crate::types::FileHash>,
+    Option<Redirection>,
+) {
     let Some(ea_bytes) = common::extra_area_bytes(raw) else {
         return (false, None, None, None);
     };

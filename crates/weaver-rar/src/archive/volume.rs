@@ -30,11 +30,7 @@ impl RarArchive {
     ///
     /// This parses the volume's headers and integrates its file entries into
     /// the unified member list. Supports both RAR5 and RAR4 volumes.
-    pub fn add_volume(
-        &mut self,
-        index: usize,
-        reader: Box<dyn ReadSeek>,
-    ) -> RarResult<()> {
+    pub fn add_volume(&mut self, index: usize, reader: Box<dyn ReadSeek>) -> RarResult<()> {
         let mut reader = reader;
 
         // Seek to start and read signature.
@@ -57,10 +53,7 @@ impl RarArchive {
         // Register this volume.
         self.volume_set.add_volume(vol_num);
 
-        let more_volumes = parsed
-            .end
-            .as_ref()
-            .is_some_and(|e| e.more_volumes);
+        let more_volumes = parsed.end.as_ref().is_some_and(|e| e.more_volumes);
 
         if !more_volumes {
             self.volume_set.set_last_volume_seen();

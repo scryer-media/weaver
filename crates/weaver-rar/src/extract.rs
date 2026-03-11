@@ -118,16 +118,17 @@ where
 
     // Verify CRC32
     if options.verify
-        && let Some(expected_crc) = file_header.data_crc32 {
-            let actual_crc = crc_hasher.unwrap().finalize();
-            if actual_crc != expected_crc {
-                return Err(RarError::DataCrcMismatch {
-                    member: file_header.name.clone(),
-                    expected: expected_crc,
-                    actual: actual_crc,
-                });
-            }
+        && let Some(expected_crc) = file_header.data_crc32
+    {
+        let actual_crc = crc_hasher.unwrap().finalize();
+        if actual_crc != expected_crc {
+            return Err(RarError::DataCrcMismatch {
+                member: file_header.name.clone(),
+                expected: expected_crc,
+                actual: actual_crc,
+            });
         }
+    }
 
     Ok(total_written)
 }
@@ -194,7 +195,12 @@ pub fn extract_member<R: Read + Seek>(
     let output = match file_header.compression.method {
         CompressionMethod::Store => {
             // For store, the CRC is verified inside decompress.
-            decompress::decompress(&compressed, unpacked_size, &file_header.compression, expected_crc)?
+            decompress::decompress(
+                &compressed,
+                unpacked_size,
+                &file_header.compression,
+                expected_crc,
+            )?
         }
         _ => {
             // For compressed data, decompress first then verify CRC.
@@ -207,18 +213,19 @@ pub fn extract_member<R: Read + Seek>(
 
             // Verify CRC32 of decompressed data.
             if options.verify
-                && let Some(expected) = file_header.data_crc32 {
-                    let mut hasher = crc32fast::Hasher::new();
-                    hasher.update(&decompressed);
-                    let actual = hasher.finalize();
-                    if actual != expected {
-                        return Err(RarError::DataCrcMismatch {
-                            member: file_header.name.clone(),
-                            expected,
-                            actual,
-                        });
-                    }
+                && let Some(expected) = file_header.data_crc32
+            {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&decompressed);
+                let actual = hasher.finalize();
+                if actual != expected {
+                    return Err(RarError::DataCrcMismatch {
+                        member: file_header.name.clone(),
+                        expected,
+                        actual,
+                    });
                 }
+            }
 
             decompressed
         }
@@ -232,11 +239,12 @@ pub fn extract_member<R: Read + Seek>(
     // Verify BLAKE2sp hash if provided.
     if options.verify
         && let Some(FileHash::Blake2sp(expected)) = hash
-            && !verify_blake2(&output, expected) {
-                return Err(RarError::Blake2Mismatch {
-                    member: file_header.name.clone(),
-                });
-            }
+        && !verify_blake2(&output, expected)
+    {
+        return Err(RarError::Blake2Mismatch {
+            member: file_header.name.clone(),
+        });
+    }
 
     // Report completion.
     if let (Some(p), Some(mi)) = (progress, member_info) {
@@ -259,11 +267,7 @@ mod tests {
     use super::*;
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
 
-    fn make_stored_file_header(
-        name: &str,
-        data: &[u8],
-        data_offset: u64,
-    ) -> FileHeader {
+    fn make_stored_file_header(name: &str, data: &[u8], data_offset: u64) -> FileHeader {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(data);
         let crc = hasher.finalize();
@@ -348,7 +352,10 @@ mod tests {
             &mut reader,
             &mut output,
             &fh,
-            &ExtractOptions { verify: false, ..Default::default() },
+            &ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
             None,
             None,
         );

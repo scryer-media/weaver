@@ -69,7 +69,8 @@ pub struct LzDecoder {
 impl LzDecoder {
     /// Create a new LZ decoder with the specified dictionary size.
     pub fn new(dict_size: usize) -> Self {
-        let total_symbols = huffman::HUFF_NC + huffman::HUFF_DC + huffman::HUFF_LDC + huffman::HUFF_RC;
+        let total_symbols =
+            huffman::HUFF_NC + huffman::HUFF_DC + huffman::HUFF_LDC + huffman::HUFF_RC;
         Self {
             window: Window::new(dict_size),
             dist_cache: [0; DIST_CACHE_SIZE],
@@ -173,7 +174,7 @@ impl LzDecoder {
             }
 
             // Decode symbols from the current block.
-            output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
+            output_size = self.decode_block(&mut reader, unpacked_size, output_size, None)?;
         }
 
         // Extract output from the window.
@@ -236,6 +237,7 @@ impl LzDecoder {
         reader: &mut BitReader,
         unpacked_size: u64,
         mut output_size: u64,
+        yield_threshold: Option<usize>,
     ) -> RarResult<u64> {
         while output_size < unpacked_size && self.block_bits_remaining > 0 {
             if reader.bits_remaining() < 1 {
@@ -324,6 +326,13 @@ impl LzDecoder {
 
             let bits_consumed = (reader.position() - pos_before) as i64;
             self.block_bits_remaining -= bits_consumed;
+
+            if let Some(threshold) = yield_threshold
+                && self.pending_filters.is_empty()
+                && self.window.unflushed_bytes() as usize >= threshold
+            {
+                break;
+            }
         }
 
         Ok(output_size)
@@ -361,11 +370,7 @@ impl LzDecoder {
     }
 
     /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).
-    fn decode_rc_length(
-        &self,
-        reader: &mut BitReader,
-        rc: &HuffmanTable,
-    ) -> RarResult<usize> {
+    fn decode_rc_length(&self, reader: &mut BitReader, rc: &HuffmanTable) -> RarResult<usize> {
         let slot = rc.decode(reader)? as usize;
         Self::slot_to_length(reader, slot)
     }
@@ -418,22 +423,17 @@ impl LzDecoder {
     ///
     /// Reads the full filter descriptor from the bitstream and pushes a
     /// [`PendingFilter`] for later application to the output.
-    fn handle_filter(
-        &mut self,
-        reader: &mut BitReader,
-        output_size: u64,
-    ) -> RarResult<u64> {
+    fn handle_filter(&mut self, reader: &mut BitReader, output_size: u64) -> RarResult<u64> {
         // Read filter flags byte.
         let flags = reader.read_bits(8)?;
         let filter_code = (flags & 0x07) as u8; // bits 0-2: filter type
         let use_counts = (flags >> 3) & 1; // bit 3: channel count follows (DELTA)
         let block_start_bits = ((flags >> 4) & 0x0F) as u8; // bits 4-7: size of block_start field
 
-        let filter_type = FilterType::from_code(filter_code).ok_or(
-            RarError::UnsupportedFilter {
+        let filter_type =
+            FilterType::from_code(filter_code).ok_or(RarError::UnsupportedFilter {
                 filter_type: filter_code,
-            },
-        )?;
+            })?;
 
         // Read block start delta (relative to current output position).
         let block_start_delta = if block_start_bits > 0 {
@@ -462,11 +462,7 @@ impl LzDecoder {
 
         trace!(
             "filter at output offset {}: type={:?}, block_start={}, block_length={}, channels={}",
-            output_size,
-            filter_type,
-            block_start,
-            block_length,
-            channels
+            output_size, filter_type, block_start, block_length, channels
         );
 
         self.pending_filters.push(PendingFilter {
@@ -496,6 +492,7 @@ impl LzDecoder {
 
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
+        let flush_threshold = (self.window.dict_size() / 2).max(1);
 
         while output_size < unpacked_size {
             if self.block_bits_remaining <= 0 {
@@ -505,11 +502,20 @@ impl LzDecoder {
                 self.read_block_header(&mut reader)?;
             }
 
-            output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
+            output_size = self.decode_block(
+                &mut reader,
+                unpacked_size,
+                output_size,
+                Some(flush_threshold),
+            )?;
 
             // Flush window periodically — but only up to filter boundaries.
             if self.pending_filters.is_empty() {
                 self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+            } else if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 pending filters exceeded dictionary window before flush".into(),
+                });
             }
         }
 
@@ -545,6 +551,7 @@ impl LzDecoder {
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
         let mut boundary_idx = 0;
+        let flush_threshold = (self.window.dict_size() / 2).max(1);
 
         // Track per-chunk output.
         let mut chunks: Vec<(usize, u64)> = Vec::new();
@@ -561,7 +568,12 @@ impl LzDecoder {
             }
 
             let prev_output = output_size;
-            output_size = self.decode_block(&mut reader, unpacked_size, output_size)?;
+            output_size = self.decode_block(
+                &mut reader,
+                unpacked_size,
+                output_size,
+                Some(flush_threshold),
+            )?;
             let decoded_this_round = output_size - prev_output;
 
             // Check if we crossed a volume boundary in compressed space.
@@ -584,7 +596,14 @@ impl LzDecoder {
 
                 // Flush window periodically — but only up to filter boundaries.
                 if self.pending_filters.is_empty() {
-                    self.window.flush_to_writer(&mut *current_writer).map_err(RarError::Io)?;
+                    self.window
+                        .flush_to_writer(&mut *current_writer)
+                        .map_err(RarError::Io)?;
+                } else if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR5 pending filters exceeded dictionary window before flush"
+                            .into(),
+                    });
                 }
             }
         }
@@ -599,10 +618,7 @@ impl LzDecoder {
     }
 
     /// Flush pending filters and remaining window data to a writer.
-    fn flush_filters_and_write<W: Write + ?Sized>(
-        &mut self,
-        writer: &mut W,
-    ) -> RarResult<()> {
+    fn flush_filters_and_write<W: Write + ?Sized>(&mut self, writer: &mut W) -> RarResult<()> {
         if self.pending_filters.is_empty() {
             self.window.flush_to_writer(writer).map_err(RarError::Io)?;
             return Ok(());

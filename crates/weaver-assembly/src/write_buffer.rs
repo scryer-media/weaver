@@ -1,18 +1,36 @@
 use std::collections::BTreeMap;
 
+use weaver_core::buffer::BufferHandle;
+
+pub trait BufferedChunk {
+    fn len_bytes(&self) -> usize;
+}
+
+impl BufferedChunk for Vec<u8> {
+    fn len_bytes(&self) -> usize {
+        self.len()
+    }
+}
+
+impl BufferedChunk for BufferHandle {
+    fn len_bytes(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Reorder buffer that collects out-of-order decoded segments and releases
 /// them in sequential file-offset order, enabling sequential disk writes
 /// even when 50+ connections produce segments in arbitrary order.
-pub struct WriteReorderBuffer {
+pub struct WriteReorderBuffer<T> {
     /// Segments waiting to be written, keyed by their file offset.
-    pending: BTreeMap<u64, Vec<u8>>,
+    pending: BTreeMap<u64, T>,
     /// The next expected sequential write offset.
     write_cursor: u64,
     /// Maximum number of buffered segments before forcing eviction.
     max_pending: usize,
 }
 
-impl WriteReorderBuffer {
+impl<T: BufferedChunk> WriteReorderBuffer<T> {
     /// Create a new reorder buffer.
     ///
     /// `max_pending` controls how many segments can be buffered before the
@@ -31,7 +49,7 @@ impl WriteReorderBuffer {
     /// Returns a vec of `(offset, data)` pairs in write order. The caller
     /// should write them to disk at the given offsets (which will be
     /// sequential whenever possible).
-    pub fn insert(&mut self, offset: u64, data: Vec<u8>) -> Vec<(u64, Vec<u8>)> {
+    pub fn insert(&mut self, offset: u64, data: T) -> Vec<(u64, T)> {
         self.pending.insert(offset, data);
 
         // Drain contiguous segments starting from write_cursor.
@@ -42,7 +60,7 @@ impl WriteReorderBuffer {
             }
             // Safe: we just confirmed the key exists.
             let (off, buf) = self.pending.pop_first().unwrap();
-            self.write_cursor += buf.len() as u64;
+            self.write_cursor += buf.len_bytes() as u64;
             ready.push((off, buf));
         }
 
@@ -60,7 +78,7 @@ impl WriteReorderBuffer {
     ///
     /// Call this when a file is complete to drain any stragglers that never
     /// formed a contiguous run with the write cursor.
-    pub fn flush_all(&mut self) -> Vec<(u64, Vec<u8>)> {
+    pub fn flush_all(&mut self) -> Vec<(u64, T)> {
         let mut out = Vec::with_capacity(self.pending.len());
         while let Some((off, buf)) = self.pending.pop_first() {
             out.push((off, buf));
@@ -76,7 +94,7 @@ mod tests {
 
     #[test]
     fn sequential_inserts_return_immediately() {
-        let mut buf = WriteReorderBuffer::new(16);
+        let mut buf = WriteReorderBuffer::<Vec<u8>>::new(16);
 
         // Insert segments in perfect order.
         let ready = buf.insert(0, vec![0u8; 1000]);
@@ -99,7 +117,7 @@ mod tests {
 
     #[test]
     fn out_of_order_buffers_until_gap_filled() {
-        let mut buf = WriteReorderBuffer::new(16);
+        let mut buf = WriteReorderBuffer::<Vec<u8>>::new(16);
 
         // Insert segment 2 first (offset 2000), then segment 1 (offset 1000).
         // Neither can be written yet because segment 0 (offset 0) is missing.
@@ -119,7 +137,7 @@ mod tests {
 
     #[test]
     fn overflow_forces_oldest_eviction() {
-        let mut buf = WriteReorderBuffer::new(2);
+        let mut buf = WriteReorderBuffer::<Vec<u8>>::new(2);
 
         // Insert 2 segments that don't start at write_cursor (0).
         let ready = buf.insert(1000, vec![0u8; 500]);
@@ -136,7 +154,7 @@ mod tests {
 
     #[test]
     fn flush_all_drains_everything() {
-        let mut buf = WriteReorderBuffer::new(16);
+        let mut buf = WriteReorderBuffer::<Vec<u8>>::new(16);
 
         buf.insert(5000, vec![0u8; 100]);
         buf.insert(3000, vec![0u8; 200]);
@@ -152,7 +170,7 @@ mod tests {
 
     #[test]
     fn partial_contiguous_run() {
-        let mut buf = WriteReorderBuffer::new(16);
+        let mut buf = WriteReorderBuffer::<Vec<u8>>::new(16);
 
         // Insert offset 0 and 1000, but gap at 2000.
         let ready = buf.insert(0, vec![0u8; 1000]);

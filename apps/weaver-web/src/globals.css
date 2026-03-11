@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -134,5 +135,17 @@ h6 {
   }
   body {
     @apply bg-background text-foreground;
+    background-image:
+      radial-gradient(circle at top, color-mix(in srgb, var(--primary) 12%, transparent) 0%, transparent 36%),
+      linear-gradient(180deg, color-mix(in srgb, var(--background) 96%, white 4%) 0%, var(--background) 100%);
+    min-height: 100vh;
+  }
+
+  .dark body {
+    background-image:
+      radial-gradient(circle at 16% 18%, color-mix(in srgb, #5b64ff 18%, transparent) 0%, transparent 28%),
+      radial-gradient(circle at 82% 14%, color-mix(in srgb, #12b5d6 12%, transparent) 0%, transparent 24%),
+      radial-gradient(circle at 52% 100%, color-mix(in srgb, #7c3aed 10%, transparent) 0%, transparent 32%),
+      linear-gradient(180deg, #09101f 0%, #070b18 48%, #050812 100%);
   }
 }

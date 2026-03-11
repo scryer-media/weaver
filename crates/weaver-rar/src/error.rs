@@ -70,11 +70,10 @@ pub enum RarError {
     #[error("member not found: {name}")]
     MemberNotFound { name: String },
 
-    #[error("solid archive requires sequential extraction: must extract {required} before {requested}")]
-    SolidOrderViolation {
-        required: String,
-        requested: String,
-    },
+    #[error(
+        "solid archive requires sequential extraction: must extract {required} before {requested}"
+    )]
+    SolidOrderViolation { required: String, requested: String },
 }
 
 pub type RarResult<T> = Result<T, RarError>;

@@ -96,19 +96,15 @@ impl Database {
     /// Delete all events for a job.
     pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
         let conn = self.conn();
-        conn.execute(
-            "DELETE FROM job_events WHERE job_id = ?1",
-            [job_id as i64],
-        )
-        .map_err(db_err)?;
+        conn.execute("DELETE FROM job_events WHERE job_id = ?1", [job_id as i64])
+            .map_err(db_err)?;
         Ok(())
     }
 
     /// Delete all job events across all jobs.
     pub fn delete_all_job_events(&self) -> Result<(), StateError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM job_events", [])
-            .map_err(db_err)?;
+        conn.execute("DELETE FROM job_events", []).map_err(db_err)?;
         Ok(())
     }
 }
@@ -122,8 +118,14 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_event(1, 1000, "JOB_CREATED", "test: 5 files", None)
             .unwrap();
-        db.insert_job_event(1, 1001, "FILE_COMPLETE", "data.rar: 1000 bytes", Some("1:0"))
-            .unwrap();
+        db.insert_job_event(
+            1,
+            1001,
+            "FILE_COMPLETE",
+            "data.rar: 1000 bytes",
+            Some("1:0"),
+        )
+        .unwrap();
         db.insert_job_event(2, 1002, "JOB_CREATED", "other job", None)
             .unwrap();
 

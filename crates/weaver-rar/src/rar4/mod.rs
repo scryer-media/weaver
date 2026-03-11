@@ -18,9 +18,7 @@ use std::io::{Read, Seek};
 use tracing::{debug, warn};
 
 use crate::error::{RarError, RarResult};
-use crate::types::{
-    CompressionInfo, CompressionMethod, HostOs, MemberInfo, VolumeSpan,
-};
+use crate::types::{CompressionInfo, CompressionMethod, HostOs, MemberInfo, VolumeSpan};
 use types::*;
 
 /// Parsed RAR4 volume contents.
@@ -40,14 +38,16 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
     let mut end = None;
 
     while let Some(raw) = header::read_raw_header(reader)? {
-
         match raw.header_type {
             Rar4HeaderType::Mark => {
                 // Marker header — skip, it's just the signature confirmation.
             }
             Rar4HeaderType::Archive => {
                 let arch = header::parse_archive_header(&raw)?;
-                debug!("RAR4 archive: solid={} volume={} encrypted={}", arch.is_solid, arch.is_volume, arch.is_encrypted);
+                debug!(
+                    "RAR4 archive: solid={} volume={} encrypted={}",
+                    arch.is_solid, arch.is_volume, arch.is_encrypted
+                );
                 if arch.is_encrypted {
                     return Err(RarError::EncryptedArchive);
                 }
@@ -55,7 +55,10 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
             }
             Rar4HeaderType::File => {
                 let fh = header::parse_file_header(&raw)?;
-                debug!("RAR4 file: name={:?} packed={} unpacked={} method={:?}", fh.name, fh.packed_size, fh.unpacked_size, fh.method);
+                debug!(
+                    "RAR4 file: name={:?} packed={} unpacked={} method={:?}",
+                    fh.name, fh.packed_size, fh.unpacked_size, fh.method
+                );
                 // For files with LARGE flag, the raw header's data_area_size only
                 // has the low 32 bits. Use the fully-resolved packed_size instead.
                 let skip_size = fh.packed_size;
@@ -71,7 +74,11 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
                 end = Some(e);
                 break;
             }
-            Rar4HeaderType::Comment | Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Recovery | Rar4HeaderType::NewSub => {
+            Rar4HeaderType::Comment
+            | Rar4HeaderType::Extra
+            | Rar4HeaderType::Sub
+            | Rar4HeaderType::Recovery
+            | Rar4HeaderType::NewSub => {
                 debug!("RAR4 skipping header type {:?}", raw.header_type);
             }
             Rar4HeaderType::Unknown(t) => {
@@ -181,7 +188,8 @@ fn dos_datetime_to_system_time(dos_dt: u32) -> Option<std::time::SystemTime> {
     }
     total_days += (day - 1) as i64;
 
-    let total_seconds = total_days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    let total_seconds =
+        total_days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
 
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_seconds as u64))
 }

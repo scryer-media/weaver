@@ -96,7 +96,8 @@ impl Database {
             .prepare(&sql)
             .map_err(|e| StateError::Database(e.to_string()))?;
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
         let rows = stmt
             .query_map(param_refs.as_slice(), |row| {
@@ -129,10 +130,7 @@ impl Database {
     pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
         let conn = self.conn();
         let changed = conn
-            .execute(
-                "DELETE FROM job_history WHERE job_id = ?1",
-                [job_id as i64],
-            )
+            .execute("DELETE FROM job_history WHERE job_id = ?1", [job_id as i64])
             .map_err(|e| StateError::Database(e.to_string()))?;
         Ok(changed > 0)
     }
@@ -184,9 +182,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&sample_history()).unwrap();
 
-        let entries = db
-            .list_job_history(&HistoryFilter::default())
-            .unwrap();
+        let entries = db.list_job_history(&HistoryFilter::default()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.nzb");
         assert_eq!(entries[0].total_bytes, 1_000_000);

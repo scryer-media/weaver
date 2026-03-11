@@ -428,7 +428,14 @@ fn test_extract_stored_crc_verification() {
 
     // Should succeed with verification enabled (default)
     let result = archive
-        .extract_member(0, &weaver_rar::ExtractOptions { verify: true, ..Default::default() }, None)
+        .extract_member(
+            0,
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result, content);
 }
@@ -487,10 +494,8 @@ fn test_multivolume_open_volumes() {
     let content = b"Hello, this is data that spans two volumes!";
     let (vol0, vol1, _full) = build_two_volume_stored_archive("movie.mkv", content, 20);
 
-    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = vec![
-        Box::new(Cursor::new(vol0)),
-        Box::new(Cursor::new(vol1)),
-    ];
+    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
     let mut archive = weaver_rar::RarArchive::open_volumes(readers).unwrap();
 
     let names = archive.member_names();
@@ -498,7 +503,14 @@ fn test_multivolume_open_volumes() {
     assert_eq!(names[0], "movie.mkv");
 
     let result = archive
-        .extract_by_name("movie.mkv", &weaver_rar::ExtractOptions { verify: false, ..Default::default() }, None)
+        .extract_by_name(
+            "movie.mkv",
+            &weaver_rar::ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result, content);
 }
@@ -508,14 +520,19 @@ fn test_multivolume_extract_with_crc() {
     let content = b"CRC-verified multi-volume content spanning two volumes here";
     let (vol0, vol1, _full) = build_two_volume_stored_archive("data.bin", content, 30);
 
-    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = vec![
-        Box::new(Cursor::new(vol0)),
-        Box::new(Cursor::new(vol1)),
-    ];
+    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
     let mut archive = weaver_rar::RarArchive::open_volumes(readers).unwrap();
 
     let result = archive
-        .extract_by_name("data.bin", &weaver_rar::ExtractOptions { verify: true, ..Default::default() }, None)
+        .extract_by_name(
+            "data.bin",
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result, content);
 }
@@ -543,7 +560,14 @@ fn test_multivolume_incremental_add() {
     assert!(archive.missing_volumes("file.dat").is_empty());
 
     let result = archive
-        .extract_by_name("file.dat", &weaver_rar::ExtractOptions { verify: false, ..Default::default() }, None)
+        .extract_by_name(
+            "file.dat",
+            &weaver_rar::ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result, content);
 }
@@ -600,12 +624,8 @@ fn test_solid_archive_stored_files() {
     let file1_content = b"First file in solid archive";
     let file2_content = b"Second file in solid archive";
 
-    let archive_bytes = build_solid_stored_archive(
-        "first.txt",
-        file1_content,
-        "second.txt",
-        file2_content,
-    );
+    let archive_bytes =
+        build_solid_stored_archive("first.txt", file1_content, "second.txt", file2_content);
 
     let cursor = Cursor::new(archive_bytes);
     let mut archive = weaver_rar::RarArchive::open(cursor).unwrap();
@@ -617,22 +637,33 @@ fn test_solid_archive_stored_files() {
 
     // Extract both in order.
     let result1 = archive
-        .extract_by_name("first.txt", &weaver_rar::ExtractOptions { verify: true, ..Default::default() }, None)
+        .extract_by_name(
+            "first.txt",
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result1, file1_content);
 
     let result2 = archive
-        .extract_by_name("second.txt", &weaver_rar::ExtractOptions { verify: true, ..Default::default() }, None)
+        .extract_by_name(
+            "second.txt",
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
     assert_eq!(result2, file2_content);
 }
 
 #[test]
 fn test_solid_archive_metadata() {
-    let archive_bytes = build_solid_stored_archive(
-        "a.txt", b"AAA",
-        "b.txt", b"BBB",
-    );
+    let archive_bytes = build_solid_stored_archive("a.txt", b"AAA", "b.txt", b"BBB");
 
     let cursor = Cursor::new(archive_bytes);
     let archive = weaver_rar::RarArchive::open(cursor).unwrap();
@@ -762,10 +793,8 @@ fn test_rar4_multivolume_open_volumes() {
     let content = b"RAR4 multi-volume stored file content spanning two volumes!";
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("movie.avi", content, 30);
 
-    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = vec![
-        Box::new(Cursor::new(vol0)),
-        Box::new(Cursor::new(vol1)),
-    ];
+    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
     let mut archive = weaver_rar::RarArchive::open_volumes(readers).unwrap();
 
     assert_eq!(archive.format(), weaver_rar::ArchiveFormat::Rar4);
@@ -777,7 +806,10 @@ fn test_rar4_multivolume_open_volumes() {
     let result = archive
         .extract_by_name(
             "movie.avi",
-            &weaver_rar::ExtractOptions { verify: false, ..Default::default() },
+            &weaver_rar::ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -806,7 +838,10 @@ fn test_rar4_multivolume_incremental_add() {
     let result = archive
         .extract_by_name(
             "file.dat",
-            &weaver_rar::ExtractOptions { verify: false, ..Default::default() },
+            &weaver_rar::ExtractOptions {
+                verify: false,
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -818,16 +853,17 @@ fn test_rar4_multivolume_crc_verification() {
     let content = b"CRC verified RAR4 multi-volume content here for testing";
     let (vol0, vol1) = build_two_volume_rar4_stored_archive("data.bin", content, 28);
 
-    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = vec![
-        Box::new(Cursor::new(vol0)),
-        Box::new(Cursor::new(vol1)),
-    ];
+    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
     let mut archive = weaver_rar::RarArchive::open_volumes(readers).unwrap();
 
     let result = archive
         .extract_by_name(
             "data.bin",
-            &weaver_rar::ExtractOptions { verify: true, ..Default::default() },
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -876,7 +912,10 @@ fn test_rar4_single_volume_stored() {
     let result = archive
         .extract_by_name(
             "single.txt",
-            &weaver_rar::ExtractOptions { verify: true, ..Default::default() },
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -965,11 +1004,8 @@ fn test_rar4_encrypted_stored_file() {
     vol.extend_from_slice(&build_rar4_end_header(false));
 
     // Open and extract with password.
-    let mut archive = weaver_rar::RarArchive::open_with_password(
-        Cursor::new(vol),
-        password,
-    )
-    .unwrap();
+    let mut archive =
+        weaver_rar::RarArchive::open_with_password(Cursor::new(vol), password).unwrap();
 
     assert_eq!(archive.format(), weaver_rar::ArchiveFormat::Rar4);
 
@@ -979,7 +1015,10 @@ fn test_rar4_encrypted_stored_file() {
     let result = archive
         .extract_by_name(
             "secret.txt",
-            &weaver_rar::ExtractOptions { verify: true, ..Default::default() },
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
             None,
         )
         .unwrap();
@@ -1015,18 +1054,20 @@ fn test_rar4_encrypted_no_password_fails() {
     vol.extend_from_slice(&RAR4_SIG);
     vol.extend_from_slice(&build_rar4_archive_header(0));
     vol.extend_from_slice(&build_rar4_encrypted_file_header(
-        "locked.txt", ciphertext.len() as u32, content.len() as u32, crc, &salt, 0,
+        "locked.txt",
+        ciphertext.len() as u32,
+        content.len() as u32,
+        crc,
+        &salt,
+        0,
     ));
     vol.extend_from_slice(&ciphertext);
     vol.extend_from_slice(&build_rar4_end_header(false));
 
     // Open without password — extraction should fail with EncryptedMember.
     let mut archive = weaver_rar::RarArchive::open(Cursor::new(vol)).unwrap();
-    let result = archive.extract_by_name(
-        "locked.txt",
-        &weaver_rar::ExtractOptions::default(),
-        None,
-    );
+    let result =
+        archive.extract_by_name("locked.txt", &weaver_rar::ExtractOptions::default(), None);
     assert!(result.is_err());
 }
 
@@ -1126,8 +1167,14 @@ fn test_symlink_propagated_to_member_info() {
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
     let member = &meta.members[0];
-    assert!(member.is_symlink, "is_symlink should be true for UnixSymlink redirection");
-    assert!(!member.is_hardlink, "is_hardlink should be false for UnixSymlink");
+    assert!(
+        member.is_symlink,
+        "is_symlink should be true for UnixSymlink redirection"
+    );
+    assert!(
+        !member.is_hardlink,
+        "is_hardlink should be false for UnixSymlink"
+    );
     assert_eq!(
         member.link_target.as_deref(),
         Some(target),
@@ -1153,8 +1200,14 @@ fn test_hardlink_propagated_to_member_info() {
     let meta = archive.metadata();
     assert_eq!(meta.members.len(), 1);
     let member = &meta.members[0];
-    assert!(!member.is_symlink, "is_symlink should be false for Hardlink");
-    assert!(member.is_hardlink, "is_hardlink should be true for Hardlink redirection");
+    assert!(
+        !member.is_symlink,
+        "is_symlink should be false for Hardlink"
+    );
+    assert!(
+        member.is_hardlink,
+        "is_hardlink should be true for Hardlink redirection"
+    );
     assert_eq!(member.link_target.as_deref(), Some(target));
 }
 
@@ -1173,7 +1226,10 @@ fn test_no_extra_records_defaults() {
     assert!(member.hash.is_none(), "hash should default to None");
     assert!(!member.is_symlink, "is_symlink should default to false");
     assert!(!member.is_hardlink, "is_hardlink should default to false");
-    assert!(member.link_target.is_none(), "link_target should default to None");
+    assert!(
+        member.link_target.is_none(),
+        "link_target should default to None"
+    );
 }
 
 // =============================================================================
@@ -1221,7 +1277,10 @@ fn open_multi(dir: &str, filenames: &[&str]) -> weaver_rar::RarArchive {
 #[test]
 fn test_rar5_fixture_store_batch() {
     let mut archive = open_single("rar5", "rar5_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("small.txt"));
 }
@@ -1229,17 +1288,26 @@ fn test_rar5_fixture_store_batch() {
 #[test]
 fn test_rar5_fixture_store_streaming() {
     let mut archive = open_single("rar5", "rar5_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
-    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_store.rar")]);
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+    let provider =
+        weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_store.rar")]);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("small.txt"));
 }
 
 #[test]
 fn test_rar5_fixture_lz_batch() {
     let mut archive = open_single("rar5", "rar5_lz.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("compressible.txt"));
 }
@@ -1247,22 +1315,36 @@ fn test_rar5_fixture_lz_batch() {
 #[test]
 fn test_rar5_fixture_lz_streaming() {
     let mut archive = open_single("rar5", "rar5_lz.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
-    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_lz.rar")]);
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+    let provider =
+        weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_lz.rar")]);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("compressible.txt"));
 }
 
 #[test]
 fn test_rar5_fixture_multivolume_store_batch() {
-    let vols: Vec<&str> = (1..=5).map(|i| match i {
-        1 => "rar5_mv_store.part1.rar", 2 => "rar5_mv_store.part2.rar",
-        3 => "rar5_mv_store.part3.rar", 4 => "rar5_mv_store.part4.rar",
-        5 => "rar5_mv_store.part5.rar", _ => unreachable!(),
-    }).collect();
+    let vols: Vec<&str> = (1..=5)
+        .map(|i| match i {
+            1 => "rar5_mv_store.part1.rar",
+            2 => "rar5_mv_store.part2.rar",
+            3 => "rar5_mv_store.part3.rar",
+            4 => "rar5_mv_store.part4.rar",
+            5 => "rar5_mv_store.part5.rar",
+            _ => unreachable!(),
+        })
+        .collect();
     let mut archive = open_multi("rar5", &vols);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("binary.bin"));
 }
@@ -1270,16 +1352,23 @@ fn test_rar5_fixture_multivolume_store_batch() {
 #[test]
 fn test_rar5_fixture_multivolume_store_streaming() {
     let vol_names = [
-        "rar5_mv_store.part1.rar", "rar5_mv_store.part2.rar",
-        "rar5_mv_store.part3.rar", "rar5_mv_store.part4.rar",
+        "rar5_mv_store.part1.rar",
+        "rar5_mv_store.part2.rar",
+        "rar5_mv_store.part3.rar",
+        "rar5_mv_store.part4.rar",
         "rar5_mv_store.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
     let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("binary.bin"));
 }
 
@@ -1288,7 +1377,10 @@ fn test_rar5_fixture_multivolume_store_streaming() {
 #[test]
 fn test_rar4_fixture_store_batch() {
     let mut archive = open_single("rar4", "rar4_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("small.txt"));
 }
@@ -1296,20 +1388,31 @@ fn test_rar4_fixture_store_batch() {
 #[test]
 fn test_rar4_fixture_lz_batch() {
     let mut archive = open_single("rar4", "rar4_lz.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("compressible.txt"));
 }
 
 #[test]
 fn test_rar4_fixture_multivolume_store_batch() {
-    let vols: Vec<&str> = (1..=5).map(|i| match i {
-        1 => "rar4_mv_store.part1.rar", 2 => "rar4_mv_store.part2.rar",
-        3 => "rar4_mv_store.part3.rar", 4 => "rar4_mv_store.part4.rar",
-        5 => "rar4_mv_store.part5.rar", _ => unreachable!(),
-    }).collect();
+    let vols: Vec<&str> = (1..=5)
+        .map(|i| match i {
+            1 => "rar4_mv_store.part1.rar",
+            2 => "rar4_mv_store.part2.rar",
+            3 => "rar4_mv_store.part3.rar",
+            4 => "rar4_mv_store.part4.rar",
+            5 => "rar4_mv_store.part5.rar",
+            _ => unreachable!(),
+        })
+        .collect();
     let mut archive = open_multi("rar4", &vols);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("binary.bin"));
 }
@@ -1318,13 +1421,21 @@ fn test_rar4_fixture_multivolume_store_batch() {
 
 #[test]
 fn test_rar5_fixture_multivolume_video_batch() {
-    let vols: Vec<&str> = (1..=5).map(|i| match i {
-        1 => "rar5_mv_video.part1.rar", 2 => "rar5_mv_video.part2.rar",
-        3 => "rar5_mv_video.part3.rar", 4 => "rar5_mv_video.part4.rar",
-        5 => "rar5_mv_video.part5.rar", _ => unreachable!(),
-    }).collect();
+    let vols: Vec<&str> = (1..=5)
+        .map(|i| match i {
+            1 => "rar5_mv_video.part1.rar",
+            2 => "rar5_mv_video.part2.rar",
+            3 => "rar5_mv_video.part3.rar",
+            4 => "rar5_mv_video.part4.rar",
+            5 => "rar5_mv_video.part5.rar",
+            _ => unreachable!(),
+        })
+        .collect();
     let mut archive = open_multi("rar5", &vols);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("test_clip.mkv"));
 }
@@ -1332,28 +1443,43 @@ fn test_rar5_fixture_multivolume_video_batch() {
 #[test]
 fn test_rar5_fixture_multivolume_video_streaming() {
     let vol_names = [
-        "rar5_mv_video.part1.rar", "rar5_mv_video.part2.rar",
-        "rar5_mv_video.part3.rar", "rar5_mv_video.part4.rar",
+        "rar5_mv_video.part1.rar",
+        "rar5_mv_video.part2.rar",
+        "rar5_mv_video.part3.rar",
+        "rar5_mv_video.part4.rar",
         "rar5_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
     let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("test_clip.mkv"));
 }
 
 #[test]
 fn test_rar4_fixture_multivolume_video_batch() {
-    let vols: Vec<&str> = (1..=5).map(|i| match i {
-        1 => "rar4_mv_video.part1.rar", 2 => "rar4_mv_video.part2.rar",
-        3 => "rar4_mv_video.part3.rar", 4 => "rar4_mv_video.part4.rar",
-        5 => "rar4_mv_video.part5.rar", _ => unreachable!(),
-    }).collect();
+    let vols: Vec<&str> = (1..=5)
+        .map(|i| match i {
+            1 => "rar4_mv_video.part1.rar",
+            2 => "rar4_mv_video.part2.rar",
+            3 => "rar4_mv_video.part3.rar",
+            4 => "rar4_mv_video.part4.rar",
+            5 => "rar4_mv_video.part5.rar",
+            _ => unreachable!(),
+        })
+        .collect();
     let mut archive = open_multi("rar4", &vols);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("test_clip.mkv"));
 }
@@ -1362,13 +1488,18 @@ fn test_rar4_fixture_multivolume_video_batch() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_multivolume_video_batch() {
     let vol_names = [
-        "rar5_enc_mv_video.part1.rar", "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar", "rar5_enc_mv_video.part4.rar",
+        "rar5_enc_mv_video.part1.rar",
+        "rar5_enc_mv_video.part2.rar",
+        "rar5_enc_mv_video.part3.rar",
+        "rar5_enc_mv_video.part4.rar",
         "rar5_enc_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("test_clip.mkv"));
 }
@@ -1377,17 +1508,24 @@ fn test_rar5_encrypted_multivolume_video_batch() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_multivolume_video_streaming() {
     let vol_names = [
-        "rar5_enc_mv_video.part1.rar", "rar5_enc_mv_video.part2.rar",
-        "rar5_enc_mv_video.part3.rar", "rar5_enc_mv_video.part4.rar",
+        "rar5_enc_mv_video.part1.rar",
+        "rar5_enc_mv_video.part2.rar",
+        "rar5_enc_mv_video.part3.rar",
+        "rar5_enc_mv_video.part4.rar",
         "rar5_enc_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
     let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("test_clip.mkv"));
 }
 
@@ -1395,13 +1533,18 @@ fn test_rar5_encrypted_multivolume_video_streaming() {
 #[cfg(feature = "slow-tests")]
 fn test_rar4_encrypted_multivolume_video_batch() {
     let vol_names = [
-        "rar4_enc_mv_video.part1.rar", "rar4_enc_mv_video.part2.rar",
-        "rar4_enc_mv_video.part3.rar", "rar4_enc_mv_video.part4.rar",
+        "rar4_enc_mv_video.part1.rar",
+        "rar4_enc_mv_video.part2.rar",
+        "rar4_enc_mv_video.part3.rar",
+        "rar4_enc_mv_video.part4.rar",
         "rar4_enc_mv_video.part5.rar",
     ];
     let mut archive = open_multi("rar4", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("test_clip.mkv"));
 }
@@ -1411,9 +1554,15 @@ fn test_rar4_encrypted_multivolume_video_batch() {
 #[test]
 fn test_rar5_encrypted_no_password_fails() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None);
-    assert!(result.is_err(), "no password should fail for encrypted archive");
+    assert!(
+        result.is_err(),
+        "no password should fail for encrypted archive"
+    );
 }
 
 #[test]
@@ -1421,7 +1570,10 @@ fn test_rar5_encrypted_no_password_fails() {
 fn test_rar5_encrypted_store_batch() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("small.txt"));
 }
@@ -1431,10 +1583,16 @@ fn test_rar5_encrypted_store_batch() {
 fn test_rar5_encrypted_store_streaming() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
-    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_store.rar")]);
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
+    let provider =
+        weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_store.rar")]);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("small.txt"));
 }
 
@@ -1443,7 +1601,10 @@ fn test_rar5_encrypted_store_streaming() {
 fn test_rar5_encrypted_lz_batch() {
     let mut archive = open_single("rar5", "rar5_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("compressible.txt"));
 }
@@ -1453,10 +1614,16 @@ fn test_rar5_encrypted_lz_batch() {
 fn test_rar5_encrypted_lz_streaming() {
     let mut archive = open_single("rar5", "rar5_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
-    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
+    let provider =
+        weaver_rar::StaticVolumeProvider::from_ordered(vec![fixture("rar5", "rar5_enc_lz.rar")]);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("compressible.txt"));
 }
 
@@ -1464,13 +1631,18 @@ fn test_rar5_encrypted_lz_streaming() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_multivolume_store_batch() {
     let vol_names = [
-        "rar5_enc_mv_store.part1.rar", "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar", "rar5_enc_mv_store.part4.rar",
+        "rar5_enc_mv_store.part1.rar",
+        "rar5_enc_mv_store.part2.rar",
+        "rar5_enc_mv_store.part3.rar",
+        "rar5_enc_mv_store.part4.rar",
         "rar5_enc_mv_store.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("binary.bin"));
 }
@@ -1479,17 +1651,24 @@ fn test_rar5_encrypted_multivolume_store_batch() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_multivolume_store_streaming() {
     let vol_names = [
-        "rar5_enc_mv_store.part1.rar", "rar5_enc_mv_store.part2.rar",
-        "rar5_enc_mv_store.part3.rar", "rar5_enc_mv_store.part4.rar",
+        "rar5_enc_mv_store.part1.rar",
+        "rar5_enc_mv_store.part2.rar",
+        "rar5_enc_mv_store.part3.rar",
+        "rar5_enc_mv_store.part4.rar",
         "rar5_enc_mv_store.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
     let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("binary.bin"));
 }
 
@@ -1497,7 +1676,10 @@ fn test_rar5_encrypted_multivolume_store_streaming() {
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_wrong_password_fails() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some("wrongpassword".into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("wrongpassword".into()),
+    };
     let result = archive.extract_member(0, &opts, None);
     assert!(result.is_err(), "wrong password should fail");
 }
@@ -1507,9 +1689,15 @@ fn test_rar5_encrypted_wrong_password_fails() {
 #[test]
 fn test_rar4_encrypted_no_password_fails_fixture() {
     let mut archive = open_single("rar4", "rar4_enc_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None);
-    assert!(result.is_err(), "no password should fail for encrypted archive");
+    assert!(
+        result.is_err(),
+        "no password should fail for encrypted archive"
+    );
 }
 
 #[test]
@@ -1517,7 +1705,10 @@ fn test_rar4_encrypted_no_password_fails_fixture() {
 fn test_rar4_encrypted_store_batch() {
     let mut archive = open_single("rar4", "rar4_enc_store.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("small.txt"));
 }
@@ -1527,7 +1718,10 @@ fn test_rar4_encrypted_store_batch() {
 fn test_rar4_encrypted_lz_batch() {
     let mut archive = open_single("rar4", "rar4_enc_lz.rar");
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("compressible.txt"));
 }
@@ -1536,13 +1730,18 @@ fn test_rar4_encrypted_lz_batch() {
 #[cfg(feature = "slow-tests")]
 fn test_rar4_encrypted_multivolume_store_batch() {
     let vol_names = [
-        "rar4_enc_mv_store.part1.rar", "rar4_enc_mv_store.part2.rar",
-        "rar4_enc_mv_store.part3.rar", "rar4_enc_mv_store.part4.rar",
+        "rar4_enc_mv_store.part1.rar",
+        "rar4_enc_mv_store.part2.rar",
+        "rar4_enc_mv_store.part3.rar",
+        "rar4_enc_mv_store.part4.rar",
         "rar4_enc_mv_store.part5.rar",
     ];
     let mut archive = open_multi("rar4", &vol_names);
     archive.set_password(TEST_PASSWORD);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: Some(TEST_PASSWORD.into()) };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(TEST_PASSWORD.into()),
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("binary.bin"));
 }
@@ -1563,7 +1762,10 @@ fn test_rar5_multifile_store_list() {
 #[test]
 fn test_rar5_multifile_store_extract_all() {
     let mut archive = open_single("rar5", "rar5_multifile_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(r0, original("hello.txt"));
@@ -1578,7 +1780,10 @@ fn test_rar5_multifile_store_extract_all() {
 #[test]
 fn test_rar5_multifile_store_extract_by_name() {
     let mut archive = open_single("rar5", "rar5_multifile_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_by_name("second.txt", &opts, None).unwrap();
     assert_eq!(result, original("second.txt"));
 }
@@ -1593,7 +1798,10 @@ fn test_rar4_multifile_store_list() {
 #[test]
 fn test_rar4_multifile_store_extract_all() {
     let mut archive = open_single("rar4", "rar4_multifile_store.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(r0, original("hello.txt"));
@@ -1610,7 +1818,10 @@ fn test_rar4_multifile_store_extract_all() {
 #[test]
 fn test_rar5_empty_member() {
     let mut archive = open_single("rar5", "rar5_empty_member.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     let names = archive.member_names();
     assert_eq!(names, vec!["empty.txt", "hello.txt"]);
@@ -1633,7 +1844,10 @@ fn test_rar5_empty_member_info() {
 #[test]
 fn test_rar4_empty_member() {
     let mut archive = open_single("rar4", "rar4_empty_member.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert!(r0.is_empty());
@@ -1650,14 +1864,25 @@ fn test_rar5_unicode_filenames() {
     let names = archive.member_names();
     assert_eq!(names.len(), 2);
     // RAR5 stores filenames as UTF-8 internally
-    assert!(names[0].contains("日本語"), "first name should contain Japanese: {}", names[0]);
-    assert!(names[1].contains("café"), "second name should contain café: {}", names[1]);
+    assert!(
+        names[0].contains("日本語"),
+        "first name should contain Japanese: {}",
+        names[0]
+    );
+    assert!(
+        names[1].contains("café"),
+        "second name should contain café: {}",
+        names[1]
+    );
 }
 
 #[test]
 fn test_rar5_unicode_extract() {
     let mut archive = open_single("rar5", "rar5_unicode.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(r0, original("日本語ファイル.txt"));
@@ -1673,7 +1898,11 @@ fn test_rar5_dirs_list() {
     let archive = open_single("rar5", "rar5_dirs.rar");
     let names = archive.member_names();
     // Should contain files and a directory entry
-    assert!(names.len() >= 2, "should have at least 2 file entries, got: {:?}", names);
+    assert!(
+        names.len() >= 2,
+        "should have at least 2 file entries, got: {:?}",
+        names
+    );
 
     // Check for directory member
     let mut has_dir = false;
@@ -1689,10 +1918,17 @@ fn test_rar5_dirs_list() {
 #[test]
 fn test_rar5_dirs_extract_files() {
     let mut archive = open_single("rar5", "rar5_dirs.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
 
     // Extract each non-directory member and verify content
-    let names = archive.member_names().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let names = archive
+        .member_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
     for (i, name) in names.iter().enumerate() {
         let info = archive.member_info(i).unwrap();
         if info.is_directory {
@@ -1711,7 +1947,11 @@ fn test_rar5_dirs_extract_files() {
 fn test_rar4_dirs_list() {
     let archive = open_single("rar4", "rar4_dirs.rar");
     let names = archive.member_names();
-    assert!(names.len() >= 2, "should have at least 2 entries, got: {:?}", names);
+    assert!(
+        names.len() >= 2,
+        "should have at least 2 entries, got: {:?}",
+        names
+    );
 }
 
 // -- Solid archives -----------------------------------------------------------
@@ -1744,7 +1984,10 @@ fn test_rar5_recovery_record_parses() {
 #[test]
 fn test_rar5_recovery_record_extract() {
     let mut archive = open_single("rar5", "rar5_recovery.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(r0, original("hello.txt"));
     let r1 = archive.extract_member(1, &opts, None).unwrap();
@@ -1761,7 +2004,10 @@ fn test_rar4_recovery_record_parses() {
 #[test]
 fn test_rar4_recovery_record_extract() {
     let mut archive = open_single("rar4", "rar4_recovery.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let r0 = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(r0, original("hello.txt"));
     let r1 = archive.extract_member(1, &opts, None).unwrap();
@@ -1780,7 +2026,10 @@ fn test_rar5_comment_archive_parses() {
 #[test]
 fn test_rar5_comment_archive_extract() {
     let mut archive = open_single("rar5", "rar5_comment.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("hello.txt"));
 }
@@ -1795,7 +2044,10 @@ fn test_rar4_comment_archive_parses() {
 #[test]
 fn test_rar4_comment_archive_extract() {
     let mut archive = open_single("rar4", "rar4_comment.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("hello.txt"));
 }
@@ -1805,12 +2057,17 @@ fn test_rar4_comment_archive_extract() {
 #[test]
 fn test_rar5_tiny_volumes_batch() {
     let vol_names = [
-        "rar5_tiny_volumes.part1.rar", "rar5_tiny_volumes.part2.rar",
-        "rar5_tiny_volumes.part3.rar", "rar5_tiny_volumes.part4.rar",
+        "rar5_tiny_volumes.part1.rar",
+        "rar5_tiny_volumes.part2.rar",
+        "rar5_tiny_volumes.part3.rar",
+        "rar5_tiny_volumes.part4.rar",
         "rar5_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("random_4k.bin"));
 }
@@ -1818,28 +2075,40 @@ fn test_rar5_tiny_volumes_batch() {
 #[test]
 fn test_rar5_tiny_volumes_streaming() {
     let vol_names = [
-        "rar5_tiny_volumes.part1.rar", "rar5_tiny_volumes.part2.rar",
-        "rar5_tiny_volumes.part3.rar", "rar5_tiny_volumes.part4.rar",
+        "rar5_tiny_volumes.part1.rar",
+        "rar5_tiny_volumes.part2.rar",
+        "rar5_tiny_volumes.part3.rar",
+        "rar5_tiny_volumes.part4.rar",
         "rar5_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar5", &vol_names);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let paths: Vec<_> = vol_names.iter().map(|n| fixture("rar5", n)).collect();
     let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths);
     let mut out = Vec::new();
-    archive.extract_member_streaming(0, &opts, &provider, &mut out).unwrap();
+    archive
+        .extract_member_streaming(0, &opts, &provider, &mut out)
+        .unwrap();
     assert_eq!(out, original("random_4k.bin"));
 }
 
 #[test]
 fn test_rar4_tiny_volumes_batch() {
     let vol_names = [
-        "rar4_tiny_volumes.part1.rar", "rar4_tiny_volumes.part2.rar",
-        "rar4_tiny_volumes.part3.rar", "rar4_tiny_volumes.part4.rar",
+        "rar4_tiny_volumes.part1.rar",
+        "rar4_tiny_volumes.part2.rar",
+        "rar4_tiny_volumes.part3.rar",
+        "rar4_tiny_volumes.part4.rar",
         "rar4_tiny_volumes.part5.rar",
     ];
     let mut archive = open_multi("rar4", &vol_names);
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("random_4k.bin"));
 }
@@ -1852,7 +2121,11 @@ fn test_rar5_longname() {
     let names = archive.member_names();
     assert_eq!(names.len(), 1);
     let long_name = &names[0];
-    assert!(long_name.len() >= 200, "filename should be >= 200 chars, got {}", long_name.len());
+    assert!(
+        long_name.len() >= 200,
+        "filename should be >= 200 chars, got {}",
+        long_name.len()
+    );
     assert!(long_name.starts_with("aaa"), "should be all a's");
     assert!(long_name.ends_with(".txt"));
 }
@@ -1860,7 +2133,10 @@ fn test_rar5_longname() {
 #[test]
 fn test_rar5_longname_extract() {
     let mut archive = open_single("rar5", "rar5_longname.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     let long_filename = format!("{}.txt", "a".repeat(200));
     assert_eq!(result, original(&long_filename));
@@ -1872,13 +2148,20 @@ fn test_rar4_longname() {
     let names = archive.member_names();
     assert_eq!(names.len(), 1);
     let long_name = &names[0];
-    assert!(long_name.len() >= 200, "filename should be >= 200 chars, got {}", long_name.len());
+    assert!(
+        long_name.len() >= 200,
+        "filename should be >= 200 chars, got {}",
+        long_name.len()
+    );
 }
 
 #[test]
 fn test_rar4_longname_extract() {
     let mut archive = open_single("rar4", "rar4_longname.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     let long_filename = format!("{}.txt", "a".repeat(200));
     assert_eq!(result, original(&long_filename));
@@ -1898,7 +2181,10 @@ fn test_rar5_symlink_metadata() {
         let info = archive.member_info(i).unwrap();
         if info.is_symlink {
             found_symlink = true;
-            assert!(info.link_target.is_some(), "symlink should have a link target");
+            assert!(
+                info.link_target.is_some(),
+                "symlink should have a link target"
+            );
         }
     }
     assert!(found_symlink, "should have a symlink member");
@@ -1909,7 +2195,10 @@ fn test_rar5_symlink_metadata() {
 #[test]
 fn test_rar5_best_compression_extract() {
     let mut archive = open_single("rar5", "rar5_best.rar");
-    let opts = weaver_rar::ExtractOptions { verify: true, password: None };
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
     let result = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(result, original("zeros_64k.bin"));
 }
@@ -1922,4 +2211,3 @@ fn test_rar5_multifile_lz_list() {
     let names = archive.member_names();
     assert_eq!(names, vec!["hello.txt", "second.txt", "zeros_64k.bin"]);
 }
-

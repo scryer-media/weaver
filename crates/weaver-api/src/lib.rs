@@ -1,6 +1,10 @@
 pub mod auth;
+mod backup;
 mod mutation;
 mod query;
+pub mod rss;
+mod runtime;
+mod submit;
 mod subscription;
 mod types;
 
@@ -8,8 +12,14 @@ use async_graphql::Schema;
 use weaver_core::config::SharedConfig;
 use weaver_state::Database;
 
-pub use mutation::{MutationRoot, init_job_counter};
+pub use backup::{
+    BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
+    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
+};
+pub use mutation::MutationRoot;
 pub use query::QueryRoot;
+pub use rss::RssService;
+pub use submit::{SubmitNzbError, SubmittedJob, init_job_counter, submit_nzb_bytes};
 pub use subscription::SubscriptionRoot;
 pub use types::*;
 
@@ -21,10 +31,12 @@ pub fn build_schema(
     handle: weaver_scheduler::SchedulerHandle,
     config: SharedConfig,
     db: Database,
+    rss: rss::RssService,
 ) -> WeaverSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(handle)
         .data(config)
         .data(db)
+        .data(rss)
         .finish()
 }

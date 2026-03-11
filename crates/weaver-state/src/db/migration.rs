@@ -151,9 +151,7 @@ fn recover_legacy(entries: Vec<JournalEntry>) -> HashMap<JobId, LegacyRecoveredJ
                     job.complete_files.insert(file_id);
                 }
             }
-            JournalEntry::JobStatusChanged {
-                job_id, status, ..
-            } => {
+            JournalEntry::JobStatusChanged { job_id, status, .. } => {
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.status = status;
                 }
@@ -176,8 +174,7 @@ impl Database {
             return Ok(false);
         }
 
-        let contents = std::fs::read_to_string(toml_path)
-            .map_err(StateError::Io)?;
+        let contents = std::fs::read_to_string(toml_path).map_err(StateError::Io)?;
 
         let mut config: Config = toml::from_str(&contents)
             .map_err(|e| StateError::Database(format!("failed to parse TOML: {e}")))?;
@@ -189,8 +186,7 @@ impl Database {
 
         // Rename the TOML file so it's not re-imported.
         let migrated_path = toml_path.with_extension("toml.migrated");
-        std::fs::rename(toml_path, &migrated_path)
-            .map_err(StateError::Io)?;
+        std::fs::rename(toml_path, &migrated_path).map_err(StateError::Io)?;
 
         tracing::info!(
             from = %toml_path.display(),
@@ -269,9 +265,9 @@ impl Database {
                     job_id: seg.file_id.job_id,
                     file_index: seg.file_id.file_index,
                     segment_number: seg.segment_number,
-                    file_offset: 0,   // offset not recoverable from HashSet
-                    decoded_size: 0,   // size not recoverable from HashSet
-                    crc32: 0,          // crc not recoverable from HashSet
+                    file_offset: 0,  // offset not recoverable from HashSet
+                    decoded_size: 0, // size not recoverable from HashSet
+                    crc32: 0,        // crc not recoverable from HashSet
                 })
                 .collect();
             self.commit_segments(&segments)?;
@@ -310,8 +306,7 @@ fn read_journal_sync(path: &Path) -> Result<Vec<JournalEntry>, StateError> {
     let mut pos = 0;
 
     while pos + 4 <= data.len() {
-        let payload_len =
-            u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
         if pos + payload_len + 4 > data.len() {
@@ -405,13 +400,19 @@ active = true
     #[test]
     fn migrate_no_toml_file() {
         let db = Database::open_in_memory().unwrap();
-        assert!(!db.migrate_from_toml(Path::new("/nonexistent/weaver.toml")).unwrap());
+        assert!(
+            !db.migrate_from_toml(Path::new("/nonexistent/weaver.toml"))
+                .unwrap()
+        );
     }
 
     #[test]
     fn migrate_no_journal_file() {
         let db = Database::open_in_memory().unwrap();
-        assert!(!db.migrate_from_journal(Path::new("/nonexistent/weaver.journal")).unwrap());
+        assert!(
+            !db.migrate_from_journal(Path::new("/nonexistent/weaver.journal"))
+                .unwrap()
+        );
     }
 
     /// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].

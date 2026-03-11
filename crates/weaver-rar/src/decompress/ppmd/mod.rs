@@ -76,9 +76,12 @@ impl PpmdDecoder {
             self.init_model(max_order, alloc_mb);
         }
 
-        let model = self.model.as_mut().ok_or_else(|| RarError::CorruptArchive {
-            detail: "PPMd block without model initialization".into(),
-        })?;
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "PPMd block without model initialization".into(),
+            })?;
 
         let mut rc = RangeDecoder::new(rc_data)?;
 

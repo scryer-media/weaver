@@ -11,8 +11,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::error::{RarError, RarResult};
 use super::types::*;
+use crate::error::{RarError, RarResult};
 
 /// Minimum header size: CRC(2) + type(1) + flags(2) + size(2) = 7 bytes.
 const MIN_HEADER_SIZE: usize = 7;
@@ -27,7 +27,12 @@ fn read_u16(data: &[u8], offset: usize) -> u16 {
 
 /// Read a u32 LE from a byte slice at the given offset.
 fn read_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
 }
 
 /// Raw header data as read from the stream.
@@ -64,7 +69,10 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
 
     if (header_size as usize) < MIN_HEADER_SIZE {
         return Err(RarError::CorruptArchive {
-            detail: format!("RAR4 header size {} is less than minimum {MIN_HEADER_SIZE}", header_size),
+            detail: format!(
+                "RAR4 header size {} is less than minimum {MIN_HEADER_SIZE}",
+                header_size
+            ),
         });
     }
 
@@ -166,7 +174,12 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
     // Read filename.
     if data.len() < pos + name_len {
         return Err(RarError::CorruptArchive {
-            detail: format!("RAR4 file header name extends past header: need {} bytes at offset {}, have {}", name_len, pos, data.len()),
+            detail: format!(
+                "RAR4 file header name extends past header: need {} bytes at offset {}, have {}",
+                name_len,
+                pos,
+                data.len()
+            ),
         });
     }
     let name_bytes = &data[pos..pos + name_len];
@@ -194,8 +207,7 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
         None
     };
 
-    let is_directory = attributes & 0x10 != 0
-        || (raw.flags & 0xE0) == 0xE0; // directory attribute in flags
+    let is_directory = attributes & 0x10 != 0 || (raw.flags & 0xE0) == 0xE0; // directory attribute in flags
 
     let data_offset = raw.offset + raw.header_size as u64;
 

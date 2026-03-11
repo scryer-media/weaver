@@ -97,8 +97,8 @@ impl RuntimeTuner {
         // --- Bandwidth tracking & recovery slot computation ---
         // EMA with α=0.3 gives ~15-second effective window at 5s intervals.
         const ALPHA: f64 = 0.3;
-        self.bandwidth_ema = ALPHA * metrics.current_download_speed as f64
-            + (1.0 - ALPHA) * self.bandwidth_ema;
+        self.bandwidth_ema =
+            ALPHA * metrics.current_download_speed as f64 + (1.0 - ALPHA) * self.bandwidth_ema;
 
         let bandwidth_mbps = self.bandwidth_ema / (1024.0 * 1024.0);
         let new_recovery_slots = if bandwidth_mbps > 50.0 {
@@ -117,9 +117,8 @@ impl RuntimeTuner {
         }
 
         // --- Post-processing awareness ---
-        let pp_active = metrics.verify_active > 0
-            || metrics.repair_active > 0
-            || metrics.extract_active > 0;
+        let pp_active =
+            metrics.verify_active > 0 || metrics.repair_active > 0 || metrics.extract_active > 0;
 
         if pp_active {
             self.pp_active_streak += 1;
@@ -167,11 +166,12 @@ impl RuntimeTuner {
         const STREAK_THRESHOLD: u32 = 3;
 
         if self.decode_pressure_streak >= STREAK_THRESHOLD
-            && self.current.max_concurrent_downloads > 1 {
-                self.current.max_concurrent_downloads -= 1;
-                self.decode_pressure_streak = 0;
-                return true;
-            }
+            && self.current.max_concurrent_downloads > 1
+        {
+            self.current.max_concurrent_downloads -= 1;
+            self.decode_pressure_streak = 0;
+            return true;
+        }
 
         if self.download_idle_streak >= STREAK_THRESHOLD && self.pre_pp_max_downloads.is_none() {
             let limit = self.max_downloads_limit();
@@ -190,7 +190,12 @@ impl RuntimeTuner {
     fn max_downloads_limit(&self) -> usize {
         match self.profile.disk.storage_class {
             StorageClass::Ssd => self.total_connections,
-            _ => self.profile.cpu.physical_cores.min(self.total_connections).min(8),
+            _ => self
+                .profile
+                .cpu
+                .physical_cores
+                .min(self.total_connections)
+                .min(8),
         }
     }
 
@@ -214,7 +219,11 @@ impl RuntimeTuner {
             StorageClass::Hdd => {
                 // HDD: head seeks between concurrent streams are devastating.
                 // Allow 2 only if IOPS suggests a decent drive.
-                if self.profile.disk.random_read_iops > 500.0 { 2 } else { 1 }
+                if self.profile.disk.random_read_iops > 500.0 {
+                    2
+                } else {
+                    1
+                }
             }
             _ => 2,
         }
@@ -342,10 +351,7 @@ mod tests {
         assert!(!tuner.adjust(&m));
         assert!(!tuner.adjust(&m));
         assert!(tuner.adjust(&m));
-        assert_eq!(
-            tuner.params().max_concurrent_downloads,
-            initial - 1
-        );
+        assert_eq!(tuner.params().max_concurrent_downloads, initial - 1);
     }
 
     #[test]
@@ -367,10 +373,7 @@ mod tests {
         assert!(!tuner.adjust(&idle));
         assert!(!tuner.adjust(&idle));
         assert!(tuner.adjust(&idle));
-        assert_eq!(
-            tuner.params().max_concurrent_downloads,
-            reduced + 1
-        );
+        assert_eq!(tuner.params().max_concurrent_downloads, reduced + 1);
     }
 
     #[test]

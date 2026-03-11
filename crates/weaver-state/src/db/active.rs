@@ -243,10 +243,7 @@ impl Database {
                 let (job_id, file_index, segment_number) = row.map_err(db_err)?;
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.committed_segments.insert(SegmentId {
-                        file_id: NzbFileId {
-                            job_id,
-                            file_index,
-                        },
+                        file_id: NzbFileId { job_id, file_index },
                         segment_number,
                     });
                 }
@@ -268,10 +265,7 @@ impl Database {
             for row in rows {
                 let (job_id, file_index) = row.map_err(db_err)?;
                 if let Some(job) = jobs.get_mut(&job_id) {
-                    job.complete_files.insert(NzbFileId {
-                        job_id,
-                        file_index,
-                    });
+                    job.complete_files.insert(NzbFileId { job_id, file_index });
                 }
             }
         }
@@ -340,8 +334,11 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
-        tx.execute("DELETE FROM active_extraction_chunks WHERE job_id = ?1", [id])
-            .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_extraction_chunks WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
@@ -350,7 +347,8 @@ impl Database {
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         // Reclaim freed pages.
-        conn.execute_batch("PRAGMA incremental_vacuum").map_err(db_err)?;
+        conn.execute_batch("PRAGMA incremental_vacuum")
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -367,8 +365,11 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
-        tx.execute("DELETE FROM active_extraction_chunks WHERE job_id = ?1", [id])
-            .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_extraction_chunks WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
@@ -376,7 +377,8 @@ impl Database {
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
-        conn.execute_batch("PRAGMA incremental_vacuum").map_err(db_err)?;
+        conn.execute_batch("PRAGMA incremental_vacuum")
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -437,7 +439,7 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT member_name, volume_index, bytes_written, temp_path, verified
+                "SELECT member_name, volume_index, bytes_written, temp_path, verified, appended
                  FROM active_extraction_chunks
                  WHERE job_id = ?1 AND set_name = ?2
                  ORDER BY member_name, volume_index",
@@ -451,10 +453,95 @@ impl Database {
                     bytes_written: row.get::<_, i64>(2)? as u64,
                     temp_path: row.get(3)?,
                     verified: row.get::<_, i64>(4)? != 0,
+                    appended: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(db_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    /// Atomically replace all chunks for a (job, set, member) in a single transaction.
+    /// On crash during insert, the transaction rolls back — no partial chunk sets visible.
+    pub fn replace_member_chunks(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+        chunks: &[ExtractionChunk],
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN").map_err(db_err)?;
+
+        // Delete any existing chunks for this member.
+        conn.execute(
+            "DELETE FROM active_extraction_chunks
+             WHERE job_id = ?1 AND set_name = ?2 AND member_name = ?3",
+            rusqlite::params![job_id.0 as i64, set_name, member_name],
+        )
+        .map_err(|e| {
+            let _ = conn.execute_batch("ROLLBACK");
+            db_err(e)
+        })?;
+
+        // Insert all new chunks.
+        for chunk in chunks {
+            conn.execute(
+                "INSERT INTO active_extraction_chunks
+                 (job_id, set_name, member_name, volume_index, bytes_written, temp_path, verified, appended)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                rusqlite::params![
+                    job_id.0 as i64,
+                    set_name,
+                    &chunk.member_name,
+                    chunk.volume_index,
+                    chunk.bytes_written as i64,
+                    &chunk.temp_path,
+                    chunk.verified as i64,
+                ],
+            )
+            .map_err(|e| {
+                let _ = conn.execute_batch("ROLLBACK");
+                db_err(e)
+            })?;
+        }
+
+        conn.execute_batch("COMMIT").map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Mark a single chunk as appended to the output file.
+    pub fn mark_chunk_appended(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+        volume_index: u32,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE active_extraction_chunks SET appended = 1
+             WHERE job_id = ?1 AND set_name = ?2 AND member_name = ?3 AND volume_index = ?4",
+            rusqlite::params![job_id.0 as i64, set_name, member_name, volume_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Delete all chunk rows for a (job, set, member).
+    pub fn clear_member_chunks(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_extraction_chunks
+             WHERE job_id = ?1 AND set_name = ?2 AND member_name = ?3",
+            rusqlite::params![job_id.0 as i64, set_name, member_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
     }
 
     // --- Archive header caching ---
@@ -535,6 +622,7 @@ pub struct ExtractionChunk {
     pub bytes_written: u64,
     pub temp_path: String,
     pub verified: bool,
+    pub appended: bool,
 }
 
 #[cfg(test)]
@@ -731,7 +819,10 @@ mod tests {
         let recovered = &jobs[&JobId(1)];
         assert_eq!(recovered.category, Some("movies".to_string()));
         assert_eq!(recovered.metadata.len(), 2);
-        assert_eq!(recovered.metadata[0], ("title".to_string(), "My Movie".to_string()));
+        assert_eq!(
+            recovered.metadata[0],
+            ("title".to_string(), "My Movie".to_string())
+        );
     }
 
     #[test]
@@ -770,5 +861,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn extraction_chunk_replace_append_and_clear_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+
+        db.replace_member_chunks(
+            JobId(1),
+            "set",
+            "movie.mkv",
+            &[
+                ExtractionChunk {
+                    member_name: "movie.mkv".into(),
+                    volume_index: 0,
+                    bytes_written: 111,
+                    temp_path: "/tmp/chunk0".into(),
+                    verified: true,
+                    appended: false,
+                },
+                ExtractionChunk {
+                    member_name: "movie.mkv".into(),
+                    volume_index: 1,
+                    bytes_written: 222,
+                    temp_path: "/tmp/chunk1".into(),
+                    verified: true,
+                    appended: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        db.mark_chunk_appended(JobId(1), "set", "movie.mkv", 0)
+            .unwrap();
+
+        let chunks = db.get_extraction_chunks(JobId(1), "set").unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().any(|c| c.volume_index == 0 && c.appended));
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.volume_index == 1 && c.verified && !c.appended)
+        );
+
+        db.clear_member_chunks(JobId(1), "set", "movie.mkv")
+            .unwrap();
+        assert!(
+            db.get_extraction_chunks(JobId(1), "set")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extraction_chunk_replace_only_overwrites_target_member() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+
+        db.replace_member_chunks(
+            JobId(1),
+            "set",
+            "movie_a.mkv",
+            &[ExtractionChunk {
+                member_name: "movie_a.mkv".into(),
+                volume_index: 0,
+                bytes_written: 100,
+                temp_path: "/tmp/a0".into(),
+                verified: true,
+                appended: false,
+            }],
+        )
+        .unwrap();
+        db.replace_member_chunks(
+            JobId(1),
+            "set",
+            "movie_b.mkv",
+            &[ExtractionChunk {
+                member_name: "movie_b.mkv".into(),
+                volume_index: 0,
+                bytes_written: 200,
+                temp_path: "/tmp/b0".into(),
+                verified: true,
+                appended: false,
+            }],
+        )
+        .unwrap();
+
+        db.replace_member_chunks(
+            JobId(1),
+            "set",
+            "movie_a.mkv",
+            &[ExtractionChunk {
+                member_name: "movie_a.mkv".into(),
+                volume_index: 1,
+                bytes_written: 300,
+                temp_path: "/tmp/a1".into(),
+                verified: true,
+                appended: false,
+            }],
+        )
+        .unwrap();
+
+        let chunks = db.get_extraction_chunks(JobId(1), "set").unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.member_name == "movie_a.mkv" && c.volume_index == 1)
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.member_name == "movie_b.mkv" && c.bytes_written == 200)
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.member_name == "movie_a.mkv" && c.volume_index == 0)
+        );
     }
 }

@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use weaver_par2::{Par2FileSet, DiskFileAccess, verify_all};
+use weaver_par2::{DiskFileAccess, Par2FileSet, verify_all};
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: verify_dir <directory>");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: verify_dir <directory>");
     let dir = PathBuf::from(dir);
 
     // Collect all .par2 files.
@@ -23,18 +25,27 @@ fn main() {
     par2_paths.sort();
     rar_files.sort();
 
-    println!("Found {} PAR2 files, {} RAR files", par2_paths.len(), rar_files.len());
+    println!(
+        "Found {} PAR2 files, {} RAR files",
+        par2_paths.len(),
+        rar_files.len()
+    );
 
     // Read and parse all PAR2 files.
-    let par2_data: Vec<Vec<u8>> = par2_paths.iter()
+    let par2_data: Vec<Vec<u8>> = par2_paths
+        .iter()
         .map(|p| std::fs::read(p).unwrap())
         .collect();
     let par2_refs: Vec<&[u8]> = par2_data.iter().map(|d| d.as_slice()).collect();
 
     let mut par2_set = Par2FileSet::from_files(&par2_refs).unwrap();
 
-    println!("\nPAR2 set: {} files, slice_size={}, recovery_blocks={}",
-        par2_set.files.len(), par2_set.slice_size, par2_set.recovery_block_count());
+    println!(
+        "\nPAR2 set: {} files, slice_size={}, recovery_blocks={}",
+        par2_set.files.len(),
+        par2_set.slice_size,
+        par2_set.recovery_block_count()
+    );
 
     // Show PAR2 internal filenames.
     println!("\n--- PAR2 internal filenames ---");
@@ -43,7 +54,10 @@ fn main() {
     }
 
     // Check if names match disk.
-    let has_matches = par2_set.files.values().any(|desc| rar_files.contains(&desc.filename));
+    let has_matches = par2_set
+        .files
+        .values()
+        .any(|desc| rar_files.contains(&desc.filename));
     println!("\nFilenames match disk: {}", has_matches);
 
     if !has_matches {
@@ -61,11 +75,17 @@ fn main() {
             let role = weaver_core::classify::FileRole::from_filename(&desc.filename);
             if let weaver_core::classify::FileRole::RarVolume { volume_number } = role {
                 if let Some(real_name) = disk_by_volume.get(&volume_number) {
-                    println!("  remap vol {}: {} -> {}", volume_number, desc.filename, real_name);
+                    println!(
+                        "  remap vol {}: {} -> {}",
+                        volume_number, desc.filename, real_name
+                    );
                     desc.filename = real_name.clone();
                     remapped += 1;
                 } else {
-                    println!("  remap vol {}: {} -> NO MATCH ON DISK", volume_number, desc.filename);
+                    println!(
+                        "  remap vol {}: {} -> NO MATCH ON DISK",
+                        volume_number, desc.filename
+                    );
                 }
             }
         }
@@ -79,7 +99,10 @@ fn main() {
 
     println!("\nResults:");
     println!("  total_missing_blocks: {}", result.total_missing_blocks);
-    println!("  recovery_blocks_available: {}", result.recovery_blocks_available);
+    println!(
+        "  recovery_blocks_available: {}",
+        result.recovery_blocks_available
+    );
     println!("  is_repairable: {:?}", result.repairable);
 
     let mut missing = 0u32;
@@ -88,7 +111,10 @@ fn main() {
     for fv in &result.files {
         match fv.status {
             weaver_par2::verify::FileStatus::Missing => {
-                println!("  MISSING: {} ({} blocks)", fv.filename, fv.missing_slice_count);
+                println!(
+                    "  MISSING: {} ({} blocks)",
+                    fv.filename, fv.missing_slice_count
+                );
                 missing += 1;
             }
             weaver_par2::verify::FileStatus::Damaged(n) => {
@@ -103,5 +129,8 @@ fn main() {
             }
         }
     }
-    println!("\n  {} complete, {} missing, {} damaged", complete, missing, damaged);
+    println!(
+        "\n  {} complete, {} missing, {} damaged",
+        complete, missing, damaged
+    );
 }

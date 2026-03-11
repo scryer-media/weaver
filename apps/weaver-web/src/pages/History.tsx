@@ -1,151 +1,171 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
-import { DELETE_HISTORY_MUTATION, DELETE_ALL_HISTORY_MUTATION, HISTORY_JOBS_QUERY } from "@/graphql/queries";
-import { StatusBadge } from "@/components/StatusBadge";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { EmptyState } from "@/components/EmptyState";
+import { PageHeader } from "@/components/PageHeader";
+import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  DELETE_ALL_HISTORY_MUTATION,
+  DELETE_HISTORY_MUTATION,
+  HISTORY_JOBS_QUERY,
+} from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+
+type HistoryJob = {
+  id: number;
+  name: string;
+  status: string;
+  totalBytes: number;
+  downloadedBytes: number;
+  failedBytes: number;
+  health: number;
+  hasPassword: boolean;
+  category: string | null;
+  outputDir: string | null;
+};
 
 export function History() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecuteQuery] = useQuery({ query: HISTORY_JOBS_QUERY });
-  const [deleteResult, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
-  const [, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
+  const [{ data, fetching }] = useQuery({ query: HISTORY_JOBS_QUERY });
+  const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
+  const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
+
+  const [jobs, setJobs] = useState<HistoryJob[]>([]);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
 
-  type HistoryJob = {
-    id: number;
-    name: string;
-    status: string;
-    totalBytes: number;
-    downloadedBytes: number;
-    failedBytes: number;
-    health: number;
-    hasPassword: boolean;
-    category: string | null;
-    outputDir: string | null;
-  };
+  useEffect(() => {
+    if (data?.jobs) {
+      setJobs(data.jobs);
+    }
+  }, [data?.jobs]);
 
-  // After a delete, use the mutation response; otherwise use the query data.
-  const jobs: HistoryJob[] = deleteResult.data?.deleteHistory ?? data?.jobs ?? [];
+  useEffect(() => {
+    if (deleteState.data?.deleteHistory) {
+      setJobs(deleteState.data.deleteHistory);
+    }
+  }, [deleteState.data]);
+
+  useEffect(() => {
+    if (deleteAllState.data?.deleteAllHistory) {
+      setJobs(deleteAllState.data.deleteAllHistory);
+    }
+  }, [deleteAllState.data]);
 
   return (
-    <div className="p-4 sm:p-6">
-      <div className="mb-4 flex items-center justify-between sm:mb-6">
-        <h1 className="text-xl font-bold text-foreground sm:text-2xl">
-          {t("history.title")}
-        </h1>
-        {jobs.length > 0 && (
-          <button
-            onClick={() => setDeleteAllConfirm(true)}
-            className="rounded-md px-3 py-1.5 text-sm font-medium text-destructive hover:bg-accent"
-          >
-            {t("action.deleteAll")}
-          </button>
-        )}
-      </div>
+    <div className="space-y-6">
+      <PageHeader
+        title={t("history.title")}
+        description={t("history.empty")}
+        actions={
+          jobs.length > 0 ? (
+            <Button variant="outline" onClick={() => setDeleteAllConfirm(true)}>
+              {t("action.deleteAll")}
+            </Button>
+          ) : undefined
+        }
+      />
 
-      {fetching ? (
-        <div className="py-12 text-center text-muted-foreground">
-          {t("label.loading")}
-        </div>
+      {fetching && jobs.length === 0 ? (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            {t("label.loading")}
+          </CardContent>
+        </Card>
       ) : jobs.length === 0 ? (
-        <div className="py-12 text-center text-muted-foreground">
-          {t("history.empty")}
-        </div>
+        <EmptyState title={t("history.title")} description={t("history.empty")} />
       ) : (
         <>
-          {/* Desktop table */}
-          <div className="hidden overflow-hidden rounded-lg border border-border md:block">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-border bg-card text-left text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  <th className="px-4 py-3">{t("table.name")}</th>
-                  <th className="w-28 px-4 py-3">{t("table.status")}</th>
-                  <th className="w-24 px-4 py-3 text-right">
-                    {t("table.health")}
-                  </th>
-                  <th className="w-36 px-4 py-3 text-right">
-                    {t("table.size")}
-                  </th>
-                  <th className="w-32 px-4 py-3">{t("table.category")}</th>
-                  <th className="w-20 px-4 py-3 text-right">{t("table.actions")}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {jobs.map((job) => (
-                  <tr key={job.id} className="hover:bg-accent/30">
-                    <td className="px-4 py-3">
+          <Card className="hidden md:block">
+            <CardContent className="px-0 pb-0">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead>{t("table.name")}</TableHead>
+                    <TableHead>{t("table.status")}</TableHead>
+                    <TableHead className="text-right">{t("table.health")}</TableHead>
+                    <TableHead className="text-right">{t("table.size")}</TableHead>
+                    <TableHead>{t("table.category")}</TableHead>
+                    <TableHead className="text-right">{t("table.actions")}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {jobs.map((job) => (
+                    <TableRow key={job.id}>
+                      <TableCell>
+                        <Link
+                          to={`/jobs/${job.id}`}
+                          className="font-medium text-foreground transition hover:text-primary"
+                        >
+                          {job.name}
+                        </Link>
+                        {job.hasPassword ? (
+                          <span className="ml-2 text-xs text-amber-500">[PW]</span>
+                        ) : null}
+                      </TableCell>
+                      <TableCell>
+                        <JobStatusBadge status={job.status} />
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {(job.health / 10).toFixed(1)}%
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {formatBytes(job.totalBytes)}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {job.category ?? "\u2014"}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
+                          {t("action.delete")}
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
+          <div className="space-y-3 md:hidden">
+            {jobs.map((job) => (
+              <Card key={job.id}>
+                <CardContent className="space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
                       <Link
                         to={`/jobs/${job.id}`}
-                        className="text-sm font-medium text-foreground hover:text-primary hover:underline"
+                        className="block truncate font-medium text-foreground transition hover:text-primary"
                       >
                         {job.name}
                       </Link>
-                      {job.hasPassword && (
-                        <span className="ml-2 text-xs text-yellow-500">
-                          [PW]
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={job.status} />
-                    </td>
-                    <td className="px-4 py-3 text-right text-sm text-muted-foreground">
-                      {(job.health / 10).toFixed(1)}%
-                    </td>
-                    <td className="px-4 py-3 text-right text-sm text-muted-foreground">
-                      {formatBytes(job.totalBytes)}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-muted-foreground">
-                      {job.category ?? "—"}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <button
-                        onClick={() => setDeleteConfirmId(job.id)}
-                        className="rounded px-2 py-1 text-xs text-destructive hover:bg-accent"
-                      >
-                        {t("action.delete")}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {/* Mobile card layout */}
-          <div className="space-y-3 md:hidden">
-            {jobs.map((job) => (
-              <div key={job.id} className="rounded-lg border border-border bg-card p-4">
-                <div className="mb-2 flex items-start justify-between gap-2">
-                  <Link
-                    to={`/jobs/${job.id}`}
-                    className="min-w-0 flex-1 truncate text-sm font-medium text-foreground hover:text-primary hover:underline"
-                  >
-                    {job.name}
-                  </Link>
-                  <StatusBadge status={job.status} />
-                </div>
-                <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                  <span>{formatBytes(job.totalBytes)}</span>
-                  <span>Health: {(job.health / 10).toFixed(1)}%</span>
-                  {job.category && <span>{job.category}</span>}
-                  {job.hasPassword && (
-                    <span className="text-yellow-500">[PW]</span>
-                  )}
-                </div>
-                <div className="flex items-center">
-                  <button
-                    onClick={() => setDeleteConfirmId(job.id)}
-                    className="rounded-md px-3 py-1.5 text-xs font-medium text-destructive hover:bg-accent"
-                  >
-                    {t("action.delete")}
-                  </button>
-                </div>
-              </div>
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                        <span>{formatBytes(job.totalBytes)}</span>
+                        <span>Health {(job.health / 10).toFixed(1)}%</span>
+                        {job.category ? <span>{job.category}</span> : null}
+                      </div>
+                    </div>
+                    <JobStatusBadge status={job.status} />
+                  </div>
+                  <div className="flex justify-end">
+                    <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
+                      {t("action.delete")}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
             ))}
           </div>
         </>
@@ -159,7 +179,7 @@ export function History() {
         cancelLabel={t("confirm.deleteHistoryDismiss")}
         onConfirm={() => {
           if (deleteConfirmId != null) {
-            deleteHistory({ id: deleteConfirmId });
+            void deleteHistory({ id: deleteConfirmId });
           }
           setDeleteConfirmId(null);
         }}
@@ -173,9 +193,7 @@ export function History() {
         confirmLabel={t("confirm.deleteAllHistoryConfirm")}
         cancelLabel={t("confirm.deleteAllHistoryDismiss")}
         onConfirm={() => {
-          deleteAllHistory({}).then(() => {
-            reexecuteQuery({ requestPolicy: "network-only" });
-          });
+          void deleteAllHistory({});
           setDeleteAllConfirm(false);
         }}
         onCancel={() => setDeleteAllConfirm(false)}

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 use weaver_core::id::JobId;
+use weaver_core::release_name::{append_original_title_metadata, derive_release_name};
 use weaver_nzb::{Nzb, parse_nzb};
 use weaver_scheduler::{FileSpec, JobSpec, SegmentSpec};
 
@@ -41,13 +42,16 @@ pub fn nzb_to_spec(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> JobSpec {
-    let name = nzb.meta.title.clone().unwrap_or_else(|| {
-        nzb_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Untitled")
-            .to_string()
-    });
+    let metadata = append_original_title_metadata(
+        metadata,
+        nzb_path.file_stem().and_then(|s| s.to_str()),
+        nzb.meta.title.as_deref(),
+    );
+
+    let name = derive_release_name(
+        nzb_path.file_stem().and_then(|s| s.to_str()),
+        nzb.meta.title.as_deref(),
+    );
 
     let password = extract_password(nzb, nzb_path);
 
@@ -93,19 +97,21 @@ pub fn nzb_to_spec(
 fn extract_password(nzb: &Nzb, nzb_path: &Path) -> Option<String> {
     // 1. NZB meta password field.
     if let Some(pw) = &nzb.meta.password
-        && !pw.is_empty() {
-            return Some(pw.clone());
-        }
+        && !pw.is_empty()
+    {
+        return Some(pw.clone());
+    }
 
     // 2. Filename convention: "Some.Release.{{password}}.nzb"
     if let Some(stem) = nzb_path.file_stem().and_then(|s| s.to_str())
         && let Some(start) = stem.find("{{")
-            && let Some(end) = stem[start..].find("}}") {
-                let pw = &stem[start + 2..start + end];
-                if !pw.is_empty() {
-                    return Some(pw.to_string());
-                }
-            }
+        && let Some(end) = stem[start..].find("}}")
+    {
+        let pw = &stem[start + 2..start + end];
+        if !pw.is_empty() {
+            return Some(pw.to_string());
+        }
+    }
 
     None
 }

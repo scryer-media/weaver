@@ -1,55 +1,148 @@
 import { gql } from "urql";
 
+const JOB_LIST_ITEM_FIELDS = `
+  fragment JobListItemFields on Job {
+    id
+    name
+    displayTitle
+    originalTitle
+    parsedRelease {
+      ...ParsedReleaseFields
+    }
+    status
+    progress
+    totalBytes
+    downloadedBytes
+    failedBytes
+    health
+    hasPassword
+    category
+    metadata {
+      key
+      value
+    }
+  }
+`;
+
+const PARSED_RELEASE_FIELDS = `
+  fragment ParsedReleaseFields on ParsedRelease {
+    normalizedTitle
+    releaseGroup
+    languagesAudio
+    languagesSubtitles
+    year
+    quality
+    source
+    videoCodec
+    videoEncoding
+    audio
+    audioCodecs
+    audioChannels
+    isDualAudio
+    isAtmos
+    isDolbyVision
+    detectedHdr
+    isHdr10Plus
+    isHlg
+    fps
+    isProperUpload
+    isRepack
+    isRemux
+    isBdDisk
+    isAiEnhanced
+    isHardcodedSubs
+    streamingService
+    edition
+    animeVersion
+    parseConfidence
+    episode {
+      season
+      episodeNumbers
+      absoluteEpisode
+      raw
+    }
+  }
+`;
+
+const HISTORY_JOB_FIELDS = `
+  fragment HistoryJobFields on Job {
+    ...JobListItemFields
+    outputDir
+  }
+`;
+
+const SERVER_FIELDS = `
+  fragment ServerFields on Server {
+    id
+    host
+    port
+    tls
+    username
+    connections
+    active
+    supportsPipelining
+    priority
+  }
+`;
+
+const CATEGORY_FIELDS = `
+  fragment CategoryFields on Category {
+    id
+    name
+    destDir
+    aliases
+  }
+`;
+
+const GENERAL_SETTINGS_FIELDS = `
+  fragment GeneralSettingsFields on GeneralSettings {
+    dataDir
+    intermediateDir
+    completeDir
+    cleanupAfterExtract
+    maxDownloadSpeed
+    maxRetries
+  }
+`;
+
+const API_KEY_FIELDS = `
+  fragment ApiKeyFields on ApiKey {
+    id
+    name
+    scope
+    createdAt
+    lastUsedAt
+  }
+`;
+
 export const JOBS_QUERY = gql`
   query Jobs {
     jobs {
-      id
-      name
-      status
-      progress
-      totalBytes
-      downloadedBytes
-      failedBytes
-      health
-      hasPassword
-      category
+      ...JobListItemFields
     }
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const JOBS_PAGE_QUERY = gql`
   query JobsPage {
     jobs {
-      id
-      name
-      status
-      progress
-      totalBytes
-      downloadedBytes
-      failedBytes
-      health
-      hasPassword
-      category
+      ...JobListItemFields
     }
     metrics {
       currentDownloadSpeed
     }
     isPaused
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const JOB_QUERY = gql`
   query Job($id: Int!) {
     job(id: $id) {
-      id
-      name
-      status
-      progress
-      totalBytes
-      downloadedBytes
-      failedBytes
-      health
-      hasPassword
+      ...JobListItemFields
     }
     jobEvents(jobId: $id) {
       kind
@@ -59,6 +152,8 @@ export const JOB_QUERY = gql`
       timestamp
     }
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const METRICS_QUERY = gql`
@@ -93,6 +188,9 @@ export const IS_PAUSED_QUERY = gql`
 
 export const SETTINGS_PAGE_QUERY = gql`
   query SettingsPage {
+    settings {
+      ...GeneralSettingsFields
+    }
     metrics {
       bytesDownloaded
       bytesDecoded
@@ -114,11 +212,12 @@ export const SETTINGS_PAGE_QUERY = gql`
     }
     isPaused
   }
+  ${GENERAL_SETTINGS_FIELDS}
 `;
 
 export const SUBMIT_NZB_MUTATION = gql`
-  mutation SubmitNzb($nzbBase64: String!, $filename: String, $password: String) {
-    submitNzb(nzbBase64: $nzbBase64, filename: $filename, password: $password) {
+  mutation SubmitNzb($nzbBase64: String!, $filename: String, $password: String, $category: String, $metadata: [MetadataInput!]) {
+    submitNzb(nzbBase64: $nzbBase64, filename: $filename, password: $password, category: $category, metadata: $metadata) {
       id
       name
       status
@@ -153,25 +252,23 @@ export const REPROCESS_JOB_MUTATION = gql`
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!) {
     deleteHistory(id: $id) {
-      id
-      name
-      status
-      progress
-      totalBytes
-      downloadedBytes
-      failedBytes
-      health
-      hasPassword
-      category
-      outputDir
+      ...HistoryJobFields
     }
   }
+  ${JOB_LIST_ITEM_FIELDS}
+  ${HISTORY_JOB_FIELDS}
+  ${PARSED_RELEASE_FIELDS}
 `;
 
 export const DELETE_ALL_HISTORY_MUTATION = gql`
   mutation DeleteAllHistory {
-    deleteAllHistory
+    deleteAllHistory {
+      ...HistoryJobFields
+    }
   }
+  ${JOB_LIST_ITEM_FIELDS}
+  ${HISTORY_JOB_FIELDS}
+  ${PARSED_RELEASE_FIELDS}
 `;
 
 export const PAUSE_ALL_MUTATION = gql`
@@ -207,16 +304,7 @@ export const JOB_UPDATES_SUBSCRIPTION = gql`
   subscription JobUpdates {
     jobUpdates {
       jobs {
-        id
-        name
-        status
-        progress
-        totalBytes
-        downloadedBytes
-        failedBytes
-        health
-        hasPassword
-        category
+        ...JobListItemFields
       }
       metrics {
         currentDownloadSpeed
@@ -224,24 +312,19 @@ export const JOB_UPDATES_SUBSCRIPTION = gql`
       isPaused
     }
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const HISTORY_JOBS_QUERY = gql`
   query HistoryJobs {
     jobs(status: [COMPLETE, FAILED]) {
-      id
-      name
-      status
-      progress
-      totalBytes
-      downloadedBytes
-      failedBytes
-      health
-      hasPassword
-      category
-      outputDir
+      ...HistoryJobFields
     }
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
+  ${HISTORY_JOB_FIELDS}
 `;
 
 // --- Server management ---
@@ -249,52 +332,37 @@ export const HISTORY_JOBS_QUERY = gql`
 export const SERVERS_QUERY = gql`
   query Servers {
     servers {
-      id
-      host
-      port
-      tls
-      username
-      connections
-      active
-      supportsPipelining
+      ...ServerFields
     }
   }
+  ${SERVER_FIELDS}
 `;
 
 export const ADD_SERVER_MUTATION = gql`
   mutation AddServer($input: ServerInput!) {
     addServer(input: $input) {
-      id
-      host
-      port
-      tls
-      username
-      connections
-      active
-      supportsPipelining
+      ...ServerFields
     }
   }
+  ${SERVER_FIELDS}
 `;
 
 export const UPDATE_SERVER_MUTATION = gql`
   mutation UpdateServer($id: Int!, $input: ServerInput!) {
     updateServer(id: $id, input: $input) {
-      id
-      host
-      port
-      tls
-      username
-      connections
-      active
-      supportsPipelining
+      ...ServerFields
     }
   }
+  ${SERVER_FIELDS}
 `;
 
 export const REMOVE_SERVER_MUTATION = gql`
   mutation RemoveServer($id: Int!) {
-    removeServer(id: $id)
+    removeServer(id: $id) {
+      ...ServerFields
+    }
   }
+  ${SERVER_FIELDS}
 `;
 
 export const TEST_CONNECTION_MUTATION = gql`
@@ -308,32 +376,62 @@ export const TEST_CONNECTION_MUTATION = gql`
   }
 `;
 
+// --- Categories ---
+
+export const CATEGORIES_QUERY = gql`
+  query Categories {
+    categories {
+      ...CategoryFields
+    }
+  }
+  ${CATEGORY_FIELDS}
+`;
+
+export const ADD_CATEGORY_MUTATION = gql`
+  mutation AddCategory($input: CategoryInput!) {
+    addCategory(input: $input) {
+      ...CategoryFields
+    }
+  }
+  ${CATEGORY_FIELDS}
+`;
+
+export const UPDATE_CATEGORY_MUTATION = gql`
+  mutation UpdateCategory($id: Int!, $input: CategoryInput!) {
+    updateCategory(id: $id, input: $input) {
+      ...CategoryFields
+    }
+  }
+  ${CATEGORY_FIELDS}
+`;
+
+export const REMOVE_CATEGORY_MUTATION = gql`
+  mutation RemoveCategory($id: Int!) {
+    removeCategory(id: $id) {
+      ...CategoryFields
+    }
+  }
+  ${CATEGORY_FIELDS}
+`;
+
 // --- General settings ---
 
 export const SETTINGS_QUERY = gql`
   query Settings {
     settings {
-      dataDir
-      intermediateDir
-      completeDir
-      cleanupAfterExtract
-      maxDownloadSpeed
-      maxRetries
+      ...GeneralSettingsFields
     }
   }
+  ${GENERAL_SETTINGS_FIELDS}
 `;
 
 export const UPDATE_SETTINGS_MUTATION = gql`
   mutation UpdateSettings($input: GeneralSettingsInput!) {
     updateSettings(input: $input) {
-      dataDir
-      intermediateDir
-      completeDir
-      cleanupAfterExtract
-      maxDownloadSpeed
-      maxRetries
+      ...GeneralSettingsFields
     }
   }
+  ${GENERAL_SETTINGS_FIELDS}
 `;
 
 // --- API Keys ---
@@ -341,32 +439,29 @@ export const UPDATE_SETTINGS_MUTATION = gql`
 export const API_KEYS_QUERY = gql`
   query ApiKeys {
     apiKeys {
-      id
-      name
-      scope
-      createdAt
-      lastUsedAt
+      ...ApiKeyFields
     }
   }
+  ${API_KEY_FIELDS}
 `;
 
 export const CREATE_API_KEY_MUTATION = gql`
   mutation CreateApiKey($name: String!, $scope: ApiKeyScope!) {
     createApiKey(name: $name, scope: $scope) {
       key {
-        id
-        name
-        scope
-        createdAt
-        lastUsedAt
+        ...ApiKeyFields
       }
       rawKey
     }
   }
+  ${API_KEY_FIELDS}
 `;
 
 export const DELETE_API_KEY_MUTATION = gql`
   mutation DeleteApiKey($id: Int!) {
-    deleteApiKey(id: $id)
+    deleteApiKey(id: $id) {
+      ...ApiKeyFields
+    }
   }
+  ${API_KEY_FIELDS}
 `;

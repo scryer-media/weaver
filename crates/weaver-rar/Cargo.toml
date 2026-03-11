@@ -26,3 +26,4 @@ rmp-serde = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+tempfile = "3"

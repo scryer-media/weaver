@@ -35,18 +35,17 @@ pub mod volume;
 
 // Re-export primary public API types
 pub use archive::{CachedArchiveHeaders, DataSegment, RarArchive, ReadSeek};
+pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
 pub use extract::ExtractOptions;
+pub use limits::Limits;
+pub use path::sanitize_path;
+pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
 pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
     MemberInfo, VolumeSpan,
 };
-pub use limits::Limits;
-pub use probe::{VolumeProbe, ProbeFile, probe_volume};
-pub use early::{EncryptionStatus, detect_encryption};
 pub use volume::{
-    VolumeSet, VolumeProvider, VolumeProviderError,
-    StaticVolumeProvider, WaitingVolumeProvider,
+    StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet, WaitingVolumeProvider,
 };
-pub use path::sanitize_path;

@@ -20,7 +20,9 @@ pub enum JobStatus {
     Repairing,
     Extracting,
     Complete,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
     Paused,
 }
 

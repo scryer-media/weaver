@@ -1,26 +1,23 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
+use regex::Regex;
 use tracing::info;
 
 use weaver_core::config::SharedConfig;
 use weaver_core::id::JobId;
-use weaver_scheduler::{FileSpec, JobSpec, SchedulerHandle, SegmentSpec};
-use weaver_state::Database;
+use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
+use weaver_scheduler::SchedulerHandle;
+use weaver_state::{Database, RssFeedRow, RssRuleRow};
 
 use crate::auth::{AdminGuard, generate_api_key, hash_api_key};
-use crate::types::{ApiKey, ApiKeyScope, CreateApiKeyResult, GeneralSettings, GeneralSettingsInput, Job, Server, ServerInput, TestConnectionResult};
-
-/// Global counter for generating unique job IDs via the API.
-static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
-
-/// Seed the job ID counter so IDs are stable across restarts.
-/// Call this on startup with the max job ID found in the journal + 1.
-pub fn init_job_counter(start: u64) {
-    NEXT_API_JOB_ID.store(start.max(10_000), Ordering::Relaxed);
-}
+use crate::rss::RssService;
+use crate::runtime::rebuild_nntp_from_config;
+use crate::submit::submit_nzb_bytes;
+use crate::types::{
+    ApiKey, ApiKeyScope, Category, CategoryInput, CreateApiKeyResult, GeneralSettings,
+    GeneralSettingsInput, Job, RssFeed, RssFeedInput, RssRule, RssRuleActionGql, RssRuleInput,
+    RssSyncReport, Server, ServerInput, TestConnectionResult,
+};
 
 pub struct MutationRoot;
 
@@ -39,114 +36,64 @@ impl MutationRoot {
         metadata: Option<Vec<crate::types::MetadataInput>>,
     ) -> Result<Job> {
         let handle = ctx.data::<SchedulerHandle>()?;
+        let config = ctx.data::<weaver_core::config::SharedConfig>()?;
 
         let nzb_bytes = base64::engine::general_purpose::STANDARD
             .decode(&nzb_base64)
             .map_err(|e| async_graphql::Error::new(format!("invalid base64: {e}")))?;
 
-        let nzb = weaver_nzb::parse_nzb(&nzb_bytes)
-            .map_err(|e| async_graphql::Error::new(format!("NZB parse error: {e}")))?;
-
-        if nzb.files.is_empty() {
-            return Err(async_graphql::Error::new("NZB contains no files"));
-        }
-
-        let job_id = JobId(NEXT_API_JOB_ID.fetch_add(1, Ordering::Relaxed));
-        // Prefer the NZB filename over internal metadata — indexers use readable
-        // names for the .nzb file while subjects/titles inside are often obfuscated.
-        let name = filename
-            .as_deref()
-            .and_then(|f| f.strip_suffix(".nzb"))
-            .filter(|n| !n.is_empty())
-            .map(String::from)
-            .or(nzb.meta.title.clone())
-            .unwrap_or_else(|| "Untitled".to_string());
-
-        // Use provided password, or extract from NZB meta.
-        let pw = password.or_else(|| {
-            nzb.meta.password.as_ref().filter(|p| !p.is_empty()).cloned()
-        });
-
-        let mut files = Vec::with_capacity(nzb.files.len());
-        let mut total_bytes: u64 = 0;
-
-        for nzb_file in &nzb.files {
-            let fname = nzb_file.filename().unwrap_or("unknown").to_string();
-            let role = nzb_file.role();
-
-            let segments: Vec<SegmentSpec> = nzb_file
-                .segments
-                .iter()
-                .map(|seg| SegmentSpec {
-                    number: seg.number.saturating_sub(1),
-                    bytes: seg.bytes,
-                    message_id: seg.message_id.clone(),
-                })
-                .collect();
-
-            let file_bytes: u64 = nzb_file.total_bytes();
-            total_bytes += file_bytes;
-
-            files.push(FileSpec {
-                filename: fname,
-                role,
-                groups: nzb_file.groups.clone(),
-                segments,
-            });
-        }
-
         let meta_vec: Vec<(String, String)> = metadata
             .as_ref()
-            .map(|m| m.iter().map(|mi| (mi.key.clone(), mi.value.clone())).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|mi| (mi.key.clone(), mi.value.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
-
-        let spec = JobSpec {
-            name: name.clone(),
-            password: pw.clone(),
-            files,
-            total_bytes,
-            category: category.clone(),
-            metadata: meta_vec.clone(),
-        };
-
-        // Persist the NZB to disk so recovery can re-parse it after restart.
-        let config = ctx.data::<SharedConfig>()?;
-        let data_dir = {
-            let cfg = config.read().await;
-            PathBuf::from(&cfg.data_dir)
-        };
-        let nzb_dir = data_dir.join(".weaver-nzbs");
-        tokio::fs::create_dir_all(&nzb_dir).await.map_err(|e| {
-            async_graphql::Error::new(format!("failed to create NZB storage dir: {e}"))
-        })?;
-        let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
-        let compressed = zstd::bulk::compress(&nzb_bytes, 19).map_err(|e| {
-            async_graphql::Error::new(format!("failed to compress NZB: {e}"))
-        })?;
-        tokio::fs::write(&nzb_path, &compressed).await.map_err(|e| {
-            async_graphql::Error::new(format!("failed to save NZB: {e}"))
-        })?;
-
-        handle.add_job(job_id, spec, nzb_path).await?;
+        let submitted = submit_nzb_bytes(
+            handle,
+            config,
+            &nzb_bytes,
+            filename,
+            password,
+            category.clone(),
+            meta_vec.clone(),
+        )
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let original_title = original_release_title(&submitted.spec.name, &submitted.spec.metadata);
+        let display_title = derive_release_name(Some(&original_title), Some(&submitted.spec.name));
+        let parsed_release = crate::types::ParsedRelease::from(parse_job_release(
+            &submitted.spec.name,
+            &submitted.spec.metadata,
+        ));
 
         Ok(Job {
-            id: job_id.0,
-            name,
+            id: submitted.job_id.0,
+            name: submitted.spec.name.clone(),
+            display_title,
+            original_title,
+            parsed_release,
             status: crate::types::JobStatusGql::Queued,
             error: None,
             progress: 0.0,
-            total_bytes,
+            total_bytes: submitted.spec.total_bytes,
             downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
-            has_password: pw.is_some(),
+            has_password: submitted.spec.password.is_some(),
             category,
-            metadata: meta_vec
-                .into_iter()
-                .map(|(k, v)| crate::types::MetadataEntry { key: k, value: v })
+            metadata: submitted
+                .spec
+                .metadata
+                .iter()
+                .map(|(k, v)| crate::types::MetadataEntry {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
                 .collect(),
             output_dir: None,
-            created_at: Some(weaver_scheduler::job::epoch_ms_now()),
+            created_at: Some(submitted.created_at_epoch_ms),
         })
     }
 
@@ -200,10 +147,10 @@ impl MutationRoot {
     }
 
     /// Delete all completed/failed/cancelled jobs from history.
-    async fn delete_all_history(&self, ctx: &Context<'_>) -> Result<bool> {
+    async fn delete_all_history(&self, ctx: &Context<'_>) -> Result<Vec<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.delete_all_history().await?;
-        Ok(true)
+        Ok(history_jobs_from_handle(handle))
     }
 
     /// Pause all download dispatch globally.
@@ -221,11 +168,7 @@ impl MutationRoot {
     }
 
     /// Set the global download speed limit in bytes/sec. 0 means unlimited.
-    async fn set_speed_limit(
-        &self,
-        ctx: &Context<'_>,
-        bytes_per_sec: u64,
-    ) -> Result<bool> {
+    async fn set_speed_limit(&self, ctx: &Context<'_>, bytes_per_sec: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.set_speed_limit(bytes_per_sec).await?;
         Ok(true)
@@ -256,6 +199,7 @@ impl MutationRoot {
             connections: input.connections,
             active: input.active,
             supports_pipelining: false,
+            priority: input.priority as u32,
         };
 
         {
@@ -283,7 +227,12 @@ impl MutationRoot {
 
     /// Update an existing NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
-    async fn update_server(&self, ctx: &Context<'_>, id: u32, input: ServerInput) -> Result<Server> {
+    async fn update_server(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: ServerInput,
+    ) -> Result<Server> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
@@ -299,9 +248,14 @@ impl MutationRoot {
             s.port = input.port;
             s.tls = input.tls;
             s.username = input.username;
-            s.password = input.password;
+            // Preserve existing password when the client sends null (edit form
+            // leaves it blank unless the user explicitly re-enters it).
+            if input.password.is_some() {
+                s.password = input.password;
+            }
             s.connections = input.connections;
             s.active = input.active;
+            s.priority = input.priority as u32;
 
             let server = s.clone();
             let db = db.clone();
@@ -322,7 +276,7 @@ impl MutationRoot {
 
     /// Remove an NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
-    async fn remove_server(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
+    async fn remove_server(&self, ctx: &Context<'_>, id: u32) -> Result<Vec<Server>> {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
@@ -344,12 +298,17 @@ impl MutationRoot {
         }
 
         rebuild_nntp_from_config(config, handle, db).await;
-        Ok(true)
+        let cfg = config.read().await;
+        Ok(cfg.servers.iter().map(Server::from).collect())
     }
 
     /// Test connectivity to an NNTP server without saving it.
     #[graphql(guard = "AdminGuard")]
-    async fn test_connection(&self, _ctx: &Context<'_>, input: ServerInput) -> Result<TestConnectionResult> {
+    async fn test_connection(
+        &self,
+        _ctx: &Context<'_>,
+        input: ServerInput,
+    ) -> Result<TestConnectionResult> {
         let nntp_config = weaver_nntp::ServerConfig {
             host: input.host,
             port: input.port,
@@ -381,6 +340,146 @@ impl MutationRoot {
         }
     }
 
+    // ── Categories ────────────────────────────────────────────────────
+
+    /// Add a new category.
+    #[graphql(guard = "AdminGuard")]
+    async fn add_category(&self, ctx: &Context<'_>, input: CategoryInput) -> Result<Category> {
+        let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            return Err(async_graphql::Error::new("category name must not be empty"));
+        }
+
+        let id = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.next_category_id())
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?
+        };
+
+        let cat = weaver_core::config::CategoryConfig {
+            id,
+            name: name.clone(),
+            dest_dir: input.dest_dir.filter(|s| !s.is_empty()),
+            aliases: input.aliases,
+        };
+
+        {
+            let mut cfg = config.write().await;
+            if cfg
+                .categories
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&name))
+            {
+                return Err(async_graphql::Error::new(format!(
+                    "category '{name}' already exists"
+                )));
+            }
+
+            let c = cat.clone();
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.insert_category(&c))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
+
+            cfg.categories.push(cat);
+            info!(id, name = %name, "category added");
+        }
+
+        let cfg = config.read().await;
+        let cat = cfg.categories.iter().find(|c| c.id == id).unwrap();
+        Ok(Category::from(cat))
+    }
+
+    /// Update a category by ID.
+    #[graphql(guard = "AdminGuard")]
+    async fn update_category(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: CategoryInput,
+    ) -> Result<Category> {
+        let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+
+        let name = input.name.trim().to_string();
+        if name.is_empty() {
+            return Err(async_graphql::Error::new("category name must not be empty"));
+        }
+
+        {
+            let mut cfg = config.write().await;
+            let c = cfg
+                .categories
+                .iter_mut()
+                .find(|c| c.id == id)
+                .ok_or_else(|| async_graphql::Error::new(format!("category {id} not found")))?;
+
+            // Uniqueness check if name changed.
+            if !c.name.eq_ignore_ascii_case(&name)
+                && cfg
+                    .categories
+                    .iter()
+                    .any(|other| other.id != id && other.name.eq_ignore_ascii_case(&name))
+            {
+                return Err(async_graphql::Error::new(format!(
+                    "category '{name}' already exists"
+                )));
+            }
+
+            // Re-borrow mutably after the uniqueness check.
+            let c = cfg.categories.iter_mut().find(|c| c.id == id).unwrap();
+            c.name = name;
+            c.dest_dir = input.dest_dir.filter(|s| !s.is_empty());
+            c.aliases = input.aliases;
+
+            let cat = c.clone();
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.update_category(&cat))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
+            info!(id, "category updated");
+        }
+
+        let cfg = config.read().await;
+        let cat = cfg.categories.iter().find(|c| c.id == id).unwrap();
+        Ok(Category::from(cat))
+    }
+
+    /// Remove a category by ID.
+    #[graphql(guard = "AdminGuard")]
+    async fn remove_category(&self, ctx: &Context<'_>, id: u32) -> Result<Vec<Category>> {
+        let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+
+        {
+            let mut cfg = config.write().await;
+            let before = cfg.categories.len();
+            cfg.categories.retain(|c| c.id != id);
+            if cfg.categories.len() == before {
+                return Err(async_graphql::Error::new(format!(
+                    "category {id} not found"
+                )));
+            }
+
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || db.delete_category(id))
+                .await
+                .map_err(|e| async_graphql::Error::new(format!("{e}")))?
+                .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
+            info!(id, "category removed");
+        }
+
+        let cfg = config.read().await;
+        Ok(cfg.categories.iter().map(Category::from).collect())
+    }
+
     /// Update general settings.
     #[graphql(guard = "AdminGuard")]
     async fn update_settings(
@@ -408,11 +507,13 @@ impl MutationRoot {
                 cfg.max_download_speed = Some(speed);
             }
             if let Some(retries) = input.max_retries {
-                let retry = cfg.retry.get_or_insert(weaver_core::config::RetryOverrides {
-                    max_retries: None,
-                    base_delay_secs: None,
-                    multiplier: None,
-                });
+                let retry = cfg
+                    .retry
+                    .get_or_insert(weaver_core::config::RetryOverrides {
+                        max_retries: None,
+                        base_delay_secs: None,
+                        multiplier: None,
+                    });
                 retry.max_retries = Some(retries);
             }
 
@@ -425,24 +526,26 @@ impl MutationRoot {
                 input.max_download_speed,
                 input.max_retries,
             );
-            tokio::task::spawn_blocking(move || -> std::result::Result<(), weaver_state::StateError> {
-                if let Some(ref v) = input_clone.0 {
-                    db.set_setting("intermediate_dir", v)?;
-                }
-                if let Some(ref v) = input_clone.1 {
-                    db.set_setting("complete_dir", v)?;
-                }
-                if let Some(v) = input_clone.2 {
-                    db.set_setting("cleanup_after_extract", &v.to_string())?;
-                }
-                if let Some(v) = input_clone.3 {
-                    db.set_setting("max_download_speed", &v.to_string())?;
-                }
-                if let Some(v) = input_clone.4 {
-                    db.set_setting("retry.max_retries", &v.to_string())?;
-                }
-                Ok(())
-            })
+            tokio::task::spawn_blocking(
+                move || -> std::result::Result<(), weaver_state::StateError> {
+                    if let Some(ref v) = input_clone.0 {
+                        db.set_setting("intermediate_dir", v)?;
+                    }
+                    if let Some(ref v) = input_clone.1 {
+                        db.set_setting("complete_dir", v)?;
+                    }
+                    if let Some(v) = input_clone.2 {
+                        db.set_setting("cleanup_after_extract", &v.to_string())?;
+                    }
+                    if let Some(v) = input_clone.3 {
+                        db.set_setting("max_download_speed", &v.to_string())?;
+                    }
+                    if let Some(v) = input_clone.4 {
+                        db.set_setting("retry.max_retries", &v.to_string())?;
+                    }
+                    Ok(())
+                },
+            )
             .await
             .map_err(|e| async_graphql::Error::new(format!("{e}")))?
             .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?;
@@ -508,7 +611,7 @@ impl MutationRoot {
 
     /// Delete an API key by ID.
     #[graphql(guard = "AdminGuard")]
-    async fn delete_api_key(&self, ctx: &Context<'_>, id: i64) -> Result<bool> {
+    async fn delete_api_key(&self, ctx: &Context<'_>, id: i64) -> Result<Vec<ApiKey>> {
         let db = ctx.data::<Database>()?;
         let db = db.clone();
         let deleted = tokio::task::spawn_blocking(move || db.delete_api_key(id))
@@ -519,86 +622,313 @@ impl MutationRoot {
         if deleted {
             info!(id, "API key deleted");
         }
+        let db = ctx.data::<Database>()?.clone();
+        let rows = tokio::task::spawn_blocking(move || db.list_api_keys())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ApiKey {
+                id: row.id,
+                name: row.name,
+                scope: match row.scope.as_str() {
+                    "admin" => ApiKeyScope::Admin,
+                    _ => ApiKeyScope::Integration,
+                },
+                created_at: row.created_at as f64,
+                last_used_at: row.last_used_at.map(|value| value as f64),
+            })
+            .collect())
+    }
+
+    /// Add a new RSS feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn add_rss_feed(&self, ctx: &Context<'_>, input: RssFeedInput) -> Result<RssFeed> {
+        validate_feed_input(&input)?;
+
+        let db = ctx.data::<Database>()?.clone();
+        let feed = tokio::task::spawn_blocking(move || {
+            let id = db.next_rss_feed_id()?;
+            let row = rss_feed_row_from_create(id, input);
+            db.insert_rss_feed(&row)?;
+            let rules = db
+                .list_rss_rules(row.id)?
+                .iter()
+                .map(RssRule::from_row)
+                .collect();
+            Ok::<_, weaver_state::StateError>(RssFeed::from_row(&row, rules))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        Ok(feed)
+    }
+
+    /// Update an RSS feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn update_rss_feed(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: RssFeedInput,
+    ) -> Result<RssFeed> {
+        validate_feed_input(&input)?;
+
+        let db = ctx.data::<Database>()?.clone();
+        let feed = tokio::task::spawn_blocking(move || {
+            let Some(existing) = db.get_rss_feed(id)? else {
+                return Err(weaver_state::StateError::Database(format!(
+                    "RSS feed {id} not found"
+                )));
+            };
+            let row = rss_feed_row_from_update(existing, input);
+            db.update_rss_feed(&row)?;
+            let rules = db
+                .list_rss_rules(row.id)?
+                .iter()
+                .map(RssRule::from_row)
+                .collect();
+            Ok::<_, weaver_state::StateError>(RssFeed::from_row(&row, rules))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        Ok(feed)
+    }
+
+    /// Delete an RSS feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_rss_feed(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        let deleted = tokio::task::spawn_blocking(move || db.delete_rss_feed(id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(deleted)
+    }
+
+    /// Add a new RSS rule.
+    #[graphql(guard = "AdminGuard")]
+    async fn add_rss_rule(
+        &self,
+        ctx: &Context<'_>,
+        feed_id: u32,
+        input: RssRuleInput,
+    ) -> Result<RssRule> {
+        validate_rule_input(&input)?;
+
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            if db.get_rss_feed(feed_id)?.is_none() {
+                return Err(weaver_state::StateError::Database(format!(
+                    "RSS feed {feed_id} not found"
+                )));
+            }
+            let id = db.next_rss_rule_id()?;
+            let row = rss_rule_row_from_input(id, feed_id, input);
+            db.insert_rss_rule(&row)?;
+            Ok::<_, weaver_state::StateError>(RssRule::from_row(&row))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Update an RSS rule.
+    #[graphql(guard = "AdminGuard")]
+    async fn update_rss_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: RssRuleInput,
+    ) -> Result<RssRule> {
+        validate_rule_input(&input)?;
+
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(existing) = db.get_rss_rule(id)? else {
+                return Err(weaver_state::StateError::Database(format!(
+                    "RSS rule {id} not found"
+                )));
+            };
+            let row = rss_rule_row_from_input(id, existing.feed_id, input);
+            db.update_rss_rule(&row)?;
+            Ok::<_, weaver_state::StateError>(RssRule::from_row(&row))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Delete an RSS rule.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_rss_rule(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        let deleted = tokio::task::spawn_blocking(move || db.delete_rss_rule(id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(deleted)
+    }
+
+    /// Run RSS sync immediately for all enabled feeds or one specific feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn run_rss_sync(&self, ctx: &Context<'_>, feed_id: Option<u32>) -> Result<RssSyncReport> {
+        let rss = ctx.data::<RssService>()?;
+        let report = rss
+            .run_sync(feed_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(RssSyncReport::from_domain(&report))
     }
 }
 
-/// Rebuild the NNTP client from the current config and send it to the pipeline.
-///
-/// Also probes each active server for capability detection (pipelining, etc.)
-/// and updates the stored config.
-async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandle, db: &Database) {
-    use weaver_nntp::client::{NntpClient, NntpClientConfig};
-    use weaver_nntp::pool::ServerPoolConfig;
+fn history_jobs_from_handle(handle: &SchedulerHandle) -> Vec<Job> {
+    handle
+        .list_jobs()
+        .iter()
+        .filter(|info| {
+            matches!(
+                &info.status,
+                weaver_scheduler::JobStatus::Complete | weaver_scheduler::JobStatus::Failed { .. }
+            )
+        })
+        .map(Job::from)
+        .collect()
+}
 
-    // Detect capabilities for all active servers.
-    {
-        let mut cfg = config.write().await;
-        for server in cfg.servers.iter_mut().filter(|s| s.active) {
-            let nntp_config = weaver_nntp::ServerConfig {
-                host: server.host.clone(),
-                port: server.port,
-                tls: server.tls,
-                username: server.username.clone(),
-                password: server.password.clone(),
-                ..Default::default()
-            };
-            match weaver_nntp::NntpConnection::connect(&nntp_config).await {
-                Ok(mut conn) => {
-                    server.supports_pipelining = conn.capabilities().supports_pipelining();
-                    tracing::info!(
-                        host = %server.host,
-                        pipelining = server.supports_pipelining,
-                        "detected server capabilities"
-                    );
-                    let _ = conn.quit().await;
-                }
-                Err(e) => {
-                    tracing::info!(
-                        host = %server.host,
-                        error = %e,
-                        "capability detection failed, assuming no pipelining"
-                    );
-                    server.supports_pipelining = false;
-                }
-            }
-
-            // Persist capabilities to DB.
-            let s = server.clone();
-            let db = db.clone();
-            let _ = tokio::task::spawn_blocking(move || db.update_server(&s)).await;
+fn validate_feed_input(input: &RssFeedInput) -> Result<()> {
+    let url = reqwest::Url::parse(&input.url)
+        .map_err(|e| async_graphql::Error::new(format!("invalid RSS feed URL: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(async_graphql::Error::new(format!(
+                "unsupported RSS feed URL scheme: {other}"
+            )));
         }
     }
+    if let Some(interval) = input.poll_interval_secs
+        && interval == 0
+    {
+        return Err(async_graphql::Error::new(
+            "poll_interval_secs must be greater than 0",
+        ));
+    }
+    Ok(())
+}
 
-    let (client, total) = {
-        let cfg = config.read().await;
-        let servers: Vec<ServerPoolConfig> = cfg
-            .servers
-            .iter()
-            .filter(|s| s.active)
-            .map(|s| ServerPoolConfig {
-                server: weaver_nntp::ServerConfig {
-                    host: s.host.clone(),
-                    port: s.port,
-                    tls: s.tls,
-                    username: s.username.clone(),
-                    password: s.password.clone(),
-                    ..Default::default()
-                },
-                max_connections: s.connections as usize,
+fn validate_rule_input(input: &RssRuleInput) -> Result<()> {
+    if let Some(pattern) = &input.title_regex {
+        Regex::new(pattern)
+            .map_err(|e| async_graphql::Error::new(format!("invalid title_regex: {e}")))?;
+    }
+    if let (Some(min), Some(max)) = (input.min_size_bytes, input.max_size_bytes)
+        && min > max
+    {
+        return Err(async_graphql::Error::new(
+            "min_size_bytes cannot be greater than max_size_bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn rss_feed_row_from_create(id: u32, input: RssFeedInput) -> RssFeedRow {
+    RssFeedRow {
+        id,
+        name: input.name,
+        url: input.url,
+        enabled: input.enabled,
+        poll_interval_secs: input.poll_interval_secs.unwrap_or(900),
+        username: normalize_optional_string(input.username),
+        password: normalize_optional_string(input.password),
+        default_category: normalize_optional_string(input.default_category),
+        default_metadata: metadata_input_to_pairs(input.default_metadata),
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    }
+}
+
+fn rss_feed_row_from_update(existing: RssFeedRow, input: RssFeedInput) -> RssFeedRow {
+    RssFeedRow {
+        id: existing.id,
+        name: input.name,
+        url: input.url,
+        enabled: input.enabled,
+        poll_interval_secs: input
+            .poll_interval_secs
+            .unwrap_or(existing.poll_interval_secs.max(1)),
+        username: merge_optional_string(existing.username, input.username),
+        password: merge_optional_string(existing.password, input.password),
+        default_category: merge_optional_string(existing.default_category, input.default_category),
+        default_metadata: input
+            .default_metadata
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.value))
+                    .collect()
             })
-            .collect();
+            .unwrap_or(existing.default_metadata),
+        etag: existing.etag,
+        last_modified: existing.last_modified,
+        last_polled_at: existing.last_polled_at,
+        last_success_at: existing.last_success_at,
+        last_error: existing.last_error,
+        consecutive_failures: existing.consecutive_failures,
+    }
+}
 
-        let total: usize = servers.iter().map(|s| s.max_connections).sum();
-        let client = NntpClient::new(NntpClientConfig {
-            servers,
-            max_idle_age: std::time::Duration::from_secs(300),
-            max_retries_per_server: 1,
-        });
-        (client, total)
-    };
+fn rss_rule_row_from_input(id: u32, feed_id: u32, input: RssRuleInput) -> RssRuleRow {
+    RssRuleRow {
+        id,
+        feed_id,
+        sort_order: input.sort_order,
+        enabled: input.enabled,
+        action: match input.action {
+            RssRuleActionGql::Accept => weaver_state::RssRuleAction::Accept,
+            RssRuleActionGql::Reject => weaver_state::RssRuleAction::Reject,
+        },
+        title_regex: normalize_optional_string(input.title_regex),
+        item_categories: input.item_categories.unwrap_or_default(),
+        min_size_bytes: input.min_size_bytes,
+        max_size_bytes: input.max_size_bytes,
+        category_override: normalize_optional_string(input.category_override),
+        metadata: metadata_input_to_pairs(input.metadata),
+    }
+}
 
-    if let Err(e) = handle.rebuild_nntp(client, total).await {
-        tracing::error!("failed to rebuild NNTP client: {e}");
+fn metadata_input_to_pairs(
+    entries: Option<Vec<crate::types::MetadataInput>>,
+) -> Vec<(String, String)> {
+    entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect()
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn merge_optional_string(existing: Option<String>, incoming: Option<String>) -> Option<String> {
+    match incoming {
+        Some(value) => normalize_optional_string(Some(value)),
+        None => existing,
     }
 }

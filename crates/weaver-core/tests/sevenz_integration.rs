@@ -77,7 +77,11 @@ fn read_dir_recursive(base: &Path, dir: &Path, out: &mut HashMap<String, Vec<u8>
         if path.is_dir() {
             read_dir_recursive(base, &path, out);
         } else {
-            let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             out.insert(rel, fs::read(&path).unwrap());
         }
     }
@@ -90,9 +94,18 @@ fn read_dir_recursive(base: &Path, dir: &Path, out: &mut HashMap<String, Vec<u8>
 #[test]
 fn classify_7z_filenames() {
     // Single archives.
-    assert_eq!(FileRole::from_filename("movie.7z"), FileRole::SevenZipArchive);
-    assert_eq!(FileRole::from_filename("ARCHIVE.7Z"), FileRole::SevenZipArchive);
-    assert_eq!(FileRole::from_filename("My.File.Name.7z"), FileRole::SevenZipArchive);
+    assert_eq!(
+        FileRole::from_filename("movie.7z"),
+        FileRole::SevenZipArchive
+    );
+    assert_eq!(
+        FileRole::from_filename("ARCHIVE.7Z"),
+        FileRole::SevenZipArchive
+    );
+    assert_eq!(
+        FileRole::from_filename("My.File.Name.7z"),
+        FileRole::SevenZipArchive
+    );
 
     // Split archives.
     assert_eq!(
@@ -112,8 +125,14 @@ fn classify_7z_filenames() {
     let sz = FileRole::SevenZipArchive;
     let split1 = FileRole::SevenZipSplit { number: 0 };
     let split5 = FileRole::SevenZipSplit { number: 4 };
-    let par2_idx = FileRole::Par2 { is_index: true, recovery_block_count: 0 };
-    let par2_rec = FileRole::Par2 { is_index: false, recovery_block_count: 5 };
+    let par2_idx = FileRole::Par2 {
+        is_index: true,
+        recovery_block_count: 0,
+    };
+    let par2_rec = FileRole::Par2 {
+        is_index: false,
+        recovery_block_count: 5,
+    };
 
     assert!(par2_idx.download_priority() < sz.download_priority());
     assert!(sz.download_priority() < split1.download_priority());
@@ -154,7 +173,9 @@ fn extract_single_7z_copy_method() {
     let extracted = extract_with_sevenz(file, &out_dir);
 
     for (name, content) in &expected {
-        let got = extracted.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        let got = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(got, content, "content mismatch for {name}");
     }
 }
@@ -182,7 +203,9 @@ fn extract_single_7z_lzma2() {
     let extracted = extract_with_sevenz(file, &out_dir);
 
     for (name, content) in &expected {
-        let got = extracted.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        let got = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(got, content, "content mismatch for {name}");
     }
 }
@@ -210,7 +233,9 @@ fn extract_single_7z_solid() {
     let extracted = extract_with_sevenz(file, &out_dir);
 
     for (name, content) in &expected {
-        let got = extracted.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        let got = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(got, content, "content mismatch for {name}");
     }
 }
@@ -276,7 +301,9 @@ fn extract_split_7z() {
     let extracted = extract_with_sevenz(reader, &out_dir);
 
     for (name, content) in &expected {
-        let got = extracted.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        let got = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(got, content, "content mismatch for {name}");
     }
 }
@@ -319,7 +346,9 @@ fn extract_split_7z_compressed() {
     let extracted = extract_with_sevenz(reader, &out_dir);
 
     for (name, content) in &expected {
-        let got = extracted.get(name).unwrap_or_else(|| panic!("missing {name}"));
+        let got = extracted
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(got, content, "content mismatch for {name}");
     }
 }
@@ -384,7 +413,11 @@ fn split_reader_seek_consistency() {
     reader.seek(SeekFrom::End(-100)).unwrap();
     let mut last100 = vec![0u8; 100];
     reader.read_exact(&mut last100).unwrap();
-    assert_eq!(last100, &all[all.len() - 100..], "last 100 bytes should match");
+    assert_eq!(
+        last100,
+        &all[all.len() - 100..],
+        "last 100 bytes should match"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -480,8 +513,14 @@ fn extract_preserves_directory_structure() {
     extract_with_sevenz(file, &out_dir);
 
     assert_eq!(fs::read(out_dir.join("root.txt")).unwrap(), b"root file");
-    assert_eq!(fs::read(out_dir.join("sub/middle.txt")).unwrap(), b"middle file");
-    assert_eq!(fs::read(out_dir.join("sub/nested/deep.txt")).unwrap(), b"deep file");
+    assert_eq!(
+        fs::read(out_dir.join("sub/middle.txt")).unwrap(),
+        b"middle file"
+    );
+    assert_eq!(
+        fs::read(out_dir.join("sub/nested/deep.txt")).unwrap(),
+        b"deep file"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +547,11 @@ fn extract_empty_archive() {
     // Also, if the archive exists but is empty/invalid, sevenz-rust2 may fail to parse it.
     if archive_path.exists() {
         let file = fs::File::open(&archive_path).unwrap();
-        match sevenz_rust2::decompress_with_password(file, &out_dir, sevenz_rust2::Password::empty()) {
+        match sevenz_rust2::decompress_with_password(
+            file,
+            &out_dir,
+            sevenz_rust2::Password::empty(),
+        ) {
             Ok(()) => {
                 let extracted = read_dir_contents(&out_dir);
                 assert!(extracted.is_empty() || extracted.values().all(|v| v.is_empty()));
@@ -551,9 +594,7 @@ fn extract_with_callback_pattern() {
         file,
         &out_dir,
         sevenz_rust2::Password::empty(),
-        |entry: &sevenz_rust2::ArchiveEntry,
-         reader: &mut dyn Read,
-         _dest: &PathBuf| {
+        |entry: &sevenz_rust2::ArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| {
             if entry.is_directory() {
                 fs::create_dir_all(out.join(entry.name()))?;
                 return Ok(true);
@@ -590,7 +631,10 @@ fn topology_single_7z() {
     let mut job = weaver_assembly::JobAssembly::new(JobId(1));
 
     let fa = weaver_assembly::FileAssembly::new(
-        NzbFileId { job_id: JobId(1), file_index: 0 },
+        NzbFileId {
+            job_id: JobId(1),
+            file_index: 0,
+        },
         "archive.7z".into(),
         FileRole::SevenZipArchive,
         vec![10000],
@@ -633,7 +677,10 @@ fn topology_split_7z() {
 
     for i in 0..3 {
         let fa = weaver_assembly::FileAssembly::new(
-            NzbFileId { job_id: JobId(1), file_index: i },
+            NzbFileId {
+                job_id: JobId(1),
+                file_index: i,
+            },
             format!("archive.7z.{:03}", i + 1),
             FileRole::SevenZipSplit { number: i },
             vec![5000],
@@ -675,13 +722,13 @@ fn topology_split_7z() {
     ));
 
     // Complete volumes one by one.
-    job.mark_volume_complete("test",0);
+    job.mark_volume_complete("test", 0);
     assert!(!matches!(
         job.extraction_readiness(),
         weaver_assembly::ExtractionReadiness::Ready
     ));
 
-    job.mark_volume_complete("test",1);
+    job.mark_volume_complete("test", 1);
     assert!(!matches!(
         job.extraction_readiness(),
         weaver_assembly::ExtractionReadiness::Ready
@@ -703,27 +750,15 @@ fn multi_set_base_name_grouping() {
     use weaver_core::classify::archive_base_name;
 
     // Different episodes produce different base names.
-    let e01 = archive_base_name(
-        "Show.S01E01.7z.001",
-        &FileRole::SevenZipSplit { number: 0 },
-    );
-    let e02 = archive_base_name(
-        "Show.S01E02.7z.001",
-        &FileRole::SevenZipSplit { number: 0 },
-    );
+    let e01 = archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 });
+    let e02 = archive_base_name("Show.S01E02.7z.001", &FileRole::SevenZipSplit { number: 0 });
     assert_eq!(e01, Some("Show.S01E01.7z".into()));
     assert_eq!(e02, Some("Show.S01E02.7z".into()));
     assert_ne!(e01, e02);
 
     // Same episode, different parts, produce the same base name.
-    let e01_p1 = archive_base_name(
-        "Show.S01E01.7z.001",
-        &FileRole::SevenZipSplit { number: 0 },
-    );
-    let e01_p2 = archive_base_name(
-        "Show.S01E01.7z.002",
-        &FileRole::SevenZipSplit { number: 1 },
-    );
+    let e01_p1 = archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 });
+    let e01_p2 = archive_base_name("Show.S01E01.7z.002", &FileRole::SevenZipSplit { number: 1 });
     assert_eq!(e01_p1, e01_p2);
 }
 
@@ -737,7 +772,10 @@ fn multi_set_readiness_partial() {
     // Add files for two independent sets: ep01 (2 parts) and ep02 (2 parts).
     for i in 0..2 {
         let fa = weaver_assembly::FileAssembly::new(
-            NzbFileId { job_id: JobId(1), file_index: i },
+            NzbFileId {
+                job_id: JobId(1),
+                file_index: i,
+            },
             format!("ep01.7z.{:03}", i + 1),
             FileRole::SevenZipSplit { number: i },
             vec![5000],
@@ -746,7 +784,10 @@ fn multi_set_readiness_partial() {
     }
     for i in 0..2 {
         let fa = weaver_assembly::FileAssembly::new(
-            NzbFileId { job_id: JobId(1), file_index: 10 + i },
+            NzbFileId {
+                job_id: JobId(1),
+                file_index: 10 + i,
+            },
             format!("ep02.7z.{:03}", i + 1),
             FileRole::SevenZipSplit { number: i },
             vec![5000],

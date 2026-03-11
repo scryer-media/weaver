@@ -29,9 +29,7 @@ impl Guard for AdminGuard {
         if scope.is_admin() {
             Ok(())
         } else {
-            Err(async_graphql::Error::new(
-                "Forbidden: admin scope required",
-            ))
+            Err(async_graphql::Error::new("Forbidden: admin scope required"))
         }
     }
 }

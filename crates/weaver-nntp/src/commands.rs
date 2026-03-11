@@ -89,10 +89,7 @@ impl Command {
     pub fn expects_multiline(&self) -> bool {
         matches!(
             self,
-            Command::Article(_)
-                | Command::Body(_)
-                | Command::Head(_)
-                | Command::Capabilities
+            Command::Article(_) | Command::Body(_) | Command::Head(_) | Command::Capabilities
         )
     }
 }

@@ -15,9 +15,9 @@ pub fn parse_response(line: &str) -> Result<Response, NntpError> {
     }
 
     let code_str = &line[..3];
-    let code_val: u16 = code_str.parse().map_err(|_| {
-        NntpError::MalformedResponse(format!("invalid status code: {code_str:?}"))
-    })?;
+    let code_val: u16 = code_str
+        .parse()
+        .map_err(|_| NntpError::MalformedResponse(format!("invalid status code: {code_str:?}")))?;
 
     let code = StatusCode::from_u16(code_val).ok_or_else(|| {
         NntpError::MalformedResponse(format!("status code out of range: {code_val}"))
@@ -63,7 +63,7 @@ pub fn is_multiline_status(code: u16) -> bool {
         224 |  // OVER / XOVER
         225 |  // HDR / XHDR
         230 |  // NEWNEWS
-        231    // NEWGROUPS
+        231 // NEWGROUPS
     )
 }
 

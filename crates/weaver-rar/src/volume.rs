@@ -176,12 +176,13 @@ impl StaticVolumeProvider {
 
 impl VolumeProvider for StaticVolumeProvider {
     fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError> {
-        let path = self.paths.get(&index).ok_or_else(|| {
-            VolumeProviderError::Unavailable {
+        let path = self
+            .paths
+            .get(&index)
+            .ok_or_else(|| VolumeProviderError::Unavailable {
                 volume: index,
                 reason: "not registered".into(),
-            }
-        })?;
+            })?;
         let file = std::fs::File::open(path).map_err(VolumeProviderError::Io)?;
         Ok(Box::new(file))
     }
@@ -260,12 +261,13 @@ impl VolumeProvider for WaitingVolumeProvider {
 
         // Check for cancellation first.
         if let Some(ref err) = state.error
-            && !state.available.contains_key(&index) {
-                return Err(VolumeProviderError::Unavailable {
-                    volume: index,
-                    reason: err.clone(),
-                });
-            }
+            && !state.available.contains_key(&index)
+        {
+            return Err(VolumeProviderError::Unavailable {
+                volume: index,
+                reason: err.clone(),
+            });
+        }
 
         let path = state.available.get(&index).ok_or_else(|| {
             if state.finished {

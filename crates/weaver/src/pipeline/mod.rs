@@ -18,9 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use std::collections::HashSet;
 
-use weaver_assembly::write_buffer::WriteReorderBuffer;
+use weaver_assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use weaver_assembly::{ExtractionReadiness, JobAssembly};
-use weaver_core::buffer::BufferPool;
+use weaver_core::buffer::{BufferHandle, BufferPool};
 use weaver_core::checksum;
 use weaver_core::event::PipelineEvent;
 use weaver_core::id::{JobId, NzbFileId, SegmentId};
@@ -89,9 +89,29 @@ pub(super) struct DecodeResult {
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
     pub(super) crc32: u32,
-    pub(super) data: Vec<u8>,
+    pub(super) data: DecodedData,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
+}
+
+pub(super) enum DecodedData {
+    Pooled(BufferHandle),
+    Owned(Vec<u8>),
+}
+
+impl DecodedData {
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Pooled(buffer) => buffer.as_slice(),
+            Self::Owned(data) => data.as_slice(),
+        }
+    }
+}
+
+impl BufferedChunk for DecodedData {
+    fn len_bytes(&self) -> usize {
+        self.as_slice().len()
+    }
 }
 
 /// The pipeline engine. Owns the scheduler loop and drives work through
@@ -103,8 +123,7 @@ pub struct Pipeline {
     pub(super) event_tx: broadcast::Sender<PipelineEvent>,
     /// NNTP client for fetching articles.
     pub(super) nntp: Arc<NntpClient>,
-    /// Buffer pool for decode stage.
-    #[allow(dead_code)]
+    /// Buffer pool shared across decode and write stages.
     pub(super) buffers: Arc<BufferPool>,
     /// Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
@@ -149,7 +168,7 @@ pub struct Pipeline {
     /// Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
     /// Per-file write reorder buffers for sequential disk writes.
-    pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer>,
+    pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<DecodedData>>,
     /// Retained PAR2 file sets per job, avoiding re-read/re-parse from disk.
     pub(super) par2_sets: HashMap<JobId, Arc<Par2FileSet>>,
     /// Members already extracted per job (for partial extraction).
@@ -160,6 +179,8 @@ pub struct Pipeline {
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.
     pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
+    /// Authoritative recovery block counts per PAR2 file index.
+    pub(super) recovery_block_counts: HashMap<JobId, HashMap<u32, u32>>,
     /// Recovery PAR2 file indices already promoted or completed for a job.
     /// Used to avoid double-promotion and to count targeted recovery capacity.
     pub(super) promoted_recovery_files: HashMap<JobId, HashSet<u32>>,
@@ -182,6 +203,10 @@ pub struct Pipeline {
     pub(super) suspect_volumes: HashMap<(JobId, String), HashSet<u32>>,
     /// Jobs that have already attempted normalization retry (one-shot guard).
     pub(super) normalization_retried: HashSet<JobId>,
+    /// Members where extraction CRC passed and chunks are in the DB, but the
+    /// output file isn't fully concatenated yet.  Separate from `extracted_members`
+    /// to prevent `try_delete_volumes` from treating them as fully extracted.
+    pub(super) pending_concat: HashMap<JobId, HashSet<String>>,
     /// Jobs where all archive members extracted with CRC pass — PAR2
     /// verification/repair is unnecessary.
     pub(super) par2_bypassed: HashSet<JobId>,
@@ -191,6 +216,8 @@ pub struct Pipeline {
     pub(super) shared_state: SharedPipelineState,
     /// SQLite database for durable history.
     pub(super) db: weaver_state::Database,
+    /// Shared config for runtime category lookups (dest_dir overrides).
+    pub(super) config: weaver_core::config::SharedConfig,
 }
 
 impl Pipeline {
@@ -210,6 +237,7 @@ impl Pipeline {
         initial_history: Vec<JobInfo>,
         shared_state: SharedPipelineState,
         db: weaver_state::Database,
+        config: weaver_core::config::SharedConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
@@ -266,6 +294,7 @@ impl Pipeline {
             extracted_members: HashMap::new(),
             extracted_sets: HashMap::new(),
             failed_extractions: HashMap::new(),
+            recovery_block_counts: HashMap::new(),
             promoted_recovery_files: HashMap::new(),
             streaming_providers: HashMap::new(),
             streaming_volume_bases: HashMap::new(),
@@ -273,10 +302,12 @@ impl Pipeline {
             clean_volumes: HashMap::new(),
             suspect_volumes: HashMap::new(),
             normalization_retried: HashSet::new(),
+            pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
             db,
+            config,
         })
     }
 
@@ -505,6 +536,8 @@ impl Pipeline {
                     self.extracted_members.remove(&job_id);
                     self.extracted_sets.remove(&job_id);
                     self.failed_extractions.remove(&job_id);
+                    self.pending_concat.remove(&job_id);
+                    self.recovery_block_counts.remove(&job_id);
                     self.promoted_recovery_files.remove(&job_id);
                     self.par2_bypassed.remove(&job_id);
                     self.eagerly_deleted.remove(&job_id);
@@ -567,28 +600,70 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
+            SchedulerCommand::UpdateRuntimePaths {
+                data_dir,
+                intermediate_dir,
+                complete_dir,
+                reply,
+            } => {
+                let result = std::fs::create_dir_all(&data_dir)
+                    .and_then(|_| std::fs::create_dir_all(&intermediate_dir))
+                    .and_then(|_| std::fs::create_dir_all(&complete_dir))
+                    .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))
+                    .map(|_| {
+                        self.intermediate_dir = intermediate_dir;
+                        self.complete_dir = complete_dir;
+                        self.nzb_dir = data_dir.join(".weaver-nzbs");
+                        let _ = std::fs::create_dir_all(&self.nzb_dir);
+                    });
+                let _ = reply.send(result);
+            }
             SchedulerCommand::ReprocessJob { job_id, reply } => {
                 let result = self.reprocess_job(job_id).await;
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteHistory { job_id, reply } => {
-                let result = if self.jobs.contains_key(&job_id) {
-                    Err(weaver_scheduler::SchedulerError::Other(
-                        "cannot delete active job — cancel it first".into(),
-                    ))
-                } else {
-                    self.finished_jobs.retain(|j| j.job_id != job_id);
-                    let db = self.db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = db.delete_job_history(job_id.0);
-                        let _ = db.delete_job_events(job_id.0);
-                    });
-                    self.publish_snapshot();
-                    Ok(())
+                let result = match self.jobs.get(&job_id).map(|state| state.status.clone()) {
+                    Some(status) if !is_terminal_status(&status) => {
+                        Err(weaver_scheduler::SchedulerError::Other(
+                            "cannot delete active job — cancel it first".into(),
+                        ))
+                    }
+                    Some(_) => {
+                        self.purge_terminal_job_runtime(job_id);
+                        self.finished_jobs.retain(|j| j.job_id != job_id);
+                        let db = self.db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = db.delete_job_history(job_id.0);
+                            let _ = db.delete_job_events(job_id.0);
+                        });
+                        self.publish_snapshot();
+                        Ok(())
+                    }
+                    None => {
+                        self.finished_jobs.retain(|j| j.job_id != job_id);
+                        let db = self.db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = db.delete_job_history(job_id.0);
+                            let _ = db.delete_job_events(job_id.0);
+                        });
+                        self.publish_snapshot();
+                        Ok(())
+                    }
                 };
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteAllHistory { reply } => {
+                let terminal_job_ids: Vec<JobId> = self
+                    .jobs
+                    .iter()
+                    .filter_map(|(job_id, state)| {
+                        is_terminal_status(&state.status).then_some(*job_id)
+                    })
+                    .collect();
+                for job_id in terminal_job_ids {
+                    self.purge_terminal_job_runtime(job_id);
+                }
                 self.finished_jobs.clear();
                 let db = self.db.clone();
                 tokio::task::spawn_blocking(move || {
@@ -688,7 +763,30 @@ pub(super) fn timestamp_secs() -> u64 {
         .as_secs()
 }
 
+pub(super) fn is_terminal_status(status: &JobStatus) -> bool {
+    matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
+}
+
 impl Pipeline {
+    fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
+        self.jobs.remove(&job_id);
+        self.job_order.retain(|id| *id != job_id);
+        self.par2_sets.remove(&job_id);
+        self.extracted_members.remove(&job_id);
+        self.extracted_sets.remove(&job_id);
+        self.failed_extractions.remove(&job_id);
+        self.pending_concat.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
+        self.promoted_recovery_files.remove(&job_id);
+        self.par2_bypassed.remove(&job_id);
+        self.eagerly_deleted.remove(&job_id);
+        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.normalization_retried.remove(&job_id);
+        self.cancel_streaming_extraction(job_id);
+        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
+    }
+
     /// Write a terminal job to SQLite history and add it to the finished_jobs list.
     pub(super) fn record_job_history(&mut self, job_id: JobId) {
         let state = match self.jobs.get(&job_id) {
@@ -733,7 +831,8 @@ impl Pipeline {
             },
         };
 
-        // Also keep in finished_jobs for runtime queries.
+        // Keep only the latest terminal snapshot for this job in runtime history.
+        self.finished_jobs.retain(|j| j.job_id != job_id);
         self.finished_jobs.push(JobInfo {
             job_id,
             name: state.spec.name.clone(),
@@ -768,5 +867,494 @@ impl Pipeline {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+    use weaver_api::submit_nzb_bytes;
+    use weaver_core::buffer::{BufferPool, BufferPoolConfig};
+    use weaver_core::config::{Config, SharedConfig};
+    use weaver_core::system::{
+        CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
+        SystemProfile,
+    };
+    use weaver_nntp::client::{NntpClient, NntpClientConfig};
+    use weaver_scheduler::{PipelineMetrics, SchedulerHandle, SharedPipelineState};
+    use weaver_state::Database;
+
+    struct TestHarness {
+        _temp_dir: TempDir,
+        data_dir: PathBuf,
+        handle: SchedulerHandle,
+        config: SharedConfig,
+        db: Database,
+        pipeline_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestHarness {
+        async fn new() -> Self {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let data_dir = temp_dir.path().join("data");
+            let intermediate_dir = temp_dir.path().join("intermediate");
+            let complete_dir = temp_dir.path().join("complete");
+            let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
+            let config: SharedConfig = Arc::new(RwLock::new(Config {
+                data_dir: data_dir.display().to_string(),
+                intermediate_dir: Some(intermediate_dir.display().to_string()),
+                complete_dir: Some(complete_dir.display().to_string()),
+                buffer_pool: None,
+                tuner: None,
+                servers: vec![],
+                categories: vec![],
+                retry: None,
+                max_download_speed: None,
+                cleanup_after_extract: Some(true),
+                config_path: None,
+            }));
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
+            let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
+            let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+            let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+
+            let nntp = NntpClient::new(NntpClientConfig {
+                servers: vec![],
+                max_idle_age: Duration::from_secs(1),
+                max_retries_per_server: 1,
+            });
+            let profile = SystemProfile {
+                cpu: CpuProfile {
+                    physical_cores: 4,
+                    logical_cores: 4,
+                    simd: SimdSupport::default(),
+                    cgroup_limit: None,
+                },
+                memory: MemoryProfile {
+                    total_bytes: 8 * 1024 * 1024 * 1024,
+                    available_bytes: 8 * 1024 * 1024 * 1024,
+                    cgroup_limit: None,
+                },
+                disk: DiskProfile {
+                    storage_class: StorageClass::Ssd,
+                    filesystem: FilesystemType::Apfs,
+                    sequential_write_mbps: 1000.0,
+                    random_read_iops: 50_000.0,
+                    same_filesystem: true,
+                },
+            };
+            let buffers = BufferPool::new(BufferPoolConfig {
+                small_count: 8,
+                medium_count: 4,
+                large_count: 2,
+            });
+
+            let mut pipeline = Pipeline::new(
+                cmd_rx,
+                event_tx,
+                nntp,
+                buffers,
+                profile,
+                data_dir.clone(),
+                intermediate_dir,
+                complete_dir,
+                0,
+                4,
+                vec![],
+                shared_state,
+                db.clone(),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+            let pipeline_task = tokio::spawn(async move {
+                pipeline.run().await;
+            });
+
+            Self {
+                _temp_dir: temp_dir,
+                data_dir,
+                handle,
+                config,
+                db,
+                pipeline_task,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.handle.shutdown().await.unwrap();
+            self.pipeline_task.await.unwrap();
+        }
+    }
+
+    fn sample_nzb_bytes() -> Vec<u8> {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="Frieren.Sample.rar">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
+          </file>
+        </nzb>"#
+            .to_vec()
+    }
+
+    fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
+        JobState {
+            job_id,
+            spec: JobSpec {
+                name: name.to_string(),
+                password: None,
+                files: vec![],
+                total_bytes: 0,
+                category: None,
+                metadata: vec![],
+            },
+            status: JobStatus::Downloading,
+            assembly: JobAssembly::new(job_id),
+            created_at: std::time::Instant::now(),
+            created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+            working_dir,
+            downloaded_bytes: 0,
+            failed_bytes: 0,
+            health_probing: false,
+            held_segments: Vec::new(),
+            download_queue: DownloadQueue::new(),
+            recovery_queue: DownloadQueue::new(),
+        }
+    }
+
+    async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+        let data_dir = temp_dir.path().join("data");
+        let intermediate_dir = temp_dir.path().join("intermediate");
+        let complete_dir = temp_dir.path().join("complete");
+        let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
+        let config: SharedConfig = Arc::new(RwLock::new(Config {
+            data_dir: data_dir.display().to_string(),
+            intermediate_dir: Some(intermediate_dir.display().to_string()),
+            complete_dir: Some(complete_dir.display().to_string()),
+            buffer_pool: None,
+            tuner: None,
+            servers: vec![],
+            categories: vec![],
+            retry: None,
+            max_download_speed: None,
+            cleanup_after_extract: Some(true),
+            config_path: None,
+        }));
+
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
+        let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
+        let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+        let nntp = NntpClient::new(NntpClientConfig {
+            servers: vec![],
+            max_idle_age: Duration::from_secs(1),
+            max_retries_per_server: 1,
+        });
+        let profile = SystemProfile {
+            cpu: CpuProfile {
+                physical_cores: 4,
+                logical_cores: 4,
+                simd: SimdSupport::default(),
+                cgroup_limit: None,
+            },
+            memory: MemoryProfile {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                available_bytes: 8 * 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: DiskProfile {
+                storage_class: StorageClass::Ssd,
+                filesystem: FilesystemType::Apfs,
+                sequential_write_mbps: 1000.0,
+                random_read_iops: 50_000.0,
+                same_filesystem: true,
+            },
+        };
+        let buffers = BufferPool::new(BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        });
+
+        let pipeline = Pipeline::new(
+            cmd_rx,
+            event_tx,
+            nntp,
+            buffers,
+            profile,
+            data_dir,
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+            0,
+            4,
+            vec![],
+            shared_state,
+            db,
+            config,
+        )
+        .await
+        .unwrap();
+
+        (pipeline, intermediate_dir, complete_dir)
+    }
+
+    async fn wait_until(
+        timeout_duration: Duration,
+        mut predicate: impl FnMut() -> bool,
+    ) -> Result<(), &'static str> {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        loop {
+            if predicate() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("condition timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_nzb_persists_zstd_and_creates_active_job() {
+        let harness = TestHarness::new().await;
+        let nzb_bytes = sample_nzb_bytes();
+
+        let submitted = tokio::time::timeout(
+            Duration::from_secs(2),
+            submit_nzb_bytes(
+                &harness.handle,
+                &harness.config,
+                &nzb_bytes,
+                Some("Frieren.Sample.nzb".to_string()),
+                None,
+                None,
+                vec![("source".to_string(), "test".to_string())],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        wait_until(Duration::from_secs(2), || {
+            harness
+                .db
+                .load_active_jobs()
+                .map(|jobs| jobs.contains_key(&submitted.job_id))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap();
+
+        let info = harness.handle.get_job(submitted.job_id).unwrap();
+        assert_eq!(info.status, JobStatus::Downloading);
+        assert!(
+            info.metadata
+                .contains(&("source".to_string(), "test".to_string()))
+        );
+        assert!(
+            info.metadata.iter().any(|(key, value)| {
+                key == "weaver.original_title" && value == "Frieren.Sample"
+            })
+        );
+
+        let stored_nzb = tokio::fs::read(
+            harness
+                .data_dir
+                .join(".weaver-nzbs")
+                .join(format!("{}.nzb", submitted.job_id.0)),
+        )
+        .await
+        .unwrap();
+        assert!(stored_nzb.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
+        assert_eq!(crate::decompress_nzb(&stored_nzb), nzb_bytes);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(10067);
+        let job_name = "Frieren Beyond Journeys End";
+        let payload_dir = "Frieren.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu";
+        let episode_name = "Frieren.Beyond.Journeys.End.S01E01.mkv";
+
+        let existing_dest = complete_dir.join(job::sanitize_dirname(job_name));
+        tokio::fs::create_dir_all(existing_dest.join(payload_dir))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            existing_dest.join(payload_dir).join(episode_name),
+            b"existing",
+        )
+        .await
+        .unwrap();
+
+        let working_dir =
+            intermediate_dir.join(format!("{}.#{}", job::sanitize_dirname(job_name), job_id.0));
+        tokio::fs::create_dir_all(working_dir.join(payload_dir))
+            .await
+            .unwrap();
+        tokio::fs::write(working_dir.join(payload_dir).join(episode_name), b"new")
+            .await
+            .unwrap();
+
+        pipeline.jobs.insert(
+            job_id,
+            minimal_job_state(job_id, job_name, working_dir.clone()),
+        );
+
+        let dest = pipeline.move_to_complete(job_id).await.unwrap();
+        let expected_dest =
+            complete_dir.join(format!("{}.#{}", job::sanitize_dirname(job_name), job_id.0));
+
+        assert_eq!(dest, expected_dest);
+        assert_eq!(
+            pipeline.jobs.get(&job_id).unwrap().working_dir,
+            expected_dest
+        );
+        assert!(!working_dir.exists());
+        assert_eq!(
+            tokio::fs::read(dest.join(payload_dir).join(episode_name))
+                .await
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            tokio::fs::read(existing_dest.join(payload_dir).join(episode_name))
+                .await
+                .unwrap(),
+            b"existing"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_final_move_marks_job_failed_instead_of_complete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(10068);
+        let job_name = "Frieren Broken Final Move";
+        let missing_working_dir = intermediate_dir.join("missing");
+
+        pipeline.jobs.insert(
+            job_id,
+            minimal_job_state(job_id, job_name, missing_working_dir),
+        );
+
+        pipeline.check_job_completion(job_id).await;
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(matches!(state.status, JobStatus::Failed { .. }));
+        let JobStatus::Failed { error } = &state.status else {
+            unreachable!();
+        };
+        assert!(error.contains("failed to read working directory"));
+        assert!(!complete_dir.join(job::sanitize_dirname(job_name)).exists());
+    }
+
+    #[tokio::test]
+    async fn missing_workdir_fails_job_and_does_not_block_future_commands() {
+        let harness = TestHarness::new().await;
+        let nzb_bytes = sample_nzb_bytes();
+        let mut events = harness.handle.subscribe_events();
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            submit_nzb_bytes(
+                &harness.handle,
+                &harness.config,
+                &nzb_bytes,
+                Some("Frieren.Broken.nzb".to_string()),
+                None,
+                None,
+                vec![],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let output_dir = loop {
+            if let Ok(info) = harness.handle.get_job(first.job_id)
+                && let Some(output_dir) = info.output_dir
+            {
+                break PathBuf::from(output_dir);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        tokio::fs::remove_dir_all(&output_dir).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), harness.handle.pause_all())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let failure = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await {
+                    Ok(PipelineEvent::JobFailed { job_id, error }) if job_id == first.job_id => {
+                        break error;
+                    }
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(failure.contains("working directory missing"));
+
+        wait_until(Duration::from_secs(2), || {
+            matches!(
+                harness.handle.get_job(first.job_id).map(|info| info.status),
+                Ok(JobStatus::Failed { .. })
+            )
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), harness.handle.resume_all())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            submit_nzb_bytes(
+                &harness.handle,
+                &harness.config,
+                &nzb_bytes,
+                Some("Frieren.Recovery.nzb".to_string()),
+                None,
+                None,
+                vec![],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        wait_until(Duration::from_secs(2), || {
+            harness
+                .db
+                .load_active_jobs()
+                .map(|jobs| jobs.contains_key(&second.job_id))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            harness.handle.get_job(second.job_id).unwrap().status,
+            JobStatus::Downloading
+        );
+        assert!(!harness.handle.is_globally_paused());
+
+        harness.shutdown().await;
     }
 }

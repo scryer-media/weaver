@@ -11,7 +11,10 @@ impl StatusCode {
     /// # Panics
     /// Panics if the value is not in the range 100..=599.
     pub fn new(code: u16) -> Self {
-        debug_assert!((100..=599).contains(&code), "invalid NNTP status code: {code}");
+        debug_assert!(
+            (100..=599).contains(&code),
+            "invalid NNTP status code: {code}"
+        );
         StatusCode(code)
     }
 
@@ -245,7 +248,10 @@ mod tests {
         assert!(caps.supports_starttls());
         assert!(caps.supports_authinfo());
         assert!(caps.supports_compress());
-        assert_eq!(caps.get("AUTHINFO"), Some(["USER".into(), "PASS".into()].as_slice()));
+        assert_eq!(
+            caps.get("AUTHINFO"),
+            Some(["USER".into(), "PASS".into()].as_slice())
+        );
         assert_eq!(caps.get("COMPRESS"), Some(["DEFLATE".into()].as_slice()));
     }
 

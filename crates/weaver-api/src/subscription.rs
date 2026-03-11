@@ -24,13 +24,8 @@ impl SubscriptionRoot {
         let handle = ctx.data::<SchedulerHandle>()?;
         let rx = handle.subscribe_events();
 
-        Ok(
-            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
-                result
-                    .ok()
-                    .map(|event| PipelineEventGql::from(&event))
-            }),
-        )
+        Ok(tokio_stream::wrappers::BroadcastStream::new(rx)
+            .filter_map(|result| result.ok().map(|event| PipelineEventGql::from(&event))))
     }
 
     /// Subscribe to real-time job state snapshots.
@@ -38,10 +33,7 @@ impl SubscriptionRoot {
     /// Pushes a full snapshot whenever a pipeline event fires, throttled to
     /// at most once per 500ms so rapid-fire segment events don't flood the
     /// client. Also ticks every 2s during idle so speed gauges stay fresh.
-    async fn job_updates(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<impl Stream<Item = JobsSnapshot>> {
+    async fn job_updates(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = JobsSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let event_rx = handle.subscribe_events();
 
@@ -50,9 +42,9 @@ impl SubscriptionRoot {
 
         // Tick every 2s as a heartbeat so speed/metrics stay fresh even when
         // no events are firing (e.g. idle, all jobs paused).
-        let heartbeat = tokio_stream::wrappers::IntervalStream::new(
-            tokio::time::interval(Duration::from_secs(2)),
-        )
+        let heartbeat = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
+            Duration::from_secs(2),
+        ))
         .map(|_| ());
 
         // Merge event triggers with heartbeat, then throttle to 100ms.

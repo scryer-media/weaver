@@ -4,7 +4,10 @@ use weaver_core::config::SharedConfig;
 use weaver_scheduler::SchedulerHandle;
 
 use crate::auth::AdminGuard;
-use crate::types::{ApiKey, ApiKeyScope, EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, Metrics, Server};
+use crate::types::{
+    ApiKey, ApiKeyScope, Category, EventKind, GeneralSettings, Job, JobEvent, JobStatusGql,
+    Metrics, RssFeed, Server,
+};
 
 pub struct QueryRoot;
 
@@ -30,13 +33,15 @@ impl QueryRoot {
                     }
                 }
                 if let Some(ref cat) = category
-                    && info.category.as_ref() != Some(cat) {
-                        return false;
-                    }
+                    && info.category.as_ref() != Some(cat)
+                {
+                    return false;
+                }
                 if let Some(ref key) = has_metadata_key
-                    && !info.metadata.iter().any(|(k, _)| k == key) {
-                        return false;
-                    }
+                    && !info.metadata.iter().any(|(k, _)| k == key)
+                {
+                    return false;
+                }
                 true
             })
             .map(Job::from)
@@ -73,6 +78,14 @@ impl QueryRoot {
         let config = ctx.data::<SharedConfig>()?;
         let cfg = config.read().await;
         Ok(cfg.servers.iter().map(Server::from).collect())
+    }
+
+    /// List all configured categories.
+    #[graphql(guard = "AdminGuard")]
+    async fn categories(&self, ctx: &Context<'_>) -> Result<Vec<Category>> {
+        let config = ctx.data::<SharedConfig>()?;
+        let cfg = config.read().await;
+        Ok(cfg.categories.iter().map(Category::from).collect())
     }
 
     /// Get the event log for a specific job.
@@ -130,11 +143,49 @@ impl QueryRoot {
             complete_dir: cfg.complete_dir(),
             cleanup_after_extract: cfg.cleanup_after_extract(),
             max_download_speed: cfg.max_download_speed.unwrap_or(0),
-            max_retries: cfg
-                .retry
-                .as_ref()
-                .and_then(|r| r.max_retries)
-                .unwrap_or(3),
+            max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
         })
+    }
+
+    /// List configured RSS feeds.
+    #[graphql(guard = "AdminGuard")]
+    async fn rss_feeds(&self, ctx: &Context<'_>) -> Result<Vec<RssFeed>> {
+        let db = ctx.data::<weaver_state::Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            let feeds = db.list_rss_feeds()?;
+            let mut out = Vec::with_capacity(feeds.len());
+            for feed in feeds {
+                let rules = db
+                    .list_rss_rules(feed.id)?
+                    .iter()
+                    .map(crate::types::RssRule::from_row)
+                    .collect();
+                out.push(RssFeed::from_row(&feed, rules));
+            }
+            Ok::<_, weaver_state::StateError>(out)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Get a single RSS feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn rss_feed(&self, ctx: &Context<'_>, id: u32) -> Result<Option<RssFeed>> {
+        let db = ctx.data::<weaver_state::Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(feed) = db.get_rss_feed(id)? else {
+                return Ok(None);
+            };
+            let rules = db
+                .list_rss_rules(feed.id)?
+                .iter()
+                .map(crate::types::RssRule::from_row)
+                .collect();
+            Ok::<_, weaver_state::StateError>(Some(RssFeed::from_row(&feed, rules)))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))
     }
 }

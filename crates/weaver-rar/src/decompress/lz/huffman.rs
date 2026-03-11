@@ -158,9 +158,7 @@ impl HuffmanTable {
                 let prefix = (code >> (length - QUICK_BITS)) as usize;
 
                 // Get or create a tree root for this prefix.
-                let tree_root = if prefix < QUICK_TABLE_SIZE
-                    && quick[prefix].length > QUICK_BITS
-                {
+                let tree_root = if prefix < QUICK_TABLE_SIZE && quick[prefix].length > QUICK_BITS {
                     // Already has a tree root.
                     quick[prefix].symbol as usize
                 } else {
@@ -237,7 +235,9 @@ impl HuffmanTable {
         }
 
         // Try quick lookup first.
-        let peek_len = (QUICK_BITS as usize).min(self.max_length as usize).min(bits_avail) as u8;
+        let peek_len = (QUICK_BITS as usize)
+            .min(self.max_length as usize)
+            .min(bits_avail) as u8;
         let peeked = reader.peek_bits(peek_len)?;
         let index = if peek_len < QUICK_BITS {
             (peeked as usize) << (QUICK_BITS - peek_len)
@@ -315,7 +315,10 @@ impl HuffmanTable {
 /// On first call, pass a zero-initialized vec of length `HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC`.
 ///
 /// Returns (nc_table, dc_table, ldc_table, rc_table).
-pub fn read_tables(reader: &mut BitReader, prev_lengths: &mut [u8]) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
+pub fn read_tables(
+    reader: &mut BitReader,
+    prev_lengths: &mut [u8],
+) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     // Step 1: Read 20 x 4-bit lengths for the BC (bit-length code) table.
     // Special encoding: if a 4-bit value is 0xF, read 4 more bits as skip count.
     // If count > 0, skip (count+1) entries (all zeros). If count == 0, value is 15.
@@ -364,8 +367,8 @@ pub fn read_tables(reader: &mut BitReader, prev_lengths: &mut [u8]) -> RarResult
         } else {
             // RLE code: determine count and fill value.
             let count = match sym {
-                16 | 18 => 3 + reader.read_bits(3)? as usize,   // short: 3-10
-                _       => 11 + reader.read_bits(7)? as usize,  // long: 11-138 (17, 19)
+                16 | 18 => 3 + reader.read_bits(3)? as usize, // short: 3-10
+                _ => 11 + reader.read_bits(7)? as usize,      // long: 11-138 (17, 19)
             };
             let value = if sym < 18 {
                 // Symbols 16-17: repeat previous value.
@@ -550,9 +553,9 @@ mod tests {
         // 4 symbols: lengths 1, 2, 3, 11
         // This forces one symbol through the tree walk path
         let mut lengths = [0u8; 4];
-        lengths[0] = 1;  // code: 0
-        lengths[1] = 3;  // code: 100
-        lengths[2] = 3;  // code: 101
+        lengths[0] = 1; // code: 0
+        lengths[1] = 3; // code: 100
+        lengths[2] = 3; // code: 101
         lengths[3] = 11; // long code requiring tree walk
 
         let table = HuffmanTable::build(&lengths).unwrap();
@@ -584,7 +587,7 @@ mod tests {
     #[test]
     fn test_bc_table_sym14_vs_sym19() {
         // Exact BC table from our test fixture.
-        let bc_lengths: [u8; 20] = [6,0,5,4,3,4,4,4,3,4,6,4,4,4,4,0,5,6,6,4];
+        let bc_lengths: [u8; 20] = [6, 0, 5, 4, 3, 4, 4, 4, 3, 4, 6, 4, 4, 4, 4, 0, 5, 6, 6, 4];
         let table = HuffmanTable::build(&bc_lengths).unwrap();
 
         // sym 14: code=12=1100 (len 4), sym 19: code=13=1101 (len 4)

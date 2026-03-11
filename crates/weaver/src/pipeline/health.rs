@@ -172,15 +172,20 @@ impl Pipeline {
         // Cancel any active streaming extractions so providers aren't orphaned.
         self.cancel_streaming_extraction(job_id);
         self.failed_extractions.remove(&job_id);
+        self.pending_concat.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
         self.promoted_recovery_files.remove(&job_id);
         self.eagerly_deleted.remove(&job_id);
         self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
         self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.normalization_retried.remove(&job_id);
+        self.write_buffers.retain(|fid, _| fid.job_id != job_id);
         self.record_job_history(job_id);
         self.job_order.retain(|id| *id != job_id);
         let _ = self
             .event_tx
             .send(PipelineEvent::JobFailed { job_id, error });
+        self.publish_snapshot();
     }
 
     /// Spawn a dedicated STAT probe task to quickly estimate job health.

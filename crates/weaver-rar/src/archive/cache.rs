@@ -7,11 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{DataSegment, FileEncryptionInfo, MemberEntry, RarArchive};
 use crate::header::file::FileHeader;
-use crate::types::{
-    ArchiveFormat, CompressionInfo, CompressionMethod, FileHash,
-};
-use crate::volume::VolumeSet;
 use crate::limits::Limits;
+use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod, FileHash};
+use crate::volume::VolumeSet;
 
 /// Serializable snapshot of parsed archive headers.
 #[derive(Serialize, Deserialize)]
@@ -69,35 +67,43 @@ impl RarArchive {
             is_solid: self.is_solid,
             is_encrypted: self.is_encrypted,
             more_volumes: self.more_volumes,
-            members: self.members.iter().map(|m| CachedMember {
-                name: m.file_header.name.clone(),
-                unpacked_size: m.file_header.unpacked_size,
-                data_crc32: m.file_header.data_crc32,
-                compression_method: m.file_header.compression.method.code(),
-                compression_version: m.file_header.compression.version,
-                compression_solid: m.file_header.compression.solid,
-                dict_size: m.file_header.compression.dict_size,
-                split_before: m.file_header.split_before,
-                split_after: m.file_header.split_after,
-                is_directory: m.file_header.is_directory,
-                is_encrypted: m.is_encrypted,
-                encryption: m.file_encryption.as_ref().map(|e| CachedEncryption {
-                    kdf_count: e.kdf_count,
-                    salt: e.salt,
-                    iv: e.iv,
-                    check_data: e.check_data,
-                    use_hash_mac: e.use_hash_mac,
-                }),
-                rar4_salt: m.rar4_salt,
-                blake2_hash: m.hash.as_ref().map(|h| match h {
-                    FileHash::Blake2sp(b) => *b,
-                }),
-                segments: m.segments.iter().map(|s| CachedSegment {
-                    volume_index: s.volume_index,
-                    data_offset: s.data_offset,
-                    data_size: s.data_size,
-                }).collect(),
-            }).collect(),
+            members: self
+                .members
+                .iter()
+                .map(|m| CachedMember {
+                    name: m.file_header.name.clone(),
+                    unpacked_size: m.file_header.unpacked_size,
+                    data_crc32: m.file_header.data_crc32,
+                    compression_method: m.file_header.compression.method.code(),
+                    compression_version: m.file_header.compression.version,
+                    compression_solid: m.file_header.compression.solid,
+                    dict_size: m.file_header.compression.dict_size,
+                    split_before: m.file_header.split_before,
+                    split_after: m.file_header.split_after,
+                    is_directory: m.file_header.is_directory,
+                    is_encrypted: m.is_encrypted,
+                    encryption: m.file_encryption.as_ref().map(|e| CachedEncryption {
+                        kdf_count: e.kdf_count,
+                        salt: e.salt,
+                        iv: e.iv,
+                        check_data: e.check_data,
+                        use_hash_mac: e.use_hash_mac,
+                    }),
+                    rar4_salt: m.rar4_salt,
+                    blake2_hash: m.hash.as_ref().map(|h| match h {
+                        FileHash::Blake2sp(b) => *b,
+                    }),
+                    segments: m
+                        .segments
+                        .iter()
+                        .map(|s| CachedSegment {
+                            volume_index: s.volume_index,
+                            data_offset: s.data_offset,
+                            data_size: s.data_size,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -112,50 +118,58 @@ impl RarArchive {
             _ => ArchiveFormat::Rar5,
         };
 
-        let members: Vec<MemberEntry> = cached.members.into_iter().map(|cm| {
-            let compression = CompressionInfo {
-                format,
-                version: cm.compression_version,
-                solid: cm.compression_solid,
-                method: CompressionMethod::from_code(cm.compression_method),
-                dict_size: cm.dict_size,
-            };
+        let members: Vec<MemberEntry> = cached
+            .members
+            .into_iter()
+            .map(|cm| {
+                let compression = CompressionInfo {
+                    format,
+                    version: cm.compression_version,
+                    solid: cm.compression_solid,
+                    method: CompressionMethod::from_code(cm.compression_method),
+                    dict_size: cm.dict_size,
+                };
 
-            MemberEntry {
-                file_header: FileHeader {
-                    name: cm.name,
-                    unpacked_size: cm.unpacked_size,
-                    attributes: crate::types::FileAttributes(0),
-                    mtime: None,
-                    data_crc32: cm.data_crc32,
-                    compression,
-                    host_os: crate::types::HostOs::Unix,
-                    is_directory: cm.is_directory,
-                    file_flags: 0,
-                    data_size: 0,
-                    split_before: cm.split_before,
-                    split_after: cm.split_after,
-                    data_offset: 0,
+                MemberEntry {
+                    file_header: FileHeader {
+                        name: cm.name,
+                        unpacked_size: cm.unpacked_size,
+                        attributes: crate::types::FileAttributes(0),
+                        mtime: None,
+                        data_crc32: cm.data_crc32,
+                        compression,
+                        host_os: crate::types::HostOs::Unix,
+                        is_directory: cm.is_directory,
+                        file_flags: 0,
+                        data_size: 0,
+                        split_before: cm.split_before,
+                        split_after: cm.split_after,
+                        data_offset: 0,
+                        is_encrypted: cm.is_encrypted,
+                    },
                     is_encrypted: cm.is_encrypted,
-                },
-                is_encrypted: cm.is_encrypted,
-                file_encryption: cm.encryption.map(|e| FileEncryptionInfo {
-                    kdf_count: e.kdf_count,
-                    salt: e.salt,
-                    iv: e.iv,
-                    check_data: e.check_data,
-                    use_hash_mac: e.use_hash_mac,
-                }),
-                rar4_salt: cm.rar4_salt,
-                hash: cm.blake2_hash.map(FileHash::Blake2sp),
-                redirection: None,
-                segments: cm.segments.into_iter().map(|s| DataSegment {
-                    volume_index: s.volume_index,
-                    data_offset: s.data_offset,
-                    data_size: s.data_size,
-                }).collect(),
-            }
-        }).collect();
+                    file_encryption: cm.encryption.map(|e| FileEncryptionInfo {
+                        kdf_count: e.kdf_count,
+                        salt: e.salt,
+                        iv: e.iv,
+                        check_data: e.check_data,
+                        use_hash_mac: e.use_hash_mac,
+                    }),
+                    rar4_salt: cm.rar4_salt,
+                    hash: cm.blake2_hash.map(FileHash::Blake2sp),
+                    redirection: None,
+                    segments: cm
+                        .segments
+                        .into_iter()
+                        .map(|s| DataSegment {
+                            volume_index: s.volume_index,
+                            data_offset: s.data_offset,
+                            data_size: s.data_size,
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
 
         RarArchive {
             format,

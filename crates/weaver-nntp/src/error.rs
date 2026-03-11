@@ -190,16 +190,46 @@ mod tests {
     fn from_status_rfc3977_codes() {
         let sc = |raw| StatusCode::new(raw);
 
-        assert!(matches!(NntpError::from_status(sc(400), ""), NntpError::ServiceUnavailable));
-        assert!(matches!(NntpError::from_status(sc(411), ""), NntpError::NoSuchGroup));
-        assert!(matches!(NntpError::from_status(sc(412), ""), NntpError::NoGroupSelected));
-        assert!(matches!(NntpError::from_status(sc(423), ""), NntpError::NoArticleWithNumber));
-        assert!(matches!(NntpError::from_status(sc(430), ""), NntpError::ArticleNotFound));
-        assert!(matches!(NntpError::from_status(sc(480), ""), NntpError::AuthenticationRequired));
-        assert!(matches!(NntpError::from_status(sc(481), "bad credentials"), NntpError::AuthenticationFailed));
-        assert!(matches!(NntpError::from_status(sc(482), "out of sequence"), NntpError::AuthenticationRejected));
-        assert!(matches!(NntpError::from_status(sc(483), ""), NntpError::TlsRequired));
-        assert!(matches!(NntpError::from_status(sc(500), ""), NntpError::CommandNotRecognized));
+        assert!(matches!(
+            NntpError::from_status(sc(400), ""),
+            NntpError::ServiceUnavailable
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(411), ""),
+            NntpError::NoSuchGroup
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(412), ""),
+            NntpError::NoGroupSelected
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(423), ""),
+            NntpError::NoArticleWithNumber
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(430), ""),
+            NntpError::ArticleNotFound
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(480), ""),
+            NntpError::AuthenticationRequired
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(481), "bad credentials"),
+            NntpError::AuthenticationFailed
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(482), "out of sequence"),
+            NntpError::AuthenticationRejected
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(483), ""),
+            NntpError::TlsRequired
+        ));
+        assert!(matches!(
+            NntpError::from_status(sc(500), ""),
+            NntpError::CommandNotRecognized
+        ));
     }
 
     #[test]

@@ -5,23 +5,48 @@ use super::*;
 impl Pipeline {
     /// Handle a completed decode — write to disk, update assembly, journal.
     pub(super) async fn handle_decode_done(&mut self, result: DecodeResult) {
-        let job_id = result.segment_id.file_id.job_id;
-        let file_id = result.segment_id.file_id;
+        let DecodeResult {
+            segment_id,
+            file_offset,
+            decoded_size,
+            crc_valid,
+            crc32,
+            data,
+            yenc_name,
+        } = result;
 
-        if !result.crc_valid {
+        let job_id = segment_id.file_id.job_id;
+        let file_id = segment_id.file_id;
+
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| is_terminal_status(&state.status))
+        {
+            debug!(
+                job_id = job_id.0,
+                segment = %segment_id,
+                "discarding decode result for inactive job"
+            );
+            return;
+        }
+
+        self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
+
+        if !crc_valid {
             self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
         }
 
         let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
-            segment_id: result.segment_id,
-            decoded_size: result.decoded_size,
-            file_offset: result.file_offset,
-            crc_valid: result.crc_valid,
+            segment_id,
+            decoded_size,
+            file_offset,
+            crc_valid,
         });
 
         // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.downloaded_bytes += result.decoded_size as u64;
+            state.downloaded_bytes += decoded_size as u64;
         }
 
         // Look up the filename and working dir for disk I/O.
@@ -42,13 +67,13 @@ impl Pipeline {
             .write_buffers
             .entry(file_id)
             .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
-        let segments_to_write = write_buf.insert(result.file_offset, result.data.clone());
+        let segments_to_write = write_buf.insert(file_offset, data);
 
         // Write the sequentially-ordered segments to disk.
         let file_path = working_dir.join(&filename);
         let write_start = Instant::now();
         for (offset, data) in &segments_to_write {
-            if let Err(e) = write_segment_to_disk(&file_path, *offset, data).await {
+            if let Err(e) = write_segment_to_disk(&file_path, *offset, data.as_slice()).await {
                 warn!(
                     file = %filename,
                     offset = offset,
@@ -71,9 +96,7 @@ impl Pipeline {
             return;
         };
 
-        let segment_number = result.segment_id.segment_number;
-        let decoded_size = result.decoded_size;
-        drop(result.data);
+        let segment_number = segment_id.segment_number;
 
         match file_asm.commit_segment(segment_number, decoded_size) {
             Ok(commit) => {
@@ -84,18 +107,18 @@ impl Pipeline {
                     .segments_committed
                     .fetch_add(1, Ordering::Relaxed);
 
-                let _ = self.event_tx.send(PipelineEvent::SegmentCommitted {
-                    segment_id: result.segment_id,
-                });
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::SegmentCommitted { segment_id });
 
                 // Batch segment commit for SQLite persistence.
                 self.segment_batch.push(CommittedSegment {
                     job_id,
-                    file_index: result.segment_id.file_id.file_index,
-                    segment_number: result.segment_id.segment_number,
-                    file_offset: result.file_offset,
+                    file_index: segment_id.file_id.file_index,
+                    segment_number: segment_id.segment_number,
+                    file_offset,
                     decoded_size,
-                    crc32: result.crc32,
+                    crc32,
                 });
                 if self.segment_batch.len() >= 100 {
                     let batch = std::mem::take(&mut self.segment_batch);
@@ -112,7 +135,9 @@ impl Pipeline {
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let file_path = working_dir.join(&filename);
                         for (offset, data) in write_buf.flush_all().iter() {
-                            if let Err(e) = write_segment_to_disk(&file_path, *offset, data).await {
+                            if let Err(e) =
+                                write_segment_to_disk(&file_path, *offset, data.as_slice()).await
+                            {
                                 warn!(
                                     file = %filename,
                                     offset = offset,
@@ -127,11 +152,11 @@ impl Pipeline {
                     let total_bytes = file_asm.total_bytes();
 
                     // Check for yEnc name mismatch (observability for NZB swap detection).
-                    if !result.yenc_name.is_empty() && result.yenc_name != filename {
+                    if !yenc_name.is_empty() && yenc_name != filename {
                         warn!(
                             job_id = job_id.0,
                             assembly = %filename,
-                            yenc = %result.yenc_name,
+                            yenc = %yenc_name,
                             "yEnc name disagrees with assembly filename"
                         );
                     }
@@ -187,7 +212,7 @@ impl Pipeline {
             }
             Err(e) => {
                 warn!(
-                    segment = %result.segment_id,
+                    segment = %segment_id,
                     error = %e,
                     "assembly commit failed"
                 );

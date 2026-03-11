@@ -1,4 +1,5 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
+use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
 
 // --- API Key types ---
 
@@ -39,6 +40,7 @@ pub struct Server {
     pub connections: u16,
     pub active: bool,
     pub supports_pipelining: bool,
+    pub priority: u32,
 }
 
 impl From<&weaver_core::config::ServerConfig> for Server {
@@ -52,6 +54,108 @@ impl From<&weaver_core::config::ServerConfig> for Server {
             connections: s.connections,
             active: s.active,
             supports_pipelining: s.supports_pipelining,
+            priority: s.priority,
+        }
+    }
+}
+
+impl From<weaver_state::RssRuleAction> for RssRuleActionGql {
+    fn from(value: weaver_state::RssRuleAction) -> Self {
+        match value {
+            weaver_state::RssRuleAction::Accept => Self::Accept,
+            weaver_state::RssRuleAction::Reject => Self::Reject,
+        }
+    }
+}
+
+impl From<RssRuleActionGql> for weaver_state::RssRuleAction {
+    fn from(value: RssRuleActionGql) -> Self {
+        match value {
+            RssRuleActionGql::Accept => Self::Accept,
+            RssRuleActionGql::Reject => Self::Reject,
+        }
+    }
+}
+
+impl RssRule {
+    pub fn from_row(rule: &weaver_state::RssRuleRow) -> Self {
+        Self {
+            id: rule.id,
+            feed_id: rule.feed_id,
+            sort_order: rule.sort_order,
+            enabled: rule.enabled,
+            action: rule.action.into(),
+            title_regex: rule.title_regex.clone(),
+            item_categories: rule.item_categories.clone(),
+            min_size_bytes: rule.min_size_bytes,
+            max_size_bytes: rule.max_size_bytes,
+            category_override: rule.category_override.clone(),
+            metadata: rule
+                .metadata
+                .iter()
+                .map(|(key, value)| MetadataEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl RssFeed {
+    pub fn from_row(feed: &weaver_state::RssFeedRow, rules: Vec<RssRule>) -> Self {
+        Self {
+            id: feed.id,
+            name: feed.name.clone(),
+            url: feed.url.clone(),
+            enabled: feed.enabled,
+            poll_interval_secs: feed.poll_interval_secs,
+            username: feed.username.clone(),
+            has_password: feed.password.is_some(),
+            default_category: feed.default_category.clone(),
+            default_metadata: feed
+                .default_metadata
+                .iter()
+                .map(|(key, value)| MetadataEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            etag: feed.etag.clone(),
+            last_modified: feed.last_modified.clone(),
+            last_polled_at: feed.last_polled_at.map(|value| value as f64 * 1000.0),
+            last_success_at: feed.last_success_at.map(|value| value as f64 * 1000.0),
+            last_error: feed.last_error.clone(),
+            consecutive_failures: feed.consecutive_failures,
+            rules,
+        }
+    }
+}
+
+impl RssSyncReport {
+    pub fn from_domain(report: &crate::rss::RssSyncReport) -> Self {
+        Self {
+            feeds_polled: report.feeds_polled,
+            items_fetched: report.items_fetched,
+            items_new: report.items_new,
+            items_accepted: report.items_accepted,
+            items_submitted: report.items_submitted,
+            items_ignored: report.items_ignored,
+            errors: report.errors.clone(),
+            feed_results: report
+                .feed_results
+                .iter()
+                .map(|feed| RssFeedSyncResult {
+                    feed_id: feed.feed_id,
+                    feed_name: feed.feed_name.clone(),
+                    items_fetched: feed.items_fetched,
+                    items_new: feed.items_new,
+                    items_accepted: feed.items_accepted,
+                    items_submitted: feed.items_submitted,
+                    items_ignored: feed.items_ignored,
+                    errors: feed.errors.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -67,6 +171,38 @@ pub struct ServerInput {
     pub connections: u16,
     #[graphql(default = true)]
     pub active: bool,
+    /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
+    #[graphql(default = 0)]
+    pub priority: u16,
+}
+
+/// GraphQL representation of a configured category.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct Category {
+    pub id: u32,
+    pub name: String,
+    pub dest_dir: Option<String>,
+    pub aliases: String,
+}
+
+impl From<&weaver_core::config::CategoryConfig> for Category {
+    fn from(c: &weaver_core::config::CategoryConfig) -> Self {
+        Category {
+            id: c.id,
+            name: c.name.clone(),
+            dest_dir: c.dest_dir.clone(),
+            aliases: c.aliases.clone(),
+        }
+    }
+}
+
+/// Input for creating or updating a category.
+#[derive(Debug, InputObject)]
+pub struct CategoryInput {
+    pub name: String,
+    pub dest_dir: Option<String>,
+    #[graphql(default)]
+    pub aliases: String,
 }
 
 /// Result of testing a server connection.
@@ -99,11 +235,145 @@ pub struct GeneralSettingsInput {
     pub max_retries: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum RssRuleActionGql {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct RssRule {
+    pub id: u32,
+    pub feed_id: u32,
+    pub sort_order: i32,
+    pub enabled: bool,
+    pub action: RssRuleActionGql,
+    pub title_regex: Option<String>,
+    pub item_categories: Vec<String>,
+    pub min_size_bytes: Option<u64>,
+    pub max_size_bytes: Option<u64>,
+    pub category_override: Option<String>,
+    pub metadata: Vec<MetadataEntry>,
+}
+
+#[derive(Debug, InputObject)]
+pub struct RssRuleInput {
+    #[graphql(default = true)]
+    pub enabled: bool,
+    pub sort_order: i32,
+    pub action: RssRuleActionGql,
+    pub title_regex: Option<String>,
+    pub item_categories: Option<Vec<String>>,
+    pub min_size_bytes: Option<u64>,
+    pub max_size_bytes: Option<u64>,
+    pub category_override: Option<String>,
+    pub metadata: Option<Vec<MetadataInput>>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct RssFeed {
+    pub id: u32,
+    pub name: String,
+    pub url: String,
+    pub enabled: bool,
+    pub poll_interval_secs: u32,
+    pub username: Option<String>,
+    pub has_password: bool,
+    pub default_category: Option<String>,
+    pub default_metadata: Vec<MetadataEntry>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub last_polled_at: Option<f64>,
+    pub last_success_at: Option<f64>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+    pub rules: Vec<RssRule>,
+}
+
+#[derive(Debug, InputObject)]
+pub struct RssFeedInput {
+    pub name: String,
+    pub url: String,
+    #[graphql(default = true)]
+    pub enabled: bool,
+    pub poll_interval_secs: Option<u32>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub default_category: Option<String>,
+    pub default_metadata: Option<Vec<MetadataInput>>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct RssFeedSyncResult {
+    pub feed_id: u32,
+    pub feed_name: String,
+    pub items_fetched: u32,
+    pub items_new: u32,
+    pub items_accepted: u32,
+    pub items_submitted: u32,
+    pub items_ignored: u32,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct RssSyncReport {
+    pub feeds_polled: u32,
+    pub items_fetched: u32,
+    pub items_new: u32,
+    pub items_accepted: u32,
+    pub items_submitted: u32,
+    pub items_ignored: u32,
+    pub errors: Vec<String>,
+    pub feed_results: Vec<RssFeedSyncResult>,
+}
+
 /// A key-value metadata entry attached to a job.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct MetadataEntry {
     pub key: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ParsedEpisode {
+    pub season: Option<u32>,
+    pub episode_numbers: Vec<u32>,
+    pub absolute_episode: Option<u32>,
+    pub raw: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ParsedRelease {
+    pub normalized_title: String,
+    pub release_group: Option<String>,
+    pub languages_audio: Vec<String>,
+    pub languages_subtitles: Vec<String>,
+    pub year: Option<u32>,
+    pub quality: Option<String>,
+    pub source: Option<String>,
+    pub video_codec: Option<String>,
+    pub video_encoding: Option<String>,
+    pub audio: Option<String>,
+    pub audio_codecs: Vec<String>,
+    pub audio_channels: Option<String>,
+    pub is_dual_audio: bool,
+    pub is_atmos: bool,
+    pub is_dolby_vision: bool,
+    pub detected_hdr: bool,
+    pub is_hdr10plus: bool,
+    pub is_hlg: bool,
+    pub fps: Option<f32>,
+    pub is_proper_upload: bool,
+    pub is_repack: bool,
+    pub is_remux: bool,
+    pub is_bd_disk: bool,
+    pub is_ai_enhanced: bool,
+    pub is_hardcoded_subs: bool,
+    pub streaming_service: Option<String>,
+    pub edition: Option<String>,
+    pub anime_version: Option<u32>,
+    pub episode: Option<ParsedEpisode>,
+    pub parse_confidence: f32,
 }
 
 /// Input for attaching metadata to a job submission.
@@ -118,6 +388,9 @@ pub struct MetadataInput {
 pub struct Job {
     pub id: u64,
     pub name: String,
+    pub display_title: String,
+    pub original_title: String,
+    pub parsed_release: ParsedRelease,
     pub status: JobStatusGql,
     /// Error message (only set when status is FAILED).
     pub error: Option<String>,
@@ -262,9 +535,16 @@ impl std::str::FromStr for EventKind {
 
 impl From<&weaver_scheduler::JobInfo> for Job {
     fn from(info: &weaver_scheduler::JobInfo) -> Self {
+        let original_title = original_release_title(&info.name, &info.metadata);
+        let display_title = derive_release_name(Some(&original_title), Some(&info.name));
+        let parsed_release = ParsedRelease::from(parse_job_release(&info.name, &info.metadata));
+
         Job {
             id: info.job_id.0,
             name: info.name.clone(),
+            display_title,
+            original_title,
+            parsed_release,
             status: JobStatusGql::from(&info.status),
             error: info.error.clone(),
             progress: info.progress,
@@ -284,6 +564,54 @@ impl From<&weaver_scheduler::JobInfo> for Job {
                 .collect(),
             output_dir: info.output_dir.clone(),
             created_at: Some(info.created_at_epoch_ms),
+        }
+    }
+}
+
+impl From<scryer_release_parser::ParsedEpisodeMetadata> for ParsedEpisode {
+    fn from(value: scryer_release_parser::ParsedEpisodeMetadata) -> Self {
+        Self {
+            season: value.season,
+            episode_numbers: value.episode_numbers,
+            absolute_episode: value.absolute_episode,
+            raw: value.raw,
+        }
+    }
+}
+
+impl From<scryer_release_parser::ParsedReleaseMetadata> for ParsedRelease {
+    fn from(value: scryer_release_parser::ParsedReleaseMetadata) -> Self {
+        Self {
+            normalized_title: value.normalized_title,
+            release_group: value.release_group,
+            languages_audio: value.languages_audio,
+            languages_subtitles: value.languages_subtitles,
+            year: value.year,
+            quality: value.quality,
+            source: value.source,
+            video_codec: value.video_codec,
+            video_encoding: value.video_encoding,
+            audio: value.audio,
+            audio_codecs: value.audio_codecs,
+            audio_channels: value.audio_channels,
+            is_dual_audio: value.is_dual_audio,
+            is_atmos: value.is_atmos,
+            is_dolby_vision: value.is_dolby_vision,
+            detected_hdr: value.detected_hdr,
+            is_hdr10plus: value.is_hdr10plus,
+            is_hlg: value.is_hlg,
+            fps: value.fps,
+            is_proper_upload: value.is_proper_upload,
+            is_repack: value.is_repack,
+            is_remux: value.is_remux,
+            is_bd_disk: value.is_bd_disk,
+            is_ai_enhanced: value.is_ai_enhanced,
+            is_hardcoded_subs: value.is_hardcoded_subs,
+            streaming_service: value.streaming_service,
+            edition: value.edition,
+            anime_version: value.anime_version,
+            episode: value.episode.map(ParsedEpisode::from),
+            parse_confidence: value.parse_confidence,
         }
     }
 }
@@ -337,7 +665,12 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
         use weaver_core::event::PipelineEvent;
 
         match event {
-            PipelineEvent::JobCreated { job_id, name, total_files, total_bytes } => PipelineEventGql {
+            PipelineEvent::JobCreated {
+                job_id,
+                name,
+                total_files,
+                total_bytes,
+            } => PipelineEventGql {
                 kind: EventKind::JobCreated,
                 job_id: Some(job_id.0),
                 file_id: None,
@@ -367,7 +700,10 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: error.clone(),
             },
-            PipelineEvent::ArticleDownloaded { segment_id, raw_size } => PipelineEventGql {
+            PipelineEvent::ArticleDownloaded {
+                segment_id,
+                raw_size,
+            } => PipelineEventGql {
                 kind: EventKind::ArticleDownloaded,
                 job_id: Some(segment_id.file_id.job_id.0),
                 file_id: Some(format!("{}", segment_id.file_id)),
@@ -379,7 +715,12 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: Some(format!("{}", segment_id.file_id)),
                 message: format!("segment {} not found", segment_id.segment_number),
             },
-            PipelineEvent::SegmentDecoded { segment_id, decoded_size, crc_valid, .. } => PipelineEventGql {
+            PipelineEvent::SegmentDecoded {
+                segment_id,
+                decoded_size,
+                crc_valid,
+                ..
+            } => PipelineEventGql {
                 kind: EventKind::SegmentDecoded,
                 job_id: Some(segment_id.file_id.job_id.0),
                 file_id: Some(format!("{}", segment_id.file_id)),
@@ -391,13 +732,21 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: Some(format!("{}", segment_id.file_id)),
                 message: "committed".into(),
             },
-            PipelineEvent::FileComplete { file_id, filename, total_bytes } => PipelineEventGql {
+            PipelineEvent::FileComplete {
+                file_id,
+                filename,
+                total_bytes,
+            } => PipelineEventGql {
                 kind: EventKind::FileComplete,
                 job_id: Some(file_id.job_id.0),
                 file_id: Some(format!("{file_id}")),
                 message: format!("{filename}: {total_bytes} bytes"),
             },
-            PipelineEvent::FileMissing { file_id, filename, missing_segments } => PipelineEventGql {
+            PipelineEvent::FileMissing {
+                file_id,
+                filename,
+                missing_segments,
+            } => PipelineEventGql {
                 kind: EventKind::FileMissing,
                 job_id: Some(file_id.job_id.0),
                 file_id: Some(format!("{file_id}")),
@@ -421,7 +770,10 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: "repair started".into(),
             },
-            PipelineEvent::RepairComplete { job_id, slices_repaired } => PipelineEventGql {
+            PipelineEvent::RepairComplete {
+                job_id,
+                slices_repaired,
+            } => PipelineEventGql {
                 kind: EventKind::RepairComplete,
                 job_id: Some(job_id.0),
                 file_id: None,
@@ -439,7 +791,12 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: "extraction ready".into(),
             },
-            PipelineEvent::ExtractionProgress { job_id, member, bytes_written, total_bytes } => PipelineEventGql {
+            PipelineEvent::ExtractionProgress {
+                job_id,
+                member,
+                bytes_written,
+                total_bytes,
+            } => PipelineEventGql {
                 kind: EventKind::ExtractionProgress,
                 job_id: Some(job_id.0),
                 file_id: None,
@@ -457,7 +814,11 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: error.clone(),
             },
-            PipelineEvent::SegmentRetryScheduled { segment_id, attempt, delay_secs } => PipelineEventGql {
+            PipelineEvent::SegmentRetryScheduled {
+                segment_id,
+                attempt,
+                delay_secs,
+            } => PipelineEventGql {
                 kind: EventKind::SegmentRetryScheduled,
                 job_id: Some(segment_id.file_id.job_id.0),
                 file_id: Some(format!("{}", segment_id.file_id)),

@@ -43,7 +43,8 @@ impl ArchiveTopology {
     pub fn deletable_volumes(&self, extracted: &HashSet<String>) -> HashSet<u32> {
         // For each volume, check if ALL members spanning it have been extracted.
         // A volume is deletable only when no unextracted member needs it.
-        let max_vol = self.expected_volume_count
+        let max_vol = self
+            .expected_volume_count
             .unwrap_or_else(|| self.volume_map.values().max().copied().map_or(0, |v| v + 1));
 
         let mut deletable: HashSet<u32> = (0..max_vol).collect();
@@ -150,13 +151,14 @@ impl JobAssembly {
         }
 
         // Check if all archive files appear in some topology's volume_map.
-        let all_archive_files_covered = self.files.values().all(|f| {
-            match f.role() {
-                FileRole::RarVolume { .. } | FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. } => {
-                    self.archive_topologies.values().any(|topo| topo.volume_map.contains_key(f.filename()))
-                }
-                _ => true,
-            }
+        let all_archive_files_covered = self.files.values().all(|f| match f.role() {
+            FileRole::RarVolume { .. }
+            | FileRole::SevenZipArchive
+            | FileRole::SevenZipSplit { .. } => self
+                .archive_topologies
+                .values()
+                .any(|topo| topo.volume_map.contains_key(f.filename())),
+            _ => true,
         });
         if !all_archive_files_covered {
             return ExtractionReadiness::Blocked {
@@ -269,7 +271,12 @@ impl JobAssembly {
     pub fn ready_archive_sets(&self) -> Vec<String> {
         self.archive_topologies
             .keys()
-            .filter(|name| matches!(self.set_extraction_readiness(name), ExtractionReadiness::Ready))
+            .filter(|name| {
+                matches!(
+                    self.set_extraction_readiness(name),
+                    ExtractionReadiness::Ready
+                )
+            })
             .cloned()
             .collect()
     }
@@ -348,14 +355,34 @@ impl JobAssembly {
     /// Number of data files (excludes PAR2 recovery volumes).
     /// Includes PAR2 index, archive volumes, standalone files.
     pub fn data_file_count(&self) -> usize {
-        self.files.values().filter(|f| !matches!(f.role(), FileRole::Par2 { is_index: false, .. })).count()
+        self.files
+            .values()
+            .filter(|f| {
+                !matches!(
+                    f.role(),
+                    FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                )
+            })
+            .count()
     }
 
     /// Number of complete data files (excludes PAR2 recovery volumes).
     pub fn complete_data_file_count(&self) -> usize {
-        self.files.values().filter(|f| {
-            !matches!(f.role(), FileRole::Par2 { is_index: false, .. }) && f.is_complete()
-        }).count()
+        self.files
+            .values()
+            .filter(|f| {
+                !matches!(
+                    f.role(),
+                    FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                ) && f.is_complete()
+            })
+            .count()
     }
 
     /// Iterator over all files.

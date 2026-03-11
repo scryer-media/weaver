@@ -57,7 +57,7 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                             match attr.key.as_ref() {
                                 b"poster" => {
                                     poster = Some(
-                                        attr.unescape_value()
+                                        attr.decode_and_unescape_value(reader.decoder())
                                             .map_err(|e| NzbError::Xml(e.to_string()))?
                                             .into_owned(),
                                     );
@@ -74,7 +74,7 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                                 }
                                 b"subject" => {
                                     subject = Some(
-                                        attr.unescape_value()
+                                        attr.decode_and_unescape_value(reader.decoder())
                                             .map_err(|e| NzbError::Xml(e.to_string()))?
                                             .into_owned(),
                                     );
@@ -110,8 +110,7 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                             let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
                             match attr.key.as_ref() {
                                 b"bytes" => {
-                                    let val =
-                                        String::from_utf8_lossy(&attr.value).into_owned();
+                                    let val = String::from_utf8_lossy(&attr.value).into_owned();
                                     bytes = Some(val.parse::<u32>().map_err(|_| {
                                         NzbError::InvalidValue {
                                             element: "segment".into(),
@@ -121,8 +120,7 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                                     })?);
                                 }
                                 b"number" => {
-                                    let val =
-                                        String::from_utf8_lossy(&attr.value).into_owned();
+                                    let val = String::from_utf8_lossy(&attr.value).into_owned();
                                     number = Some(val.parse::<u32>().map_err(|_| {
                                         NzbError::InvalidValue {
                                             element: "segment".into(),
@@ -157,27 +155,29 @@ pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
                     }
                     b"group" if in_groups => {
                         if let Some(ref mut f) = current_file
-                            && !text_buf.is_empty() {
-                                f.groups.push(text_buf.clone());
-                            }
+                            && !text_buf.is_empty()
+                        {
+                            f.groups.push(text_buf.clone());
+                        }
                     }
                     b"groups" => in_groups = false,
                     b"segment" if in_segments => {
                         if let Some(seg) = current_segment.take()
-                            && let Some(ref mut f) = current_file {
-                                let number = seg.number.unwrap_or(0);
-                                let bytes = seg.bytes.unwrap_or(0);
-                                // Strip angle brackets from message-ID if present
-                                let message_id = text_buf
-                                    .trim_start_matches('<')
-                                    .trim_end_matches('>')
-                                    .to_owned();
-                                f.segments.push(NzbSegment {
-                                    number,
-                                    bytes,
-                                    message_id,
-                                });
-                            }
+                            && let Some(ref mut f) = current_file
+                        {
+                            let number = seg.number.unwrap_or(0);
+                            let bytes = seg.bytes.unwrap_or(0);
+                            // Strip angle brackets from message-ID if present
+                            let message_id = text_buf
+                                .trim_start_matches('<')
+                                .trim_end_matches('>')
+                                .to_owned();
+                            f.segments.push(NzbSegment {
+                                number,
+                                bytes,
+                                message_id,
+                            });
+                        }
                     }
                     b"segments" => in_segments = false,
                     b"file" => {
@@ -323,7 +323,10 @@ mod tests {
         assert_eq!(nzb.meta.title.as_deref(), Some("Some Title"));
         assert_eq!(nzb.meta.password.as_deref(), Some("secret"));
         assert_eq!(nzb.meta.tags.len(), 2);
-        assert_eq!(nzb.meta.tags[0], ("tag".to_string(), "category".to_string()));
+        assert_eq!(
+            nzb.meta.tags[0],
+            ("tag".to_string(), "category".to_string())
+        );
         assert_eq!(nzb.meta.tags[1], ("category".to_string(), "tv".to_string()));
     }
 
@@ -534,8 +537,10 @@ mod tests {
   </file>
 </nzb>"#;
         let err = parse_nzb(xml).unwrap_err();
-        assert!(matches!(err, NzbError::InvalidValue { ref element, ref attribute, .. }
-            if element == "file" && attribute == "date"));
+        assert!(
+            matches!(err, NzbError::InvalidValue { ref element, ref attribute, .. }
+            if element == "file" && attribute == "date")
+        );
     }
 
     // Additional: namespace prefix handling
@@ -577,7 +582,10 @@ mod tests {
   </file>
 </nzb>"#;
         let nzb = parse_nzb(xml).unwrap();
-        assert_eq!(nzb.files[0].subject, "Title & More - \"file.rar\" yEnc (1/1)");
+        assert_eq!(
+            nzb.files[0].subject,
+            "Title & More - \"file.rar\" yEnc (1/1)"
+        );
         assert_eq!(nzb.files[0].filename(), Some("file.rar"));
     }
 

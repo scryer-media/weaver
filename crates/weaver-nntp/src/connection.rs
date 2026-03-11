@@ -96,10 +96,9 @@ impl NntpConnection {
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
-        let result = tokio::time::timeout(connect_timeout, async {
-            Self::connect_inner(config).await
-        })
-        .await;
+        let result =
+            tokio::time::timeout(connect_timeout, async { Self::connect_inner(config).await })
+                .await;
 
         match result {
             Ok(inner) => inner,
@@ -346,10 +345,7 @@ impl NntpConnection {
     /// Used for commands like BODY, HEAD, ARTICLE that return multi-line data.
     /// If the server responds with 480 (authentication required) and we have
     /// stored credentials, transparently re-authenticates and retries once.
-    pub async fn send_multiline_command(
-        &mut self,
-        cmd: &Command,
-    ) -> Result<MultiLineResponse> {
+    pub async fn send_multiline_command(&mut self, cmd: &Command) -> Result<MultiLineResponse> {
         let initial = self.send_command(cmd).await?;
 
         // Handle mid-session re-auth (480) transparently.
@@ -371,7 +367,10 @@ impl NntpConnection {
                     )));
                 }
                 let data = self.read_multiline_data().await?;
-                return Ok(MultiLineResponse { initial: retry, data });
+                return Ok(MultiLineResponse {
+                    initial: retry,
+                    data,
+                });
             }
             return Err(NntpError::AuthenticationRequired);
         }
@@ -400,7 +399,9 @@ impl NntpConnection {
         if self.current_group.as_deref() == Some(group) {
             return Ok(());
         }
-        let response = self.send_command(&Command::Group(group.to_string())).await?;
+        let response = self
+            .send_command(&Command::Group(group.to_string()))
+            .await?;
 
         // Handle mid-session re-auth (480) transparently.
         if response.code.raw() == 480 {
@@ -408,7 +409,9 @@ impl NntpConnection {
                 debug!("server requested re-authentication (480), re-authenticating");
                 self.authenticate(&user, &pass).await?;
                 self.current_group = None;
-                let retry = self.send_command(&Command::Group(group.to_string())).await?;
+                let retry = self
+                    .send_command(&Command::Group(group.to_string()))
+                    .await?;
                 if retry.code.is_error() {
                     return Err(NntpError::from_status(retry.code, &retry.message));
                 }
@@ -557,11 +560,7 @@ impl NntpConnection {
     /// Returns the total number of bytes streamed (after dot-unstuffing).
     /// The callback receives each chunk of decoded data as it arrives,
     /// avoiding buffering the entire article in memory.
-    pub async fn stream_body_chunked<F>(
-        &mut self,
-        message_id: &str,
-        mut on_chunk: F,
-    ) -> Result<u64>
+    pub async fn stream_body_chunked<F>(&mut self, message_id: &str, mut on_chunk: F) -> Result<u64>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -598,8 +597,7 @@ impl NntpConnection {
                 }
 
                 let mut tmp = [0u8; 65536];
-                let transport =
-                    self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
+                let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
                 let n = transport.read(&mut tmp).await.map_err(|e| {
                     self.poisoned = true;
                     self.current_group = None;

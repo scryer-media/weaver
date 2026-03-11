@@ -1,16 +1,101 @@
 use super::*;
 
+fn move_path_with_copy_fallback(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+
+    if metadata.is_dir() {
+        if dst.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dst.display()),
+            ));
+        }
+
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            move_path_with_copy_fallback(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        std::fs::remove_dir(src)?;
+        return Ok(());
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    std::fs::remove_file(src)?;
+    Ok(())
+}
+
 impl Pipeline {
+    async fn compute_complete_destination(
+        &self,
+        job_id: JobId,
+        job_name: &str,
+        category: Option<&str>,
+    ) -> PathBuf {
+        let dir_name = job::sanitize_dirname(job_name);
+        let base_dest = {
+            let cfg = self.config.read().await;
+            let cat_dest = category.and_then(|cat| {
+                cfg.categories
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(cat))
+                    .and_then(|c| c.dest_dir.as_ref())
+                    .filter(|d| !d.is_empty())
+                    .map(PathBuf::from)
+            });
+
+            if let Some(custom_dest) = cat_dest {
+                custom_dest.join(&dir_name)
+            } else {
+                let mut dest = self.complete_dir.clone();
+                if let Some(cat) = category
+                    && !cat.is_empty()
+                {
+                    dest = dest.join(cat);
+                }
+                dest.join(&dir_name)
+            }
+        };
+
+        if !base_dest.exists() {
+            return base_dest;
+        }
+
+        let parent = base_dest
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let suffixed = parent.join(format!("{}.#{}", dir_name, job_id.0));
+        if !suffixed.exists() {
+            return suffixed;
+        }
+
+        let mut attempt = 1u32;
+        loop {
+            let candidate = parent.join(format!("{}.#{}.{}", dir_name, job_id.0, attempt));
+            if !candidate.exists() {
+                return candidate;
+            }
+            attempt += 1;
+        }
+    }
+
     /// Move extracted/completed files from the intermediate working directory
     /// to the complete directory, organized by category.
     ///
     /// Layout: `{complete_dir}/[{category}/]{job_name}/`
+    /// On collision, appends `.#<job_id>` (and a numeric suffix if needed).
     ///
     /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
-    pub(super) async fn move_to_complete(&mut self, job_id: JobId) {
+    pub(super) async fn move_to_complete(&mut self, job_id: JobId) -> Result<PathBuf, String> {
         let (working_dir, job_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
-                return;
+                return Err(format!("job {} not found for move_to_complete", job_id.0));
             };
             (
                 state.working_dir.clone(),
@@ -19,42 +104,32 @@ impl Pipeline {
             )
         };
 
-        // Build destination path: complete_dir/[category/]job_name/
-        let dir_name = job::sanitize_dirname(&job_name);
-        let mut dest = self.complete_dir.clone();
-        if let Some(ref cat) = category
-            && !cat.is_empty()
-        {
-            dest = dest.join(cat);
-        }
-        dest = dest.join(&dir_name);
+        let dest = self
+            .compute_complete_destination(job_id, &job_name, category.as_deref())
+            .await;
 
-        // Ensure destination exists.
-        if let Err(e) = tokio::fs::create_dir_all(&dest).await {
-            warn!(
-                job_id = job_id.0,
-                dest = %dest.display(),
-                error = %e,
-                "failed to create complete directory"
-            );
-            return;
-        }
-
-        // List files in the working directory and move them.
+        // List files in the working directory before creating the destination so
+        // a missing source directory doesn't leave behind an empty complete dir.
         let mut entries = match tokio::fs::read_dir(&working_dir).await {
             Ok(entries) => entries,
             Err(e) => {
-                warn!(
-                    job_id = job_id.0,
-                    dir = %working_dir.display(),
-                    error = %e,
-                    "failed to read working directory for move"
-                );
-                return;
+                return Err(format!(
+                    "failed to read working directory {} for move: {e}",
+                    working_dir.display()
+                ));
             }
         };
 
+        // Ensure destination exists.
+        if let Err(e) = tokio::fs::create_dir_all(&dest).await {
+            return Err(format!(
+                "failed to create complete directory {}: {e}",
+                dest.display()
+            ));
+        }
+
         let mut moved = 0u32;
+        let mut failures = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let src = entry.path();
             let file_name = entry.file_name();
@@ -65,27 +140,60 @@ impl Pipeline {
                 Ok(()) => {
                     moved += 1;
                 }
-                Err(_rename_err) => {
-                    // Cross-filesystem fallback: copy + delete.
-                    match tokio::fs::copy(&src, &dst).await {
-                        Ok(_) => {
-                            let _ = tokio::fs::remove_file(&src).await;
+                Err(rename_err) => {
+                    let src_fallback = src.clone();
+                    let dst_fallback = dst.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        move_path_with_copy_fallback(&src_fallback, &dst_fallback)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
                             moved += 1;
                         }
-                        Err(e) => {
-                            warn!(
-                                file = %file_name.to_string_lossy(),
-                                error = %e,
-                                "failed to move file to complete directory"
-                            );
+                        Ok(Err(copy_err)) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                copy_err
+                            ));
+                        }
+                        Err(join_err) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback task failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                join_err
+                            ));
                         }
                     }
                 }
             }
         }
 
+        if !failures.is_empty() {
+            for failure in &failures {
+                warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
+            }
+            return Err(format!(
+                "failed to move {} entr{} to complete directory",
+                failures.len(),
+                if failures.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+
         // Remove the now-empty intermediate directory.
-        let _ = tokio::fs::remove_dir(&working_dir).await;
+        if let Err(e) = tokio::fs::remove_dir(&working_dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                dir = %working_dir.display(),
+                error = %e,
+                "failed to remove intermediate directory after move"
+            );
+        }
 
         // Update working_dir to point to the complete path (for API reporting).
         if let Some(state) = self.jobs.get_mut(&job_id) {
@@ -98,6 +206,7 @@ impl Pipeline {
             dest = %dest.display(),
             "moved files to complete directory"
         );
+        Ok(dest)
     }
 
     fn apply_eager_delete_exclusions(
@@ -326,6 +435,19 @@ impl Pipeline {
             }
         }
 
+        // Don't finalize while concatenation is still pending.
+        if self
+            .pending_concat
+            .get(&job_id)
+            .is_some_and(|s| !s.is_empty())
+        {
+            debug!(
+                job_id = job_id.0,
+                "deferring completion — pending concatenation"
+            );
+            return;
+        }
+
         // All data files downloaded — transition out of Downloading so the UI
         // reflects post-processing (verify/extract/cleanup).
         {
@@ -375,6 +497,7 @@ impl Pipeline {
                     error!(error = %e, "db write failed for verifying status");
                 }
                 self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
+                info!(job_id = job_id.0, "par2 verification started");
                 let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
                     file_id: NzbFileId {
                         job_id,
@@ -699,6 +822,7 @@ impl Pipeline {
 
         // Drop retained Par2FileSet — no longer needed.
         self.par2_sets.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
 
         // Check extraction readiness.
         let readiness = {
@@ -708,13 +832,17 @@ impl Pipeline {
         match readiness {
             ExtractionReadiness::NotApplicable => {
                 // No archives — move to complete and finish.
-                self.move_to_complete(job_id).await;
+                if let Err(error) = self.move_to_complete(job_id).await {
+                    self.fail_job(job_id, error);
+                    return;
+                }
                 let state = self.jobs.get_mut(&job_id).unwrap();
                 if state.status == JobStatus::Extracting {
                     self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
                 }
                 state.status = JobStatus::Complete;
                 self.promoted_recovery_files.remove(&job_id);
+                self.recovery_block_counts.remove(&job_id);
                 self.eagerly_deleted.remove(&job_id);
                 self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
                 self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
@@ -875,7 +1003,17 @@ impl Pipeline {
                 }
 
                 // Move extracted files to complete directory.
-                self.move_to_complete(job_id).await;
+                let was_extracting = self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| state.status == JobStatus::Extracting);
+                if let Err(error) = self.move_to_complete(job_id).await {
+                    if was_extracting {
+                        self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    self.fail_job(job_id, error);
+                    return;
+                }
 
                 {
                     let state = self.jobs.get_mut(&job_id).unwrap();
@@ -886,6 +1024,7 @@ impl Pipeline {
                 self.streaming_volume_bases
                     .retain(|(jid, _, _), _| *jid != job_id);
                 self.promoted_recovery_files.remove(&job_id);
+                self.recovery_block_counts.remove(&job_id);
                 self.eagerly_deleted.remove(&job_id);
                 self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
                 self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
@@ -1032,11 +1171,13 @@ impl Pipeline {
                     );
                     match archive.extract_member_streaming(idx, &options, extraction_provider.as_ref(), &mut out_file) {
                         Ok(bytes_written) => {
+                            let unpacked = member.unpacked_size.unwrap_or(0);
+                            info!(job_id = job_id.0, member = %member.name, bytes_written, total_bytes = unpacked, "member extracted");
                             let _ = event_tx.send(PipelineEvent::ExtractionProgress {
                                 job_id,
                                 member: member.name.clone(),
                                 bytes_written,
-                                total_bytes: member.unpacked_size.unwrap_or(0),
+                                total_bytes: unpacked,
                             });
                             extracted_count += 1;
                         }
@@ -1152,6 +1293,13 @@ impl Pipeline {
                     let mut file = std::fs::File::create(&out_path)?;
                     let bytes_written = std::io::copy(reader, &mut file)?;
 
+                    tracing::info!(
+                        job_id = job_id.0,
+                        member = entry.name(),
+                        bytes_written,
+                        total_bytes = entry.size(),
+                        "member extracted"
+                    );
                     let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
                         job_id,
                         member: entry.name().to_string(),

@@ -41,28 +41,17 @@ pub enum ExtraRecord {
     /// BLAKE2sp hash of the file data.
     FileHash(FileHash),
     /// High-precision file time record (raw, not fully decoded).
-    FileTime {
-        flags: u64,
-    },
+    FileTime { flags: u64 },
     /// File version.
-    FileVersion {
-        version: u64,
-    },
+    FileVersion { version: u64 },
     /// Redirection (symlink, hardlink, junction).
-    Redirection {
-        redir_type: u64,
-        target: String,
-    },
+    Redirection { redir_type: u64, target: String },
     /// Unix owner info.
-    UnixOwner {
-        flags: u64,
-    },
+    UnixOwner { flags: u64 },
     /// Service data.
     ServiceData,
     /// Unknown record type.
-    Unknown {
-        record_type: u64,
-    },
+    Unknown { record_type: u64 },
 }
 
 /// Parse all extra area records from the raw extra area bytes.
@@ -101,9 +90,7 @@ pub fn parse_extra_area(data: &[u8]) -> RarResult<Vec<ExtraRecord>> {
                 },
             },
             record_type::SERVICE_DATA => ExtraRecord::ServiceData,
-            other => ExtraRecord::Unknown {
-                record_type: other,
-            },
+            other => ExtraRecord::Unknown { record_type: other },
         };
 
         records.push(record);
@@ -172,7 +159,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
             return ExtraRecord::Redirection {
                 redir_type: 0,
                 target: String::new(),
-            }
+            };
         }
     };
 
@@ -184,7 +171,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
             return ExtraRecord::Redirection {
                 redir_type,
                 target: String::new(),
-            }
+            };
         }
     };
     let rest = &rest[m..];
@@ -196,7 +183,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
             return ExtraRecord::Redirection {
                 redir_type,
                 target: String::new(),
-            }
+            };
         }
     };
     let name_start = k;
@@ -207,10 +194,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
         String::new()
     };
 
-    ExtraRecord::Redirection {
-        redir_type,
-        target,
-    }
+    ExtraRecord::Redirection { redir_type, target }
 }
 
 fn parse_file_encryption(data: &[u8]) -> ExtraRecord {
@@ -225,7 +209,7 @@ fn parse_file_encryption(data: &[u8]) -> ExtraRecord {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
-            }
+            };
         }
     };
     let rest = &data[n..];
@@ -241,7 +225,7 @@ fn parse_file_encryption(data: &[u8]) -> ExtraRecord {
                 salt: [0; 16],
                 iv: [0; 16],
                 check_data: None,
-            }
+            };
         }
     };
     let rest = &rest[n..];
@@ -364,9 +348,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(matches!(
             records[0],
-            ExtraRecord::Unknown {
-                record_type: 0xFF
-            }
+            ExtraRecord::Unknown { record_type: 0xFF }
         ));
     }
 }

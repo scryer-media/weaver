@@ -36,6 +36,8 @@ pub struct NntpPool {
     last_connect_failure: Vec<Arc<Mutex<Option<Instant>>>>,
     reconnect_delay: Duration,
     stale_check_age: Duration,
+    /// Priority group for each server (parallel to pools/configs).
+    groups: Vec<u32>,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -63,6 +65,8 @@ impl Default for PoolConfig {
 pub struct ServerPoolConfig {
     pub server: ServerConfig,
     pub max_connections: usize,
+    /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
+    pub group: u32,
 }
 
 impl NntpPool {
@@ -73,8 +77,10 @@ impl NntpPool {
         let mut configs = Vec::with_capacity(server_count);
         let mut semaphores = Vec::with_capacity(server_count);
         let mut last_connect_failure = Vec::with_capacity(server_count);
+        let mut groups = Vec::with_capacity(server_count);
 
         for spc in &config.servers {
+            groups.push(spc.group);
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(Mutex::new(ServerPool {
@@ -101,6 +107,7 @@ impl NntpPool {
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
             stale_check_age: config.stale_check_age,
+            groups,
         }
     }
 
@@ -146,8 +153,11 @@ impl NntpPool {
                         match c.ping().await {
                             Ok(()) => break c,
                             Err(e) => {
-                                trace!(server = idx, error = %e, "stale ping failed, discarding");
-                                // Discard and loop to try the next idle connection.
+                                trace!(server = idx, error = %e, "stale ping failed, draining all idle");
+                                // If one connection is dead, all are likely dead
+                                // (network interface change). Drain everything so
+                                // the loop falls through to create a fresh connection.
+                                self.drain_all_idle().await;
                                 continue;
                             }
                         }
@@ -217,21 +227,23 @@ impl NntpPool {
 
         let ordered = {
             let mut health = self.health.lock().await;
-            health.ordered_servers()
+            let mut servers = health.ordered_servers();
+            // Stable-sort by group so lower-group (primary) servers are tried first,
+            // while preserving health ordering within each group.
+            servers.sort_by_key(|&idx| self.groups[idx]);
+            servers
         };
 
-        // Try non-blocking acquire on each server in health order.
+        // Try non-blocking acquire on each server in group+health order.
         for idx in &ordered {
             match self.semaphores[*idx].clone().try_acquire_owned() {
-                Ok(permit) => {
-                    match self.acquire_with_permit(*idx, permit).await {
-                        Ok(conn) => return Ok(conn),
-                        Err(e) => {
-                            warn!(server = idx, error = %e, "failed to acquire from server, trying next");
-                            continue;
-                        }
+                Ok(permit) => match self.acquire_with_permit(*idx, permit).await {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        warn!(server = idx, error = %e, "failed to acquire from server, trying next");
+                        continue;
                     }
-                }
+                },
                 Err(_) => continue, // No permits available, try next server.
             }
         }
@@ -243,6 +255,26 @@ impl NntpPool {
         } else {
             // All servers disabled — fall back to server 0.
             self.acquire(ServerId(0)).await
+        }
+    }
+
+    /// Drain all idle connections across all servers.
+    ///
+    /// Called when a network change is suspected (e.g. I/O errors after an
+    /// interface switch). Connections are dropped without recording health
+    /// failures, since the servers themselves are fine.
+    pub async fn drain_all_idle(&self) {
+        let mut total = 0usize;
+        for pool in &self.pools {
+            let mut p = pool.lock().await;
+            total += p.idle.len();
+            p.idle.clear();
+        }
+        if total > 0 {
+            warn!(
+                count = total,
+                "drained all idle connections (suspected network change)"
+            );
         }
     }
 
@@ -263,6 +295,11 @@ impl NntpPool {
     /// The number of configured servers.
     pub fn server_count(&self) -> usize {
         self.pools.len()
+    }
+
+    /// Priority group for each server (indexed by pool position).
+    pub fn server_groups(&self) -> &[u32] {
+        &self.groups
     }
 
     /// Access the health tracker for observability.
@@ -373,6 +410,7 @@ mod tests {
                     ..Default::default()
                 },
                 max_connections: max_per_server,
+                group: 0,
             }],
             max_idle_age: Duration::from_secs(300),
             health_config: HealthConfig::default(),
@@ -397,6 +435,7 @@ mod tests {
                         ..Default::default()
                     },
                     max_connections: 10,
+                    group: 0,
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -404,6 +443,7 @@ mod tests {
                         ..Default::default()
                     },
                     max_connections: 5,
+                    group: 0,
                 },
             ],
             max_idle_age: Duration::from_secs(300),
@@ -442,6 +482,7 @@ mod tests {
                         ..Default::default()
                     },
                     max_connections: 5,
+                    group: 0,
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -449,6 +490,7 @@ mod tests {
                         ..Default::default()
                     },
                     max_connections: 5,
+                    group: 0,
                 },
             ],
             max_idle_age: Duration::from_secs(300),
@@ -477,6 +519,7 @@ mod tests {
                     ..Default::default()
                 },
                 max_connections: 2,
+                group: 0,
             }],
             max_idle_age: Duration::from_secs(300),
             health_config: HealthConfig::default(),
@@ -518,6 +561,7 @@ mod tests {
                     ..Default::default()
                 },
                 max_connections: 2,
+                group: 0,
             }],
             max_idle_age: Duration::from_secs(300),
             health_config: HealthConfig::default(),

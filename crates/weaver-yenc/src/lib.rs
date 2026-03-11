@@ -30,7 +30,9 @@ pub mod simd;
 pub mod types;
 
 // Convenience re-exports.
-pub use decode::{decode, decode_body, decode_chunk, decode_with_options, DecodeOptions, DecodeState};
+pub use decode::{
+    DecodeOptions, DecodeState, decode, decode_body, decode_chunk, decode_with_options,
+};
 pub use encode::{encode, encode_part};
 pub use error::YencError;
 pub use header::extract_filename_from_subject;

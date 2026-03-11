@@ -128,7 +128,10 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
     const MAX_HEADER_BODY: u64 = 16 * 1024 * 1024;
     if header_size > MAX_HEADER_BODY {
         return Err(RarError::CorruptArchive {
-            detail: format!("header size {} exceeds maximum {}", header_size, MAX_HEADER_BODY),
+            detail: format!(
+                "header size {} exceeds maximum {}",
+                header_size, MAX_HEADER_BODY
+            ),
         });
     }
 

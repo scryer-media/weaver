@@ -244,7 +244,10 @@ fn find_line_dot_line(buf: &[u8]) -> Option<(usize, usize, usize)> {
                         (nl_pos, 1) // \n.\n
                     };
                     return Some((pos, le_len, 2)); // dot_term = ".\n"
-                } else if buf[nl_pos + 2] == b'\r' && nl_pos + 3 < buf.len() && buf[nl_pos + 3] == b'\n' {
+                } else if buf[nl_pos + 2] == b'\r'
+                    && nl_pos + 3 < buf.len()
+                    && buf[nl_pos + 3] == b'\n'
+                {
                     let (pos, le_len) = if nl_pos > 0 && buf[nl_pos - 1] == b'\r' {
                         (nl_pos - 1, 2) // \r\n.\r\n
                     } else {

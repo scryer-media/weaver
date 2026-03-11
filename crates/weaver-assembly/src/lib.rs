@@ -255,16 +255,28 @@ mod tests {
         let mut job = JobAssembly::new(JobId(1));
 
         job.add_file(FileAssembly::new(
-            make_file_id(0), "movie.part01.rar".into(),
-            FileRole::RarVolume { volume_number: 0 }, vec![1000],
+            make_file_id(0),
+            "movie.part01.rar".into(),
+            FileRole::RarVolume { volume_number: 0 },
+            vec![1000],
         ));
         job.add_file(FileAssembly::new(
-            make_file_id(1), "movie.par2".into(),
-            FileRole::Par2 { is_index: true, recovery_block_count: 0 }, vec![500],
+            make_file_id(1),
+            "movie.par2".into(),
+            FileRole::Par2 {
+                is_index: true,
+                recovery_block_count: 0,
+            },
+            vec![500],
         ));
         job.add_file(FileAssembly::new(
-            make_file_id(2), "movie.vol00+01.par2".into(),
-            FileRole::Par2 { is_index: false, recovery_block_count: 1 }, vec![2000],
+            make_file_id(2),
+            "movie.vol00+01.par2".into(),
+            FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: 1,
+            },
+            vec![2000],
         ));
 
         assert_eq!(job.total_file_count(), 3);
@@ -272,7 +284,10 @@ mod tests {
         assert_eq!(job.complete_data_file_count(), 0);
 
         // Complete the RAR volume.
-        job.file_mut(make_file_id(0)).unwrap().commit_segment(0, 1000).unwrap();
+        job.file_mut(make_file_id(0))
+            .unwrap()
+            .commit_segment(0, 1000)
+            .unwrap();
         assert_eq!(job.complete_data_file_count(), 1);
     }
 
@@ -288,7 +303,10 @@ mod tests {
         );
         job.add_file(fa);
 
-        assert_eq!(job.extraction_readiness(), ExtractionReadiness::NotApplicable);
+        assert_eq!(
+            job.extraction_readiness(),
+            ExtractionReadiness::NotApplicable
+        );
     }
 
     #[test]
@@ -435,5 +453,68 @@ mod tests {
         job.mark_volume_complete("test", 2);
 
         assert_eq!(job.extraction_readiness(), ExtractionReadiness::Ready);
+    }
+
+    #[test]
+    fn deletable_volumes_wait_for_shared_boundary_member() {
+        let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
+            volume_map: [
+                ("show.part01.rar".into(), 0),
+                ("show.part02.rar".into(), 1),
+                ("show.part03.rar".into(), 2),
+                ("show.part04.rar".into(), 3),
+            ]
+            .into_iter()
+            .collect(),
+            complete_volumes: [0, 1, 2, 3].into_iter().collect(),
+            expected_volume_count: Some(4),
+            members: vec![
+                ArchiveMember {
+                    name: "E01.mkv".into(),
+                    first_volume: 0,
+                    last_volume: 1,
+                    unpacked_size: 1000,
+                },
+                ArchiveMember {
+                    name: "E02.mkv".into(),
+                    first_volume: 1,
+                    last_volume: 2,
+                    unpacked_size: 1000,
+                },
+                ArchiveMember {
+                    name: "E03.mkv".into(),
+                    first_volume: 2,
+                    last_volume: 3,
+                    unpacked_size: 1000,
+                },
+            ],
+        };
+
+        let extracted: HashSet<String> = ["E01.mkv".to_string()].into_iter().collect();
+        assert_eq!(
+            topo.deletable_volumes(&extracted),
+            [0u32].into_iter().collect()
+        );
+
+        let extracted: HashSet<String> = ["E01.mkv".to_string(), "E02.mkv".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            topo.deletable_volumes(&extracted),
+            [0u32, 1u32].into_iter().collect()
+        );
+
+        let extracted: HashSet<String> = [
+            "E01.mkv".to_string(),
+            "E02.mkv".to_string(),
+            "E03.mkv".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            topo.deletable_volumes(&extracted),
+            [0u32, 1u32, 2u32, 3u32].into_iter().collect()
+        );
     }
 }

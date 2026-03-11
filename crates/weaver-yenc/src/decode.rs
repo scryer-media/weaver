@@ -4,14 +4,12 @@ use crate::header;
 use crate::types::DecodeResult;
 
 /// Options for decoding.
-#[derive(Debug, Clone, Copy)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
     /// If true, perform NNTP dot-unstuffing (strip leading dot from lines
     /// starting with `..`). Default: false (assumes transport layer handled it).
     pub dot_unstuffing: bool,
 }
-
 
 /// Decode a complete yEnc article (headers + data + trailer) from `input` into `output`.
 ///
@@ -45,22 +43,24 @@ pub fn decode_with_options(
 
     // Validate decoded size against =yend size (like NZBGet's dsInvalidSize).
     if let Some(expected_size) = yend_size
-        && bytes_written as u64 != expected_size {
-            return Err(YencError::SizeMismatch {
-                expected: expected_size,
-                actual: bytes_written as u64,
-            });
-        }
+        && bytes_written as u64 != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: expected_size,
+            actual: bytes_written as u64,
+        });
+    }
 
     // For single-part articles, also validate =ybegin size vs =yend size.
     if parsed.metadata.part.is_none()
         && let Some(expected_size) = yend_size
-            && parsed.metadata.size != expected_size {
-                return Err(YencError::SizeMismatch {
-                    expected: parsed.metadata.size,
-                    actual: expected_size,
-                });
-            }
+        && parsed.metadata.size != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: parsed.metadata.size,
+            actual: expected_size,
+        });
+    }
 
     // For single-part articles, the `crc32` field in =yend is the part CRC.
     // For multi-part articles, `pcrc32` is the part CRC.
@@ -174,8 +174,7 @@ pub fn decode_body(
             _ => {
                 at_line_start = false;
                 // Use SIMD fast path for runs of normal bytes.
-                let (consumed, written) =
-                    crate::simd::decode_normal_run(input, src, output, dst);
+                let (consumed, written) = crate::simd::decode_normal_run(input, src, output, dst);
                 if written == 0 {
                     // Should not happen since byte is not a special char,
                     // but handle output buffer being full.
@@ -495,7 +494,7 @@ mod tests {
 
         // All should be escaped: =X format.
         // Verify escapes are present.
-        assert!(encoded.iter().any(|&b| b == b'='));
+        assert!(encoded.contains(&b'='));
 
         let mut output = vec![0u8; 64];
         let mut crc = Crc32::new();
@@ -665,20 +664,11 @@ mod tests {
 
         let mut article = Vec::new();
         article.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article.extend_from_slice(&encoded_data);
         article.extend_from_slice(
-            format!(
-                "\r\n=yend size={} crc32={}\r\n",
-                original.len(),
-                crc_hex
-            )
-            .as_bytes(),
+            format!("\r\n=yend size={} crc32={}\r\n", original.len(), crc_hex).as_bytes(),
         );
 
         let mut output = vec![0u8; 1024];
@@ -698,11 +688,7 @@ mod tests {
 
         let mut article = Vec::new();
         article.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article.extend_from_slice(&encoded_data);
         article.extend_from_slice(b"\r\n=yend size=9 crc32=DEADBEEF\r\n");
@@ -724,11 +710,7 @@ mod tests {
 
         let mut article = Vec::new();
         article.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article.extend_from_slice(&encoded_data);
         article.extend_from_slice(b"\r\n");
@@ -762,8 +744,7 @@ mod tests {
 
         let mut output = vec![0u8; 64];
         let mut crc = Crc32::new();
-        let n =
-            decode_body(&with_crlf, &mut output, &mut crc, DecodeOptions::default()).unwrap();
+        let n = decode_body(&with_crlf, &mut output, &mut crc, DecodeOptions::default()).unwrap();
         assert_eq!(n, 1);
         assert_eq!(output[0], 214);
     }
@@ -779,15 +760,25 @@ mod tests {
         // One-shot via decode_body.
         let mut out_body = vec![0u8; 64];
         let mut crc_body = Crc32::new();
-        let n_body =
-            decode_body(&encoded, &mut out_body, &mut crc_body, DecodeOptions::default()).unwrap();
+        let n_body = decode_body(
+            &encoded,
+            &mut out_body,
+            &mut crc_body,
+            DecodeOptions::default(),
+        )
+        .unwrap();
         let crc_body_val = crc_body.finalize();
 
         // One-shot via decode_chunk.
-        let mut out_chunk = vec![0u8; 64];
+        let mut out_chunk = [0u8; 64];
         let mut state = DecodeState::new();
-        let n_chunk =
-            decode_chunk(&encoded, &mut out_chunk, &mut state, DecodeOptions::default()).unwrap();
+        let n_chunk = decode_chunk(
+            &encoded,
+            &mut out_chunk,
+            &mut state,
+            DecodeOptions::default(),
+        )
+        .unwrap();
         let crc_chunk_val = state.finalize_crc();
 
         assert_eq!(n_body, n_chunk);
@@ -812,7 +803,10 @@ mod tests {
         let opts = DecodeOptions::default();
 
         let n1 = decode_chunk(chunk1, &mut output, &mut state, opts).unwrap();
-        assert!(state.escape_pending, "escape should be pending after chunk ending with =");
+        assert!(
+            state.escape_pending,
+            "escape should be pending after chunk ending with ="
+        );
 
         let n2 = decode_chunk(chunk2, &mut output[n1..], &mut state, opts).unwrap();
         assert!(!state.escape_pending);
@@ -839,11 +833,7 @@ mod tests {
         encoded.extend(yenc_encode_byte(b'D'));
 
         // Split right after CRLF.
-        let crlf_end = encoded
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap()
-            + 2;
+        let crlf_end = encoded.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
         let chunk1 = &encoded[..crlf_end];
         let chunk2 = &encoded[crlf_end..];
 
@@ -870,8 +860,13 @@ mod tests {
         // One-shot CRC.
         let mut out_body = vec![0u8; 512];
         let mut crc_body = Crc32::new();
-        let n_body =
-            decode_body(&encoded, &mut out_body, &mut crc_body, DecodeOptions::default()).unwrap();
+        let n_body = decode_body(
+            &encoded,
+            &mut out_body,
+            &mut crc_body,
+            DecodeOptions::default(),
+        )
+        .unwrap();
         let expected_crc = crc_body.finalize();
 
         // Chunked decode (chunks of 7 bytes for odd splitting).
@@ -899,8 +894,13 @@ mod tests {
         // One-shot.
         let mut out_body = vec![0u8; 64];
         let mut crc_body = Crc32::new();
-        let n_body =
-            decode_body(&encoded, &mut out_body, &mut crc_body, DecodeOptions::default()).unwrap();
+        let n_body = decode_body(
+            &encoded,
+            &mut out_body,
+            &mut crc_body,
+            DecodeOptions::default(),
+        )
+        .unwrap();
         let expected_crc = crc_body.finalize();
 
         // Single-byte chunks.
@@ -932,11 +932,7 @@ mod tests {
         encoded.extend_from_slice(b"..");
         encoded.extend(yenc_encode_byte(b'B'));
 
-        let crlf_end = encoded
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .unwrap()
-            + 2;
+        let crlf_end = encoded.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
         let chunk1 = &encoded[..crlf_end];
         let chunk2 = &encoded[crlf_end..];
 
@@ -970,11 +966,7 @@ mod tests {
 
         let mut article = Vec::new();
         article.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article.extend_from_slice(&encoded_data);
         // Lie about size in =yend.
@@ -982,7 +974,13 @@ mod tests {
 
         let mut output = vec![0u8; 1024];
         let result = decode(&article, &mut output);
-        assert!(matches!(result, Err(YencError::SizeMismatch { expected: 999, actual: 5 })));
+        assert!(matches!(
+            result,
+            Err(YencError::SizeMismatch {
+                expected: 999,
+                actual: 5
+            })
+        ));
     }
 
     #[test]
@@ -994,14 +992,18 @@ mod tests {
         let mut article = Vec::new();
         article.extend_from_slice(b"=ybegin line=128 size=100 name=test.bin\r\n");
         article.extend_from_slice(&encoded_data);
-        article.extend_from_slice(
-            format!("\r\n=yend size={}\r\n", original.len()).as_bytes(),
-        );
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
 
         let mut output = vec![0u8; 1024];
         let result = decode(&article, &mut output);
         // =ybegin size=100 != =yend size=5
-        assert!(matches!(result, Err(YencError::SizeMismatch { expected: 100, actual: 5 })));
+        assert!(matches!(
+            result,
+            Err(YencError::SizeMismatch {
+                expected: 100,
+                actual: 5
+            })
+        ));
     }
 
     #[test]
@@ -1012,16 +1014,10 @@ mod tests {
         // With trailer.
         let mut article = Vec::new();
         article.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article.extend_from_slice(&encoded_data);
-        article.extend_from_slice(
-            format!("\r\n=yend size={}\r\n", original.len()).as_bytes(),
-        );
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
 
         let mut output = vec![0u8; 1024];
         let result = decode(&article, &mut output).unwrap();
@@ -1030,11 +1026,7 @@ mod tests {
         // Without trailer.
         let mut article2 = Vec::new();
         article2.extend_from_slice(
-            format!(
-                "=ybegin line=128 size={} name=test.bin\r\n",
-                original.len()
-            )
-            .as_bytes(),
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).as_bytes(),
         );
         article2.extend_from_slice(&encoded_data);
 
@@ -1048,7 +1040,9 @@ mod tests {
     #[test]
     fn decode_chunk_dot_pending_terminator() {
         // Chunk1 ends with \r\n followed by '.', chunk2 starts with \r\n (terminator).
-        let opts = DecodeOptions { dot_unstuffing: true };
+        let opts = DecodeOptions {
+            dot_unstuffing: true,
+        };
         let mut output = vec![0u8; 64];
         let mut state = DecodeState::new();
 
@@ -1070,7 +1064,9 @@ mod tests {
     #[test]
     fn decode_chunk_dot_pending_stuffed() {
         // Chunk1 ends with \r\n + '.', chunk2 starts with '.' (dot-stuffed).
-        let opts = DecodeOptions { dot_unstuffing: true };
+        let opts = DecodeOptions {
+            dot_unstuffing: true,
+        };
         let mut output = vec![0u8; 64];
         let mut state = DecodeState::new();
 
@@ -1100,7 +1096,9 @@ mod tests {
         // Chunk1 ends with \r\n + '.', chunk2 starts with a normal byte.
         // The dot was actual encoded data (shouldn't normally happen in NNTP,
         // but we handle it gracefully).
-        let opts = DecodeOptions { dot_unstuffing: true };
+        let opts = DecodeOptions {
+            dot_unstuffing: true,
+        };
         let mut output = vec![0u8; 64];
         let mut state = DecodeState::new();
 

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
@@ -86,9 +86,15 @@ impl BufferPoolConfig {
         } else if available_mb < 8192 {
             // 4–8 GB: standard (~144 MB)
             (192, 24, 6)
-        } else {
-            // 8 GB+: full default (~192 MB)
+        } else if available_mb < 16384 {
+            // 8–16 GB: current full profile (~192 MB)
             (256, 32, 8)
+        } else if available_mb < 32768 {
+            // 16–32 GB: modest bump once the pool is on the hot path (~288 MB)
+            (384, 48, 12)
+        } else {
+            // 32 GB+: cap the default pool below 384 MB.
+            (512, 64, 16)
         };
 
         Self {

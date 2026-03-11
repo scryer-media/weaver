@@ -4,10 +4,10 @@ use std::time::Duration;
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
 use crate::error::NntpError;
 
@@ -82,7 +82,10 @@ pub fn default_tls_config() -> Arc<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let config = ClientConfig::builder()
+    let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 

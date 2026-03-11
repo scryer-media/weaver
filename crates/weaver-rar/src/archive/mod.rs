@@ -16,7 +16,6 @@ use crate::decompress::lz::LzDecoder;
 use crate::decompress::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
 use crate::extract::{self, ExtractOptions};
-use crate::volume::VolumeProvider;
 use crate::header;
 use crate::header::file::FileHeader;
 use crate::limits::Limits;
@@ -25,6 +24,7 @@ use crate::signature;
 use crate::types::{
     ArchiveFormat, ArchiveMetadata, CompressionMethod, FileHash, MemberInfo, VolumeSpan,
 };
+use crate::volume::VolumeProvider;
 use crate::volume::VolumeSet;
 
 /// File-level encryption parameters extracted from the file's extra records.
@@ -165,7 +165,8 @@ impl RarArchive {
             }
             // Check that we have readers for all segments' volumes.
             entry.segments.iter().all(|seg| {
-                self.volumes.get(seg.volume_index)
+                self.volumes
+                    .get(seg.volume_index)
                     .is_some_and(|v| v.is_some())
             })
         } else {
@@ -179,9 +180,13 @@ impl RarArchive {
     /// expected volume if the member still has continuation segments pending.
     pub fn missing_volumes(&self, name: &str) -> Vec<usize> {
         if let Some(entry) = self.members.iter().find(|m| m.file_header.name == name) {
-            let mut missing: Vec<usize> = entry.segments.iter()
+            let mut missing: Vec<usize> = entry
+                .segments
+                .iter()
                 .filter(|seg| {
-                    !self.volumes.get(seg.volume_index)
+                    !self
+                        .volumes
+                        .get(seg.volume_index)
                         .is_some_and(|v| v.is_some())
                 })
                 .map(|seg| seg.volume_index)
@@ -190,7 +195,9 @@ impl RarArchive {
             // If the member is still split (awaiting more segments),
             // report the next volume after the last known segment.
             if entry.file_header.split_after {
-                let next_vol = entry.segments.last()
+                let next_vol = entry
+                    .segments
+                    .last()
                     .map(|s| s.volume_index + 1)
                     .unwrap_or(1);
                 if !missing.contains(&next_vol) {
@@ -232,9 +239,7 @@ impl RarArchive {
 
     /// Find a member by name, returning its index.
     pub fn find_member(&self, name: &str) -> Option<usize> {
-        self.members
-            .iter()
-            .position(|m| m.file_header.name == name)
+        self.members.iter().position(|m| m.file_header.name == name)
     }
 
     /// Find a member by sanitized name, returning its index into `self.members`.
@@ -250,13 +255,19 @@ impl RarArchive {
 
     /// Get member info by index.
     pub fn member_info(&self, index: usize) -> Option<MemberInfo> {
-        self.members.get(index).map(|entry| self.make_member_info(entry))
+        self.members
+            .get(index)
+            .map(|entry| self.make_member_info(entry))
     }
 
     pub(super) fn make_member_info(&self, entry: &MemberEntry) -> MemberInfo {
         let fh = &entry.file_header;
         let first_vol = entry.segments.first().map(|s| s.volume_index).unwrap_or(0);
-        let last_vol = entry.segments.last().map(|s| s.volume_index).unwrap_or(first_vol);
+        let last_vol = entry
+            .segments
+            .last()
+            .map(|s| s.volume_index)
+            .unwrap_or(first_vol);
         let total_compressed: u64 = entry.segments.iter().map(|s| s.data_size).sum();
 
         let (is_symlink, is_hardlink, link_target) = match &entry.redirection {
@@ -331,7 +342,9 @@ impl RarArchive {
 
     /// Get the compression method for a member by index.
     pub fn member_compression(&self, index: usize) -> Option<CompressionMethod> {
-        self.members.get(index).map(|e| e.file_header.compression.method)
+        self.members
+            .get(index)
+            .map(|e| e.file_header.compression.method)
     }
 
     /// Whether a member is encrypted.

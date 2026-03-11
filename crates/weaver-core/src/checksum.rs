@@ -209,8 +209,8 @@ mod tests {
         assert_eq!(
             empty_md5,
             [
-                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec,
-                0xf8, 0x42, 0x7e
+                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+                0x42, 0x7e
             ]
         );
     }
@@ -228,7 +228,10 @@ mod tests {
                 state.update(chunk);
             }
             let (crc, md5_hash) = state.finalize(None);
-            assert_eq!(crc, expected_crc, "CRC32 mismatch for chunk_size={chunk_size}");
+            assert_eq!(
+                crc, expected_crc,
+                "CRC32 mismatch for chunk_size={chunk_size}"
+            );
             assert_eq!(
                 md5_hash, expected_md5,
                 "MD5 mismatch for chunk_size={chunk_size}"

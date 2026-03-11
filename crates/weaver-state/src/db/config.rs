@@ -1,5 +1,5 @@
 use weaver_core::config::{
-    BufferPoolOverrides, Config, RetryOverrides, ServerConfig, TunerOverrides,
+    BufferPoolOverrides, CategoryConfig, Config, RetryOverrides, ServerConfig, TunerOverrides,
 };
 
 use crate::StateError;
@@ -14,9 +14,7 @@ impl Database {
         let mut stmt = conn
             .prepare_cached("SELECT value FROM settings WHERE key = ?1")
             .map_err(|e| StateError::Database(e.to_string()))?;
-        let result = stmt
-            .query_row([key], |row| row.get(0))
-            .ok();
+        let result = stmt.query_row([key], |row| row.get(0)).ok();
         Ok(result)
     }
 
@@ -31,6 +29,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM settings WHERE key = ?1", [key])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Load a full `Config` from the settings and servers tables.
     pub fn load_config(&self) -> Result<Config, StateError> {
         let conn = self.conn();
@@ -40,20 +45,20 @@ impl Database {
             .prepare_cached("SELECT key, value FROM settings")
             .map_err(|e| StateError::Database(e.to_string()))?;
         let settings: std::collections::HashMap<String, String> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| StateError::Database(e.to_string()))?
             .filter_map(|r| r.ok())
             .collect();
 
-        // Load servers.
+        // Load servers and categories.
         drop(stmt);
         drop(conn);
         let servers = self.list_servers()?;
+        let categories = self.list_categories()?;
 
-        let data_dir = settings
-            .get("data_dir")
-            .cloned()
-            .unwrap_or_default();
+        let data_dir = settings.get("data_dir").cloned().unwrap_or_default();
         // Backward compat: if old "output_dir" exists but "intermediate_dir" doesn't, use it.
         let intermediate_dir = settings
             .get("intermediate_dir")
@@ -68,9 +73,15 @@ impl Database {
             .and_then(|v| v.parse().ok());
 
         let buffer_pool = {
-            let small = settings.get("buffer_pool.small_count").and_then(|v| v.parse().ok());
-            let medium = settings.get("buffer_pool.medium_count").and_then(|v| v.parse().ok());
-            let large = settings.get("buffer_pool.large_count").and_then(|v| v.parse().ok());
+            let small = settings
+                .get("buffer_pool.small_count")
+                .and_then(|v| v.parse().ok());
+            let medium = settings
+                .get("buffer_pool.medium_count")
+                .and_then(|v| v.parse().ok());
+            let large = settings
+                .get("buffer_pool.large_count")
+                .and_then(|v| v.parse().ok());
             if small.is_some() || medium.is_some() || large.is_some() {
                 Some(BufferPoolOverrides {
                     small_count: small,
@@ -83,9 +94,15 @@ impl Database {
         };
 
         let tuner = {
-            let max_dl = settings.get("tuner.max_concurrent_downloads").and_then(|v| v.parse().ok());
-            let max_dq = settings.get("tuner.max_decode_queue").and_then(|v| v.parse().ok());
-            let decode_threads = settings.get("tuner.decode_thread_count").and_then(|v| v.parse().ok());
+            let max_dl = settings
+                .get("tuner.max_concurrent_downloads")
+                .and_then(|v| v.parse().ok());
+            let max_dq = settings
+                .get("tuner.max_decode_queue")
+                .and_then(|v| v.parse().ok());
+            let decode_threads = settings
+                .get("tuner.decode_thread_count")
+                .and_then(|v| v.parse().ok());
             if max_dl.is_some() || max_dq.is_some() || decode_threads.is_some() {
                 Some(TunerOverrides {
                     max_concurrent_downloads: max_dl,
@@ -98,9 +115,15 @@ impl Database {
         };
 
         let retry = {
-            let max_retries = settings.get("retry.max_retries").and_then(|v| v.parse().ok());
-            let base_delay = settings.get("retry.base_delay_secs").and_then(|v| v.parse().ok());
-            let multiplier = settings.get("retry.multiplier").and_then(|v| v.parse().ok());
+            let max_retries = settings
+                .get("retry.max_retries")
+                .and_then(|v| v.parse().ok());
+            let base_delay = settings
+                .get("retry.base_delay_secs")
+                .and_then(|v| v.parse().ok());
+            let multiplier = settings
+                .get("retry.multiplier")
+                .and_then(|v| v.parse().ok());
             if max_retries.is_some() || base_delay.is_some() || multiplier.is_some() {
                 Some(RetryOverrides {
                     max_retries,
@@ -119,6 +142,7 @@ impl Database {
             buffer_pool,
             tuner,
             servers,
+            categories,
             retry,
             max_download_speed,
             cleanup_after_extract,
@@ -188,6 +212,16 @@ impl Database {
             self.insert_server(server)?;
         }
 
+        // Sync categories: delete all, re-insert.
+        {
+            let conn = self.conn();
+            conn.execute("DELETE FROM categories", [])
+                .map_err(|e| StateError::Database(e.to_string()))?;
+        }
+        for cat in &config.categories {
+            self.insert_category(cat)?;
+        }
+
         Ok(())
     }
 
@@ -197,8 +231,8 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining
-                 FROM servers ORDER BY id",
+                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority
+                 FROM servers ORDER BY priority, id",
             )
             .map_err(|e| StateError::Database(e.to_string()))?;
 
@@ -214,6 +248,7 @@ impl Database {
                     connections: row.get(6)?,
                     active: row.get::<_, bool>(7)?,
                     supports_pipelining: row.get::<_, bool>(8)?,
+                    priority: row.get::<_, u32>(9)?,
                 })
             })
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -228,8 +263,8 @@ impl Database {
     pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 server.id,
                 server.host,
@@ -240,6 +275,7 @@ impl Database {
                 server.connections,
                 server.active,
                 server.supports_pipelining,
+                server.priority,
             ],
         )
         .map_err(|e| StateError::Database(e.to_string()))?;
@@ -250,7 +286,7 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "UPDATE servers SET host=?2, port=?3, tls=?4, username=?5, password=?6,
-             connections=?7, active=?8, supports_pipelining=?9
+             connections=?7, active=?8, supports_pipelining=?9, priority=?10
              WHERE id=?1",
             rusqlite::params![
                 server.id,
@@ -262,6 +298,7 @@ impl Database {
                 server.connections,
                 server.active,
                 server.supports_pipelining,
+                server.priority,
             ],
         )
         .map_err(|e| StateError::Database(e.to_string()))?;
@@ -280,6 +317,68 @@ impl Database {
         let conn = self.conn();
         let max: Option<u32> = conn
             .query_row("SELECT MAX(id) FROM servers", [], |row| row.get(0))
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(max.unwrap_or(0) + 1)
+    }
+
+    // ── Categories ────────────────────────────────────────────────────
+
+    pub fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached("SELECT id, name, dest_dir, aliases FROM categories ORDER BY name")
+            .map_err(|e| StateError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CategoryConfig {
+                    id: row.get::<_, u32>(0)?,
+                    name: row.get(1)?,
+                    dest_dir: row.get(2)?,
+                    aliases: row.get::<_, String>(3)?,
+                })
+            })
+            .map_err(|e| StateError::Database(e.to_string()))?;
+
+        let mut categories = Vec::new();
+        for row in rows {
+            categories.push(row.map_err(|e| StateError::Database(e.to_string()))?);
+        }
+        Ok(categories)
+    }
+
+    pub fn insert_category(&self, cat: &CategoryConfig) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO categories (id, name, dest_dir, aliases) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![cat.id, cat.name, cat.dest_dir, cat.aliases],
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn update_category(&self, cat: &CategoryConfig) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE categories SET name=?2, dest_dir=?3, aliases=?4 WHERE id=?1",
+            rusqlite::params![cat.id, cat.name, cat.dest_dir, cat.aliases],
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn delete_category(&self, id: u32) -> Result<bool, StateError> {
+        let conn = self.conn();
+        let changed = conn
+            .execute("DELETE FROM categories WHERE id = ?1", [id])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
+    pub fn next_category_id(&self) -> Result<u32, StateError> {
+        let conn = self.conn();
+        let max: Option<u32> = conn
+            .query_row("SELECT MAX(id) FROM categories", [], |row| row.get(0))
             .map_err(|e| StateError::Database(e.to_string()))?;
         Ok(max.unwrap_or(0) + 1)
     }
@@ -319,6 +418,7 @@ mod tests {
             connections: 10,
             active: true,
             supports_pipelining: false,
+            priority: 0,
         };
 
         db.insert_server(&server).unwrap();
@@ -364,6 +464,13 @@ mod tests {
                 connections: 5,
                 active: true,
                 supports_pipelining: true,
+                priority: 0,
+            }],
+            categories: vec![CategoryConfig {
+                id: 1,
+                name: "Movies".to_string(),
+                dest_dir: Some("/media/movies".to_string()),
+                aliases: "movie*, film*".to_string(),
             }],
             retry: None,
             max_download_speed: Some(1_000_000),
@@ -375,12 +482,56 @@ mod tests {
         let loaded = db.load_config().unwrap();
 
         assert_eq!(loaded.data_dir, "/tmp/weaver");
-        assert_eq!(loaded.intermediate_dir, Some("/tmp/intermediate".to_string()));
+        assert_eq!(
+            loaded.intermediate_dir,
+            Some("/tmp/intermediate".to_string())
+        );
         assert_eq!(loaded.complete_dir, Some("/tmp/complete".to_string()));
         assert_eq!(loaded.max_download_speed, Some(1_000_000));
         assert_eq!(loaded.cleanup_after_extract, Some(false));
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].host, "news.test.com");
         assert!(loaded.servers[0].supports_pipelining);
+        assert_eq!(loaded.categories.len(), 1);
+        assert_eq!(loaded.categories[0].name, "Movies");
+        assert_eq!(
+            loaded.categories[0].dest_dir,
+            Some("/media/movies".to_string())
+        );
+        assert_eq!(loaded.categories[0].aliases, "movie*, film*");
+    }
+
+    #[test]
+    fn category_crud() {
+        let db = Database::open_in_memory().unwrap();
+
+        let cat = CategoryConfig {
+            id: 1,
+            name: "TV".to_string(),
+            dest_dir: None,
+            aliases: "TV*, television".to_string(),
+        };
+
+        db.insert_category(&cat).unwrap();
+        let cats = db.list_categories().unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].name, "TV");
+        assert_eq!(cats[0].dest_dir, None);
+
+        let mut updated = cat.clone();
+        updated.dest_dir = Some("/media/tv".to_string());
+        db.update_category(&updated).unwrap();
+        let cats = db.list_categories().unwrap();
+        assert_eq!(cats[0].dest_dir, Some("/media/tv".to_string()));
+
+        assert!(db.delete_category(1).unwrap());
+        assert!(!db.delete_category(1).unwrap());
+        assert!(db.list_categories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn next_category_id_empty() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.next_category_id().unwrap(), 1);
     }
 }
