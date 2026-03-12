@@ -102,7 +102,11 @@ pub(crate) fn build_job_timeline(
         TimelineStage::Downloading,
         close_open_job_spans(download_spans, ended_at, outcome, now),
     );
-    push_lane(&mut lanes, TimelineStage::Paused, pause_spans);
+    push_lane(
+        &mut lanes,
+        TimelineStage::Paused,
+        close_open_job_spans(pause_spans, ended_at, outcome, now),
+    );
     push_lane(
         &mut lanes,
         TimelineStage::Verifying,
@@ -236,8 +240,9 @@ fn collect_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
 
 fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
     let mut spans = Vec::new();
-    let mut pause_started: Option<f64> = None;
+    let mut open: Option<usize> = None;
     let mut download_active = false;
+    let mut pause_boundary_at: Option<f64> = None;
 
     for event in events {
         let Ok(kind) = event.kind.parse::<EventKind>() else {
@@ -248,42 +253,42 @@ fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
         match kind {
             EventKind::DownloadStarted => {
                 download_active = true;
+                pause_boundary_at = None;
             }
             EventKind::DownloadFinished
             | EventKind::JobFailed
             | EventKind::JobCompleted
             | EventKind::JobCreated => {
-                download_active = false;
-                if let Some(start) = pause_started.take()
-                    && at > start
-                {
-                    spans.push(JobTimelineSpan {
-                        started_at: start,
-                        ended_at: Some(at),
-                        state: TimelineSpanState::Complete,
-                        label: Some("Paused".to_string()),
-                    });
+                if kind == EventKind::DownloadFinished && download_active {
+                    pause_boundary_at = Some(at);
+                } else {
+                    pause_boundary_at = None;
                 }
+                download_active = false;
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
             }
             EventKind::JobPaused => {
-                if download_active {
-                    pause_started = Some(at);
-                    download_active = false;
-                }
-            }
-            EventKind::JobResumed => {
-                if let Some(start) = pause_started.take()
-                    && at > start
-                {
+                if open.is_none() && (download_active || pause_boundary_at == Some(at)) {
                     spans.push(JobTimelineSpan {
-                        started_at: start,
-                        ended_at: Some(at),
-                        state: TimelineSpanState::Complete,
+                        started_at: at,
+                        ended_at: None,
+                        state: TimelineSpanState::Running,
                         label: Some("Paused".to_string()),
                     });
+                    open = Some(spans.len() - 1);
+                }
+                download_active = false;
+                pause_boundary_at = None;
+            }
+            EventKind::JobResumed => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                pause_boundary_at = None;
+            }
+            _ => {
+                if pause_boundary_at.is_some() && pause_boundary_at != Some(at) {
+                    pause_boundary_at = None;
                 }
             }
-            _ => {}
         }
     }
 
@@ -870,6 +875,57 @@ mod tests {
                 .map(|lane| lane.spans.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn tracks_pause_when_pause_follows_download_finish_at_same_timestamp() {
+        let timeline = build_job_timeline(
+            &job(JobStatus::Complete),
+            Some(&history(1, 12)),
+            &[
+                event("JobCreated", 1_000, None, ""),
+                event("DownloadStarted", 2_000, None, ""),
+                event("DownloadFinished", 5_000, None, ""),
+                event("JobPaused", 5_000, None, "paused"),
+                event("JobResumed", 9_000, None, "resumed"),
+                event("DownloadStarted", 9_000, None, ""),
+                event("JobCompleted", 12_000, None, "done"),
+            ],
+        );
+
+        let paused_lane = timeline
+            .lanes
+            .iter()
+            .find(|lane| lane.stage == TimelineStage::Paused)
+            .expect("paused lane");
+        assert_eq!(paused_lane.spans.len(), 1);
+        assert_eq!(paused_lane.spans[0].started_at, 5_000.0);
+        assert_eq!(paused_lane.spans[0].ended_at, Some(9_000.0));
+        assert_eq!(paused_lane.spans[0].label.as_deref(), Some("Paused"));
+    }
+
+    #[test]
+    fn keeps_pause_lane_open_for_currently_paused_job() {
+        let timeline = build_job_timeline(
+            &job(JobStatus::Paused),
+            None,
+            &[
+                event("JobCreated", 1_000, None, ""),
+                event("DownloadStarted", 2_000, None, ""),
+                event("DownloadFinished", 4_000, None, ""),
+                event("JobPaused", 4_000, None, "paused"),
+            ],
+        );
+
+        let paused_lane = timeline
+            .lanes
+            .iter()
+            .find(|lane| lane.stage == TimelineStage::Paused)
+            .expect("paused lane");
+        assert_eq!(paused_lane.spans.len(), 1);
+        assert_eq!(paused_lane.spans[0].started_at, 4_000.0);
+        assert_eq!(paused_lane.spans[0].ended_at, None);
+        assert_eq!(paused_lane.spans[0].state, TimelineSpanState::Running);
     }
 
     #[test]

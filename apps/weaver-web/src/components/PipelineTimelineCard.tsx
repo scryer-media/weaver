@@ -75,6 +75,7 @@ type PlotSpan = {
 type PlotRow = {
   key: string;
   title: string;
+  displayTitle?: string | null;
   tone: "stage" | "member";
   details: DetailItem[];
   badge?: {
@@ -297,7 +298,10 @@ function DetailList({ items }: { items: DetailItem[] }) {
   return (
     <div className="grid gap-1.5">
       {items.map((item) => (
-        <div key={`${item.label}:${item.value}`} className="grid grid-cols-[5.5rem_1fr] gap-2">
+        <div
+          key={`${item.label}:${item.value}`}
+          className="grid grid-cols-[7rem_minmax(0,1fr)] gap-3"
+        >
           <div className="text-[11px] uppercase tracking-[0.12em] text-muted-foreground/80">
             {item.label}
           </div>
@@ -331,25 +335,32 @@ function TimelineSpanPopover({
         <button
           type="button"
           className={cn(
-            "absolute top-1/2 h-4 -translate-y-1/2 border border-background/50 shadow-sm transition-opacity hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60",
-            span.colorClass,
-            span.state === "FAILED" && "bg-destructive/85",
-            span.dashed && "border-dashed",
+            "absolute top-1/2 z-10 h-4 -translate-y-1/2 transition-opacity hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 before:absolute before:-inset-x-2 before:-inset-y-1 before:content-['']",
           )}
           style={spanStyle(span.startedAt, span.endedAt, axisStart, axisEnd)}
           aria-label={`${row.title}: ${span.title}`}
-          onMouseEnter={handlePointerEnter}
-          onMouseLeave={handlePointerLeave}
+          onPointerEnter={handlePointerEnter}
+          onPointerLeave={handlePointerLeave}
           onFocus={handlePointerEnter}
           onBlur={handlePointerLeave}
           onClick={() => setOpen((current) => !current)}
-        />
+        >
+          <span
+            className={cn(
+              "absolute inset-0 rounded-[3px] border border-background/50 shadow-sm",
+              span.colorClass,
+              span.state === "FAILED" && "bg-destructive/85",
+              span.dashed && "border-dashed",
+            )}
+          />
+        </button>
       </PopoverTrigger>
       <PopoverContent
         side="top"
-        className="space-y-3"
-        onMouseEnter={handlePointerEnter}
-        onMouseLeave={handlePointerLeave}
+        sideOffset={4}
+        className="w-[36rem] max-w-[calc(100vw-2rem)] space-y-3"
+        onPointerEnter={handlePointerEnter}
+        onPointerLeave={handlePointerLeave}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="space-y-1">
@@ -410,9 +421,9 @@ function SharedPlot({
 
   return (
     <div className="overflow-hidden rounded-2xl border border-border/60 bg-background/20">
-      <div className="grid grid-cols-1 md:grid-cols-[minmax(13rem,18rem)_1fr]">
-        <div className="hidden border-b border-border/50 px-4 py-2 md:block" />
-        <div className="border-b border-border/50 px-4 py-2">
+      <div className="grid grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_1fr]">
+        <div className="hidden border-b border-border/50 px-3 py-1.5 md:block" />
+        <div className="border-b border-border/50 px-3 py-1.5">
           <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80">
             {ticks.map((tick) => (
               <span key={tick.ratio}>{tick.label}</span>
@@ -422,22 +433,28 @@ function SharedPlot({
 
         {rows.map((row, index) => {
           const isLast = index === rows.length - 1;
+          const rowPaddingClass = row.tone === "stage" ? "px-3 py-2.5" : "px-3 py-1.5";
+          const rowTitleClass =
+            row.tone === "stage"
+              ? "font-medium text-foreground"
+              : "text-[13px] leading-4 text-muted-foreground";
+          const plotHeightClass = row.tone === "stage" ? "h-7" : "h-6";
 
           return (
             <div key={row.key} className="contents">
-              <div className={cn("px-4 py-3", !isLast && "border-b border-border/35")}>
+              <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
                 <div
                   className={cn(
-                    "min-w-0 break-words whitespace-normal text-sm leading-5",
-                    row.tone === "stage" ? "font-medium text-foreground" : "text-muted-foreground",
+                    "min-w-0 break-words whitespace-normal text-sm leading-4",
+                    rowTitleClass,
                   )}
                 >
-                  {row.title}
+                  {row.displayTitle ?? row.title}
                 </div>
               </div>
 
-              <div className={cn("px-4 py-3", !isLast && "border-b border-border/35")}>
-                <div className="relative h-8">
+              <div className={cn(rowPaddingClass, !isLast && "border-b border-border/35")}>
+                <div className={cn("relative", plotHeightClass)}>
                   <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border/20" />
                   {ticks.slice(1, -1).map((tick) => (
                     <div
@@ -458,7 +475,7 @@ function SharedPlot({
                       {span.endedAt != null ? (
                         <div
                           className={cn(
-                            "absolute top-1/2 z-10 h-5 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
+                            "pointer-events-none absolute top-1/2 z-20 h-4 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
                             span.state === "FAILED" && "bg-destructive",
                           )}
                           style={pointStyle(span.endedAt, axisStart, axisEnd)}
@@ -486,6 +503,7 @@ function memberRows(
       group.members.map((member) => ({
         key: `${group.setName}:${member.member}`,
         title: memberName(member.member),
+        displayTitle: "",
         tone: "member" as const,
         details: [
           {
@@ -616,7 +634,14 @@ export function PipelineTimelineCard({
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <Badge variant="outline">{formatDuration(axisEnd - axisStart)}</Badge>
             {extractionRows.length > 0 ? (
-              <Badge variant="outline">{extractionRows.length}</Badge>
+              <Badge variant="outline">
+                {t(
+                  extractionRows.length === 1
+                    ? "timeline.fileCountSingular"
+                    : "timeline.fileCountPlural",
+                  { count: extractionRows.length },
+                )}
+              </Badge>
             ) : null}
             <Badge variant={outcomeVariant(timeline.outcome)}>
               {formatOutcome(timeline.outcome)}

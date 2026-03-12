@@ -27,7 +27,6 @@ use crate::types::{
     ArchiveFormat, ArchiveMetadata, CompressionMethod, FileHash, MemberInfo, TopologyMemberInfo,
     VolumeSpan,
 };
-use crate::volume::VolumeProvider;
 use crate::volume::VolumeSet;
 
 /// File-level encryption parameters extracted from the file's extra records.
@@ -397,51 +396,6 @@ impl RarArchive {
     /// Whether a member is encrypted.
     pub fn member_is_encrypted(&self, index: usize) -> bool {
         self.members.get(index).is_some_and(|e| e.is_encrypted)
-    }
-
-    /// Discover all volumes via a `VolumeProvider`, parsing headers for each.
-    ///
-    /// Walks volumes sequentially starting from the first unknown volume,
-    /// calling `add_volume` for each until all members are complete (no
-    /// `split_after` remaining) or the provider signals no more volumes.
-    ///
-    /// This is used by streaming extraction to build the full segment list
-    /// before decompression begins. The `VolumeProvider` may block waiting
-    /// for volumes to finish downloading.
-    pub fn discover_volumes(&mut self, provider: &dyn VolumeProvider) -> RarResult<()> {
-        use crate::volume::VolumeProviderError;
-
-        let mut next_vol = self.volumes.len().max(1);
-
-        loop {
-            // Check if any member still needs continuation segments.
-            let needs_more = self.members.iter().any(|m| m.file_header.split_after);
-            if !needs_more {
-                break;
-            }
-
-            match provider.get_volume(next_vol) {
-                Ok(reader) => {
-                    self.add_volume(next_vol, Box::new(reader))?;
-                    next_vol += 1;
-                }
-                Err(VolumeProviderError::Unavailable { .. }) => {
-                    // No more volumes available — stop discovery.
-                    break;
-                }
-                Err(VolumeProviderError::Cancelled) => {
-                    return Err(RarError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "volume discovery cancelled",
-                    )));
-                }
-                Err(VolumeProviderError::Io(e)) => {
-                    return Err(RarError::Io(e));
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 

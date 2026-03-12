@@ -2051,6 +2051,64 @@ fn test_rar5_solid_metadata() {
 }
 
 #[test]
+fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
+    let fixture = fixture("rar5", "rar5_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
+    let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
+
+    let mut archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let first_chunk_dir = temp_dir.path().join("first");
+    let first_chunks = archive
+        .extract_member_solid_chunked(0, &options, |volume_index| {
+            let path = first_chunk_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+    assert!(!first_chunks.is_empty());
+    let mut actual_first = Vec::new();
+    for (volume_index, bytes_written) in &first_chunks {
+        let data = std::fs::read(first_chunk_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        actual_first.extend_from_slice(&data);
+    }
+    assert_eq!(actual_first, expected_first);
+
+    let second_chunk_dir = temp_dir.path().join("second");
+    let second_chunks = archive
+        .extract_member_solid_chunked(1, &options, |volume_index| {
+            let path = second_chunk_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+    assert!(!second_chunks.is_empty());
+    let mut actual_second = Vec::new();
+    for (volume_index, bytes_written) in &second_chunks {
+        let data =
+            std::fs::read(second_chunk_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        actual_second.extend_from_slice(&data);
+    }
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
 fn test_rar4_solid_metadata() {
     let archive = open_single("rar4", "rar4_solid.rar");
     assert!(archive.is_solid(), "archive should be marked solid");

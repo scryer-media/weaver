@@ -27,6 +27,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
+import { requestGraphqlClientRestart } from "@/graphql/client";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
@@ -178,10 +179,7 @@ export function JobDetail() {
     [jobId, reexecuteJobQuery],
   );
 
-  const [, executeEventsSubscription] = useSubscription(
-    { query: EVENTS_SUBSCRIPTION },
-    handleSubscription,
-  );
+  useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
 
   useReconnectPolling({
     enabled: connection.isDisconnected && Number.isFinite(jobId),
@@ -189,7 +187,7 @@ export function JobDetail() {
     variables: queryVariables,
     onData: (nextData) => {
       setPolledData(nextData);
-      executeEventsSubscription();
+      requestGraphqlClientRestart();
     },
   });
 

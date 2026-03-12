@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { type AnyVariables, type DocumentInput, useClient } from "urql";
 
-const RETRY_DELAYS_MS = [0, 1_000, 2_000, 5_000, 10_000, 30_000] as const;
-const SUCCESS_POLL_INTERVAL_MS = 5_000;
+const INITIAL_POLL_DELAY_MS = 0;
+const POLL_INTERVAL_MS = 2_000;
 
 interface UseReconnectPollingOptions<Data, Variables extends AnyVariables> {
   enabled: boolean;
@@ -24,7 +24,6 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
   const client = useClient();
   const [isPolling, setIsPolling] = useState(false);
   const timerRef = useRef<number | null>(null);
-  const failureCountRef = useRef(0);
   const onDataRef = useRef(onData);
 
   onDataRef.current = onData;
@@ -35,7 +34,6 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
       }
-      failureCountRef.current = 0;
       setIsPolling(false);
       return;
     }
@@ -71,26 +69,22 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
         }
 
         if (result.data) {
-          failureCountRef.current = 0;
           onDataRef.current(result.data);
-          scheduleNext(SUCCESS_POLL_INTERVAL_MS);
+          scheduleNext(POLL_INTERVAL_MS);
           return;
         }
       } catch {
-        // Treat transport failures the same as GraphQL errors for retry scheduling.
+        // Keep the polling cadence steady during disconnects.
       }
 
       if (cancelled) {
         return;
       }
 
-      const delayMs =
-        RETRY_DELAYS_MS[Math.min(failureCountRef.current, RETRY_DELAYS_MS.length - 1)];
-      failureCountRef.current += 1;
-      scheduleNext(delayMs);
+      scheduleNext(POLL_INTERVAL_MS);
     };
 
-    scheduleNext(RETRY_DELAYS_MS[0]);
+    scheduleNext(INITIAL_POLL_DELAY_MS);
 
     return () => {
       cancelled = true;

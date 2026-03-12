@@ -48,6 +48,4 @@ pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
     MemberInfo, TopologyMemberInfo, VolumeSpan,
 };
-pub use volume::{
-    StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet, WaitingVolumeProvider,
-};
+pub use volume::{StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet};

@@ -70,7 +70,7 @@ impl Pipeline {
         }
     }
 
-    fn clear_par2_runtime_state(&mut self, job_id: JobId) {
+    pub(super) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
         self.par2_sets.remove(&job_id);
         self.promoted_recovery_files.remove(&job_id);
         self.recovery_block_counts.remove(&job_id);
@@ -778,13 +778,7 @@ impl Pipeline {
             state.status = JobStatus::Complete;
         }
         self.clear_par2_runtime_state(job_id);
-        self.eagerly_deleted.remove(&job_id);
-        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.rar_header_snapshots
-            .retain(|(jid, _), _| *jid != job_id);
-        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
-        self.normalization_retried.remove(&job_id);
+        self.clear_job_rar_runtime(job_id);
         self.job_order.retain(|id| *id != job_id);
         let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
         self.record_job_history(job_id);
@@ -1321,12 +1315,7 @@ impl Pipeline {
                 }
                 state.status = JobStatus::Complete;
                 self.clear_par2_runtime_state(job_id);
-                self.eagerly_deleted.remove(&job_id);
-                self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-                self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-                self.rar_header_snapshots
-                    .retain(|(jid, _), _| *jid != job_id);
-                self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+                self.clear_job_rar_runtime(job_id);
                 self.job_order.retain(|id| *id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
                 info!(job_id = job_id.0, "job completed (no archives)");
@@ -1458,13 +1447,7 @@ impl Pipeline {
                     state.status = JobStatus::Complete;
                 }
                 self.clear_par2_runtime_state(job_id);
-                self.eagerly_deleted.remove(&job_id);
-                self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-                self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-                self.rar_header_snapshots
-                    .retain(|(jid, _), _| *jid != job_id);
-                self.rar_sets.retain(|(jid, _), _| *jid != job_id);
-                self.normalization_retried.remove(&job_id);
+                self.clear_job_rar_runtime(job_id);
                 self.job_order.retain(|id| *id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
                 self.record_job_history(job_id);

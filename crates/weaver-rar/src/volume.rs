@@ -1,19 +1,13 @@
-//! Multi-volume topology tracking and on-demand volume providers.
+//! Multi-volume topology tracking and on-disk volume providers.
 //!
 //! Tracks which volumes are present, which members span which volumes,
 //! and provides queries for extraction readiness.
-//!
-//! Also defines [`VolumeProvider`] for streaming extraction: volumes can
-//! be requested on demand, with [`WaitingVolumeProvider`] blocking until
-//! a volume finishes downloading.
-
-use std::collections::HashMap;
-use std::fmt;
-use std::path::PathBuf;
-use std::sync::{Condvar, Mutex};
 
 use crate::archive::ReadSeek;
 use crate::types::VolumeSpan;
+use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
 
 /// State of a volume in the set.
 #[derive(Debug)]
@@ -156,8 +150,6 @@ impl Default for VolumeSet {
 pub enum VolumeProviderError {
     /// Volume will never become available.
     Unavailable { volume: usize, reason: String },
-    /// Extraction was cancelled (job removed, app shutting down).
-    Cancelled,
     /// I/O error opening the volume file.
     Io(std::io::Error),
 }
@@ -168,7 +160,6 @@ impl fmt::Display for VolumeProviderError {
             Self::Unavailable { volume, reason } => {
                 write!(f, "volume {volume} unavailable: {reason}")
             }
-            Self::Cancelled => write!(f, "extraction cancelled"),
             Self::Io(e) => write!(f, "volume I/O error: {e}"),
         }
     }
@@ -178,13 +169,9 @@ impl std::error::Error for VolumeProviderError {}
 
 /// Provides volume readers on demand for streaming extraction.
 ///
-/// Implementations may block (e.g. waiting for a download to finish) or
-/// return immediately if all volumes are already on disk.
+/// Implementations return readers for volumes already on disk.
 pub trait VolumeProvider: Send + Sync {
     /// Get a reader for the given volume index.
-    ///
-    /// May block until the volume becomes available. Returns an error if
-    /// the volume will never be available or if extraction was cancelled.
     fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError>;
 }
 
@@ -214,108 +201,6 @@ impl VolumeProvider for StaticVolumeProvider {
                 volume: index,
                 reason: "not registered".into(),
             })?;
-        let file = std::fs::File::open(path).map_err(VolumeProviderError::Io)?;
-        Ok(Box::new(file))
-    }
-}
-
-/// Internal state for [`WaitingVolumeProvider`].
-struct WaitingState {
-    /// Volumes that have completed downloading.
-    available: HashMap<usize, PathBuf>,
-    /// Set when the download is done (all volumes available) or cancelled.
-    finished: bool,
-    /// Error message if cancelled/failed.
-    error: Option<String>,
-}
-
-/// Volume provider that blocks until volumes finish downloading.
-///
-/// The async pipeline calls [`volume_ready`] as each volume completes.
-/// The extraction thread (running in `spawn_blocking`) calls [`get_volume`],
-/// which blocks on a condvar until the requested volume is available.
-pub struct WaitingVolumeProvider {
-    state: Mutex<WaitingState>,
-    notify: Condvar,
-}
-
-impl Default for WaitingVolumeProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WaitingVolumeProvider {
-    pub fn new() -> Self {
-        Self {
-            state: Mutex::new(WaitingState {
-                available: HashMap::new(),
-                finished: false,
-                error: None,
-            }),
-            notify: Condvar::new(),
-        }
-    }
-
-    /// Signal that a volume has finished downloading and is on disk.
-    pub fn volume_ready(&self, index: usize, path: PathBuf) {
-        let mut state = self.state.lock().unwrap();
-        state.available.insert(index, path);
-        self.notify.notify_all();
-    }
-
-    /// Check whether a specific volume is already available without blocking.
-    pub fn is_volume_ready(&self, index: usize) -> bool {
-        self.state.lock().unwrap().available.contains_key(&index)
-    }
-
-    /// Signal that all volumes have been provided.
-    pub fn mark_finished(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.finished = true;
-        self.notify.notify_all();
-    }
-
-    /// Signal that the download was cancelled or failed.
-    pub fn mark_cancelled(&self, reason: String) {
-        let mut state = self.state.lock().unwrap();
-        state.finished = true;
-        state.error = Some(reason);
-        self.notify.notify_all();
-    }
-}
-
-impl VolumeProvider for WaitingVolumeProvider {
-    fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError> {
-        let state = self.state.lock().unwrap();
-        let state = self
-            .notify
-            .wait_while(state, |s| {
-                !s.available.contains_key(&index) && !s.finished && s.error.is_none()
-            })
-            .unwrap();
-
-        // Check for cancellation first.
-        if let Some(ref err) = state.error
-            && !state.available.contains_key(&index)
-        {
-            return Err(VolumeProviderError::Unavailable {
-                volume: index,
-                reason: err.clone(),
-            });
-        }
-
-        let path = state.available.get(&index).ok_or_else(|| {
-            if state.finished {
-                VolumeProviderError::Unavailable {
-                    volume: index,
-                    reason: "download finished without this volume".into(),
-                }
-            } else {
-                VolumeProviderError::Cancelled
-            }
-        })?;
-
         let file = std::fs::File::open(path).map_err(VolumeProviderError::Io)?;
         Ok(Box::new(file))
     }
@@ -404,52 +289,5 @@ mod tests {
         assert!(provider.get_volume(1).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_waiting_volume_provider() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let dir = std::env::temp_dir().join("weaver_test_waiting_vp");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("vol0.rar");
-        std::fs::write(&path, b"volume zero").unwrap();
-
-        let provider = Arc::new(WaitingVolumeProvider::new());
-        let p2 = Arc::clone(&provider);
-
-        // Spawn a thread that requests volume 0 (will block briefly).
-        let handle = thread::spawn(move || {
-            let mut reader = p2.get_volume(0).unwrap();
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut reader, &mut buf).unwrap();
-            buf
-        });
-
-        // Signal that volume 0 is ready.
-        provider.volume_ready(0, path);
-
-        let result = handle.join().unwrap();
-        assert_eq!(result, b"volume zero");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_waiting_volume_provider_cancelled() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let provider = Arc::new(WaitingVolumeProvider::new());
-        let p2 = Arc::clone(&provider);
-
-        let handle = thread::spawn(move || p2.get_volume(0));
-
-        // Cancel while the thread is waiting.
-        provider.mark_cancelled("job removed".into());
-
-        let result = handle.join().unwrap();
-        assert!(result.is_err());
     }
 }

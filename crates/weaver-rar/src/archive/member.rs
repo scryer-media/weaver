@@ -12,6 +12,116 @@ use crate::volume::VolumeProvider;
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 impl RarArchive {
+    fn solid_volume_transitions(
+        segments: &[DataSegment],
+    ) -> (usize, Vec<crate::decompress::VolumeTransition>) {
+        let mut sorted_segments = segments.to_vec();
+        sorted_segments.sort_by_key(|segment| segment.volume_index);
+        let first_volume = sorted_segments
+            .first()
+            .map_or(0, |segment| segment.volume_index);
+        let mut compressed_offset = 0u64;
+        let mut transitions = Vec::new();
+        for pair in sorted_segments.windows(2) {
+            compressed_offset = compressed_offset.saturating_add(pair[0].data_size);
+            transitions.push(crate::decompress::VolumeTransition {
+                volume_index: pair[1].volume_index,
+                compressed_offset,
+            });
+        }
+        (first_volume, transitions)
+    }
+
+    fn advance_solid_cursor_to(&mut self, index: usize, fh: &FileHeader) -> RarResult<()> {
+        if index < self.solid_next_index {
+            return Err(RarError::SolidOrderViolation {
+                required: format!("member index {}", self.solid_next_index),
+                requested: fh.name.clone(),
+            });
+        }
+
+        while self.solid_next_index < index {
+            let skip_idx = self.solid_next_index;
+            let skip_entry = &self.members[skip_idx];
+            let skip_fh = skip_entry.file_header.clone();
+            if skip_fh.compression.method != CompressionMethod::Store {
+                let skip_data = self.read_member_data(skip_idx)?;
+                let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
+                self.run_solid_decoder(&skip_data, skip_unpacked, &skip_fh)?;
+            }
+            self.solid_next_index += 1;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_solid_store_chunked<F>(
+        &self,
+        fh: &FileHeader,
+        options: &ExtractOptions,
+        segments: &[DataSegment],
+        data: &[u8],
+        mut writer_factory: F,
+        skip_hash_verify: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let mut sorted_segments = segments.to_vec();
+        sorted_segments.sort_by_key(|segment| segment.volume_index);
+
+        let mut hasher = if options.verify && !skip_hash_verify {
+            Some(crc32fast::Hasher::new())
+        } else {
+            None
+        };
+        let mut chunks = Vec::with_capacity(sorted_segments.len());
+        let mut offset = 0usize;
+
+        for segment in &sorted_segments {
+            let remaining = data.len().saturating_sub(offset);
+            let write_len = remaining.min(segment.data_size as usize);
+            let mut writer = writer_factory(segment.volume_index)?;
+            if write_len > 0 {
+                writer
+                    .write_all(&data[offset..offset + write_len])
+                    .map_err(RarError::Io)?;
+                if let Some(ref mut crc) = hasher {
+                    crc.update(&data[offset..offset + write_len]);
+                }
+            }
+            writer.flush().map_err(RarError::Io)?;
+            chunks.push((segment.volume_index, write_len as u64));
+            offset += write_len;
+        }
+
+        if offset != data.len() {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "solid store member {} left {} bytes unmapped to volume chunks",
+                    fh.name,
+                    data.len().saturating_sub(offset)
+                ),
+            });
+        }
+
+        if let Some(crc) = hasher
+            && let Some(expected) = fh.data_crc32
+        {
+            let actual = crc.finalize();
+            if actual != expected {
+                return Err(RarError::DataCrcMismatch {
+                    member: fh.name.clone(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+
+        Ok(chunks)
+    }
+
     /// Read all data segments for a member, concatenating them into a single buffer.
     ///
     /// This handles cross-volume data by reading each segment from its
@@ -539,6 +649,109 @@ impl RarArchive {
         Ok(unpacked_size)
     }
 
+    /// Extract a solid member into per-volume chunk writers while preserving
+    /// the archive's solid decoder state across sequential members.
+    pub fn extract_member_solid_chunked<F>(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let entry = self
+            .members
+            .get(index)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: format!("member index {index} out of range"),
+            })?;
+
+        let member_password = if entry.is_encrypted {
+            let pwd = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: entry.file_header.name.clone(),
+                })?;
+            Some(pwd.to_string())
+        } else {
+            None
+        };
+
+        let fh = entry.file_header.clone();
+        let file_enc = entry.file_encryption.clone();
+        let rar4_salt = entry.rar4_salt;
+        let archive_format = self.format;
+        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
+
+        if !self.is_solid {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "member {} is not in a solid archive; use non-solid chunked extraction",
+                    fh.name
+                ),
+            });
+        }
+
+        let segments = self.members[index].segments.clone();
+        let mut compressed = self.read_member_data(index)?;
+
+        if let Some(ref pwd) = member_password {
+            if archive_format == ArchiveFormat::Rar4 {
+                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4 member {} is marked encrypted but has no salt",
+                        fh.name
+                    ),
+                })?;
+                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
+            } else {
+                let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!(
+                        "member {} is marked encrypted but has no encryption parameters",
+                        fh.name
+                    ),
+                })?;
+                if let Some(ref check_data) = enc_info.check_data
+                    && !crate::crypto::verify_password_check(
+                        pwd,
+                        &enc_info.salt,
+                        enc_info.kdf_count,
+                        check_data,
+                    )
+                {
+                    return Err(RarError::WrongPassword {
+                        member: fh.name.clone(),
+                    });
+                }
+                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
+            }
+        }
+
+        if member_password.is_some()
+            && fh.compression.method == CompressionMethod::Store
+            && compressed.len() as u64 > unpacked_size
+        {
+            compressed.truncate(unpacked_size as usize);
+        }
+
+        self.decompress_solid_chunked(
+            index,
+            &compressed,
+            unpacked_size,
+            &fh,
+            &segments,
+            options,
+            writer_factory,
+            skip_hash_verify,
+        )
+    }
+
     /// Decompress a member in a solid archive, maintaining LZ decoder state
     /// across sequential members.
     ///
@@ -552,30 +765,52 @@ impl RarArchive {
         unpacked_size: u64,
         fh: &FileHeader,
     ) -> RarResult<Vec<u8>> {
-        // Ensure sequential extraction order.
-        if index < self.solid_next_index {
-            // Allow re-extracting a member if it's the current one
-            // (e.g. retrying after a transient error). But we can't go backwards.
-            return Err(RarError::SolidOrderViolation {
-                required: format!("member index {}", self.solid_next_index),
-                requested: fh.name.clone(),
-            });
-        }
-
-        // If we need to skip ahead, we must decode intervening members.
-        while self.solid_next_index < index {
-            let skip_idx = self.solid_next_index;
-            let skip_entry = &self.members[skip_idx];
-            let skip_fh = skip_entry.file_header.clone();
-            if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_data = self.read_member_data(skip_idx)?;
-                let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
-                self.run_solid_decoder(&skip_data, skip_unpacked, &skip_fh)?;
-            }
-            self.solid_next_index += 1;
-        }
+        self.advance_solid_cursor_to(index, fh)?;
 
         let result = self.run_solid_decoder(compressed, unpacked_size, fh)?;
+        self.solid_next_index = index + 1;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decompress_solid_chunked<F>(
+        &mut self,
+        index: usize,
+        compressed: &[u8],
+        unpacked_size: u64,
+        fh: &FileHeader,
+        segments: &[DataSegment],
+        options: &ExtractOptions,
+        writer_factory: F,
+        skip_hash_verify: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        self.advance_solid_cursor_to(index, fh)?;
+
+        let result = if fh.compression.method == CompressionMethod::Store {
+            self.extract_solid_store_chunked(
+                fh,
+                options,
+                segments,
+                compressed,
+                writer_factory,
+                skip_hash_verify,
+            )?
+        } else {
+            let (first_volume, boundaries) = Self::solid_volume_transitions(segments);
+            self.run_solid_decoder_chunked(
+                compressed,
+                unpacked_size,
+                fh,
+                first_volume,
+                &boundaries,
+                writer_factory,
+                options.verify && !skip_hash_verify,
+            )?
+        };
+
         self.solid_next_index = index + 1;
         Ok(result)
     }
@@ -624,6 +859,103 @@ impl RarArchive {
                 .unwrap()
                 .decompress(compressed, unpacked_size)
         }
+    }
+
+    pub(super) fn run_solid_decoder_chunked<F>(
+        &mut self,
+        compressed: &[u8],
+        unpacked_size: u64,
+        fh: &FileHeader,
+        first_volume_index: usize,
+        boundaries: &[crate::decompress::VolumeTransition],
+        writer_factory: F,
+        verify_crc: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let dict_size = fh.compression.dict_size;
+        if dict_size > self.limits.max_dict_size {
+            return Err(RarError::DictionaryTooLarge {
+                size: dict_size,
+                max: self.limits.max_dict_size,
+            });
+        }
+
+        let shared_hasher = if verify_crc {
+            Some(Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())))
+        } else {
+            None
+        };
+
+        let mut writer_factory = writer_factory;
+        let chunks = if fh.compression.format == ArchiveFormat::Rar4 {
+            if let Some(decoder) = &mut self.solid_decoder_rar4 {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size as usize));
+            }
+            let decoder = self.solid_decoder_rar4.as_mut().unwrap();
+            let hasher_clone = shared_hasher.clone();
+            decoder.decompress_to_writer_chunked(
+                compressed,
+                unpacked_size,
+                first_volume_index,
+                boundaries,
+                |volume_index| {
+                    let writer = writer_factory(volume_index)?;
+                    if let Some(ref hasher) = hasher_clone {
+                        Ok(Box::new(CrcTrackingWriter {
+                            inner: writer,
+                            hasher: Arc::clone(hasher),
+                        }))
+                    } else {
+                        Ok(writer)
+                    }
+                },
+            )?
+        } else {
+            if let Some(decoder) = &mut self.solid_decoder {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder = Some(LzDecoder::new(dict_size as usize));
+            }
+            let decoder = self.solid_decoder.as_mut().unwrap();
+            let hasher_clone = shared_hasher.clone();
+            decoder.decompress_to_writer_chunked(
+                compressed,
+                unpacked_size,
+                first_volume_index,
+                boundaries,
+                |volume_index| {
+                    let writer = writer_factory(volume_index)?;
+                    if let Some(ref hasher) = hasher_clone {
+                        Ok(Box::new(CrcTrackingWriter {
+                            inner: writer,
+                            hasher: Arc::clone(hasher),
+                        }))
+                    } else {
+                        Ok(writer)
+                    }
+                },
+            )?
+        };
+
+        if let Some(hasher_arc) = shared_hasher
+            && let Some(expected) = fh.data_crc32
+        {
+            let hasher = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
+            let actual = hasher.finalize();
+            if actual != expected {
+                return Err(RarError::DataCrcMismatch {
+                    member: fh.name.clone(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+
+        Ok(chunks)
     }
 
     /// Extract a member by name, handling any supported compression method.

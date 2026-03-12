@@ -131,6 +131,8 @@ const en: LocaleDictionary = {
   "timeline.memberDetailHint": "Expand to inspect per-member extraction and append timing.",
   "timeline.sharedAxisHint": "Stage rows and extracted members are stacked on one shared timeline.",
   "timeline.restartHint": "Downtime or recovery between attempts.",
+  "timeline.fileCountSingular": "{{count}} file",
+  "timeline.fileCountPlural": "{{count}} files",
   "timeline.ended": "Ended",
   "timeline.started": "Started",
   "timeline.active": "Active",

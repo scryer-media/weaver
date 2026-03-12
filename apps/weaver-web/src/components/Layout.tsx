@@ -14,7 +14,10 @@ import {
   Unplug,
 } from "lucide-react";
 import { useQuery, useSubscription } from "urql";
-import { useGraphqlConnectionState } from "@/graphql/client";
+import {
+  requestGraphqlClientRestart,
+  useGraphqlConnectionState,
+} from "@/graphql/client";
 import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY } from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
@@ -115,7 +118,7 @@ export function Layout() {
     [],
   );
 
-  const [{ data }, executeSubscription] = useSubscription(
+  const [{ data }] = useSubscription(
     { query: JOB_UPDATES_SUBSCRIPTION },
     handleSubscription,
   );
@@ -125,7 +128,7 @@ export function Layout() {
     query: JOBS_PAGE_QUERY,
     onData: (nextSnapshot) => {
       setPolledSnapshot(nextSnapshot);
-      executeSubscription();
+      requestGraphqlClientRestart();
     },
   });
 

@@ -1,13 +1,14 @@
 import { Provider } from "urql";
 import { RouterProvider } from "react-router";
 import { ThemeProvider } from "next-themes";
-import { client } from "./graphql/client";
+import { useGraphqlClient } from "./graphql/client";
 import { router } from "./router";
 import { useLanguage } from "@/lib/hooks/use-language";
 import { TranslateContext } from "@/lib/context/translate-context";
 
 function AppProviders() {
   const { t } = useLanguage();
+  const client = useGraphqlClient();
 
   return (
     <TranslateContext.Provider value={t}>

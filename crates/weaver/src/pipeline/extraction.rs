@@ -218,62 +218,88 @@ impl Pipeline {
             member: member_name.clone(),
         });
 
-        if is_solid {
-            let bytes_written =
-                match archive.extract_member_to_file(idx, options, None, &partial_path) {
-                    Ok(bytes_written) => bytes_written,
-                    Err(error) => {
-                        let _ = std::fs::remove_file(&partial_path);
-                        return Err(format!("failed to extract {member_name}: {error}"));
-                    }
-                };
-            let partial_file = std::fs::File::open(&partial_path)
-                .map_err(|e| format!("failed to reopen partial file: {e}"))?;
-            partial_file
-                .sync_all()
-                .map_err(|e| format!("failed to sync partial output: {e}"))?;
-            std::fs::rename(&partial_path, &out_path)
-                .map_err(|e| format!("failed to finalize output: {e}"))?;
-            return Ok((member_name, bytes_written, unpacked_size));
-        }
-
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
         Self::clear_member_chunk_artifacts(db, job_id, set_name, &member_name, &chunk_dir)?;
-
-        let mut provider_paths = std::collections::HashMap::new();
-        for absolute_volume in first_volume..=last_volume {
-            let Some(path) = volume_paths.get(&absolute_volume) else {
-                return Err(format!(
-                    "missing local RAR volume {absolute_volume} for member {member_name}"
-                ));
-            };
-            provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
-        }
-        let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
-        let mut chunk_paths = std::collections::BTreeMap::new();
-        let chunk_records = archive
-            .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
-                let absolute_volume = first_volume + local_volume as u32;
-                let path = chunk_dir.join(format!("{absolute_volume:05}.chunk"));
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
-                }
-                let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
-                chunk_paths.insert(absolute_volume, path);
-                Ok(Box::new(std::io::BufWriter::with_capacity(
-                    8 * 1024 * 1024,
-                    file,
-                )))
-            })
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&partial_path);
-                let _ = std::fs::remove_dir_all(&chunk_dir);
-                format!("failed to extract {member_name}: {error}")
-            })?;
+        let mut chunk_paths: std::collections::BTreeMap<u32, PathBuf> =
+            std::collections::BTreeMap::new();
+        let chunk_records: Result<Vec<(u32, u64)>, weaver_rar::RarError> = if is_solid {
+            archive
+                .extract_member_solid_chunked(idx, options, |absolute_volume| {
+                    let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
+                        weaver_rar::RarError::CorruptArchive {
+                            detail: format!(
+                                "solid chunk volume {absolute_volume} does not fit into u32"
+                            ),
+                        }
+                    })?;
+                    let path = chunk_dir.join(format!("{absolute_volume:05}.chunk"));
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+                    }
+                    let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+                    chunk_paths.insert(absolute_volume, path);
+                    Ok(Box::new(std::io::BufWriter::with_capacity(
+                        8 * 1024 * 1024,
+                        file,
+                    )))
+                })
+                .and_then(|records| {
+                    records
+                        .into_iter()
+                        .map(|(absolute_volume, bytes_written)| {
+                            let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
+                                weaver_rar::RarError::CorruptArchive {
+                                    detail: format!(
+                                        "solid chunk volume {absolute_volume} does not fit into u32"
+                                    ),
+                                }
+                            })?;
+                            Ok((absolute_volume, bytes_written))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+        } else {
+            let mut provider_paths = std::collections::HashMap::new();
+            for absolute_volume in first_volume..=last_volume {
+                let Some(path) = volume_paths.get(&absolute_volume) else {
+                    return Err(format!(
+                        "missing local RAR volume {absolute_volume} for member {member_name}"
+                    ));
+                };
+                provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+            }
+            let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
+            archive
+                .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
+                    let absolute_volume = first_volume + local_volume as u32;
+                    let path = chunk_dir.join(format!("{absolute_volume:05}.chunk"));
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+                    }
+                    let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+                    chunk_paths.insert(absolute_volume, path);
+                    Ok(Box::new(std::io::BufWriter::with_capacity(
+                        8 * 1024 * 1024,
+                        file,
+                    )))
+                })
+                .and_then(|records| {
+                    records
+                        .into_iter()
+                        .map(|(local_volume, bytes_written)| {
+                            Ok((first_volume + local_volume as u32, bytes_written))
+                        })
+                        .collect::<Result<Vec<_>, weaver_rar::RarError>>()
+                })
+        };
+        let chunk_records = chunk_records.map_err(|error| {
+            let _ = std::fs::remove_file(&partial_path);
+            let _ = std::fs::remove_dir_all(&chunk_dir);
+            format!("failed to extract {member_name}: {error}")
+        })?;
 
         let mut persisted_chunks = Vec::with_capacity(chunk_records.len());
-        for (local_volume, bytes_written) in chunk_records {
-            let absolute_volume = first_volume + local_volume as u32;
+        for (absolute_volume, bytes_written) in chunk_records {
             let path = chunk_paths
                 .get(&absolute_volume)
                 .ok_or_else(|| {

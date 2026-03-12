@@ -336,20 +336,9 @@ impl Pipeline {
         });
 
         // Clear stale per-job caches from previous attempt.
-        self.par2_sets.remove(&job_id);
-        self.extracted_members.remove(&job_id);
-        self.extracted_sets.remove(&job_id);
-        self.failed_extractions.remove(&job_id);
-        self.pending_concat.remove(&job_id);
-        self.recovery_block_counts.remove(&job_id);
-        self.promoted_recovery_files.remove(&job_id);
-        self.eagerly_deleted.remove(&job_id);
-        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.rar_header_snapshots
-            .retain(|(jid, _), _| *jid != job_id);
-        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
-        self.normalization_retried.remove(&job_id);
+        self.clear_par2_runtime_state(job_id);
+        self.clear_job_extraction_runtime(job_id);
+        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
 
         // Add to job_order so it shows as active.

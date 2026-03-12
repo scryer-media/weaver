@@ -614,22 +614,11 @@ impl Pipeline {
                     });
 
                     // Clean up per-job caches.
-                    self.par2_sets.remove(&job_id);
-                    self.extracted_members.remove(&job_id);
-                    self.extracted_sets.remove(&job_id);
-                    self.failed_extractions.remove(&job_id);
-                    self.pending_concat.remove(&job_id);
+                    self.clear_par2_runtime_state(job_id);
+                    self.clear_job_extraction_runtime(job_id);
                     self.active_download_passes.remove(&job_id);
                     self.active_downloads_by_job.remove(&job_id);
-                    self.recovery_block_counts.remove(&job_id);
-                    self.promoted_recovery_files.remove(&job_id);
-                    self.par2_bypassed.remove(&job_id);
-                    self.eagerly_deleted.remove(&job_id);
-                    self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-                    self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-                    self.rar_header_snapshots
-                        .retain(|(jid, _), _| *jid != job_id);
-                    self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+                    self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
 
                     // Delete per-job working directory.
@@ -1049,6 +1038,24 @@ impl Pipeline {
         }
     }
 
+    pub(super) fn clear_job_extraction_runtime(&mut self, job_id: JobId) {
+        self.extracted_members.remove(&job_id);
+        self.extracted_sets.remove(&job_id);
+        self.failed_extractions.remove(&job_id);
+        self.pending_concat.remove(&job_id);
+        self.par2_bypassed.remove(&job_id);
+    }
+
+    pub(super) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
+        self.eagerly_deleted.remove(&job_id);
+        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.rar_header_snapshots
+            .retain(|(jid, _), _| *jid != job_id);
+        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+        self.normalization_retried.remove(&job_id);
+    }
+
     pub(super) fn write_target_for_file(
         &self,
         file_id: NzbFileId,
@@ -1065,23 +1072,11 @@ impl Pipeline {
     fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
-        self.par2_sets.remove(&job_id);
-        self.extracted_members.remove(&job_id);
-        self.extracted_sets.remove(&job_id);
-        self.failed_extractions.remove(&job_id);
-        self.pending_concat.remove(&job_id);
+        self.clear_par2_runtime_state(job_id);
+        self.clear_job_extraction_runtime(job_id);
         self.active_download_passes.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
-        self.recovery_block_counts.remove(&job_id);
-        self.promoted_recovery_files.remove(&job_id);
-        self.par2_bypassed.remove(&job_id);
-        self.eagerly_deleted.remove(&job_id);
-        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.rar_header_snapshots
-            .retain(|(jid, _), _| *jid != job_id);
-        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
-        self.normalization_retried.remove(&job_id);
+        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
     }
 

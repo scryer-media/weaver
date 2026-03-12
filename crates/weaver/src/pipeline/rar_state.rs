@@ -146,6 +146,7 @@ pub(super) fn build_plan(
     };
 
     let metadata = archive.metadata();
+    let topology_members = archive.topology_members();
     topology.expected_volume_count = metadata.volume_count.map(|count| count as u32);
     let final_volume_seen = facts
         .get(&prefix_end)
@@ -163,6 +164,18 @@ pub(super) fn build_plan(
     };
     let mut member_names = Vec::new();
     let mut member_claims: HashMap<String, HashSet<u32>> = HashMap::new();
+    for member in &topology_members {
+        if member.is_directory || !member.missing_start {
+            continue;
+        }
+        let first_volume = member.volumes.first_volume as u32;
+        let last_volume = member.volumes.last_volume as u32;
+        waiting_on_volumes.extend(first_volume..=last_volume);
+        topology.unresolved_spans.push(ArchivePendingSpan {
+            first_volume,
+            last_volume,
+        });
+    }
     for member in &metadata.members {
         if member.is_directory {
             continue;
@@ -588,6 +601,47 @@ mod tests {
         let decision = plan.delete_decisions.get(&3).unwrap();
         assert_eq!(decision.owners, vec!["E02.mkv".to_string()]);
         assert_eq!(decision.pending_owners, vec!["E02.mkv".to_string()]);
+        assert!(!decision.ownership_eligible);
+    }
+
+    #[test]
+    fn build_plan_blocks_delete_for_missing_start_continuation_spans() {
+        let files = build_multifile_multivolume_rar_set();
+        let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        archive
+            .add_volume(3, Box::new(Cursor::new(files[3].1.clone())))
+            .unwrap();
+
+        let facts: BTreeMap<u32, RarVolumeFacts> = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (_, bytes))| {
+                (
+                    volume as u32,
+                    RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+                )
+            })
+            .collect();
+        let volume_map = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+            .collect();
+
+        let plan = build_plan(
+            volume_map,
+            &facts,
+            &archive,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(plan.waiting_on_volumes.contains(&3));
+        assert!(!plan.deletion_eligible.contains(&3));
+        let decision = plan.delete_decisions.get(&3).unwrap();
+        assert!(decision.unresolved_boundary);
         assert!(!decision.ownership_eligible);
     }
 }

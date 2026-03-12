@@ -3,6 +3,7 @@ import { useQuery, useSubscription } from "urql";
 import { PageHeader } from "@/components/PageHeader";
 import { SpeedDisplay, formatBytes } from "@/components/SpeedDisplay";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { requestGraphqlClientRestart } from "@/graphql/client";
 import { METRICS_PAGE_QUERY, METRICS_PAGE_SUBSCRIPTION } from "@/graphql/queries";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -52,7 +53,7 @@ export function MetricsPage() {
     _prev: MetricsPageData | undefined,
     response: { jobUpdates: MetricsPageData },
   ) => response.jobUpdates;
-  const [{ data: subscriptionData }, executeSubscription] = useSubscription(
+  const [{ data: subscriptionData }] = useSubscription(
     { query: METRICS_PAGE_SUBSCRIPTION },
     handleSubscription,
   );
@@ -61,7 +62,7 @@ export function MetricsPage() {
     query: METRICS_PAGE_QUERY,
     onData: (nextSnapshot) => {
       setPolledSnapshot(nextSnapshot);
-      executeSubscription();
+      requestGraphqlClientRestart();
     },
   });
 
