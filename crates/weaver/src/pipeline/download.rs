@@ -190,7 +190,7 @@ impl Pipeline {
 
         if let Some(job_id) = active_id {
             // Phase 1: Primary segments (from download_queue).
-            // Recovery segments promoted by promote_recovery() also land here.
+            // Recovery segments promoted for targeted repair also land here.
             while self.active_downloads < max {
                 if self.rate_limiter.should_wait() {
                     break;
@@ -208,7 +208,7 @@ impl Pipeline {
             }
 
             // Recovery files are NOT downloaded proactively. They are only
-            // downloaded when CRC failures trigger promote_recovery(), which
+            // downloaded when CRC failures trigger targeted recovery promotion, which
             // moves needed recovery segments from recovery_queue into
             // download_queue (handled by Phase 1 above).
         }

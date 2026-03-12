@@ -452,22 +452,6 @@ impl Pipeline {
         promoted_blocks
     }
 
-    /// Promote all recovery files for a job from its recovery queue to its
-    /// primary queue. Used as an emergency fallback when targeted promotion
-    /// cannot determine a trustworthy lower bound.
-    #[allow(dead_code)]
-    pub(super) fn promote_recovery(&mut self, job_id: JobId) {
-        let total_capacity = self.total_recovery_block_capacity(job_id);
-        let promoted = self.promote_recovery_targeted(job_id, total_capacity);
-        if promoted > 0 {
-            info!(
-                job_id = job_id.0,
-                promoted_blocks = promoted,
-                "promoted all recovery files to primary queue"
-            );
-        }
-    }
-
     /// List all jobs.
     pub(super) fn list_jobs(&self) -> Vec<JobInfo> {
         let mut list = Vec::with_capacity(self.jobs.len() + self.finished_jobs.len());

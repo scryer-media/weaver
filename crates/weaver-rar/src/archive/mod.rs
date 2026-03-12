@@ -73,9 +73,6 @@ pub struct DataSegment {
 /// Holder for a volume's reader and parsed metadata.
 pub(super) struct VolumeData {
     pub(super) reader: Box<dyn ReadSeek>,
-    /// Volume index (0-based).
-    #[allow(dead_code)]
-    pub(super) index: usize,
 }
 
 /// Trait alias for Read + Seek so we can use trait objects.
@@ -98,9 +95,6 @@ pub struct RarArchive {
     pub(super) volume_set: VolumeSet,
     /// All member entries (file headers + data segments).
     pub(super) members: Vec<MemberEntry>,
-    /// Whether the end of archive was reached.
-    #[allow(dead_code)]
-    pub(super) end_reached: bool,
     /// Whether more volumes follow.
     pub(super) more_volumes: bool,
     /// Volume readers, indexed by volume number.

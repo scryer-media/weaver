@@ -192,7 +192,6 @@ impl RarArchive {
             is_encrypted: cached.is_encrypted,
             volume_set: VolumeSet::from_presence(cached.volume_presence, cached.last_volume_seen),
             members,
-            end_reached: cached.last_volume_seen,
             more_volumes: cached.more_volumes,
             volumes: Vec::new(),
             solid_decoder: None,

@@ -44,8 +44,6 @@ impl RarArchive {
             volume_set.set_last_volume_seen();
         }
 
-        let end_reached = parsed.end.is_some();
-
         // Build member entries from file headers.
         // For the first volume, each file header that doesn't have split_before
         // starts a new member. Files with split_before are continuations from
@@ -82,10 +80,7 @@ impl RarArchive {
         while volumes.len() <= volume_number {
             volumes.push(None);
         }
-        volumes[volume_number] = Some(VolumeData {
-            reader,
-            index: volume_number,
-        });
+        volumes[volume_number] = Some(VolumeData { reader });
 
         Ok(RarArchive {
             format,
@@ -93,7 +88,6 @@ impl RarArchive {
             is_encrypted: parsed.is_encrypted,
             volume_set,
             members,
-            end_reached,
             more_volumes,
             volumes,
             solid_decoder: None,
@@ -123,8 +117,6 @@ impl RarArchive {
         };
 
         let more_volumes = parsed.end.as_ref().is_some_and(|e| e.more_volumes);
-        let end_reached = parsed.end.is_some();
-
         if !more_volumes {
             volume_set.set_last_volume_seen();
         }
@@ -147,7 +139,7 @@ impl RarArchive {
             });
         }
 
-        let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData { reader, index: 0 })];
+        let volumes: Vec<Option<VolumeData>> = vec![Some(VolumeData { reader })];
 
         Ok(RarArchive {
             format: ArchiveFormat::Rar4,
@@ -155,7 +147,6 @@ impl RarArchive {
             is_encrypted: parsed.archive_header.is_encrypted,
             volume_set,
             members,
-            end_reached,
             more_volumes,
             volumes,
             solid_decoder: None,

@@ -60,10 +60,6 @@ impl RarArchive {
             self.more_volumes = false;
         }
 
-        if parsed.end.is_some() {
-            self.end_reached = true;
-        }
-
         // Process file headers from this volume.
         for pf in parsed.files {
             let segment = DataSegment {
@@ -121,10 +117,6 @@ impl RarArchive {
             self.volume_set.set_last_volume_seen();
             self.more_volumes = false;
         }
-        if parsed.end.is_some() {
-            self.end_reached = true;
-        }
-
         for fh in &parsed.files {
             let segment = DataSegment {
                 volume_index: vol_num,
@@ -328,10 +320,7 @@ impl RarArchive {
         while self.volumes.len() <= vol_num {
             self.volumes.push(None);
         }
-        self.volumes[vol_num] = Some(VolumeData {
-            reader,
-            index: vol_num,
-        });
+        self.volumes[vol_num] = Some(VolumeData { reader });
     }
 }
 
@@ -402,7 +391,6 @@ mod tests {
             is_encrypted: false,
             volume_set: VolumeSet::new(),
             members,
-            end_reached: false,
             more_volumes: true,
             volumes: Vec::new(),
             solid_decoder: None,
