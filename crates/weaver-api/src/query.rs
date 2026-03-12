@@ -4,9 +4,10 @@ use weaver_core::config::SharedConfig;
 use weaver_scheduler::SchedulerHandle;
 
 use crate::auth::AdminGuard;
+use crate::timeline::build_job_timeline;
 use crate::types::{
     ApiKey, ApiKeyScope, Category, EventKind, GeneralSettings, Job, JobEvent, JobStatusGql,
-    Metrics, RssFeed, Server,
+    JobTimeline, Metrics, RssFeed, RssSeenItem, Server,
 };
 
 pub struct QueryRoot;
@@ -57,6 +58,29 @@ impl QueryRoot {
             Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Get synthesized waterfall/timeline data for a job.
+    async fn job_timeline(&self, ctx: &Context<'_>, job_id: u64) -> Result<Option<JobTimeline>> {
+        let handle = ctx.data::<SchedulerHandle>()?.clone();
+        let db = ctx.data::<weaver_state::Database>()?.clone();
+
+        let job = match handle.get_job(weaver_core::id::JobId(job_id)) {
+            Ok(info) => info,
+            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let (events, history) = tokio::task::spawn_blocking(move || {
+            let events = db.get_job_events(job_id)?;
+            let history = db.get_job_history(job_id)?;
+            Ok::<_, weaver_state::StateError>((events, history))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        Ok(Some(build_job_timeline(&job, history.as_ref(), &events)))
     }
 
     /// Get current pipeline metrics.
@@ -183,6 +207,29 @@ impl QueryRoot {
                 .map(crate::types::RssRule::from_row)
                 .collect();
             Ok::<_, weaver_state::StateError>(Some(RssFeed::from_row(&feed, rules)))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// List recently seen RSS items, optionally scoped to one feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn rss_seen_items(
+        &self,
+        ctx: &Context<'_>,
+        feed_id: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RssSeenItem>> {
+        let db = ctx.data::<weaver_state::Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            let items = db.list_rss_seen_items(feed_id, limit)?;
+            Ok::<_, weaver_state::StateError>(
+                items
+                    .iter()
+                    .map(crate::types::RssSeenItem::from_row)
+                    .collect(),
+            )
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?

@@ -52,5 +52,6 @@ export interface JobData {
   health: number;
   hasPassword: boolean;
   category: string | null;
+  createdAt?: number | null;
   metadata: { key: string; value: string }[];
 }

@@ -2,21 +2,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
 import {
+  BarChart3,
   Clock3,
-  Download,
   FolderUp,
+  ListOrdered,
   Menu,
   Monitor,
   MoonStar,
   Settings,
   Sun,
-  Workflow,
+  Unplug,
 } from "lucide-react";
 import { useQuery, useSubscription } from "urql";
+import { useGraphqlConnectionState } from "@/graphql/client";
 import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY } from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { LiveDataContext } from "@/lib/context/live-data-context";
+import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import type { JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { settingsNav } from "@/pages/settings/SettingsLayout";
@@ -30,8 +33,9 @@ import {
 } from "@/components/ui/sheet";
 
 const navItems = [
-  { to: "/", labelKey: "nav.jobs", icon: Workflow },
+  { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
+  { to: "/metrics", labelKey: "nav.metrics", icon: BarChart3 },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
@@ -72,11 +76,35 @@ function ThemeToggle() {
   );
 }
 
+function DisconnectBanner({
+  title,
+  message,
+}: {
+  title: string;
+  message: string;
+}) {
+  return (
+    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-950 dark:text-amber-100">
+      <div className="flex items-center gap-3">
+        <div className="flex size-8 items-center justify-center rounded-full bg-amber-500/20">
+          <Unplug className="size-4" />
+        </div>
+        <div className="min-w-0">
+          <div className="text-sm font-semibold">{title}</div>
+          <div className="text-sm text-amber-900/80 dark:text-amber-100/80">{message}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Layout() {
   const t = useTranslate();
   const location = useLocation();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [polledSnapshot, setPolledSnapshot] = useState<Snapshot | undefined>();
+  const connectionState = useGraphqlConnectionState();
 
   const [{ data: queryData }] = useQuery<Snapshot>({
     query: JOBS_PAGE_QUERY,
@@ -87,20 +115,43 @@ export function Layout() {
     [],
   );
 
-  const [{ data }] = useSubscription(
+  const [{ data }, executeSubscription] = useSubscription(
     { query: JOB_UPDATES_SUBSCRIPTION },
     handleSubscription,
   );
 
-  const snapshot = data ?? queryData;
+  const reconnectPolling = useReconnectPolling<Snapshot>({
+    enabled: connectionState.status === "disconnected",
+    query: JOBS_PAGE_QUERY,
+    onData: (nextSnapshot) => {
+      setPolledSnapshot(nextSnapshot);
+      executeSubscription();
+    },
+  });
+
+  useEffect(() => {
+    if (connectionState.status === "connected") {
+      setPolledSnapshot(undefined);
+    }
+  }, [connectionState.status]);
+
+  const snapshot = data ?? polledSnapshot ?? queryData;
   const liveData = useMemo(
     () => ({
       jobs: snapshot?.jobs ?? [],
       speed: snapshot?.metrics?.currentDownloadSpeed ?? 0,
       isPaused: snapshot?.isPaused ?? false,
+      connection: {
+        status: connectionState.status,
+        isDisconnected: connectionState.status === "disconnected",
+        isPolling: reconnectPolling.isPolling,
+      },
     }),
-    [snapshot],
+    [connectionState.status, reconnectPolling.isPolling, snapshot],
   );
+  const disconnectBannerMessage = liveData.connection.isPolling
+    ? t("connection.pollingBody")
+    : t("connection.retryingBody");
 
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
@@ -151,6 +202,14 @@ export function Layout() {
         <div className="mx-auto w-full max-w-[1587px] px-3 py-3 sm:px-4 sm:py-4">
           <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
             <div className="pointer-events-none absolute inset-x-0 top-0 h-56 bg-gradient-to-br from-primary/10 via-transparent to-transparent" />
+            {liveData.connection.isDisconnected ? (
+              <div className="relative z-20">
+                <DisconnectBanner
+                  title={t("connection.disconnectedTitle")}
+                  message={disconnectBannerMessage}
+                />
+              </div>
+            ) : null}
             <div className="relative grid min-h-[calc(100vh-1.5rem)] md:grid-cols-[224px_minmax(0,1fr)]">
               <aside className="hidden border-r border-border/60 bg-background/90 md:flex md:flex-col">
                 <div className="flex items-center justify-between border-b border-border/60 px-4 py-4">

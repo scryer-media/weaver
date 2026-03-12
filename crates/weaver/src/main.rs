@@ -221,6 +221,7 @@ async fn run_download(
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     detect_server_capabilities(config, db).await;
     let nntp = build_nntp_client(config);
+    let initial_global_paused = weaver_api::load_global_pause_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
     let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
@@ -281,6 +282,7 @@ async fn run_download(
         total_connections,
         write_buf_max,
         vec![],
+        initial_global_paused,
         shared_state,
         db.clone(),
         standalone_config,
@@ -513,6 +515,7 @@ async fn run_server_command(
                                 job_id,
                                 spec,
                                 recovered.committed_segments,
+                                recovered.extracted_members,
                                 status,
                                 recovered.output_dir,
                             ));
@@ -586,6 +589,7 @@ async fn run_server_command(
     if !to_restore.is_empty() {
         info!(count = to_restore.len(), "recovering in-progress jobs");
     }
+    let initial_global_paused = weaver_api::load_global_pause_from_db(&db).await?;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.publish_jobs(initial_history.clone());
@@ -622,6 +626,7 @@ async fn run_server_command(
         total_connections,
         write_buf_max,
         initial_history,
+        initial_global_paused,
         shared_state,
         db.clone(),
         pipeline_config,
@@ -633,10 +638,17 @@ async fn run_server_command(
     });
 
     // Restore in-progress jobs from SQLite.
-    for (job_id, spec, committed, status, working_dir) in to_restore {
+    for (job_id, spec, committed, extracted_members, status, working_dir) in to_restore {
         let committed_count = committed.len();
         match handle
-            .restore_job(job_id, spec, committed, status, working_dir)
+            .restore_job(
+                job_id,
+                spec,
+                committed,
+                extracted_members,
+                status,
+                working_dir,
+            )
             .await
         {
             Ok(()) => info!(job_id = job_id.0, committed_count, "job restored"),

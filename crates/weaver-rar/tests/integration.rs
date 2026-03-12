@@ -1673,6 +1673,92 @@ fn test_rar5_encrypted_multivolume_store_streaming() {
 }
 
 #[test]
+fn test_cached_headers_resume_encrypted_out_of_order_multivolume_topology() {
+    let first = std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part1.rar")).unwrap();
+    let archive = weaver_rar::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
+    let headers = archive.serialize_headers();
+
+    let mut restored = weaver_rar::RarArchive::deserialize_headers_with_password(
+        &headers,
+        Some(TEST_PASSWORD.to_string()),
+    )
+    .unwrap();
+
+    restored
+        .add_volume(
+            2,
+            Box::new(std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part3.rar")).unwrap()),
+        )
+        .unwrap();
+
+    let pending = restored
+        .topology_members()
+        .into_iter()
+        .find(|member| member.missing_start)
+        .expect("out-of-order continuation should stay in cached topology");
+    assert_eq!(pending.volumes.first_volume, 2);
+    assert_eq!(pending.volumes.last_volume, 2);
+
+    for (volume, name) in [
+        (1usize, "rar5_enc_mv_store.part2.rar"),
+        (4usize, "rar5_enc_mv_store.part5.rar"),
+        (3usize, "rar5_enc_mv_store.part4.rar"),
+    ] {
+        restored
+            .add_volume(
+                volume,
+                Box::new(std::fs::File::open(fixture("rar5", name)).unwrap()),
+            )
+            .unwrap();
+    }
+
+    let member = restored
+        .topology_members()
+        .into_iter()
+        .find(|member| member.name == "binary.bin" && !member.missing_start)
+        .expect("resolved member should be present after all volumes arrive");
+    assert_eq!(member.volumes.first_volume, 0);
+    assert_eq!(member.volumes.last_volume, 4);
+    assert_eq!(restored.metadata().volume_count, Some(5));
+}
+
+#[test]
+fn test_cached_headers_reverse_volume_arrival_merges_without_panicking() {
+    let first = std::fs::File::open(fixture("rar5", "rar5_enc_mv_store.part1.rar")).unwrap();
+    let archive = weaver_rar::RarArchive::open_with_password(first, TEST_PASSWORD).unwrap();
+    let headers = archive.serialize_headers();
+
+    let mut restored = weaver_rar::RarArchive::deserialize_headers_with_password(
+        &headers,
+        Some(TEST_PASSWORD.to_string()),
+    )
+    .unwrap();
+
+    for (volume, name) in [
+        (4usize, "rar5_enc_mv_store.part5.rar"),
+        (3usize, "rar5_enc_mv_store.part4.rar"),
+        (2usize, "rar5_enc_mv_store.part3.rar"),
+        (1usize, "rar5_enc_mv_store.part2.rar"),
+    ] {
+        restored
+            .add_volume(
+                volume,
+                Box::new(std::fs::File::open(fixture("rar5", name)).unwrap()),
+            )
+            .unwrap();
+    }
+
+    let member = restored
+        .topology_members()
+        .into_iter()
+        .find(|member| member.name == "binary.bin" && !member.missing_start)
+        .expect("resolved member should be present after reverse arrival");
+    assert_eq!(member.volumes.first_volume, 0);
+    assert_eq!(member.volumes.last_volume, 4);
+    assert_eq!(restored.metadata().volume_count, Some(5));
+}
+
+#[test]
 #[cfg(feature = "slow-tests")]
 fn test_rar5_encrypted_wrong_password_fails() {
     let mut archive = open_single("rar5", "rar5_enc_store.rar");

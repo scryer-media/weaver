@@ -6,6 +6,7 @@ pub mod rss;
 mod runtime;
 mod submit;
 mod subscription;
+mod timeline;
 mod types;
 
 use async_graphql::Schema;
@@ -19,6 +20,7 @@ pub use backup::{
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;
 pub use rss::RssService;
+pub use runtime::load_global_pause_from_db;
 pub use submit::{SubmitNzbError, SubmittedJob, init_job_counter, submit_nzb_bytes};
 pub use subscription::SubscriptionRoot;
 pub use types::*;

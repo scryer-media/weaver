@@ -31,7 +31,7 @@ export function UploadNzbForm({
     categories,
     dragging,
     error,
-    file,
+    files,
     fileInputRef,
     fetching,
     password,
@@ -42,6 +42,7 @@ export function UploadNzbForm({
     setPassword,
     setPriority,
     handleDrop,
+    handleFiles,
     openPicker,
     submit,
     onFileInputChange,
@@ -50,7 +51,7 @@ export function UploadNzbForm({
     open,
     onSubmitted,
   });
-  const displayName = file ? formatNzbNameForDisplay(file.name) : "";
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
 
   return (
     <Card className={cn(layout === "dialog" ? "border-0 bg-transparent shadow-none" : "")}>
@@ -81,20 +82,20 @@ export function UploadNzbForm({
             ref={fileInputRef}
             type="file"
             accept=".nzb"
+            multiple
             className="hidden"
             onChange={onFileInputChange}
           />
           <UploadCloud className="mb-3 size-10 text-primary" />
-          {file ? (
+          {files.length > 0 ? (
             <>
-              <div
-                className="max-w-full text-balance break-words text-base font-medium text-foreground [overflow-wrap:anywhere]"
-                title={file.name}
-              >
-                {displayName}
+              <div className="text-base font-medium text-foreground">
+                {files.length === 1
+                  ? t("upload.selectedSingle")
+                  : t("upload.selectedMultiple", { count: files.length })}
               </div>
               <div className="mt-1 text-sm text-muted-foreground">
-                {(file.size / 1024).toFixed(1)} KB
+                {t("upload.totalSizeLabel")} {(totalBytes / 1024).toFixed(1)} KB
               </div>
               <div className="mt-2 text-xs text-muted-foreground">{t("upload.replaceHint")}</div>
             </>
@@ -105,6 +106,32 @@ export function UploadNzbForm({
             </>
           )}
         </button>
+
+        {files.length > 0 ? (
+          <div className="max-h-64 space-y-2 overflow-auto rounded-2xl border border-border/70 bg-background/70 p-3">
+            {files.map((file) => (
+              <div
+                key={`${file.name}:${file.size}:${file.lastModified}`}
+                className="flex items-start justify-between gap-3 rounded-xl border border-border/50 bg-card px-3 py-2"
+              >
+                <div className="min-w-0">
+                  <div
+                    className="max-w-full text-sm font-medium text-foreground [overflow-wrap:anywhere]"
+                    title={file.name}
+                  >
+                    {formatNzbNameForDisplay(file.name)}
+                  </div>
+                  <div className="mt-1 max-w-full text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                    {file.name}
+                  </div>
+                </div>
+                <div className="shrink-0 pt-0.5 text-xs text-muted-foreground">
+                  {(file.size / 1024).toFixed(1)} KB
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="grid gap-4 sm:grid-cols-3">
           <div className="space-y-2">
@@ -150,14 +177,26 @@ export function UploadNzbForm({
           </div>
         </div>
 
+        {files.length > 1 ? (
+          <div className="text-sm text-muted-foreground">{t("upload.sharedSettingsHint")}</div>
+        ) : null}
+
         {error ? (
           <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
             {error}
           </div>
         ) : null}
 
+        {files.length > 0 ? (
+          <div className="flex justify-start">
+            <Button variant="ghost" onClick={() => handleFiles([])}>
+              {t("upload.clearSelection")}
+            </Button>
+          </div>
+        ) : null}
+
         <div className="flex justify-end">
-          <Button disabled={!file || fetching} onClick={() => void submit()}>
+          <Button disabled={files.length === 0 || fetching} onClick={() => void submit()}>
             {fetching ? t("action.uploading") : t("action.submit")}
           </Button>
         </div>

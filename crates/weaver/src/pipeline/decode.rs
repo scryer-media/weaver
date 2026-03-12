@@ -3,6 +3,74 @@ use std::time::Instant;
 use super::*;
 
 impl Pipeline {
+    pub(super) async fn flush_quiescent_write_backlog(&mut self) {
+        if self.active_downloads > 0
+            || !self.pending_decode.is_empty()
+            || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
+        {
+            return;
+        }
+
+        let stalled_jobs: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter_map(|(job_id, state)| {
+                if is_terminal_status(&state.status) || !state.download_queue.is_empty() {
+                    return None;
+                }
+                let has_buffered_segments = self
+                    .write_buffers
+                    .keys()
+                    .any(|file_id| file_id.job_id == *job_id);
+                has_buffered_segments.then_some(*job_id)
+            })
+            .collect();
+
+        for job_id in stalled_jobs {
+            let file_ids: Vec<NzbFileId> = self
+                .write_buffers
+                .keys()
+                .copied()
+                .filter(|file_id| file_id.job_id == job_id)
+                .collect();
+
+            if file_ids.is_empty() {
+                continue;
+            }
+
+            info!(
+                job_id = job_id.0,
+                files = file_ids.len(),
+                "flushing quiescent write backlog"
+            );
+
+            for file_id in file_ids {
+                loop {
+                    let candidate = self
+                        .write_buffers
+                        .get_mut(&file_id)
+                        .and_then(WriteReorderBuffer::take_oldest_buffered);
+                    let Some((offset, segment)) = candidate else {
+                        self.remove_empty_write_buffer(file_id);
+                        break;
+                    };
+
+                    if let Err(e) = self
+                        .persist_out_of_order_segment(file_id, offset, segment)
+                        .await
+                    {
+                        warn!(
+                            file_id = %file_id,
+                            error = %e,
+                            "failed to flush quiescent buffered segment"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Handle a completed decode — persist the segment, update assembly, journal.
     pub(super) async fn handle_decode_done(&mut self, result: DecodeDone) {
         self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
@@ -239,7 +307,21 @@ impl Pipeline {
             .write_buffers
             .get(&file_id)
             .is_some_and(WriteReorderBuffer::is_empty);
-        if should_remove {
+        if !should_remove {
+            return;
+        }
+
+        let file_complete = self.jobs.get(&file_id.job_id).is_none_or(|state| {
+            state
+                .assembly
+                .file(file_id)
+                .is_none_or(weaver_assembly::FileAssembly::is_complete)
+        });
+
+        // Preserve the per-file write cursor until the file is actually complete.
+        // Otherwise a long in-order file resets to cursor 0 after every drain and
+        // leaves its tail permanently buffered behind the max-pending window.
+        if file_complete {
             self.write_buffers.remove(&file_id);
         }
     }

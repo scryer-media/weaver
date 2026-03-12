@@ -31,6 +31,77 @@ pub struct HistoryFilter {
 }
 
 impl Database {
+    pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                        failed_bytes, health, category, output_dir, nzb_path,
+                        created_at, completed_at, metadata
+                 FROM job_history
+                 WHERE job_id = ?1
+                 LIMIT 1",
+            )
+            .map_err(|e| StateError::Database(e.to_string()))?;
+
+        let mut rows = stmt
+            .query([job_id as i64])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+
+        let Some(row) = rows
+            .next()
+            .map_err(|e| StateError::Database(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(JobHistoryRow {
+            job_id: row
+                .get::<_, i64>(0)
+                .map_err(|e| StateError::Database(e.to_string()))? as u64,
+            name: row
+                .get(1)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            status: row
+                .get(2)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            error_message: row
+                .get(3)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            total_bytes: row
+                .get::<_, i64>(4)
+                .map_err(|e| StateError::Database(e.to_string()))? as u64,
+            downloaded_bytes: row
+                .get::<_, i64>(5)
+                .map_err(|e| StateError::Database(e.to_string()))?
+                as u64,
+            failed_bytes: row
+                .get::<_, i64>(6)
+                .map_err(|e| StateError::Database(e.to_string()))? as u64,
+            health: row
+                .get(7)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            category: row
+                .get(8)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            output_dir: row
+                .get(9)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            nzb_path: row
+                .get(10)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            created_at: row
+                .get(11)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            completed_at: row
+                .get(12)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            metadata: row
+                .get(13)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+        }))
+    }
+
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
@@ -186,6 +257,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.nzb");
         assert_eq!(entries[0].total_bytes, 1_000_000);
+        assert_eq!(db.get_job_history(1).unwrap().unwrap().name, "test.nzb");
     }
 
     #[test]

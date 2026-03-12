@@ -29,6 +29,7 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "active_extracted",
     "active_extraction_chunks",
     "active_archive_headers",
+    "active_rar_volume_facts",
     "active_volume_status",
 ];
 

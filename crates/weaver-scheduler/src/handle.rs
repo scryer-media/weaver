@@ -1,9 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use weaver_core::event::PipelineEvent;
@@ -85,6 +85,7 @@ pub enum SchedulerCommand {
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        extracted_members: HashSet<String>,
         status: JobStatus,
         working_dir: PathBuf,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
@@ -221,6 +222,7 @@ impl SchedulerHandle {
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        extracted_members: HashSet<String>,
         status: JobStatus,
         working_dir: PathBuf,
     ) -> Result<(), SchedulerError> {
@@ -230,6 +232,7 @@ impl SchedulerHandle {
                 job_id,
                 spec,
                 committed_segments,
+                extracted_members,
                 status,
                 working_dir,
                 reply: tx,

@@ -4,11 +4,13 @@
 //! archives, volumes can be added incrementally as they become available.
 
 mod cache;
+mod facts;
 mod member;
 mod parse;
 mod volume;
 
 pub use cache::CachedArchiveHeaders;
+pub use facts::{RarVolumeFacts, RarVolumeMemberFacts};
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -22,7 +24,8 @@ use crate::limits::Limits;
 use crate::progress::ProgressHandler;
 use crate::signature;
 use crate::types::{
-    ArchiveFormat, ArchiveMetadata, CompressionMethod, FileHash, MemberInfo, VolumeSpan,
+    ArchiveFormat, ArchiveMetadata, CompressionMethod, FileHash, MemberInfo, TopologyMemberInfo,
+    VolumeSpan,
 };
 use crate::volume::VolumeProvider;
 use crate::volume::VolumeSet;
@@ -227,6 +230,50 @@ impl RarArchive {
             volume_count: self.volume_set.expected_count(),
             members,
         }
+    }
+
+    /// Return member spans for topology building, including unresolved
+    /// continuation entries whose starting header has not arrived yet.
+    pub fn topology_members(&self) -> Vec<TopologyMemberInfo> {
+        self.members
+            .iter()
+            .map(|entry| TopologyMemberInfo {
+                name: crate::path::sanitize_path(&entry.file_header.name),
+                unpacked_size: entry.file_header.unpacked_size,
+                is_directory: entry.file_header.is_directory,
+                volumes: VolumeSpan {
+                    first_volume: entry.segments.first().map(|s| s.volume_index).unwrap_or(0),
+                    last_volume: entry.segments.last().map(|s| s.volume_index).unwrap_or(0),
+                },
+                missing_start: entry.file_header.split_before && entry.segments.len() == 1,
+            })
+            .collect()
+    }
+
+    /// Return the set of volumes already integrated into this archive view.
+    pub fn present_volumes(&self) -> Vec<usize> {
+        self.volume_set
+            .presence()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, present)| present.then_some(idx))
+            .collect()
+    }
+
+    /// Return whether a specific volume index is already integrated.
+    pub fn has_volume(&self, volume: usize) -> bool {
+        self.volume_set.is_present(volume)
+    }
+
+    /// Attach a reader for a volume already known to the archive topology.
+    ///
+    /// This is used when restoring a cached header snapshot after some early
+    /// source volumes were eagerly deleted. Topology still comes from the
+    /// cached headers; the attached reader just makes the remaining on-disk
+    /// volume available for extraction and readiness checks.
+    pub fn attach_volume_reader(&mut self, volume: usize, reader: Box<dyn ReadSeek>) {
+        self.volume_set.add_volume(volume);
+        self.store_volume_reader(volume, reader);
     }
 
     /// List all member names.

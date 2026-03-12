@@ -48,6 +48,12 @@ pub enum PipelineEvent {
         raw_size: u32,
     },
 
+    /// A job started an active article download pass.
+    DownloadStarted { job_id: JobId },
+
+    /// A job finished an active article download pass.
+    DownloadFinished { job_id: JobId },
+
     /// Article not found on any configured server.
     ArticleNotFound { segment_id: SegmentId },
 
@@ -110,6 +116,12 @@ pub enum PipelineEvent {
     /// PAR2 metadata was parsed, enabling verification.
     Par2MetadataLoaded { job_id: JobId },
 
+    /// Job-level PAR2 verification started.
+    JobVerificationStarted { job_id: JobId },
+
+    /// Job-level PAR2 verification completed.
+    JobVerificationComplete { job_id: JobId, passed: bool },
+
     /// Updated repair confidence after verification.
     RepairConfidenceUpdated {
         job_id: JobId,
@@ -132,12 +144,64 @@ pub enum PipelineEvent {
     /// Archive extraction is ready to begin.
     ExtractionReady { job_id: JobId },
 
+    /// A specific archive member started extraction work.
+    ExtractionMemberStarted {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+    },
+
+    /// A specific archive member is blocked waiting for another RAR volume.
+    ExtractionMemberWaitingStarted {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+        volume_index: usize,
+    },
+
+    /// A specific archive member resumed after a blocking volume wait.
+    ExtractionMemberWaitingFinished {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+        volume_index: usize,
+    },
+
+    /// A specific archive member started append/concat finalization.
+    ExtractionMemberAppendStarted {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+    },
+
+    /// A specific archive member finished append/concat finalization.
+    ExtractionMemberAppendFinished {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+    },
+
     /// Progress on extracting a single archive member.
     ExtractionProgress {
         job_id: JobId,
         member: String,
         bytes_written: u64,
         total_bytes: u64,
+    },
+
+    /// A specific archive member finished extraction successfully.
+    ExtractionMemberFinished {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+    },
+
+    /// A specific archive member failed extraction or CRC validation.
+    ExtractionMemberFailed {
+        job_id: JobId,
+        set_name: String,
+        member: String,
+        error: String,
     },
 
     /// All archive members extracted.
@@ -149,6 +213,12 @@ pub enum PipelineEvent {
     // ---- File classification (discovered during download) ----
     /// A file's role was identified or updated.
     FileClassified { file_id: NzbFileId, role: FileRole },
+
+    /// Final move from intermediate to complete has started.
+    MoveToCompleteStarted { job_id: JobId },
+
+    /// Final move from intermediate to complete finished successfully.
+    MoveToCompleteFinished { job_id: JobId },
 }
 
 /// Result of verifying a file against PAR2 checksums.

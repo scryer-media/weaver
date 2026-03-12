@@ -169,8 +169,6 @@ impl Pipeline {
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
         }
-        // Cancel any active streaming extractions so providers aren't orphaned.
-        self.cancel_streaming_extraction(job_id);
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);
         self.recovery_block_counts.remove(&job_id);
@@ -178,6 +176,9 @@ impl Pipeline {
         self.eagerly_deleted.remove(&job_id);
         self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
         self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.rar_header_snapshots
+            .retain(|(jid, _), _| *jid != job_id);
+        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
         self.clear_job_write_backlog(job_id);
         self.record_job_history(job_id);

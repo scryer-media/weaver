@@ -21,7 +21,7 @@ pub use events::JobEvent;
 pub use history::{HistoryFilter, JobHistoryRow};
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// SQLite-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
@@ -189,6 +189,14 @@ impl Database {
                 PRIMARY KEY (job_id, set_name)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS active_rar_volume_facts (
+                job_id      INTEGER NOT NULL,
+                set_name    TEXT NOT NULL,
+                volume_index INTEGER NOT NULL,
+                facts_blob  BLOB NOT NULL,
+                PRIMARY KEY (job_id, set_name, volume_index)
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS active_volume_status (
                 job_id       INTEGER NOT NULL,
                 set_name     TEXT NOT NULL,
@@ -322,12 +330,17 @@ impl Database {
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(6) => {
-                // v6→v8: RSS + categories tables are created above.
+                // v6→v9: RSS + categories + RAR facts tables are created above.
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(7) => {
-                // v7→v8: categories table created above via IF NOT EXISTS.
+                // v7→v9: categories + RAR facts tables created above via IF NOT EXISTS.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(8) => {
+                // v8→v9: RAR volume facts table created above via IF NOT EXISTS.
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }

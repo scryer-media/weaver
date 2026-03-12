@@ -23,6 +23,7 @@ pub enum ArchiveType {
 }
 
 /// Archive topology for extraction readiness.
+#[derive(Debug, Clone)]
 pub struct ArchiveTopology {
     /// What kind of archive this topology describes.
     pub archive_type: ArchiveType,
@@ -34,6 +35,9 @@ pub struct ArchiveTopology {
     pub expected_volume_count: Option<u32>,
     /// Archive members and which volumes they span.
     pub members: Vec<ArchiveMember>,
+    /// Volumes occupied by continuation entries whose starting header has not
+    /// arrived yet. These spans must never be considered deletable.
+    pub unresolved_spans: Vec<ArchivePendingSpan>,
 }
 
 impl ArchiveTopology {
@@ -43,9 +47,16 @@ impl ArchiveTopology {
     pub fn deletable_volumes(&self, extracted: &HashSet<String>) -> HashSet<u32> {
         // For each volume, check if ALL members spanning it have been extracted.
         // A volume is deletable only when no unextracted member needs it.
-        let max_vol = self
-            .expected_volume_count
-            .unwrap_or_else(|| self.volume_map.values().max().copied().map_or(0, |v| v + 1));
+        let max_vol = self.expected_volume_count.unwrap_or_else(|| {
+            let map_max = self.volume_map.values().max().copied().map_or(0, |v| v + 1);
+            let unresolved_max = self
+                .unresolved_spans
+                .iter()
+                .map(|span| span.last_volume + 1)
+                .max()
+                .unwrap_or(0);
+            map_max.max(unresolved_max)
+        });
 
         let mut deletable: HashSet<u32> = (0..max_vol).collect();
 
@@ -58,11 +69,18 @@ impl ArchiveTopology {
             }
         }
 
+        for span in &self.unresolved_spans {
+            for v in span.first_volume..=span.last_volume {
+                deletable.remove(&v);
+            }
+        }
+
         deletable
     }
 }
 
 /// A member (file) within an archive set.
+#[derive(Debug, Clone)]
 pub struct ArchiveMember {
     pub name: String,
     /// First volume this member starts in.
@@ -71,6 +89,13 @@ pub struct ArchiveMember {
     pub last_volume: u32,
     /// Unpacked size in bytes.
     pub unpacked_size: u64,
+}
+
+/// A protected span whose starting member header has not been observed yet.
+#[derive(Debug, Clone)]
+pub struct ArchivePendingSpan {
+    pub first_volume: u32,
+    pub last_volume: u32,
 }
 
 /// Whether the job's archives are ready for extraction.
@@ -221,7 +246,7 @@ impl JobAssembly {
         // If we know the expected volume count, check for missing volumes.
         if let Some(expected) = topo.expected_volume_count {
             let all_complete = (0..expected).all(|v| topo.complete_volumes.contains(&v));
-            if all_complete {
+            if all_complete && topo.unresolved_spans.is_empty() {
                 return ExtractionReadiness::Ready;
             }
         } else if !topo.members.is_empty() {
@@ -231,10 +256,16 @@ impl JobAssembly {
                 .map(|m| m.last_volume)
                 .max()
                 .unwrap_or(0);
+            let max_from_unresolved = topo
+                .unresolved_spans
+                .iter()
+                .map(|span| span.last_volume)
+                .max()
+                .unwrap_or(0);
             let max_from_map = topo.volume_map.values().max().copied().unwrap_or(0);
-            let max_volume = max_from_members.max(max_from_map);
+            let max_volume = max_from_members.max(max_from_map).max(max_from_unresolved);
             let all_complete = (0..=max_volume).all(|v| topo.complete_volumes.contains(&v));
-            if all_complete {
+            if all_complete && topo.unresolved_spans.is_empty() {
                 return ExtractionReadiness::Ready;
             }
         }
@@ -253,12 +284,19 @@ impl JobAssembly {
             }
         }
 
-        if waiting.is_empty() && !extractable.is_empty() {
+        if waiting.is_empty() && !extractable.is_empty() && topo.unresolved_spans.is_empty() {
             ExtractionReadiness::Ready
         } else if !extractable.is_empty() {
+            if !topo.unresolved_spans.is_empty() {
+                waiting.push("archive topology continuation".into());
+            }
             ExtractionReadiness::Partial {
                 extractable,
                 waiting_on: waiting,
+            }
+        } else if !topo.unresolved_spans.is_empty() {
+            ExtractionReadiness::Blocked {
+                reason: "archive topology incomplete".into(),
             }
         } else {
             ExtractionReadiness::Blocked {

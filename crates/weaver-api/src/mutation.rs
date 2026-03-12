@@ -61,6 +61,14 @@ impl MutationRoot {
         )
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        if let Ok(info) = handle.get_job(submitted.job_id) {
+            return Ok(Job::from(&info));
+        }
+        tokio::task::yield_now().await;
+        if let Ok(info) = handle.get_job(submitted.job_id) {
+            return Ok(Job::from(&info));
+        }
+
         let original_title = original_release_title(&submitted.spec.name, &submitted.spec.metadata);
         let display_title = derive_release_name(Some(&original_title), Some(&submitted.spec.name));
         let parsed_release = crate::types::ParsedRelease::from(parse_job_release(
@@ -783,6 +791,32 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(RssSyncReport::from_domain(&report))
+    }
+
+    /// Forget one seen RSS item so it can be reconsidered on a future sync.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_rss_seen_item(
+        &self,
+        ctx: &Context<'_>,
+        feed_id: u32,
+        item_id: String,
+    ) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.delete_rss_seen_item(feed_id, &item_id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Clear seen RSS items, either globally or for one feed.
+    #[graphql(guard = "AdminGuard")]
+    async fn clear_rss_seen_items(&self, ctx: &Context<'_>, feed_id: Option<u32>) -> Result<u32> {
+        let db = ctx.data::<Database>()?.clone();
+        let cleared = tokio::task::spawn_blocking(move || db.clear_rss_seen_items(feed_id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(cleared as u32)
     }
 }
 

@@ -6,7 +6,8 @@ pub mod write_buffer;
 pub use error::AssemblyError;
 pub use file_assembly::{CommitResult, FileAssembly};
 pub use job_assembly::{
-    ArchiveMember, ArchiveTopology, ArchiveType, ExtractionReadiness, JobAssembly,
+    ArchiveMember, ArchivePendingSpan, ArchiveTopology, ArchiveType, ExtractionReadiness,
+    JobAssembly,
 };
 
 #[cfg(test)]
@@ -332,6 +333,7 @@ mod tests {
                 last_volume: 0,
                 unpacked_size: 1_000_000,
             }],
+            unresolved_spans: vec![],
         };
         job.set_archive_topology("test".into(), topo);
 
@@ -381,6 +383,7 @@ mod tests {
                     unpacked_size: 2000,
                 },
             ],
+            unresolved_spans: vec![],
         };
         job.set_archive_topology("test".into(), topo);
 
@@ -419,6 +422,7 @@ mod tests {
                 last_volume: 0,
                 unpacked_size: 1_000_000,
             }],
+            unresolved_spans: vec![],
         };
         job.set_archive_topology("test".into(), topo);
 
@@ -443,6 +447,7 @@ mod tests {
                 last_volume: 2,
                 unpacked_size: 3000,
             }],
+            unresolved_spans: vec![],
         };
         job.set_archive_topology("test".into(), topo);
 
@@ -489,6 +494,7 @@ mod tests {
                     unpacked_size: 1000,
                 },
             ],
+            unresolved_spans: vec![],
         };
 
         let extracted: HashSet<String> = ["E01.mkv".to_string()].into_iter().collect();
@@ -516,5 +522,51 @@ mod tests {
             topo.deletable_volumes(&extracted),
             [0u32, 1u32, 2u32, 3u32].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn unresolved_spans_block_deletion_and_ready_state() {
+        let topo = ArchiveTopology {
+            archive_type: ArchiveType::Rar,
+            volume_map: [
+                ("show.part01.rar".into(), 0),
+                ("show.part02.rar".into(), 1),
+                ("show.part03.rar".into(), 2),
+                ("show.part04.rar".into(), 3),
+            ]
+            .into_iter()
+            .collect(),
+            complete_volumes: [0, 1, 2, 3].into_iter().collect(),
+            expected_volume_count: Some(4),
+            members: vec![ArchiveMember {
+                name: "E01.mkv".into(),
+                first_volume: 0,
+                last_volume: 1,
+                unpacked_size: 1000,
+            }],
+            unresolved_spans: vec![ArchivePendingSpan {
+                first_volume: 3,
+                last_volume: 3,
+            }],
+        };
+
+        let extracted: HashSet<String> = ["E01.mkv".to_string()].into_iter().collect();
+        assert_eq!(
+            topo.deletable_volumes(&extracted),
+            [0u32, 1u32, 2u32].into_iter().collect()
+        );
+
+        let mut job = JobAssembly::new(JobId(1));
+        job.set_archive_topology("show".into(), topo);
+        match job.set_extraction_readiness("show") {
+            ExtractionReadiness::Partial {
+                extractable,
+                waiting_on,
+            } => {
+                assert_eq!(extractable, vec!["E01.mkv"]);
+                assert_eq!(waiting_on, vec!["archive topology continuation"]);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 }

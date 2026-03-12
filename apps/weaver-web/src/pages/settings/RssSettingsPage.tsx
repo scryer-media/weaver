@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
+import { formatBytes } from "@/components/SpeedDisplay";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,7 +22,9 @@ import { Switch } from "@/components/ui/switch";
 import {
   ADD_RSS_FEED_MUTATION,
   ADD_RSS_RULE_MUTATION,
+  CLEAR_RSS_SEEN_ITEMS_MUTATION,
   DELETE_RSS_FEED_MUTATION,
+  DELETE_RSS_SEEN_ITEM_MUTATION,
   DELETE_RSS_RULE_MUTATION,
   RSS_SETTINGS_QUERY,
   RUN_RSS_SYNC_MUTATION,
@@ -98,7 +102,21 @@ type RssSyncReport = {
 
 type RssSettingsData = {
   rssFeeds: RssFeed[];
+  rssSeenItems: RssSeenItem[];
   categories: Category[];
+};
+
+type RssSeenItem = {
+  feedId: number;
+  itemId: string;
+  itemTitle: string;
+  publishedAt: number | null;
+  sizeBytes: number | null;
+  decision: string;
+  seenAt: number;
+  jobId: number | null;
+  itemUrl: string | null;
+  error: string | null;
 };
 
 type FeedFormValues = {
@@ -162,6 +180,8 @@ export function RssSettingsPage() {
   const [, addRule] = useMutation(ADD_RSS_RULE_MUTATION);
   const [, updateRule] = useMutation(UPDATE_RSS_RULE_MUTATION);
   const [, deleteRule] = useMutation(DELETE_RSS_RULE_MUTATION);
+  const [, deleteSeenItem] = useMutation(DELETE_RSS_SEEN_ITEM_MUTATION);
+  const [, clearSeenItems] = useMutation(CLEAR_RSS_SEEN_ITEMS_MUTATION);
   const [runSyncState, runSync] = useMutation(RUN_RSS_SYNC_MUTATION);
 
   const feeds = useMemo(
@@ -175,6 +195,19 @@ export function RssSettingsPage() {
     () => [...(data?.categories ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
     [data?.categories],
   );
+  const seenItemsByFeed = useMemo(() => {
+    const grouped = new Map<number, RssSeenItem[]>();
+    for (const item of data?.rssSeenItems ?? []) {
+      const existing = grouped.get(item.feedId);
+      if (existing) {
+        existing.push(item);
+      } else {
+        grouped.set(item.feedId, [item]);
+      }
+    }
+    return grouped;
+  }, [data?.rssSeenItems]);
+  const totalSeenItems = data?.rssSeenItems?.length ?? 0;
 
   const [editingFeed, setEditingFeed] = useState<RssFeed | null>(null);
   const [showFeedForm, setShowFeedForm] = useState(false);
@@ -186,6 +219,7 @@ export function RssSettingsPage() {
     feedId: number;
     ruleId: number;
   } | null>(null);
+  const [clearSeenTarget, setClearSeenTarget] = useState<number | "all" | null>(null);
   const [syncTarget, setSyncTarget] = useState<number | "all" | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -320,6 +354,33 @@ export function RssSettingsPage() {
     refresh();
   };
 
+  const handleForgetSeenItem = async (item: RssSeenItem) => {
+    resetFeedback();
+    const result = await deleteSeenItem({ feedId: item.feedId, itemId: item.itemId });
+    if (result.error) {
+      setErrorMessage(result.error.message);
+      return;
+    }
+    setNotice(t("rss.seenItemForgotten"));
+    refresh();
+  };
+
+  const handleClearSeenItems = async (feedId?: number) => {
+    resetFeedback();
+    const result = await clearSeenItems({ feedId: feedId ?? null });
+    if (result.error) {
+      setErrorMessage(result.error.message);
+      return;
+    }
+    setClearSeenTarget(null);
+    setNotice(
+      t("rss.seenHistoryCleared", {
+        count: result.data?.clearRssSeenItems ?? 0,
+      }),
+    );
+    refresh();
+  };
+
   const handleRunSync = async (feedId?: number) => {
     resetFeedback();
     setSyncTarget(feedId ?? "all");
@@ -343,6 +404,13 @@ export function RssSettingsPage() {
         description={t("settings.rssDesc")}
         actions={
           <>
+            <Button
+              variant="outline"
+              onClick={() => setClearSeenTarget("all")}
+              disabled={totalSeenItems === 0}
+            >
+              {t("rss.clearAllSeen")}
+            </Button>
             <Button
               variant="outline"
               onClick={() => void handleRunSync()}
@@ -437,6 +505,14 @@ export function RssSettingsPage() {
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => openAddRule(feed.id)}>
                   {t("rss.addRule")}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setClearSeenTarget(feed.id)}
+                  disabled={(seenItemsByFeed.get(feed.id)?.length ?? 0) === 0}
+                >
+                  {t("rss.clearSeen")}
                 </Button>
                 <Button variant="ghost" size="sm" onClick={() => openEditFeed(feed)}>
                   {t("action.edit")}
@@ -546,6 +622,11 @@ export function RssSettingsPage() {
                   ))}
               </div>
             )}
+
+            <SeenItemsCard
+              items={seenItemsByFeed.get(feed.id) ?? []}
+              onForget={handleForgetSeenItem}
+            />
           </CardContent>
         </Card>
       ))}
@@ -570,6 +651,23 @@ export function RssSettingsPage() {
           deleteRuleTarget != null && void handleDeleteRule(deleteRuleTarget.ruleId)
         }
         onCancel={() => setDeleteRuleTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={clearSeenTarget != null}
+        title={t("confirm.clearRssSeen")}
+        message={
+          clearSeenTarget === "all"
+            ? t("confirm.clearRssSeenMessageAll")
+            : t("confirm.clearRssSeenMessageFeed")
+        }
+        confirmLabel={t("confirm.clearRssSeenConfirm")}
+        cancelLabel={t("confirm.clearRssSeenDismiss")}
+        onConfirm={() =>
+          clearSeenTarget != null &&
+          void handleClearSeenItems(clearSeenTarget === "all" ? undefined : clearSeenTarget)
+        }
+        onCancel={() => setClearSeenTarget(null)}
       />
     </div>
   );
@@ -1053,6 +1151,105 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
   );
 }
 
+function SeenItemsCard({
+  items,
+  onForget,
+}: {
+  items: RssSeenItem[];
+  onForget: (item: RssSeenItem) => Promise<void> | void;
+}) {
+  const t = useTranslate();
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-foreground">{t("rss.seenHistory")}</div>
+          <div className="text-xs text-muted-foreground">{t("rss.seenHistoryDesc")}</div>
+        </div>
+        {items.length > 0 ? <Badge variant="outline">{items.length}</Badge> : null}
+      </div>
+
+      {items.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-border/80 px-4 py-6 text-sm text-muted-foreground">
+          <div className="font-medium text-foreground">{t("rss.noSeenItems")}</div>
+          <p className="mt-1">{t("rss.noSeenItemsHint")}</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {items.slice(0, 8).map((item) => (
+            <div
+              key={`${item.feedId}:${item.itemId}`}
+              className="rounded-2xl border border-border/70 bg-card px-4 py-4"
+            >
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div className="min-w-0 space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={decisionVariant(item.decision)}>
+                      {formatDecision(item.decision, t)}
+                    </Badge>
+                    {item.jobId ? (
+                      <Link
+                        to={`/jobs/${item.jobId}`}
+                        className="text-sm font-medium text-primary hover:underline"
+                      >
+                        {t("rss.jobId")} #{item.jobId}
+                      </Link>
+                    ) : null}
+                  </div>
+
+                  <div>
+                    <div className="text-sm font-medium text-foreground">{item.itemTitle}</div>
+                    <div className="mt-1 break-all text-xs text-muted-foreground">
+                      {item.itemId}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    <DetailCard label={t("rss.seenAt")}>
+                      {formatTimestamp(item.seenAt) ?? t("rss.never")}
+                    </DetailCard>
+                    <DetailCard label={t("rss.publishedAt")}>
+                      {formatTimestamp(item.publishedAt) ?? t("rss.none")}
+                    </DetailCard>
+                    <DetailCard label={t("rss.itemSize")}>
+                      {item.sizeBytes != null ? formatBytes(item.sizeBytes) : t("rss.none")}
+                    </DetailCard>
+                    <DetailCard label={t("rss.itemUrl")}>
+                      {item.itemUrl ? (
+                        <a
+                          href={item.itemUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-primary hover:underline"
+                        >
+                          {t("rss.openLink")}
+                        </a>
+                      ) : (
+                        t("rss.none")
+                      )}
+                    </DetailCard>
+                  </div>
+
+                  {item.error ? (
+                    <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-3 text-sm text-destructive">
+                      {item.error}
+                    </div>
+                  ) : null}
+                </div>
+
+                <Button variant="ghost" size="sm" onClick={() => void onForget(item)}>
+                  {t("rss.forgetSeen")}
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MetadataEditor({
   entries,
   label,
@@ -1209,4 +1406,34 @@ function formatTimestamp(value: number | null) {
     return null;
   }
   return new Date(value).toLocaleString();
+}
+
+function decisionVariant(decision: string) {
+  switch (decision) {
+    case "submitted":
+      return "success" as const;
+    case "accepted":
+      return "info" as const;
+    case "rejected":
+      return "destructive" as const;
+    case "error":
+      return "warning" as const;
+    default:
+      return "muted" as const;
+  }
+}
+
+function formatDecision(decision: string, t: ReturnType<typeof useTranslate>) {
+  switch (decision) {
+    case "submitted":
+      return t("rss.decisionSubmitted");
+    case "accepted":
+      return t("rss.decisionAccepted");
+    case "rejected":
+      return t("rss.decisionRejected");
+    case "error":
+      return t("rss.decisionError");
+    default:
+      return t("rss.decisionIgnored");
+  }
 }

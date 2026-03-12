@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JobProgress } from "@/components/JobProgress";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { PageHeader } from "@/components/PageHeader";
+import { PipelineTimelineCard } from "@/components/PipelineTimelineCard";
 import { ParsedReleaseDetails } from "@/components/ParsedReleaseDetails";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
@@ -28,6 +29,7 @@ import {
 } from "@/graphql/queries";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 
 interface EventEntry {
   kind: string;
@@ -42,9 +44,13 @@ export function JobDetail() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const { jobs: liveJobs } = useLiveData();
+  const { jobs: liveJobs, connection } = useLiveData();
+  const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
 
-  const [{ data, fetching }] = useQuery({ query: JOB_QUERY, variables: { id: jobId } });
+  const [{ data, fetching }, reexecuteJobQuery] = useQuery({
+    query: JOB_QUERY,
+    variables: queryVariables,
+  });
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
@@ -55,14 +61,24 @@ export function JobDetail() {
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [lastLiveJob, setLastLiveJob] = useState<(typeof liveJobs)[number] | null>(null);
+  const [polledData, setPolledData] = useState<typeof data>();
   const seededRef = useRef(false);
+  const lastTimelineRefreshRef = useRef(0);
   const liveJob = liveJobs.find((candidate) => candidate.id === jobId) ?? null;
+  const jobQueryData = polledData ?? data;
 
   useEffect(() => {
     setLastLiveJob(null);
     seededRef.current = false;
     setEvents([]);
+    setPolledData(undefined);
   }, [jobId]);
+
+  useEffect(() => {
+    if (!connection.isDisconnected) {
+      setPolledData(undefined);
+    }
+  }, [connection.isDisconnected]);
 
   useEffect(() => {
     if (liveJob) {
@@ -71,10 +87,14 @@ export function JobDetail() {
   }, [liveJob]);
 
   useEffect(() => {
-    if (data?.job?.id === jobId && data.jobEvents && !seededRef.current) {
+    if (jobQueryData?.job?.id !== jobId || !jobQueryData.jobEvents) {
+      return;
+    }
+
+    if (!seededRef.current || connection.isDisconnected) {
       seededRef.current = true;
       setEvents(
-        data.jobEvents
+        jobQueryData.jobEvents
           .map(
             (event: {
               kind: string;
@@ -93,7 +113,7 @@ export function JobDetail() {
           .reverse(),
       );
     }
-  }, [data?.jobEvents]);
+  }, [connection.isDisconnected, jobId, jobQueryData?.job?.id, jobQueryData?.jobEvents]);
 
   const handleSubscription = useCallback(
     (
@@ -119,20 +139,63 @@ export function JobDetail() {
         "EXTRACTION_PROGRESS",
         "REPAIR_CONFIDENCE_UPDATED",
       ]);
+      const timelineRelevant = new Set([
+        "JOB_PAUSED",
+        "JOB_RESUMED",
+        "DOWNLOAD_STARTED",
+        "DOWNLOAD_FINISHED",
+        "JOB_VERIFICATION_STARTED",
+        "JOB_VERIFICATION_COMPLETE",
+        "REPAIR_STARTED",
+        "REPAIR_COMPLETE",
+        "REPAIR_FAILED",
+        "EXTRACTION_MEMBER_STARTED",
+        "EXTRACTION_MEMBER_WAITING_STARTED",
+        "EXTRACTION_MEMBER_WAITING_FINISHED",
+        "EXTRACTION_MEMBER_APPEND_STARTED",
+        "EXTRACTION_MEMBER_APPEND_FINISHED",
+        "EXTRACTION_MEMBER_FINISHED",
+        "EXTRACTION_MEMBER_FAILED",
+        "MOVE_TO_COMPLETE_STARTED",
+        "MOVE_TO_COMPLETE_FINISHED",
+        "JOB_COMPLETED",
+        "JOB_FAILED",
+      ]);
 
       if ((event.jobId === jobId || event.jobId === null) && !noisy.has(event.kind)) {
         setEvents((current) => [{ ...event, timestamp: Date.now() }, ...current].slice(0, 500));
+        if (event.jobId === jobId && timelineRelevant.has(event.kind)) {
+          const now = Date.now();
+          if (now - lastTimelineRefreshRef.current > 250) {
+            lastTimelineRefreshRef.current = now;
+            void reexecuteJobQuery({ requestPolicy: "network-only" });
+          }
+        }
       }
 
       return [];
     },
-    [jobId],
+    [jobId, reexecuteJobQuery],
   );
 
-  useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
+  const [, executeEventsSubscription] = useSubscription(
+    { query: EVENTS_SUBSCRIPTION },
+    handleSubscription,
+  );
 
-  const queryJob = data?.job?.id === jobId ? data.job : null;
+  useReconnectPolling({
+    enabled: connection.isDisconnected && Number.isFinite(jobId),
+    query: JOB_QUERY,
+    variables: queryVariables,
+    onData: (nextData) => {
+      setPolledData(nextData);
+      executeEventsSubscription();
+    },
+  });
+
+  const queryJob = jobQueryData?.job?.id === jobId ? jobQueryData.job : null;
   const job = liveJob ?? lastLiveJob ?? queryJob;
+  const timeline = jobQueryData?.jobTimeline ?? null;
 
   if (fetching && !job) {
     return <div className="text-muted-foreground">{t("label.loading")}</div>;
@@ -226,6 +289,8 @@ export function JobDetail() {
           />
         </CardContent>
       </Card>
+
+      <PipelineTimelineCard timeline={timeline} />
 
       <Card>
         <CardHeader>

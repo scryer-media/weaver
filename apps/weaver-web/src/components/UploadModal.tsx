@@ -22,7 +22,7 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-h-[90vh] w-[min(96vw,72rem)] overflow-y-auto p-4 sm:max-w-5xl sm:p-6">
         <DialogHeader>
           <DialogTitle>{t("upload.title")}</DialogTitle>
           <DialogDescription>{t("upload.accepts")}</DialogDescription>

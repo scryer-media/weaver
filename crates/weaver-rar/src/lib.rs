@@ -34,7 +34,9 @@ pub mod vint;
 pub mod volume;
 
 // Re-export primary public API types
-pub use archive::{CachedArchiveHeaders, DataSegment, RarArchive, ReadSeek};
+pub use archive::{
+    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeMemberFacts, ReadSeek,
+};
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
 pub use extract::ExtractOptions;
@@ -44,7 +46,7 @@ pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
 pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
-    MemberInfo, VolumeSpan,
+    MemberInfo, TopologyMemberInfo, VolumeSpan,
 };
 pub use volume::{
     StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet, WaitingVolumeProvider,

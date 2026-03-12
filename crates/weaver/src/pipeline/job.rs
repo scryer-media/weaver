@@ -346,11 +346,10 @@ impl Pipeline {
         self.eagerly_deleted.remove(&job_id);
         self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
         self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.rar_header_snapshots
+            .retain(|(jid, _), _| *jid != job_id);
+        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
-        self.streaming_providers
-            .retain(|(jid, _, _), _| *jid != job_id);
-        self.streaming_volume_bases
-            .retain(|(jid, _, _), _| *jid != job_id);
         self.clear_job_write_backlog(job_id);
 
         // Add to job_order so it shows as active.
@@ -370,7 +369,7 @@ impl Pipeline {
     }
 
     /// Reload PAR2 and RAR metadata from on-disk files for a reprocessed job.
-    async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
+    async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
         // Collect file IDs and roles to avoid borrow conflicts.
         let files: Vec<(NzbFileId, weaver_core::classify::FileRole)> = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -382,6 +381,10 @@ impl Pipeline {
                 .map(|f| (f.file_id(), f.role().clone()))
                 .collect()
         };
+
+        self.par2_sets.remove(&job_id);
+        self.promoted_recovery_files.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
 
         // Load PAR2 index files first (needed before recovery volumes).
         for (file_id, role) in &files {
@@ -402,9 +405,30 @@ impl Pipeline {
                     ..
                 }
             ) {
-                self.try_merge_par2_recovery(job_id, *file_id).await;
+                if self.par2_sets.contains_key(&job_id) {
+                    self.try_merge_par2_recovery(job_id, *file_id).await;
+                } else {
+                    self.try_load_par2_metadata(job_id, *file_id).await;
+                }
             }
         }
+    }
+
+    /// Reload PAR2 and RAR metadata from on-disk files for a reprocessed job.
+    async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
+        self.restore_par2_state_from_disk(job_id).await;
+
+        // Collect file IDs and roles to avoid borrow conflicts.
+        let files: Vec<(NzbFileId, weaver_core::classify::FileRole)> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            state
+                .assembly
+                .files()
+                .map(|f| (f.file_id(), f.role().clone()))
+                .collect()
+        };
 
         // Load archive topology from RAR volume 0.
         for (file_id, role) in &files {
@@ -426,7 +450,7 @@ impl Pipeline {
     }
 
     /// Collect all segment IDs for a job spec (used to mark everything as "already downloaded").
-    fn all_segment_ids(job_id: JobId, spec: &JobSpec) -> HashSet<SegmentId> {
+    pub(super) fn all_segment_ids(job_id: JobId, spec: &JobSpec) -> HashSet<SegmentId> {
         let mut ids = HashSet::new();
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -444,11 +468,12 @@ impl Pipeline {
     }
 
     /// Restore a job from crash-recovery journal.
-    pub(super) fn restore_job(
+    pub(super) async fn restore_job(
         &mut self,
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        extracted_members: HashSet<String>,
         status: JobStatus,
         working_dir: PathBuf,
     ) -> Result<(), weaver_scheduler::SchedulerError> {
@@ -511,6 +536,11 @@ impl Pipeline {
         };
         self.jobs.insert(job_id, state);
         self.job_order.push(job_id);
+        if !extracted_members.is_empty() {
+            self.extracted_members.insert(job_id, extracted_members);
+        }
+        self.restore_par2_state_from_disk(job_id).await;
+        self.restore_rar_state_for_job(job_id).await;
 
         info!(
             job_id = job_id.0,

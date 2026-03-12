@@ -18,6 +18,10 @@ pub struct CachedArchiveHeaders {
     pub is_solid: bool,
     pub is_encrypted: bool,
     pub more_volumes: bool,
+    #[serde(default)]
+    pub volume_presence: Vec<bool>,
+    #[serde(default)]
+    pub last_volume_seen: bool,
     pub members: Vec<CachedMember>,
 }
 
@@ -67,6 +71,8 @@ impl RarArchive {
             is_solid: self.is_solid,
             is_encrypted: self.is_encrypted,
             more_volumes: self.more_volumes,
+            volume_presence: self.volume_set.presence(),
+            last_volume_seen: self.volume_set.last_volume_seen(),
             members: self
                 .members
                 .iter()
@@ -113,6 +119,15 @@ impl RarArchive {
     /// with `extract_member_streaming_chunked` which obtains volumes via a
     /// `VolumeProvider` instead of pre-loaded readers.
     pub fn from_cached_headers(cached: CachedArchiveHeaders) -> Self {
+        Self::from_cached_headers_with_password(cached, None::<String>)
+    }
+
+    /// Reconstruct a `RarArchive` from cached headers and optionally restore
+    /// the password required for parsing additional encrypted volumes.
+    pub fn from_cached_headers_with_password(
+        cached: CachedArchiveHeaders,
+        password: impl Into<Option<String>>,
+    ) -> Self {
         let format = match cached.format {
             4 => ArchiveFormat::Rar4,
             _ => ArchiveFormat::Rar5,
@@ -175,16 +190,16 @@ impl RarArchive {
             format,
             is_solid: cached.is_solid,
             is_encrypted: cached.is_encrypted,
-            volume_set: VolumeSet::default(),
+            volume_set: VolumeSet::from_presence(cached.volume_presence, cached.last_volume_seen),
             members,
-            end_reached: true,
+            end_reached: cached.last_volume_seen,
             more_volumes: cached.more_volumes,
             volumes: Vec::new(),
             solid_decoder: None,
             solid_decoder_rar4: None,
             solid_next_index: 0,
             limits: Limits::default(),
-            password: None,
+            password: password.into(),
         }
     }
 
@@ -196,7 +211,16 @@ impl RarArchive {
 
     /// Deserialize headers from MessagePack bytes and reconstruct archive.
     pub fn deserialize_headers(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        Self::deserialize_headers_with_password(data, None::<String>)
+    }
+
+    /// Deserialize headers from MessagePack bytes and restore a password for
+    /// subsequent encrypted volume parsing if needed.
+    pub fn deserialize_headers_with_password(
+        data: &[u8],
+        password: impl Into<Option<String>>,
+    ) -> Result<Self, rmp_serde::decode::Error> {
         let cached: CachedArchiveHeaders = rmp_serde::from_slice(data)?;
-        Ok(Self::from_cached_headers(cached))
+        Ok(Self::from_cached_headers_with_password(cached, password))
     }
 }

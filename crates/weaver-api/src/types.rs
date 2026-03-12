@@ -1,4 +1,5 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
+use serde::{Deserialize, Serialize};
 use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
 
 // --- API Key types ---
@@ -128,6 +129,23 @@ impl RssFeed {
             last_error: feed.last_error.clone(),
             consecutive_failures: feed.consecutive_failures,
             rules,
+        }
+    }
+}
+
+impl RssSeenItem {
+    pub fn from_row(item: &weaver_state::RssSeenItemRow) -> Self {
+        Self {
+            feed_id: item.feed_id,
+            item_id: item.item_id.clone(),
+            item_title: item.item_title.clone(),
+            published_at: item.published_at.map(|value| value as f64 * 1000.0),
+            size_bytes: item.size_bytes,
+            decision: item.decision.clone(),
+            seen_at: item.seen_at as f64 * 1000.0,
+            job_id: item.job_id,
+            item_url: item.item_url.clone(),
+            error: item.error.clone(),
         }
     }
 }
@@ -327,6 +345,20 @@ pub struct RssSyncReport {
     pub feed_results: Vec<RssFeedSyncResult>,
 }
 
+#[derive(Debug, Clone, SimpleObject)]
+pub struct RssSeenItem {
+    pub feed_id: u32,
+    pub item_id: String,
+    pub item_title: String,
+    pub published_at: Option<f64>,
+    pub size_bytes: Option<u64>,
+    pub decision: String,
+    pub seen_at: f64,
+    pub job_id: Option<u64>,
+    pub item_url: Option<String>,
+    pub error: Option<String>,
+}
+
 /// A key-value metadata entry attached to a job.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct MetadataEntry {
@@ -432,6 +464,9 @@ pub struct Metrics {
     pub download_queue_depth: u32,
     pub decode_pending: u32,
     pub commit_pending: u32,
+    pub write_buffered_bytes: u64,
+    pub write_buffered_segments: u32,
+    pub direct_write_evictions: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -440,6 +475,7 @@ pub struct Metrics {
     pub verify_active: u32,
     pub repair_active: u32,
     pub extract_active: u32,
+    pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     pub segments_failed_permanent: u64,
     pub current_download_speed: u64,
@@ -469,6 +505,31 @@ pub struct JobEvent {
     pub timestamp: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TimelineMemberSubject {
+    pub set_name: String,
+    pub member: String,
+    #[serde(default)]
+    pub volume_index: Option<usize>,
+}
+
+pub(crate) fn encode_timeline_member_subject(
+    set_name: &str,
+    member: &str,
+    volume_index: Option<usize>,
+) -> Option<String> {
+    serde_json::to_string(&TimelineMemberSubject {
+        set_name: set_name.to_string(),
+        member: member.to_string(),
+        volume_index,
+    })
+    .ok()
+}
+
+pub(crate) fn decode_timeline_member_subject(value: Option<&str>) -> Option<TimelineMemberSubject> {
+    serde_json::from_str(value?).ok()
+}
+
 /// Event categories for subscriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum EventKind {
@@ -477,6 +538,8 @@ pub enum EventKind {
     JobResumed,
     JobCompleted,
     JobFailed,
+    DownloadStarted,
+    DownloadFinished,
     ArticleDownloaded,
     ArticleNotFound,
     SegmentDecoded,
@@ -485,13 +548,24 @@ pub enum EventKind {
     FileMissing,
     VerificationStarted,
     VerificationComplete,
+    JobVerificationStarted,
+    JobVerificationComplete,
     RepairStarted,
     RepairComplete,
     RepairFailed,
     ExtractionReady,
+    ExtractionMemberStarted,
+    ExtractionMemberWaitingStarted,
+    ExtractionMemberWaitingFinished,
+    ExtractionMemberAppendStarted,
+    ExtractionMemberAppendFinished,
+    ExtractionMemberFinished,
+    ExtractionMemberFailed,
     ExtractionProgress,
     ExtractionComplete,
     ExtractionFailed,
+    MoveToCompleteStarted,
+    MoveToCompleteFinished,
     SegmentRetryScheduled,
     SegmentFailedPermanent,
     GlobalPaused,
@@ -507,6 +581,8 @@ impl std::str::FromStr for EventKind {
             "JobResumed" => Ok(Self::JobResumed),
             "JobCompleted" => Ok(Self::JobCompleted),
             "JobFailed" => Ok(Self::JobFailed),
+            "DownloadStarted" => Ok(Self::DownloadStarted),
+            "DownloadFinished" => Ok(Self::DownloadFinished),
             "ArticleDownloaded" => Ok(Self::ArticleDownloaded),
             "ArticleNotFound" => Ok(Self::ArticleNotFound),
             "SegmentDecoded" => Ok(Self::SegmentDecoded),
@@ -515,13 +591,24 @@ impl std::str::FromStr for EventKind {
             "FileMissing" => Ok(Self::FileMissing),
             "VerificationStarted" => Ok(Self::VerificationStarted),
             "VerificationComplete" => Ok(Self::VerificationComplete),
+            "JobVerificationStarted" => Ok(Self::JobVerificationStarted),
+            "JobVerificationComplete" => Ok(Self::JobVerificationComplete),
             "RepairStarted" => Ok(Self::RepairStarted),
             "RepairComplete" => Ok(Self::RepairComplete),
             "RepairFailed" => Ok(Self::RepairFailed),
             "ExtractionReady" => Ok(Self::ExtractionReady),
+            "ExtractionMemberStarted" => Ok(Self::ExtractionMemberStarted),
+            "ExtractionMemberWaitingStarted" => Ok(Self::ExtractionMemberWaitingStarted),
+            "ExtractionMemberWaitingFinished" => Ok(Self::ExtractionMemberWaitingFinished),
+            "ExtractionMemberAppendStarted" => Ok(Self::ExtractionMemberAppendStarted),
+            "ExtractionMemberAppendFinished" => Ok(Self::ExtractionMemberAppendFinished),
+            "ExtractionMemberFinished" => Ok(Self::ExtractionMemberFinished),
+            "ExtractionMemberFailed" => Ok(Self::ExtractionMemberFailed),
             "ExtractionProgress" => Ok(Self::ExtractionProgress),
             "ExtractionComplete" => Ok(Self::ExtractionComplete),
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
+            "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
+            "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),
             "SegmentFailedPermanent" => Ok(Self::SegmentFailedPermanent),
             "GlobalPaused" => Ok(Self::GlobalPaused),
@@ -529,6 +616,87 @@ impl std::str::FromStr for EventKind {
             _ => Err(()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum TimelineStage {
+    PendingDownload,
+    Downloading,
+    Paused,
+    Verifying,
+    Repairing,
+    Extracting,
+    Interrupted,
+    FinalMove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum TimelineSpanState {
+    Running,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum ExtractionMemberState {
+    Running,
+    Interrupted,
+    Complete,
+    AwaitingRepair,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum ExtractionMemberSpanKind {
+    Extracting,
+    WaitingForVolume,
+    Appending,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobTimelineSpan {
+    pub started_at: f64,
+    pub ended_at: Option<f64>,
+    pub state: TimelineSpanState,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobTimelineLane {
+    pub stage: TimelineStage,
+    pub spans: Vec<JobTimelineSpan>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ExtractionMemberTimelineSpan {
+    pub kind: ExtractionMemberSpanKind,
+    pub started_at: f64,
+    pub ended_at: Option<f64>,
+    pub state: TimelineSpanState,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ExtractionMemberTimeline {
+    pub member: String,
+    pub state: ExtractionMemberState,
+    pub error: Option<String>,
+    pub spans: Vec<ExtractionMemberTimelineSpan>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ExtractionTimelineGroup {
+    pub set_name: String,
+    pub members: Vec<ExtractionMemberTimeline>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobTimeline {
+    pub started_at: f64,
+    pub ended_at: Option<f64>,
+    pub outcome: JobStatusGql,
+    pub lanes: Vec<JobTimelineLane>,
+    pub extraction_groups: Vec<ExtractionTimelineGroup>,
 }
 
 // --- Conversion from domain types ---
@@ -641,6 +809,9 @@ impl From<&weaver_scheduler::MetricsSnapshot> for Metrics {
             download_queue_depth: m.download_queue_depth as u32,
             decode_pending: m.decode_pending as u32,
             commit_pending: m.commit_pending as u32,
+            write_buffered_bytes: m.write_buffered_bytes,
+            write_buffered_segments: m.write_buffered_segments as u32,
+            direct_write_evictions: m.direct_write_evictions,
             segments_downloaded: m.segments_downloaded,
             segments_decoded: m.segments_decoded,
             segments_committed: m.segments_committed,
@@ -649,6 +820,7 @@ impl From<&weaver_scheduler::MetricsSnapshot> for Metrics {
             verify_active: m.verify_active as u32,
             repair_active: m.repair_active as u32,
             extract_active: m.extract_active as u32,
+            disk_write_latency_us: m.disk_write_latency_us,
             segments_retried: m.segments_retried,
             segments_failed_permanent: m.segments_failed_permanent,
             current_download_speed: m.current_download_speed,
@@ -699,6 +871,18 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: error.clone(),
+            },
+            PipelineEvent::DownloadStarted { job_id } => PipelineEventGql {
+                kind: EventKind::DownloadStarted,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "download started".into(),
+            },
+            PipelineEvent::DownloadFinished { job_id } => PipelineEventGql {
+                kind: EventKind::DownloadFinished,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "download finished".into(),
             },
             PipelineEvent::ArticleDownloaded {
                 segment_id,
@@ -764,6 +948,22 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: Some(format!("{file_id}")),
                 message: format!("{status:?}"),
             },
+            PipelineEvent::JobVerificationStarted { job_id } => PipelineEventGql {
+                kind: EventKind::JobVerificationStarted,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "verification started".into(),
+            },
+            PipelineEvent::JobVerificationComplete { job_id, passed } => PipelineEventGql {
+                kind: EventKind::JobVerificationComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: if *passed {
+                    "verification passed".into()
+                } else {
+                    "verification found damage".into()
+                },
+            },
             PipelineEvent::RepairStarted { job_id } => PipelineEventGql {
                 kind: EventKind::RepairStarted,
                 job_id: Some(job_id.0),
@@ -791,6 +991,58 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: "extraction ready".into(),
             },
+            PipelineEvent::ExtractionMemberStarted {
+                job_id,
+                set_name,
+                member,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberStarted,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, None),
+                message: format!("{set_name}: {member}"),
+            },
+            PipelineEvent::ExtractionMemberWaitingStarted {
+                job_id,
+                set_name,
+                member,
+                volume_index,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberWaitingStarted,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, Some(*volume_index)),
+                message: format!("{set_name}: {member} waiting for volume {volume_index}"),
+            },
+            PipelineEvent::ExtractionMemberWaitingFinished {
+                job_id,
+                set_name,
+                member,
+                volume_index,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberWaitingFinished,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, Some(*volume_index)),
+                message: format!("{set_name}: {member} resumed with volume {volume_index}"),
+            },
+            PipelineEvent::ExtractionMemberAppendStarted {
+                job_id,
+                set_name,
+                member,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberAppendStarted,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, None),
+                message: format!("{set_name}: {member}"),
+            },
+            PipelineEvent::ExtractionMemberAppendFinished {
+                job_id,
+                set_name,
+                member,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberAppendFinished,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, None),
+                message: format!("{set_name}: {member}"),
+            },
             PipelineEvent::ExtractionProgress {
                 job_id,
                 member,
@@ -808,11 +1060,44 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 file_id: None,
                 message: "extraction complete".into(),
             },
+            PipelineEvent::ExtractionMemberFinished {
+                job_id,
+                set_name,
+                member,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberFinished,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, None),
+                message: format!("{set_name}: {member}"),
+            },
+            PipelineEvent::ExtractionMemberFailed {
+                job_id,
+                set_name,
+                member,
+                error,
+            } => PipelineEventGql {
+                kind: EventKind::ExtractionMemberFailed,
+                job_id: Some(job_id.0),
+                file_id: encode_timeline_member_subject(set_name, member, None),
+                message: format!("{set_name}: {member} — {error}"),
+            },
             PipelineEvent::ExtractionFailed { job_id, error } => PipelineEventGql {
                 kind: EventKind::ExtractionFailed,
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: error.clone(),
+            },
+            PipelineEvent::MoveToCompleteStarted { job_id } => PipelineEventGql {
+                kind: EventKind::MoveToCompleteStarted,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "move to complete started".into(),
+            },
+            PipelineEvent::MoveToCompleteFinished { job_id } => PipelineEventGql {
+                kind: EventKind::MoveToCompleteFinished,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "move to complete finished".into(),
             },
             PipelineEvent::SegmentRetryScheduled {
                 segment_id,

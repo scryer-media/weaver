@@ -2,6 +2,19 @@ use weaver_core::config::{Config, SharedConfig};
 use weaver_scheduler::SchedulerHandle;
 use weaver_state::Database;
 
+pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
+    let db = db.clone();
+    let value = tokio::task::spawn_blocking(move || db.get_setting("global_paused"))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    Ok(value
+        .as_deref()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(false))
+}
+
 pub async fn rebuild_nntp_from_config(
     config: &SharedConfig,
     handle: &SchedulerHandle,
@@ -109,6 +122,11 @@ pub async fn reload_runtime_from_db(
         .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
         .map_err(|e| e.to_string())?;
+    if load_global_pause_from_db(db).await? {
+        handle.pause_all().await.map_err(|e| e.to_string())?;
+    } else {
+        handle.resume_all().await.map_err(|e| e.to_string())?;
+    }
 
     Ok(loaded)
 }

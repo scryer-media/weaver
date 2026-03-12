@@ -452,6 +452,108 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_rss_seen_items(
+        &self,
+        feed_id: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let conn = self.conn();
+        let mut out = Vec::new();
+
+        match (feed_id, limit) {
+            (Some(feed_id), Some(limit)) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                                seen_at, job_id, item_url, error
+                         FROM rss_seen_items
+                         WHERE feed_id = ?1
+                         ORDER BY seen_at DESC
+                         LIMIT ?2",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![feed_id, limit], map_seen_item_row)
+                    .map_err(db_err)?;
+                for row in rows {
+                    out.push(row.map_err(db_err)?);
+                }
+            }
+            (Some(feed_id), None) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                                seen_at, job_id, item_url, error
+                         FROM rss_seen_items
+                         WHERE feed_id = ?1
+                         ORDER BY seen_at DESC",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map([feed_id], map_seen_item_row)
+                    .map_err(db_err)?;
+                for row in rows {
+                    out.push(row.map_err(db_err)?);
+                }
+            }
+            (None, Some(limit)) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                                seen_at, job_id, item_url, error
+                         FROM rss_seen_items
+                         ORDER BY seen_at DESC
+                         LIMIT ?1",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt.query_map([limit], map_seen_item_row).map_err(db_err)?;
+                for row in rows {
+                    out.push(row.map_err(db_err)?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                                seen_at, job_id, item_url, error
+                         FROM rss_seen_items
+                         ORDER BY seen_at DESC",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt.query_map([], map_seen_item_row).map_err(db_err)?;
+                for row in rows {
+                    out.push(row.map_err(db_err)?);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
+        let conn = self.conn();
+        let changed = conn
+            .execute(
+                "DELETE FROM rss_seen_items WHERE feed_id = ?1 AND item_id = ?2",
+                rusqlite::params![feed_id, item_id],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
+    pub fn clear_rss_seen_items(&self, feed_id: Option<u32>) -> Result<u64, StateError> {
+        let conn = self.conn();
+        let changed = match feed_id {
+            Some(feed_id) => conn
+                .execute("DELETE FROM rss_seen_items WHERE feed_id = ?1", [feed_id])
+                .map_err(db_err)?,
+            None => conn
+                .execute("DELETE FROM rss_seen_items", [])
+                .map_err(db_err)?,
+        };
+        Ok(changed as u64)
+    }
+
     pub fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError> {
         let conn = self.conn();
         let changed = conn
@@ -497,6 +599,21 @@ impl Database {
         .map_err(db_err)?;
         Ok(())
     }
+}
+
+fn map_seen_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSeenItemRow> {
+    Ok(RssSeenItemRow {
+        feed_id: row.get::<_, u32>(0)?,
+        item_id: row.get(1)?,
+        item_title: row.get(2)?,
+        published_at: row.get(3)?,
+        size_bytes: row.get(4)?,
+        decision: row.get(5)?,
+        seen_at: row.get(6)?,
+        job_id: row.get(7)?,
+        item_url: row.get(8)?,
+        error: row.get(9)?,
+    })
 }
 
 #[cfg(test)]
@@ -578,7 +695,67 @@ mod tests {
         };
         db.insert_rss_seen_item(&item).unwrap();
         assert!(db.rss_seen_item_exists(1, "guid-1").unwrap());
+        assert_eq!(
+            db.list_rss_seen_items(Some(1), Some(10)).unwrap(),
+            vec![item]
+        );
+        assert!(db.delete_rss_seen_item(1, "guid-1").unwrap());
+        assert!(!db.rss_seen_item_exists(1, "guid-1").unwrap());
+
+        db.insert_rss_seen_item(&RssSeenItemRow {
+            feed_id: 1,
+            item_id: "guid-1".to_string(),
+            item_title: "Example".to_string(),
+            published_at: Some(123),
+            size_bytes: Some(456),
+            decision: "accepted".to_string(),
+            seen_at: 1_000,
+            job_id: Some(42),
+            item_url: Some("https://example.com/a.nzb".to_string()),
+            error: None,
+        })
+        .unwrap();
         assert_eq!(db.purge_old_rss_seen_items(2_000).unwrap(), 1);
         assert!(!db.rss_seen_item_exists(1, "guid-1").unwrap());
+    }
+
+    #[test]
+    fn clear_rss_seen_items_can_scope_to_feed() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_rss_feed(&sample_feed(1)).unwrap();
+        db.insert_rss_feed(&sample_feed(2)).unwrap();
+        db.insert_rss_seen_item(&RssSeenItemRow {
+            feed_id: 1,
+            item_id: "guid-1".to_string(),
+            item_title: "Example".to_string(),
+            published_at: None,
+            size_bytes: None,
+            decision: "submitted".to_string(),
+            seen_at: 1_000,
+            job_id: Some(1),
+            item_url: None,
+            error: None,
+        })
+        .unwrap();
+        db.insert_rss_seen_item(&RssSeenItemRow {
+            feed_id: 2,
+            item_id: "guid-2".to_string(),
+            item_title: "Example Two".to_string(),
+            published_at: None,
+            size_bytes: None,
+            decision: "ignored".to_string(),
+            seen_at: 2_000,
+            job_id: None,
+            item_url: None,
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(db.clear_rss_seen_items(Some(1)).unwrap(), 1);
+        let remaining = db.list_rss_seen_items(None, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].feed_id, 2);
+        assert_eq!(db.clear_rss_seen_items(None).unwrap(), 1);
+        assert!(db.list_rss_seen_items(None, None).unwrap().is_empty());
     }
 }

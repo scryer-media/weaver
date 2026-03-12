@@ -144,6 +144,33 @@ pub struct VerificationResult {
     pub repairable: Repairability,
 }
 
+impl VerificationResult {
+    pub fn refresh_repairability(&mut self) {
+        self.repairable =
+            repairability_for_counts(self.total_missing_blocks, self.recovery_blocks_available);
+    }
+}
+
+fn repairability_for_counts(
+    total_missing_blocks: u32,
+    recovery_blocks_available: u32,
+) -> Repairability {
+    if total_missing_blocks == 0 {
+        Repairability::NotNeeded
+    } else if total_missing_blocks <= recovery_blocks_available {
+        Repairability::Repairable {
+            blocks_needed: total_missing_blocks,
+            blocks_available: recovery_blocks_available,
+        }
+    } else {
+        Repairability::Insufficient {
+            blocks_needed: total_missing_blocks,
+            blocks_available: recovery_blocks_available,
+            deficit: total_missing_blocks - recovery_blocks_available,
+        }
+    }
+}
+
 /// Perform a 16KB quick-check on a file.
 ///
 /// Reads the first 16384 bytes (or less if file is shorter) and computes MD5,
@@ -465,20 +492,7 @@ pub fn verify_selected_file_ids_with_options(
     }
 
     let recovery_blocks_available = par2.recovery_block_count();
-    let repairable = if total_missing_blocks == 0 {
-        Repairability::NotNeeded
-    } else if total_missing_blocks <= recovery_blocks_available {
-        Repairability::Repairable {
-            blocks_needed: total_missing_blocks,
-            blocks_available: recovery_blocks_available,
-        }
-    } else {
-        Repairability::Insufficient {
-            blocks_needed: total_missing_blocks,
-            blocks_available: recovery_blocks_available,
-            deficit: total_missing_blocks - recovery_blocks_available,
-        }
-    };
+    let repairable = repairability_for_counts(total_missing_blocks, recovery_blocks_available);
 
     VerificationResult {
         files,
@@ -908,6 +922,31 @@ mod tests {
         assert!(matches!(
             damaged_only.files[0].status,
             FileStatus::Damaged(1)
+        ));
+    }
+
+    #[test]
+    fn refresh_repairability_recomputes_after_missing_count_changes() {
+        let mut result = VerificationResult {
+            files: Vec::new(),
+            recovery_blocks_available: 40,
+            total_missing_blocks: 1380,
+            repairable: Repairability::Insufficient {
+                blocks_needed: 1380,
+                blocks_available: 40,
+                deficit: 1340,
+            },
+        };
+
+        result.total_missing_blocks = 40;
+        result.refresh_repairability();
+
+        assert!(matches!(
+            result.repairable,
+            Repairability::Repairable {
+                blocks_needed: 40,
+                blocks_available: 40
+            }
         ));
     }
 }

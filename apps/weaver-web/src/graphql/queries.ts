@@ -17,6 +17,7 @@ const JOB_LIST_ITEM_FIELDS = `
     health
     hasPassword
     category
+    createdAt
     metadata {
       key
       value
@@ -105,6 +106,68 @@ const GENERAL_SETTINGS_FIELDS = `
   }
 `;
 
+const METRICS_FIELDS = `
+  fragment MetricsFields on Metrics {
+    bytesDownloaded
+    bytesDecoded
+    bytesCommitted
+    downloadQueueDepth
+    decodePending
+    commitPending
+    writeBufferedBytes
+    writeBufferedSegments
+    directWriteEvictions
+    segmentsDownloaded
+    segmentsDecoded
+    segmentsCommitted
+    articlesNotFound
+    decodeErrors
+    verifyActive
+    repairActive
+    extractActive
+    diskWriteLatencyUs
+    segmentsRetried
+    segmentsFailedPermanent
+    currentDownloadSpeed
+    crcErrors
+    recoveryQueueDepth
+    articlesPerSec
+    decodeRateMbps
+  }
+`;
+
+const JOB_TIMELINE_FIELDS = `
+  fragment JobTimelineFields on JobTimeline {
+    startedAt
+    endedAt
+    outcome
+    lanes {
+      stage
+      spans {
+        startedAt
+        endedAt
+        state
+        label
+      }
+    }
+    extractionGroups {
+      setName
+      members {
+        member
+        state
+        error
+        spans {
+          kind
+          startedAt
+          endedAt
+          state
+          label
+        }
+      }
+    }
+  }
+`;
+
 const API_KEY_FIELDS = `
   fragment ApiKeyFields on ApiKey {
     id
@@ -160,6 +223,21 @@ const RSS_FEED_FIELDS = `
   }
 `;
 
+const RSS_SEEN_ITEM_FIELDS = `
+  fragment RssSeenItemFields on RssSeenItem {
+    feedId
+    itemId
+    itemTitle
+    publishedAt
+    sizeBytes
+    decision
+    seenAt
+    jobId
+    itemUrl
+    error
+  }
+`;
+
 export const JOBS_QUERY = gql`
   query Jobs {
     jobs {
@@ -189,6 +267,9 @@ export const JOB_QUERY = gql`
     job(id: $id) {
       ...JobListItemFields
     }
+    jobTimeline(jobId: $id) {
+      ...JobTimelineFields
+    }
     jobEvents(jobId: $id) {
       kind
       jobId
@@ -197,6 +278,7 @@ export const JOB_QUERY = gql`
       timestamp
     }
   }
+  ${JOB_TIMELINE_FIELDS}
   ${PARSED_RELEASE_FIELDS}
   ${JOB_LIST_ITEM_FIELDS}
 `;
@@ -204,25 +286,20 @@ export const JOB_QUERY = gql`
 export const METRICS_QUERY = gql`
   query Metrics {
     metrics {
-      bytesDownloaded
-      bytesDecoded
-      bytesCommitted
-      downloadQueueDepth
-      decodePending
-      commitPending
-      segmentsDownloaded
-      segmentsDecoded
-      segmentsCommitted
-      articlesNotFound
-      decodeErrors
-      verifyActive
-      repairActive
-      extractActive
-      segmentsRetried
-      segmentsFailedPermanent
-      currentDownloadSpeed
+      ...MetricsFields
     }
   }
+  ${METRICS_FIELDS}
+`;
+
+export const METRICS_PAGE_QUERY = gql`
+  query MetricsPage {
+    metrics {
+      ...MetricsFields
+    }
+    isPaused
+  }
+  ${METRICS_FIELDS}
 `;
 
 export const IS_PAUSED_QUERY = gql`
@@ -237,37 +314,25 @@ export const SETTINGS_PAGE_QUERY = gql`
       ...GeneralSettingsFields
     }
     metrics {
-      bytesDownloaded
-      bytesDecoded
-      bytesCommitted
-      downloadQueueDepth
-      decodePending
-      commitPending
-      segmentsDownloaded
-      segmentsDecoded
-      segmentsCommitted
-      articlesNotFound
-      decodeErrors
-      verifyActive
-      repairActive
-      extractActive
-      segmentsRetried
-      segmentsFailedPermanent
-      currentDownloadSpeed
+      ...MetricsFields
     }
     isPaused
   }
   ${GENERAL_SETTINGS_FIELDS}
+  ${METRICS_FIELDS}
 `;
 
 export const SUBMIT_NZB_MUTATION = gql`
   mutation SubmitNzb($nzbBase64: String!, $filename: String, $password: String, $category: String, $metadata: [MetadataInput!]) {
     submitNzb(nzbBase64: $nzbBase64, filename: $filename, password: $password, category: $category, metadata: $metadata) {
-      id
-      name
-      status
+      ...JobListItemFields
+      error
+      outputDir
+      createdAt
     }
   }
+  ${PARSED_RELEASE_FIELDS}
+  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const PAUSE_JOB_MUTATION = gql`
@@ -359,6 +424,18 @@ export const JOB_UPDATES_SUBSCRIPTION = gql`
   }
   ${PARSED_RELEASE_FIELDS}
   ${JOB_LIST_ITEM_FIELDS}
+`;
+
+export const METRICS_PAGE_SUBSCRIPTION = gql`
+  subscription MetricsPageUpdates {
+    jobUpdates {
+      metrics {
+        ...MetricsFields
+      }
+      isPaused
+    }
+  }
+  ${METRICS_FIELDS}
 `;
 
 export const HISTORY_JOBS_QUERY = gql`
@@ -518,12 +595,16 @@ export const RSS_SETTINGS_QUERY = gql`
     rssFeeds {
       ...RssFeedFields
     }
+    rssSeenItems(limit: 200) {
+      ...RssSeenItemFields
+    }
     categories {
       ...CategoryFields
     }
   }
   ${RSS_RULE_FIELDS}
   ${RSS_FEED_FIELDS}
+  ${RSS_SEEN_ITEM_FIELDS}
   ${CATEGORY_FIELDS}
 `;
 
@@ -598,5 +679,17 @@ export const RUN_RSS_SYNC_MUTATION = gql`
         errors
       }
     }
+  }
+`;
+
+export const DELETE_RSS_SEEN_ITEM_MUTATION = gql`
+  mutation DeleteRssSeenItem($feedId: Int!, $itemId: String!) {
+    deleteRssSeenItem(feedId: $feedId, itemId: $itemId)
+  }
+`;
+
+export const CLEAR_RSS_SEEN_ITEMS_MUTATION = gql`
+  mutation ClearRssSeenItems($feedId: Int) {
+    clearRssSeenItems(feedId: $feedId)
   }
 `;

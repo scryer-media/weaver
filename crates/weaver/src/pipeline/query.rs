@@ -470,39 +470,61 @@ impl Pipeline {
 
     /// List all jobs.
     pub(super) fn list_jobs(&self) -> Vec<JobInfo> {
-        let mut list: Vec<JobInfo> = self
+        let mut list = Vec::with_capacity(self.jobs.len() + self.finished_jobs.len());
+        let mut seen = HashSet::with_capacity(self.jobs.len());
+
+        let mut push_state = |state: &JobState| {
+            let total = state.spec.total_bytes;
+            let health = if total == 0 {
+                1000
+            } else {
+                ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
+            };
+            list.push(JobInfo {
+                job_id: state.job_id,
+                name: state.spec.name.clone(),
+                error: if let JobStatus::Failed { error } = &state.status {
+                    Some(error.clone())
+                } else {
+                    None
+                },
+                status: state.status.clone(),
+                progress: state.assembly.progress(),
+                total_bytes: total,
+                downloaded_bytes: state.downloaded_bytes,
+                failed_bytes: state.failed_bytes,
+                health,
+                password: state.spec.password.clone(),
+                category: state.spec.category.clone(),
+                metadata: state.spec.metadata.clone(),
+                output_dir: Some(state.working_dir.display().to_string()),
+                created_at_epoch_ms: state.created_at_epoch_ms,
+            });
+        };
+
+        for job_id in &self.job_order {
+            let Some(state) = self.jobs.get(job_id) else {
+                continue;
+            };
+            if is_terminal_status(&state.status) || !seen.insert(*job_id) {
+                continue;
+            }
+            push_state(state);
+        }
+
+        let mut unordered: Vec<&JobState> = self
             .jobs
             .values()
-            .filter(|state| !is_terminal_status(&state.status))
-            .map(|state| {
-                let total = state.spec.total_bytes;
-                let health = if total == 0 {
-                    1000
-                } else {
-                    ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
-                };
-                JobInfo {
-                    job_id: state.job_id,
-                    name: state.spec.name.clone(),
-                    error: if let JobStatus::Failed { error } = &state.status {
-                        Some(error.clone())
-                    } else {
-                        None
-                    },
-                    status: state.status.clone(),
-                    progress: state.assembly.progress(),
-                    total_bytes: total,
-                    downloaded_bytes: state.downloaded_bytes,
-                    failed_bytes: state.failed_bytes,
-                    health,
-                    password: state.spec.password.clone(),
-                    category: state.spec.category.clone(),
-                    metadata: state.spec.metadata.clone(),
-                    output_dir: Some(state.working_dir.display().to_string()),
-                    created_at_epoch_ms: state.created_at_epoch_ms,
-                }
-            })
+            .filter(|state| !is_terminal_status(&state.status) && !seen.contains(&state.job_id))
             .collect();
+        unordered.sort_by(|left, right| {
+            left.created_at_epoch_ms
+                .total_cmp(&right.created_at_epoch_ms)
+        });
+        for state in unordered {
+            push_state(state);
+        }
+
         list.extend(self.finished_jobs.iter().cloned());
         list
     }

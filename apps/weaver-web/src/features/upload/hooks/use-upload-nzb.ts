@@ -22,34 +22,40 @@ export function useUploadNzb(options?: {
 }) {
   const t = useTranslate();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [password, setPassword] = useState("");
   const [category, setCategory] = useState(NO_CATEGORY_VALUE);
   const [priority, setPriority] = useState("NORMAL");
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [{ fetching }, submitNzb] = useMutation(SUBMIT_NZB_MUTATION);
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
 
   useEffect(() => {
     if (options?.resetOnOpen && options.open) {
-      setFile(null);
+      setFiles([]);
       setPassword("");
       setCategory(NO_CATEGORY_VALUE);
       setPriority("NORMAL");
       setDragging(false);
       setError(null);
+      setSubmitting(false);
     }
   }, [options?.open, options?.resetOnOpen]);
 
-  const handleFile = useCallback(
-    (nextFile: File) => {
+  const handleFiles = useCallback(
+    (nextFiles: File[]) => {
       setError(null);
-      if (!nextFile.name.toLowerCase().endsWith(".nzb")) {
-        setError(t("upload.invalidFile"));
+      if (nextFiles.length === 0) {
+        setFiles([]);
         return;
       }
-      setFile(nextFile);
+      if (nextFiles.some((file) => !file.name.toLowerCase().endsWith(".nzb"))) {
+        setError(t("upload.invalidFiles"));
+        return;
+      }
+      setFiles(nextFiles);
     },
     [t],
   );
@@ -58,35 +64,50 @@ export function useUploadNzb(options?: {
     (event: DragEvent) => {
       event.preventDefault();
       setDragging(false);
-      const droppedFile = event.dataTransfer.files[0];
-      if (droppedFile) {
-        handleFile(droppedFile);
-      }
+      handleFiles(Array.from(event.dataTransfer.files));
     },
-    [handleFile],
+    [handleFiles],
   );
 
   const submit = useCallback(async () => {
-    if (!file) {
+    if (files.length === 0) {
       return false;
     }
 
     setError(null);
+    setSubmitting(true);
 
     try {
-      const result = await submitNzb({
-        nzbBase64: await toBase64(file),
-        filename: file.name,
-        password: password.trim() || null,
-        category: category.trim() && category !== NO_CATEGORY_VALUE ? category : null,
-        metadata: [{ key: "priority", value: priority }],
-      });
+      let submittedCount = 0;
+      for (const file of files) {
+        const result = await submitNzb({
+          nzbBase64: await toBase64(file),
+          filename: file.name,
+          password: password.trim() || null,
+          category: category.trim() && category !== NO_CATEGORY_VALUE ? category : null,
+          metadata: [{ key: "priority", value: priority }],
+        });
 
-      if (result.error) {
-        setError(result.error.message);
-        return false;
+        if (result.error) {
+          const prefix =
+            submittedCount > 0
+              ? t("upload.partialFailure", {
+                  submitted: submittedCount,
+                  total: files.length,
+                  name: file.name,
+                })
+              : t("upload.batchFailure", { name: file.name });
+          setError(`${prefix} ${result.error.message}`);
+          return false;
+        }
+
+        submittedCount += 1;
       }
 
+      setFiles([]);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
       options?.onSubmitted?.();
       return true;
     } catch (submissionError) {
@@ -96,16 +117,18 @@ export function useUploadNzb(options?: {
           : "Upload failed",
       );
       return false;
+    } finally {
+      setSubmitting(false);
     }
-  }, [category, file, options, password, priority, submitNzb]);
+  }, [category, files, options, password, priority, submitNzb, t]);
 
   return {
     categories: categoryData?.categories ?? [],
     dragging,
     error,
-    file,
+    files,
     fileInputRef,
-    fetching,
+    fetching: submitting || fetching,
     password,
     priority,
     category,
@@ -114,14 +137,12 @@ export function useUploadNzb(options?: {
     setPassword,
     setPriority,
     handleDrop,
-    handleFile,
+    handleFiles,
     openPicker: () => fileInputRef.current?.click(),
     submit,
     onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => {
-      const nextFile = event.target.files?.[0];
-      if (nextFile) {
-        handleFile(nextFile);
-      }
+      handleFiles(Array.from(event.target.files ?? []));
+      event.target.value = "";
     },
   };
 }

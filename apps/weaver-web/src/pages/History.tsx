@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Trash2 } from "lucide-react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -8,6 +9,7 @@ import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -22,10 +24,13 @@ import {
   HISTORY_JOBS_QUERY,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
 
 type HistoryJob = {
   id: number;
   name: string;
+  displayTitle: string;
+  originalTitle: string;
   status: string;
   totalBytes: number;
   downloadedBytes: number;
@@ -34,7 +39,10 @@ type HistoryJob = {
   hasPassword: boolean;
   category: string | null;
   outputDir: string | null;
+  createdAt: number | null;
 };
+
+type HistoryFilter = "all" | "success" | "failure";
 
 export function History() {
   const t = useTranslate();
@@ -45,6 +53,8 @@ export function History() {
   const [jobs, setJobs] = useState<HistoryJob[]>([]);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
+  const [filter, setFilter] = useState<HistoryFilter>("all");
+  const [search, setSearch] = useState("");
 
   useEffect(() => {
     if (data?.jobs) {
@@ -64,6 +74,55 @@ export function History() {
     }
   }, [deleteAllState.data]);
 
+  const counts = useMemo(
+    () => ({
+      all: jobs.length,
+      success: jobs.filter((job) => job.status === "COMPLETE").length,
+      failure: jobs.filter((job) => job.status === "FAILED").length,
+    }),
+    [jobs],
+  );
+  const sortedJobs = useMemo(
+    () =>
+      [...jobs].sort(
+        (left, right) =>
+          (right.createdAt ?? 0) - (left.createdAt ?? 0) || right.id - left.id,
+      ),
+    [jobs],
+  );
+  const timestampFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      }),
+    [],
+  );
+
+  const normalizedSearch = search.trim().toLowerCase();
+  const filteredJobs = useMemo(
+    () =>
+      sortedJobs.filter((job) => {
+        if (filter === "success" && job.status !== "COMPLETE") {
+          return false;
+        }
+        if (filter === "failure" && job.status !== "FAILED") {
+          return false;
+        }
+        if (!normalizedSearch) {
+          return true;
+        }
+        return [job.name, job.category ?? "", job.outputDir ?? ""]
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedSearch);
+      }),
+    [filter, normalizedSearch, sortedJobs],
+  );
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -78,6 +137,54 @@ export function History() {
         }
       />
 
+      {jobs.length > 0 ? (
+        <Card>
+          <CardContent className="space-y-4 pt-6">
+            <div className="flex flex-wrap gap-2">
+              <FilterButton
+                active={filter === "all"}
+                label={t("history.filterAll")}
+                count={counts.all}
+                onClick={() => setFilter("all")}
+              />
+              <FilterButton
+                active={filter === "success"}
+                label={t("history.filterSuccess")}
+                count={counts.success}
+                onClick={() => setFilter("success")}
+              />
+              <FilterButton
+                active={filter === "failure"}
+                label={t("history.filterFailure")}
+                count={counts.failure}
+                onClick={() => setFilter("failure")}
+              />
+            </div>
+
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="max-w-md flex-1">
+                <Input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder={t("history.searchPlaceholder")}
+                />
+              </div>
+              {search || filter !== "all" ? (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setFilter("all");
+                    setSearch("");
+                  }}
+                >
+                  {t("action.clearFilters")}
+                </Button>
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
       {fetching && jobs.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
@@ -86,51 +193,87 @@ export function History() {
         </Card>
       ) : jobs.length === 0 ? (
         <EmptyState title={t("history.title")} description={t("history.empty")} />
+      ) : filteredJobs.length === 0 ? (
+        <Card>
+          <CardContent className="space-y-3 py-12 text-center">
+            <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+            <div>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setFilter("all");
+                  setSearch("");
+                }}
+              >
+                {t("action.clearFilters")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       ) : (
         <>
-          <Card className="hidden md:block">
+          <Card className="hidden lg:block">
             <CardContent className="px-0 pb-0">
-              <Table>
+              <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    <TableHead>{t("table.name")}</TableHead>
-                    <TableHead>{t("table.status")}</TableHead>
-                    <TableHead className="text-right">{t("table.health")}</TableHead>
-                    <TableHead className="text-right">{t("table.size")}</TableHead>
-                    <TableHead>{t("table.category")}</TableHead>
-                    <TableHead className="text-right">{t("table.actions")}</TableHead>
+                    <TableHead className="h-7 w-[34%] px-2 text-[9px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[12%] px-2 text-[9px]">{t("table.status")}</TableHead>
+                    <TableHead className="h-7 w-[18%] px-2 text-[9px]">{t("table.time")}</TableHead>
+                    <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.health")}</TableHead>
+                    <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
+                    <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.category")}</TableHead>
+                    <TableHead className="h-7 w-[6%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {jobs.map((job) => (
-                    <TableRow key={job.id}>
-                      <TableCell>
+                  {filteredJobs.map((job) => (
+                    <TableRow key={job.id} className="text-[11px]">
+                      <TableCell className="min-w-0 px-2 py-1.5">
                         <Link
                           to={`/jobs/${job.id}`}
-                          className="font-medium text-foreground transition hover:text-primary"
+                          title={job.originalTitle}
+                          className="block min-w-0 truncate text-[11px] font-medium leading-tight text-foreground transition hover:text-primary"
                         >
-                          {job.name}
+                          {job.displayTitle}
                         </Link>
                         {job.hasPassword ? (
-                          <span className="ml-2 text-xs text-amber-500">[PW]</span>
+                          <span className="ml-2 shrink-0 text-[9px] text-amber-500">
+                            {t("jobs.passwordProtected")}
+                          </span>
                         ) : null}
                       </TableCell>
-                      <TableCell>
-                        <JobStatusBadge status={job.status} />
+                      <TableCell className="overflow-hidden px-2 py-1.5">
+                        <JobStatusBadge status={job.status} compact className="px-1.5" />
                       </TableCell>
-                      <TableCell className="text-right text-muted-foreground">
+                      <TableCell
+                        className="px-2 py-1.5 text-[10px] text-muted-foreground"
+                        title={formatHistoryTimestamp(job.createdAt)}
+                      >
+                        {formatHistoryTimestamp(job.createdAt, timestampFormatter)}
+                      </TableCell>
+                      <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
                         {(job.health / 10).toFixed(1)}%
                       </TableCell>
-                      <TableCell className="text-right text-muted-foreground">
+                      <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
                         {formatBytes(job.totalBytes)}
                       </TableCell>
-                      <TableCell className="text-muted-foreground">
+                      <TableCell className="truncate px-2 py-1.5 text-[10px] text-muted-foreground" title={job.category ?? "\u2014"}>
                         {job.category ?? "\u2014"}
                       </TableCell>
-                      <TableCell className="text-right">
-                        <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
-                          {t("action.delete")}
-                        </Button>
+                      <TableCell className="px-2 py-1.5">
+                        <div className="flex justify-end gap-0.5">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            title={t("action.delete")}
+                            aria-label={t("action.delete")}
+                            className="size-6"
+                            onClick={() => setDeleteConfirmId(job.id)}
+                          >
+                            <Trash2 className="size-3.5" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -139,8 +282,8 @@ export function History() {
             </CardContent>
           </Card>
 
-          <div className="space-y-3 md:hidden">
-            {jobs.map((job) => (
+          <div className="space-y-3 lg:hidden">
+            {filteredJobs.map((job) => (
               <Card key={job.id}>
                 <CardContent className="space-y-3">
                   <div className="flex items-start justify-between gap-3">
@@ -149,15 +292,16 @@ export function History() {
                         to={`/jobs/${job.id}`}
                         className="block truncate font-medium text-foreground transition hover:text-primary"
                       >
-                        {job.name}
+                        {job.displayTitle}
                       </Link>
                       <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                        <span>{formatHistoryTimestamp(job.createdAt, timestampFormatter)}</span>
                         <span>{formatBytes(job.totalBytes)}</span>
                         <span>Health {(job.health / 10).toFixed(1)}%</span>
                         {job.category ? <span>{job.category}</span> : null}
                       </div>
                     </div>
-                    <JobStatusBadge status={job.status} />
+                    <JobStatusBadge status={job.status} compact />
                   </div>
                   <div className="flex justify-end">
                     <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
@@ -199,5 +343,50 @@ export function History() {
         onCancel={() => setDeleteAllConfirm(false)}
       />
     </div>
+  );
+}
+
+function formatHistoryTimestamp(
+  timestamp: number | null,
+  formatter = new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }),
+) {
+  if (!timestamp) {
+    return "-";
+  }
+
+  return formatter.format(new Date(timestamp));
+}
+
+function FilterButton({
+  active,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <Button variant={active ? "default" : "outline"} size="sm" onClick={onClick}>
+      <span>{label}</span>
+      <span
+        className={cn(
+          "ml-1.5 rounded-full px-1.5 py-0.5 text-[11px] leading-none",
+          active
+            ? "bg-primary-foreground/18 text-primary-foreground"
+            : "bg-muted text-muted-foreground",
+        )}
+      >
+        {count}
+      </span>
+    </Button>
   );
 }

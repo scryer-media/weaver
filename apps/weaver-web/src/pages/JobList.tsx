@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDown, ChevronRight, Pause, Play, X } from "lucide-react";
 import { useMutation } from "urql";
@@ -20,6 +20,7 @@ import { SpeedDisplay, formatBytes } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -72,23 +73,79 @@ function formatEta(remainingBytes: number, speed: number): string {
 
 const ETA_UPDATE_INTERVAL_MS = 2500;
 
-function useThrottledEta() {
-  const cache = useRef(new Map<number, { eta: string; at: number }>());
-  return (jobId: number, remainingBytes: number, jobSpeed: number): string => {
-    const now = Date.now();
-    const entry = cache.current.get(jobId);
-    if (entry && now - entry.at < ETA_UPDATE_INTERVAL_MS) {
-      return entry.eta;
+function buildQueueEtaById(
+  jobs: {
+    id: number;
+    status: string;
+    totalBytes: number;
+    downloadedBytes: number;
+  }[],
+  speed: number,
+): Map<number, string> {
+  const etaById = new Map<number, string>();
+  if (speed <= 0) {
+    return etaById;
+  }
+
+  let bytesAhead = 0;
+  for (const job of jobs) {
+    if (job.status !== "DOWNLOADING" && job.status !== "QUEUED") {
+      continue;
     }
-    const eta = formatEta(remainingBytes, jobSpeed);
-    cache.current.set(jobId, { eta, at: now });
-    return eta;
-  };
+    const remaining = Math.max(job.totalBytes - job.downloadedBytes, 0);
+    bytesAhead += remaining;
+    etaById.set(job.id, formatEta(bytesAhead, speed));
+  }
+
+  return etaById;
+}
+
+function useThrottledQueueEta(
+  jobs: {
+    id: number;
+    status: string;
+    totalBytes: number;
+    downloadedBytes: number;
+  }[],
+  speed: number,
+) {
+  const cache = useRef({
+    at: 0,
+    signature: "",
+    etaById: new Map<number, string>(),
+  });
+
+  return useMemo(() => {
+    const signature = jobs
+      .filter((job) => job.status === "DOWNLOADING" || job.status === "QUEUED")
+      .map((job) => `${job.id}:${job.status}:${job.totalBytes}`)
+      .join("|");
+    const now = Date.now();
+    const shouldRefresh =
+      speed <= 0
+      || cache.current.signature !== signature
+      || now - cache.current.at >= ETA_UPDATE_INTERVAL_MS;
+
+    if (shouldRefresh) {
+      cache.current = {
+        at: now,
+        signature,
+        etaById: buildQueueEtaById(jobs, speed),
+      };
+    }
+
+    return cache.current.etaById;
+  }, [jobs, speed]);
+}
+
+function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {
+  return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED");
 }
 
 export function JobList() {
   const { jobs: allJobs, speed, isPaused } = useLiveData();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
+  const blockedJobs = jobs.filter((job) => isBlockedByGlobalPause(job, isPaused)).length;
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
@@ -101,7 +158,6 @@ export function JobList() {
   const [speedLimitValue, setSpeedLimitValue] = useState("0");
   const [cancelConfirmId, setCancelConfirmId] = useState<number | null>(null);
   const [expandedJobIds, setExpandedJobIds] = useState<Set<number>>(new Set());
-  const getEta = useThrottledEta();
   const t = useTranslate();
 
   const toggleExpanded = (jobId: number) => {
@@ -116,16 +172,19 @@ export function JobList() {
     });
   };
 
-  const totalRemaining = jobs.reduce(
-    (sum, job) => (job.status === "DOWNLOADING" ? sum + (job.totalBytes - job.downloadedBytes) : sum),
-    0,
-  );
+  const queueEtaById = useThrottledQueueEta(jobs, speed);
 
   return (
     <div className="space-y-6">
       <PageHeader
         title={t("jobs.title")}
-        description={jobs.length === 0 ? t("jobs.emptyHint") : undefined}
+        description={
+          isPaused && blockedJobs > 0
+            ? t("jobs.pausedHeaderHint")
+            : jobs.length === 0
+              ? t("jobs.emptyHint")
+              : undefined
+        }
         actions={
           <>
             <div className="rounded-xl border border-border/70 bg-background/70 px-4 py-2">
@@ -133,6 +192,11 @@ export function JobList() {
                 {t("label.downloadSpeed")}
               </div>
               <SpeedDisplay bytesPerSec={speed} className="text-lg font-semibold text-foreground" />
+              {isPaused ? (
+                <div className="mt-1 text-[11px] font-medium uppercase tracking-[0.16em] text-amber-600 dark:text-amber-300">
+                  {t("jobs.downloadsPaused")}
+                </div>
+              ) : null}
             </div>
             <Select
               value={speedLimitValue}
@@ -152,13 +216,44 @@ export function JobList() {
                 ))}
               </SelectContent>
             </Select>
-            <Button variant="outline" onClick={() => void (isPaused ? resumeAll({}) : pauseAll({}))}>
+            <Button
+              variant={isPaused ? "default" : "outline"}
+              onClick={() => void (isPaused ? resumeAll({}) : pauseAll({}))}
+            >
+              {isPaused ? <Play className="size-4" /> : <Pause className="size-4" />}
               {isPaused ? t("action.resumeAll") : t("action.pauseAll")}
             </Button>
             <Button onClick={() => setUploadOpen(true)}>{t("nav.upload")}</Button>
           </>
         }
       />
+
+      {isPaused && blockedJobs > 0 ? (
+        <Card className="border-amber-500/40 bg-amber-500/8">
+          <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="warning">{t("jobs.globalPauseBadge")}</Badge>
+                <span className="text-sm font-medium text-foreground">
+                  {t("jobs.downloadsPausedTitle")}
+                </span>
+              </div>
+              <div className="text-sm text-muted-foreground">
+                {t("jobs.downloadsPausedBody")}
+              </div>
+              <div className="text-xs uppercase tracking-[0.14em] text-amber-700 dark:text-amber-300">
+                {t("jobs.pauseAffectedCount", { count: blockedJobs })}
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button onClick={() => void resumeAll({})}>
+                <Play className="size-4" />
+                {t("action.resumeAll")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {jobs.length === 0 ? (
         <EmptyState
@@ -174,29 +269,24 @@ export function JobList() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-7 w-[36%] px-2 text-[9px]">{t("table.name")}</TableHead>
-                    <TableHead className="h-7 w-[9%] px-2 text-[9px]">{t("table.status")}</TableHead>
-                    <TableHead className="h-7 w-[7%] px-2 text-[9px]">{t("table.priority")}</TableHead>
-                    <TableHead className="h-7 w-[8%] px-2 text-[9px]">{t("table.category")}</TableHead>
-                    <TableHead className="h-7 w-[15%] px-2 text-[9px]">{t("table.progress")}</TableHead>
-                    <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
-                    <TableHead className="h-7 w-[6%] px-2 text-right text-[9px]">{t("table.eta")}</TableHead>
-                    <TableHead className="h-7 w-[7%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
+                    <TableHead className="h-7 w-[34%] px-2 text-[13px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[11%] px-2 text-[13px]">{t("table.status")}</TableHead>
+                    <TableHead className="h-7 w-[7%] px-2 text-[13px]">{t("table.priority")}</TableHead>
+                    <TableHead className="h-7 w-[8%] px-2 text-[13px]">{t("table.category")}</TableHead>
+                    <TableHead className="h-7 w-[15%] px-2 text-[13px]">{t("table.progress")}</TableHead>
+                    <TableHead className="h-7 w-[12%] px-2 text-right text-[13px]">{t("table.size")}</TableHead>
+                    <TableHead className="h-7 w-[6%] px-2 text-right text-[13px]">{t("table.eta")}</TableHead>
+                    <TableHead className="h-7 w-[7%] px-2 text-right text-[13px]">{t("table.actions")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {jobs.map((job) => {
-                    const remaining = job.totalBytes - job.downloadedBytes;
                     const priority = getJobPriority(job);
                     const displayName = job.displayTitle;
                     const expanded = expandedJobIds.has(job.id);
-                    const jobSpeed =
-                      job.status === "DOWNLOADING" && totalRemaining > 0
-                        ? (remaining / totalRemaining) * speed
-                        : 0;
                     return (
                       <Fragment key={job.id}>
-                        <TableRow key={job.id} className="text-[11px]">
+                        <TableRow key={job.id} className="text-xs">
                           <TableCell className="min-w-0 px-2 py-1.5">
                             <div className="flex min-w-0 items-center gap-1.5">
                               <Button
@@ -216,34 +306,41 @@ export function JobList() {
                               <Link
                                 to={`/jobs/${job.id}`}
                                 title={job.originalTitle}
-                                className="block min-w-0 truncate text-[11px] font-medium leading-tight transition hover:text-primary"
+                                className="block min-w-0 truncate text-xs font-medium leading-tight transition hover:text-primary"
                               >
                                 {displayName}
                               </Link>
                               {job.hasPassword ? (
-                                <span className="shrink-0 text-[9px] text-amber-500">{t("jobs.passwordProtected")}</span>
+                                <span className="shrink-0 text-[10px] text-amber-500">{t("jobs.passwordProtected")}</span>
                               ) : null}
                             </div>
                           </TableCell>
                           <TableCell className="overflow-hidden px-2 py-1.5">
-                            <JobStatusBadge status={job.status} compact className="px-1.5" />
+                            <div className="flex flex-col items-start gap-1">
+                              <JobStatusBadge status={job.status} compact className="px-1.5" />
+                              {isBlockedByGlobalPause(job, isPaused) ? (
+                                <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-amber-600 dark:text-amber-300">
+                                  {t("jobs.globalPauseShort")}
+                                </span>
+                              ) : null}
+                            </div>
                           </TableCell>
-                          <TableCell className="truncate px-2 py-1.5 text-[10px]" title={formatJobPriority(priority)}>
+                          <TableCell className="truncate px-2 py-1.5 text-[11px]" title={formatJobPriority(priority)}>
                             {formatJobPriority(priority)}
                           </TableCell>
-                          <TableCell className="truncate px-2 py-1.5 text-[10px]" title={job.category ?? "\u2014"}>
+                          <TableCell className="truncate px-2 py-1.5 text-[11px]" title={job.category ?? "\u2014"}>
                             {job.category ?? "\u2014"}
                           </TableCell>
                           <TableCell className="min-w-0 px-2 py-1.5" title={`${(job.progress * 100).toFixed(1)}%`}>
                             <JobProgress progress={job.progress} status={job.status} compact showLabel={false} />
                           </TableCell>
-                          <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
+                          <TableCell className="px-2 py-1.5 text-right text-[11px] text-muted-foreground">
                             {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
                           </TableCell>
-                          <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
-                            {job.status === "DOWNLOADING"
-                              ? getEta(job.id, remaining, jobSpeed)
-                              : "\u2014"}
+                          <TableCell className="px-2 py-1.5 text-right text-[11px] text-muted-foreground">
+                            {isBlockedByGlobalPause(job, isPaused)
+                              ? t("status.paused")
+                              : (queueEtaById.get(job.id) ?? "\u2014")}
                           </TableCell>
                           <TableCell className="px-2 py-1.5">
                             <div className="flex justify-end gap-0.5">
@@ -304,14 +401,9 @@ export function JobList() {
 
           <div className="space-y-3 lg:hidden">
             {jobs.map((job) => {
-              const remaining = job.totalBytes - job.downloadedBytes;
               const priority = getJobPriority(job);
               const displayName = job.displayTitle;
               const expanded = expandedJobIds.has(job.id);
-              const jobSpeed =
-                job.status === "DOWNLOADING" && totalRemaining > 0
-                  ? (remaining / totalRemaining) * speed
-                  : 0;
               return (
                 <Card key={job.id}>
                   <CardContent className="space-y-3">
@@ -342,10 +434,21 @@ export function JobList() {
                           <span>{formatJobPriority(priority)}</span>
                           <span>{job.category ?? "\u2014"}</span>
                           <span>{formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}</span>
-                          <span>{job.status === "DOWNLOADING" ? getEta(job.id, remaining, jobSpeed) : "\u2014"}</span>
+                          <span>
+                            {isBlockedByGlobalPause(job, isPaused)
+                              ? t("status.paused")
+                              : (queueEtaById.get(job.id) ?? "\u2014")}
+                          </span>
                         </div>
                       </div>
-                      <JobStatusBadge status={job.status} compact />
+                      <div className="flex flex-col items-end gap-1">
+                        <JobStatusBadge status={job.status} compact />
+                        {isBlockedByGlobalPause(job, isPaused) ? (
+                          <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-amber-600 dark:text-amber-300">
+                            {t("jobs.globalPauseShort")}
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
                     <JobProgress progress={job.progress} status={job.status} compact />
                     {expanded ? (

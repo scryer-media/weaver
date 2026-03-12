@@ -108,6 +108,37 @@ impl VolumeSet {
             None
         }
     }
+
+    /// Return a compact bitmap of known volume presence.
+    pub fn presence(&self) -> Vec<bool> {
+        self.volumes
+            .iter()
+            .map(|state| matches!(state, VolumeState::Present))
+            .collect()
+    }
+
+    /// Return whether the terminating volume has been observed.
+    pub fn last_volume_seen(&self) -> bool {
+        self.last_volume_seen
+    }
+
+    /// Restore a volume set from serialized presence state.
+    pub fn from_presence(presence: Vec<bool>, last_volume_seen: bool) -> Self {
+        let volumes = presence
+            .into_iter()
+            .map(|present| {
+                if present {
+                    VolumeState::Present
+                } else {
+                    VolumeState::Missing
+                }
+            })
+            .collect();
+        Self {
+            volumes,
+            last_volume_seen,
+        }
+    }
 }
 
 impl Default for VolumeSet {
@@ -231,6 +262,11 @@ impl WaitingVolumeProvider {
         let mut state = self.state.lock().unwrap();
         state.available.insert(index, path);
         self.notify.notify_all();
+    }
+
+    /// Check whether a specific volume is already available without blocking.
+    pub fn is_volume_ready(&self, index: usize) -> bool {
+        self.state.lock().unwrap().available.contains_key(&index)
     }
 
     /// Signal that all volumes have been provided.

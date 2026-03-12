@@ -136,6 +136,19 @@ pub struct MemberInfo {
     pub link_target: Option<String>,
 }
 
+/// Topology-oriented member info, including unresolved continuation entries.
+#[derive(Debug, Clone)]
+pub struct TopologyMemberInfo {
+    /// The sanitized file name if known. Continuation-only entries may be empty.
+    pub name: String,
+    pub unpacked_size: Option<u64>,
+    pub is_directory: bool,
+    pub volumes: VolumeSpan,
+    /// True when the starting header is still missing and this entry only
+    /// represents later continuation segments.
+    pub missing_start: bool,
+}
+
 /// Header-only metadata for the archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveMetadata {

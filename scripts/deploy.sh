@@ -2,9 +2,9 @@
 # Deploy weaver: kill existing, clean logs, release build, start with logging.
 #
 # Usage: deploy.sh [level:components]
-#   No args:                RUST_LOG=info
-#   deploy.sh debug:nntp    RUST_LOG=info,weaver_nntp=debug
-#   deploy.sh debug:nntp,scheduler  RUST_LOG=info,weaver_nntp=debug,weaver_scheduler=debug
+#   No args:                RUST_LOG=info,weaver::pipeline=debug
+#   deploy.sh debug:nntp    RUST_LOG=info,weaver::pipeline=debug,weaver_nntp=debug
+#   deploy.sh debug:nntp,scheduler  RUST_LOG=info,weaver::pipeline=debug,weaver_nntp=debug,weaver_scheduler=debug
 #   deploy.sh trace:pipeline        RUST_LOG=info,weaver::pipeline=trace
 #   deploy.sh debug:all     RUST_LOG=debug
 set -e
@@ -14,7 +14,7 @@ LOG_FILE="/tmp/weaver.log"
 BINARY="$PROJ_DIR/target/release/weaver"
 
 # Build RUST_LOG from arguments.
-RUST_LOG="info"
+RUST_LOG="info,weaver::pipeline=debug"
 if [ $# -gt 0 ]; then
     level="${1%%:*}"
     targets="${1#*:}"

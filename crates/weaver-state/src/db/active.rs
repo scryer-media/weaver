@@ -37,6 +37,7 @@ pub struct RecoveredJob {
     pub output_dir: PathBuf,
     pub committed_segments: HashSet<SegmentId>,
     pub complete_files: HashSet<NzbFileId>,
+    pub extracted_members: HashSet<String>,
     pub status: String,
     pub error: Option<String>,
     pub created_at: u64,
@@ -212,6 +213,7 @@ impl Database {
                         output_dir: PathBuf::from(output_dir),
                         committed_segments: HashSet::new(),
                         complete_files: HashSet::new(),
+                        extracted_members: HashSet::new(),
                         status,
                         error,
                         created_at,
@@ -266,6 +268,27 @@ impl Database {
                 let (job_id, file_index) = row.map_err(db_err)?;
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.complete_files.insert(NzbFileId { job_id, file_index });
+                }
+            }
+        }
+
+        // Load extracted members.
+        {
+            let mut stmt = conn
+                .prepare("SELECT job_id, member_name FROM active_extracted")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        JobId(row.get::<_, i64>(0)? as u64),
+                        row.get::<_, String>(1)?,
+                    ))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let (job_id, member_name) = row.map_err(db_err)?;
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.extracted_members.insert(member_name);
                 }
             }
         }
@@ -341,6 +364,11 @@ impl Database {
         .map_err(db_err)?;
         tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_rar_volume_facts WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
@@ -372,6 +400,11 @@ impl Database {
         .map_err(db_err)?;
         tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_rar_volume_facts WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
@@ -583,6 +616,101 @@ impl Database {
         }
     }
 
+    /// Load all cached archive headers for a job.
+    pub fn load_all_archive_headers(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<String, Vec<u8>>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT set_name, headers FROM active_archive_headers
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![job_id.0 as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<HashMap<_, _>, _>>().map_err(db_err)
+    }
+
+    /// Delete cached archive headers for a single set.
+    pub fn delete_archive_headers(&self, job_id: JobId, set_name: &str) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_archive_headers WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Save immutable header facts for a single physical RAR volume.
+    pub fn save_rar_volume_facts(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        volume_index: u32,
+        facts_blob: &[u8],
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO active_rar_volume_facts
+             (job_id, set_name, volume_index, facts_blob)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![job_id.0 as i64, set_name, volume_index, facts_blob],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Load all persisted RAR volume facts for a job, grouped by set name.
+    pub fn load_all_rar_volume_facts(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<String, Vec<(u32, Vec<u8>)>>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT set_name, volume_index, facts_blob
+                 FROM active_rar_volume_facts
+                 WHERE job_id = ?1
+                 ORDER BY set_name, volume_index",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![job_id.0 as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut grouped: HashMap<String, Vec<(u32, Vec<u8>)>> = HashMap::new();
+        for row in rows {
+            let (set_name, volume_index, facts_blob) = row.map_err(db_err)?;
+            grouped
+                .entry(set_name)
+                .or_default()
+                .push((volume_index, facts_blob));
+        }
+        Ok(grouped)
+    }
+
+    /// Delete persisted RAR volume facts for a whole job.
+    pub fn delete_all_rar_volume_facts(&self, job_id: JobId) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_rar_volume_facts WHERE job_id = ?1",
+            [job_id.0 as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     // --- Volume status tracking ---
 
     /// Set volume extraction/verification/deletion status.
@@ -611,6 +739,26 @@ impl Database {
         )
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Load all volumes that were already eagerly deleted for a job.
+    pub fn load_deleted_volume_statuses(
+        &self,
+        job_id: JobId,
+    ) -> Result<Vec<(String, u32)>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT set_name, volume_index
+                 FROM active_volume_status
+                 WHERE job_id = ?1 AND deleted = 1
+                 ORDER BY set_name, volume_index",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
     }
 }
 
@@ -979,6 +1127,47 @@ mod tests {
             !chunks
                 .iter()
                 .any(|c| c.member_name == "movie_a.mkv" && c.volume_index == 0)
+        );
+    }
+
+    #[test]
+    fn archive_headers_roundtrip_and_delete() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+
+        db.save_archive_headers(JobId(1), "set-a", &[1, 2, 3])
+            .unwrap();
+        db.save_archive_headers(JobId(1), "set-b", &[4, 5]).unwrap();
+
+        assert_eq!(
+            db.load_archive_headers(JobId(1), "set-a").unwrap(),
+            Some(vec![1, 2, 3])
+        );
+
+        let all = db.load_all_archive_headers(JobId(1)).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["set-b"], vec![4, 5]);
+
+        db.delete_archive_headers(JobId(1), "set-a").unwrap();
+        assert_eq!(db.load_archive_headers(JobId(1), "set-a").unwrap(), None);
+        assert_eq!(db.load_all_archive_headers(JobId(1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleted_volume_statuses_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+
+        db.set_volume_status(JobId(1), "set-a", 0, true, true, true)
+            .unwrap();
+        db.set_volume_status(JobId(1), "set-a", 1, true, true, false)
+            .unwrap();
+        db.set_volume_status(JobId(1), "set-b", 4, true, true, true)
+            .unwrap();
+
+        assert_eq!(
+            db.load_deleted_volume_statuses(JobId(1)).unwrap(),
+            vec![("set-a".to_string(), 0), ("set-b".to_string(), 4)]
         );
     }
 }

@@ -1,6 +1,31 @@
 use super::*;
 
 impl Pipeline {
+    fn mark_download_pass_started(&mut self, job_id: JobId) {
+        if self.active_download_passes.insert(job_id) {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::DownloadStarted { job_id });
+        }
+    }
+
+    fn maybe_finish_download_pass(&mut self, job_id: JobId) {
+        let in_flight = self
+            .active_downloads_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0);
+        let has_queued_work = self.jobs.get(&job_id).is_some_and(|state| {
+            !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
+        });
+
+        if in_flight == 0 && !has_queued_work && self.active_download_passes.remove(&job_id) {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::DownloadFinished { job_id });
+        }
+    }
+
     fn spawn_decode_task(&self, work: PendingDecodeWork, output: Option<BufferHandle>) {
         let tx = self.decode_done_tx.clone();
         let segment_id = work.segment_id;
@@ -209,10 +234,13 @@ impl Pipeline {
 
     /// Spawn a download task for a single segment.
     pub(super) fn spawn_download(&mut self, work: DownloadWork, is_recovery: bool) {
+        let job_id = work.segment_id.file_id.job_id;
         self.active_downloads += 1;
         if is_recovery {
             self.active_recovery += 1;
         }
+        *self.active_downloads_by_job.entry(job_id).or_default() += 1;
+        self.mark_download_pass_started(job_id);
 
         let nntp = Arc::clone(&self.nntp);
         let tx = self.download_done_tx.clone();
@@ -246,6 +274,12 @@ impl Pipeline {
         }
 
         let job_id = result.segment_id.file_id.job_id;
+        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                self.active_downloads_by_job.remove(&job_id);
+            }
+        }
         if self
             .jobs
             .get(&job_id)
@@ -256,6 +290,7 @@ impl Pipeline {
                 segment = %result.segment_id,
                 "discarding download result for inactive job"
             );
+            self.maybe_finish_download_pass(job_id);
             return;
         }
 
@@ -379,5 +414,7 @@ impl Pipeline {
                 }
             }
         }
+
+        self.maybe_finish_download_pass(job_id);
     }
 }

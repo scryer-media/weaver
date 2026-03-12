@@ -9,6 +9,8 @@ use tracing::debug;
 use super::*;
 use crate::volume::VolumeProvider;
 
+const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 impl RarArchive {
     /// Read all data segments for a member, concatenating them into a single buffer.
     ///
@@ -801,7 +803,7 @@ impl RarArchive {
             None
         };
         let mut written = 0u64;
-        let mut chunk = vec![0u8; 256 * 1024];
+        let mut chunk = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
 
         // For encrypted Store members, use unpacked_size to know when to stop
         // (decrypted data may have AES padding at the end).

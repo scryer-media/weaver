@@ -6,6 +6,7 @@ import { Upload } from "@/pages/Upload";
 import { Servers } from "@/pages/Servers";
 import { Categories } from "@/pages/Categories";
 import { History } from "@/pages/History";
+import { MetricsPage } from "@/pages/MetricsPage";
 import { SettingsLayout } from "@/pages/settings/SettingsLayout";
 import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
 import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
@@ -19,6 +20,7 @@ export const router = createBrowserRouter([
       { index: true, element: <JobList /> },
       { path: "jobs/:id", element: <JobDetail /> },
       { path: "upload", element: <Upload /> },
+      { path: "metrics", element: <MetricsPage /> },
       { path: "history", element: <History /> },
       { path: "servers", element: <Navigate to="/settings/servers" replace /> },
       { path: "categories", element: <Navigate to="/settings/categories" replace /> },

@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -32,6 +34,48 @@ fn move_path_with_copy_fallback(
 }
 
 impl Pipeline {
+    async fn cleanup_par2_files(&self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let cleanup_dir = state.working_dir.clone();
+        let par2_files: Vec<String> = state
+            .assembly
+            .files()
+            .filter(|f| matches!(f.role(), weaver_core::classify::FileRole::Par2 { .. }))
+            .map(|f| f.filename().to_string())
+            .collect();
+        if par2_files.is_empty() {
+            return;
+        }
+
+        let mut removed = 0u32;
+        for filename in &par2_files {
+            let path = cleanup_dir.join(filename);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %path.display(), error = %e, "failed to delete PAR2 file");
+                }
+            }
+        }
+        if removed > 0 {
+            info!(
+                job_id = job_id.0,
+                removed,
+                total = par2_files.len(),
+                "deleted PAR2 files"
+            );
+        }
+    }
+
+    fn clear_par2_runtime_state(&mut self, job_id: JobId) {
+        self.par2_sets.remove(&job_id);
+        self.promoted_recovery_files.remove(&job_id);
+        self.recovery_block_counts.remove(&job_id);
+    }
+
     async fn compute_complete_destination(
         &self,
         job_id: JobId,
@@ -104,6 +148,10 @@ impl Pipeline {
             )
         };
 
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::MoveToCompleteStarted { job_id });
+
         let dest = self
             .compute_complete_destination(job_id, &job_name, category.as_deref())
             .await;
@@ -133,6 +181,18 @@ impl Pipeline {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let src = entry.path();
             let file_name = entry.file_name();
+            if file_name == ".weaver-chunks" {
+                if let Err(error) = tokio::fs::remove_dir_all(&src).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        path = %src.display(),
+                        error = %error,
+                        "failed to remove extraction chunk workspace before final move"
+                    );
+                }
+                continue;
+            }
             let dst = dest.join(&file_name);
 
             // Try rename first (fast, same filesystem).
@@ -206,27 +266,97 @@ impl Pipeline {
             dest = %dest.display(),
             "moved files to complete directory"
         );
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::MoveToCompleteFinished { job_id });
         Ok(dest)
     }
 
-    fn apply_eager_delete_exclusions(
+    fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
+        let mut volume_numbers = HashMap::new();
+        let Some(state) = self.jobs.get(&job_id) else {
+            return volume_numbers;
+        };
+
+        for topology in state.assembly.archive_topologies().values() {
+            for (filename, &volume_number) in &topology.volume_map {
+                volume_numbers.insert(filename.clone(), volume_number);
+            }
+        }
+
+        volume_numbers
+    }
+
+    pub(super) fn claim_clean_rar_volume(
+        decision: &crate::pipeline::rar_state::RarVolumeDeleteDecision,
+    ) -> bool {
+        decision.pending_owners.is_empty()
+            && decision.failed_owners.is_empty()
+            && !decision.unresolved_boundary
+    }
+
+    fn suspect_rar_volumes_for_job(&self, job_id: JobId) -> HashSet<u32> {
+        let mut suspect: HashSet<u32> = self
+            .rar_sets
+            .iter()
+            .filter(|((jid, _), _)| *jid == job_id)
+            .flat_map(|(_, state)| {
+                state
+                    .plan
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|plan| {
+                        plan.delete_decisions
+                            .iter()
+                            .filter_map(|(volume, decision)| {
+                                (!decision.failed_owners.is_empty()
+                                    || !decision.pending_owners.is_empty()
+                                    || plan.waiting_on_volumes.contains(volume))
+                                .then_some(*volume)
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        suspect.extend(
+            self.suspect_volumes
+                .iter()
+                .filter(|((jid, _), _)| *jid == job_id)
+                .flat_map(|(_, volumes)| volumes.iter().copied()),
+        );
+        suspect
+    }
+
+    pub(super) fn apply_eager_delete_exclusions(
         &self,
         job_id: JobId,
         verification: &mut weaver_par2::VerificationResult,
-    ) -> u32 {
+    ) -> (u32, u32) {
         let eagerly_deleted_names: HashSet<&str> = self
             .eagerly_deleted
             .get(&job_id)
             .map(|s| s.iter().map(String::as_str).collect())
             .unwrap_or_default();
+        let suspect_volumes = self.suspect_rar_volumes_for_job(job_id);
+        let volume_numbers = self.rar_volume_numbers_by_filename(job_id);
 
         let mut skipped_blocks = 0u32;
+        let mut retained_suspect_blocks = 0u32;
         for file_verification in &mut verification.files {
             if matches!(
                 file_verification.status,
                 weaver_par2::verify::FileStatus::Missing
             ) && eagerly_deleted_names.contains(file_verification.filename.as_str())
             {
+                let Some(&volume_number) = volume_numbers.get(file_verification.filename.as_str())
+                else {
+                    continue;
+                };
+                if suspect_volumes.contains(&volume_number) {
+                    retained_suspect_blocks = retained_suspect_blocks
+                        .saturating_add(file_verification.missing_slice_count);
+                    continue;
+                }
                 skipped_blocks += file_verification.missing_slice_count;
                 file_verification.status = weaver_par2::verify::FileStatus::Complete;
                 file_verification.valid_slices.fill(true);
@@ -236,10 +366,11 @@ impl Pipeline {
         verification.total_missing_blocks = verification
             .total_missing_blocks
             .saturating_sub(skipped_blocks);
-        skipped_blocks
+        verification.refresh_repairability();
+        (skipped_blocks, retained_suspect_blocks)
     }
 
-    fn recompute_volume_safety_from_verification(
+    pub(super) fn recompute_volume_safety_from_verification(
         &mut self,
         job_id: JobId,
         verification: &weaver_par2::VerificationResult,
@@ -249,6 +380,8 @@ impl Pipeline {
             .get(&job_id)
             .map(|s| s.iter().map(String::as_str).collect())
             .unwrap_or_default();
+        let suspect_volumes = self.suspect_rar_volumes_for_job(job_id);
+        let volume_numbers = self.rar_volume_numbers_by_filename(job_id);
 
         let status_by_name: HashMap<&str, &weaver_par2::FileVerification> = verification
             .files
@@ -275,7 +408,10 @@ impl Pipeline {
                                     clean.insert(volume_number);
                                 }
                                 weaver_par2::verify::FileStatus::Missing
-                                    if eagerly_deleted_names.contains(filename.as_str()) =>
+                                    if eagerly_deleted_names.contains(filename.as_str())
+                                        && !volume_numbers.get(filename.as_str()).is_some_and(
+                                            |number| suspect_volumes.contains(number),
+                                        ) =>
                                 {
                                     clean.insert(volume_number);
                                 }
@@ -306,122 +442,468 @@ impl Pipeline {
         }
     }
 
-    async fn refresh_rar_topology_after_normalization(
+    pub(super) async fn refresh_rar_topology_after_normalization(
         &mut self,
         job_id: JobId,
         normalized_files: &HashSet<String>,
-    ) {
+    ) -> Result<(), String> {
         if normalized_files.is_empty() {
+            return Ok(());
+        }
+
+        let touched_sets: BTreeMap<String, HashSet<String>> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return Ok(());
+            };
+
+            state
+                .assembly
+                .files()
+                .filter_map(|file| {
+                    if !normalized_files.contains(file.filename()) {
+                        return None;
+                    }
+                    match file.role() {
+                        weaver_core::classify::FileRole::RarVolume { .. } => {
+                            weaver_core::classify::archive_base_name(file.filename(), file.role())
+                                .map(|set_name| (set_name, file.filename().to_string()))
+                        }
+                        _ => None,
+                    }
+                })
+                .fold(BTreeMap::new(), |mut acc, (set_name, filename)| {
+                    acc.entry(set_name).or_default().insert(filename);
+                    acc
+                })
+        };
+
+        let mut errors = Vec::new();
+        for (set_name, touched_filenames) in touched_sets {
+            match self
+                .refresh_rar_volume_facts_for_set(job_id, &set_name, &touched_filenames)
+                .await
+            {
+                Ok(()) => info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    "refreshed RAR topology after normalization"
+                ),
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error,
+                        "failed to refresh RAR topology after normalization; retaining previous snapshot and topology"
+                    );
+                    errors.push(format!("{set_name}: {error}"));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn has_active_rar_workers(&self, job_id: JobId) -> bool {
+        self.rar_set_names_for_job(job_id).iter().any(|set_name| {
+            self.rar_sets
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|state| state.active_workers > 0)
+        })
+    }
+
+    fn placement_normalized_files(plan: &weaver_par2::PlacementPlan) -> HashSet<String> {
+        let mut normalized_files = HashSet::new();
+        for (left, right) in &plan.swaps {
+            normalized_files.insert(left.correct_name.clone());
+            normalized_files.insert(right.correct_name.clone());
+        }
+        for entry in &plan.renames {
+            normalized_files.insert(entry.correct_name.clone());
+        }
+        normalized_files
+    }
+
+    fn log_placement_plan(job_id: JobId, plan: &weaver_par2::PlacementPlan) {
+        if plan.swaps.is_empty() && plan.renames.is_empty() {
             return;
         }
 
-        let refresh_plan: Vec<(String, bool, Vec<(u32, NzbFileId)>)> = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
+        let swap_pairs: Vec<String> = plan
+            .swaps
+            .iter()
+            .map(|(left, right)| {
+                format!(
+                    "{} -> {} | {} -> {}",
+                    left.current_name, left.correct_name, right.current_name, right.correct_name
+                )
+            })
+            .collect();
+        let renames: Vec<String> = plan
+            .renames
+            .iter()
+            .map(|entry| format!("{} -> {}", entry.current_name, entry.correct_name))
+            .collect();
 
-            let mut set_to_files: HashMap<String, HashSet<String>> = HashMap::new();
-            for (set_name, topo) in state.assembly.archive_topologies() {
-                let touched: HashSet<String> = topo
-                    .volume_map
-                    .keys()
-                    .filter(|filename| normalized_files.contains(*filename))
-                    .cloned()
-                    .collect();
-                if !touched.is_empty() {
-                    set_to_files.insert(set_name.clone(), touched);
-                }
+        info!(
+            job_id = job_id.0,
+            swaps = ?swap_pairs,
+            renames = ?renames,
+            "placement scan identified remapped files"
+        );
+    }
+
+    async fn apply_placement_plan_for_retry_or_repair(
+        &mut self,
+        job_id: JobId,
+        working_dir: PathBuf,
+        plan: &weaver_par2::PlacementPlan,
+    ) -> Result<(), String> {
+        if plan.swaps.is_empty() && plan.renames.is_empty() {
+            return Ok(());
+        }
+
+        let plan = plan.clone();
+        let normalized_files = Self::placement_normalized_files(&plan);
+        let plan_for_apply = plan.clone();
+        let moved = tokio::task::spawn_blocking(move || {
+            weaver_par2::apply_placement_plan(&working_dir, &plan_for_apply)
+                .map_err(|e| format!("placement normalization failed: {e}"))
+        })
+        .await
+        .map_err(|e| format!("placement normalization task panicked: {e}"))??;
+
+        info!(
+            job_id = job_id.0,
+            swaps = plan.swaps.len(),
+            renames = plan.renames.len(),
+            moved,
+            "applied placement normalization after verify"
+        );
+
+        self.refresh_rar_topology_after_normalization(job_id, &normalized_files)
+            .await
+    }
+
+    async fn recompute_rar_retry_frontier(&mut self, job_id: JobId) {
+        for set_name in self.rar_set_names_for_job(job_id) {
+            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to recompute RAR set while rebuilding retry frontier"
+                );
             }
+        }
+    }
 
-            set_to_files
-                .into_iter()
-                .map(|(set_name, touched_files)| {
-                    let mut file_ids = Vec::new();
-                    let mut has_volume_zero = false;
+    pub(super) fn invalid_rar_retry_frontier_reason(&self, job_id: JobId) -> Option<String> {
+        let extracted = self
+            .extracted_members
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut has_incomplete_sets = false;
 
-                    for file in state.assembly.files() {
-                        if let weaver_core::classify::FileRole::RarVolume { volume_number } =
-                            file.role()
-                            && let Some(base_name) = weaver_core::classify::archive_base_name(
-                                file.filename(),
-                                file.role(),
-                            )
-                            && base_name == set_name
-                        {
-                            if touched_files.contains(file.filename()) {
-                                file_ids.push((*volume_number, file.file_id()));
-                            }
-                            if *volume_number == 0
-                                && file.is_complete()
-                                && state.working_dir.join(file.filename()).exists()
-                            {
-                                has_volume_zero = true;
-                            }
-                        }
-                    }
-
-                    if has_volume_zero {
-                        file_ids.clear();
-                        for file in state.assembly.files() {
-                            if let weaver_core::classify::FileRole::RarVolume { volume_number } =
-                                file.role()
-                                && let Some(base_name) = weaver_core::classify::archive_base_name(
-                                    file.filename(),
-                                    file.role(),
-                                )
-                                && base_name == set_name
-                                && file.is_complete()
-                                && state.working_dir.join(file.filename()).exists()
-                            {
-                                file_ids.push((*volume_number, file.file_id()));
-                            }
-                        }
-                    }
-
-                    file_ids.sort_by_key(|(volume_number, _)| *volume_number);
-                    (set_name, has_volume_zero, file_ids)
-                })
-                .collect()
-        };
-
-        for (set_name, full_rebuild, file_ids) in refresh_plan {
-            if file_ids.is_empty() {
+        for set_name in self.rar_set_names_for_job(job_id) {
+            let Some(set_state) = self.rar_sets.get(&(job_id, set_name.clone())) else {
+                continue;
+            };
+            let Some(plan) = set_state.plan.as_ref() else {
+                continue;
+            };
+            let set_complete = !plan.member_names.is_empty()
+                && plan
+                    .member_names
+                    .iter()
+                    .all(|member| extracted.contains(member));
+            if set_complete {
                 continue;
             }
 
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                if full_rebuild {
-                    state.assembly.archive_topologies_mut().remove(&set_name);
-                } else if let Some(topo) = state.assembly.archive_topology_for_mut(&set_name) {
-                    let touched: HashSet<u32> = file_ids
-                        .iter()
-                        .map(|(volume_number, _)| *volume_number)
-                        .collect();
-                    topo.members
-                        .retain(|member| !touched.contains(&member.first_volume));
-                    for volume_number in &touched {
-                        topo.complete_volumes.remove(volume_number);
+            has_incomplete_sets = true;
+
+            let waiting_marked_deletable: Vec<u32> = plan
+                .waiting_on_volumes
+                .intersection(&plan.deletion_eligible)
+                .copied()
+                .collect();
+            if !waiting_marked_deletable.is_empty() {
+                return Some(format!(
+                    "set '{set_name}' waiting volumes marked deletable: {:?}",
+                    waiting_marked_deletable
+                ));
+            }
+
+            let waiting_already_deleted: Vec<u32> = plan
+                .waiting_on_volumes
+                .iter()
+                .copied()
+                .filter(|volume| {
+                    self.is_rar_volume_deleted(job_id, &plan.topology.volume_map, *volume)
+                })
+                .collect();
+            if !waiting_already_deleted.is_empty() {
+                return Some(format!(
+                    "set '{set_name}' waiting volumes already deleted: {:?}",
+                    waiting_already_deleted
+                ));
+            }
+
+            if !plan.ready_members.is_empty()
+                || matches!(
+                    plan.phase,
+                    crate::pipeline::rar_state::RarSetPhase::FallbackFullSet
+                )
+            {
+                return None;
+            }
+        }
+
+        if has_incomplete_sets {
+            Some("no retryable work remains for incomplete RAR sets".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn job_has_only_rar_archives(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+
+        let mut has_rar = false;
+        for file in state.assembly.files() {
+            match file.role() {
+                weaver_core::classify::FileRole::RarVolume { .. } => has_rar = true,
+                weaver_core::classify::FileRole::SevenZipArchive
+                | weaver_core::classify::FileRole::SevenZipSplit { .. } => return false,
+                _ => {}
+            }
+        }
+
+        has_rar
+    }
+
+    fn rar_set_names_for_job(&self, job_id: JobId) -> Vec<String> {
+        let mut set_names: HashSet<String> = HashSet::new();
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        for file in state.assembly.files() {
+            if matches!(
+                file.role(),
+                weaver_core::classify::FileRole::RarVolume { .. }
+            ) && let Some(set_name) =
+                weaver_core::classify::archive_base_name(file.filename(), file.role())
+            {
+                set_names.insert(set_name);
+            }
+        }
+        let mut set_names: Vec<String> = set_names.into_iter().collect();
+        set_names.sort();
+        set_names
+    }
+
+    async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.status == JobStatus::Extracting)
+        {
+            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::ExtractionComplete { job_id });
+
+        {
+            let state = self.jobs.get(&job_id).unwrap();
+            let cleanup_dir = state.working_dir.clone();
+            let cleanup_files: Vec<String> = state
+                .assembly
+                .files()
+                .filter(|f| {
+                    matches!(
+                        f.role(),
+                        weaver_core::classify::FileRole::Par2 { .. }
+                            | weaver_core::classify::FileRole::RarVolume { .. }
+                            | weaver_core::classify::FileRole::SevenZipArchive
+                            | weaver_core::classify::FileRole::SevenZipSplit { .. }
+                    )
+                })
+                .map(|f| f.filename().to_string())
+                .collect();
+            let mut removed = 0u32;
+            for filename in &cleanup_files {
+                let path = cleanup_dir.join(filename);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        warn!(
+                            file = %path.display(),
+                            error = %e,
+                            "failed to clean up source file"
+                        );
                     }
                 }
             }
-
-            for (_, file_id) in file_ids {
-                self.try_update_archive_topology(job_id, file_id).await;
-            }
-
             info!(
                 job_id = job_id.0,
-                set_name = %set_name,
-                full_rebuild,
-                "refreshed RAR topology after normalization"
+                removed,
+                total = cleanup_files.len(),
+                "post-extraction cleanup complete"
             );
         }
+
+        let was_extracting = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.status == JobStatus::Extracting);
+        if let Err(error) = self.move_to_complete(job_id).await {
+            if was_extracting {
+                self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+            }
+            self.fail_job(job_id, error);
+            return;
+        }
+
+        {
+            let state = self.jobs.get_mut(&job_id).unwrap();
+            state.status = JobStatus::Complete;
+        }
+        self.clear_par2_runtime_state(job_id);
+        self.eagerly_deleted.remove(&job_id);
+        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+        self.rar_header_snapshots
+            .retain(|(jid, _), _| *jid != job_id);
+        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+        self.normalization_retried.remove(&job_id);
+        self.job_order.retain(|id| *id != job_id);
+        let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
+        self.record_job_history(job_id);
+    }
+
+    async fn check_rar_job_completion(&mut self, job_id: JobId) {
+        let set_names = self.rar_set_names_for_job(job_id);
+        if set_names.is_empty() {
+            return;
+        }
+
+        let has_active_worker = set_names.iter().any(|set_name| {
+            self.rar_sets
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|state| state.active_workers > 0)
+        });
+        if has_active_worker {
+            if let Some(state) = self.jobs.get_mut(&job_id)
+                && state.status != JobStatus::Extracting
+            {
+                state.status = JobStatus::Extracting;
+                if let Err(error) = self.db.set_active_job_status(job_id, "extracting", None) {
+                    error!(error = %error, "db write failed for extracting status");
+                }
+                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::ExtractionReady { job_id });
+            }
+            return;
+        }
+
+        let extracted = self
+            .extracted_members
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut fallback_sets = Vec::new();
+        let mut has_incomplete_sets = false;
+        let mut has_ready_incremental_work = false;
+        for set_name in &set_names {
+            let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
+            let set_complete =
+                set_state
+                    .and_then(|state| state.plan.as_ref())
+                    .is_some_and(|plan| {
+                        !plan.member_names.is_empty()
+                            && plan
+                                .member_names
+                                .iter()
+                                .all(|member| extracted.contains(member))
+                    });
+            if set_complete {
+                self.extracted_sets
+                    .entry(job_id)
+                    .or_default()
+                    .insert(set_name.clone());
+            } else {
+                has_incomplete_sets = true;
+                if let Some(state) = set_state
+                    && let Some(plan) = state.plan.as_ref()
+                {
+                    if matches!(
+                        plan.phase,
+                        crate::pipeline::rar_state::RarSetPhase::FallbackFullSet
+                    ) {
+                        fallback_sets.push(set_name.clone());
+                    } else if !plan.ready_members.is_empty() {
+                        has_ready_incremental_work = true;
+                    }
+                }
+            }
+        }
+
+        if has_incomplete_sets {
+            if let Some(state) = self.jobs.get_mut(&job_id)
+                && state.status != JobStatus::Extracting
+            {
+                state.status = JobStatus::Extracting;
+                if let Err(error) = self.db.set_active_job_status(job_id, "extracting", None) {
+                    error!(error = %error, "db write failed for extracting status");
+                }
+                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::ExtractionReady { job_id });
+            }
+
+            if has_ready_incremental_work {
+                self.try_partial_extraction(job_id).await;
+                return;
+            }
+
+            for set_name in &fallback_sets {
+                if let Err(error) = self.extract_rar_set(job_id, set_name).await {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error = %error,
+                        "failed to start RAR full-set extraction"
+                    );
+                    self.fail_job(job_id, error);
+                    return;
+                }
+            }
+            if !fallback_sets.is_empty() {
+                return;
+            }
+
+            return;
+        }
+
+        self.finalize_completed_archive_job(job_id).await;
     }
 
     /// Check if all data files in a job are complete, and trigger post-processing.
     ///
     /// PAR2 is treated as a repair tool only — damage is detected via yEnc CRC
-    /// (per-segment) and RAR CRC (per-member during streaming extraction). If
+    /// (per-segment) and RAR CRC (per-member extraction). If
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(super) async fn check_job_completion(&mut self, job_id: JobId) {
@@ -470,16 +952,10 @@ impl Pipeline {
             .is_some_and(|f| !f.is_empty());
 
         if has_crc_failures && !par2_bypassed {
-            // Don't start verify/repair while streaming extraction is still active.
-            // Providers hold file handles — renaming files would break extraction.
-            let has_active_streams = self
-                .streaming_providers
-                .keys()
-                .any(|(jid, _, _)| *jid == job_id);
-            if has_active_streams {
-                debug!(
+            if self.has_active_rar_workers(job_id) {
+                info!(
                     job_id = job_id.0,
-                    "deferring verify — active streaming providers"
+                    "deferring verify — active RAR extraction workers"
                 );
                 return;
             }
@@ -498,6 +974,9 @@ impl Pipeline {
                 }
                 self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
                 info!(job_id = job_id.0, "par2 verification started");
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::JobVerificationStarted { job_id });
                 let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
                     file_id: NzbFileId {
                         job_id,
@@ -519,38 +998,21 @@ impl Pipeline {
                         ));
                     }
 
-                    let mut normalized_files = HashSet::new();
-                    if !plan.swaps.is_empty() || !plan.renames.is_empty() {
-                        for (a, b) in &plan.swaps {
-                            normalized_files.insert(a.correct_name.clone());
-                            normalized_files.insert(b.correct_name.clone());
-                        }
-                        for entry in &plan.renames {
-                            normalized_files.insert(entry.correct_name.clone());
-                        }
-
-                        let moved = weaver_par2::apply_placement_plan(&verify_dir, &plan)
-                            .map_err(|e| format!("placement normalization failed: {e}"))?;
-                        tracing::info!(
-                            swaps = plan.swaps.len(),
-                            renames = plan.renames.len(),
-                            moved,
-                            "normalized file placement before verify"
-                        );
-                    }
-
-                    let file_access =
-                        weaver_par2::DiskFileAccess::new(verify_dir, &par2_for_verify);
+                    let file_access = weaver_par2::PlacementFileAccess::from_plan(
+                        verify_dir,
+                        &par2_for_verify,
+                        &plan,
+                    );
                     Ok((
                         weaver_par2::verify_all(&par2_for_verify, &file_access),
-                        normalized_files,
+                        plan,
                     ))
                 })
                 .await;
 
                 self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
-                let (mut verification, normalized_files) = match verify_result {
+                let (mut verification, placement_plan) = match verify_result {
                     Ok(Ok(v)) => v,
                     Ok(Err(msg)) => {
                         warn!(job_id = job_id.0, error = %msg);
@@ -574,18 +1036,22 @@ impl Pipeline {
                         return;
                     }
                 };
+                Self::log_placement_plan(job_id, &placement_plan);
 
-                if !normalized_files.is_empty() {
-                    self.refresh_rar_topology_after_normalization(job_id, &normalized_files)
-                        .await;
-                }
-
-                let skipped_blocks = self.apply_eager_delete_exclusions(job_id, &mut verification);
+                let (skipped_blocks, retained_suspect_blocks) =
+                    self.apply_eager_delete_exclusions(job_id, &mut verification);
                 if skipped_blocks > 0 {
                     info!(
                         job_id = job_id.0,
                         skipped_blocks,
                         "excluded eagerly-deleted CRC-verified volumes from damage count"
+                    );
+                }
+                if retained_suspect_blocks > 0 {
+                    info!(
+                        job_id = job_id.0,
+                        retained_suspect_blocks,
+                        "retained suspect eagerly-deleted volumes in damage count"
                     );
                 }
 
@@ -594,6 +1060,10 @@ impl Pipeline {
                 let damaged = verification.total_missing_blocks;
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
+                let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
+                    job_id,
+                    passed: damaged == 0,
+                });
 
                 if damaged == 0 {
                     info!(
@@ -616,11 +1086,39 @@ impl Pipeline {
                             return;
                         }
 
+                        if let Err(error) = self
+                            .apply_placement_plan_for_retry_or_repair(
+                                job_id,
+                                working_dir.clone(),
+                                &placement_plan,
+                            )
+                            .await
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
+
                         self.normalization_retried.insert(job_id);
-                        let cleared = self
-                            .failed_extractions
-                            .remove(&job_id)
-                            .map_or(0, |s| s.len());
+                        let failed_members =
+                            self.failed_extractions.remove(&job_id).unwrap_or_default();
+                        let cleared = failed_members.len();
+                        self.recompute_rar_retry_frontier(job_id).await;
+                        if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
+                            if !failed_members.is_empty() {
+                                self.failed_extractions.insert(job_id, failed_members);
+                            }
+                            let msg = format!(
+                                "invalid RAR retry frontier after placement correction: {reason}"
+                            );
+                            warn!(job_id = job_id.0, error = %msg);
+                            let state = self.jobs.get_mut(&job_id).unwrap();
+                            state.status = JobStatus::Failed { error: msg.clone() };
+                            let _ = self
+                                .event_tx
+                                .send(PipelineEvent::JobFailed { job_id, error: msg });
+                            self.record_job_history(job_id);
+                            return;
+                        }
                         info!(
                             job_id = job_id.0,
                             cleared,
@@ -644,6 +1142,18 @@ impl Pipeline {
                         total_recovery_capacity,
                         "PAR2 verification — damage detected"
                     );
+
+                    if let Err(error) = self
+                        .apply_placement_plan_for_retry_or_repair(
+                            job_id,
+                            working_dir.clone(),
+                            &placement_plan,
+                        )
+                        .await
+                    {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
 
                     if total_recovery_capacity < damaged {
                         let state = self.jobs.get_mut(&job_id).unwrap();
@@ -785,44 +1295,10 @@ impl Pipeline {
             }
         }
 
-        // Clean up PAR2 files — no longer needed.
-        // Skip if PAR2 was bypassed (files already deleted by drain_recovery_and_bypass_par2).
-        if !par2_bypassed {
-            if let Some(state) = self.jobs.get(&job_id) {
-                let cleanup_dir = state.working_dir.clone();
-                let par2_files: Vec<String> = state
-                    .assembly
-                    .files()
-                    .filter(|f| matches!(f.role(), weaver_core::classify::FileRole::Par2 { .. }))
-                    .map(|f| f.filename().to_string())
-                    .collect();
-                if !par2_files.is_empty() {
-                    let mut removed = 0u32;
-                    for filename in &par2_files {
-                        let path = cleanup_dir.join(filename);
-                        match tokio::fs::remove_file(&path).await {
-                            Ok(()) => removed += 1,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                warn!(file = %path.display(), error = %e, "failed to delete PAR2 file");
-                            }
-                        }
-                    }
-                    if removed > 0 {
-                        info!(
-                            job_id = job_id.0,
-                            removed,
-                            total = par2_files.len(),
-                            "deleted PAR2 files"
-                        );
-                    }
-                }
-            }
+        if self.job_has_only_rar_archives(job_id) {
+            self.check_rar_job_completion(job_id).await;
+            return;
         }
-
-        // Drop retained Par2FileSet — no longer needed.
-        self.par2_sets.remove(&job_id);
-        self.recovery_block_counts.remove(&job_id);
 
         // Check extraction readiness.
         let readiness = {
@@ -831,6 +1307,9 @@ impl Pipeline {
         };
         match readiness {
             ExtractionReadiness::NotApplicable => {
+                if !par2_bypassed {
+                    self.cleanup_par2_files(job_id).await;
+                }
                 // No archives — move to complete and finish.
                 if let Err(error) = self.move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
@@ -841,11 +1320,13 @@ impl Pipeline {
                     self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
                 }
                 state.status = JobStatus::Complete;
-                self.promoted_recovery_files.remove(&job_id);
-                self.recovery_block_counts.remove(&job_id);
+                self.clear_par2_runtime_state(job_id);
                 self.eagerly_deleted.remove(&job_id);
                 self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
                 self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+                self.rar_header_snapshots
+                    .retain(|(jid, _), _| *jid != job_id);
+                self.rar_sets.retain(|(jid, _), _| *jid != job_id);
                 self.job_order.retain(|id| *id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
                 info!(job_id = job_id.0, "job completed (no archives)");
@@ -871,49 +1352,6 @@ impl Pipeline {
                 };
 
                 if !sets_to_extract.is_empty() {
-                    // If streaming extractions are still active for this job, let them
-                    // finish naturally instead of starting full-set extraction (which
-                    // would race: full-set completes → deletes volumes → streaming loses data).
-                    let has_active_streaming = self
-                        .streaming_providers
-                        .keys()
-                        .any(|(jid, _, _)| *jid == job_id);
-                    if has_active_streaming {
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        if state.status != JobStatus::Extracting {
-                            state.status = JobStatus::Extracting;
-                            if let Err(e) =
-                                self.db.set_active_job_status(job_id, "extracting", None)
-                            {
-                                error!(error = %e, "db write failed for extracting status");
-                            }
-                            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-                            let _ = self
-                                .event_tx
-                                .send(PipelineEvent::ExtractionReady { job_id });
-                        }
-                        // Feed all providers and mark finished — all volumes are available.
-                        let active_set_names: HashSet<String> = self
-                            .streaming_providers
-                            .keys()
-                            .filter(|(jid, _, _)| *jid == job_id)
-                            .map(|(_, sn, _)| sn.clone())
-                            .collect();
-                        for sn in &active_set_names {
-                            self.feed_streaming_volumes(job_id, sn);
-                        }
-                        for (key, provider) in &self.streaming_providers {
-                            if key.0 == job_id {
-                                provider.mark_finished();
-                            }
-                        }
-                        info!(
-                            job_id = job_id.0,
-                            "waiting for streaming extractions to finish before full-set extraction"
-                        );
-                        return;
-                    }
-
                     // Spawn extraction tasks in the background.
                     // handle_extraction_done will re-enter check_job_completion
                     // when each set finishes, and we'll reach the empty branch below.
@@ -1019,15 +1457,13 @@ impl Pipeline {
                     let state = self.jobs.get_mut(&job_id).unwrap();
                     state.status = JobStatus::Complete;
                 }
-                self.streaming_providers
-                    .retain(|(jid, _, _), _| *jid != job_id);
-                self.streaming_volume_bases
-                    .retain(|(jid, _, _), _| *jid != job_id);
-                self.promoted_recovery_files.remove(&job_id);
-                self.recovery_block_counts.remove(&job_id);
+                self.clear_par2_runtime_state(job_id);
                 self.eagerly_deleted.remove(&job_id);
                 self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
                 self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
+                self.rar_header_snapshots
+                    .retain(|(jid, _), _| *jid != job_id);
+                self.rar_sets.retain(|(jid, _), _| *jid != job_id);
                 self.normalization_retried.remove(&job_id);
                 self.job_order.retain(|id| *id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
@@ -1058,62 +1494,47 @@ impl Pipeline {
         }
     }
 
-    /// Extract a single RAR archive set using streaming extraction.
-    ///
-    /// Uses a `WaitingVolumeProvider` so volumes are opened on demand as the
-    /// decompressor needs them, rather than requiring all volumes upfront.
-    /// Already-complete volumes are fed immediately; if called during download,
-    /// remaining volumes will be fed as they complete via `feed_streaming_volumes`.
+    /// Extract a single RAR archive set from complete local volume files.
     pub(super) async fn extract_rar_set(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let (first_vol_path, password, working_dir) = {
+        let (volume_paths, cached_headers, password, working_dir) = {
             let state = self
                 .jobs
                 .get(&job_id)
                 .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let topo = state
-                .assembly
-                .archive_topology_for(set_name)
-                .ok_or_else(|| format!("no topology for RAR set '{set_name}'"))?;
-
-            // Find the first volume path.
-            let first_vol_filename = topo
-                .volume_map
-                .iter()
-                .find(|&(_, &vn)| vn == 0)
-                .map(|(name, _)| name.clone())
-                .ok_or_else(|| "no volume 0 in topology".to_string())?;
-
-            let path = state.working_dir.join(&first_vol_filename);
-            (path, state.spec.password.clone(), state.working_dir.clone())
+            let mut parts = std::collections::BTreeMap::new();
+            for file_asm in state.assembly.files() {
+                let weaver_core::classify::FileRole::RarVolume { volume_number } = file_asm.role()
+                else {
+                    continue;
+                };
+                let base_name =
+                    weaver_core::classify::archive_base_name(file_asm.filename(), file_asm.role());
+                if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
+                    continue;
+                }
+                let path = state.working_dir.join(file_asm.filename());
+                if path.exists() {
+                    parts.insert(*volume_number, path);
+                }
+            }
+            (
+                parts,
+                self.load_rar_snapshot(job_id, set_name),
+                state.spec.password.clone(),
+                state.working_dir.clone(),
+            )
         };
 
-        let output_dir = working_dir;
-        let event_tx = self.event_tx.clone();
-
-        // Create or reuse a WaitingVolumeProvider for this set (full-set extraction).
-        let set_key = (job_id, set_name.to_string(), String::new());
-        let provider = if let Some(existing) = self.streaming_providers.get(&set_key) {
-            Arc::clone(existing)
-        } else {
-            let p = Arc::new(weaver_rar::WaitingVolumeProvider::new());
-            self.streaming_providers
-                .insert(set_key.clone(), Arc::clone(&p));
-            p
-        };
-
-        // Feed all currently-complete volumes into the provider.
-        self.feed_streaming_volumes(job_id, set_name);
-
-        // If all files are downloaded, mark provider finished so it doesn't block forever.
-        {
-            let state = self.jobs.get(&job_id).unwrap();
-            let all_done = state.assembly.files().all(|f| f.is_complete());
-            if all_done {
-                provider.mark_finished();
+        if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
+            set_state.active_workers = 1;
+            set_state.in_flight_members.clear();
+            set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+            if let Some(plan) = set_state.plan.as_mut() {
+                plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
             }
         }
 
@@ -1126,83 +1547,95 @@ impl Pipeline {
 
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_owned = set_name.to_string();
-        let extraction_provider = Arc::clone(&provider);
+        let set_name_for_task = set_name.to_string();
+        let event_tx = self.event_tx.clone();
+        let db = self.db.clone();
+        let output_dir = working_dir;
+        let set_name_for_result = set_name_owned.clone();
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let first_file = std::fs::File::open(&first_vol_path)
-                    .map_err(|e| format!("failed to open first volume: {e}"))?;
-                let mut archive = if let Some(ref pw) = password {
-                    weaver_rar::RarArchive::open_with_password(first_file, pw)
-                } else {
-                    weaver_rar::RarArchive::open(first_file)
+                if volume_paths.is_empty() {
+                    return Err(format!("no on-disk RAR volumes for set '{set_name_owned}'"));
                 }
-                .map_err(|e| format!("failed to open RAR archive: {e}"))?;
+
+                let mut archive = Self::open_rar_archive_from_snapshot_or_disk(
+                    &set_name_owned,
+                    volume_paths.clone(),
+                    password.clone(),
+                    cached_headers,
+                )?;
 
                 let meta = archive.metadata();
                 let options = weaver_rar::ExtractOptions {
                     verify: true,
                     password: password.clone(),
                 };
+                let is_solid = archive.is_solid();
 
-                let mut extracted_count = 0u32;
+                let mut extracted_members = Vec::new();
                 let mut failed_members: Vec<String> = Vec::new();
                 for (idx, member) in meta.members.iter().enumerate() {
                     if already_extracted.contains(&member.name) {
-                        extracted_count += 1;
                         continue;
                     }
 
-                    if member.is_directory {
-                        let dir_path = output_dir.join(&member.name);
-                        std::fs::create_dir_all(&dir_path)
-                            .map_err(|e| format!("failed to create dir {}: {e}", member.name))?;
-                        continue;
-                    }
-
-                    let out_path = output_dir.join(&member.name);
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("failed to create parent dir: {e}"))?;
-                    }
-
-                    let mut out_file = std::io::BufWriter::new(
-                        std::fs::File::create(&out_path)
-                            .map_err(|e| format!("failed to create {}: {e}", member.name))?
-                    );
-                    match archive.extract_member_streaming(idx, &options, extraction_provider.as_ref(), &mut out_file) {
-                        Ok(bytes_written) => {
-                            let unpacked = member.unpacked_size.unwrap_or(0);
-                            info!(job_id = job_id.0, member = %member.name, bytes_written, total_bytes = unpacked, "member extracted");
+                    match Self::extract_rar_member_to_output(
+                        &mut archive,
+                        &volume_paths,
+                        &db,
+                        &event_tx,
+                        job_id,
+                        &set_name_for_task,
+                        &output_dir,
+                        idx,
+                        &options,
+                    ) {
+                        Ok((member_name, bytes_written, total_bytes)) => {
+                            info!(job_id = job_id.0, member = %member_name, bytes_written, total_bytes, "member extracted");
                             let _ = event_tx.send(PipelineEvent::ExtractionProgress {
                                 job_id,
-                                member: member.name.clone(),
+                                member: member_name.clone(),
                                 bytes_written,
-                                total_bytes: unpacked,
+                                total_bytes,
                             });
-                            extracted_count += 1;
+                            let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+                                job_id,
+                                set_name: set_name_for_task.clone(),
+                                member: member_name.clone(),
+                            });
+                            extracted_members.push(member_name);
                         }
                         Err(e) => {
+                            let _ = event_tx.send(PipelineEvent::ExtractionMemberFailed {
+                                job_id,
+                                set_name: set_name_for_task.clone(),
+                                member: member.name.clone(),
+                                error: e.to_string(),
+                            });
                             tracing::warn!(member = %member.name, error = %e, "member extraction failed, continuing with remaining members");
-                            // Clean up partial output file.
-                            let _ = std::fs::remove_file(&out_path);
                             failed_members.push(member.name.clone());
+                            if is_solid {
+                                break;
+                            }
                         }
                     }
                 }
 
-                Ok((extracted_count, failed_members))
+                Ok(FullSetExtractionOutcome {
+                    extracted: extracted_members,
+                    failed: failed_members,
+                })
             })
             .await;
 
             let result = match result {
-                Ok(Ok(v)) => Ok(v),
-                Ok(Err(e)) => Err(e),
+                Ok(result) => result,
                 Err(e) => Err(format!("extraction task panicked: {e}")),
             };
             let _ = extract_done_tx
                 .send(ExtractionDone::FullSet {
                     job_id,
-                    set_name: set_name_owned,
+                    set_name: set_name_for_result,
                     result,
                 })
                 .await;
@@ -1270,8 +1703,8 @@ impl Pipeline {
                     sevenz_rust2::Password::empty()
                 };
 
-                let mut extracted_count = 0u32;
-                let extracted_count_ref = &mut extracted_count;
+                let mut extracted_members = Vec::new();
+                let extracted_members_ref = &mut extracted_members;
                 let event_tx_ref = &event_tx;
                 let output_dir_ref = &output_dir;
 
@@ -1289,6 +1722,11 @@ impl Pipeline {
                     if let Some(parent) = out_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
+                    let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
+                        job_id,
+                        set_name: set_name_owned.clone(),
+                        member: entry.name().to_string(),
+                    });
 
                     let mut file = std::fs::File::create(&out_path)?;
                     let bytes_written = std::io::copy(reader, &mut file)?;
@@ -1306,8 +1744,13 @@ impl Pipeline {
                         bytes_written,
                         total_bytes: entry.size(),
                     });
+                    let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
+                        job_id,
+                        set_name: set_name_owned.clone(),
+                        member: entry.name().to_string(),
+                    });
 
-                    *extracted_count_ref += 1;
+                    extracted_members_ref.push(entry.name().to_string());
                     Ok(true)
                 };
 
@@ -1333,7 +1776,10 @@ impl Pipeline {
                     .map_err(|e| format!("7z extraction failed: {e}"))?;
                 }
 
-                Ok((extracted_count, Vec::new()))
+                Ok(FullSetExtractionOutcome {
+                    extracted: extracted_members,
+                    failed: Vec::new(),
+                })
             })
             .await;
 
@@ -1354,87 +1800,175 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// Delete RAR volumes that are no longer needed by any active extraction.
-    ///
-    /// Called after a member finishes streaming extraction with CRC pass.
-    /// A volume can be deleted when no active streaming provider still needs it.
-    /// Deleted filenames are tracked in `eagerly_deleted` so PAR2 verify excludes
-    /// them from the damage count (they passed CRC during extraction).
+    /// Persist RAR volume eligibility without deleting source volumes.
     pub(super) fn try_delete_volumes(&mut self, job_id: JobId, set_name: &str) {
-        let Some(state) = self.jobs.get(&job_id) else {
+        let key = (job_id, set_name.to_string());
+        let Some(plan) = self.rar_sets.get(&key).and_then(|state| state.plan.clone()) else {
             return;
         };
-        let Some(topo) = state.assembly.archive_topology_for(set_name) else {
+        let volumes: Vec<u32> = self
+            .rar_sets
+            .get(&key)
+            .map(|state| state.facts.keys().copied().collect())
+            .unwrap_or_default();
+        if volumes.is_empty() {
             return;
-        };
-
-        // A volume is deletable when every member spanning it has been extracted.
-        let extracted = self
-            .extracted_members
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default();
-        let deletable = topo.deletable_volumes(&extracted);
-
-        // Active streaming providers still need volumes at or above their base
-        // (open-ended because we don't know when the stream will finish).
-        let stream_bases: Vec<u32> = self
-            .streaming_volume_bases
-            .iter()
-            .filter(|((jid, sn, _), _)| *jid == job_id && sn == set_name)
-            .map(|(_, &base)| base)
-            .collect();
-        let clean = self
-            .clean_volumes
-            .get(&(job_id, set_name.to_string()))
-            .cloned()
-            .unwrap_or_default();
-        let suspect = self
-            .suspect_volumes
-            .get(&(job_id, set_name.to_string()))
-            .cloned()
-            .unwrap_or_default();
-
-        let working_dir = state.working_dir.clone();
-        let mut deleted = 0u32;
-
-        for (filename, &vol_num) in &topo.volume_map {
-            if !deletable.contains(&vol_num) {
-                continue;
-            }
-            if !clean.contains(&vol_num) {
-                continue;
-            }
-            if suspect.contains(&vol_num) {
-                continue;
-            }
-            if stream_bases.iter().any(|&base| vol_num >= base) {
-                continue;
-            }
-
-            let path = working_dir.join(filename);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    deleted += 1;
-                    self.eagerly_deleted
-                        .entry(job_id)
-                        .or_default()
-                        .insert(filename.clone());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "failed to delete volume");
-                }
-            }
         }
+        let suspect = self.suspect_volumes.get(&key).cloned().unwrap_or_default();
+        let mut deleted_now = Vec::new();
+        let mut ownership_ready = Vec::new();
 
-        if deleted > 0 {
-            info!(
-                job_id = job_id.0,
-                set_name = %set_name,
+        for volume in volumes {
+            let Some(decision) = plan.delete_decisions.get(&volume) else {
+                continue;
+            };
+            let Some(filename) =
+                Self::rar_volume_filename(&plan.topology.volume_map, volume).map(str::to_string)
+            else {
+                debug!(
+                    job_id = job_id.0,
+                    set_name, volume, "RAR eager delete skipped: no filename for volume"
+                );
+                continue;
+            };
+
+            let claim_clean = Self::claim_clean_rar_volume(decision);
+            let verified_suspect = suspect.contains(&volume);
+            let solid_blocked = plan.is_solid;
+            let waiting_on_retry = plan.waiting_on_volumes.contains(&volume);
+            let failed_member_claim = !decision.failed_owners.is_empty()
+                || self.volume_has_failed_member_claim(job_id, set_name, volume);
+            let already_deleted = self
+                .eagerly_deleted
+                .get(&job_id)
+                .is_some_and(|deleted| deleted.contains(&filename));
+            let should_delete = decision.ownership_eligible
+                && !waiting_on_retry
+                && !failed_member_claim
+                && !verified_suspect
+                && !solid_blocked
+                && !already_deleted;
+
+            if should_delete {
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                let path = state.working_dir.join(&filename);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        self.eagerly_deleted
+                            .entry(job_id)
+                            .or_default()
+                            .insert(filename.clone());
+                        deleted_now.push(volume);
+                        info!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            volume,
+                            file = %filename,
+                            owners = ?decision.owners,
+                            "RAR volume eagerly deleted"
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            volume,
+                            file = %filename,
+                            owners = ?decision.owners,
+                            "RAR eager delete found volume already missing"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            volume,
+                            file = %filename,
+                            owners = ?decision.owners,
+                            error = %error,
+                            "RAR eager delete failed"
+                        );
+                    }
+                }
+            } else {
+                let mut reasons = Vec::new();
+                if !decision.pending_owners.is_empty() {
+                    reasons.push(format!("pending_members={:?}", decision.pending_owners));
+                }
+                if !decision.failed_owners.is_empty() {
+                    reasons.push(format!("failed_members={:?}", decision.failed_owners));
+                }
+                if decision.unresolved_boundary {
+                    reasons.push("unresolved_boundary".to_string());
+                }
+                if waiting_on_retry {
+                    reasons.push("waiting_on_retry".to_string());
+                }
+                if failed_member_claim {
+                    reasons.push("failed_member_claim".to_string());
+                }
+                if solid_blocked {
+                    reasons.push("solid_archive".to_string());
+                }
+                if !claim_clean {
+                    reasons.push("claims_not_clean".to_string());
+                }
+                if verified_suspect {
+                    reasons.push("verified_suspect".to_string());
+                }
+                if already_deleted {
+                    reasons.push("already_deleted".to_string());
+                }
+                if decision.ownership_eligible && !waiting_on_retry && !failed_member_claim {
+                    ownership_ready.push(volume);
+                }
+                debug!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    volume,
+                    file = %filename,
+                    owners = ?decision.owners,
+                    clean_owners = ?decision.clean_owners,
+                    failed_owners = ?decision.failed_owners,
+                    pending_owners = ?decision.pending_owners,
+                    reasons = ?reasons,
+                    "RAR eager delete retained volume"
+                );
+            }
+
+            let deleted = self
+                .eagerly_deleted
+                .get(&job_id)
+                .is_some_and(|deleted| deleted.contains(&filename));
+            let par2_clean = claim_clean && !verified_suspect;
+            if let Err(error) = self.db.set_volume_status(
+                job_id,
+                set_name,
+                volume,
+                decision.ownership_eligible,
+                par2_clean,
                 deleted,
-                "eagerly deleted RAR volumes"
-            );
+            ) {
+                error!(
+                    job_id = job_id.0,
+                    set_name,
+                    volume,
+                    error = %error,
+                    "failed to persist RAR volume eligibility"
+                );
+            }
         }
+
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            solid = plan.is_solid,
+            ownership_ready = ?ownership_ready,
+            deleted_now = ?deleted_now,
+            verified_suspect_volumes = ?suspect,
+            "RAR eager delete audit"
+        );
     }
 }

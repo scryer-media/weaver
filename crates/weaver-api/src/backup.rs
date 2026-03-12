@@ -755,6 +755,7 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
         let (event_tx, _) = broadcast::channel(16);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+        let task_state = state.clone();
         tokio::spawn(async move {
             while let Some(command) = cmd_rx.recv().await {
                 match command {
@@ -777,6 +778,14 @@ mod tests {
                         *capture.updated_paths.lock().unwrap() =
                             Some((data_dir, intermediate_dir, complete_dir));
                         let _ = reply.send(Ok(()));
+                    }
+                    SchedulerCommand::PauseAll { reply } => {
+                        task_state.set_paused(true);
+                        let _ = reply.send(());
+                    }
+                    SchedulerCommand::ResumeAll { reply } => {
+                        task_state.set_paused(false);
+                        let _ = reply.send(());
                     }
                     _ => {}
                 }

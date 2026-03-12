@@ -382,8 +382,13 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
-        .layer(CompressionLayer::new())
-        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new().gzip(true).br(true).zstd(true))
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .zstd(true),
+        )
         .layer(CorsLayer::permissive());
 
     info!(%addr, "starting HTTP server");
