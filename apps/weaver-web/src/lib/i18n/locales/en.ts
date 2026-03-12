@@ -106,6 +106,9 @@ const en: LocaleDictionary = {
   "job.notFound": "Job not found.",
   "job.passwordProtected": "Password protected",
   "job.eventLog": "Event Log",
+  "job.savedBandwidthSkipped": "Skipped unneeded PAR2 recovery download",
+  "job.savedBandwidthUsedAll": "All optional PAR2 recovery was needed",
+  "job.savedBandwidthLegacy": "This older job completed successfully, but recovery-savings details were not recorded yet.",
   "job.waitingForEvents": "Waiting for events...",
 
   // Connection state
@@ -154,6 +157,7 @@ const en: LocaleDictionary = {
   "label.downloaded": "Downloaded",
   "label.totalSize": "Total Size",
   "label.progress": "Progress",
+  "label.savedBandwidth": "Saved bandwidth",
   "label.downloadSpeed": "Download Speed",
   "label.enabled": "Enabled",
   "label.disabled": "Disabled",

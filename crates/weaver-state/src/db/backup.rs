@@ -26,11 +26,14 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "active_segments",
     "active_files",
     "active_par2",
+    "active_par2_files",
     "active_extracted",
+    "active_failed_extractions",
     "active_extraction_chunks",
     "active_archive_headers",
     "active_rar_volume_facts",
     "active_volume_status",
+    "active_rar_verified_suspect",
 ];
 
 const CLEAR_IMPORT_TABLES: &[&str] = &[
@@ -54,6 +57,26 @@ pub struct StableStateExport {
 
 fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
+}
+
+fn table_has_column(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<bool, StateError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA {schema}.table_info({table})"))
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_err)?;
+    for row in rows {
+        if row.map_err(db_err)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Database {
@@ -119,6 +142,22 @@ impl Database {
         let conn = self.conn();
         conn.execute("ATTACH DATABASE ?1 AS src", [&src_path])
             .map_err(db_err)?;
+        let src_optional_recovery_bytes =
+            if table_has_column(&conn, "src", "job_history", "optional_recovery_bytes")? {
+                "optional_recovery_bytes"
+            } else {
+                "0"
+            };
+        let src_optional_recovery_downloaded_bytes = if table_has_column(
+            &conn,
+            "src",
+            "job_history",
+            "optional_recovery_downloaded_bytes",
+        )? {
+            "optional_recovery_downloaded_bytes"
+        } else {
+            "0"
+        };
         let tx = conn.unchecked_transaction().map_err(db_err)?;
 
         for table in CLEAR_IMPORT_TABLES {
@@ -126,7 +165,7 @@ impl Database {
             tx.execute(&sql, []).map_err(db_err)?;
         }
 
-        tx.execute_batch(
+        tx.execute_batch(&format!(
             "INSERT INTO settings (key, value)
                  SELECT key, value FROM src.settings;
              INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
@@ -136,8 +175,12 @@ impl Database {
              INSERT INTO api_keys (id, name, key_hash, scope, created_at, last_used_at)
                  SELECT id, name, key_hash, scope, created_at, last_used_at FROM src.api_keys;
              INSERT INTO job_history
-                 (job_id, name, status, error_message, total_bytes, downloaded_bytes, failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata)
-                 SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes, failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata
+                 (job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                  optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                  failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata)
+                 SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                        {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
+                        failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata
                  FROM src.job_history;
              INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                  SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
@@ -159,7 +202,7 @@ impl Database {
              INSERT INTO sqlite_sequence (name, seq)
                  SELECT 'job_events', COALESCE(MAX(id), 0) FROM job_events;
              ",
-        )
+        ))
         .map_err(db_err)?;
 
         tx.commit().map_err(db_err)?;
@@ -226,6 +269,8 @@ mod tests {
             error_message: None,
             total_bytes: 123,
             downloaded_bytes: 123,
+            optional_recovery_bytes: 45,
+            optional_recovery_downloaded_bytes: 12,
             failed_bytes: 0,
             health: 1000,
             category: Some("tv".into()),
@@ -304,12 +349,10 @@ mod tests {
         assert_eq!(restored.servers.len(), 1);
         assert_eq!(restored.categories.len(), 1);
         assert_eq!(dest.list_api_keys().unwrap().len(), 1);
-        assert_eq!(
-            dest.list_job_history(&HistoryFilter::default())
-                .unwrap()
-                .len(),
-            1
-        );
+        let history = dest.list_job_history(&HistoryFilter::default()).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].optional_recovery_bytes, 45);
+        assert_eq!(history[0].optional_recovery_downloaded_bytes, 12);
         assert_eq!(dest.get_job_events(77).unwrap().len(), 1);
         assert_eq!(dest.list_rss_feeds().unwrap().len(), 1);
         assert_eq!(dest.list_rss_rules(1).unwrap().len(), 1);
@@ -327,6 +370,8 @@ mod tests {
             error_message: None,
             total_bytes: 1,
             downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
             category: None,

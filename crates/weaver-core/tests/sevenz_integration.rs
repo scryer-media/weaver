@@ -659,6 +659,7 @@ fn topology_single_7z() {
             last_volume: 0,
             unpacked_size: 0,
         }],
+        unresolved_spans: Vec::new(),
     };
     job.set_archive_topology("test".into(), topo);
 
@@ -712,6 +713,7 @@ fn topology_split_7z() {
             last_volume: 2,
             unpacked_size: 0,
         }],
+        unresolved_spans: Vec::new(),
     };
     job.set_archive_topology("test".into(), topo);
 
@@ -809,6 +811,7 @@ fn multi_set_readiness_partial() {
             last_volume: 1,
             unpacked_size: 0,
         }],
+        unresolved_spans: Vec::new(),
     };
     let topo2 = weaver_assembly::ArchiveTopology {
         archive_type: weaver_assembly::ArchiveType::SevenZip,
@@ -823,6 +826,7 @@ fn multi_set_readiness_partial() {
             last_volume: 1,
             unpacked_size: 0,
         }],
+        unresolved_spans: Vec::new(),
     };
 
     job.set_archive_topology("ep01.7z".into(), topo1);

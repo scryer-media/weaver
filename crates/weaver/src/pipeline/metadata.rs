@@ -126,7 +126,11 @@ impl Pipeline {
             .and_then(|state| state.plan.as_ref())
             .map(|plan| plan.deletion_eligible.clone())
             .unwrap_or_default();
-        let suspect_volumes = self.suspect_volumes.get(&key).cloned().unwrap_or_default();
+        let verified_suspect_volumes = self
+            .rar_sets
+            .get(&key)
+            .map(|state| state.verified_suspect_volumes.clone())
+            .unwrap_or_default();
 
         for volume in self
             .rar_sets
@@ -139,7 +143,7 @@ impl Pipeline {
                 .delete_decisions
                 .get(&volume)
                 .is_some_and(crate::pipeline::Pipeline::claim_clean_rar_volume)
-                && !suspect_volumes.contains(&volume);
+                && !verified_suspect_volumes.contains(&volume);
             let deleted = self.is_rar_volume_deleted(job_id, &plan.topology.volume_map, volume);
             if let Err(error) = self
                 .db
@@ -176,7 +180,7 @@ impl Pipeline {
                 ready_members = plan.ready_members.len(),
                 waiting_on = ?plan.waiting_on_volumes,
                 ownership_eligible = ?plan.deletion_eligible,
-                verified_suspect_volumes = ?suspect_volumes,
+                verified_suspect_volumes = ?verified_suspect_volumes,
                 "RAR set recomputed"
             );
         }
@@ -209,7 +213,7 @@ impl Pipeline {
                 unresolved_boundary = decision.unresolved_boundary,
                 ownership_eligible = decision.ownership_eligible,
                 claim_clean = crate::pipeline::Pipeline::claim_clean_rar_volume(decision),
-                verified_suspect = suspect_volumes.contains(volume),
+                verified_suspect = verified_suspect_volumes.contains(volume),
                 deleted = self.is_rar_volume_deleted(job_id, &plan.topology.volume_map, *volume),
                 "RAR volume ownership audit"
             );
@@ -502,7 +506,7 @@ impl Pipeline {
         // exists yet (no index file), treat this recovery volume as the
         // initial source of PAR2 metadata — every PAR2 file contains the
         // file descriptions and checksums needed for verification.
-        if !is_index && self.par2_sets.contains_key(&job_id) {
+        if !is_index && self.par2_set(job_id).is_some() {
             return;
         }
 
@@ -582,7 +586,12 @@ impl Pipeline {
         let slice_size = par2_set.slice_size;
         let recovery_block_count = par2_set.recovery_block_count();
 
-        self.note_recovery_block_count(job_id, file_id.file_index, recovery_block_count);
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            let entry = runtime.files.entry(file_id.file_index).or_default();
+            entry.filename = filename.clone();
+            entry.recovery_blocks = recovery_block_count;
+        }
 
         info!(
             job_id = job_id.0,
@@ -593,7 +602,7 @@ impl Pipeline {
         );
 
         // Retain the Par2FileSet for repair (avoids re-reading from disk).
-        self.par2_sets.insert(job_id, Arc::new(par2_set));
+        self.ensure_par2_runtime(job_id).set = Some(Arc::new(par2_set));
 
         let _ = self
             .event_tx
@@ -605,6 +614,20 @@ impl Pipeline {
             .set_par2_metadata(job_id, slice_size, recovery_block_count)
         {
             error!(error = %e, "db write failed for set_par2_metadata");
+        }
+        if let Err(error) = self.db.upsert_par2_file(
+            job_id,
+            file_id.file_index,
+            &filename,
+            recovery_block_count,
+            false,
+        ) {
+            error!(
+                job_id = job_id.0,
+                file_index = file_id.file_index,
+                error = %error,
+                "db write failed for upsert_par2_file"
+            );
         }
     }
 
@@ -635,7 +658,7 @@ impl Pipeline {
         }
 
         // Need a retained Par2FileSet to merge into.
-        if !self.par2_sets.contains_key(&job_id) {
+        if self.par2_set(job_id).is_none() {
             return;
         }
 
@@ -653,18 +676,45 @@ impl Pipeline {
 
         // Merge into the retained set (Arc::make_mut clones only if shared).
         let merge_result = {
-            let par2_set = Arc::make_mut(self.par2_sets.get_mut(&job_id).unwrap());
+            let par2_set = Arc::make_mut(self.ensure_par2_runtime(job_id).set.as_mut().unwrap());
             let merge = par2_set.merge_packets(packet_list);
             let total_recovery = par2_set.recovery_block_count();
             (merge, total_recovery)
         };
         match merge_result {
             (Ok(result), total_recovery) if result.new_recovery_slices > 0 => {
-                self.note_recovery_block_count(
+                let promoted = self
+                    .par2_runtime(job_id)
+                    .and_then(|runtime| runtime.files.get(&file_id.file_index))
+                    .is_some_and(|file| file.promoted);
+                {
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    let entry = runtime.files.entry(file_id.file_index).or_default();
+                    entry.filename = filename.clone();
+                    entry.recovery_blocks = result.new_recovery_slices;
+                    entry.promoted = promoted;
+                }
+                if let Err(error) = self.db.upsert_par2_file(
                     job_id,
                     file_id.file_index,
+                    &filename,
                     result.new_recovery_slices,
-                );
+                    promoted,
+                ) {
+                    error!(
+                        job_id = job_id.0,
+                        file_index = file_id.file_index,
+                        error = %error,
+                        "db write failed for upsert_par2_file"
+                    );
+                }
+                let slice_size = self.par2_set(job_id).map(|set| set.slice_size).unwrap_or(0);
+                if let Err(error) = self
+                    .db
+                    .set_par2_metadata(job_id, slice_size, total_recovery)
+                {
+                    error!(error = %error, "db write failed for set_par2_metadata");
+                }
                 info!(
                     job_id = job_id.0,
                     filename = %filename,
@@ -686,17 +736,19 @@ impl Pipeline {
     }
 
     fn set_rar_snapshot(&mut self, job_id: JobId, set_name: &str, headers: Vec<u8>) {
-        self.rar_header_snapshots
-            .insert((job_id, set_name.to_string()), headers.clone());
+        self.rar_sets
+            .entry((job_id, set_name.to_string()))
+            .or_default()
+            .cached_headers = Some(headers.clone());
         if let Err(e) = self.db.save_archive_headers(job_id, set_name, &headers) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to persist RAR headers");
         }
     }
 
     pub(super) fn load_rar_snapshot(&self, job_id: JobId, set_name: &str) -> Option<Vec<u8>> {
-        self.rar_header_snapshots
+        self.rar_sets
             .get(&(job_id, set_name.to_string()))
-            .cloned()
+            .and_then(|state| state.cached_headers.clone())
             .or_else(|| {
                 self.db
                     .load_archive_headers(job_id, set_name)
@@ -706,8 +758,9 @@ impl Pipeline {
     }
 
     pub(super) fn clear_rar_snapshot(&mut self, job_id: JobId, set_name: &str) {
-        self.rar_header_snapshots
-            .remove(&(job_id, set_name.to_string()));
+        if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
+            state.cached_headers = None;
+        }
         if let Err(e) = self.db.delete_archive_headers(job_id, set_name) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to delete cached RAR headers");
         }
@@ -763,8 +816,10 @@ impl Pipeline {
                         password.clone(),
                     ) {
                         Ok(_) => {
-                            self.rar_header_snapshots
-                                .insert((job_id, set_name), headers);
+                            self.rar_sets
+                                .entry((job_id, set_name))
+                                .or_default()
+                                .cached_headers = Some(headers);
                         }
                         Err(error) => {
                             warn!(
@@ -827,6 +882,24 @@ impl Pipeline {
                         );
                     }
                 }
+            }
+        }
+
+        match self.db.load_verified_suspect_volumes(job_id) {
+            Ok(verified_suspect_by_set) => {
+                for (set_name, verified_suspect_volumes) in verified_suspect_by_set {
+                    self.rar_sets
+                        .entry((job_id, set_name))
+                        .or_default()
+                        .verified_suspect_volumes = verified_suspect_volumes;
+                }
+            }
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted verified suspect RAR volumes"
+                );
             }
         }
 

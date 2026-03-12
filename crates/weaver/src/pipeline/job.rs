@@ -340,6 +340,15 @@ impl Pipeline {
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
+        self.replace_failed_extraction_members(job_id, HashSet::new());
+        self.set_normalization_retried_state(job_id, false);
+        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
+            error!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to clear persisted verified suspect RAR volumes during reprocess"
+            );
+        }
 
         // Add to job_order so it shows as active.
         if !self.job_order.contains(&job_id) {
@@ -371,9 +380,31 @@ impl Pipeline {
                 .collect()
         };
 
-        self.par2_sets.remove(&job_id);
-        self.promoted_recovery_files.remove(&job_id);
-        self.recovery_block_counts.remove(&job_id);
+        self.par2_runtime.remove(&job_id);
+
+        match self.db.load_par2_files(job_id) {
+            Ok(files) if !files.is_empty() => {
+                let runtime = self.ensure_par2_runtime(job_id);
+                for (file_index, file) in files {
+                    runtime.files.insert(
+                        file_index,
+                        crate::pipeline::Par2FileRuntime {
+                            filename: file.filename,
+                            recovery_blocks: file.recovery_block_count,
+                            promoted: file.promoted,
+                        },
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted PAR2 file state"
+                );
+            }
+        }
 
         // Load PAR2 index files first (needed before recovery volumes).
         for (file_id, role) in &files {
@@ -394,13 +425,15 @@ impl Pipeline {
                     ..
                 }
             ) {
-                if self.par2_sets.contains_key(&job_id) {
+                if self.par2_set(job_id).is_some() {
                     self.try_merge_par2_recovery(job_id, *file_id).await;
                 } else {
                     self.try_load_par2_metadata(job_id, *file_id).await;
                 }
             }
         }
+
+        self.reapply_promoted_recovery_queue(job_id);
     }
 
     /// Reload PAR2 and RAR metadata from on-disk files for a reprocessed job.
@@ -527,6 +560,32 @@ impl Pipeline {
         self.job_order.push(job_id);
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);
+        }
+        match self.db.load_failed_extractions(job_id) {
+            Ok(failed_members) if !failed_members.is_empty() => {
+                self.failed_extractions.insert(job_id, failed_members);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted failed extraction members"
+                );
+            }
+        }
+        match self.db.load_active_job_normalization_retried(job_id) {
+            Ok(true) => {
+                self.normalization_retried.insert(job_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted normalization retry state"
+                );
+            }
         }
         self.restore_par2_state_from_disk(job_id).await;
         self.restore_rar_state_for_job(job_id).await;

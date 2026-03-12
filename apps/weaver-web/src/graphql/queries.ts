@@ -13,6 +13,8 @@ const JOB_LIST_ITEM_FIELDS = `
     progress
     totalBytes
     downloadedBytes
+    optionalRecoveryBytes
+    optionalRecoveryDownloadedBytes
     failedBytes
     health
     hasPassword

@@ -30,6 +30,37 @@ pub enum ConnectionState {
 /// Minimum allowed timeout value (1 second).
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Internal NNTP buffer sizing profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NntpBufferProfile {
+    pub read_buf_capacity: usize,
+    pub socket_read_size: usize,
+}
+
+impl NntpBufferProfile {
+    pub fn adaptive(available_bytes: u64, total_connections: usize) -> Self {
+        let total_budget = (available_bytes / 32).min(256 * 1024 * 1024) as usize;
+        let per_connection = if total_connections == 0 {
+            128 * 1024
+        } else {
+            (total_budget / total_connections).clamp(128 * 1024, 512 * 1024)
+        };
+        Self {
+            read_buf_capacity: per_connection,
+            socket_read_size: per_connection.min(256 * 1024),
+        }
+    }
+}
+
+impl Default for NntpBufferProfile {
+    fn default() -> Self {
+        Self {
+            read_buf_capacity: 64 * 1024,
+            socket_read_size: 64 * 1024,
+        }
+    }
+}
+
 /// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -51,6 +82,8 @@ pub struct ServerConfig {
     /// Timeout for individual command responses.
     /// Clamped to a minimum of 1 second.
     pub command_timeout: Duration,
+    /// Internal read-buffer sizing profile.
+    pub buffer_profile: NntpBufferProfile,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +97,7 @@ impl Default for ServerConfig {
             password: None,
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_secs(60),
+            buffer_profile: NntpBufferProfile::default(),
         }
     }
 }
@@ -78,6 +112,8 @@ pub struct NntpConnection {
     transport: Option<NntpTransport>,
     codec: NntpCodec,
     read_buf: BytesMut,
+    io_buf: Vec<u8>,
+    buffer_profile: NntpBufferProfile,
     state: ConnectionState,
     capabilities: Capabilities,
     host: String,
@@ -117,10 +153,14 @@ impl NntpConnection {
         };
 
         let now = Instant::now();
+        let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
+        let socket_read_size = config.buffer_profile.socket_read_size.max(64 * 1024);
         let mut conn = NntpConnection {
             transport: Some(transport),
             codec: NntpCodec::new(),
-            read_buf: BytesMut::with_capacity(65536),
+            read_buf: BytesMut::with_capacity(read_buf_capacity),
+            io_buf: vec![0u8; socket_read_size],
+            buffer_profile: config.buffer_profile,
             state: ConnectionState::Greeting,
             capabilities: Capabilities::default(),
             host: config.host.clone(),
@@ -276,6 +316,7 @@ impl NntpConnection {
     /// Read a single response line from the server.
     async fn read_response(&mut self) -> Result<Response> {
         let frame = self.read_frame().await?;
+        self.trim_read_buffer();
         match frame {
             NntpFrame::Line(line) => parse_response(&line),
             NntpFrame::MultiLineData(_) => Err(NntpError::MalformedResponse(
@@ -296,21 +337,8 @@ impl NntpConnection {
                 }
 
                 // Need more data from the transport.
-                let mut tmp = [0u8; 65536];
-                let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
-                let n = transport.read(&mut tmp).await.map_err(|e| {
-                    self.poisoned = true;
-                    self.current_group = None;
-                    NntpError::Io(e)
-                })?;
-
-                if n == 0 {
-                    self.poisoned = true;
-                    self.current_group = None;
-                    return Err(NntpError::ConnectionClosed);
-                }
-
-                self.read_buf.extend_from_slice(&tmp[..n]);
+                let n = self.read_into_buffer().await?;
+                self.read_buf.extend_from_slice(&self.io_buf[..n]);
             }
         })
         .await;
@@ -332,6 +360,7 @@ impl NntpConnection {
         self.codec.set_multiline(true);
 
         let frame = self.read_frame().await?;
+        self.trim_read_buffer();
         match frame {
             NntpFrame::MultiLineData(data) => Ok(data.freeze()),
             NntpFrame::Line(line) => Err(NntpError::MalformedResponse(format!(
@@ -596,33 +625,53 @@ impl NntpConnection {
                     }
                 }
 
-                let mut tmp = [0u8; 65536];
-                let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
-                let n = transport.read(&mut tmp).await.map_err(|e| {
-                    self.poisoned = true;
-                    self.current_group = None;
-                    NntpError::Io(e)
-                })?;
-
-                if n == 0 {
-                    self.poisoned = true;
-                    self.current_group = None;
-                    return Err(NntpError::ConnectionClosed);
-                }
-
-                self.read_buf.extend_from_slice(&tmp[..n]);
+                let n = self.read_into_buffer().await?;
+                self.read_buf.extend_from_slice(&self.io_buf[..n]);
             }
         })
         .await;
 
         match result {
-            Ok(inner) => inner,
+            Ok(inner) => {
+                self.trim_read_buffer();
+                inner
+            }
             Err(_) => {
                 self.poisoned = true;
                 self.current_group = None;
                 Err(NntpError::Timeout)
             }
         }
+    }
+
+    fn trim_read_buffer(&mut self) {
+        let target = self
+            .buffer_profile
+            .read_buf_capacity
+            .max(self.read_buf.len())
+            .max(64 * 1024);
+        if self.read_buf.capacity() > target.saturating_mul(2) {
+            let mut trimmed = BytesMut::with_capacity(target);
+            trimmed.extend_from_slice(&self.read_buf);
+            self.read_buf = trimmed;
+        }
+    }
+
+    async fn read_into_buffer(&mut self) -> Result<usize> {
+        let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
+        let n = transport.read(&mut self.io_buf).await.map_err(|e| {
+            self.poisoned = true;
+            self.current_group = None;
+            NntpError::Io(e)
+        })?;
+
+        if n == 0 {
+            self.poisoned = true;
+            self.current_group = None;
+            return Err(NntpError::ConnectionClosed);
+        }
+
+        Ok(n)
     }
 
     /// Send QUIT and close the connection gracefully.

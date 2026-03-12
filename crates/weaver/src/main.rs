@@ -220,7 +220,7 @@ async fn run_download(
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     detect_server_capabilities(config, db).await;
-    let nntp = build_nntp_client(config);
+    let nntp = build_nntp_client(config, &profile);
     let initial_global_paused = weaver_api::load_global_pause_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
@@ -388,7 +388,7 @@ async fn run_server_command(
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     detect_server_capabilities(&mut config, &db).await;
-    let nntp = build_nntp_client(&config);
+    let nntp = build_nntp_client(&config, &profile);
     let total_connections: usize = config
         .servers
         .iter()
@@ -454,6 +454,8 @@ async fn run_server_command(
                 progress: 1.0,
                 total_bytes: 0,
                 downloaded_bytes: 0,
+                optional_recovery_bytes: 0,
+                optional_recovery_downloaded_bytes: 0,
                 failed_bytes: 0,
                 health: 1000,
                 password: None,
@@ -485,6 +487,8 @@ async fn run_server_command(
                     progress: 0.0,
                     total_bytes: 0,
                     downloaded_bytes: 0,
+                    optional_recovery_bytes: 0,
+                    optional_recovery_downloaded_bytes: 0,
                     failed_bytes: 0,
                     health: 0,
                     password: None,
@@ -562,6 +566,8 @@ async fn run_server_command(
                     progress: 1.0,
                     total_bytes: row.total_bytes,
                     downloaded_bytes: row.downloaded_bytes,
+                    optional_recovery_bytes: row.optional_recovery_bytes,
+                    optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
                     failed_bytes: row.failed_bytes,
                     health: row.health,
                     password: None,
@@ -749,10 +755,20 @@ fn status_str_to_job_status(status: &str, error: Option<&str>) -> weaver_schedul
 }
 
 /// Build an NntpClient from the config's active server list.
-pub fn build_nntp_client(config: &Config) -> NntpClient {
+pub fn build_nntp_client(
+    config: &Config,
+    profile: &weaver_core::system::SystemProfile,
+) -> NntpClient {
     let mut active: Vec<&weaver_core::config::ServerConfig> =
         config.servers.iter().filter(|s| s.active).collect();
     active.sort_by_key(|s| (s.priority, s.id));
+    let total_connections: usize = active.iter().map(|s| s.connections as usize).sum();
+    let effective_memory = profile
+        .memory
+        .cgroup_limit
+        .unwrap_or(profile.memory.available_bytes);
+    let buffer_profile =
+        weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
     let servers: Vec<ServerPoolConfig> = active
         .iter()
         .map(|s| ServerPoolConfig {
@@ -762,6 +778,7 @@ pub fn build_nntp_client(config: &Config) -> NntpClient {
                 tls: s.tls,
                 username: s.username.clone(),
                 password: s.password.clone(),
+                buffer_profile,
                 ..Default::default()
             },
             max_connections: s.connections as usize,

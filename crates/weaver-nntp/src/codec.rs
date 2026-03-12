@@ -40,6 +40,13 @@ pub struct NntpCodec {
     streaming_multiline: bool,
 }
 
+#[derive(Debug)]
+struct MultilineScan {
+    data_end: usize,
+    terminator_len: usize,
+    copied: Option<BytesMut>,
+}
+
 impl NntpCodec {
     /// Create a new codec in line mode.
     pub fn new() -> Self {
@@ -72,45 +79,18 @@ impl NntpCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<StreamChunk>, NntpError> {
-        if src.is_empty() {
+        let Some(scan) = scan_multiline_chunk(src, true) else {
             return Ok(None);
-        }
+        };
 
-        // Check for empty body: buffer starts with ".\r\n" or ".\n"
-        if src.len() >= 2 && src[0] == b'.' && src[1] == b'\n' {
-            src.advance(2);
+        let chunk = take_multiline_output(src, scan);
+        if chunk.terminator_len > 0 {
             self.streaming_multiline = false;
+        }
+        if chunk.data.is_empty() && chunk.terminator_len > 0 {
             return Ok(Some(StreamChunk::End));
         }
-        if src.len() >= 3 && src[0] == b'.' && src[1] == b'\r' && src[2] == b'\n' {
-            src.advance(3);
-            self.streaming_multiline = false;
-            return Ok(Some(StreamChunk::End));
-        }
-
-        // Look for line-ending + "." + line-ending terminator within the buffer.
-        if let Some((pos, le_len, dot_term_len)) = find_line_dot_line(src) {
-            // Data is everything up to and including the line ending before the dot.
-            let data_end = pos + le_len;
-            let raw = src.split_to(data_end);
-            // Consume the ".\r\n" or ".\n"
-            src.advance(dot_term_len);
-            let unstuffed = dot_unstuff(&raw);
-            self.streaming_multiline = false;
-            return Ok(Some(StreamChunk::Data(unstuffed)));
-        }
-
-        // No terminator found. Yield complete lines up to the last line ending,
-        // leaving any partial line in the buffer for the next read.
-        if let Some((last_pos, term_len)) = rfind_line_ending(src) {
-            let split_at = last_pos + term_len;
-            let raw = src.split_to(split_at);
-            let unstuffed = dot_unstuff(&raw);
-            Ok(Some(StreamChunk::Data(unstuffed)))
-        } else {
-            // No complete line yet — need more data.
-            Ok(None)
-        }
+        Ok(Some(StreamChunk::Data(chunk.data)))
     }
 
     /// Decode a single line terminated by `\r\n` or bare `\n`.
@@ -140,32 +120,24 @@ impl NntpCodec {
 
     /// Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
     fn decode_multiline(&self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
-        // Look for the termination sequence: a line containing only "." followed
-        // by a line ending. Handles \r\n.\r\n, \n.\n, \n.\r\n, \r\n.\n variants.
-        if let Some((end_pos, dot_term_len)) = find_multiline_terminator(src) {
-            if end_pos > MAX_MULTILINE_LENGTH {
-                return Err(NntpError::MalformedResponse(
-                    "multi-line response too large".into(),
-                ));
+        match scan_multiline_chunk(src, false) {
+            Some(scan) => {
+                if scan.data_end > MAX_MULTILINE_LENGTH {
+                    return Err(NntpError::MalformedResponse(
+                        "multi-line response too large".into(),
+                    ));
+                }
+                let chunk = take_multiline_output(src, scan);
+                Ok(Some(NntpFrame::MultiLineData(chunk.data)))
             }
-
-            // Extract the raw data up to (but not including) the terminator line.
-            let raw = &src[..end_pos];
-
-            // Dot-unstuff the data.
-            let unstuffed = dot_unstuff(raw);
-
-            // Advance past the data + the dot terminator (".\r\n" or ".\n")
-            src.advance(end_pos + dot_term_len);
-
-            Ok(Some(NntpFrame::MultiLineData(unstuffed)))
-        } else {
-            if src.len() > MAX_MULTILINE_LENGTH {
-                return Err(NntpError::MalformedResponse(
-                    "multi-line response too large".into(),
-                ));
+            None => {
+                if src.len() > MAX_MULTILINE_LENGTH {
+                    return Err(NntpError::MalformedResponse(
+                        "multi-line response too large".into(),
+                    ));
+                }
+                Ok(None)
             }
-            Ok(None)
         }
     }
 }
@@ -218,84 +190,95 @@ fn find_line_ending(buf: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-/// Find the `\n.\n` or `\n.\r\n` or `\r\n.\r\n` or `\r\n.\n` terminator in the buffer.
-///
-/// Returns `(pos, line_ending_len, term_dot_len)` where:
-/// - `pos` is the index of the `\r` or `\n` that starts the line ending before the dot
-/// - `line_ending_len` is the length of that line ending (1 for `\n`, 2 for `\r\n`)
-/// - `term_dot_len` is the total length of `.<terminator>` after the line ending (2 for `.\n`, 3 for `.\r\n`)
-fn find_line_dot_line(buf: &[u8]) -> Option<(usize, usize, usize)> {
-    // Search for every \n that could precede a dot-terminator.
-    let mut start = 0;
-    while start < buf.len() {
-        let nl_pos = match memchr::memchr(b'\n', &buf[start..]) {
-            Some(p) => start + p,
-            None => return None,
-        };
-        // Check if \n is followed by '.' and then another line ending
-        if nl_pos + 1 < buf.len() && buf[nl_pos + 1] == b'.' {
-            // Check what follows the dot
-            if nl_pos + 2 < buf.len() {
-                if buf[nl_pos + 2] == b'\n' {
-                    // \n.\n — the line ending before is \r\n or \n
-                    let (pos, le_len) = if nl_pos > 0 && buf[nl_pos - 1] == b'\r' {
-                        (nl_pos - 1, 2) // \r\n.\n
-                    } else {
-                        (nl_pos, 1) // \n.\n
-                    };
-                    return Some((pos, le_len, 2)); // dot_term = ".\n"
-                } else if buf[nl_pos + 2] == b'\r'
-                    && nl_pos + 3 < buf.len()
-                    && buf[nl_pos + 3] == b'\n'
-                {
-                    let (pos, le_len) = if nl_pos > 0 && buf[nl_pos - 1] == b'\r' {
-                        (nl_pos - 1, 2) // \r\n.\r\n
-                    } else {
-                        (nl_pos, 1) // \n.\r\n
-                    };
-                    return Some((pos, le_len, 3)); // dot_term = ".\r\n"
-                }
-            }
-        }
-        start = nl_pos + 1;
+fn scan_multiline_chunk(buf: &[u8], allow_partial: bool) -> Option<MultilineScan> {
+    if buf.is_empty() {
+        return None;
     }
+
+    let mut cursor = 0usize;
+    let mut last_complete_end = 0usize;
+    let mut copy_cursor = 0usize;
+    let mut copied: Option<BytesMut> = None;
+
+    while cursor < buf.len() {
+        let Some(line_rel_end) = memchr::memchr(b'\n', &buf[cursor..]) else {
+            break;
+        };
+        let line_end = cursor + line_rel_end;
+        let content_end = if line_end > cursor && buf[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line_total_end = line_end + 1;
+
+        if cursor < content_end && buf[cursor] == b'.' {
+            // A line consisting of just "." is the multiline terminator.
+            if content_end == cursor + 1 {
+                if let Some(ref mut output) = copied
+                    && copy_cursor < cursor
+                {
+                    output.extend_from_slice(&buf[copy_cursor..cursor]);
+                }
+                return Some(MultilineScan {
+                    data_end: cursor,
+                    terminator_len: line_total_end - cursor,
+                    copied,
+                });
+            }
+
+            let output = copied.get_or_insert_with(|| {
+                let mut output = BytesMut::with_capacity(buf.len());
+                if copy_cursor < cursor {
+                    output.extend_from_slice(&buf[copy_cursor..cursor]);
+                }
+                output
+            });
+            output.extend_from_slice(&buf[cursor + 1..line_total_end]);
+            copy_cursor = line_total_end;
+        }
+
+        cursor = line_total_end;
+        last_complete_end = cursor;
+    }
+
+    if allow_partial && last_complete_end > 0 {
+        if let Some(ref mut output) = copied
+            && copy_cursor < last_complete_end
+        {
+            output.extend_from_slice(&buf[copy_cursor..last_complete_end]);
+        }
+        return Some(MultilineScan {
+            data_end: last_complete_end,
+            terminator_len: 0,
+            copied,
+        });
+    }
+
     None
 }
 
-/// Find the last line ending (`\r\n` or bare `\n`) in the buffer.
-///
-/// Returns `(position, terminator_length)` where position is the index of `\r`
-/// (for `\r\n`) or `\n` (for bare `\n`).
-fn rfind_line_ending(buf: &[u8]) -> Option<(usize, usize)> {
-    let nl_pos = memchr::memrchr(b'\n', buf)?;
-    if nl_pos > 0 && buf[nl_pos - 1] == b'\r' {
-        Some((nl_pos - 1, 2))
-    } else {
-        Some((nl_pos, 1))
-    }
+struct TakenMultiline {
+    data: BytesMut,
+    terminator_len: usize,
 }
 
-/// Find the position within `buf` where the multi-line terminator begins.
-///
-/// The terminator is a line consisting of just "." followed by a line ending.
-/// This appears as `\r\n.\r\n`, `\n.\n`, `\n.\r\n`, or `\r\n.\n` in the stream,
-/// or at the very start of the buffer if the data block is empty (`.\r\n` or `.\n`).
-///
-/// Returns `(data_end, dot_term_len)` where `buf[..data_end]` is the data before
-/// the terminator and `dot_term_len` is the length of the `.\r\n` or `.\n` to skip.
-fn find_multiline_terminator(buf: &[u8]) -> Option<(usize, usize)> {
-    // Check for empty data block: starts with ".\r\n" or ".\n"
-    if buf.len() >= 2 && buf[0] == b'.' && buf[1] == b'\n' {
-        return Some((0, 2)); // ".\n"
+fn take_multiline_output(src: &mut BytesMut, scan: MultilineScan) -> TakenMultiline {
+    let data = if let Some(copied) = scan.copied {
+        src.advance(scan.data_end + scan.terminator_len);
+        copied
+    } else {
+        let data = src.split_to(scan.data_end);
+        if scan.terminator_len > 0 {
+            src.advance(scan.terminator_len);
+        }
+        data
+    };
+
+    TakenMultiline {
+        data,
+        terminator_len: scan.terminator_len,
     }
-    if buf.len() >= 3 && buf[0] == b'.' && buf[1] == b'\r' && buf[2] == b'\n' {
-        return Some((0, 3)); // ".\r\n"
-    }
-    // Look for line-ending + "." + line-ending
-    let (pos, le_len, dot_term_len) = find_line_dot_line(buf)?;
-    // Data includes everything up to and including the line ending before the dot.
-    // pos is where the line ending starts, le_len is its length.
-    Some((pos + le_len, dot_term_len))
 }
 
 /// Perform NNTP dot-unstuffing on raw multi-line data.
@@ -303,30 +286,44 @@ fn find_multiline_terminator(buf: &[u8]) -> Option<(usize, usize)> {
 /// Per RFC 3977 Section 3.1.1: if a line begins with a dot, the first dot is
 /// removed (it was added by the server to avoid confusion with the terminator).
 pub fn dot_unstuff(data: &[u8]) -> BytesMut {
-    let mut result = BytesMut::with_capacity(data.len());
-    let mut i = 0;
+    let mut i = 0usize;
     let mut line_start = true;
+    let mut used_copy = false;
+    let mut segment_start = 0usize;
+    let mut segments = Vec::new();
 
     while i < data.len() {
-        if line_start && i < data.len() && data[i] == b'.' {
-            // Skip the stuffed dot at the beginning of the line.
-            i += 1;
+        if line_start && data[i] == b'.' {
+            used_copy = true;
+            if segment_start < i {
+                segments.push((segment_start, i));
+            }
+            segment_start = i + 1;
             line_start = false;
+            i += 1;
             continue;
         }
-
         if data[i] == b'\n' {
-            result.extend_from_slice(b"\n");
             line_start = true;
-            i += 1;
         } else {
-            result.extend_from_slice(&[data[i]]);
             line_start = false;
-            i += 1;
         }
+        i += 1;
     }
 
-    result
+    if !used_copy {
+        return BytesMut::from(data);
+    }
+
+    if segment_start < data.len() {
+        segments.push((segment_start, data.len()));
+    }
+
+    let mut output = BytesMut::with_capacity(data.len());
+    for (start, end) in segments {
+        output.extend_from_slice(&data[start..end]);
+    }
+    output
 }
 
 #[cfg(test)]

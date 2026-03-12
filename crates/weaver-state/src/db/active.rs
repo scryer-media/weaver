@@ -45,6 +45,14 @@ pub struct RecoveredJob {
     pub metadata: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePar2File {
+    pub file_index: u32,
+    pub filename: String,
+    pub recovery_block_count: u32,
+    pub promoted: bool,
+}
+
 fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
@@ -153,6 +161,242 @@ impl Database {
             "INSERT OR REPLACE INTO active_par2 (job_id, slice_size, recovery_block_count)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![job_id.0 as i64, slice_size as i64, recovery_block_count],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn upsert_par2_file(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        recovery_block_count: u32,
+        promoted: bool,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO active_par2_files
+             (job_id, file_index, filename, recovery_block_count, promoted)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                job_id.0 as i64,
+                file_index,
+                filename,
+                recovery_block_count,
+                i64::from(promoted),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn set_par2_file_promotion(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        promoted: bool,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE active_par2_files SET promoted = ?1 WHERE job_id = ?2 AND file_index = ?3",
+            rusqlite::params![i64::from(promoted), job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn load_par2_files(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, ActivePar2File>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_index, filename, recovery_block_count, promoted
+                 FROM active_par2_files
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| {
+                Ok(ActivePar2File {
+                    file_index: row.get(0)?,
+                    filename: row.get(1)?,
+                    recovery_block_count: row.get(2)?,
+                    promoted: row.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(db_err)?;
+        let mut files = HashMap::new();
+        for row in rows {
+            let file = row.map_err(db_err)?;
+            files.insert(file.file_index, file);
+        }
+        Ok(files)
+    }
+
+    pub fn load_failed_extractions(&self, job_id: JobId) -> Result<HashSet<String>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT member_name FROM active_failed_extractions
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| row.get::<_, String>(0))
+            .map_err(db_err)?;
+        rows.collect::<Result<HashSet<_>, _>>().map_err(db_err)
+    }
+
+    pub fn replace_failed_extractions(
+        &self,
+        job_id: JobId,
+        members: &HashSet<String>,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_failed_extractions WHERE job_id = ?1",
+            [job_id.0 as i64],
+        )
+        .map_err(db_err)?;
+        if !members.is_empty() {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO active_failed_extractions (job_id, member_name)
+                     VALUES (?1, ?2)",
+                )
+                .map_err(db_err)?;
+            for member_name in members {
+                stmt.execute(rusqlite::params![job_id.0 as i64, member_name])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn add_failed_extraction(
+        &self,
+        job_id: JobId,
+        member_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO active_failed_extractions (job_id, member_name)
+             VALUES (?1, ?2)",
+            rusqlite::params![job_id.0 as i64, member_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn remove_failed_extraction(
+        &self,
+        job_id: JobId,
+        member_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_failed_extractions
+             WHERE job_id = ?1 AND member_name = ?2",
+            rusqlite::params![job_id.0 as i64, member_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn load_active_job_normalization_retried(&self, job_id: JobId) -> Result<bool, StateError> {
+        let conn = self.conn();
+        let result = conn.query_row(
+            "SELECT normalization_retried FROM active_jobs WHERE job_id = ?1",
+            [job_id.0 as i64],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(value) => Ok(value != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(error) => Err(db_err(error)),
+        }
+    }
+
+    pub fn set_active_job_normalization_retried(
+        &self,
+        job_id: JobId,
+        normalization_retried: bool,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE active_jobs SET normalization_retried = ?1 WHERE job_id = ?2",
+            rusqlite::params![i64::from(normalization_retried), job_id.0 as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn load_verified_suspect_volumes(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<String, HashSet<u32>>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT set_name, volume_index
+                 FROM active_rar_verified_suspect
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(db_err)?;
+        let mut result = HashMap::<String, HashSet<u32>>::new();
+        for row in rows {
+            let (set_name, volume_index) = row.map_err(db_err)?;
+            result.entry(set_name).or_default().insert(volume_index);
+        }
+        Ok(result)
+    }
+
+    pub fn replace_verified_suspect_volumes(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        volumes: &HashSet<u32>,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_rar_verified_suspect
+             WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+        )
+        .map_err(db_err)?;
+        if !volumes.is_empty() {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO active_rar_verified_suspect
+                     (job_id, set_name, volume_index)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .map_err(db_err)?;
+            for volume_index in volumes {
+                stmt.execute(rusqlite::params![job_id.0 as i64, set_name, volume_index])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_verified_suspect_volumes(&self, job_id: JobId) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_rar_verified_suspect WHERE job_id = ?1",
+            [job_id.0 as i64],
         )
         .map_err(db_err)?;
         Ok(())
@@ -326,9 +570,10 @@ impl Database {
         tx.execute(
             "INSERT OR REPLACE INTO job_history
              (job_id, name, status, error_message, total_bytes, downloaded_bytes,
+              optional_recovery_bytes, optional_recovery_downloaded_bytes,
               failed_bytes, health, category, output_dir, nzb_path,
               created_at, completed_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 history.job_id as i64,
                 history.name,
@@ -336,6 +581,8 @@ impl Database {
                 history.error_message,
                 history.total_bytes as i64,
                 history.downloaded_bytes as i64,
+                history.optional_recovery_bytes as i64,
+                history.optional_recovery_downloaded_bytes as i64,
                 history.failed_bytes as i64,
                 history.health,
                 history.category,
@@ -355,8 +602,15 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_par2 WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute("DELETE FROM active_par2_files WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_failed_extractions WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute(
             "DELETE FROM active_extraction_chunks WHERE job_id = ?1",
             [id],
@@ -371,6 +625,11 @@ impl Database {
         .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_rar_verified_suspect WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
@@ -391,8 +650,15 @@ impl Database {
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_par2 WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute("DELETE FROM active_par2_files WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_failed_extractions WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute(
             "DELETE FROM active_extraction_chunks WHERE job_id = ?1",
             [id],
@@ -407,6 +673,11 @@ impl Database {
         .map_err(db_err)?;
         tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM active_rar_verified_suspect WHERE job_id = ?1",
+            [id],
+        )
+        .map_err(db_err)?;
         tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
@@ -426,12 +697,15 @@ impl Database {
         volume_index: u32,
         bytes_written: u64,
         temp_path: &str,
+        start_offset: u64,
+        end_offset: u64,
     ) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
             "INSERT OR REPLACE INTO active_extraction_chunks
-             (job_id, set_name, member_name, volume_index, bytes_written, temp_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (job_id, set_name, member_name, volume_index, bytes_written, temp_path,
+              start_offset, end_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 job_id.0 as i64,
                 set_name,
@@ -439,6 +713,8 @@ impl Database {
                 volume_index,
                 bytes_written as i64,
                 temp_path,
+                start_offset as i64,
+                end_offset as i64,
             ],
         )
         .map_err(db_err)?;
@@ -472,7 +748,8 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT member_name, volume_index, bytes_written, temp_path, verified, appended
+                "SELECT member_name, volume_index, bytes_written, temp_path,
+                        start_offset, end_offset, verified, appended
                  FROM active_extraction_chunks
                  WHERE job_id = ?1 AND set_name = ?2
                  ORDER BY member_name, volume_index",
@@ -485,8 +762,10 @@ impl Database {
                     volume_index: row.get(1)?,
                     bytes_written: row.get::<_, i64>(2)? as u64,
                     temp_path: row.get(3)?,
-                    verified: row.get::<_, i64>(4)? != 0,
-                    appended: row.get::<_, i64>(5)? != 0,
+                    start_offset: row.get::<_, i64>(4)? as u64,
+                    end_offset: row.get::<_, i64>(5)? as u64,
+                    verified: row.get::<_, i64>(6)? != 0,
+                    appended: row.get::<_, i64>(7)? != 0,
                 })
             })
             .map_err(db_err)?;
@@ -520,8 +799,9 @@ impl Database {
         for chunk in chunks {
             conn.execute(
                 "INSERT INTO active_extraction_chunks
-                 (job_id, set_name, member_name, volume_index, bytes_written, temp_path, verified, appended)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                 (job_id, set_name, member_name, volume_index, bytes_written, temp_path,
+                  start_offset, end_offset, verified, appended)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     job_id.0 as i64,
                     set_name,
@@ -529,7 +809,10 @@ impl Database {
                     chunk.volume_index,
                     chunk.bytes_written as i64,
                     &chunk.temp_path,
+                    chunk.start_offset as i64,
+                    chunk.end_offset as i64,
                     chunk.verified as i64,
+                    chunk.appended as i64,
                 ],
             )
             .map_err(|e| {
@@ -769,6 +1052,8 @@ pub struct ExtractionChunk {
     pub volume_index: u32,
     pub bytes_written: u64,
     pub temp_path: String,
+    pub start_offset: u64,
+    pub end_offset: u64,
     pub verified: bool,
     pub appended: bool,
 }
@@ -875,6 +1160,8 @@ mod tests {
             error_message: None,
             total_bytes: 1_000_000,
             downloaded_bytes: 1_000_000,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
             category: None,
@@ -923,6 +1210,8 @@ mod tests {
             error_message: None,
             total_bytes: 0,
             downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
             category: None,
@@ -994,6 +1283,53 @@ mod tests {
     }
 
     #[test]
+    fn par2_file_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+        db.upsert_par2_file(JobId(1), 4, "repair.vol00+01.par2", 12, false)
+            .unwrap();
+        db.set_par2_file_promotion(JobId(1), 4, true).unwrap();
+
+        let files = db.load_par2_files(JobId(1)).unwrap();
+        assert_eq!(
+            files.get(&4),
+            Some(&ActivePar2File {
+                file_index: 4,
+                filename: "repair.vol00+01.par2".to_string(),
+                recovery_block_count: 12,
+                promoted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn restart_runtime_state_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+
+        db.replace_failed_extractions(
+            JobId(1),
+            &HashSet::from(["E10.mkv".to_string(), "E15.mkv".to_string()]),
+        )
+        .unwrap();
+        db.set_active_job_normalization_retried(JobId(1), true)
+            .unwrap();
+        db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([37u32, 38u32]))
+            .unwrap();
+
+        let failed = db.load_failed_extractions(JobId(1)).unwrap();
+        assert_eq!(
+            failed,
+            HashSet::from(["E10.mkv".to_string(), "E15.mkv".to_string()])
+        );
+        assert!(db.load_active_job_normalization_retried(JobId(1)).unwrap());
+        assert_eq!(
+            db.load_verified_suspect_volumes(JobId(1)).unwrap(),
+            HashMap::from([("show".to_string(), HashSet::from([37u32, 38u32]))])
+        );
+    }
+
+    #[test]
     fn extracted_member_roundtrip() {
         let db = Database::open_in_memory().unwrap();
         db.create_active_job(&sample_job(1)).unwrap();
@@ -1026,6 +1362,8 @@ mod tests {
                     volume_index: 0,
                     bytes_written: 111,
                     temp_path: "/tmp/chunk0".into(),
+                    start_offset: 0,
+                    end_offset: 111,
                     verified: true,
                     appended: false,
                 },
@@ -1034,6 +1372,8 @@ mod tests {
                     volume_index: 1,
                     bytes_written: 222,
                     temp_path: "/tmp/chunk1".into(),
+                    start_offset: 111,
+                    end_offset: 333,
                     verified: true,
                     appended: false,
                 },
@@ -1076,6 +1416,8 @@ mod tests {
                 volume_index: 0,
                 bytes_written: 100,
                 temp_path: "/tmp/a0".into(),
+                start_offset: 0,
+                end_offset: 100,
                 verified: true,
                 appended: false,
             }],
@@ -1090,6 +1432,8 @@ mod tests {
                 volume_index: 0,
                 bytes_written: 200,
                 temp_path: "/tmp/b0".into(),
+                start_offset: 0,
+                end_offset: 200,
                 verified: true,
                 appended: false,
             }],
@@ -1105,6 +1449,8 @@ mod tests {
                 volume_index: 1,
                 bytes_written: 300,
                 temp_path: "/tmp/a1".into(),
+                start_offset: 100,
+                end_offset: 400,
                 verified: true,
                 appended: false,
             }],

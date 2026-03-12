@@ -30,7 +30,7 @@ use weaver_nntp::NntpClient;
 use weaver_par2::par2_set::Par2FileSet;
 use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
-    RuntimeTuner, SchedulerCommand, SharedPipelineState, TokenBucket,
+    RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState, TokenBucket,
 };
 use weaver_state::CommittedSegment;
 
@@ -75,6 +75,19 @@ pub(super) struct BatchExtractionOutcome {
 pub(super) struct FullSetExtractionOutcome {
     pub(super) extracted: Vec<String>,
     pub(super) failed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Par2FileRuntime {
+    pub(super) filename: String,
+    pub(super) recovery_blocks: u32,
+    pub(super) promoted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct Par2RuntimeState {
+    pub(super) set: Option<Arc<Par2FileSet>>,
+    pub(super) files: HashMap<u32, Par2FileRuntime>,
 }
 
 pub(super) enum ExtractionDone {
@@ -214,8 +227,8 @@ pub struct Pipeline {
     pub(super) write_buffered_segments: usize,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
-    /// Retained PAR2 file sets per job, avoiding re-read/re-parse from disk.
-    pub(super) par2_sets: HashMap<JobId, Arc<Par2FileSet>>,
+    /// Authoritative PAR2 runtime state per job.
+    pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Members already extracted per job (for partial extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archive sets already extracted per job (for multi-set 7z).
@@ -224,21 +237,10 @@ pub struct Pipeline {
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.
     pub(super) failed_extractions: HashMap<JobId, HashSet<String>>,
-    /// Authoritative recovery block counts per PAR2 file index.
-    pub(super) recovery_block_counts: HashMap<JobId, HashMap<u32, u32>>,
-    /// Recovery PAR2 file indices already promoted or completed for a job.
-    /// Used to avoid double-promotion and to count targeted recovery capacity.
-    pub(super) promoted_recovery_files: HashMap<JobId, HashSet<u32>>,
     /// Filenames eagerly deleted per job after CRC-verified extraction.
     /// Used to distinguish truly-missing files from intentionally-deleted ones
     /// during PAR2 verification.
     pub(super) eagerly_deleted: HashMap<JobId, HashSet<String>>,
-    /// Volumes proven clean by CRC-verified extraction or authoritative PAR2 verify.
-    pub(super) clean_volumes: HashMap<(JobId, String), HashSet<u32>>,
-    /// Volumes touched by failed extraction or damaged in authoritative verify.
-    pub(super) suspect_volumes: HashMap<(JobId, String), HashSet<u32>>,
-    /// Serialized RAR header snapshots per archive set.
-    pub(super) rar_header_snapshots: HashMap<(JobId, String), Vec<u8>>,
     /// Pipeline-owned RAR scheduling state derived from immutable completed-volume facts.
     rar_sets: HashMap<(JobId, String), RarSetState>,
     /// Jobs that have already attempted normalization retry (one-shot guard).
@@ -341,16 +343,11 @@ impl Pipeline {
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
-            par2_sets: HashMap::new(),
+            par2_runtime: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_sets: HashMap::new(),
             failed_extractions: HashMap::new(),
-            recovery_block_counts: HashMap::new(),
-            promoted_recovery_files: HashMap::new(),
             eagerly_deleted: HashMap::new(),
-            clean_volumes: HashMap::new(),
-            suspect_volumes: HashMap::new(),
-            rar_header_snapshots: HashMap::new(),
             rar_sets: HashMap::new(),
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
@@ -569,12 +566,15 @@ impl Pipeline {
                 let result = if let Some(state) = self.jobs.remove(&job_id) {
                     // Per-job queues are dropped with the JobState.
                     self.job_order.retain(|id| *id != job_id);
+                    self.update_queue_metrics();
 
                     // Archive cancelled job: move to history + delete active state.
                     let now = timestamp_secs() as i64;
                     let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
                     let created_at = now - elapsed_secs;
                     let total = state.spec.total_bytes;
+                    let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+                        state.assembly.optional_recovery_bytes();
                     let health = if total == 0 {
                         1000
                     } else {
@@ -587,6 +587,8 @@ impl Pipeline {
                         error_message: None,
                         total_bytes: total,
                         downloaded_bytes: state.downloaded_bytes,
+                        optional_recovery_bytes,
+                        optional_recovery_downloaded_bytes,
                         failed_bytes: state.failed_bytes,
                         health,
                         category: state.spec.category.clone(),
@@ -745,10 +747,28 @@ impl Pipeline {
                         }
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = db.delete_job_history(job_id.0);
-                            let _ = db.delete_job_events(job_id.0);
-                        });
+                        let delete_result =
+                            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                                db.delete_job_history(job_id.0)
+                                    .map_err(|e| format!("failed to delete history row: {e}"))?;
+                                db.delete_job_events(job_id.0)
+                                    .map_err(|e| format!("failed to delete job events: {e}"))?;
+                                Ok(())
+                            })
+                            .await;
+                        match delete_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                let _ = reply.send(Err(SchedulerError::Other(error)));
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(SchedulerError::Other(format!(
+                                    "failed to join history delete task: {error}"
+                                ))));
+                                return;
+                            }
+                        }
                         self.publish_snapshot();
                         Ok(())
                     }
@@ -782,10 +802,27 @@ impl Pipeline {
                 }
                 self.finished_jobs.clear();
                 let db = self.db.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = db.delete_all_job_history();
-                    let _ = db.delete_all_job_events();
-                });
+                let delete_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    db.delete_all_job_history()
+                        .map_err(|e| format!("failed to delete all job history: {e}"))?;
+                    db.delete_all_job_events()
+                        .map_err(|e| format!("failed to delete all job events: {e}"))?;
+                    Ok(())
+                })
+                .await;
+                match delete_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Err(SchedulerError::Other(error)));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(SchedulerError::Other(format!(
+                            "failed to join delete-all-history task: {error}"
+                        ))));
+                        return;
+                    }
+                }
                 self.publish_snapshot();
                 let _ = reply.send(Ok(()));
             }
@@ -1048,12 +1085,84 @@ impl Pipeline {
 
     pub(super) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
         self.eagerly_deleted.remove(&job_id);
-        self.clean_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.suspect_volumes.retain(|(jid, _), _| *jid != job_id);
-        self.rar_header_snapshots
-            .retain(|(jid, _), _| *jid != job_id);
         self.rar_sets.retain(|(jid, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
+    }
+
+    pub(super) fn set_failed_extraction_member(&mut self, job_id: JobId, member_name: &str) {
+        self.failed_extractions
+            .entry(job_id)
+            .or_default()
+            .insert(member_name.to_string());
+        if let Err(error) = self.db.add_failed_extraction(job_id, member_name) {
+            error!(
+                job_id = job_id.0,
+                member = %member_name,
+                error = %error,
+                "failed to persist failed extraction member"
+            );
+        }
+    }
+
+    pub(super) fn replace_failed_extraction_members(
+        &mut self,
+        job_id: JobId,
+        members: HashSet<String>,
+    ) {
+        if members.is_empty() {
+            self.failed_extractions.remove(&job_id);
+        } else {
+            self.failed_extractions.insert(job_id, members.clone());
+        }
+        if let Err(error) = self.db.replace_failed_extractions(job_id, &members) {
+            error!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to persist failed extraction member set"
+            );
+        }
+    }
+
+    pub(super) fn set_normalization_retried_state(
+        &mut self,
+        job_id: JobId,
+        normalization_retried: bool,
+    ) {
+        if normalization_retried {
+            self.normalization_retried.insert(job_id);
+        } else {
+            self.normalization_retried.remove(&job_id);
+        }
+        if let Err(error) = self
+            .db
+            .set_active_job_normalization_retried(job_id, normalization_retried)
+        {
+            error!(
+                job_id = job_id.0,
+                normalization_retried,
+                error = %error,
+                "failed to persist normalization retry state"
+            );
+        }
+    }
+
+    pub(super) fn persist_verified_suspect_volumes(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        volumes: &HashSet<u32>,
+    ) {
+        if let Err(error) = self
+            .db
+            .replace_verified_suspect_volumes(job_id, set_name, volumes)
+        {
+            error!(
+                job_id = job_id.0,
+                set_name,
+                error = %error,
+                "failed to persist verified suspect RAR volumes"
+            );
+        }
     }
 
     pub(super) fn write_target_for_file(
@@ -1078,6 +1187,7 @@ impl Pipeline {
         self.active_downloads_by_job.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
+        self.update_queue_metrics();
     }
 
     /// Write a terminal job to SQLite history and add it to the finished_jobs list.
@@ -1097,6 +1207,8 @@ impl Pipeline {
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
+        let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+            state.assembly.optional_recovery_bytes();
         let health = if total == 0 {
             1000
         } else {
@@ -1110,6 +1222,8 @@ impl Pipeline {
             error_message,
             total_bytes: total,
             downloaded_bytes: state.downloaded_bytes,
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
             failed_bytes: state.failed_bytes,
             health,
             category: state.spec.category.clone(),
@@ -1126,6 +1240,8 @@ impl Pipeline {
 
         // Keep only the latest terminal snapshot for this job in runtime history.
         self.finished_jobs.retain(|j| j.job_id != job_id);
+        let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+            state.assembly.optional_recovery_bytes();
         self.finished_jobs.push(JobInfo {
             job_id,
             name: state.spec.name.clone(),
@@ -1138,6 +1254,8 @@ impl Pipeline {
             progress: state.assembly.progress(),
             total_bytes: total,
             downloaded_bytes: state.downloaded_bytes,
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
             failed_bytes: state.failed_bytes,
             health,
             password: state.spec.password.clone(),
@@ -1160,6 +1278,7 @@ impl Pipeline {
                 }
             }
         });
+        self.purge_terminal_job_runtime(job_id);
     }
 }
 
@@ -1339,6 +1458,8 @@ mod tests {
             error_message: None,
             total_bytes: 1024,
             downloaded_bytes: 1024,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
             category: None,
@@ -1747,6 +1868,27 @@ mod tests {
         }
     }
 
+    fn install_test_par2_runtime(
+        pipeline: &mut Pipeline,
+        job_id: JobId,
+        par2_set: Par2FileSet,
+        files: &[(u32, &str, u32, bool)],
+    ) {
+        let runtime = pipeline.ensure_par2_runtime(job_id);
+        runtime.set = Some(Arc::new(par2_set));
+        runtime.files.clear();
+        for (file_index, filename, recovery_blocks, promoted) in files {
+            runtime.files.insert(
+                *file_index,
+                Par2FileRuntime {
+                    filename: (*filename).to_string(),
+                    recovery_blocks: *recovery_blocks,
+                    promoted: *promoted,
+                },
+            );
+        }
+    }
+
     fn build_test_par2_packet(
         packet_type: &[u8; 16],
         body: &[u8],
@@ -1903,6 +2045,18 @@ mod tests {
             candidate
         };
         tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        pipeline
+            .db
+            .create_active_job(&weaver_state::ActiveJob {
+                job_id,
+                nzb_hash: [0; 32],
+                nzb_path: working_dir.join(format!("{}.nzb", job_id.0)),
+                output_dir: working_dir.clone(),
+                created_at: 0,
+                category: spec.category.clone(),
+                metadata: spec.metadata.clone(),
+            })
+            .unwrap();
         let (assembly, download_queue, recovery_queue) =
             Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
         pipeline.jobs.insert(
@@ -1973,7 +2127,7 @@ mod tests {
     }
 
     fn unresolved_spans(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> Vec<(u32, u32)> {
-        pipeline
+        let mut spans: Vec<(u32, u32)> = pipeline
             .jobs
             .get(&job_id)
             .and_then(|state| state.assembly.archive_topology_for(set_name))
@@ -1982,9 +2136,25 @@ mod tests {
                     .unresolved_spans
                     .iter()
                     .map(|span| (span.first_volume, span.last_volume))
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        spans.sort_unstable();
+        spans
+    }
+
+    fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus> {
+        pipeline
+            .jobs
+            .get(&job_id)
+            .map(|state| state.status.clone())
+            .or_else(|| {
+                pipeline
+                    .finished_jobs
+                    .iter()
+                    .find(|job| job.job_id == job_id)
+                    .map(|job| job.status.clone())
+            })
     }
 
     async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
@@ -2150,9 +2320,9 @@ mod tests {
 
         pipeline.check_job_completion(job_id).await;
 
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        assert!(matches!(state.status, JobStatus::Failed { .. }));
-        let JobStatus::Failed { error } = &state.status else {
+        let status = job_status_for_assert(&pipeline, job_id).unwrap();
+        assert!(matches!(status, JobStatus::Failed { .. }));
+        let JobStatus::Failed { error } = &status else {
             unreachable!();
         };
         assert!(error.contains("failed to read working directory"));
@@ -2272,7 +2442,7 @@ mod tests {
             0
         );
         assert!(matches!(
-            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
         ));
     }
@@ -2358,7 +2528,7 @@ mod tests {
             segment_count as u64
         );
         assert!(matches!(
-            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
         ));
     }
@@ -2809,7 +2979,7 @@ mod tests {
         assert_eq!(pipeline.write_buffered_bytes, 0);
         assert_eq!(pipeline.write_buffered_segments, 0);
         assert!(matches!(
-            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
         ));
     }
@@ -2828,7 +2998,10 @@ mod tests {
         write_and_complete_rar_volume(&mut pipeline, job_id, 3, &files[3].0, &files[3].1).await;
 
         assert_eq!(member_span(&pipeline, job_id, "show", "E02.mkv"), None);
-        assert_eq!(unresolved_spans(&pipeline, job_id, "show"), vec![(1, 1)]);
+        assert_eq!(
+            unresolved_spans(&pipeline, job_id, "show"),
+            vec![(1, 1), (3, 3)]
+        );
         let fact_volumes: Vec<u32> = pipeline
             .db
             .load_all_rar_volume_facts(job_id)
@@ -2891,10 +3064,6 @@ mod tests {
         pipeline
             .extracted_members
             .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
-        pipeline.clean_volumes.insert(
-            (job_id, "show".to_string()),
-            [0u32, 1u32, 2u32, 3u32].into_iter().collect(),
-        );
         pipeline
             .recompute_rar_set_state(job_id, "show")
             .await
@@ -2956,10 +3125,6 @@ mod tests {
                 .db
                 .add_extracted_member(job_id, "E01.mkv", &working_dir.join("E01.mkv"))
                 .unwrap();
-            pipeline.clean_volumes.insert(
-                (job_id, "show".to_string()),
-                [0u32, 1u32, 2u32, 3u32].into_iter().collect(),
-            );
             pipeline.try_delete_volumes(job_id, "show");
             working_dir
         };
@@ -2999,6 +3164,50 @@ mod tests {
         assert!(!working_dir.join("show.part02.rar").exists());
         assert!(working_dir.join("show.part03.rar").exists());
         assert!(working_dir.join("show.part04.rar").exists());
+    }
+
+    #[tokio::test]
+    async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let files = build_multifile_multivolume_rar_set();
+        let spec = rar_job_spec("Terminal Runtime Cleanup", &files);
+        let job_id = JobId(30033);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        pipeline.update_queue_metrics();
+        assert!(
+            pipeline
+                .metrics
+                .download_queue_depth
+                .load(Ordering::Relaxed)
+                > 0
+        );
+
+        pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
+        pipeline.record_job_history(job_id);
+
+        assert!(!pipeline.jobs.contains_key(&job_id));
+        assert_eq!(
+            pipeline
+                .metrics
+                .download_queue_depth
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            pipeline
+                .metrics
+                .recovery_queue_depth
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            pipeline
+                .finished_jobs
+                .iter()
+                .any(|job| job.job_id == job_id)
+        );
     }
 
     #[tokio::test]
@@ -3108,10 +3317,176 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(restored.par2_sets.contains_key(&job_id));
-        let par2_set = restored.par2_sets.get(&job_id).unwrap();
+        assert!(restored.par2_set(job_id).is_some());
+        let par2_set = restored.par2_set(job_id).unwrap();
         assert_eq!(par2_set.files.len(), 1);
         assert_eq!(par2_set.recovery_block_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_job_reapplies_only_promoted_recovery_segments() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let index_filename = "repair.par2";
+        let recovery_filename = "repair.vol00+01.par2";
+        let par2_bytes = build_test_par2_index("payload.bin", b"payload-data", 8);
+        let spec = JobSpec {
+            name: "PAR2 Promote Restore".to_string(),
+            password: None,
+            total_bytes: par2_bytes.len() as u64 + 64,
+            category: None,
+            metadata: vec![],
+            files: vec![
+                FileSpec {
+                    filename: index_filename.to_string(),
+                    role: FileRole::from_filename(index_filename),
+                    groups: vec!["alt.binaries.test".to_string()],
+                    segments: vec![SegmentSpec {
+                        number: 0,
+                        bytes: par2_bytes.len() as u32,
+                        message_id: "par2-index@example.com".to_string(),
+                    }],
+                },
+                FileSpec {
+                    filename: recovery_filename.to_string(),
+                    role: FileRole::from_filename(recovery_filename),
+                    groups: vec!["alt.binaries.test".to_string()],
+                    segments: vec![SegmentSpec {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "par2-recovery@example.com".to_string(),
+                    }],
+                },
+            ],
+        };
+        let job_id = JobId(30032);
+        let working_dir = {
+            let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+            let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+            tokio::fs::write(working_dir.join(index_filename), &par2_bytes)
+                .await
+                .unwrap();
+            pipeline
+                .db
+                .upsert_par2_file(job_id, 1, recovery_filename, 1, true)
+                .unwrap();
+            working_dir
+        };
+
+        let committed_segments = [SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        }]
+        .into_iter()
+        .collect();
+
+        let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+        restored
+            .restore_job(
+                job_id,
+                spec,
+                committed_segments,
+                HashSet::new(),
+                JobStatus::Downloading,
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        assert!(restored.par2_set(job_id).is_some());
+        assert_eq!(
+            restored
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&1))
+                .map(|file| (file.recovery_blocks, file.promoted)),
+            Some((1, true))
+        );
+
+        let state = restored.jobs.get_mut(&job_id).unwrap();
+        let mut queued = state.download_queue.drain_all();
+        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].segment_id.file_id.file_index, 1);
+        assert!(state.recovery_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let files = build_multifile_multivolume_rar_set();
+        let spec = rar_job_spec("RAR Restart Runtime Restore", &files);
+        let job_id = JobId(30034);
+        let working_dir = {
+            let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+            let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+
+            for (file_index, (filename, bytes)) in files.iter().enumerate() {
+                write_and_complete_rar_volume(
+                    &mut pipeline,
+                    job_id,
+                    file_index as u32,
+                    filename,
+                    bytes,
+                )
+                .await;
+            }
+
+            pipeline
+                .db
+                .add_failed_extraction(job_id, "E10.mkv")
+                .unwrap();
+            pipeline
+                .db
+                .add_failed_extraction(job_id, "E15.mkv")
+                .unwrap();
+            pipeline
+                .db
+                .set_active_job_normalization_retried(job_id, true)
+                .unwrap();
+            pipeline
+                .db
+                .replace_verified_suspect_volumes(
+                    job_id,
+                    "show",
+                    &std::collections::HashSet::from([1u32, 2u32]),
+                )
+                .unwrap();
+            working_dir
+        };
+
+        let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+        restored
+            .restore_job(
+                job_id,
+                spec,
+                Pipeline::all_segment_ids(
+                    job_id,
+                    &rar_job_spec("RAR Restart Runtime Restore", &files),
+                ),
+                HashSet::new(),
+                JobStatus::Downloading,
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            restored.failed_extractions.get(&job_id).cloned(),
+            Some(HashSet::from([
+                "E10.mkv".to_string(),
+                "E15.mkv".to_string(),
+            ]))
+        );
+        assert!(restored.normalization_retried.contains(&job_id));
+        assert_eq!(
+            restored
+                .rar_sets
+                .get(&(job_id, "show".to_string()))
+                .map(|state| state.verified_suspect_volumes.clone()),
+            Some(HashSet::from([1u32, 2u32]))
+        );
     }
 
     #[tokio::test]
@@ -3242,10 +3617,6 @@ mod tests {
         pipeline
             .extracted_members
             .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
-        pipeline.clean_volumes.insert(
-            (job_id, "show".to_string()),
-            [0u32, 1u32, 2u32, 3u32].into_iter().collect(),
-        );
         pipeline.try_delete_volumes(job_id, "show");
 
         assert!(working_dir.join("show.part01.rar").exists());
@@ -3350,7 +3721,7 @@ mod tests {
         pipeline.handle_extraction_done(second_done).await;
 
         assert!(matches!(
-            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
         ));
     }
@@ -3679,15 +4050,12 @@ mod tests {
         tokio::fs::write(working_dir.join(par2_filename), &files[4].1)
             .await
             .unwrap();
-        pipeline
-            .par2_sets
-            .insert(job_id, Arc::new(minimal_par2_file_set()));
-        pipeline
-            .recovery_block_counts
-            .insert(job_id, [(4u32, 1u32)].into_iter().collect());
-        pipeline
-            .promoted_recovery_files
-            .insert(job_id, [4u32].into_iter().collect());
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            minimal_par2_file_set(),
+            &[(4, par2_filename, 1, true)],
+        );
 
         let set_state = pipeline
             .rar_sets
@@ -3706,18 +4074,20 @@ mod tests {
             Some(JobStatus::Extracting)
         );
         assert!(working_dir.join(par2_filename).exists());
-        assert!(pipeline.par2_sets.contains_key(&job_id));
+        assert!(pipeline.par2_set(job_id).is_some());
         assert_eq!(
             pipeline
-                .recovery_block_counts
-                .get(&job_id)
-                .and_then(|counts| counts.get(&4))
-                .copied(),
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&4))
+                .map(|file| file.recovery_blocks),
             Some(1)
         );
         assert_eq!(
-            pipeline.promoted_recovery_files.get(&job_id).cloned(),
-            Some([4u32].into_iter().collect())
+            pipeline
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&4))
+                .map(|file| file.promoted),
+            Some(true)
         );
     }
 
@@ -3741,9 +4111,7 @@ mod tests {
             .await;
         }
 
-        pipeline
-            .par2_sets
-            .insert(job_id, Arc::new(placement_par2_file_set(&files)));
+        install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
         pipeline
             .failed_extractions
             .insert(job_id, ["E02.mkv".to_string()].into_iter().collect());
@@ -3802,15 +4170,12 @@ mod tests {
         tokio::fs::write(working_dir.join(par2_filename), &files[4].1)
             .await
             .unwrap();
-        pipeline
-            .par2_sets
-            .insert(job_id, Arc::new(minimal_par2_file_set()));
-        pipeline
-            .recovery_block_counts
-            .insert(job_id, [(4u32, 1u32)].into_iter().collect());
-        pipeline
-            .promoted_recovery_files
-            .insert(job_id, [4u32].into_iter().collect());
+        install_test_par2_runtime(
+            &mut pipeline,
+            job_id,
+            minimal_par2_file_set(),
+            &[(4, par2_filename, 1, true)],
+        );
 
         pipeline.try_partial_extraction(job_id).await;
         let done = next_extraction_done(&mut pipeline).await;
@@ -3831,10 +4196,13 @@ mod tests {
 
         assert!(!pipeline.par2_bypassed.contains(&job_id));
         assert!(working_dir.join(par2_filename).exists());
-        assert!(pipeline.par2_sets.contains_key(&job_id));
+        assert!(pipeline.par2_set(job_id).is_some());
         assert_eq!(
-            pipeline.promoted_recovery_files.get(&job_id).cloned(),
-            Some([4u32].into_iter().collect())
+            pipeline
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&4))
+                .map(|file| file.promoted),
+            Some(true)
         );
     }
 
@@ -3861,10 +4229,6 @@ mod tests {
         pipeline
             .extracted_members
             .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
-        pipeline.clean_volumes.insert(
-            (job_id, "show".to_string()),
-            [0u32, 1u32, 2u32, 3u32].into_iter().collect(),
-        );
         pipeline
             .recompute_rar_set_state(job_id, "show")
             .await
@@ -3984,19 +4348,13 @@ mod tests {
 
         pipeline.recompute_volume_safety_from_verification(job_id, &verification);
 
-        let suspect = pipeline
-            .suspect_volumes
+        let verified_suspect = pipeline
+            .rar_sets
             .get(&(job_id, "show".to_string()))
-            .cloned()
+            .map(|state| state.verified_suspect_volumes.clone())
             .unwrap_or_default();
-        let clean = pipeline
-            .clean_volumes
-            .get(&(job_id, "show".to_string()))
-            .cloned()
-            .unwrap_or_default();
-        assert!(suspect.contains(&1));
-        assert!(!clean.contains(&1));
-        assert!(clean.contains(&3));
+        assert!(verified_suspect.contains(&1));
+        assert!(!verified_suspect.contains(&3));
     }
 
     #[tokio::test]
@@ -4042,28 +4400,56 @@ mod tests {
             .get_mut(&job_id)
             .unwrap()
             .assembly
-            .set_archive_topology("show".to_string(), topology);
+            .set_archive_topology("show".to_string(), topology.clone());
 
-        pipeline
-            .failed_extractions
-            .insert(job_id, ["E10.mkv".to_string()].into_iter().collect());
-        pipeline.mark_member_volumes_suspect(job_id, "show", "E10.mkv");
-        pipeline.mark_member_volumes_clean(job_id, "show", "E11.mkv");
+        pipeline.rar_sets.insert(
+            (job_id, "show".to_string()),
+            rar_state::RarSetState {
+                facts: std::collections::BTreeMap::from([
+                    (0u32, dummy_rar_volume_facts(0)),
+                    (1u32, dummy_rar_volume_facts(1)),
+                    (2u32, dummy_rar_volume_facts(2)),
+                ]),
+                volume_files: std::collections::BTreeMap::new(),
+                cached_headers: None,
+                verified_suspect_volumes: std::collections::HashSet::from([1u32]),
+                active_workers: 0,
+                in_flight_members: std::collections::HashSet::new(),
+                phase: rar_state::RarSetPhase::Ready,
+                plan: Some(rar_state::RarDerivedPlan {
+                    phase: rar_state::RarSetPhase::Ready,
+                    is_solid: false,
+                    ready_members: Vec::new(),
+                    member_names: vec!["E10.mkv".to_string(), "E11.mkv".to_string()],
+                    waiting_on_volumes: std::collections::HashSet::new(),
+                    deletion_eligible: std::collections::HashSet::new(),
+                    delete_decisions: std::collections::BTreeMap::from([(
+                        1u32,
+                        rar_state::RarVolumeDeleteDecision {
+                            owners: vec!["E10.mkv".to_string(), "E11.mkv".to_string()],
+                            clean_owners: vec!["E11.mkv".to_string()],
+                            failed_owners: vec!["E10.mkv".to_string()],
+                            pending_owners: Vec::new(),
+                            unresolved_boundary: false,
+                            ownership_eligible: false,
+                        },
+                    )]),
+                    topology,
+                    fallback_reason: None,
+                }),
+            },
+        );
 
-        let suspect = pipeline
-            .suspect_volumes
+        let suspect = pipeline.suspect_rar_volumes_for_job(job_id);
+        let decision = pipeline
+            .rar_sets
             .get(&(job_id, "show".to_string()))
-            .cloned()
-            .unwrap_or_default();
-        let clean = pipeline
-            .clean_volumes
-            .get(&(job_id, "show".to_string()))
-            .cloned()
-            .unwrap_or_default();
+            .and_then(|state| state.plan.as_ref())
+            .and_then(|plan| plan.delete_decisions.get(&1))
+            .unwrap();
 
         assert!(suspect.contains(&1));
-        assert!(clean.contains(&1));
-        assert!(clean.contains(&2));
+        assert!(!Pipeline::claim_clean_rar_volume(decision));
     }
 
     #[tokio::test]
@@ -4163,13 +4549,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        pipeline.clean_volumes.insert(
-            (job_id, "show".to_string()),
-            [0u32, 1u32].into_iter().collect(),
-        );
-        pipeline
-            .par2_sets
-            .insert(job_id, Arc::new(placement_par2_file_set(&files)));
+        install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
         pipeline
             .extracted_members
             .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
@@ -4322,9 +4702,6 @@ mod tests {
             .assembly
             .set_archive_topology("show".to_string(), topology.clone());
         pipeline
-            .clean_volumes
-            .insert((job_id, "show".to_string()), [1u32].into_iter().collect());
-        pipeline
             .failed_extractions
             .insert(job_id, ["E10.mkv".to_string()].into_iter().collect());
         pipeline.rar_sets.insert(
@@ -4332,6 +4709,8 @@ mod tests {
             rar_state::RarSetState {
                 facts: std::collections::BTreeMap::from([(1u32, dummy_rar_volume_facts(1))]),
                 volume_files: std::collections::BTreeMap::new(),
+                cached_headers: None,
+                verified_suspect_volumes: std::collections::HashSet::new(),
                 active_workers: 0,
                 in_flight_members: std::collections::HashSet::new(),
                 phase: rar_state::RarSetPhase::Ready,
@@ -4345,12 +4724,12 @@ mod tests {
                     delete_decisions: std::collections::BTreeMap::from([(
                         1u32,
                         rar_state::RarVolumeDeleteDecision {
-                            owners: vec!["E11.mkv".to_string()],
+                            owners: vec!["E10.mkv".to_string(), "E11.mkv".to_string()],
                             clean_owners: vec!["E11.mkv".to_string()],
-                            failed_owners: Vec::new(),
+                            failed_owners: vec!["E10.mkv".to_string()],
                             pending_owners: Vec::new(),
                             unresolved_boundary: false,
-                            ownership_eligible: true,
+                            ownership_eligible: false,
                         },
                     )]),
                     topology,

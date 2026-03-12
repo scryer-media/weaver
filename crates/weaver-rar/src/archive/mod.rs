@@ -111,6 +111,13 @@ pub struct RarArchive {
     pub(super) password: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemberPlannerState {
+    pub name: String,
+    pub extractable: bool,
+    pub missing_volumes: Vec<usize>,
+}
+
 impl RarArchive {
     /// Open and parse a RAR archive from a reader.
     pub fn open(reader: impl Read + Seek + Send + 'static) -> RarResult<Self> {
@@ -205,6 +212,50 @@ impl RarArchive {
         } else {
             Vec::new()
         }
+    }
+
+    /// Planner-oriented member state, keyed by sanitized member name.
+    pub fn planner_member_states(&self) -> Vec<MemberPlannerState> {
+        self.members
+            .iter()
+            .map(|entry| {
+                let extractable = !entry.file_header.split_after
+                    && entry.segments.iter().all(|seg| {
+                        self.volumes
+                            .get(seg.volume_index)
+                            .is_some_and(|volume| volume.is_some())
+                    });
+
+                let mut missing_volumes: Vec<usize> = entry
+                    .segments
+                    .iter()
+                    .filter(|seg| {
+                        !self
+                            .volumes
+                            .get(seg.volume_index)
+                            .is_some_and(|volume| volume.is_some())
+                    })
+                    .map(|seg| seg.volume_index)
+                    .collect();
+
+                if entry.file_header.split_after {
+                    let next_vol = entry
+                        .segments
+                        .last()
+                        .map(|segment| segment.volume_index + 1)
+                        .unwrap_or(1);
+                    if !missing_volumes.contains(&next_vol) {
+                        missing_volumes.push(next_vol);
+                    }
+                }
+
+                MemberPlannerState {
+                    name: crate::path::sanitize_path(&entry.file_header.name),
+                    extractable,
+                    missing_volumes,
+                }
+            })
+            .collect()
     }
 
     /// Get archive metadata without decompression.

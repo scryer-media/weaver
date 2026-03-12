@@ -429,6 +429,8 @@ pub struct Job {
     pub progress: f64,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
+    pub optional_recovery_bytes: u64,
+    pub optional_recovery_downloaded_bytes: u64,
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
@@ -718,6 +720,8 @@ impl From<&weaver_scheduler::JobInfo> for Job {
             progress: info.progress,
             total_bytes: info.total_bytes,
             downloaded_bytes: info.downloaded_bytes,
+            optional_recovery_bytes: info.optional_recovery_bytes,
+            optional_recovery_downloaded_bytes: info.optional_recovery_downloaded_bytes,
             failed_bytes: info.failed_bytes,
             health: info.health,
             has_password: info.password.is_some(),

@@ -87,6 +87,8 @@ impl MutationRoot {
             progress: 0.0,
             total_bytes: submitted.spec.total_bytes,
             downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
             failed_bytes: 0,
             health: 1000,
             has_password: submitted.spec.password.is_some(),

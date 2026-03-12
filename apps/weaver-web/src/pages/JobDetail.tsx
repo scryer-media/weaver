@@ -212,6 +212,24 @@ export function JobDetail() {
     );
   }
 
+  const optionalRecoveryBytes = job.optionalRecoveryBytes ?? 0;
+  const optionalRecoveryDownloadedBytes = job.optionalRecoveryDownloadedBytes ?? 0;
+  const savedBandwidthBytes = Math.max(
+    optionalRecoveryBytes - optionalRecoveryDownloadedBytes,
+    0,
+  );
+  const displayProgress = job.status === "COMPLETE" ? 1 : job.progress;
+  const showSavedBandwidthTile = job.status === "COMPLETE" && optionalRecoveryBytes > 0;
+  const showLegacySavedBandwidthNote =
+    job.status === "COMPLETE"
+    && job.downloadedBytes < job.totalBytes
+    && optionalRecoveryBytes === 0
+    && optionalRecoveryDownloadedBytes === 0;
+  const savedBandwidthDetail =
+    savedBandwidthBytes > 0
+      ? t("job.savedBandwidthSkipped")
+      : t("job.savedBandwidthUsedAll");
+
   return (
     <div className="space-y-6">
       <div>
@@ -262,17 +280,30 @@ export function JobDetail() {
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
-          <JobProgress progress={job.progress} status={job.status} />
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <JobProgress progress={displayProgress} status={job.status} />
+          <div
+            className={`grid grid-cols-2 gap-4 ${showSavedBandwidthTile ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}
+          >
             <MetricTile label={t("label.downloaded")} value={formatBytes(job.downloadedBytes)} />
             <MetricTile label={t("label.totalSize")} value={formatBytes(job.totalBytes)} />
-            <MetricTile label={t("label.progress")} value={`${(job.progress * 100).toFixed(1)}%`} />
+            <MetricTile label={t("label.progress")} value={`${(displayProgress * 100).toFixed(1)}%`} />
             <MetricTile
-              label="Health"
+              label={t("table.health")}
               value={`${(job.health / 10).toFixed(1)}%`}
               className={healthColor(job.health)}
             />
+            {showSavedBandwidthTile ? (
+              <MetricTile
+                label={t("label.savedBandwidth")}
+                value={formatBytes(savedBandwidthBytes)}
+                detail={savedBandwidthDetail}
+                className={savedBandwidthBytes > 0 ? "text-emerald-600 dark:text-emerald-300" : undefined}
+              />
+            ) : null}
           </div>
+          {showLegacySavedBandwidthNote ? (
+            <p className="text-sm text-muted-foreground">{t("job.savedBandwidthLegacy")}</p>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -369,16 +400,19 @@ export function JobDetail() {
 function MetricTile({
   label,
   value,
+  detail,
   className,
 }: {
   label: string;
   value: string;
+  detail?: string;
   className?: string;
 }) {
   return (
     <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
       <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
       <div className={`mt-2 text-lg font-semibold ${className ?? "text-foreground"}`}>{value}</div>
+      {detail ? <div className="mt-1 text-xs text-muted-foreground">{detail}</div> : null}
     </div>
   );
 }

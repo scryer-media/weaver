@@ -11,6 +11,8 @@ pub struct JobHistoryRow {
     pub error_message: Option<String>,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
+    pub optional_recovery_bytes: u64,
+    pub optional_recovery_downloaded_bytes: u64,
     pub failed_bytes: u64,
     pub health: u32,
     pub category: Option<String>,
@@ -36,6 +38,7 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                        optional_recovery_bytes, optional_recovery_downloaded_bytes,
                         failed_bytes, health, category, output_dir, nzb_path,
                         created_at, completed_at, metadata
                  FROM job_history
@@ -75,29 +78,37 @@ impl Database {
                 .get::<_, i64>(5)
                 .map_err(|e| StateError::Database(e.to_string()))?
                 as u64,
-            failed_bytes: row
+            optional_recovery_bytes: row
                 .get::<_, i64>(6)
+                .map_err(|e| StateError::Database(e.to_string()))?
+                as u64,
+            optional_recovery_downloaded_bytes: row
+                .get::<_, i64>(7)
+                .map_err(|e| StateError::Database(e.to_string()))?
+                as u64,
+            failed_bytes: row
+                .get::<_, i64>(8)
                 .map_err(|e| StateError::Database(e.to_string()))? as u64,
             health: row
-                .get(7)
-                .map_err(|e| StateError::Database(e.to_string()))?,
-            category: row
-                .get(8)
-                .map_err(|e| StateError::Database(e.to_string()))?,
-            output_dir: row
                 .get(9)
                 .map_err(|e| StateError::Database(e.to_string()))?,
-            nzb_path: row
+            category: row
                 .get(10)
                 .map_err(|e| StateError::Database(e.to_string()))?,
-            created_at: row
+            output_dir: row
                 .get(11)
                 .map_err(|e| StateError::Database(e.to_string()))?,
-            completed_at: row
+            nzb_path: row
                 .get(12)
                 .map_err(|e| StateError::Database(e.to_string()))?,
-            metadata: row
+            created_at: row
                 .get(13)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            completed_at: row
+                .get(14)
+                .map_err(|e| StateError::Database(e.to_string()))?,
+            metadata: row
+                .get(15)
                 .map_err(|e| StateError::Database(e.to_string()))?,
         }))
     }
@@ -107,9 +118,10 @@ impl Database {
         conn.execute(
             "INSERT OR REPLACE INTO job_history
              (job_id, name, status, error_message, total_bytes, downloaded_bytes,
+              optional_recovery_bytes, optional_recovery_downloaded_bytes,
               failed_bytes, health, category, output_dir, nzb_path,
               created_at, completed_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 entry.job_id as i64,
                 entry.name,
@@ -117,6 +129,8 @@ impl Database {
                 entry.error_message,
                 entry.total_bytes as i64,
                 entry.downloaded_bytes as i64,
+                entry.optional_recovery_bytes as i64,
+                entry.optional_recovery_downloaded_bytes as i64,
                 entry.failed_bytes as i64,
                 entry.health,
                 entry.category,
@@ -139,6 +153,7 @@ impl Database {
 
         let mut sql = String::from(
             "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                    optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
                     created_at, completed_at, metadata
              FROM job_history WHERE 1=1",
@@ -179,14 +194,16 @@ impl Database {
                     error_message: row.get(3)?,
                     total_bytes: row.get::<_, i64>(4)? as u64,
                     downloaded_bytes: row.get::<_, i64>(5)? as u64,
-                    failed_bytes: row.get::<_, i64>(6)? as u64,
-                    health: row.get(7)?,
-                    category: row.get(8)?,
-                    output_dir: row.get(9)?,
-                    nzb_path: row.get(10)?,
-                    created_at: row.get(11)?,
-                    completed_at: row.get(12)?,
-                    metadata: row.get(13)?,
+                    optional_recovery_bytes: row.get::<_, i64>(6)? as u64,
+                    optional_recovery_downloaded_bytes: row.get::<_, i64>(7)? as u64,
+                    failed_bytes: row.get::<_, i64>(8)? as u64,
+                    health: row.get(9)?,
+                    category: row.get(10)?,
+                    output_dir: row.get(11)?,
+                    nzb_path: row.get(12)?,
+                    created_at: row.get(13)?,
+                    completed_at: row.get(14)?,
+                    metadata: row.get(15)?,
                 })
             })
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -237,6 +254,8 @@ mod tests {
             error_message: None,
             total_bytes: 1_000_000,
             downloaded_bytes: 1_000_000,
+            optional_recovery_bytes: 200_000,
+            optional_recovery_downloaded_bytes: 50_000,
             failed_bytes: 0,
             health: 1000,
             category: Some("movies".to_string()),
@@ -257,6 +276,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.nzb");
         assert_eq!(entries[0].total_bytes, 1_000_000);
+        assert_eq!(entries[0].optional_recovery_bytes, 200_000);
+        assert_eq!(entries[0].optional_recovery_downloaded_bytes, 50_000);
         assert_eq!(db.get_job_history(1).unwrap().unwrap().name, "test.nzb");
     }
 

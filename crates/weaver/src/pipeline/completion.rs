@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn move_path_with_copy_fallback(
@@ -71,9 +72,7 @@ impl Pipeline {
     }
 
     pub(super) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
-        self.par2_sets.remove(&job_id);
-        self.promoted_recovery_files.remove(&job_id);
-        self.recovery_block_counts.remove(&job_id);
+        self.par2_runtime.remove(&job_id);
     }
 
     async fn compute_complete_destination(
@@ -295,35 +294,30 @@ impl Pipeline {
             && !decision.unresolved_boundary
     }
 
-    fn suspect_rar_volumes_for_job(&self, job_id: JobId) -> HashSet<u32> {
-        let mut suspect: HashSet<u32> = self
+    pub(super) fn suspect_rar_volumes_for_job(&self, job_id: JobId) -> HashSet<u32> {
+        let suspect: HashSet<u32> = self
             .rar_sets
             .iter()
             .filter(|((jid, _), _)| *jid == job_id)
             .flat_map(|(_, state)| {
-                state
-                    .plan
-                    .as_ref()
-                    .into_iter()
-                    .flat_map(|plan| {
-                        plan.delete_decisions
-                            .iter()
-                            .filter_map(|(volume, decision)| {
-                                (!decision.failed_owners.is_empty()
-                                    || !decision.pending_owners.is_empty()
-                                    || plan.waiting_on_volumes.contains(volume))
-                                .then_some(*volume)
-                            })
-                    })
-                    .collect::<Vec<_>>()
+                let mut volumes = state
+                    .verified_suspect_volumes
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let Some(plan) = state.plan.as_ref() {
+                    volumes.extend(plan.delete_decisions.iter().filter_map(
+                        |(volume, decision)| {
+                            (!decision.failed_owners.is_empty()
+                                || !decision.pending_owners.is_empty()
+                                || plan.waiting_on_volumes.contains(volume))
+                            .then_some(*volume)
+                        },
+                    ));
+                }
+                volumes
             })
             .collect();
-        suspect.extend(
-            self.suspect_volumes
-                .iter()
-                .filter(|((jid, _), _)| *jid == job_id)
-                .flat_map(|(_, volumes)| volumes.iter().copied()),
-        );
         suspect
     }
 
@@ -389,7 +383,7 @@ impl Pipeline {
             .map(|file| (file.filename.as_str(), file))
             .collect();
 
-        let plans: Vec<(String, HashSet<u32>, HashSet<u32>)> = {
+        let plans: Vec<(String, HashSet<u32>)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -398,23 +392,17 @@ impl Pipeline {
                 .archive_topologies()
                 .iter()
                 .map(|(set_name, topo)| {
-                    let mut clean = HashSet::new();
                     let mut suspect = HashSet::new();
                     for (filename, &volume_number) in &topo.volume_map {
                         if let Some(file) = status_by_name.get(filename.as_str()) {
                             match file.status {
                                 weaver_par2::verify::FileStatus::Complete
-                                | weaver_par2::verify::FileStatus::Renamed(_) => {
-                                    clean.insert(volume_number);
-                                }
+                                | weaver_par2::verify::FileStatus::Renamed(_) => {}
                                 weaver_par2::verify::FileStatus::Missing
                                     if eagerly_deleted_names.contains(filename.as_str())
                                         && !volume_numbers.get(filename.as_str()).is_some_and(
                                             |number| suspect_volumes.contains(number),
-                                        ) =>
-                                {
-                                    clean.insert(volume_number);
-                                }
+                                        ) => {}
                                 weaver_par2::verify::FileStatus::Missing
                                 | weaver_par2::verify::FileStatus::Damaged(_) => {
                                     suspect.insert(volume_number);
@@ -422,23 +410,24 @@ impl Pipeline {
                             }
                         }
                     }
-                    (set_name.clone(), clean, suspect)
+                    (set_name.clone(), suspect)
                 })
                 .collect()
         };
 
-        for (set_name, clean, suspect) in plans {
-            let key = (job_id, set_name.clone());
-            if clean.is_empty() {
-                self.clean_volumes.remove(&key);
-            } else {
-                self.clean_volumes.insert(key.clone(), clean);
+        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
+            error!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to clear persisted verified suspect RAR volumes"
+            );
+        }
+
+        for (set_name, suspect) in plans {
+            if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                state.verified_suspect_volumes = suspect.clone();
             }
-            if suspect.is_empty() {
-                self.suspect_volumes.remove(&key);
-            } else {
-                self.suspect_volumes.insert(key, suspect);
-            }
+            self.persist_verified_suspect_volumes(job_id, &set_name, &suspect);
         }
     }
 
@@ -954,7 +943,7 @@ impl Pipeline {
                 return;
             }
 
-            let par2_set = self.par2_sets.get(&job_id).cloned();
+            let par2_set = self.par2_set(job_id).cloned();
             if let Some(par2_set) = par2_set {
                 {
                     let state = self.jobs.get_mut(&job_id).unwrap();
@@ -1092,14 +1081,18 @@ impl Pipeline {
                             return;
                         }
 
-                        self.normalization_retried.insert(job_id);
-                        let failed_members =
-                            self.failed_extractions.remove(&job_id).unwrap_or_default();
+                        self.set_normalization_retried_state(job_id, true);
+                        let failed_members = self
+                            .failed_extractions
+                            .get(&job_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.replace_failed_extraction_members(job_id, HashSet::new());
                         let cleared = failed_members.len();
                         self.recompute_rar_retry_frontier(job_id).await;
                         if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
                             if !failed_members.is_empty() {
-                                self.failed_extractions.insert(job_id, failed_members);
+                                self.replace_failed_extraction_members(job_id, failed_members);
                             }
                             let msg = format!(
                                 "invalid RAR retry frontier after placement correction: {reason}"
@@ -1227,10 +1220,9 @@ impl Pipeline {
                                 slices_repaired,
                             });
 
-                            let cleared = self
-                                .failed_extractions
-                                .remove(&job_id)
-                                .map_or(0, |s| s.len());
+                            let cleared =
+                                self.failed_extractions.get(&job_id).map_or(0, HashSet::len);
+                            self.replace_failed_extraction_members(job_id, HashSet::new());
                             if cleared > 0 {
                                 info!(
                                     job_id = job_id.0,
@@ -1797,7 +1789,11 @@ impl Pipeline {
         if volumes.is_empty() {
             return;
         }
-        let suspect = self.suspect_volumes.get(&key).cloned().unwrap_or_default();
+        let verified_suspect = self
+            .rar_sets
+            .get(&key)
+            .map(|state| state.verified_suspect_volumes.clone())
+            .unwrap_or_default();
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 
@@ -1816,11 +1812,10 @@ impl Pipeline {
             };
 
             let claim_clean = Self::claim_clean_rar_volume(decision);
-            let verified_suspect = suspect.contains(&volume);
+            let verification_blocked = verified_suspect.contains(&volume);
             let solid_blocked = plan.is_solid;
             let waiting_on_retry = plan.waiting_on_volumes.contains(&volume);
-            let failed_member_claim = !decision.failed_owners.is_empty()
-                || self.volume_has_failed_member_claim(job_id, set_name, volume);
+            let failed_member_claim = !decision.failed_owners.is_empty();
             let already_deleted = self
                 .eagerly_deleted
                 .get(&job_id)
@@ -1828,7 +1823,7 @@ impl Pipeline {
             let should_delete = decision.ownership_eligible
                 && !waiting_on_retry
                 && !failed_member_claim
-                && !verified_suspect
+                && !verification_blocked
                 && !solid_blocked
                 && !already_deleted;
 
@@ -1898,7 +1893,7 @@ impl Pipeline {
                 if !claim_clean {
                     reasons.push("claims_not_clean".to_string());
                 }
-                if verified_suspect {
+                if verification_blocked {
                     reasons.push("verified_suspect".to_string());
                 }
                 if already_deleted {
@@ -1925,7 +1920,7 @@ impl Pipeline {
                 .eagerly_deleted
                 .get(&job_id)
                 .is_some_and(|deleted| deleted.contains(&filename));
-            let par2_clean = claim_clean && !verified_suspect;
+            let par2_clean = claim_clean && !verification_blocked;
             if let Err(error) = self.db.set_volume_status(
                 job_id,
                 set_name,
@@ -1950,7 +1945,7 @@ impl Pipeline {
             solid = plan.is_solid,
             ownership_ready = ?ownership_ready,
             deleted_now = ?deleted_now,
-            verified_suspect_volumes = ?suspect,
+            verified_suspect_volumes = ?verified_suspect,
             "RAR eager delete audit"
         );
     }

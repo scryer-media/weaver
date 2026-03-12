@@ -58,6 +58,8 @@ pub(super) struct RarDerivedPlan {
 pub(super) struct RarSetState {
     pub(super) facts: BTreeMap<u32, RarVolumeFacts>,
     pub(super) volume_files: BTreeMap<u32, String>,
+    pub(super) cached_headers: Option<Vec<u8>>,
+    pub(super) verified_suspect_volumes: HashSet<u32>,
     pub(super) active_workers: usize,
     pub(super) in_flight_members: HashSet<String>,
     pub(super) phase: RarSetPhase,
@@ -69,6 +71,8 @@ impl Default for RarSetState {
         Self {
             facts: BTreeMap::new(),
             volume_files: BTreeMap::new(),
+            cached_headers: None,
+            verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
             phase: RarSetPhase::WaitingForVolumes,
@@ -147,16 +151,32 @@ pub(super) fn build_plan(
 
     let metadata = archive.metadata();
     let topology_members = archive.topology_members();
+    let planner_states: HashMap<String, (bool, Vec<u32>)> = archive
+        .planner_member_states()
+        .into_iter()
+        .map(|state| {
+            (
+                state.name,
+                (
+                    state.extractable,
+                    state
+                        .missing_volumes
+                        .into_iter()
+                        .map(|volume| volume as u32)
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
     topology.expected_volume_count = metadata.volume_count.map(|count| count as u32);
     let final_volume_seen = facts
         .get(&prefix_end)
         .is_some_and(|volume_facts| !volume_facts.more_volumes);
     let missing_for_member = |member: &weaver_rar::MemberInfo| {
-        let mut missing: Vec<u32> = archive
-            .missing_volumes(&member.name)
-            .into_iter()
-            .map(|volume| volume as u32)
-            .collect();
+        let mut missing = planner_states
+            .get(&member.name)
+            .map(|(_, missing)| missing.clone())
+            .unwrap_or_default();
         if final_volume_seen && member.volumes.last_volume as u32 == prefix_end {
             missing.retain(|volume| *volume <= prefix_end);
         }
@@ -231,7 +251,11 @@ pub(super) fn build_plan(
             if member.is_directory || extracted.contains(&member.name) {
                 continue;
             }
-            if archive.is_extractable(&member.name) {
+            let extractable = planner_states
+                .get(&member.name)
+                .map(|(extractable, _)| *extractable)
+                .unwrap_or(false);
+            if extractable {
                 if !failed.contains(&member.name) {
                     push_unique_ready_member(
                         &mut ready_members,
@@ -252,7 +276,11 @@ pub(super) fn build_plan(
             {
                 continue;
             }
-            if archive.is_extractable(&member.name) {
+            let extractable = planner_states
+                .get(&member.name)
+                .map(|(extractable, _)| *extractable)
+                .unwrap_or(false);
+            if extractable {
                 push_unique_ready_member(&mut ready_members, &mut ready_member_names, &member.name);
             } else {
                 waiting_on_volumes.extend(missing_for_member(member));

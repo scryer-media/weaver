@@ -27,3 +27,8 @@ rmp-serde = { workspace = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "archive_hotspots"
+harness = false

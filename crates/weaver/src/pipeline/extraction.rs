@@ -1,4 +1,43 @@
 use super::*;
+use std::io::Write;
+
+struct ChunkFileWriter {
+    inner: std::io::BufWriter<std::fs::File>,
+    bytes_written: u64,
+}
+
+impl ChunkFileWriter {
+    fn new(inner: std::io::BufWriter<std::fs::File>) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+}
+
+impl std::io::Write for ChunkFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.bytes_written += buf.len() as u64;
+        Ok(())
+    }
+}
+
+impl Drop for ChunkFileWriter {
+    fn drop(&mut self) {
+        let _ = self.inner.flush();
+    }
+}
 
 impl Pipeline {
     fn rar_set_worker_limit(plan: &crate::pipeline::rar_state::RarDerivedPlan) -> usize {
@@ -29,11 +68,16 @@ impl Pipeline {
             .join(member_name)
     }
 
-    fn clear_member_chunk_artifacts(
+    fn member_chunk_path(chunk_dir: &std::path::Path, volume_index: u32) -> PathBuf {
+        chunk_dir.join(format!("{volume_index:05}.chunk"))
+    }
+
+    fn clear_member_extraction_artifacts(
         db: &weaver_state::Database,
         job_id: JobId,
         set_name: &str,
         member_name: &str,
+        partial_path: &std::path::Path,
         chunk_dir: &std::path::Path,
     ) -> Result<(), String> {
         let existing = db
@@ -54,6 +98,16 @@ impl Pipeline {
                 }
             }
         }
+        match std::fs::remove_file(partial_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove stale partial output {}: {error}",
+                    partial_path.display()
+                ));
+            }
+        }
         db.clear_member_chunks(job_id, set_name, member_name)
             .map_err(|e| format!("failed to clear extraction chunk rows: {e}"))?;
         match std::fs::remove_dir_all(chunk_dir) {
@@ -69,15 +123,15 @@ impl Pipeline {
         Ok(())
     }
 
-    fn finalize_member_chunks(
+    fn finalize_member_output(
         db: &weaver_state::Database,
         event_tx: &broadcast::Sender<PipelineEvent>,
         job_id: JobId,
         set_name: &str,
         member_name: &str,
-        chunk_dir: &std::path::Path,
         partial_path: &std::path::Path,
         out_path: &std::path::Path,
+        chunk_dir: &std::path::Path,
         chunks: &[weaver_state::ExtractionChunk],
     ) -> Result<u64, String> {
         let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendStarted {
@@ -86,35 +140,72 @@ impl Pipeline {
             member: member_name.to_string(),
         });
 
-        match std::fs::remove_file(partial_path) {
+        match std::fs::remove_file(out_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(format!(
-                    "failed to remove stale partial output {}: {error}",
-                    partial_path.display()
+                    "failed to remove stale finalized output {}: {error}",
+                    out_path.display()
                 ));
             }
         }
 
-        let mut partial = std::fs::File::create(partial_path).map_err(|e| {
+        let mut partial = std::io::BufWriter::with_capacity(
+            8 * 1024 * 1024,
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(partial_path)
+                .map_err(|e| {
+                    format!(
+                        "failed to create partial output {}: {e}",
+                        partial_path.display()
+                    )
+                })?,
+        );
+        let mut total_written = 0u64;
+        for chunk in chunks {
+            let mut chunk_file = std::io::BufReader::with_capacity(
+                8 * 1024 * 1024,
+                std::fs::File::open(&chunk.temp_path).map_err(|e| {
+                    format!("failed to open extraction chunk {}: {e}", chunk.temp_path)
+                })?,
+            );
+            let written = std::io::copy(&mut chunk_file, &mut partial).map_err(|e| {
+                format!(
+                    "failed to append extraction chunk {} to {}: {e}",
+                    chunk.temp_path,
+                    partial_path.display()
+                )
+            })?;
+            total_written += written;
+            if let Err(error) =
+                db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name,
+                    member = member_name,
+                    volume = chunk.volume_index,
+                    error = %error,
+                    "failed to mark extraction chunk appended"
+                );
+            }
+        }
+        partial.flush().map_err(|e| {
             format!(
-                "failed to create partial output {}: {e}",
+                "failed to flush partial output {}: {e}",
                 partial_path.display()
             )
         })?;
-        let mut total_written = 0u64;
-        let mut ordered_chunks = chunks.to_vec();
-        ordered_chunks.sort_by_key(|chunk| chunk.volume_index);
-        for chunk in &ordered_chunks {
-            let mut input = std::fs::File::open(&chunk.temp_path)
-                .map_err(|e| format!("failed to open extraction chunk {}: {e}", chunk.temp_path))?;
-            total_written += std::io::copy(&mut input, &mut partial).map_err(|e| {
-                format!("failed to append extraction chunk {}: {e}", chunk.temp_path)
-            })?;
-            db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
-                .map_err(|e| format!("failed to persist appended chunk state: {e}"))?;
-        }
+        let partial = partial.into_inner().map_err(|e| {
+            format!(
+                "failed to finalize partial output {}: {e}",
+                partial_path.display()
+            )
+        })?;
         partial.sync_all().map_err(|e| {
             format!(
                 "failed to sync partial output {}: {e}",
@@ -124,49 +215,37 @@ impl Pipeline {
         std::fs::rename(partial_path, out_path)
             .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
 
-        let mut cleanup_failed = false;
-        for chunk in &ordered_chunks {
+        for chunk in chunks {
             match std::fs::remove_file(&chunk.temp_path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    cleanup_failed = true;
-                    warn!(
-                        job_id = job_id.0,
-                        set_name,
-                        member = member_name,
-                        chunk = %chunk.temp_path,
-                        error = %error,
-                        "failed to delete finalized extraction chunk"
-                    );
+                    return Err(format!(
+                        "failed to remove extraction chunk {}: {error}",
+                        chunk.temp_path
+                    ));
                 }
             }
         }
+        match std::fs::remove_dir_all(chunk_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove extraction chunk dir {}: {error}",
+                    chunk_dir.display()
+                ));
+            }
+        }
 
-        if !cleanup_failed {
-            if let Err(error) = db.clear_member_chunks(job_id, set_name, member_name) {
-                warn!(
-                    job_id = job_id.0,
-                    set_name,
-                    member = member_name,
-                    error = %error,
-                    "failed to clear extraction chunk manifest after finalize"
-                );
-            }
-            match std::fs::remove_dir_all(chunk_dir) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name,
-                        member = member_name,
-                        path = %chunk_dir.display(),
-                        error = %error,
-                        "failed to remove extraction chunk directory after finalize"
-                    );
-                }
-            }
+        if let Err(error) = db.clear_member_chunks(job_id, set_name, member_name) {
+            warn!(
+                job_id = job_id.0,
+                set_name,
+                member = member_name,
+                error = %error,
+                "failed to clear extraction checkpoint manifest after finalize"
+            );
         }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendFinished {
@@ -219,9 +298,20 @@ impl Pipeline {
         });
 
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
-        Self::clear_member_chunk_artifacts(db, job_id, set_name, &member_name, &chunk_dir)?;
-        let mut chunk_paths: std::collections::BTreeMap<u32, PathBuf> =
-            std::collections::BTreeMap::new();
+        Self::clear_member_extraction_artifacts(
+            db,
+            job_id,
+            set_name,
+            &member_name,
+            &partial_path,
+            &chunk_dir,
+        )?;
+        std::fs::create_dir_all(&chunk_dir).map_err(|e| {
+            format!(
+                "failed to create extraction chunk dir {}: {e}",
+                chunk_dir.display()
+            )
+        })?;
         let chunk_records: Result<Vec<(u32, u64)>, weaver_rar::RarError> = if is_solid {
             archive
                 .extract_member_solid_chunked(idx, options, |absolute_volume| {
@@ -232,15 +322,15 @@ impl Pipeline {
                             ),
                         }
                     })?;
-                    let path = chunk_dir.join(format!("{absolute_volume:05}.chunk"));
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
-                    }
-                    let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
-                    chunk_paths.insert(absolute_volume, path);
-                    Ok(Box::new(std::io::BufWriter::with_capacity(
-                        8 * 1024 * 1024,
-                        file,
+                    let chunk_path = Self::member_chunk_path(&chunk_dir, absolute_volume);
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&chunk_path)
+                        .map_err(weaver_rar::RarError::Io)?;
+                    Ok(Box::new(ChunkFileWriter::new(
+                        std::io::BufWriter::with_capacity(8 * 1024 * 1024, file),
                     )))
                 })
                 .and_then(|records| {
@@ -272,15 +362,15 @@ impl Pipeline {
             archive
                 .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
                     let absolute_volume = first_volume + local_volume as u32;
-                    let path = chunk_dir.join(format!("{absolute_volume:05}.chunk"));
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
-                    }
-                    let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
-                    chunk_paths.insert(absolute_volume, path);
-                    Ok(Box::new(std::io::BufWriter::with_capacity(
-                        8 * 1024 * 1024,
-                        file,
+                    let chunk_path = Self::member_chunk_path(&chunk_dir, absolute_volume);
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&chunk_path)
+                        .map_err(weaver_rar::RarError::Io)?;
+                    Ok(Box::new(ChunkFileWriter::new(
+                        std::io::BufWriter::with_capacity(8 * 1024 * 1024, file),
                     )))
                 })
                 .and_then(|records| {
@@ -294,23 +384,24 @@ impl Pipeline {
         };
         let chunk_records = chunk_records.map_err(|error| {
             let _ = std::fs::remove_file(&partial_path);
-            let _ = std::fs::remove_dir_all(&chunk_dir);
             format!("failed to extract {member_name}: {error}")
         })?;
 
         let mut persisted_chunks = Vec::with_capacity(chunk_records.len());
+        let mut next_offset = 0u64;
         for (absolute_volume, bytes_written) in chunk_records {
-            let path = chunk_paths
-                .get(&absolute_volume)
-                .ok_or_else(|| {
-                    format!("missing chunk path for member {member_name} volume {absolute_volume}")
-                })?
-                .clone();
+            let start_offset = next_offset;
+            let end_offset = start_offset + bytes_written;
+            next_offset = end_offset;
             persisted_chunks.push(weaver_state::ExtractionChunk {
                 member_name: member_name.clone(),
                 volume_index: absolute_volume,
                 bytes_written,
-                temp_path: path.to_string_lossy().to_string(),
+                temp_path: Self::member_chunk_path(&chunk_dir, absolute_volume)
+                    .to_string_lossy()
+                    .to_string(),
+                start_offset,
+                end_offset,
                 verified: true,
                 appended: false,
             });
@@ -319,19 +410,18 @@ impl Pipeline {
             db.replace_member_chunks(job_id, set_name, &member_name, &persisted_chunks)
         {
             let _ = std::fs::remove_file(&partial_path);
-            let _ = std::fs::remove_dir_all(&chunk_dir);
             return Err(format!("failed to persist extraction chunks: {error}"));
         }
 
-        let bytes_written = match Self::finalize_member_chunks(
+        let bytes_written = match Self::finalize_member_output(
             db,
             event_tx,
             job_id,
             set_name,
             &member_name,
-            &chunk_dir,
             &partial_path,
             &out_path,
+            &chunk_dir,
             &persisted_chunks,
         ) {
             Ok(bytes_written) => bytes_written,
@@ -639,35 +729,6 @@ impl Pipeline {
         Some((member.first_volume, member.last_volume))
     }
 
-    fn failed_member_volume_span(
-        &self,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-    ) -> Option<(u32, u32)> {
-        let (first_volume, last_volume) = self.member_volume_span(job_id, set_name, member_name)?;
-        Some((
-            first_volume.saturating_sub(1),
-            last_volume.saturating_add(1),
-        ))
-    }
-
-    pub(super) fn volume_has_failed_member_claim(
-        &self,
-        job_id: JobId,
-        set_name: &str,
-        volume: u32,
-    ) -> bool {
-        self.failed_extractions.get(&job_id).is_some_and(|failed| {
-            failed.iter().any(|member_name| {
-                self.failed_member_volume_span(job_id, set_name, member_name)
-                    .is_some_and(|(first_volume, last_volume)| {
-                        (first_volume..=last_volume).contains(&volume)
-                    })
-            })
-        })
-    }
-
     pub(super) fn clear_failed_extraction_member(&mut self, job_id: JobId, member_name: &str) {
         let mut remove_entry = false;
         if let Some(failed) = self.failed_extractions.get_mut(&job_id) {
@@ -677,81 +738,14 @@ impl Pipeline {
         if remove_entry {
             self.failed_extractions.remove(&job_id);
         }
-    }
-
-    #[cfg(test)]
-    fn mark_volume_range(
-        target: &mut HashMap<(JobId, String), HashSet<u32>>,
-        job_id: JobId,
-        set_name: &str,
-        first_volume: u32,
-        last_volume: u32,
-    ) {
-        let entry = target.entry((job_id, set_name.to_string())).or_default();
-        for volume in first_volume..=last_volume {
-            entry.insert(volume);
+        if let Err(error) = self.db.remove_failed_extraction(job_id, member_name) {
+            error!(
+                job_id = job_id.0,
+                member = %member_name,
+                error = %error,
+                "failed to clear persisted failed extraction member"
+            );
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn mark_member_volumes_clean(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-    ) {
-        let Some((first_volume, last_volume)) =
-            self.member_volume_span(job_id, set_name, member_name)
-        else {
-            return;
-        };
-
-        Self::mark_volume_range(
-            &mut self.clean_volumes,
-            job_id,
-            set_name,
-            first_volume,
-            last_volume,
-        );
-
-        let suspect_first = first_volume.saturating_sub(1);
-        let suspect_last = last_volume.saturating_add(1);
-        let clearable_volumes: Vec<u32> = (suspect_first..=suspect_last)
-            .filter(|volume| !self.volume_has_failed_member_claim(job_id, set_name, *volume))
-            .collect();
-        let key = (job_id, set_name.to_string());
-        if let Some(suspect) = self.suspect_volumes.get_mut(&key) {
-            for volume in clearable_volumes {
-                suspect.remove(&volume);
-            }
-            if suspect.is_empty() {
-                self.suspect_volumes.remove(&key);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn mark_member_volumes_suspect(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-    ) {
-        let Some((first_volume, last_volume)) =
-            self.member_volume_span(job_id, set_name, member_name)
-        else {
-            return;
-        };
-
-        let suspect_first = first_volume.saturating_sub(1);
-        let suspect_last = last_volume.saturating_add(1);
-        Self::mark_volume_range(
-            &mut self.suspect_volumes,
-            job_id,
-            set_name,
-            suspect_first,
-            suspect_last,
-        );
     }
 
     fn suspect_par2_file_ids_for_member(
@@ -760,7 +754,7 @@ impl Pipeline {
         set_name: &str,
         member_name: &str,
     ) -> Vec<weaver_par2::FileId> {
-        let Some(par2_set) = self.par2_sets.get(&job_id) else {
+        let Some(par2_set) = self.par2_set(job_id) else {
             return Vec::new();
         };
         let Some((first_volume, last_volume)) =
@@ -821,7 +815,7 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            let Some(par2_set) = self.par2_sets.get(&job_id).cloned() else {
+            let Some(par2_set) = self.par2_set(job_id).cloned() else {
                 return;
             };
             (state.working_dir.clone(), par2_set)
@@ -939,10 +933,7 @@ impl Pipeline {
                                 error = %error,
                                 "RAR batch member failed"
                             );
-                            self.failed_extractions
-                                .entry(job_id)
-                                .or_default()
-                                .insert(member.clone());
+                            self.set_failed_extraction_member(job_id, member);
                             self.promote_recovery_for_failed_member(job_id, &set_name, member)
                                 .await;
                         }
@@ -955,10 +946,7 @@ impl Pipeline {
                             "RAR batch extraction worker failed"
                         );
                         for member in &attempted {
-                            self.failed_extractions
-                                .entry(job_id)
-                                .or_default()
-                                .insert(member.clone());
+                            self.set_failed_extraction_member(job_id, member);
                             self.promote_recovery_for_failed_member(job_id, &set_name, member)
                                 .await;
                         }
@@ -1030,10 +1018,7 @@ impl Pipeline {
                             if let Some(members) = self.extracted_members.get_mut(&job_id) {
                                 members.remove(member);
                             }
-                            self.failed_extractions
-                                .entry(job_id)
-                                .or_default()
-                                .insert(member.clone());
+                            self.set_failed_extraction_member(job_id, member);
                             self.promote_recovery_for_failed_member(job_id, &set_name, member)
                                 .await;
                         }

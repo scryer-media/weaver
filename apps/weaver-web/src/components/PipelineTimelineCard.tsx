@@ -328,9 +328,10 @@ function TimelineSpanPopover({
 
   const handlePointerEnter = () => setOpen(true);
   const handlePointerLeave = () => setOpen(false);
+  const preventAutoFocus = (event: Event) => event.preventDefault();
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover modal={false} open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -359,6 +360,8 @@ function TimelineSpanPopover({
         side="top"
         sideOffset={4}
         className="w-[36rem] max-w-[calc(100vw-2rem)] space-y-3"
+        onOpenAutoFocus={preventAutoFocus}
+        onCloseAutoFocus={preventAutoFocus}
         onPointerEnter={handlePointerEnter}
         onPointerLeave={handlePointerLeave}
       >

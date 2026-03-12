@@ -12,6 +12,14 @@ use crate::volume::VolumeProvider;
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 impl RarArchive {
+    fn compressed_capacity_hint(segments: &[DataSegment]) -> usize {
+        segments
+            .iter()
+            .map(|segment| segment.data_size)
+            .sum::<u64>()
+            .min(usize::MAX as u64) as usize
+    }
+
     fn solid_volume_transitions(
         segments: &[DataSegment],
     ) -> (usize, Vec<crate::decompress::VolumeTransition>) {
@@ -1300,7 +1308,7 @@ impl RarArchive {
         };
 
         let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
-        let mut compressed = Vec::new();
+        let mut compressed = Vec::with_capacity(Self::compressed_capacity_hint(segments));
         std::io::Read::read_to_end(&mut buf_reader, &mut compressed).map_err(|e| {
             // Check if this is a VolumeProvider error wrapped in io::Error.
             RarError::Io(e)
@@ -1679,7 +1687,7 @@ impl RarArchive {
         // Wrap in VolumeTrackingReader to capture transitions during read_to_end.
         let mut tracking_reader =
             VolumeTrackingReader::new(BufReader::with_capacity(1024 * 1024, inner), volume_tracker);
-        let mut compressed = Vec::new();
+        let mut compressed = Vec::with_capacity(Self::compressed_capacity_hint(segments));
         std::io::Read::read_to_end(&mut tracking_reader, &mut compressed).map_err(RarError::Io)?;
 
         let transitions = tracking_reader.into_transitions();

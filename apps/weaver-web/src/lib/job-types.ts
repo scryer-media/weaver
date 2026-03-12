@@ -48,6 +48,8 @@ export interface JobData {
   progress: number;
   totalBytes: number;
   downloadedBytes: number;
+  optionalRecoveryBytes: number;
+  optionalRecoveryDownloadedBytes: number;
   failedBytes: number;
   health: number;
   hasPassword: boolean;

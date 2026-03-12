@@ -19,3 +19,10 @@ bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 socket2 = { workspace = true }
 memchr = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "multiline_decode"
+harness = false

@@ -125,16 +125,20 @@ fn select_recovery_file_indices(
 }
 
 impl Pipeline {
-    pub(super) fn note_recovery_block_count(
+    pub(super) fn par2_runtime(&self, job_id: JobId) -> Option<&crate::pipeline::Par2RuntimeState> {
+        self.par2_runtime.get(&job_id)
+    }
+
+    pub(super) fn par2_set(&self, job_id: JobId) -> Option<&Arc<Par2FileSet>> {
+        self.par2_runtime(job_id)
+            .and_then(|runtime| runtime.set.as_ref())
+    }
+
+    pub(super) fn ensure_par2_runtime(
         &mut self,
         job_id: JobId,
-        file_index: u32,
-        blocks: u32,
-    ) {
-        self.recovery_block_counts
-            .entry(job_id)
-            .or_default()
-            .insert(file_index, blocks);
+    ) -> &mut crate::pipeline::Par2RuntimeState {
+        self.par2_runtime.entry(job_id).or_default()
     }
 
     pub(super) fn note_recovery_count_from_yenc_name(
@@ -153,14 +157,17 @@ impl Pipeline {
                 recovery_block_count,
             } => {
                 let blocks = if is_index { 0 } else { recovery_block_count };
-                self.note_recovery_block_count(job_id, file_index, blocks);
+                let runtime = self.ensure_par2_runtime(job_id);
+                let entry = runtime.files.entry(file_index).or_default();
+                entry.filename = yenc_name.to_string();
+                entry.recovery_blocks = blocks;
             }
             _ => {}
         }
     }
 
     fn recovery_packet_size(&self, job_id: JobId) -> Option<u64> {
-        let par2_set = self.par2_sets.get(&job_id)?;
+        let par2_set = self.par2_set(job_id)?;
         Some(par2_recovery_packet_size(par2_set.slice_size))
     }
 
@@ -170,8 +177,9 @@ impl Pipeline {
 
         let mut overheads = Vec::new();
 
-        if let Some(exact) = self.recovery_block_counts.get(&job_id) {
-            for (&file_index, &blocks) in exact {
+        if let Some(runtime) = self.par2_runtime(job_id) {
+            for (&file_index, file) in &runtime.files {
+                let blocks = file.recovery_blocks;
                 let Some(total_bytes) = recovery_file_bytes(&state.spec, file_index) else {
                     continue;
                 };
@@ -210,10 +218,9 @@ impl Pipeline {
         file_index: u32,
     ) -> Option<(u32, RecoveryCountSource)> {
         if let Some(blocks) = self
-            .recovery_block_counts
-            .get(&job_id)
-            .and_then(|counts| counts.get(&file_index))
-            .copied()
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&file_index))
+            .map(|file| file.recovery_blocks)
         {
             return Some((blocks, RecoveryCountSource::Exact));
         }
@@ -272,9 +279,14 @@ impl Pipeline {
         };
 
         let mut file_indices = self
-            .promoted_recovery_files
-            .get(&job_id)
-            .cloned()
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| file.promoted.then_some(file_index))
+                    .collect::<HashSet<_>>()
+            })
             .unwrap_or_default();
 
         for file in state.assembly.files() {
@@ -360,9 +372,9 @@ impl Pipeline {
         let mut candidates = Vec::new();
         for file_index in work_by_file.keys().copied() {
             if self
-                .promoted_recovery_files
-                .get(&job_id)
-                .is_some_and(|files| files.contains(&file_index))
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .is_some_and(|file| file.promoted)
             {
                 continue;
             }
@@ -425,10 +437,45 @@ impl Pipeline {
         };
 
         if !promoted_file_indices.is_empty() {
-            self.promoted_recovery_files
-                .entry(job_id)
-                .or_default()
-                .extend(promoted_file_indices.iter().copied());
+            let filenames: HashMap<u32, String> = self
+                .jobs
+                .get(&job_id)
+                .map(|state| {
+                    promoted_file_indices
+                        .iter()
+                        .filter_map(|file_index| {
+                            state
+                                .spec
+                                .files
+                                .get(*file_index as usize)
+                                .map(|file| (*file_index, file.filename.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for file_index in &promoted_file_indices {
+                let (filename, recovery_blocks) = {
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    let entry = runtime.files.entry(*file_index).or_default();
+                    if let Some(filename) = filenames.get(file_index) {
+                        entry.filename = filename.clone();
+                    }
+                    entry.recovery_blocks = block_map.get(file_index).copied().unwrap_or(0);
+                    entry.promoted = true;
+                    (entry.filename.clone(), entry.recovery_blocks)
+                };
+                if let Err(error) =
+                    self.db
+                        .upsert_par2_file(job_id, *file_index, &filename, recovery_blocks, true)
+                {
+                    error!(
+                        job_id = job_id.0,
+                        file_index,
+                        error = %error,
+                        "failed to persist PAR2 file state"
+                    );
+                }
+            }
             info!(
                 job_id = job_id.0,
                 blocks_needed,
@@ -452,6 +499,51 @@ impl Pipeline {
         promoted_blocks
     }
 
+    pub(super) fn reapply_promoted_recovery_queue(&mut self, job_id: JobId) {
+        let promoted: HashSet<u32> = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| file.promoted.then_some(file_index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if promoted.is_empty() {
+            return;
+        }
+
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+
+        let queued = state.recovery_queue.drain_all();
+        let mut moved_segments = 0usize;
+        let mut moved_files = HashSet::new();
+        for mut work in queued {
+            let file_index = work.segment_id.file_id.file_index;
+            if promoted.contains(&file_index) {
+                work.priority = PROMOTED_RECOVERY_PRIORITY;
+                state.download_queue.push(work);
+                moved_segments += 1;
+                moved_files.insert(file_index);
+            } else {
+                state.recovery_queue.push(work);
+            }
+        }
+
+        if moved_segments > 0 {
+            info!(
+                job_id = job_id.0,
+                moved_segments,
+                moved_files = ?moved_files,
+                "reapplied promoted PAR2 recovery queue state after restore"
+            );
+            self.update_queue_metrics();
+        }
+    }
+
     /// List all jobs.
     pub(super) fn list_jobs(&self) -> Vec<JobInfo> {
         let mut list = Vec::with_capacity(self.jobs.len() + self.finished_jobs.len());
@@ -459,6 +551,8 @@ impl Pipeline {
 
         let mut push_state = |state: &JobState| {
             let total = state.spec.total_bytes;
+            let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+                state.assembly.optional_recovery_bytes();
             let health = if total == 0 {
                 1000
             } else {
@@ -476,6 +570,8 @@ impl Pipeline {
                 progress: state.assembly.progress(),
                 total_bytes: total,
                 downloaded_bytes: state.downloaded_bytes,
+                optional_recovery_bytes,
+                optional_recovery_downloaded_bytes,
                 failed_bytes: state.failed_bytes,
                 health,
                 password: state.spec.password.clone(),

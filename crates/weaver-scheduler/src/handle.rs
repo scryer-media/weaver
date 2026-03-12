@@ -155,6 +155,8 @@ pub struct JobInfo {
     pub progress: f64,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
+    pub optional_recovery_bytes: u64,
+    pub optional_recovery_downloaded_bytes: u64,
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
@@ -447,6 +449,8 @@ mod tests {
                 progress: state.assembly.progress(),
                 total_bytes: state.spec.total_bytes,
                 downloaded_bytes: 0,
+                optional_recovery_bytes: 0,
+                optional_recovery_downloaded_bytes: 0,
                 failed_bytes: 0,
                 health: 1000,
                 password: state.spec.password.clone(),
