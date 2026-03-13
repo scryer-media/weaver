@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_graphql::Data;
 use async_graphql_axum::{GraphQLProtocol, GraphQLRequest, GraphQLResponse, GraphQLWebSocket};
@@ -362,7 +363,34 @@ async fn metrics_handler(Extension(handle): Extension<SchedulerHandle>) -> impl 
     )
 }
 
-async fn static_handler(uri: Uri) -> impl IntoResponse {
+/// Rewrite `index.html` to inject the base URL for reverse proxy support.
+///
+/// When `base_url` is non-empty (e.g. "/weaver"), this:
+/// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
+/// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
+fn rewrite_index_html(raw: &[u8], base_url: &str) -> Vec<u8> {
+    if base_url.is_empty() {
+        return raw.to_vec();
+    }
+    let html = String::from_utf8_lossy(raw);
+    let html = html.replace(
+        "<base href=\"/\" />",
+        &format!("<base href=\"{base_url}/\" />"),
+    );
+    let html = html.replace(
+        "</head>",
+        &format!(
+            "<script>window.__WEAVER_BASE__={}</script>\n  </head>",
+            serde_json::to_string(base_url).unwrap_or_default()
+        ),
+    );
+    html.into_bytes()
+}
+
+async fn static_handler(
+    uri: Uri,
+    Extension(base_url): Extension<Arc<String>>,
+) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
     // Try the exact path first, then fall back to index.html for SPA routing.
@@ -376,10 +404,11 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             .into_response()
     } else if let Some(index) = FrontendAssets::get("index.html") {
         let mime = mime_guess::from_path("index.html").first_or_octet_stream();
+        let body = rewrite_index_html(&index.data, &base_url);
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-            index.data,
+            body,
         )
             .into_response()
     } else {
@@ -393,8 +422,11 @@ pub async fn run_server(
     db: Database,
     backup: BackupService,
     addr: SocketAddr,
+    base_url: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = Router::new()
+    let base_url_ext = Arc::new(base_url.clone());
+
+    let inner = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/graphql/ws", get(ws_handler))
@@ -407,6 +439,22 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
+        .layer(Extension(base_url_ext));
+
+    let app = if base_url.is_empty() {
+        inner
+    } else {
+        // Redirect bare path (e.g. /weaver) to trailing slash (e.g. /weaver/).
+        let redirect_target = format!("{base_url}/");
+        Router::new()
+            .route(
+                &base_url,
+                get(move || async move { axum::response::Redirect::permanent(&redirect_target) }),
+            )
+            .nest(&base_url, inner)
+    };
+
+    let app = app
         .layer(CompressionLayer::new().gzip(true).br(true).zstd(true))
         .layer(
             RequestDecompressionLayer::new()
@@ -416,7 +464,7 @@ pub async fn run_server(
         )
         .layer(CorsLayer::permissive());
 
-    info!(%addr, "starting HTTP server");
+    info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

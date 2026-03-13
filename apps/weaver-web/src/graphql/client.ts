@@ -5,7 +5,7 @@ import {
   createClient as createWSClient,
 } from "graphql-ws";
 
-const graphqlUrl = "/graphql";
+const graphqlUrl = "graphql";
 const WS_KEEP_ALIVE_MS = 10_000;
 const WS_PONG_TIMEOUT_MS = 5_000;
 const CLIENT_RESTART_THROTTLE_MS = 2_000;
@@ -129,10 +129,11 @@ function clearPongTimeout(transportId?: number) {
   pongTimeoutId = null;
 }
 
-// Resolve WebSocket URL from the current page location.
+// Resolve WebSocket URL from the document base URI (respects <base href>).
 function wsUrl(): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}${graphqlUrl}/ws`;
+  const resolved = new URL("graphql/ws", document.baseURI);
+  resolved.protocol = resolved.protocol === "https:" ? "wss:" : "ws:";
+  return resolved.href;
 }
 
 function createGraphqlClientResources(): GraphqlClientResources {

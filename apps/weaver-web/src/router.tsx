@@ -13,6 +13,8 @@ import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
 import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
 
+const basename = window.__WEAVER_BASE__ || "/";
+
 export const router = createBrowserRouter([
   {
     element: <Layout />,
@@ -39,4 +41,4 @@ export const router = createBrowserRouter([
       },
     ],
   },
-]);
+], { basename });

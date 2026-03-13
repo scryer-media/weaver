@@ -58,10 +58,14 @@ function buildManualPwaPlugin(): Plugin {
 const CACHE_PREFIX = ${JSON.stringify(PWA_CACHE_PREFIX)};
 const PRECACHE_URLS = ${JSON.stringify(precacheUrls, null, 2)};
 const STATIC_ASSET_RE = /\\.(?:js|css|woff2?|png|webp|svg|ico)$/i;
-const BYPASS_PREFIXES = ["/graphql", "/metrics"];
+const BYPASS_SUFFIXES = ["/graphql", "/metrics"];
 
 function isSameOrigin(url) {
   return url.origin === self.location.origin;
+}
+
+function getBasePath() {
+  return new URL(self.registration.scope).pathname;
 }
 
 function shouldBypass(request) {
@@ -72,7 +76,11 @@ function shouldBypass(request) {
   if (!isSameOrigin(url)) {
     return true;
   }
-  return BYPASS_PREFIXES.some((prefix) => url.pathname.startsWith(prefix));
+  const base = getBasePath();
+  const localPath = url.pathname.startsWith(base)
+    ? "/" + url.pathname.slice(base.length)
+    : url.pathname;
+  return BYPASS_SUFFIXES.some((suffix) => localPath.startsWith(suffix));
 }
 
 async function deleteOldCaches() {
@@ -168,6 +176,7 @@ self.addEventListener("fetch", (event) => {
 }
 
 export default defineConfig({
+  base: "./",
   plugins: [react(), buildManualPwaPlugin()],
   build: {
     rollupOptions: {

@@ -61,6 +61,10 @@ enum Command {
         /// Port to listen on (default: 9090).
         #[arg(short, long, default_value = "9090")]
         port: u16,
+
+        /// Base URL path for reverse proxy hosting (e.g. "/weaver").
+        #[arg(long, default_value = "/")]
+        base_url: String,
     },
 }
 
@@ -118,8 +122,15 @@ async fn async_main() {
                 std::process::exit(1);
             }
         }
-        Command::Serve { port } => {
-            if let Err(e) = run_server_command(config, db, port).await {
+        Command::Serve { port, base_url } => {
+            // Normalize: ensure leading slash, strip trailing slashes.
+            let base_url = format!("/{}", base_url.trim_matches('/'));
+            let base_url = if base_url == "/" {
+                String::new()
+            } else {
+                base_url
+            };
+            if let Err(e) = run_server_command(config, db, port, &base_url).await {
                 error!("server failed: {e}");
                 std::process::exit(1);
             }
@@ -354,6 +365,7 @@ async fn run_server_command(
     mut config: Config,
     db: Database,
     port: u16,
+    base_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
@@ -672,6 +684,7 @@ async fn run_server_command(
         db.clone(),
         backup,
         addr,
+        base_url.to_owned(),
     ));
 
     tokio::select! {
