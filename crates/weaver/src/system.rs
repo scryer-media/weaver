@@ -69,15 +69,15 @@ fn detect_physical_cores() -> Option<usize> {
         let mut current_core = String::new();
 
         for line in contents.lines() {
-            if let Some(val) = line.strip_prefix("physical id") {
-                if let Some(v) = val.split(':').nth(1) {
-                    current_physical = v.trim().to_string();
-                }
+            if let Some(val) = line.strip_prefix("physical id")
+                && let Some(v) = val.split(':').nth(1)
+            {
+                current_physical = v.trim().to_string();
             }
-            if let Some(val) = line.strip_prefix("core id") {
-                if let Some(v) = val.split(':').nth(1) {
-                    current_core = v.trim().to_string();
-                }
+            if let Some(val) = line.strip_prefix("core id")
+                && let Some(v) = val.split(':').nth(1)
+            {
+                current_core = v.trim().to_string();
             }
             if line.trim().is_empty() && !current_physical.is_empty() {
                 core_ids.insert(format!("{current_physical}:{current_core}"));
@@ -514,13 +514,12 @@ fn linux_storage_class(path: &Path) -> StorageClass {
 #[cfg(target_os = "linux")]
 fn strip_partition_suffix(dev: &str) -> &str {
     // NVMe: nvme0n1p1 -> nvme0n1
-    if let Some(idx) = dev.rfind('p') {
-        if dev[..idx].ends_with(|c: char| c.is_ascii_digit())
-            && dev[idx + 1..].chars().all(|c| c.is_ascii_digit())
-            && !dev[idx + 1..].is_empty()
-        {
-            return &dev[..idx];
-        }
+    if let Some(idx) = dev.rfind('p')
+        && dev[..idx].ends_with(|c: char| c.is_ascii_digit())
+        && dev[idx + 1..].chars().all(|c| c.is_ascii_digit())
+        && !dev[idx + 1..].is_empty()
+    {
+        return &dev[..idx];
     }
 
     // Traditional: sda1 -> sda, vda2 -> vda

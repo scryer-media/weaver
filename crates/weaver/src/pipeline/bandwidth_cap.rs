@@ -46,16 +46,28 @@ impl BandwidthCapRuntime {
             .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes))
     }
 
+    /// Default policy used solely for computing a display window when no
+    /// real policy is configured.  Monthly from day 1 at midnight matches
+    /// the frontend form defaults.
+    fn default_display_policy() -> IspBandwidthCapConfig {
+        IspBandwidthCapConfig {
+            enabled: false,
+            period: IspBandwidthCapPeriod::Monthly,
+            limit_bytes: 0,
+            reset_time_minutes_local: 0,
+            weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
+            monthly_reset_day: 1,
+        }
+    }
+
     pub(super) fn update_for_now(
         &mut self,
         db: &weaver_state::Database,
     ) -> Result<(), weaver_state::StateError> {
-        let Some(policy) = self.policy.as_ref() else {
-            self.window = None;
-            self.used_bytes = 0;
-            self.reserved_bytes = 0;
-            return Ok(());
-        };
+        // Always compute a window so the UI can show real usage even before
+        // the user configures a cap.  Fall back to a default monthly window.
+        let default_policy = Self::default_display_policy();
+        let policy = self.policy.as_ref().unwrap_or(&default_policy);
 
         let now = Local::now();
         let next_window = compute_window(now, policy);

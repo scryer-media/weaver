@@ -84,7 +84,7 @@ function timeInputToMinutes(raw: string) {
 
 export function GeneralSettingsPage() {
   const t = useTranslate();
-  const [{ data }] = useQuery<{ settings: GeneralSettings; downloadBlock: DownloadBlock }>({
+  const [{ data }, reexecuteQuery] = useQuery<{ settings: GeneralSettings; downloadBlock: DownloadBlock }>({
     query: SETTINGS_QUERY,
   });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
@@ -136,10 +136,11 @@ export function GeneralSettingsPage() {
     if (updateState.data?.updateSettings) {
       setSettings(updateState.data.updateSettings);
       setSettingsSaved(true);
+      reexecuteQuery({ requestPolicy: "network-only" });
       const timeout = window.setTimeout(() => setSettingsSaved(false), 2000);
       return () => window.clearTimeout(timeout);
     }
-  }, [updateState.data]);
+  }, [updateState.data, reexecuteQuery]);
 
   const persistSettings = async () => {
     await updateSettings({
@@ -367,7 +368,9 @@ export function GeneralSettingsPage() {
                   {t("settings.bandwidthCapRemaining")}
                 </div>
                 <div className="mt-1 text-base font-semibold text-foreground">
-                  {formatBytes(downloadBlock?.remainingBytes ?? 0)}
+                  {downloadBlock?.capEnabled
+                    ? formatBytes(downloadBlock?.remainingBytes ?? 0)
+                    : "\u2014"}
                 </div>
               </div>
               <div>
@@ -375,7 +378,9 @@ export function GeneralSettingsPage() {
                   {t("settings.bandwidthCapLimit")}
                 </div>
                 <div className="mt-1 text-base font-semibold text-foreground">
-                  {formatBytes(downloadBlock?.limitBytes ?? 0)}
+                  {downloadBlock?.capEnabled
+                    ? formatBytes(downloadBlock?.limitBytes ?? 0)
+                    : "\u2014"}
                 </div>
               </div>
               <div>
@@ -391,14 +396,16 @@ export function GeneralSettingsPage() {
               <div
                 className="h-full bg-primary transition-all"
                 style={{
-                  width: `${Math.min(
-                    100,
-                    Math.max(
-                      0,
-                      ((downloadBlock?.usedBytes ?? 0) / Math.max(downloadBlock?.limitBytes ?? 1, 1))
-                        * 100,
-                    ),
-                  )}%`,
+                  width: downloadBlock?.capEnabled
+                    ? `${Math.min(
+                        100,
+                        Math.max(
+                          0,
+                          ((downloadBlock?.usedBytes ?? 0) / Math.max(downloadBlock?.limitBytes ?? 1, 1))
+                            * 100,
+                        ),
+                      )}%`
+                    : "0%",
                 }}
               />
             </div>

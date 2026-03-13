@@ -1022,6 +1022,7 @@ pub(super) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) 
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(path_cstr.as_ptr(), &mut stat) == 0 {
+            #[allow(clippy::unnecessary_cast)]
             let available = stat.f_bavail as u64 * stat.f_frsize as u64;
             if available < needed_bytes {
                 let avail_mb = available / (1024 * 1024);
