@@ -104,8 +104,12 @@ impl NntpCodec {
             let line_bytes = src.split_to(pos);
             // Skip the line terminator (\r\n or \n)
             src.advance(term_len);
-            // Convert to string — treat as lossy UTF-8 per plan (some servers send non-UTF-8)
-            let line = String::from_utf8_lossy(&line_bytes).into_owned();
+            // Fast path: try valid UTF-8 first (>99% of NNTP is ASCII).
+            // from_utf8 takes ownership of the Vec on success — no extra copy.
+            let line = match String::from_utf8(line_bytes.to_vec()) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
             Ok(Some(NntpFrame::Line(line)))
         } else {
             // Not enough data yet

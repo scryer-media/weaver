@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+
 use crate::checksum::{self, SliceChecksumState};
 use crate::par2_set::Par2FileSet;
 use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
@@ -227,7 +229,7 @@ pub fn verify_slices(
     let file_data = access.read_file(file_id).ok()?;
 
     let results: Vec<bool> = checksums
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, expected)| {
             let offset = i as u64 * slice_size;

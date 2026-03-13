@@ -62,7 +62,10 @@ impl Database {
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
-             PRAGMA auto_vacuum=INCREMENTAL;",
+             PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA cache_size=-32000;
+             PRAGMA mmap_size=67108864;
+             PRAGMA temp_store=MEMORY;",
         )
         .map_err(|e| StateError::Database(e.to_string()))?;
 

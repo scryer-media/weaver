@@ -57,27 +57,31 @@ impl Window {
             });
         }
 
-        // Source position in the ring buffer.
         let mut src = if distance <= self.pos {
             self.pos - distance
         } else {
             dict_size - (distance - self.pos)
         };
+        let mut dst = self.pos;
+        let mut remaining = length;
 
-        for _ in 0..length {
-            let b = self.buf[src];
-            self.buf[self.pos] = b;
+        while remaining > 0 {
+            // Contiguous bytes available before src or dst wraps.
+            let src_contig = dict_size - src;
+            let dst_contig = dict_size - dst;
+            // For overlapping copies (distance < length), limit chunk size to
+            // the gap between src and dst so that copy_within (memmove) produces
+            // the correct byte-replication pattern.
+            let gap = if src < dst { dst - src } else { dict_size - src + dst };
+            let chunk = remaining.min(src_contig).min(dst_contig).min(gap);
 
-            src += 1;
-            if src >= dict_size {
-                src = 0;
-            }
-            self.pos += 1;
-            if self.pos >= dict_size {
-                self.pos = 0;
-            }
+            self.buf.copy_within(src..src + chunk, dst);
+            src = (src + chunk) % dict_size;
+            dst = (dst + chunk) % dict_size;
+            remaining -= chunk;
         }
 
+        self.pos = dst;
         self.total_written += length as u64;
         Ok(())
     }
@@ -120,9 +124,6 @@ impl Window {
         let dict_size = self.buf.len();
         let mut result = Vec::with_capacity(len);
 
-        // Calculate the ring buffer position for start_total.
-        // The current position corresponds to total_written.
-        // start_total corresponds to a position `total_written - start_total` bytes back.
         let distance = (self.total_written - start_total) as usize;
         let mut idx = if distance <= self.pos {
             self.pos - distance
@@ -130,12 +131,12 @@ impl Window {
             dict_size - (distance - self.pos)
         };
 
-        for _ in 0..len {
-            result.push(self.buf[idx]);
-            idx += 1;
-            if idx >= dict_size {
-                idx = 0;
-            }
+        let mut remaining = len;
+        while remaining > 0 {
+            let contig = (dict_size - idx).min(remaining);
+            result.extend_from_slice(&self.buf[idx..idx + contig]);
+            idx = (idx + contig) % dict_size;
+            remaining -= contig;
         }
 
         result

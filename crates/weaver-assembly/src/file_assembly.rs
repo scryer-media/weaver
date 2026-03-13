@@ -12,6 +12,8 @@ pub struct FileAssembly {
     total_segments: u32,
     total_bytes: u64,
     segment_sizes: Vec<u32>,
+    /// Cumulative byte offsets: cumulative_offsets[i] = sum of segment_sizes[0..i].
+    cumulative_offsets: Vec<u64>,
 
     /// Bitset tracking which segments (0-indexed) have been received.
     received: BitVec,
@@ -40,12 +42,21 @@ impl FileAssembly {
         let total_segments = segment_sizes.len() as u32;
         let total_bytes = segment_sizes.iter().map(|&s| s as u64).sum();
 
+        let mut cumulative_offsets = Vec::with_capacity(total_segments as usize + 1);
+        cumulative_offsets.push(0);
+        let mut acc = 0u64;
+        for &size in &segment_sizes {
+            acc += size as u64;
+            cumulative_offsets.push(acc);
+        }
+
         Self {
             file_id,
             filename,
             role,
             total_segments,
             total_bytes,
+            cumulative_offsets,
             received: bitvec![0; total_segments as usize],
             received_bytes: 0,
             segment_sizes,
@@ -119,10 +130,7 @@ impl FileAssembly {
     /// The byte offset within the target file where a given segment's data should be written.
     /// Segments are sequential: segment 0 starts at offset 0, segment 1 at segment_sizes[0], etc.
     pub fn segment_offset(&self, segment_number: u32) -> u64 {
-        self.segment_sizes[..segment_number as usize]
-            .iter()
-            .map(|&s| s as u64)
-            .sum()
+        self.cumulative_offsets[segment_number as usize]
     }
 
     /// Total expected bytes for the file.
