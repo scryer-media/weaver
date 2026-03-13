@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
-import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { useMutation, useQuery } from "urql";
+import { authHeaders } from "@/graphql/client";
 import {
   API_KEYS_QUERY,
   CREATE_API_KEY_MUTATION,
@@ -115,7 +115,9 @@ export function BackupRestoreSection({
   const loadStatus = async () => {
     setStatusLoading(true);
     try {
-      const response = await fetch("/admin/backup/status");
+      const response = await fetch("/admin/backup/status", {
+        headers: authHeaders(),
+      });
       const payload = (await readJsonOrThrow(response)) as BackupStatusResponse;
       setStatus(payload);
     } catch (error) {
@@ -133,7 +135,7 @@ export function BackupRestoreSection({
     try {
       const response = await fetch("/admin/backup/export", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           password: backupPassword.trim() ? backupPassword.trim() : null,
         }),
@@ -174,6 +176,7 @@ export function BackupRestoreSection({
       }
       const response = await fetch("/admin/backup/inspect", {
         method: "POST",
+        headers: authHeaders(),
         body: form,
       });
       const payload = (await readJsonOrThrow(response)) as BackupInspectResult;
@@ -225,6 +228,7 @@ export function BackupRestoreSection({
 
       const response = await fetch("/admin/backup/restore", {
         method: "POST",
+        headers: authHeaders(),
         body: form,
       });
       const payload = (await readJsonOrThrow(response)) as { history_jobs: number };
@@ -489,9 +493,6 @@ export function BackupRestoreSection({
 
 export function ApiKeysSection() {
   const t = useTranslate();
-  const navigate = useNavigate();
-  const location = useLocation();
-  const [searchParams] = useSearchParams();
   const [{ data }] = useQuery({ query: API_KEYS_QUERY });
   const [, createApiKey] = useMutation(CREATE_API_KEY_MUTATION);
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
@@ -509,7 +510,6 @@ export function ApiKeysSection() {
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [copiedRawKey, setCopiedRawKey] = useState(false);
-  const [copiedDeepLink, setCopiedDeepLink] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [keys, setKeys] = useState<
     {
@@ -521,7 +521,6 @@ export function ApiKeysSection() {
     }[]
   >([]);
   const keyFieldRef = useRef<HTMLInputElement | null>(null);
-  const autoCreateRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (data?.apiKeys) {
@@ -537,16 +536,6 @@ export function ApiKeysSection() {
     });
     return () => window.cancelAnimationFrame(handle);
   }, [createdKey, createdKeyOpen]);
-
-  const deepLinkName = newKeyName.trim() || t("settings.apiKeyDeepLinkDefaultName");
-  const deepLinkUrl = useMemo(() => {
-    if (typeof window === "undefined") return "";
-    const url = new URL("/settings/security", window.location.origin);
-    url.searchParams.set("createApiKey", "1");
-    url.searchParams.set("name", deepLinkName);
-    url.searchParams.set("scope", newKeyScope.toLowerCase());
-    return url.toString();
-  }, [deepLinkName, newKeyScope]);
 
   const createKey = async (
     name: string,
@@ -578,27 +567,6 @@ export function ApiKeysSection() {
     setCreateBusy(false);
   };
 
-  useEffect(() => {
-    if (searchParams.get("createApiKey") !== "1") {
-      autoCreateRef.current = null;
-      return;
-    }
-    const signature = searchParams.toString();
-    if (autoCreateRef.current === signature) return;
-    autoCreateRef.current = signature;
-    const name = searchParams.get("name")?.trim() || deepLinkName;
-    const scope = normalizeApiKeyScope(searchParams.get("scope"));
-    void navigate(
-      {
-        pathname: location.pathname,
-        search: "",
-        hash: location.hash,
-      },
-      { replace: true },
-    );
-    void createKey(name, scope);
-  }, [deepLinkName, location.hash, location.pathname, navigate, searchParams]);
-
   const handleCreate = async () => {
     await createKey(newKeyName.trim(), newKeyScope);
   };
@@ -609,13 +577,6 @@ export function ApiKeysSection() {
       setCopiedRawKey(true);
       window.setTimeout(() => setCopiedRawKey(false), 2000);
     }
-  };
-
-  const handleCopyDeepLink = () => {
-    if (!deepLinkUrl) return;
-    void navigator.clipboard.writeText(deepLinkUrl);
-    setCopiedDeepLink(true);
-    window.setTimeout(() => setCopiedDeepLink(false), 2000);
   };
 
   const handleKeyFieldFocus = () => {
@@ -728,31 +689,6 @@ export function ApiKeysSection() {
           </Button>
         </div>
 
-        <div className="rounded-xl border border-border/70 bg-muted/20 p-3">
-          <Label className="mb-2">{t("settings.apiKeyDeepLink")}</Label>
-          <div className="mb-2 text-xs text-muted-foreground">
-            {t("settings.apiKeyDeepLinkDesc")}
-          </div>
-          <div className="flex items-center gap-2">
-            <Input
-              readOnly
-              value={deepLinkUrl}
-              onFocus={(event) => event.currentTarget.select()}
-              className="font-mono text-xs"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              onClick={handleCopyDeepLink}
-              aria-label={t("settings.apiKeyCopyDeepLink")}
-              title={t("settings.apiKeyCopyDeepLink")}
-            >
-              {copiedDeepLink ? <CheckIcon className="size-4" /> : <CopyIcon className="size-4" />}
-            </Button>
-          </div>
-        </div>
-
         {createError ? (
           <p className="text-sm text-destructive">{createError}</p>
         ) : null}
@@ -816,10 +752,6 @@ export function ApiKeysSection() {
       </CardContent>
     </Card>
   );
-}
-
-function normalizeApiKeyScope(value: string | null): "INTEGRATION" | "ADMIN" {
-  return value?.toLowerCase() === "admin" ? "ADMIN" : "INTEGRATION";
 }
 
 async function readJsonOrThrow(response: Response) {

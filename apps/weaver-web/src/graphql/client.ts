@@ -6,6 +6,8 @@ import {
 } from "graphql-ws";
 
 const graphqlUrl = "graphql";
+const sessionToken: string | undefined = (window as unknown as Record<string, unknown>)
+  .__WEAVER_SESSION__ as string | undefined;
 const WS_KEEP_ALIVE_MS = 10_000;
 const WS_PONG_TIMEOUT_MS = 5_000;
 const CLIENT_RESTART_THROTTLE_MS = 2_000;
@@ -147,6 +149,9 @@ function createGraphqlClientResources(): GraphqlClientResources {
       url: graphqlUrl,
       preferGetMethod: false,
       requestPolicy: "network-only",
+      fetchOptions: sessionToken
+        ? { headers: { "x-api-key": sessionToken } }
+        : undefined,
       exchanges: [
         subscriptionExchange({
           forwardSubscription(request) {
@@ -168,6 +173,7 @@ function createGraphqlClientResources(): GraphqlClientResources {
 function createTrackedWsClient(transportId: number): GraphqlWsClient {
   const wsClient = createWSClient({
     url: wsUrl(),
+    connectionParams: sessionToken ? { api_key: sessionToken } : undefined,
     keepAlive: WS_KEEP_ALIVE_MS,
     // Keep the socket alive briefly across React StrictMode unmount/remount
     // cycles so subscriptions don't get killed and re-created.
@@ -272,6 +278,11 @@ export function useGraphqlConnectionState(): GraphqlConnectionSnapshot {
 
 export function useGraphqlClient(): Client {
   return useSyncExternalStore(subscribeToGraphqlClient, getGraphqlClient, getGraphqlClient);
+}
+
+/** Headers that authenticate requests to the Weaver API. */
+export function authHeaders(): Record<string, string> {
+  return sessionToken ? { "x-api-key": sessionToken } : {};
 }
 
 export function requestGraphqlClientRestart() {

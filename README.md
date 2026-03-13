@@ -122,18 +122,20 @@ Weaver models each download as a **job graph** — a directed acyclic graph wher
 
 The scheduler continuously evaluates what work can proceed, balancing disk I/O, network throughput, CPU usage, and memory across all active jobs.
 
-## Feature Comparison
+## Comparison
 
-| Feature | Weaver | NZBGet | SABnzbd |
-|---------|:------:|:------:|:-------:|
-| Single binary (no external tools) | Yes | No | No |
+| | Weaver | NZBGet | SABnzbd |
+|---|---|---|---|
+| Language | Rust | C++ | Python |
+| Runtime | Native binary | Native binary | Python interpreter + dependencies |
+| Idle memory | ~24 MB | ~8 MB | ~68 MB |
+| External tools required | None | `unrar`, `par2` | `unrar`, `par2` |
+| PAR2 repair | Built-in | External `par2` | External `par2` |
+| RAR extraction | Built-in (RAR4 + RAR5) | External `unrar` | External `unrar` |
 | Streaming extraction | Yes | No | No |
-| Built-in PAR2 repair | Yes | No (external `par2`) | No (external `par2`) |
-| Built-in RAR extraction | Yes | No (external `unrar`) | No (external `unrar`) |
-| Web interface | Yes | Yes | Yes |
-| Real-time updates (WebSocket) | Yes | Yes | Polling |
-| GraphQL API | Yes | No (XML-RPC / JSON-RPC) | No (REST) |
-| Multi-server support | Yes | Yes | Yes |
+| API type | GraphQL | XML-RPC / JSON-RPC | REST |
+| Real-time updates | WebSocket | WebSocket | Polling |
+| Multi-server | Yes | Yes | Yes |
 | RSS automation | Yes | Yes | Yes |
 | Categories | Yes | Yes | Yes |
 | ISP bandwidth caps | Yes | No | No |
@@ -142,9 +144,6 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | API authentication | Yes | Yes | Yes |
 | Backup & restore | Yes | No | No |
 | Docker multi-arch | Yes | Yes | Yes |
-| Written in | Rust | C++ | Python |
-| RAR5 support | Yes | Via `unrar` | Via `unrar` |
-| Encrypted archives | Yes | Via `unrar` | Via `unrar` |
 | Obfuscation handling | Planned | Yes | Yes |
 
 > **Note:** NZBGet has been discontinued by its original author. [NZBGet v24+](https://github.com/nzbgetcom/nzbget) is maintained by the community. SABnzbd is actively maintained.

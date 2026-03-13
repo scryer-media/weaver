@@ -1,7 +1,9 @@
 import { defineConfig, type Plugin, type ResolvedConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { compression } from "vite-plugin-compression2";
 import path from "path";
 
+const BACKEND_ORIGIN = "http://localhost:6789";
 const PWA_CACHE_PREFIX = "weaver-shell";
 const PUBLIC_PWA_ASSETS = [
   "/manifest.webmanifest",
@@ -12,7 +14,6 @@ const PUBLIC_PWA_ASSETS = [
   "/apple-touch-icon.png",
   "/app-icon-dark-192.png",
   "/app-icon-dark-512.png",
-  "/weaver-mark.png",
 ];
 
 function buildManualPwaPlugin(): Plugin {
@@ -42,7 +43,8 @@ function buildManualPwaPlugin(): Plugin {
           return normalize(`/${entry.fileName}`);
         })
         .filter((entry): entry is string => entry !== null)
-        .filter((entry) => !entry.endsWith("/sw.js"));
+        .filter((entry) => !entry.endsWith("/sw.js"))
+        .filter((entry) => !entry.endsWith(".gz"));
 
       const precacheUrls = Array.from(
         new Set([
@@ -175,9 +177,48 @@ self.addEventListener("fetch", (event) => {
   };
 }
 
+/**
+ * Dev-only plugin: fetches the backend's index.html at startup to extract
+ * the ephemeral session token, then injects it into Vite's dev HTML.
+ */
+function buildDevSessionPlugin(): Plugin {
+  let sessionScript = "";
+
+  return {
+    name: "weaver-dev-session",
+    apply: "serve",
+    async configureServer() {
+      try {
+        const response = await fetch(BACKEND_ORIGIN);
+        const html = await response.text();
+        const match = /window\.__WEAVER_SESSION__\s*=\s*"([^"]+)"/.exec(html);
+        if (match?.[1]) {
+          sessionScript = `<script>window.__WEAVER_SESSION__=${JSON.stringify(match[1])}</script>`;
+        }
+      } catch {
+        // Backend not running — session token will be undefined; API calls
+        // will 401 but the dev server still starts.
+      }
+    },
+    transformIndexHtml(html) {
+      if (!sessionScript) return html;
+      return html.replace("</head>", `${sessionScript}\n  </head>`);
+    },
+  };
+}
+
 export default defineConfig({
   base: "./",
-  plugins: [react(), buildManualPwaPlugin()],
+  plugins: [
+    react(),
+    compression({
+      include: /\.(js|css|svg|webmanifest|json)$/i,
+      exclude: /sw\.js$/,
+      algorithms: ["gzip"],
+    }),
+    buildManualPwaPlugin(),
+    buildDevSessionPlugin(),
+  ],
   build: {
     rollupOptions: {
       output: {
@@ -227,8 +268,11 @@ export default defineConfig({
   server: {
     proxy: {
       "/graphql": {
-        target: "http://localhost:6789",
+        target: BACKEND_ORIGIN,
         ws: true,
+      },
+      "/admin": {
+        target: BACKEND_ORIGIN,
       },
     },
   },

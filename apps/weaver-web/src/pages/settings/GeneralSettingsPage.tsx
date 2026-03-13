@@ -1,5 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
+import { FolderOpen } from "lucide-react";
+import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -105,6 +107,8 @@ export function GeneralSettingsPage() {
   >("MON");
   const [capMonthlyResetDay, setCapMonthlyResetDay] = useState(1);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [browserTarget, setBrowserTarget] = useState<"intermediate" | "complete" | null>(null);
+  const [browsePath, setBrowsePath] = useState<string | null>(null);
 
   useEffect(() => {
     if (data?.settings) {
@@ -438,18 +442,44 @@ export function GeneralSettingsPage() {
                 staticValue={settings.dataDir}
               />
               <SettingField label={t("settings.intermediateDir")} description={t("settings.intermediateDirDesc")}>
-                <Input
-                  value={intermediateDir}
-                  onChange={(event) => setIntermediateDir(event.target.value)}
-                  placeholder={`${settings.dataDir}/intermediate`}
-                />
+                <div className="flex gap-2">
+                  <Input
+                    value={intermediateDir}
+                    onChange={(event) => setIntermediateDir(event.target.value)}
+                    placeholder={`${settings.dataDir}/intermediate`}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setBrowsePath(intermediateDir.trim() || null);
+                      setBrowserTarget("intermediate");
+                    }}
+                  >
+                    <FolderOpen className="size-4" />
+                    {t("categories.browse")}
+                  </Button>
+                </div>
               </SettingField>
               <SettingField label={t("settings.completeDir")} description={t("settings.completeDirDesc")}>
-                <Input
-                  value={completeDir}
-                  onChange={(event) => setCompleteDir(event.target.value)}
-                  placeholder={`${settings.dataDir}/complete`}
-                />
+                <div className="flex gap-2">
+                  <Input
+                    value={completeDir}
+                    onChange={(event) => setCompleteDir(event.target.value)}
+                    placeholder={`${settings.dataDir}/complete`}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setBrowsePath(completeDir.trim() || null);
+                      setBrowserTarget("complete");
+                    }}
+                  >
+                    <FolderOpen className="size-4" />
+                    {t("categories.browse")}
+                  </Button>
+                </div>
               </SettingField>
               <SettingField label={t("settings.maxRetries")} description={t("settings.maxRetriesDesc")}>
                 <Input
@@ -485,6 +515,18 @@ export function GeneralSettingsPage() {
                 </span>
               ) : null}
             </div>
+
+            <DirectoryBrowserDialog
+              open={browserTarget != null}
+              path={browsePath}
+              onPathChange={setBrowsePath}
+              onClose={() => setBrowserTarget(null)}
+              onChoose={(nextPath) => {
+                if (browserTarget === "intermediate") setIntermediateDir(nextPath);
+                else if (browserTarget === "complete") setCompleteDir(nextPath);
+                setBrowserTarget(null);
+              }}
+            />
           </CardContent>
         </Card>
       ) : null}
