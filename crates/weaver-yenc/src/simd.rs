@@ -78,41 +78,43 @@ unsafe fn decode_normal_run_sse2(
     let mut src = start;
     let mut dst = dst_start;
 
-    let special_eq = _mm_set1_epi8(b'=' as i8);
-    let special_cr = _mm_set1_epi8(b'\r' as i8);
-    let special_lf = _mm_set1_epi8(b'\n' as i8);
-    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+    unsafe {
+        let special_eq = _mm_set1_epi8(b'=' as i8);
+        let special_cr = _mm_set1_epi8(b'\r' as i8);
+        let special_lf = _mm_set1_epi8(b'\n' as i8);
+        let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
 
-    // Process 16 bytes at a time.
-    while src + 16 <= input.len() && dst + 16 <= output.len() {
-        let chunk = _mm_loadu_si128(input.as_ptr().add(src) as *const __m128i);
+        // Process 16 bytes at a time.
+        while src + 16 <= input.len() && dst + 16 <= output.len() {
+            let chunk = _mm_loadu_si128(input.as_ptr().add(src) as *const __m128i);
 
-        // Check for special characters.
-        let eq_mask = _mm_cmpeq_epi8(chunk, special_eq);
-        let cr_mask = _mm_cmpeq_epi8(chunk, special_cr);
-        let lf_mask = _mm_cmpeq_epi8(chunk, special_lf);
-        let any_special = _mm_or_si128(_mm_or_si128(eq_mask, cr_mask), lf_mask);
+            // Check for special characters.
+            let eq_mask = _mm_cmpeq_epi8(chunk, special_eq);
+            let cr_mask = _mm_cmpeq_epi8(chunk, special_cr);
+            let lf_mask = _mm_cmpeq_epi8(chunk, special_lf);
+            let any_special = _mm_or_si128(_mm_or_si128(eq_mask, cr_mask), lf_mask);
 
-        let mask = _mm_movemask_epi8(any_special);
-        if mask != 0 {
-            // Found a special character. Decode the clean prefix before it.
-            let count = mask.trailing_zeros() as usize;
-            if count > 0 {
-                let decoded = _mm_add_epi8(chunk, sub42);
-                let mut tmp = [0u8; 16];
-                _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, decoded);
-                output[dst..dst + count].copy_from_slice(&tmp[..count]);
-                src += count;
-                dst += count;
+            let mask = _mm_movemask_epi8(any_special);
+            if mask != 0 {
+                // Found a special character. Decode the clean prefix before it.
+                let count = mask.trailing_zeros() as usize;
+                if count > 0 {
+                    let decoded = _mm_add_epi8(chunk, sub42);
+                    let mut tmp = [0u8; 16];
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, decoded);
+                    output[dst..dst + count].copy_from_slice(&tmp[..count]);
+                    src += count;
+                    dst += count;
+                }
+                break;
             }
-            break;
-        }
 
-        // All 16 bytes are normal -- subtract 42 and store.
-        let decoded = _mm_add_epi8(chunk, sub42);
-        _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, decoded);
-        src += 16;
-        dst += 16;
+            // All 16 bytes are normal -- subtract 42 and store.
+            let decoded = _mm_add_epi8(chunk, sub42);
+            _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, decoded);
+            src += 16;
+            dst += 16;
+        }
     }
 
     // Handle remaining bytes with scalar.
@@ -134,37 +136,39 @@ unsafe fn decode_normal_run_avx2(
     let mut src = start;
     let mut dst = dst_start;
 
-    let special_eq = _mm256_set1_epi8(b'=' as i8);
-    let special_cr = _mm256_set1_epi8(b'\r' as i8);
-    let special_lf = _mm256_set1_epi8(b'\n' as i8);
-    let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+    unsafe {
+        let special_eq = _mm256_set1_epi8(b'=' as i8);
+        let special_cr = _mm256_set1_epi8(b'\r' as i8);
+        let special_lf = _mm256_set1_epi8(b'\n' as i8);
+        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
 
-    while src + 32 <= input.len() && dst + 32 <= output.len() {
-        let chunk = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
+        while src + 32 <= input.len() && dst + 32 <= output.len() {
+            let chunk = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
 
-        let eq_mask = _mm256_cmpeq_epi8(chunk, special_eq);
-        let cr_mask = _mm256_cmpeq_epi8(chunk, special_cr);
-        let lf_mask = _mm256_cmpeq_epi8(chunk, special_lf);
-        let any_special = _mm256_or_si256(_mm256_or_si256(eq_mask, cr_mask), lf_mask);
+            let eq_mask = _mm256_cmpeq_epi8(chunk, special_eq);
+            let cr_mask = _mm256_cmpeq_epi8(chunk, special_cr);
+            let lf_mask = _mm256_cmpeq_epi8(chunk, special_lf);
+            let any_special = _mm256_or_si256(_mm256_or_si256(eq_mask, cr_mask), lf_mask);
 
-        let mask = _mm256_movemask_epi8(any_special);
-        if mask != 0 {
-            let count = mask.trailing_zeros() as usize;
-            if count > 0 {
-                let decoded = _mm256_add_epi8(chunk, sub42);
-                let mut tmp = [0u8; 32];
-                _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, decoded);
-                output[dst..dst + count].copy_from_slice(&tmp[..count]);
-                src += count;
-                dst += count;
+            let mask = _mm256_movemask_epi8(any_special);
+            if mask != 0 {
+                let count = mask.trailing_zeros() as usize;
+                if count > 0 {
+                    let decoded = _mm256_add_epi8(chunk, sub42);
+                    let mut tmp = [0u8; 32];
+                    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, decoded);
+                    output[dst..dst + count].copy_from_slice(&tmp[..count]);
+                    src += count;
+                    dst += count;
+                }
+                break;
             }
-            break;
-        }
 
-        let decoded = _mm256_add_epi8(chunk, sub42);
-        _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, decoded);
-        src += 32;
-        dst += 32;
+            let decoded = _mm256_add_epi8(chunk, sub42);
+            _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, decoded);
+            src += 32;
+            dst += 32;
+        }
     }
 
     // Tail: fall through to SSE2 for remaining bytes.
