@@ -222,6 +222,15 @@ impl Pipeline {
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             state.download_queue.push(work);
                         }
+                        // Remaining bytes are non-zero but too small for any
+                        // segment — force the UI to show the cap as the blocker.
+                        if self.bandwidth_cap.cap_enabled() {
+                            use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
+                            self.shared_state.set_download_block(DownloadBlockState {
+                                kind: DownloadBlockKind::IspCap,
+                                ..self.bandwidth_cap.to_download_block_state(self.global_paused)
+                            });
+                        }
                         break;
                     }
                     Err(error) => {

@@ -895,7 +895,17 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            if state.assembly.complete_data_file_count() < state.assembly.data_file_count() {
+            let total = state.assembly.data_file_count();
+            let complete = state.assembly.complete_data_file_count();
+            if complete < total {
+                return;
+            }
+            // If no data files registered yet but there are still segments queued,
+            // downloads haven't really started — don't prematurely leave Downloading.
+            if total == 0
+                && state.status == JobStatus::Downloading
+                && (!state.download_queue.is_empty() || !state.recovery_queue.is_empty())
+            {
                 return;
             }
         }
