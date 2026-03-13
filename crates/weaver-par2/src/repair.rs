@@ -236,7 +236,6 @@ pub fn xor_out_slice(
         slice_size.is_multiple_of(2),
         "PAR2 slice_size must be a multiple of 2"
     );
-    let word_count = slice_size / 2;
 
     // Pad input data to slice_size if needed.
     let padded;
@@ -253,22 +252,16 @@ pub fn xor_out_slice(
 
     let constant = plan.constants[global_idx];
 
-    for (r, &exp) in plan.recovery_exponents.iter().enumerate() {
-        let factor = gf::pow(constant, exp);
-        if factor == 0 {
-            continue;
-        }
-        let recovery = &mut recovery_buffers[r];
-        for w in 0..word_count {
-            let input_word = u16::from_le_bytes([data[w * 2], data[w * 2 + 1]]);
-            let contribution = gf::mul(input_word, factor);
-            let rec_word = u16::from_le_bytes([recovery[w * 2], recovery[w * 2 + 1]]);
-            let adjusted = gf::add(rec_word, contribution);
-            let bytes = adjusted.to_le_bytes();
-            recovery[w * 2] = bytes[0];
-            recovery[w * 2 + 1] = bytes[1];
-        }
-    }
+    // Parallelize across recovery buffers — each (factor, buffer) pair is independent.
+    recovery_buffers
+        .par_iter_mut()
+        .zip(plan.recovery_exponents.par_iter())
+        .for_each(|(recovery, &exp)| {
+            let factor = gf::pow(constant, exp);
+            if factor != 0 {
+                crate::gf_simd::mul_acc_region(factor, data, &mut recovery[..slice_size]);
+            }
+        });
 }
 
 /// Multiply adjusted recovery data by the decode matrix and write repaired slices.
@@ -328,25 +321,24 @@ pub fn reconstruct_and_write(
         .map(|&chunk_start| {
             let chunk_end = (chunk_start + chunk_size).min(word_count);
             let chunk_len = chunk_end - chunk_start;
+            let byte_start = chunk_start * 2;
+            let byte_len = chunk_len * 2;
 
-            let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; chunk_len * 2]; n];
+            let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; byte_len]; n];
 
-            for w_offset in 0..chunk_len {
-                let w = chunk_start + w_offset;
-                let adjusted_words: Vec<u16> = recovery_buffers
-                    .iter()
-                    .map(|rd| u16::from_le_bytes([rd[w * 2], rd[w * 2 + 1]]))
-                    .collect();
-
-                #[allow(clippy::needless_range_loop)]
-                for j in 0..n {
-                    let mut val = 0u16;
-                    for (r, &word) in adjusted_words.iter().enumerate() {
-                        val = gf::add(val, gf::mul(plan.decode_matrix[j][r], word));
+            // Per-coefficient region multiply: for each missing slice j and each
+            // recovery buffer r, accumulate decode_matrix[j][r] * recovery[r]
+            // into output[j]. This enables SIMD and improves cache access patterns.
+            for j in 0..n {
+                for (r, recovery) in recovery_buffers.iter().enumerate() {
+                    let factor = plan.decode_matrix[j][r];
+                    if factor != 0 {
+                        crate::gf_simd::mul_acc_region(
+                            factor,
+                            &recovery[byte_start..byte_start + byte_len],
+                            &mut chunk_output[j],
+                        );
                     }
-                    let bytes = val.to_le_bytes();
-                    chunk_output[j][w_offset * 2] = bytes[0];
-                    chunk_output[j][w_offset * 2 + 1] = bytes[1];
                 }
             }
 
