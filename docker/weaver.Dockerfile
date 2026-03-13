@@ -1,7 +1,7 @@
 FROM busybox:1.37 AS prep
 RUN mkdir -p /data && chown 65532:65532 /data
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 WORKDIR /app
 
