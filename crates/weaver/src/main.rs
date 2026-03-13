@@ -111,12 +111,45 @@ async fn async_main() {
         std::process::exit(1);
     }
 
+    // Preflight: ensure required directories exist and are writable.
+    let data_dir = PathBuf::from(&config.data_dir);
+    let intermediate_dir = PathBuf::from(config.intermediate_dir());
+    let complete_dir = PathBuf::from(config.complete_dir());
+
+    for (label, dir) in [
+        ("data_dir", &data_dir),
+        ("intermediate_dir", &intermediate_dir),
+        ("complete_dir", &complete_dir),
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            error!(
+                path = %dir.display(),
+                error = %e,
+                "cannot create {label} directory — check permissions and volume mounts",
+            );
+            std::process::exit(1);
+        }
+        // Verify we can actually write into the directory.
+        let probe = dir.join(".weaver-write-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+            }
+            Err(e) => {
+                error!(
+                    path = %dir.display(),
+                    error = %e,
+                    "{label} is not writable — check permissions and volume mounts",
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     match cli.command {
         Command::Download { nzb, output } => {
-            let data_dir = PathBuf::from(&config.data_dir);
             let intermediate_dir =
-                output.unwrap_or_else(|| PathBuf::from(config.intermediate_dir()));
-            let complete_dir = PathBuf::from(config.complete_dir());
+                output.unwrap_or(intermediate_dir);
             if let Err(e) = run_download(
                 &mut config,
                 &db,
@@ -212,7 +245,7 @@ async fn run_download(
     );
 
     // Detect system capabilities.
-    let profile = detect_system(intermediate_dir);
+    let profile = detect_system(data_dir);
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
@@ -381,7 +414,7 @@ async fn run_server_command(
     let complete_dir = PathBuf::from(config.complete_dir());
 
     // Detect system capabilities.
-    let profile = detect_system(&intermediate_dir);
+    let profile = detect_system(&data_dir);
     info!(
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,

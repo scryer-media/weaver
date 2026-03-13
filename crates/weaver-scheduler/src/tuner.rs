@@ -199,6 +199,18 @@ impl RuntimeTuner {
         }
     }
 
+    /// Update the connection limit (e.g. after adding/removing a server) and
+    /// recalculate `max_concurrent_downloads` so downloads can use the new capacity.
+    pub fn set_connection_limit(&mut self, total_connections: usize) {
+        self.total_connections = total_connections;
+        let limit = self.max_downloads_limit();
+        // Re-derive max_concurrent_downloads the same way as initial construction,
+        // so adding a server immediately makes those connections available.
+        self.current.max_concurrent_downloads = limit;
+        self.current.max_decode_queue = limit * 2;
+        self.current.max_write_queue = limit * 2;
+    }
+
     /// The system profile.
     pub fn profile(&self) -> &SystemProfile {
         &self.profile
@@ -519,5 +531,27 @@ mod tests {
         }
         // Should be PP-throttled, not increased.
         assert!(tuner.params().max_concurrent_downloads <= reduced);
+    }
+
+    #[test]
+    fn set_connection_limit_increases_capacity() {
+        // Start with 0 connections (no servers configured).
+        let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), 0);
+        assert_eq!(tuner.params().max_concurrent_downloads, 0);
+
+        // Add a server with 20 connections.
+        tuner.set_connection_limit(20);
+        assert_eq!(tuner.params().max_concurrent_downloads, 20); // SSD uses all
+        assert_eq!(tuner.params().max_decode_queue, 40);
+    }
+
+    #[test]
+    fn set_connection_limit_decreases_capacity() {
+        let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), 20);
+        assert_eq!(tuner.params().max_concurrent_downloads, 20);
+
+        // Remove a server, now only 5 connections.
+        tuner.set_connection_limit(5);
+        assert_eq!(tuner.params().max_concurrent_downloads, 5);
     }
 }

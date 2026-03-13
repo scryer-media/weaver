@@ -68,7 +68,8 @@ npm run build 2>&1 | tail -3
 
 echo "==> Building release..."
 cd "$PROJ_DIR"
-cargo build --release -p weaver 2>&1 | tail -5
+CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    cargo build --release -p weaver 2>&1 | tail -5
 
 echo "==> Starting weaver (RUST_LOG=$RUST_LOG, logging to $LOG_FILE)..."
 RUST_LOG="$RUST_LOG" "$BINARY" serve >>"$LOG_FILE" 2>&1 &

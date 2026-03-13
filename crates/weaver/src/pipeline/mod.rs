@@ -698,8 +698,10 @@ impl Pipeline {
                 if let Ok(new_client) = client.downcast::<NntpClient>() {
                     self.nntp = Arc::new(*new_client);
                     self.connection_ramp = total_connections.min(5);
+                    self.tuner.set_connection_limit(total_connections);
                     info!(
                         total_connections,
+                        max_downloads = self.tuner.params().max_concurrent_downloads,
                         "NNTP client rebuilt with new server config"
                     );
                 }

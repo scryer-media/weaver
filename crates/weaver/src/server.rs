@@ -18,7 +18,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
-use weaver_api::auth::{CallerScope, hash_api_key};
+use weaver_api::auth::{CallerScope, generate_api_key, hash_api_key};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
 use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_scheduler::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
@@ -28,15 +28,25 @@ use weaver_state::Database;
 #[folder = "../../apps/weaver-web/dist/"]
 struct FrontendAssets;
 
+#[derive(Clone)]
+struct BaseUrl(Arc<String>);
+
+#[derive(Clone)]
+struct SessionToken(Arc<String>);
+
 /// Resolve the caller scope from an optional API key header.
 async fn resolve_scope(
     db: &Database,
+    session_token: &str,
     api_key_header: Option<&axum::http::HeaderValue>,
 ) -> Result<CallerScope, StatusCode> {
     let Some(hdr) = api_key_header else {
-        return Ok(CallerScope::Local);
+        return Err(StatusCode::UNAUTHORIZED);
     };
     let raw_key = hdr.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if raw_key == session_token {
+        return Ok(CallerScope::Local);
+    }
     let key_hash = hash_api_key(raw_key);
     let db = db.clone();
     let db2 = db.clone();
@@ -67,10 +77,11 @@ async fn resolve_scope(
 async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(db): Extension<Database>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
-    let scope = resolve_scope(&db, headers.get("x-api-key")).await?;
+    let scope = resolve_scope(&db, &session_token, headers.get("x-api-key")).await?;
     let mut request = req.into_inner();
     request = request.data(scope);
     Ok(schema.execute(request).await.into())
@@ -83,9 +94,10 @@ struct BackupExportRequest {
 
 async fn require_admin(
     db: &Database,
+    session_token: &str,
     api_key_header: Option<&axum::http::HeaderValue>,
 ) -> Result<(), StatusCode> {
-    let scope = resolve_scope(db, api_key_header).await?;
+    let scope = resolve_scope(db, session_token, api_key_header).await?;
     if scope.is_admin() {
         Ok(())
     } else {
@@ -96,9 +108,10 @@ async fn require_admin(
 async fn backup_status_handler(
     Extension(db): Extension<Database>,
     Extension(backup): Extension<BackupService>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
 ) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(&db, headers.get("x-api-key")).await?;
+    require_admin(&db, &session_token, headers.get("x-api-key")).await?;
     let status = backup
         .status()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -108,10 +121,11 @@ async fn backup_status_handler(
 async fn backup_export_handler(
     Extension(db): Extension<Database>,
     Extension(backup): Extension<BackupService>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = require_admin(&db, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
         return status.into_response();
     }
     match backup.create_backup(body.password).await {
@@ -133,10 +147,11 @@ async fn backup_export_handler(
 async fn backup_inspect_handler(
     Extension(db): Extension<Database>,
     Extension(backup): Extension<BackupService>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -154,10 +169,11 @@ async fn backup_inspect_handler(
 async fn backup_restore_handler(
     Extension(db): Extension<Database>,
     Extension(backup): Extension<BackupService>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -299,48 +315,46 @@ fn internal_upload_err(e: impl std::fmt::Display) -> (StatusCode, String) {
 async fn ws_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(db): Extension<Database>,
-    headers: HeaderMap,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
     protocol: GraphQLProtocol,
     ws: WebSocketUpgrade,
-) -> Result<impl IntoResponse, StatusCode> {
-    // Check X-Api-Key header on the WS upgrade request.
-    let scope = resolve_scope(&db, headers.get("x-api-key")).await?;
-
-    let mut data = Data::default();
-    data.insert(scope);
-
-    let resp = ws
-        .protocols(["graphql-transport-ws", "graphql-ws"])
+) -> impl IntoResponse {
+    // Browsers cannot send custom HTTP headers on WebSocket upgrade requests,
+    // so we skip auth here and rely on `connection_init` payload instead.
+    ws.protocols(["graphql-transport-ws", "graphql-ws"])
         .on_upgrade(move |stream| {
             let ws = GraphQLWebSocket::new(stream, schema, protocol)
-                .with_data(data)
                 .on_connection_init(move |payload: serde_json::Value| async move {
-                    // Allow connection_init payload to carry an api_key too
-                    // for WS clients that can't set custom headers.
-                    if let Some(key) = payload.get("api_key").and_then(|v| v.as_str()) {
-                        let key_hash = hash_api_key(key);
-                        let row = db.lookup_api_key(&key_hash).map_err(|e| {
-                            async_graphql::Error::new(format!("auth lookup failed: {e}"))
-                        })?;
-                        match row {
-                            Some(row) => {
-                                let scope = match row.scope.as_str() {
-                                    "admin" => CallerScope::Admin,
-                                    _ => CallerScope::Integration,
-                                };
-                                let mut data = Data::default();
-                                data.insert(scope);
-                                Ok(data)
-                            }
-                            None => Err(async_graphql::Error::new("Invalid API key")),
+                    let Some(key) = payload.get("api_key").and_then(|v| v.as_str()) else {
+                        return Err(async_graphql::Error::new(
+                            "Missing api_key in connection_init",
+                        ));
+                    };
+                    // Check session token first.
+                    if key == session_token.as_str() {
+                        let mut data = Data::default();
+                        data.insert(CallerScope::Local);
+                        return Ok(data);
+                    }
+                    let key_hash = hash_api_key(key);
+                    let row = db.lookup_api_key(&key_hash).map_err(|e| {
+                        async_graphql::Error::new(format!("auth lookup failed: {e}"))
+                    })?;
+                    match row {
+                        Some(row) => {
+                            let scope = match row.scope.as_str() {
+                                "admin" => CallerScope::Admin,
+                                _ => CallerScope::Integration,
+                            };
+                            let mut data = Data::default();
+                            data.insert(scope);
+                            Ok(data)
                         }
-                    } else {
-                        Ok(Data::default())
+                        None => Err(async_graphql::Error::new("Invalid API key")),
                     }
                 });
             ws.serve()
-        });
-    Ok(resp)
+        })
 }
 
 async fn metrics_handler(Extension(handle): Extension<SchedulerHandle>) -> impl IntoResponse {
@@ -363,39 +377,74 @@ async fn metrics_handler(Extension(handle): Extension<SchedulerHandle>) -> impl 
     )
 }
 
-/// Rewrite `index.html` to inject the base URL for reverse proxy support.
+/// Rewrite `index.html` to inject the session token and (optionally) base URL.
 ///
-/// When `base_url` is non-empty (e.g. "/weaver"), this:
+/// Always injects `window.__WEAVER_SESSION__` so the frontend can authenticate.
+/// When `base_url` is non-empty (e.g. "/weaver"), also:
 /// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
 /// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
-fn rewrite_index_html(raw: &[u8], base_url: &str) -> Vec<u8> {
-    if base_url.is_empty() {
-        return raw.to_vec();
-    }
+fn rewrite_index_html(raw: &[u8], base_url: &str, session_token: &str) -> Vec<u8> {
     let html = String::from_utf8_lossy(raw);
-    let html = html.replace(
-        "<base href=\"/\" />",
-        &format!("<base href=\"{base_url}/\" />"),
-    );
+    let html = if base_url.is_empty() {
+        html.into_owned()
+    } else {
+        let html = html.replace(
+            "<base href=\"/\" />",
+            &format!("<base href=\"{base_url}/\" />"),
+        );
+        html.replace(
+            "</head>",
+            &format!(
+                "<script>window.__WEAVER_BASE__={}</script>\n  </head>",
+                serde_json::to_string(base_url).unwrap_or_default()
+            ),
+        )
+    };
     let html = html.replace(
         "</head>",
         &format!(
-            "<script>window.__WEAVER_BASE__={}</script>\n  </head>",
-            serde_json::to_string(base_url).unwrap_or_default()
+            "<script>window.__WEAVER_SESSION__={}</script>\n  </head>",
+            serde_json::to_string(session_token).unwrap_or_default()
         ),
     );
     html.into_bytes()
 }
 
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("gzip"))
+}
+
 async fn static_handler(
     uri: Uri,
-    Extension(base_url): Extension<Arc<String>>,
+    headers: HeaderMap,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+    Extension(SessionToken(session_token)): Extension<SessionToken>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
     // Try the exact path first, then fall back to index.html for SPA routing.
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+
+        // Serve pre-compressed .gz variant if client accepts gzip.
+        if accepts_gzip(&headers) {
+            let gz_path = format!("{path}.gz");
+            if let Some(gz_file) = FrontendAssets::get(&gz_path) {
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                        (header::CONTENT_ENCODING, "gzip".to_string()),
+                    ],
+                    gz_file.data,
+                )
+                    .into_response();
+            }
+        }
+
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime.as_ref().to_string())],
@@ -404,7 +453,7 @@ async fn static_handler(
             .into_response()
     } else if let Some(index) = FrontendAssets::get("index.html") {
         let mime = mime_guess::from_path("index.html").first_or_octet_stream();
-        let body = rewrite_index_html(&index.data, &base_url);
+        let body = rewrite_index_html(&index.data, &base_url, &session_token);
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, mime.as_ref().to_string())],
@@ -424,7 +473,8 @@ pub async fn run_server(
     addr: SocketAddr,
     base_url: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let base_url_ext = Arc::new(base_url.clone());
+    let base_url_ext = BaseUrl(Arc::new(base_url.clone()));
+    let session_token = SessionToken(Arc::new(generate_api_key()));
 
     let inner = Router::new()
         .route("/metrics", get(metrics_handler))
@@ -440,7 +490,8 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
-        .layer(Extension(base_url_ext));
+        .layer(Extension(base_url_ext))
+        .layer(Extension(session_token));
 
     let app = if base_url.is_empty() {
         inner
@@ -468,7 +519,9 @@ pub async fn run_server(
         .layer(CorsLayer::permissive());
 
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        format!("failed to bind to {addr}: {e} — is another process using this port?")
+    })?;
     axum::serve(listener, app).await?;
     Ok(())
 }
