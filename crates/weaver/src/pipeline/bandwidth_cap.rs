@@ -430,8 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn monthly_window_clamps_short_months() {
-        let now = local_datetime(2026, 2, 28, 12 * 60);
+    fn monthly_window_clamps_short_months_before_anchor() {
+        let now = local_datetime(2026, 2, 28, 7 * 60 + 30);
         let window = compute_window(now, &cap(IspBandwidthCapPeriod::Monthly));
         assert_eq!(
             window.starts_at.date_naive(),
@@ -440,6 +440,20 @@ mod tests {
         assert_eq!(
             window.ends_at.date_naive(),
             NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+    }
+
+    #[test]
+    fn monthly_window_rolls_forward_after_clamped_anchor() {
+        let now = local_datetime(2026, 2, 28, 12 * 60);
+        let window = compute_window(now, &cap(IspBandwidthCapPeriod::Monthly));
+        assert_eq!(
+            window.starts_at.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+        assert_eq!(
+            window.ends_at.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 31).unwrap()
         );
     }
 }

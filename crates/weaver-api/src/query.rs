@@ -269,8 +269,9 @@ impl QueryRoot {
 }
 
 fn browse_directories(path: &Path) -> Result<DirectoryBrowseResult> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| async_graphql::Error::new(format!("failed to read directory metadata: {e}")))?;
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        async_graphql::Error::new(format!("failed to read directory metadata: {e}"))
+    })?;
     if !metadata.is_dir() {
         return Err(async_graphql::Error::new("path is not a directory"));
     }
