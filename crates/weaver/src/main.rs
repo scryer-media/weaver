@@ -148,8 +148,7 @@ async fn async_main() {
 
     match cli.command {
         Command::Download { nzb, output } => {
-            let intermediate_dir =
-                output.unwrap_or(intermediate_dir);
+            let intermediate_dir = output.unwrap_or(intermediate_dir);
             if let Err(e) = run_download(
                 &mut config,
                 &db,

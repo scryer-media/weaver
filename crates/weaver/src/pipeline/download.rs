@@ -228,7 +228,9 @@ impl Pipeline {
                             use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
                             self.shared_state.set_download_block(DownloadBlockState {
                                 kind: DownloadBlockKind::IspCap,
-                                ..self.bandwidth_cap.to_download_block_state(self.global_paused)
+                                ..self
+                                    .bandwidth_cap
+                                    .to_download_block_state(self.global_paused)
                             });
                         }
                         break;

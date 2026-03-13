@@ -205,14 +205,8 @@ unsafe fn mul_acc_region_ssse3(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
             let p3_hi = _mm_shuffle_epi8(t7, hi_n1);
 
             // XOR contributions for result lo bytes and result hi bytes.
-            let result_lo = _mm_xor_si128(
-                _mm_xor_si128(p0_lo, p1_lo),
-                _mm_xor_si128(p2_lo, p3_lo),
-            );
-            let result_hi = _mm_xor_si128(
-                _mm_xor_si128(p0_hi, p1_hi),
-                _mm_xor_si128(p2_hi, p3_hi),
-            );
+            let result_lo = _mm_xor_si128(_mm_xor_si128(p0_lo, p1_lo), _mm_xor_si128(p2_lo, p3_lo));
+            let result_hi = _mm_xor_si128(_mm_xor_si128(p0_hi, p1_hi), _mm_xor_si128(p2_hi, p3_hi));
 
             // Reinterleave: [rlo0, rhi0, rlo1, rhi1, ..., rlo7, rhi7]
             let product = _mm_unpacklo_epi8(result_lo, result_hi);
@@ -252,35 +246,33 @@ unsafe fn mul_acc_region_avx2(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
 
         // Broadcast each 16-byte table into both 128-bit lanes.
         let t0 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[0].as_ptr() as *const __m128i,
+            tables.tables[0].as_ptr() as *const __m128i
         ));
         let t1 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[1].as_ptr() as *const __m128i,
+            tables.tables[1].as_ptr() as *const __m128i
         ));
         let t2 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[2].as_ptr() as *const __m128i,
+            tables.tables[2].as_ptr() as *const __m128i
         ));
         let t3 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[3].as_ptr() as *const __m128i,
+            tables.tables[3].as_ptr() as *const __m128i
         ));
         let t4 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[4].as_ptr() as *const __m128i,
+            tables.tables[4].as_ptr() as *const __m128i
         ));
         let t5 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[5].as_ptr() as *const __m128i,
+            tables.tables[5].as_ptr() as *const __m128i
         ));
         let t6 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[6].as_ptr() as *const __m128i,
+            tables.tables[6].as_ptr() as *const __m128i
         ));
         let t7 = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            tables.tables[7].as_ptr() as *const __m128i,
+            tables.tables[7].as_ptr() as *const __m128i
         ));
 
         // Deinterleave masks (same pattern in each 128-bit lane).
-        let deint_lo_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 

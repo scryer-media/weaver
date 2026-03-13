@@ -323,8 +323,8 @@ async fn ws_handler(
     // so we skip auth here and rely on `connection_init` payload instead.
     ws.protocols(["graphql-transport-ws", "graphql-ws"])
         .on_upgrade(move |stream| {
-            let ws = GraphQLWebSocket::new(stream, schema, protocol)
-                .on_connection_init(move |payload: serde_json::Value| async move {
+            let ws = GraphQLWebSocket::new(stream, schema, protocol).on_connection_init(
+                move |payload: serde_json::Value| async move {
                     let Some(key) = payload.get("api_key").and_then(|v| v.as_str()) else {
                         return Err(async_graphql::Error::new(
                             "Missing api_key in connection_init",
@@ -352,7 +352,8 @@ async fn ws_handler(
                         }
                         None => Err(async_graphql::Error::new("Invalid API key")),
                     }
-                });
+                },
+            );
             ws.serve()
         })
 }

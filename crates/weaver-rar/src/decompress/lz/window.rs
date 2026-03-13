@@ -72,7 +72,11 @@ impl Window {
             // For overlapping copies (distance < length), limit chunk size to
             // the gap between src and dst so that copy_within (memmove) produces
             // the correct byte-replication pattern.
-            let gap = if src < dst { dst - src } else { dict_size - src + dst };
+            let gap = if src < dst {
+                dst - src
+            } else {
+                dict_size - src + dst
+            };
             let chunk = remaining.min(src_contig).min(dst_contig).min(gap);
 
             self.buf.copy_within(src..src + chunk, dst);
