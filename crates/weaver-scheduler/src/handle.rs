@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use weaver_core::config::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
 use weaver_core::event::PipelineEvent;
 use weaver_core::id::{JobId, SegmentId};
 
@@ -22,6 +23,7 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<Vec<JobInfo>>>,
     paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
+    download_block: Arc<RwLock<DownloadBlockState>>,
 }
 
 impl SharedPipelineState {
@@ -30,6 +32,7 @@ impl SharedPipelineState {
             jobs: Arc::new(RwLock::new(initial_jobs)),
             paused: Arc::new(AtomicBool::new(false)),
             metrics,
+            download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
         }
     }
 
@@ -60,6 +63,10 @@ impl SharedPipelineState {
         &self.metrics
     }
 
+    pub fn download_block(&self) -> DownloadBlockState {
+        self.download_block.read().unwrap().clone()
+    }
+
     // --- Writer methods (called by pipeline loop only) ---
 
     pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
@@ -68,6 +75,48 @@ impl SharedPipelineState {
 
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn set_download_block(&self, state: DownloadBlockState) {
+        *self.download_block.write().unwrap() = state;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadBlockKind {
+    None,
+    ManualPause,
+    IspCap,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DownloadBlockState {
+    pub kind: DownloadBlockKind,
+    pub cap_enabled: bool,
+    pub period: Option<IspBandwidthCapPeriod>,
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub remaining_bytes: u64,
+    pub reserved_bytes: u64,
+    pub window_starts_at_epoch_ms: Option<f64>,
+    pub window_ends_at_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+
+impl Default for DownloadBlockState {
+    fn default() -> Self {
+        Self {
+            kind: DownloadBlockKind::None,
+            cap_enabled: false,
+            period: None,
+            used_bytes: 0,
+            limit_bytes: 0,
+            remaining_bytes: 0,
+            reserved_bytes: 0,
+            window_starts_at_epoch_ms: None,
+            window_ends_at_epoch_ms: None,
+            timezone_name: chrono::Local::now().offset().to_string(),
+        }
     }
 }
 
@@ -113,6 +162,11 @@ pub enum SchedulerCommand {
     SetSpeedLimit {
         bytes_per_sec: u64,
         reply: oneshot::Sender<()>,
+    },
+    /// Set or clear the ISP bandwidth cap policy.
+    SetBandwidthCapPolicy {
+        policy: Option<IspBandwidthCapConfig>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Replace the NNTP client at runtime (hot-reload after server config change).
     /// The client is boxed as `dyn Any` to avoid coupling weaver-scheduler to weaver-nntp.
@@ -321,6 +375,10 @@ impl SchedulerHandle {
         self.state.metrics_snapshot()
     }
 
+    pub fn get_download_block(&self) -> DownloadBlockState {
+        self.state.download_block()
+    }
+
     /// Pause all download dispatch globally.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -346,6 +404,18 @@ impl SchedulerHandle {
     /// Check whether the pipeline is globally paused (reads from shared state).
     pub fn is_globally_paused(&self) -> bool {
         self.state.is_paused()
+    }
+
+    pub async fn set_bandwidth_cap_policy(
+        &self,
+        policy: Option<IspBandwidthCapConfig>,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetBandwidthCapPolicy { policy, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     /// Set the global download speed limit. 0 means unlimited.
@@ -551,6 +621,9 @@ mod tests {
                     }
                     SchedulerCommand::SetSpeedLimit { reply, .. } => {
                         let _ = reply.send(());
+                    }
+                    SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
+                        let _ = reply.send(Ok(()));
                     }
                     SchedulerCommand::RebuildNntp { reply, .. } => {
                         let _ = reply.send(());

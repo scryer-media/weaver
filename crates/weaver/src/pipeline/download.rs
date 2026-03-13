@@ -1,6 +1,11 @@
 use super::*;
 
 impl Pipeline {
+    fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
+        let decoded = decoded_bytes as u64;
+        decoded.saturating_add(decoded / 16).saturating_add(1024)
+    }
+
     fn mark_download_pass_started(&mut self, job_id: JobId) {
         if self.active_download_passes.insert(job_id) {
             let _ = self
@@ -163,6 +168,14 @@ impl Pipeline {
         if self.global_paused || self.rate_limiter.should_wait() {
             return;
         }
+        if let Err(error) = self.refresh_bandwidth_cap_window() {
+            error!(error = %error, "failed to refresh ISP bandwidth cap state");
+            return;
+        }
+        if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
+            self.update_queue_metrics();
+            return;
+        }
 
         let params = self.tuner.params();
         let decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed);
@@ -195,12 +208,30 @@ impl Pipeline {
                 if self.rate_limiter.should_wait() {
                     break;
                 }
-                let Some(state) = self.jobs.get_mut(&job_id) else {
+                let Some(work) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.download_queue.pop())
+                else {
                     break;
                 };
-                let Some(work) = state.download_queue.pop() else {
-                    break;
-                };
+                let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
+                match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Some(state) = self.jobs.get_mut(&job_id) {
+                            state.download_queue.push(work);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        error!(error = %error, "failed to reserve ISP bandwidth for dispatch");
+                        if let Some(state) = self.jobs.get_mut(&job_id) {
+                            state.download_queue.push(work);
+                        }
+                        break;
+                    }
+                }
                 let estimate = work.byte_estimate as u64;
                 let is_recovery = work.is_recovery;
                 self.spawn_download(work, is_recovery);
@@ -279,6 +310,18 @@ impl Pipeline {
             if *in_flight == 0 {
                 self.active_downloads_by_job.remove(&job_id);
             }
+        }
+        if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
+            error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
+        }
+        if let Ok(raw) = &result.data
+            && let Err(error) = self.record_download_bandwidth_usage(raw.len() as u64)
+        {
+            error!(
+                error = %error,
+                segment = %result.segment_id,
+                "failed to record ISP bandwidth usage"
+            );
         }
         if self
             .jobs

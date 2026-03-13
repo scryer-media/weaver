@@ -53,6 +53,20 @@ pub struct ActivePar2File {
     pub promoted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveExtractionChunk {
+    pub job_id: JobId,
+    pub set_name: String,
+    pub member_name: String,
+    pub volume_index: u32,
+    pub bytes_written: u64,
+    pub temp_path: String,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
+pub type RarVolumeFactsBySet = HashMap<String, Vec<(u32, Vec<u8>)>>;
+
 fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
@@ -689,17 +703,7 @@ impl Database {
     // --- Extraction chunk tracking ---
 
     /// Record an extraction chunk (per-volume temp file).
-    pub fn insert_extraction_chunk(
-        &self,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-        volume_index: u32,
-        bytes_written: u64,
-        temp_path: &str,
-        start_offset: u64,
-        end_offset: u64,
-    ) -> Result<(), StateError> {
+    pub fn insert_extraction_chunk(&self, chunk: &ActiveExtractionChunk) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
             "INSERT OR REPLACE INTO active_extraction_chunks
@@ -707,14 +711,14 @@ impl Database {
               start_offset, end_offset)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
-                job_id.0 as i64,
-                set_name,
-                member_name,
-                volume_index,
-                bytes_written as i64,
-                temp_path,
-                start_offset as i64,
-                end_offset as i64,
+                chunk.job_id.0 as i64,
+                &chunk.set_name,
+                &chunk.member_name,
+                chunk.volume_index,
+                chunk.bytes_written as i64,
+                &chunk.temp_path,
+                chunk.start_offset as i64,
+                chunk.end_offset as i64,
             ],
         )
         .map_err(db_err)?;
@@ -953,7 +957,7 @@ impl Database {
     pub fn load_all_rar_volume_facts(
         &self,
         job_id: JobId,
-    ) -> Result<HashMap<String, Vec<(u32, Vec<u8>)>>, StateError> {
+    ) -> Result<RarVolumeFactsBySet, StateError> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
@@ -972,7 +976,7 @@ impl Database {
                 ))
             })
             .map_err(db_err)?;
-        let mut grouped: HashMap<String, Vec<(u32, Vec<u8>)>> = HashMap::new();
+        let mut grouped: RarVolumeFactsBySet = HashMap::new();
         for row in rows {
             let (set_name, volume_index, facts_blob) = row.map_err(db_err)?;
             grouped

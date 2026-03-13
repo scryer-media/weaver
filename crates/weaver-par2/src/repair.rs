@@ -533,7 +533,7 @@ mod tests {
         let num_slices = if file_length == 0 {
             0
         } else {
-            ((file_length + slice_size - 1) / slice_size) as usize
+            file_length.div_ceil(slice_size) as usize
         };
 
         let mut checksums = Vec::new();
@@ -631,8 +631,8 @@ mod tests {
 
         // Set up access with damaged data (corrupt slice 2).
         let mut damaged = file_data.clone();
-        for i in 128..192 {
-            damaged[i] ^= 0xFF;
+        for item in damaged.iter_mut().take(192).skip(128) {
+            *item ^= 0xFF;
         }
 
         let mut access = MemoryFileAccess::new();
@@ -667,11 +667,11 @@ mod tests {
 
         // Damage slices 0 and 3 (out of 4 total).
         let mut damaged = file_data.clone();
-        for i in 0..32 {
-            damaged[i] = 0;
+        for item in damaged.iter_mut().take(32) {
+            *item = 0;
         }
-        for i in 96..128 {
-            damaged[i] = 0;
+        for item in damaged.iter_mut().take(128).skip(96) {
+            *item = 0;
         }
 
         let mut access = MemoryFileAccess::new();
@@ -734,11 +734,11 @@ mod tests {
 
         // Damage 2 slices but only 1 recovery block.
         let mut damaged = file_data.clone();
-        for i in 0..64 {
-            damaged[i] = 0;
+        for item in damaged.iter_mut().take(64) {
+            *item = 0;
         }
-        for i in 64..128 {
-            damaged[i] = 0;
+        for item in damaged.iter_mut().take(128).skip(64) {
+            *item = 0;
         }
 
         let mut access = MemoryFileAccess::new();
@@ -759,8 +759,8 @@ mod tests {
 
         // Damage the last slice.
         let mut damaged = file_data.clone();
-        for i in 64..100 {
-            damaged[i] = 0;
+        for item in damaged.iter_mut().take(100).skip(64) {
+            *item = 0;
         }
 
         let mut access = MemoryFileAccess::new();

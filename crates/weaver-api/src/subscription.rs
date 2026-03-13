@@ -5,7 +5,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use weaver_scheduler::SchedulerHandle;
 
-use crate::types::{Job, Metrics, PipelineEventGql};
+use crate::types::{DownloadBlock, Job, Metrics, PipelineEventGql};
 
 /// Snapshot of all jobs + metrics, pushed over WebSocket.
 #[derive(Debug, Clone, SimpleObject)]
@@ -13,6 +13,7 @@ pub struct JobsSnapshot {
     pub jobs: Vec<Job>,
     pub metrics: Metrics,
     pub is_paused: bool,
+    pub download_block: DownloadBlock,
 }
 
 pub struct SubscriptionRoot;
@@ -55,11 +56,13 @@ impl SubscriptionRoot {
             let jobs = handle.list_jobs().iter().map(Job::from).collect();
             let metrics = Metrics::from(&handle.get_metrics());
             let is_paused = handle.is_globally_paused();
+            let download_block = DownloadBlock::from(&handle.get_download_block());
 
             JobsSnapshot {
                 jobs,
                 metrics,
                 is_paused,
+                download_block,
             }
         });
 

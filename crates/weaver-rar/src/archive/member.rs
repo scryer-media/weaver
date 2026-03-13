@@ -810,12 +810,14 @@ impl RarArchive {
             let (first_volume, boundaries) = Self::solid_volume_transitions(segments);
             self.run_solid_decoder_chunked(
                 compressed,
-                unpacked_size,
                 fh,
-                first_volume,
-                &boundaries,
+                SolidChunkDecodeConfig {
+                    unpacked_size,
+                    first_volume_index: first_volume,
+                    boundaries: &boundaries,
+                    verify_crc: options.verify && !skip_hash_verify,
+                },
                 writer_factory,
-                options.verify && !skip_hash_verify,
             )?
         };
 
@@ -872,16 +874,19 @@ impl RarArchive {
     pub(super) fn run_solid_decoder_chunked<F>(
         &mut self,
         compressed: &[u8],
-        unpacked_size: u64,
         fh: &FileHeader,
-        first_volume_index: usize,
-        boundaries: &[crate::decompress::VolumeTransition],
+        config: SolidChunkDecodeConfig<'_>,
         writer_factory: F,
-        verify_crc: bool,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
+        let SolidChunkDecodeConfig {
+            unpacked_size,
+            first_volume_index,
+            boundaries,
+            verify_crc,
+        } = config;
         let dict_size = fh.compression.dict_size;
         if dict_size > self.limits.max_dict_size {
             return Err(RarError::DictionaryTooLarge {
@@ -1734,19 +1739,18 @@ impl RarArchive {
         let final_skip_hash = final_meta.use_hash_mac;
         drop(final_meta);
 
-        if let Some(hasher_arc) = shared_hasher {
-            if !final_skip_hash {
-                if let Some(expected) = effective_crc {
-                    let h = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
-                    let actual = h.finalize();
-                    if actual != expected {
-                        return Err(RarError::DataCrcMismatch {
-                            member: fh.name.clone(),
-                            expected,
-                            actual,
-                        });
-                    }
-                }
+        if let Some(hasher_arc) = shared_hasher
+            && !final_skip_hash
+            && let Some(expected) = effective_crc
+        {
+            let h = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
+            let actual = h.finalize();
+            if actual != expected {
+                return Err(RarError::DataCrcMismatch {
+                    member: fh.name.clone(),
+                    expected,
+                    actual,
+                });
             }
         }
 
@@ -1989,7 +1993,7 @@ impl Read for ChainedSegmentReader<'_> {
 ///
 /// Used in the LZ extraction path: wraps the reader chain (ChainedSegmentReader
 /// + optional DecryptingReader), runs `read_to_end`, then provides the recorded
-/// transitions for splitting decompressed output at volume boundaries.
+///   transitions for splitting decompressed output at volume boundaries.
 pub struct VolumeTrackingReader<R: Read> {
     inner: R,
     volume_tracker: Arc<AtomicUsize>,
@@ -2032,4 +2036,11 @@ impl<R: Read> Read for VolumeTrackingReader<R> {
         }
         Ok(n)
     }
+}
+
+pub(super) struct SolidChunkDecodeConfig<'a> {
+    pub unpacked_size: u64,
+    pub first_volume_index: usize,
+    pub boundaries: &'a [crate::decompress::VolumeTransition],
+    pub verify_crc: bool,
 }

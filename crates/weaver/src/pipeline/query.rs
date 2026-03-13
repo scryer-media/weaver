@@ -151,18 +151,16 @@ impl Pipeline {
             return;
         }
 
-        match weaver_core::classify::FileRole::from_filename(yenc_name) {
-            weaver_core::classify::FileRole::Par2 {
-                is_index,
-                recovery_block_count,
-            } => {
-                let blocks = if is_index { 0 } else { recovery_block_count };
-                let runtime = self.ensure_par2_runtime(job_id);
-                let entry = runtime.files.entry(file_index).or_default();
-                entry.filename = yenc_name.to_string();
-                entry.recovery_blocks = blocks;
-            }
-            _ => {}
+        if let weaver_core::classify::FileRole::Par2 {
+            is_index,
+            recovery_block_count,
+        } = weaver_core::classify::FileRole::from_filename(yenc_name)
+        {
+            let blocks = if is_index { 0 } else { recovery_block_count };
+            let runtime = self.ensure_par2_runtime(job_id);
+            let entry = runtime.files.entry(file_index).or_default();
+            entry.filename = yenc_name.to_string();
+            entry.recovery_blocks = blocks;
         }
     }
 

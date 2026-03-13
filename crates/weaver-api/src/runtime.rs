@@ -122,6 +122,10 @@ pub async fn reload_runtime_from_db(
         .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
         .map_err(|e| e.to_string())?;
+    handle
+        .set_bandwidth_cap_policy(loaded.isp_bandwidth_cap.clone())
+        .await
+        .map_err(|e| e.to_string())?;
     if load_global_pause_from_db(db).await? {
         handle.pause_all().await.map_err(|e| e.to_string())?;
     } else {

@@ -39,6 +39,49 @@ impl Drop for ChunkFileWriter {
     }
 }
 
+struct FinalizeMemberContext<'a> {
+    db: &'a weaver_state::Database,
+    event_tx: &'a broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &'a str,
+    member_name: &'a str,
+    partial_path: &'a std::path::Path,
+    out_path: &'a std::path::Path,
+    chunk_dir: &'a std::path::Path,
+}
+
+pub(super) struct RarExtractionContext<'a> {
+    volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
+    db: &'a weaver_state::Database,
+    event_tx: &'a broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &'a str,
+    output_dir: &'a std::path::Path,
+    options: &'a weaver_rar::ExtractOptions,
+}
+
+impl<'a> RarExtractionContext<'a> {
+    pub(super) fn new(
+        volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
+        db: &'a weaver_state::Database,
+        event_tx: &'a broadcast::Sender<PipelineEvent>,
+        job_id: JobId,
+        set_name: &'a str,
+        output_dir: &'a std::path::Path,
+        options: &'a weaver_rar::ExtractOptions,
+    ) -> Self {
+        Self {
+            volume_paths,
+            db,
+            event_tx,
+            job_id,
+            set_name,
+            output_dir,
+            options,
+        }
+    }
+}
+
 impl Pipeline {
     fn rar_set_worker_limit(plan: &crate::pipeline::rar_state::RarDerivedPlan) -> usize {
         if plan.is_solid { 1 } else { 2 }
@@ -124,16 +167,19 @@ impl Pipeline {
     }
 
     fn finalize_member_output(
-        db: &weaver_state::Database,
-        event_tx: &broadcast::Sender<PipelineEvent>,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-        partial_path: &std::path::Path,
-        out_path: &std::path::Path,
-        chunk_dir: &std::path::Path,
+        ctx: FinalizeMemberContext<'_>,
         chunks: &[weaver_state::ExtractionChunk],
     ) -> Result<u64, String> {
+        let FinalizeMemberContext {
+            db,
+            event_tx,
+            job_id,
+            set_name,
+            member_name,
+            partial_path,
+            out_path,
+            chunk_dir,
+        } = ctx;
         let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendStarted {
             job_id,
             set_name: set_name.to_string(),
@@ -259,15 +305,18 @@ impl Pipeline {
 
     pub(super) fn extract_rar_member_to_output(
         archive: &mut weaver_rar::RarArchive,
-        volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
-        db: &weaver_state::Database,
-        event_tx: &broadcast::Sender<PipelineEvent>,
-        job_id: JobId,
-        set_name: &str,
-        output_dir: &std::path::Path,
+        ctx: RarExtractionContext<'_>,
         idx: usize,
-        options: &weaver_rar::ExtractOptions,
     ) -> Result<(String, u64, u64), String> {
+        let RarExtractionContext {
+            volume_paths,
+            db,
+            event_tx,
+            job_id,
+            set_name,
+            output_dir,
+            options,
+        } = ctx;
         let member = archive
             .member_info(idx)
             .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
@@ -414,14 +463,16 @@ impl Pipeline {
         }
 
         let bytes_written = match Self::finalize_member_output(
-            db,
-            event_tx,
-            job_id,
-            set_name,
-            &member_name,
-            &partial_path,
-            &out_path,
-            &chunk_dir,
+            FinalizeMemberContext {
+                db,
+                event_tx,
+                job_id,
+                set_name,
+                member_name: &member_name,
+                partial_path: &partial_path,
+                out_path: &out_path,
+                chunk_dir: &chunk_dir,
+            },
             &persisted_chunks,
         ) {
             Ok(bytes_written) => bytes_written,
@@ -660,14 +711,16 @@ impl Pipeline {
 
                             match Self::extract_rar_member_to_output(
                                 &mut archive,
-                                &volume_paths_map,
-                                &db,
-                                &event_tx,
-                                job_id,
-                                &set_name_for_task,
-                                &output_dir,
+                                RarExtractionContext {
+                                    volume_paths: &volume_paths_map,
+                                    db: &db,
+                                    event_tx: &event_tx,
+                                    job_id,
+                                    set_name: &set_name_for_task,
+                                    output_dir: &output_dir,
+                                    options: &options,
+                                },
                                 idx,
-                                &options,
                             ) {
                                 Ok((extracted_name, bytes_written, total_bytes)) => {
                                     let _ = event_tx.send(PipelineEvent::ExtractionProgress {

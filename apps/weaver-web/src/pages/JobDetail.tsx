@@ -329,7 +329,7 @@ export function JobDetail() {
           {events.length === 0 ? (
             <div className="px-6 pb-6 text-sm text-muted-foreground">{t("job.waitingForEvents")}</div>
           ) : (
-            <>
+            <div className="max-h-[150lh] overflow-y-auto">
               <div className="hidden sm:block">
                 <Table>
                   <TableHeader>
@@ -363,7 +363,7 @@ export function JobDetail() {
                   </div>
                 ))}
               </div>
-            </>
+            </div>
           )}
         </CardContent>
       </Card>

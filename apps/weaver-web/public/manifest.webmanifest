@@ -1,0 +1,23 @@
+{
+  "id": "/",
+  "name": "Weaver",
+  "short_name": "Weaver",
+  "description": "Queue control and download monitoring for Weaver.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#081224",
+  "theme_color": "#081224",
+  "icons": [
+    {
+      "src": "/app-icon-dark-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/app-icon-dark-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

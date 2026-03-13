@@ -532,14 +532,14 @@ mod tests {
         let mut lengths = [0u8; 256];
         // 128 symbols at length 8, 64 at length 9, 64 at length 10
         // All fit within QUICK_BITS (10), so no tree walk needed
-        for i in 0..128 {
-            lengths[i] = 8;
+        for item in lengths.iter_mut().take(128) {
+            *item = 8;
         }
-        for i in 128..192 {
-            lengths[i] = 9;
+        for item in lengths.iter_mut().take(192).skip(128) {
+            *item = 9;
         }
-        for i in 192..256 {
-            lengths[i] = 10;
+        for item in lengths.iter_mut().skip(192) {
+            *item = 10;
         }
 
         let table = HuffmanTable::build(&lengths).unwrap();

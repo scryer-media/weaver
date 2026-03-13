@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <style>
+    .dark {
+      display: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .light {
+        display: none;
+      }
+
+      .dark {
+        display: block;
+      }
+    }
+  </style>
+  <image class="light" href="app-icon-light-512.png" width="512" height="512" />
+  <image class="dark" href="app-icon-dark-512.png" width="512" height="512" />
+</svg>

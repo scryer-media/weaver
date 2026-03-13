@@ -5,6 +5,7 @@ import { useGraphqlClient } from "./graphql/client";
 import { router } from "./router";
 import { useLanguage } from "@/lib/hooks/use-language";
 import { TranslateContext } from "@/lib/context/translate-context";
+import { PwaProvider } from "@/lib/context/pwa-context";
 
 function AppProviders() {
   const { t } = useLanguage();
@@ -22,7 +23,9 @@ function AppProviders() {
 export function App() {
   return (
     <ThemeProvider attribute="class" defaultTheme="dark" enableSystem>
-      <AppProviders />
+      <PwaProvider>
+        <AppProviders />
+      </PwaProvider>
     </ThemeProvider>
   );
 }

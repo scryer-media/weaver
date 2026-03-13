@@ -19,6 +19,8 @@ use tracing::info;
 
 use weaver_api::auth::{CallerScope, hash_api_key};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
+use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
+use weaver_scheduler::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
 use weaver_state::Database;
 
 #[derive(Embed)]
@@ -340,6 +342,26 @@ async fn ws_handler(
     Ok(resp)
 }
 
+async fn metrics_handler(Extension(handle): Extension<SchedulerHandle>) -> impl IntoResponse {
+    let snapshot = handle.get_metrics();
+    let jobs = handle.list_jobs();
+    let download_block = handle.get_download_block();
+    let body = render_prometheus_metrics(
+        &snapshot,
+        &jobs,
+        handle.is_globally_paused(),
+        &download_block,
+    );
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8".to_string(),
+        )],
+        body,
+    )
+}
+
 async fn static_handler(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
@@ -367,11 +389,13 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
 pub async fn run_server(
     schema: WeaverSchema,
+    handle: SchedulerHandle,
     db: Database,
     backup: BackupService,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
+        .route("/metrics", get(metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/graphql/ws", get(ws_handler))
         .route("/admin/backup/status", get(backup_status_handler))
@@ -379,6 +403,7 @@ pub async fn run_server(
         .route("/admin/backup/inspect", post(backup_inspect_handler))
         .route("/admin/backup/restore", post(backup_restore_handler))
         .fallback(get(static_handler))
+        .layer(Extension(handle))
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
@@ -395,4 +420,599 @@ pub async fn run_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn render_prometheus_metrics(
+    snapshot: &MetricsSnapshot,
+    jobs: &[JobInfo],
+    pipeline_paused: bool,
+    download_block: &DownloadBlockState,
+) -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str("# HELP weaver_build_info Static build information.\n");
+    out.push_str("# TYPE weaver_build_info gauge\n");
+    append_labeled_metric(
+        &mut out,
+        "weaver_build_info",
+        &[("version", env!("CARGO_PKG_VERSION"))],
+        1,
+    );
+
+    out.push_str("# HELP weaver_pipeline_paused Whether the entire pipeline is globally paused.\n");
+    out.push_str("# TYPE weaver_pipeline_paused gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_paused",
+        if pipeline_paused { 1 } else { 0 },
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_gate Current global download gate by reason.\n");
+    out.push_str("# TYPE weaver_pipeline_download_gate gauge\n");
+    for reason in ["none", "manual_pause", "isp_cap"] {
+        let active = match (reason, download_block.kind) {
+            ("none", DownloadBlockKind::None) => 1,
+            ("manual_pause", DownloadBlockKind::ManualPause) => 1,
+            ("isp_cap", DownloadBlockKind::IspCap) => 1,
+            _ => 0,
+        };
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_gate",
+            &[("reason", reason)],
+            active,
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_bandwidth_cap_enabled Whether the ISP bandwidth cap policy is enabled.\n",
+    );
+    out.push_str("# TYPE weaver_bandwidth_cap_enabled gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_enabled",
+        if download_block.cap_enabled { 1 } else { 0 },
+    );
+
+    out.push_str(
+        "# HELP weaver_bandwidth_cap_used_bytes Current ISP bandwidth cap usage in bytes.\n",
+    );
+    out.push_str("# TYPE weaver_bandwidth_cap_used_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_used_bytes",
+        download_block.used_bytes,
+    );
+
+    out.push_str(
+        "# HELP weaver_bandwidth_cap_limit_bytes Configured ISP bandwidth cap limit in bytes.\n",
+    );
+    out.push_str("# TYPE weaver_bandwidth_cap_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_limit_bytes",
+        download_block.limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_bandwidth_cap_remaining_bytes Remaining ISP bandwidth cap bytes in the active window.\n");
+    out.push_str("# TYPE weaver_bandwidth_cap_remaining_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_remaining_bytes",
+        download_block.remaining_bytes,
+    );
+
+    out.push_str("# HELP weaver_bandwidth_cap_reserved_bytes Bytes conservatively reserved for in-flight downloads against the active cap window.\n");
+    out.push_str("# TYPE weaver_bandwidth_cap_reserved_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_reserved_bytes",
+        download_block.reserved_bytes,
+    );
+
+    out.push_str("# HELP weaver_bandwidth_cap_window_end_seconds Active ISP bandwidth cap window end as a unix timestamp.\n");
+    out.push_str("# TYPE weaver_bandwidth_cap_window_end_seconds gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_bandwidth_cap_window_end_seconds",
+        download_block
+            .window_ends_at_epoch_ms
+            .map(|value| (value / 1000.0) as u64)
+            .unwrap_or(0),
+    );
+
+    out.push_str("# HELP weaver_pipeline_jobs Number of active jobs by status.\n");
+    out.push_str("# TYPE weaver_pipeline_jobs gauge\n");
+    for status in all_job_statuses() {
+        let count = jobs
+            .iter()
+            .filter(|job| job_status_label(&job.status) == status)
+            .count();
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_jobs",
+            &[("status", status)],
+            count,
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_pipeline_bytes_downloaded_total Total bytes downloaded by the pipeline.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_bytes_downloaded_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_bytes_downloaded_total",
+        snapshot.bytes_downloaded,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_bytes_decoded_total Total bytes decoded by the pipeline.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_bytes_decoded_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_bytes_decoded_total",
+        snapshot.bytes_decoded,
+    );
+
+    out.push_str("# HELP weaver_pipeline_bytes_committed_total Total bytes committed to disk by the pipeline.\n");
+    out.push_str("# TYPE weaver_pipeline_bytes_committed_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_bytes_committed_total",
+        snapshot.bytes_committed,
+    );
+
+    out.push_str("# HELP weaver_pipeline_segments_downloaded_total Total segments downloaded.\n");
+    out.push_str("# TYPE weaver_pipeline_segments_downloaded_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_segments_downloaded_total",
+        snapshot.segments_downloaded,
+    );
+
+    out.push_str("# HELP weaver_pipeline_segments_decoded_total Total segments decoded.\n");
+    out.push_str("# TYPE weaver_pipeline_segments_decoded_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_segments_decoded_total",
+        snapshot.segments_decoded,
+    );
+
+    out.push_str("# HELP weaver_pipeline_segments_committed_total Total segments committed.\n");
+    out.push_str("# TYPE weaver_pipeline_segments_committed_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_segments_committed_total",
+        snapshot.segments_committed,
+    );
+
+    out.push_str("# HELP weaver_pipeline_segments_retried_total Total segments retried.\n");
+    out.push_str("# TYPE weaver_pipeline_segments_retried_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_segments_retried_total",
+        snapshot.segments_retried,
+    );
+
+    out.push_str("# HELP weaver_pipeline_segments_failed_permanent_total Total segments permanently failed.\n");
+    out.push_str("# TYPE weaver_pipeline_segments_failed_permanent_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_segments_failed_permanent_total",
+        snapshot.segments_failed_permanent,
+    );
+
+    out.push_str("# HELP weaver_pipeline_articles_not_found_total Total articles not found.\n");
+    out.push_str("# TYPE weaver_pipeline_articles_not_found_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_articles_not_found_total",
+        snapshot.articles_not_found,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_errors_total Total decode errors.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_errors_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_errors_total",
+        snapshot.decode_errors,
+    );
+
+    out.push_str("# HELP weaver_pipeline_crc_errors_total Total CRC errors.\n");
+    out.push_str("# TYPE weaver_pipeline_crc_errors_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_crc_errors_total",
+        snapshot.crc_errors,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_queue_depth Download queue depth.\n");
+    out.push_str("# TYPE weaver_pipeline_download_queue_depth gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_queue_depth",
+        snapshot.download_queue_depth,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_pending Decode pending queue depth.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_pending gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pending",
+        snapshot.decode_pending,
+    );
+
+    out.push_str("# HELP weaver_pipeline_commit_pending Commit pending queue depth.\n");
+    out.push_str("# TYPE weaver_pipeline_commit_pending gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_commit_pending",
+        snapshot.commit_pending,
+    );
+
+    out.push_str("# HELP weaver_pipeline_recovery_queue_depth Recovery queue depth.\n");
+    out.push_str("# TYPE weaver_pipeline_recovery_queue_depth gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_recovery_queue_depth",
+        snapshot.recovery_queue_depth,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_buffered_bytes Buffered write bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_write_buffered_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_buffered_bytes",
+        snapshot.write_buffered_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_buffered_segments Buffered write segments.\n");
+    out.push_str("# TYPE weaver_pipeline_write_buffered_segments gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_buffered_segments",
+        snapshot.write_buffered_segments,
+    );
+
+    out.push_str("# HELP weaver_pipeline_direct_write_evictions_total Direct write evictions.\n");
+    out.push_str("# TYPE weaver_pipeline_direct_write_evictions_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_direct_write_evictions_total",
+        snapshot.direct_write_evictions,
+    );
+
+    out.push_str("# HELP weaver_pipeline_verify_active Active verification workers.\n");
+    out.push_str("# TYPE weaver_pipeline_verify_active gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_verify_active",
+        snapshot.verify_active,
+    );
+
+    out.push_str("# HELP weaver_pipeline_repair_active Active repair workers.\n");
+    out.push_str("# TYPE weaver_pipeline_repair_active gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_repair_active",
+        snapshot.repair_active,
+    );
+
+    out.push_str("# HELP weaver_pipeline_extract_active Active extraction workers.\n");
+    out.push_str("# TYPE weaver_pipeline_extract_active gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_extract_active",
+        snapshot.extract_active,
+    );
+
+    out.push_str("# HELP weaver_pipeline_disk_write_latency_microseconds Disk write latency in microseconds.\n");
+    out.push_str("# TYPE weaver_pipeline_disk_write_latency_microseconds gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_disk_write_latency_microseconds",
+        snapshot.disk_write_latency_us,
+    );
+
+    out.push_str("# HELP weaver_pipeline_current_download_speed_bytes_per_second Current download speed in bytes per second.\n");
+    out.push_str("# TYPE weaver_pipeline_current_download_speed_bytes_per_second gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_current_download_speed_bytes_per_second",
+        snapshot.current_download_speed,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_articles_per_second Current effective article throughput.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_articles_per_second gauge\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_articles_per_second",
+        snapshot.articles_per_sec,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_rate_mebibytes_per_second Current decode throughput in MiB per second.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_rate_mebibytes_per_second gauge\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_decode_rate_mebibytes_per_second",
+        snapshot.decode_rate_mbps,
+    );
+
+    out.push_str("# HELP weaver_job_info Static information for active jobs.\n");
+    out.push_str("# TYPE weaver_job_info gauge\n");
+    out.push_str("# HELP weaver_job_progress_ratio Fractional job progress from 0 to 1.\n");
+    out.push_str("# TYPE weaver_job_progress_ratio gauge\n");
+    out.push_str("# HELP weaver_job_total_bytes Expected total bytes for the job.\n");
+    out.push_str("# TYPE weaver_job_total_bytes gauge\n");
+    out.push_str("# HELP weaver_job_downloaded_bytes Downloaded bytes for the job.\n");
+    out.push_str("# TYPE weaver_job_downloaded_bytes gauge\n");
+    out.push_str("# HELP weaver_job_optional_recovery_bytes Optional recovery bytes available for the job.\n");
+    out.push_str("# TYPE weaver_job_optional_recovery_bytes gauge\n");
+    out.push_str("# HELP weaver_job_optional_recovery_downloaded_bytes Optional recovery bytes downloaded for the job.\n");
+    out.push_str("# TYPE weaver_job_optional_recovery_downloaded_bytes gauge\n");
+    out.push_str("# HELP weaver_job_failed_bytes Permanently failed bytes for the job.\n");
+    out.push_str("# TYPE weaver_job_failed_bytes gauge\n");
+    out.push_str("# HELP weaver_job_health_per_mille Job health in per-mille.\n");
+    out.push_str("# TYPE weaver_job_health_per_mille gauge\n");
+    out.push_str("# HELP weaver_job_created_at_seconds Unix creation timestamp for the job.\n");
+    out.push_str("# TYPE weaver_job_created_at_seconds gauge\n");
+
+    for job in jobs {
+        append_job_metric(&mut out, "weaver_job_info", job, 1);
+        append_job_metric_f64(&mut out, "weaver_job_progress_ratio", job, job.progress);
+        append_job_metric(&mut out, "weaver_job_total_bytes", job, job.total_bytes);
+        append_job_metric(
+            &mut out,
+            "weaver_job_downloaded_bytes",
+            job,
+            job.downloaded_bytes,
+        );
+        append_job_metric(
+            &mut out,
+            "weaver_job_optional_recovery_bytes",
+            job,
+            job.optional_recovery_bytes,
+        );
+        append_job_metric(
+            &mut out,
+            "weaver_job_optional_recovery_downloaded_bytes",
+            job,
+            job.optional_recovery_downloaded_bytes,
+        );
+        append_job_metric(&mut out, "weaver_job_failed_bytes", job, job.failed_bytes);
+        append_job_metric(&mut out, "weaver_job_health_per_mille", job, job.health);
+        append_job_metric_f64(
+            &mut out,
+            "weaver_job_created_at_seconds",
+            job,
+            job.created_at_epoch_ms / 1000.0,
+        );
+    }
+
+    out
+}
+
+fn append_metric<T: std::fmt::Display>(out: &mut String, name: &str, value: T) {
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn append_metric_f64(out: &mut String, name: &str, value: f64) {
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&format_prometheus_f64(value));
+    out.push('\n');
+}
+
+fn append_labeled_metric<T: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    labels: &[(&str, &str)],
+    value: T,
+) {
+    out.push_str(name);
+    append_labels(out, labels);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn append_job_metric<T: std::fmt::Display>(out: &mut String, name: &str, job: &JobInfo, value: T) {
+    out.push_str(name);
+    append_job_labels(out, job);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn append_job_metric_f64(out: &mut String, name: &str, job: &JobInfo, value: f64) {
+    out.push_str(name);
+    append_job_labels(out, job);
+    out.push(' ');
+    out.push_str(&format_prometheus_f64(value));
+    out.push('\n');
+}
+
+fn append_labels(out: &mut String, labels: &[(&str, &str)]) {
+    if labels.is_empty() {
+        return;
+    }
+    out.push('{');
+    for (idx, (key, value)) in labels.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(key);
+        out.push_str("=\"");
+        out.push_str(&escape_prometheus_label_value(value));
+        out.push('"');
+    }
+    out.push('}');
+}
+
+fn append_job_labels(out: &mut String, job: &JobInfo) {
+    append_labels(
+        out,
+        &[
+            ("job_id", &job.job_id.0.to_string()),
+            ("job_name", &job.name),
+            ("status", job_status_label(&job.status)),
+            ("category", job.category.as_deref().unwrap_or("")),
+            (
+                "has_password",
+                if job.password.is_some() {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ],
+    );
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn format_prometheus_f64(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else if value.is_nan() {
+        "NaN".to_string()
+    } else if value.is_sign_negative() {
+        "-Inf".to_string()
+    } else {
+        "+Inf".to_string()
+    }
+}
+
+fn all_job_statuses() -> [&'static str; 9] {
+    [
+        "queued",
+        "downloading",
+        "checking",
+        "verifying",
+        "repairing",
+        "extracting",
+        "complete",
+        "failed",
+        "paused",
+    ]
+}
+
+fn job_status_label(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "queued",
+        JobStatus::Downloading => "downloading",
+        JobStatus::Checking => "checking",
+        JobStatus::Verifying => "verifying",
+        JobStatus::Repairing => "repairing",
+        JobStatus::Extracting => "extracting",
+        JobStatus::Complete => "complete",
+        JobStatus::Failed { .. } => "failed",
+        JobStatus::Paused => "paused",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaver_core::id::JobId;
+
+    #[test]
+    fn renders_prometheus_metrics_for_pipeline_and_jobs() {
+        let snapshot = MetricsSnapshot {
+            bytes_downloaded: 10,
+            bytes_decoded: 8,
+            bytes_committed: 7,
+            download_queue_depth: 5,
+            decode_pending: 4,
+            commit_pending: 3,
+            write_buffered_bytes: 2,
+            write_buffered_segments: 1,
+            direct_write_evictions: 9,
+            segments_downloaded: 11,
+            segments_decoded: 12,
+            segments_committed: 13,
+            articles_not_found: 14,
+            decode_errors: 15,
+            verify_active: 1,
+            repair_active: 0,
+            extract_active: 2,
+            disk_write_latency_us: 16,
+            segments_retried: 17,
+            segments_failed_permanent: 18,
+            current_download_speed: 19,
+            crc_errors: 20,
+            recovery_queue_depth: 21,
+            articles_per_sec: 22.5,
+            decode_rate_mbps: 23.5,
+        };
+        let jobs = vec![JobInfo {
+            job_id: JobId(42),
+            name: "Frieren".into(),
+            status: JobStatus::Downloading,
+            progress: 0.5,
+            total_bytes: 100,
+            downloaded_bytes: 50,
+            optional_recovery_bytes: 25,
+            optional_recovery_downloaded_bytes: 5,
+            failed_bytes: 2,
+            health: 999,
+            password: Some("secret".into()),
+            category: Some("tv".into()),
+            metadata: Vec::new(),
+            output_dir: None,
+            error: None,
+            created_at_epoch_ms: 1_700_000_000_000.0,
+        }];
+
+        let rendered = render_prometheus_metrics(
+            &snapshot,
+            &jobs,
+            true,
+            &DownloadBlockState {
+                kind: DownloadBlockKind::ManualPause,
+                cap_enabled: false,
+                period: None,
+                used_bytes: 0,
+                limit_bytes: 0,
+                remaining_bytes: 0,
+                reserved_bytes: 0,
+                window_starts_at_epoch_ms: None,
+                window_ends_at_epoch_ms: None,
+                timezone_name: "MDT".into(),
+            },
+        );
+
+        assert!(rendered.contains("weaver_pipeline_paused 1"));
+        assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
+        assert!(rendered.contains(
+            "weaver_job_info{job_id=\"42\",job_name=\"Frieren\",status=\"downloading\",category=\"tv\",has_password=\"true\"} 1"
+        ));
+        assert!(rendered.contains("weaver_job_progress_ratio{job_id=\"42\""));
+        assert!(rendered.contains("weaver_pipeline_jobs{status=\"downloading\"} 1"));
+    }
+
+    #[test]
+    fn escapes_prometheus_label_values() {
+        assert_eq!(
+            escape_prometheus_label_value("a\"b\\c\nd"),
+            "a\\\"b\\\\c\\nd"
+        );
+    }
 }

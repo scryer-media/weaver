@@ -666,7 +666,13 @@ async fn run_server_command(
 
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let server_task = tokio::spawn(server::run_server(schema, db.clone(), backup, addr));
+    let server_task = tokio::spawn(server::run_server(
+        schema,
+        handle.clone(),
+        db.clone(),
+        backup,
+        addr,
+    ));
 
     tokio::select! {
         _ = wait_for_shutdown() => {

@@ -105,6 +105,35 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxDownloadSpeed
     maxRetries
+    ispBandwidthCap {
+      ...IspBandwidthCapFields
+    }
+  }
+`;
+
+const ISP_BANDWIDTH_CAP_FIELDS = `
+  fragment IspBandwidthCapFields on IspBandwidthCapSettings {
+    enabled
+    period
+    limitBytes
+    resetTimeMinutesLocal
+    weeklyResetWeekday
+    monthlyResetDay
+  }
+`;
+
+const DOWNLOAD_BLOCK_FIELDS = `
+  fragment DownloadBlockFields on DownloadBlock {
+    kind
+    capEnabled
+    period
+    usedBytes
+    limitBytes
+    remainingBytes
+    reservedBytes
+    windowStartsAtEpochMs
+    windowEndsAtEpochMs
+    timezoneName
   }
 `;
 
@@ -259,9 +288,13 @@ export const JOBS_PAGE_QUERY = gql`
       currentDownloadSpeed
     }
     isPaused
+    downloadBlock {
+      ...DownloadBlockFields
+    }
   }
   ${PARSED_RELEASE_FIELDS}
   ${JOB_LIST_ITEM_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const JOB_QUERY = gql`
@@ -300,8 +333,12 @@ export const METRICS_PAGE_QUERY = gql`
       ...MetricsFields
     }
     isPaused
+    downloadBlock {
+      ...DownloadBlockFields
+    }
   }
   ${METRICS_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const IS_PAUSED_QUERY = gql`
@@ -319,9 +356,14 @@ export const SETTINGS_PAGE_QUERY = gql`
       ...MetricsFields
     }
     isPaused
+    downloadBlock {
+      ...DownloadBlockFields
+    }
   }
   ${GENERAL_SETTINGS_FIELDS}
+  ${ISP_BANDWIDTH_CAP_FIELDS}
   ${METRICS_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const SUBMIT_NZB_MUTATION = gql`
@@ -422,10 +464,14 @@ export const JOB_UPDATES_SUBSCRIPTION = gql`
         currentDownloadSpeed
       }
       isPaused
+      downloadBlock {
+        ...DownloadBlockFields
+      }
     }
   }
   ${PARSED_RELEASE_FIELDS}
   ${JOB_LIST_ITEM_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const METRICS_PAGE_SUBSCRIPTION = gql`
@@ -435,9 +481,13 @@ export const METRICS_PAGE_SUBSCRIPTION = gql`
         ...MetricsFields
       }
       isPaused
+      downloadBlock {
+        ...DownloadBlockFields
+      }
     }
   }
   ${METRICS_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const HISTORY_JOBS_QUERY = gql`
@@ -545,8 +595,13 @@ export const SETTINGS_QUERY = gql`
     settings {
       ...GeneralSettingsFields
     }
+    downloadBlock {
+      ...DownloadBlockFields
+    }
   }
   ${GENERAL_SETTINGS_FIELDS}
+  ${ISP_BANDWIDTH_CAP_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const UPDATE_SETTINGS_MUTATION = gql`
@@ -556,6 +611,7 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
+  ${ISP_BANDWIDTH_CAP_FIELDS}
 `;
 
 // --- API Keys ---

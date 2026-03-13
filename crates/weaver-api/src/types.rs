@@ -1,6 +1,8 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
 use serde::{Deserialize, Serialize};
+use weaver_core::config::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
+use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 
 // --- API Key types ---
 
@@ -241,6 +243,7 @@ pub struct GeneralSettings {
     pub cleanup_after_extract: bool,
     pub max_download_speed: u64,
     pub max_retries: u32,
+    pub isp_bandwidth_cap: Option<IspBandwidthCapSettings>,
 }
 
 /// Input for updating general settings.
@@ -251,6 +254,167 @@ pub struct GeneralSettingsInput {
     pub cleanup_after_extract: Option<bool>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
+    pub isp_bandwidth_cap: Option<IspBandwidthCapSettingsInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum IspBandwidthCapPeriodGql {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl From<IspBandwidthCapPeriod> for IspBandwidthCapPeriodGql {
+    fn from(value: IspBandwidthCapPeriod) -> Self {
+        match value {
+            IspBandwidthCapPeriod::Daily => Self::Daily,
+            IspBandwidthCapPeriod::Weekly => Self::Weekly,
+            IspBandwidthCapPeriod::Monthly => Self::Monthly,
+        }
+    }
+}
+
+impl From<IspBandwidthCapPeriodGql> for IspBandwidthCapPeriod {
+    fn from(value: IspBandwidthCapPeriodGql) -> Self {
+        match value {
+            IspBandwidthCapPeriodGql::Daily => Self::Daily,
+            IspBandwidthCapPeriodGql::Weekly => Self::Weekly,
+            IspBandwidthCapPeriodGql::Monthly => Self::Monthly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum IspBandwidthCapWeekdayGql {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl From<IspBandwidthCapWeekday> for IspBandwidthCapWeekdayGql {
+    fn from(value: IspBandwidthCapWeekday) -> Self {
+        match value {
+            IspBandwidthCapWeekday::Mon => Self::Mon,
+            IspBandwidthCapWeekday::Tue => Self::Tue,
+            IspBandwidthCapWeekday::Wed => Self::Wed,
+            IspBandwidthCapWeekday::Thu => Self::Thu,
+            IspBandwidthCapWeekday::Fri => Self::Fri,
+            IspBandwidthCapWeekday::Sat => Self::Sat,
+            IspBandwidthCapWeekday::Sun => Self::Sun,
+        }
+    }
+}
+
+impl From<IspBandwidthCapWeekdayGql> for IspBandwidthCapWeekday {
+    fn from(value: IspBandwidthCapWeekdayGql) -> Self {
+        match value {
+            IspBandwidthCapWeekdayGql::Mon => Self::Mon,
+            IspBandwidthCapWeekdayGql::Tue => Self::Tue,
+            IspBandwidthCapWeekdayGql::Wed => Self::Wed,
+            IspBandwidthCapWeekdayGql::Thu => Self::Thu,
+            IspBandwidthCapWeekdayGql::Fri => Self::Fri,
+            IspBandwidthCapWeekdayGql::Sat => Self::Sat,
+            IspBandwidthCapWeekdayGql::Sun => Self::Sun,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct IspBandwidthCapSettings {
+    pub enabled: bool,
+    pub period: IspBandwidthCapPeriodGql,
+    pub limit_bytes: u64,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: IspBandwidthCapWeekdayGql,
+    pub monthly_reset_day: u8,
+}
+
+impl From<&IspBandwidthCapConfig> for IspBandwidthCapSettings {
+    fn from(value: &IspBandwidthCapConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            period: value.period.into(),
+            limit_bytes: value.limit_bytes,
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct IspBandwidthCapSettingsInput {
+    pub enabled: bool,
+    pub period: IspBandwidthCapPeriodGql,
+    pub limit_bytes: u64,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: IspBandwidthCapWeekdayGql,
+    pub monthly_reset_day: u8,
+}
+
+impl From<IspBandwidthCapSettingsInput> for IspBandwidthCapConfig {
+    fn from(value: IspBandwidthCapSettingsInput) -> Self {
+        Self {
+            enabled: value.enabled,
+            period: value.period.into(),
+            limit_bytes: value.limit_bytes,
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum DownloadBlockKindGql {
+    None,
+    ManualPause,
+    IspCap,
+}
+
+impl From<DownloadBlockKind> for DownloadBlockKindGql {
+    fn from(value: DownloadBlockKind) -> Self {
+        match value {
+            DownloadBlockKind::None => Self::None,
+            DownloadBlockKind::ManualPause => Self::ManualPause,
+            DownloadBlockKind::IspCap => Self::IspCap,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct DownloadBlock {
+    pub kind: DownloadBlockKindGql,
+    pub cap_enabled: bool,
+    pub period: Option<IspBandwidthCapPeriodGql>,
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub remaining_bytes: u64,
+    pub reserved_bytes: u64,
+    pub window_starts_at_epoch_ms: Option<f64>,
+    pub window_ends_at_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+
+impl From<&DownloadBlockState> for DownloadBlock {
+    fn from(value: &DownloadBlockState) -> Self {
+        Self {
+            kind: value.kind.into(),
+            cap_enabled: value.cap_enabled,
+            period: value.period.map(Into::into),
+            used_bytes: value.used_bytes,
+            limit_bytes: value.limit_bytes,
+            remaining_bytes: value.remaining_bytes,
+            reserved_bytes: value.reserved_bytes,
+            window_starts_at_epoch_ms: value.window_starts_at_epoch_ms,
+            window_ends_at_epoch_ms: value.window_ends_at_epoch_ms,
+            timezone_name: value.timezone_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]

@@ -303,11 +303,7 @@ pub fn dot_unstuff(data: &[u8]) -> BytesMut {
             i += 1;
             continue;
         }
-        if data[i] == b'\n' {
-            line_start = true;
-        } else {
-            line_start = false;
-        }
+        line_start = data[i] == b'\n';
         i += 1;
     }
 

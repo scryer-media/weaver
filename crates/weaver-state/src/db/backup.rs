@@ -14,6 +14,7 @@ const STABLE_TABLES: &[&str] = &[
     "api_keys",
     "job_history",
     "job_events",
+    "bandwidth_usage_minute_buckets",
     "rss_feeds",
     "rss_rules",
     "rss_seen_items",
@@ -43,6 +44,7 @@ const CLEAR_IMPORT_TABLES: &[&str] = &[
     "job_events",
     "job_history",
     "api_keys",
+    "bandwidth_usage_minute_buckets",
     "categories",
     "servers",
     "settings",
@@ -184,6 +186,8 @@ impl Database {
                  FROM src.job_history;
              INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                  SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
+             INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
+                 SELECT bucket_epoch_minute, payload_bytes FROM src.bandwidth_usage_minute_buckets;
              INSERT INTO rss_feeds
                  (id, name, url, enabled, poll_interval_secs, username, password, default_category, default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error, consecutive_failures)
                  SELECT id, name, url, enabled, poll_interval_secs, username, password, default_category, default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error, consecutive_failures
@@ -250,6 +254,7 @@ mod tests {
                 multiplier: Some(2.0),
             }),
             max_download_speed: Some(42),
+            isp_bandwidth_cap: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }

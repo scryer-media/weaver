@@ -904,7 +904,7 @@ mod tests {
         let expected_crc = crc_body.finalize();
 
         // Single-byte chunks.
-        let mut out_chunk = vec![0u8; 64];
+        let mut out_chunk = [0u8; 64];
         let mut state = DecodeState::new();
         let opts = DecodeOptions::default();
         let mut total = 0usize;

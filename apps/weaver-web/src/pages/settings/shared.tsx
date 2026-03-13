@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CheckIcon, CopyIcon } from "lucide-react";
+import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   API_KEYS_QUERY,
@@ -25,6 +27,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 export function SettingsPageHeader({
   title,
@@ -480,6 +489,9 @@ export function BackupRestoreSection({
 
 export function ApiKeysSection() {
   const t = useTranslate();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
   const [{ data }] = useQuery({ query: API_KEYS_QUERY });
   const [, createApiKey] = useMutation(CREATE_API_KEY_MUTATION);
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
@@ -488,8 +500,16 @@ export function ApiKeysSection() {
   const [newKeyScope, setNewKeyScope] = useState<"INTEGRATION" | "ADMIN">(
     "INTEGRATION",
   );
-  const [createdKey, setCreatedKey] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [createdKey, setCreatedKey] = useState<{
+    rawKey: string;
+    name: string;
+    scope: "INTEGRATION" | "ADMIN";
+  } | null>(null);
+  const [createdKeyOpen, setCreatedKeyOpen] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [copiedRawKey, setCopiedRawKey] = useState(false);
+  const [copiedDeepLink, setCopiedDeepLink] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [keys, setKeys] = useState<
     {
@@ -500,6 +520,8 @@ export function ApiKeysSection() {
       lastUsedAt: number | null;
     }[]
   >([]);
+  const keyFieldRef = useRef<HTMLInputElement | null>(null);
+  const autoCreateRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (data?.apiKeys) {
@@ -507,24 +529,98 @@ export function ApiKeysSection() {
     }
   }, [data?.apiKeys]);
 
-  const handleCreate = async () => {
-    if (!newKeyName.trim()) return;
+  useEffect(() => {
+    if (!createdKeyOpen || !createdKey || !keyFieldRef.current) return;
+    const handle = window.requestAnimationFrame(() => {
+      keyFieldRef.current?.focus();
+      keyFieldRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(handle);
+  }, [createdKey, createdKeyOpen]);
+
+  const deepLinkName = newKeyName.trim() || t("settings.apiKeyDeepLinkDefaultName");
+  const deepLinkUrl = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    const url = new URL("/settings/security", window.location.origin);
+    url.searchParams.set("createApiKey", "1");
+    url.searchParams.set("name", deepLinkName);
+    url.searchParams.set("scope", newKeyScope.toLowerCase());
+    return url.toString();
+  }, [deepLinkName, newKeyScope]);
+
+  const createKey = async (
+    name: string,
+    scope: "INTEGRATION" | "ADMIN",
+  ) => {
+    if (!name.trim()) return;
+    setCreateBusy(true);
+    setCreateError(null);
+    setCopiedRawKey(false);
     const result = await createApiKey({
-      name: newKeyName.trim(),
-      scope: newKeyScope,
+      name: name.trim(),
+      scope,
     });
     if (result.data?.createApiKey?.rawKey) {
-      setCreatedKey(result.data.createApiKey.rawKey);
+      setCreatedKey({
+        rawKey: result.data.createApiKey.rawKey,
+        name: name.trim(),
+        scope,
+      });
+      setCreatedKeyOpen(true);
       setNewKeyName("");
       setKeys((current) => [result.data.createApiKey.key, ...current]);
+    } else {
+      setCreateError(t("settings.apiKeyCreateFailed"));
     }
+    if (result.error) {
+      setCreateError(result.error.message);
+    }
+    setCreateBusy(false);
+  };
+
+  useEffect(() => {
+    if (searchParams.get("createApiKey") !== "1") {
+      autoCreateRef.current = null;
+      return;
+    }
+    const signature = searchParams.toString();
+    if (autoCreateRef.current === signature) return;
+    autoCreateRef.current = signature;
+    const name = searchParams.get("name")?.trim() || deepLinkName;
+    const scope = normalizeApiKeyScope(searchParams.get("scope"));
+    void navigate(
+      {
+        pathname: location.pathname,
+        search: "",
+        hash: location.hash,
+      },
+      { replace: true },
+    );
+    void createKey(name, scope);
+  }, [deepLinkName, location.hash, location.pathname, navigate, searchParams]);
+
+  const handleCreate = async () => {
+    await createKey(newKeyName.trim(), newKeyScope);
   };
 
   const handleCopy = () => {
     if (createdKey) {
-      navigator.clipboard.writeText(createdKey);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      void navigator.clipboard.writeText(createdKey.rawKey);
+      setCopiedRawKey(true);
+      window.setTimeout(() => setCopiedRawKey(false), 2000);
+    }
+  };
+
+  const handleCopyDeepLink = () => {
+    if (!deepLinkUrl) return;
+    void navigator.clipboard.writeText(deepLinkUrl);
+    setCopiedDeepLink(true);
+    window.setTimeout(() => setCopiedDeepLink(false), 2000);
+  };
+
+  const handleKeyFieldFocus = () => {
+    if (keyFieldRef.current) {
+      keyFieldRef.current.select();
     }
   };
 
@@ -553,30 +649,6 @@ export function ApiKeysSection() {
         <CardDescription>{t("settings.apiKeysDesc")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-
-      {createdKey && (
-        <div className="rounded-2xl border border-yellow-500/40 bg-yellow-500/10 p-4">
-          <div className="mb-1 text-sm font-medium text-foreground">
-            {t("settings.apiKeyCreated")}
-          </div>
-          <div className="mb-1 text-xs text-muted-foreground">
-            {t("settings.apiKeyCopyWarning")}
-          </div>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
-              {createdKey}
-            </code>
-            <Button
-              onClick={handleCopy}
-              size="sm"
-              className="shrink-0"
-            >
-              {copied ? t("action.copied") : t("action.copy")}
-            </Button>
-          </div>
-        </div>
-      )}
-
       {keys.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {t("settings.apiKeyNone")}
@@ -620,39 +692,70 @@ export function ApiKeysSection() {
         </div>
       )}
 
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="min-w-52 flex-1">
-          <Label className="mb-2">{t("settings.apiKeyName")}</Label>
-          <Input
-            value={newKeyName}
-            onChange={(e) => setNewKeyName(e.target.value)}
-            placeholder={t("settings.apiKeyNamePlaceholder")}
-            onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-          />
-        </div>
-        <div>
-          <Label className="mb-2">{t("settings.apiKeyScope")}</Label>
-          <Select
-            value={newKeyScope}
-            onValueChange={(value) =>
-              setNewKeyScope(value as "INTEGRATION" | "ADMIN")
-            }
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="min-w-52 flex-1">
+            <Label className="mb-2">{t("settings.apiKeyName")}</Label>
+            <Input
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+              placeholder={t("settings.apiKeyNamePlaceholder")}
+              onKeyDown={(e) => e.key === "Enter" && void handleCreate()}
+            />
+          </div>
+          <div>
+            <Label className="mb-2">{t("settings.apiKeyScope")}</Label>
+            <Select
+              value={newKeyScope}
+              onValueChange={(value) =>
+                setNewKeyScope(value as "INTEGRATION" | "ADMIN")
+              }
+            >
+              <SelectTrigger className="min-w-44">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="INTEGRATION">{t("settings.scopeIntegration")}</SelectItem>
+                <SelectItem value="ADMIN">{t("settings.scopeAdmin")}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <Button
+            onClick={() => void handleCreate()}
+            disabled={!newKeyName.trim() || createBusy}
           >
-            <SelectTrigger className="min-w-44">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="INTEGRATION">{t("settings.scopeIntegration")}</SelectItem>
-              <SelectItem value="ADMIN">{t("settings.scopeAdmin")}</SelectItem>
-            </SelectContent>
-          </Select>
+            {createBusy ? t("settings.apiKeyCreating") : t("settings.createApiKey")}
+          </Button>
         </div>
-        <Button
-          onClick={handleCreate}
-          disabled={!newKeyName.trim()}
-        >
-          {t("settings.createApiKey")}
-        </Button>
+
+        <div className="rounded-xl border border-border/70 bg-muted/20 p-3">
+          <Label className="mb-2">{t("settings.apiKeyDeepLink")}</Label>
+          <div className="mb-2 text-xs text-muted-foreground">
+            {t("settings.apiKeyDeepLinkDesc")}
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              readOnly
+              value={deepLinkUrl}
+              onFocus={(event) => event.currentTarget.select()}
+              className="font-mono text-xs"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={handleCopyDeepLink}
+              aria-label={t("settings.apiKeyCopyDeepLink")}
+              title={t("settings.apiKeyCopyDeepLink")}
+            >
+              {copiedDeepLink ? <CheckIcon className="size-4" /> : <CopyIcon className="size-4" />}
+            </Button>
+          </div>
+        </div>
+
+        {createError ? (
+          <p className="text-sm text-destructive">{createError}</p>
+        ) : null}
       </div>
 
       <ConfirmDialog
@@ -664,9 +767,59 @@ export function ApiKeysSection() {
         onConfirm={() => deleteConfirmId != null && handleDelete(deleteConfirmId)}
         onCancel={() => setDeleteConfirmId(null)}
       />
+
+      <Dialog open={createdKeyOpen} onOpenChange={setCreatedKeyOpen}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{t("settings.apiKeyCreated")}</DialogTitle>
+            <DialogDescription>{t("settings.apiKeyCopyWarning")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+              <div>
+                <span className="font-medium text-foreground">{t("settings.apiKeyName")}:</span>{" "}
+                {createdKey?.name ?? ""}
+              </div>
+              <div>
+                <span className="font-medium text-foreground">{t("settings.apiKeyScope")}:</span>{" "}
+                {createdKey?.scope === "ADMIN"
+                  ? t("settings.scopeAdmin")
+                  : t("settings.scopeIntegration")}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                ref={keyFieldRef}
+                readOnly
+                value={createdKey?.rawKey ?? ""}
+                onFocus={handleKeyFieldFocus}
+                onClick={handleKeyFieldFocus}
+                className="font-mono text-xs"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                onClick={handleCopy}
+                aria-label={t("settings.apiKeyCopyRawKey")}
+                title={t("settings.apiKeyCopyRawKey")}
+              >
+                {copiedRawKey ? <CheckIcon className="size-4" /> : <CopyIcon className="size-4" />}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.apiKeyCopyShortcutHint")}
+            </p>
+          </div>
+        </DialogContent>
+      </Dialog>
       </CardContent>
     </Card>
   );
+}
+
+function normalizeApiKeyScope(value: string | null): "INTEGRATION" | "ADMIN" {
+  return value?.toLowerCase() === "admin" ? "ADMIN" : "INTEGRATION";
 }
 
 async function readJsonOrThrow(response: Response) {

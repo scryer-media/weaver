@@ -40,6 +40,17 @@ type MetricsSnapshot = {
 type MetricsPageData = {
   metrics: MetricsSnapshot;
   isPaused: boolean;
+  downloadBlock: {
+    kind: "NONE" | "MANUAL_PAUSE" | "ISP_CAP";
+    capEnabled: boolean;
+    period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
+    usedBytes: number;
+    limitBytes: number;
+    remainingBytes: number;
+    reservedBytes: number;
+    windowEndsAtEpochMs?: number | null;
+    timezoneName: string;
+  };
 };
 
 export function MetricsPage() {
@@ -88,6 +99,15 @@ export function MetricsPage() {
   const snapshot = subscriptionData ?? polledSnapshot ?? queryData;
   const metrics = snapshot?.metrics;
   const isPaused = snapshot?.isPaused ?? liveData.isPaused;
+  const downloadBlock = snapshot?.downloadBlock ?? liveData.downloadBlock;
+  const capResetAt = downloadBlock.windowEndsAtEpochMs
+    ? new Date(downloadBlock.windowEndsAtEpochMs).toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      })
+    : "\u2014";
 
   return (
     <div className="space-y-6">
@@ -124,6 +144,34 @@ export function MetricsPage() {
             <MetricTile label={t("metrics.activeJobs")} value={counts.active} />
             <MetricTile label={t("metrics.queuedJobs")} value={counts.queued} />
           </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("metrics.bandwidthCap")}</CardTitle>
+              <CardDescription>{t("metrics.bandwidthCapDesc")}</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <MetricTile
+                label={t("metrics.bandwidthCapState")}
+                value={
+                  downloadBlock.kind === "ISP_CAP"
+                    ? t("metrics.bandwidthCapHit")
+                    : downloadBlock.capEnabled
+                    ? t("metrics.bandwidthCapActive")
+                    : t("label.disabled")
+                }
+              />
+              <MetricTile
+                label={t("metrics.bandwidthCapUsed")}
+                value={formatBytes(downloadBlock.usedBytes)}
+              />
+              <MetricTile
+                label={t("metrics.bandwidthCapRemaining")}
+                value={formatBytes(downloadBlock.remainingBytes)}
+              />
+              <MetricTile label={t("metrics.bandwidthCapReset")} value={capResetAt} />
+            </CardContent>
+          </Card>
 
           <Card>
             <CardHeader>

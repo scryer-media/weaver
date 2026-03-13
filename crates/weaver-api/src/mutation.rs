@@ -526,6 +526,9 @@ impl MutationRoot {
                     });
                 retry.max_retries = Some(retries);
             }
+            if let Some(cap) = input.isp_bandwidth_cap.clone() {
+                cfg.isp_bandwidth_cap = Some(cap.into());
+            }
 
             // Persist to SQLite.
             let db = db.clone();
@@ -535,6 +538,7 @@ impl MutationRoot {
                 input.cleanup_after_extract,
                 input.max_download_speed,
                 input.max_retries,
+                input.isp_bandwidth_cap.clone(),
             );
             tokio::task::spawn_blocking(
                 move || -> std::result::Result<(), weaver_state::StateError> {
@@ -553,6 +557,38 @@ impl MutationRoot {
                     if let Some(v) = input_clone.4 {
                         db.set_setting("retry.max_retries", &v.to_string())?;
                     }
+                    if let Some(ref cap) = input_clone.5 {
+                        db.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
+                        db.set_setting(
+                            "bandwidth_cap.period",
+                            match cap.period {
+                                crate::types::IspBandwidthCapPeriodGql::Daily => "daily",
+                                crate::types::IspBandwidthCapPeriodGql::Weekly => "weekly",
+                                crate::types::IspBandwidthCapPeriodGql::Monthly => "monthly",
+                            },
+                        )?;
+                        db.set_setting("bandwidth_cap.limit_bytes", &cap.limit_bytes.to_string())?;
+                        db.set_setting(
+                            "bandwidth_cap.reset_time_minutes_local",
+                            &cap.reset_time_minutes_local.to_string(),
+                        )?;
+                        db.set_setting(
+                            "bandwidth_cap.weekly_reset_weekday",
+                            match cap.weekly_reset_weekday {
+                                crate::types::IspBandwidthCapWeekdayGql::Mon => "mon",
+                                crate::types::IspBandwidthCapWeekdayGql::Tue => "tue",
+                                crate::types::IspBandwidthCapWeekdayGql::Wed => "wed",
+                                crate::types::IspBandwidthCapWeekdayGql::Thu => "thu",
+                                crate::types::IspBandwidthCapWeekdayGql::Fri => "fri",
+                                crate::types::IspBandwidthCapWeekdayGql::Sat => "sat",
+                                crate::types::IspBandwidthCapWeekdayGql::Sun => "sun",
+                            },
+                        )?;
+                        db.set_setting(
+                            "bandwidth_cap.monthly_reset_day",
+                            &cap.monthly_reset_day.to_string(),
+                        )?;
+                    }
                     Ok(())
                 },
             )
@@ -567,12 +603,16 @@ impl MutationRoot {
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+                isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
             }
         };
 
         // Apply speed limit immediately.
         if let Some(speed) = input.max_download_speed {
             let _ = handle.set_speed_limit(speed).await;
+        }
+        if let Some(cap) = input.isp_bandwidth_cap {
+            let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
         }
 
         Ok(settings)

@@ -142,10 +142,32 @@ function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {
   return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED");
 }
 
+function isBlockedByIspCap(
+  job: { status: string },
+  downloadBlock: { kind: string },
+) {
+  return (
+    downloadBlock.kind === "ISP_CAP"
+    && (job.status === "DOWNLOADING" || job.status === "QUEUED")
+  );
+}
+
+function formatResetAt(epochMs?: number | null) {
+  if (!epochMs) return "\u2014";
+  return new Date(epochMs).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 export function JobList() {
-  const { jobs: allJobs, speed, isPaused } = useLiveData();
+  const { jobs: allJobs, speed, isPaused, downloadBlock } = useLiveData();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
   const blockedJobs = jobs.filter((job) => isBlockedByGlobalPause(job, isPaused)).length;
+  const capBlockedJobs = jobs.filter((job) => isBlockedByIspCap(job, downloadBlock)).length;
+  const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
@@ -179,7 +201,9 @@ export function JobList() {
       <PageHeader
         title={t("jobs.title")}
         description={
-          isPaused && blockedJobs > 0
+          downloadBlock.kind === "ISP_CAP" && capBlockedJobs > 0
+            ? t("jobs.bandwidthCapHeaderHint", { resetAt: capResetAt })
+            : isPaused && blockedJobs > 0
             ? t("jobs.pausedHeaderHint")
             : jobs.length === 0
               ? t("jobs.emptyHint")
@@ -228,7 +252,33 @@ export function JobList() {
         }
       />
 
-      {isPaused && blockedJobs > 0 ? (
+      {downloadBlock.kind === "ISP_CAP" && capBlockedJobs > 0 ? (
+        <Card className="border-orange-500/40 bg-orange-500/8">
+          <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="warning">{t("jobs.bandwidthCapBadge")}</Badge>
+                <span className="text-sm font-medium text-foreground">
+                  {t("jobs.bandwidthCapTitle")}
+                </span>
+              </div>
+              <div className="text-sm text-muted-foreground">
+                {t("jobs.bandwidthCapBody", { resetAt: capResetAt })}
+              </div>
+              {isPaused ? (
+                <div className="text-xs uppercase tracking-[0.14em] text-orange-700 dark:text-orange-300">
+                  {t("jobs.bandwidthCapManualPauseNote")}
+                </div>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button asChild variant="outline">
+                <Link to="/settings/general">{t("jobs.bandwidthCapOpenSettings")}</Link>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : isPaused && blockedJobs > 0 ? (
         <Card className="border-amber-500/40 bg-amber-500/8">
           <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
             <div className="space-y-2">
@@ -318,7 +368,11 @@ export function JobList() {
                           <TableCell className="overflow-hidden px-2 py-1.5">
                             <div className="flex flex-col items-start gap-1">
                               <JobStatusBadge status={job.status} compact className="px-1.5" />
-                              {isBlockedByGlobalPause(job, isPaused) ? (
+                              {isBlockedByIspCap(job, downloadBlock) ? (
+                                <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-orange-600 dark:text-orange-300">
+                                  {t("jobs.bandwidthCapShort")}
+                                </span>
+                              ) : isBlockedByGlobalPause(job, isPaused) ? (
                                 <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-amber-600 dark:text-amber-300">
                                   {t("jobs.globalPauseShort")}
                                 </span>
@@ -338,7 +392,9 @@ export function JobList() {
                             {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
                           </TableCell>
                           <TableCell className="px-2 py-1.5 text-right text-[11px] text-muted-foreground">
-                            {isBlockedByGlobalPause(job, isPaused)
+                            {isBlockedByIspCap(job, downloadBlock)
+                              ? t("jobs.bandwidthCapEta", { resetAt: capResetAt })
+                              : isBlockedByGlobalPause(job, isPaused)
                               ? t("status.paused")
                               : (queueEtaById.get(job.id) ?? "\u2014")}
                           </TableCell>
@@ -435,7 +491,9 @@ export function JobList() {
                           <span>{job.category ?? "\u2014"}</span>
                           <span>{formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}</span>
                           <span>
-                            {isBlockedByGlobalPause(job, isPaused)
+                            {isBlockedByIspCap(job, downloadBlock)
+                              ? t("jobs.bandwidthCapEta", { resetAt: capResetAt })
+                              : isBlockedByGlobalPause(job, isPaused)
                               ? t("status.paused")
                               : (queueEtaById.get(job.id) ?? "\u2014")}
                           </span>
@@ -443,7 +501,11 @@ export function JobList() {
                       </div>
                       <div className="flex flex-col items-end gap-1">
                         <JobStatusBadge status={job.status} compact />
-                        {isBlockedByGlobalPause(job, isPaused) ? (
+                        {isBlockedByIspCap(job, downloadBlock) ? (
+                          <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-orange-600 dark:text-orange-300">
+                            {t("jobs.bandwidthCapShort")}
+                          </span>
+                        ) : isBlockedByGlobalPause(job, isPaused) ? (
                           <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-amber-600 dark:text-amber-300">
                             {t("jobs.globalPauseShort")}
                           </span>

@@ -1,3 +1,4 @@
+mod bandwidth_cap;
 mod completion;
 mod decode;
 mod download;
@@ -34,6 +35,7 @@ use weaver_scheduler::{
 };
 use weaver_state::CommittedSegment;
 
+use self::bandwidth_cap::BandwidthCapRuntime;
 use self::rar_state::RarSetState;
 
 /// Maximum number of retries for a single segment before giving up.
@@ -213,6 +215,11 @@ pub struct Pipeline {
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
+    /// ISP bandwidth cap runtime state.
+    bandwidth_cap: BandwidthCapRuntime,
+    /// Conservative byte reservations for in-flight downloads used to enforce the
+    /// ISP bandwidth cap before actual payload bytes are known.
+    bandwidth_reservations: HashMap<SegmentId, u64>,
     /// Bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
     /// Gradual connection ramp-up limit (increases each tick).
@@ -285,6 +292,7 @@ impl Pipeline {
         let metrics = Arc::clone(shared_state.metrics());
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
+        let initial_bandwidth_policy = config.read().await.isp_bandwidth_cap.clone();
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
             write_backlog_budget_mb = write_backlog_budget_bytes / (1024 * 1024),
@@ -306,8 +314,10 @@ impl Pipeline {
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         shared_state.set_paused(initial_global_paused);
+        let mut bandwidth_cap = BandwidthCapRuntime::default();
+        bandwidth_cap.set_policy(initial_bandwidth_policy);
 
-        Ok(Self {
+        let mut pipeline = Self {
             cmd_rx,
             event_tx,
             nntp: Arc::new(nntp),
@@ -336,6 +346,8 @@ impl Pipeline {
             extract_done_tx,
             extract_done_rx,
             global_paused: initial_global_paused,
+            bandwidth_cap,
+            bandwidth_reservations: HashMap::new(),
             connection_ramp: total_connections.min(5),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
@@ -356,7 +368,9 @@ impl Pipeline {
             shared_state,
             db,
             config,
-        })
+        };
+        let _ = pipeline.refresh_bandwidth_cap_window();
+        Ok(pipeline)
     }
 
     /// Run the pipeline main loop until shutdown.
@@ -494,7 +508,8 @@ impl Pipeline {
     }
 
     /// Publish current job list to shared state for lock-free control plane reads.
-    fn publish_snapshot(&self) {
+    fn publish_snapshot(&mut self) {
+        let _ = self.refresh_bandwidth_cap_window();
         self.shared_state.publish_jobs(self.list_jobs());
     }
 
@@ -608,10 +623,10 @@ impl Pipeline {
                         if let Err(e) = db.archive_job(job_id, &row) {
                             tracing::error!(job_id = job_id.0, error = %e, "failed to archive cancelled job");
                         }
-                        if let Err(e) = std::fs::remove_file(&nzb_path) {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
-                            }
+                        if let Err(e) = std::fs::remove_file(&nzb_path)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
                         }
                     });
 
@@ -646,6 +661,8 @@ impl Pipeline {
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.shared_state.set_paused(true);
+                self.shared_state
+                    .set_download_block(self.bandwidth_cap.to_download_block_state(true));
                 if let Err(e) = self.db.set_setting("global_paused", "true") {
                     error!(error = %e, "db write failed for PauseAll");
                 }
@@ -655,6 +672,7 @@ impl Pipeline {
             SchedulerCommand::ResumeAll { reply } => {
                 self.global_paused = false;
                 self.shared_state.set_paused(false);
+                let _ = self.refresh_bandwidth_cap_window();
                 if let Err(e) = self.db.set_setting("global_paused", "false") {
                     error!(error = %e, "db write failed for ResumeAll");
                 }
@@ -667,6 +685,10 @@ impl Pipeline {
             } => {
                 self.rate_limiter.set_rate(bytes_per_sec);
                 let _ = reply.send(());
+            }
+            SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
+                let result = self.apply_bandwidth_cap_policy(policy);
+                let _ = reply.send(result);
             }
             SchedulerCommand::RebuildNntp {
                 client,
@@ -1272,10 +1294,10 @@ impl Pipeline {
                 tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
             }
             // Clean up the stored NZB file — no longer needed after archival.
-            if let Err(e) = std::fs::remove_file(&nzb_path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
-                }
+            if let Err(e) = std::fs::remove_file(&nzb_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
             }
         });
         self.purge_terminal_job_runtime(job_id);
@@ -1288,6 +1310,7 @@ mod tests {
 
     use std::time::Duration;
 
+    use chrono::Timelike;
     use tempfile::TempDir;
     use tokio::sync::{RwLock, oneshot};
     use weaver_api::submit_nzb_bytes;
@@ -1330,6 +1353,7 @@ mod tests {
                 categories: vec![],
                 retry: None,
                 max_download_speed: None,
+                isp_bandwidth_cap: None,
                 cleanup_after_extract: Some(true),
                 config_path: None,
             }));
@@ -1490,6 +1514,7 @@ mod tests {
             categories: vec![],
             retry: None,
             max_download_speed: None,
+            isp_bandwidth_cap: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }));
@@ -2621,6 +2646,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_downloads_blocks_when_isp_bandwidth_cap_is_hit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 1,
+                medium_count: 1,
+                large_count: 1,
+            },
+            2,
+        )
+        .await;
+        let job_id = JobId(20005);
+        let spec = standalone_job_spec("ISP Cap Gate", &[("queued.bin".to_string(), 512u32)]);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline.connection_ramp = 1;
+
+        let now = chrono::Local::now();
+        let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+        pipeline
+            .db
+            .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 1024)
+            .unwrap();
+        pipeline
+            .apply_bandwidth_cap_policy(Some(weaver_core::config::IspBandwidthCapConfig {
+                enabled: true,
+                period: weaver_core::config::IspBandwidthCapPeriod::Daily,
+                limit_bytes: 512,
+                reset_time_minutes_local: reset_minutes,
+                weekly_reset_weekday: weaver_core::config::IspBandwidthCapWeekday::Mon,
+                monthly_reset_day: 1,
+            }))
+            .unwrap();
+
+        pipeline.dispatch_downloads();
+
+        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 1);
+        assert_eq!(
+            pipeline.shared_state.download_block().kind,
+            weaver_scheduler::handle::DownloadBlockKind::IspCap
+        );
+    }
+
+    #[tokio::test]
+    async fn set_bandwidth_cap_policy_recomputes_current_window_usage_from_ledger() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 1,
+                medium_count: 1,
+                large_count: 1,
+            },
+            1,
+        )
+        .await;
+
+        let now = chrono::Local::now();
+        let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+        pipeline
+            .db
+            .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 4096)
+            .unwrap();
+
+        pipeline
+            .apply_bandwidth_cap_policy(Some(weaver_core::config::IspBandwidthCapConfig {
+                enabled: false,
+                period: weaver_core::config::IspBandwidthCapPeriod::Daily,
+                limit_bytes: 10_000,
+                reset_time_minutes_local: reset_minutes,
+                weekly_reset_weekday: weaver_core::config::IspBandwidthCapWeekday::Mon,
+                monthly_reset_day: 1,
+            }))
+            .unwrap();
+
+        let block = pipeline.shared_state.download_block();
+        assert_eq!(block.used_bytes, 4096);
+        assert_eq!(block.remaining_bytes, 10_000 - 4096);
+        assert!(!block.cap_enabled);
+    }
+
+    #[tokio::test]
     async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -3581,8 +3689,7 @@ mod tests {
                 .db
                 .load_all_rar_volume_facts(job_id)
                 .unwrap()
-                .get("show")
-                .is_some()
+                .contains_key("show")
         );
     }
 

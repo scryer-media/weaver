@@ -1,0 +1,235 @@
+name: deploy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "weaver-v*"
+
+concurrency:
+  group: weaver-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "25"
+  RUST_TOOLCHAIN: "1.94"
+  WEB_ARTIFACT_NAME: weaver-web-dist
+
+jobs:
+  web-build:
+    name: web-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/weaver-web/package-lock.json
+      - name: Install dependencies
+        working-directory: apps/weaver-web
+        run: npm ci
+      - name: Build web app
+        working-directory: apps/weaver-web
+        run: npm run build
+      - name: Verify static output
+        run: test -f apps/weaver-web/dist/index.html
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-fmt:
+    name: rust-fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+
+  rust-clippy:
+    name: rust-clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Verify embedded web artifact
+        run: test -f apps/weaver-web/dist/index.html
+      - name: Run clippy
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+
+  rust-audit:
+    name: rust-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
+
+  rust-test:
+    name: rust-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Verify embedded web artifact
+        run: test -f apps/weaver-web/dist/index.html
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  docker-publish:
+    name: docker-publish-${{ matrix.platform }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runs_on: ubuntu-24.04
+          - platform: linux-arm64
+            runs_on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve image metadata
+        id: meta
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/weaver"
+          ARCH_TAG="${IMAGE}:${VERSION}-${{ matrix.platform }}"
+          LATEST_ARCH_TAG="${IMAGE}:latest-${{ matrix.platform }}"
+          {
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+            echo "arch_tag=${ARCH_TAG}"
+            echo "latest_arch_tag=${LATEST_ARCH_TAG}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Verify embedded web artifact
+        run: test -f apps/weaver-web/dist/index.html
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked
+      - name: Prepare Docker context
+        run: |
+          mkdir -p docker-ctx
+          cp target/release/weaver docker-ctx/weaver
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image
+        run: |
+          docker build \
+            --label org.opencontainers.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            --label org.opencontainers.image.version="${{ steps.meta.outputs.version }}" \
+            -f docker/weaver.Dockerfile \
+            -t "${{ steps.meta.outputs.arch_tag }}" \
+            -t "${{ steps.meta.outputs.latest_arch_tag }}" \
+            docker-ctx
+      - name: Smoke test image
+        run: docker run --rm --entrypoint /usr/local/bin/weaver "${{ steps.meta.outputs.arch_tag }}" --help >/dev/null
+      - name: Push arch images
+        run: |
+          docker push "${{ steps.meta.outputs.arch_tag }}"
+          docker push "${{ steps.meta.outputs.latest_arch_tag }}"
+
+  docker-manifest:
+    name: docker-manifest
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [docker-publish]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve manifest metadata
+        id: meta
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/weaver"
+          {
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-arch manifests
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            -t "${{ steps.meta.outputs.image }}:latest" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-linux-amd64" \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-linux-arm64"
+      - name: Inspect published manifest
+        run: docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"

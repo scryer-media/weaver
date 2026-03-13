@@ -276,7 +276,7 @@ mod tests {
         let num_slices = if file_length == 0 {
             0
         } else {
-            ((file_length + slice_size - 1) / slice_size) as usize
+            file_length.div_ceil(slice_size) as usize
         };
 
         let mut checksums = Vec::new();

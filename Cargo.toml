@@ -62,6 +62,7 @@ memchr = "2"
 rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = "3"
 zstd = "0.13"
+chrono = { version = "0.4", features = ["clock", "serde"] }
 sevenz-rust2 = { version = "0.20", features = ["aes256", "bzip2", "deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 feed-rs = "2.3"

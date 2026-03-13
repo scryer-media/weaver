@@ -6,8 +6,8 @@ use weaver_scheduler::SchedulerHandle;
 use crate::auth::AdminGuard;
 use crate::timeline::build_job_timeline;
 use crate::types::{
-    ApiKey, ApiKeyScope, Category, EventKind, GeneralSettings, Job, JobEvent, JobStatusGql,
-    JobTimeline, Metrics, RssFeed, RssSeenItem, Server,
+    ApiKey, ApiKeyScope, Category, DownloadBlock, EventKind, GeneralSettings, Job, JobEvent,
+    JobStatusGql, JobTimeline, Metrics, RssFeed, RssSeenItem, Server,
 };
 
 pub struct QueryRoot;
@@ -96,6 +96,12 @@ impl QueryRoot {
         Ok(handle.is_globally_paused())
     }
 
+    /// Current global download block state (manual pause or ISP cap).
+    async fn download_block(&self, ctx: &Context<'_>) -> Result<DownloadBlock> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        Ok(DownloadBlock::from(&handle.get_download_block()))
+    }
+
     /// List all configured NNTP servers.
     #[graphql(guard = "AdminGuard")]
     async fn servers(&self, ctx: &Context<'_>) -> Result<Vec<Server>> {
@@ -168,6 +174,7 @@ impl QueryRoot {
             cleanup_after_extract: cfg.cleanup_after_extract(),
             max_download_speed: cfg.max_download_speed.unwrap_or(0),
             max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+            isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
         })
     }
 

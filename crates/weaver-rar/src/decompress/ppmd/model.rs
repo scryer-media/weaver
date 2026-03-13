@@ -1303,7 +1303,7 @@ mod tests {
         for _ in 0..5 {
             let ch = model.decode_char(&mut rc);
             assert!(
-                (ch >= 0 && ch < 256) || ch == -1,
+                (0..256).contains(&ch) || ch == -1,
                 "unexpected decode result: {ch}"
             );
         }

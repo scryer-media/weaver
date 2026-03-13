@@ -8,6 +8,7 @@ use crate::StateError;
 mod active;
 mod api_keys;
 mod backup;
+mod bandwidth;
 mod config;
 mod events;
 mod history;
@@ -21,7 +22,7 @@ pub use events::JobEvent;
 pub use history::{HistoryFilter, JobHistoryRow};
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 fn ensure_column(
     conn: &Connection,
@@ -256,6 +257,11 @@ impl Database {
                 PRIMARY KEY (job_id, set_name, volume_index)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS bandwidth_usage_minute_buckets (
+                bucket_epoch_minute INTEGER PRIMARY KEY NOT NULL,
+                payload_bytes       INTEGER NOT NULL
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS api_keys (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 name         TEXT NOT NULL,
@@ -406,6 +412,11 @@ impl Database {
             Some(11) => {
                 // v11→v12: active job normalization flag is added below; new active-state tables
                 // are created above via IF NOT EXISTS.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(12) => {
+                // v12→v13: bandwidth usage ledger is created above via IF NOT EXISTS.
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
@@ -677,6 +688,36 @@ mod tests {
             .unwrap();
         assert!(failed_cols > 0);
         assert!(suspect_cols > 0);
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v12_adds_bandwidth_usage_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (12);",
+        )
+        .unwrap();
+
+        let db = Database {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        db.create_schema().unwrap();
+
+        let conn = db.conn();
+        let bucket_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('bandwidth_usage_minute_buckets')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(bucket_cols > 0);
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))

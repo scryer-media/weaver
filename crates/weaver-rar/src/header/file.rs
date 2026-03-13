@@ -172,7 +172,7 @@ mod tests {
     use crate::header::common::read_raw_header;
     use crate::vint::encode_vint;
 
-    fn build_file_header(
+    struct TestFileHeaderArgs<'a> {
         file_flags: u64,
         unpacked_size: u64,
         attributes: u64,
@@ -180,22 +180,24 @@ mod tests {
         crc32: Option<u32>,
         comp_info: u64,
         host_os: u64,
-        name: &str,
-    ) -> Vec<u8> {
+        name: &'a str,
+    }
+
+    fn build_file_header(args: TestFileHeaderArgs<'_>) -> Vec<u8> {
         let mut type_body = Vec::new();
-        type_body.extend_from_slice(&encode_vint(file_flags));
-        type_body.extend_from_slice(&encode_vint(unpacked_size));
-        type_body.extend_from_slice(&encode_vint(attributes));
-        if let Some(ts) = mtime {
+        type_body.extend_from_slice(&encode_vint(args.file_flags));
+        type_body.extend_from_slice(&encode_vint(args.unpacked_size));
+        type_body.extend_from_slice(&encode_vint(args.attributes));
+        if let Some(ts) = args.mtime {
             type_body.extend_from_slice(&ts.to_le_bytes());
         }
-        if let Some(crc) = crc32 {
+        if let Some(crc) = args.crc32 {
             type_body.extend_from_slice(&crc.to_le_bytes());
         }
-        type_body.extend_from_slice(&encode_vint(comp_info));
-        type_body.extend_from_slice(&encode_vint(host_os));
-        type_body.extend_from_slice(&encode_vint(name.len() as u64));
-        type_body.extend_from_slice(name.as_bytes());
+        type_body.extend_from_slice(&encode_vint(args.comp_info));
+        type_body.extend_from_slice(&encode_vint(args.host_os));
+        type_body.extend_from_slice(&encode_vint(args.name.len() as u64));
+        type_body.extend_from_slice(args.name.as_bytes());
 
         let header_type = 2u64;
         let common_flags = 0u64;
@@ -222,16 +224,16 @@ mod tests {
 
     #[test]
     fn test_basic_file_header() {
-        let data = build_file_header(
-            flags::TIME_PRESENT | flags::CRC32_PRESENT,
-            1024,
-            0o644,
-            Some(1700000000),
-            Some(0xDEADBEEF),
-            0, // store, version 0, dict 128KB
-            1, // Unix
-            "test.txt",
-        );
+        let data = build_file_header(TestFileHeaderArgs {
+            file_flags: flags::TIME_PRESENT | flags::CRC32_PRESENT,
+            unpacked_size: 1024,
+            attributes: 0o644,
+            mtime: Some(1700000000),
+            crc32: Some(0xDEADBEEF),
+            comp_info: 0, // store, version 0, dict 128KB
+            host_os: 1,   // Unix
+            name: "test.txt",
+        });
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
         let data_offset = cursor.position();
@@ -251,7 +253,16 @@ mod tests {
 
     #[test]
     fn test_directory_entry() {
-        let data = build_file_header(flags::DIRECTORY, 0, 0o755, None, None, 0, 1, "subdir/");
+        let data = build_file_header(TestFileHeaderArgs {
+            file_flags: flags::DIRECTORY,
+            unpacked_size: 0,
+            attributes: 0o755,
+            mtime: None,
+            crc32: None,
+            comp_info: 0,
+            host_os: 1,
+            name: "subdir/",
+        });
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
         let data_offset = cursor.position();
@@ -265,16 +276,16 @@ mod tests {
 
     #[test]
     fn test_unknown_size() {
-        let data = build_file_header(
-            flags::UNPACKED_SIZE_UNKNOWN,
-            0xFFFFFFFFFFFFFFFF,
-            0,
-            None,
-            None,
-            0,
-            0,
-            "stream.dat",
-        );
+        let data = build_file_header(TestFileHeaderArgs {
+            file_flags: flags::UNPACKED_SIZE_UNKNOWN,
+            unpacked_size: 0xFFFFFFFFFFFFFFFF,
+            attributes: 0,
+            mtime: None,
+            crc32: None,
+            comp_info: 0,
+            host_os: 0,
+            name: "stream.dat",
+        });
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
         let data_offset = cursor.position();

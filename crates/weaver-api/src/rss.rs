@@ -1063,6 +1063,7 @@ mod tests {
             categories: vec![],
             retry: None,
             max_download_speed: None,
+            isp_bandwidth_cap: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }));

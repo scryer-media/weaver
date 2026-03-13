@@ -768,6 +768,9 @@ mod tests {
                         capture.speed_limits.lock().unwrap().push(bytes_per_sec);
                         let _ = reply.send(());
                     }
+                    SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
                     SchedulerCommand::RebuildNntp { reply, .. } => {
                         let _ = reply.send(());
                     }
@@ -820,6 +823,7 @@ mod tests {
             ],
             retry: None,
             max_download_speed: Some(1234),
+            isp_bandwidth_cap: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }
@@ -930,6 +934,7 @@ mod tests {
                 categories: vec![],
                 retry: None,
                 max_download_speed: None,
+                isp_bandwidth_cap: None,
                 cleanup_after_extract: Some(true),
                 config_path: None,
             })
@@ -947,6 +952,7 @@ mod tests {
                 categories: vec![],
                 retry: None,
                 max_download_speed: None,
+                isp_bandwidth_cap: None,
                 cleanup_after_extract: Some(true),
                 config_path: None,
             },
@@ -1001,6 +1007,7 @@ mod tests {
                 categories: vec![],
                 retry: None,
                 max_download_speed: None,
+                isp_bandwidth_cap: None,
                 cleanup_after_extract: Some(true),
                 config_path: None,
             })
@@ -1018,6 +1025,7 @@ mod tests {
                 categories: vec![],
                 retry: None,
                 max_download_speed: None,
+                isp_bandwidth_cap: None,
                 cleanup_after_extract: Some(true),
                 config_path: None,
             },

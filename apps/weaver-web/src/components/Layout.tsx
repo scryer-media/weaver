@@ -5,6 +5,7 @@ import {
   BarChart3,
   Clock3,
   FolderUp,
+  RefreshCw,
   ListOrdered,
   Menu,
   Monitor,
@@ -25,6 +26,7 @@ import { LiveDataContext } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import type { JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
+import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/SettingsLayout";
 import { Button } from "@/components/ui/button";
 import {
@@ -46,6 +48,18 @@ interface Snapshot {
   jobs: JobData[];
   metrics: { currentDownloadSpeed: number };
   isPaused: boolean;
+  downloadBlock: {
+    kind: "NONE" | "MANUAL_PAUSE" | "ISP_CAP";
+    capEnabled: boolean;
+    period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
+    usedBytes: number;
+    limitBytes: number;
+    remainingBytes: number;
+    reservedBytes: number;
+    windowStartsAtEpochMs?: number | null;
+    windowEndsAtEpochMs?: number | null;
+    timezoneName: string;
+  };
 }
 
 function ThemeToggle() {
@@ -101,6 +115,36 @@ function DisconnectBanner({
   );
 }
 
+function PwaUpdateBanner() {
+  const t = useTranslate();
+  const { updateAvailable, applyUpdate } = usePwa();
+
+  if (!updateAvailable) {
+    return null;
+  }
+
+  return (
+    <div className="fixed right-4 bottom-4 z-50 max-w-sm rounded-2xl border border-border/80 bg-background/95 p-4 shadow-[0_18px_60px_rgba(8,18,36,0.28)] backdrop-blur-md">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-foreground">
+            {t("pwa.updateTitle")}
+          </div>
+          <div className="mt-1 text-sm text-muted-foreground">
+            {t("pwa.updateBody")}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <Button size="sm" onClick={applyUpdate}>
+              <RefreshCw className="size-4" />
+              {t("pwa.reload")}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Layout() {
   const t = useTranslate();
   const location = useLocation();
@@ -144,6 +188,18 @@ export function Layout() {
       jobs: snapshot?.jobs ?? [],
       speed: snapshot?.metrics?.currentDownloadSpeed ?? 0,
       isPaused: snapshot?.isPaused ?? false,
+      downloadBlock: snapshot?.downloadBlock ?? {
+        kind: "NONE",
+        capEnabled: false,
+        period: null,
+        usedBytes: 0,
+        limitBytes: 0,
+        remainingBytes: 0,
+        reservedBytes: 0,
+        windowStartsAtEpochMs: null,
+        windowEndsAtEpochMs: null,
+        timezoneName: "",
+      },
       connection: {
         status: connectionState.status,
         isDisconnected: connectionState.status === "disconnected",
@@ -217,11 +273,13 @@ export function Layout() {
               <aside className="hidden border-r border-border/60 bg-background/90 md:flex md:flex-col">
                 <div className="flex items-center justify-between border-b border-border/60 px-4 py-4">
                   <div>
-                    <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
-                      Weaver
-                    </div>
-                    <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
-                      Queue Control
+                    <div>
+                      <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
+                        Weaver
+                      </div>
+                      <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                        Queue Control
+                      </div>
                     </div>
                   </div>
                   <ThemeToggle />
@@ -394,6 +452,7 @@ export function Layout() {
         </Sheet>
 
         <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
+        <PwaUpdateBanner />
       </div>
     </LiveDataContext.Provider>
   );

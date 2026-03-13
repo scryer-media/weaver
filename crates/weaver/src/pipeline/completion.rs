@@ -1556,14 +1556,16 @@ impl Pipeline {
 
                     match Self::extract_rar_member_to_output(
                         &mut archive,
-                        &volume_paths,
-                        &db,
-                        &event_tx,
-                        job_id,
-                        &set_name_for_task,
-                        &output_dir,
+                        crate::pipeline::extraction::RarExtractionContext::new(
+                            &volume_paths,
+                            &db,
+                            &event_tx,
+                            job_id,
+                            &set_name_for_task,
+                            &output_dir,
+                            &options,
+                        ),
                         idx,
-                        &options,
                     ) {
                         Ok((member_name, bytes_written, total_bytes)) => {
                             info!(job_id = job_id.0, member = %member_name, bytes_written, total_bytes, "member extracted");

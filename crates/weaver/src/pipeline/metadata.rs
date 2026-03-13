@@ -54,10 +54,10 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
-    pub(super) fn rar_volume_filename<'a>(
-        volume_map: &'a HashMap<String, u32>,
+    pub(super) fn rar_volume_filename(
+        volume_map: &HashMap<String, u32>,
         volume: u32,
-    ) -> Option<&'a str> {
+    ) -> Option<&str> {
         volume_map.iter().find_map(|(filename, volume_number)| {
             (*volume_number == volume).then_some(filename.as_str())
         })
@@ -560,11 +560,11 @@ impl Pipeline {
             let mut remapped = 0u32;
             for desc in par2_set.files.values_mut() {
                 let role = weaver_core::classify::FileRole::from_filename(&desc.filename);
-                if let weaver_core::classify::FileRole::RarVolume { volume_number } = role {
-                    if let Some(deobfuscated) = assembly_by_volume.get(&volume_number) {
-                        desc.filename = deobfuscated.clone();
-                        remapped += 1;
-                    }
+                if let weaver_core::classify::FileRole::RarVolume { volume_number } = role
+                    && let Some(deobfuscated) = assembly_by_volume.get(&volume_number)
+                {
+                    desc.filename = deobfuscated.clone();
+                    remapped += 1;
                 }
             }
 

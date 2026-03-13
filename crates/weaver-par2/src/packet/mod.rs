@@ -178,7 +178,7 @@ mod tests {
     fn make_creator_packet(creator: &str, rsid: [u8; 16]) -> Vec<u8> {
         // Pad creator to multiple of 4 for body alignment
         let mut body = creator.as_bytes().to_vec();
-        while body.len() % 4 != 0 {
+        while !body.len().is_multiple_of(4) {
             body.push(0);
         }
         make_full_packet(header::TYPE_CREATOR, &body, rsid)
