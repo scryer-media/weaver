@@ -1,10 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
+import { ChevronRight, FolderOpen, Loader2, MoveUp } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -17,6 +19,7 @@ import {
 } from "@/components/ui/table";
 import {
   ADD_CATEGORY_MUTATION,
+  BROWSE_DIRECTORIES_QUERY,
   CATEGORIES_QUERY,
   REMOVE_CATEGORY_MUTATION,
   UPDATE_CATEGORY_MUTATION,
@@ -34,6 +37,15 @@ type CategoryFormValues = {
   name: string;
   destDir: string;
   aliases: string;
+};
+
+type DirectoryBrowseResult = {
+  currentPath: string;
+  parentPath: string | null;
+  entries: Array<{
+    name: string;
+    path: string;
+  }>;
 };
 
 const defaultForm: CategoryFormValues = {
@@ -233,6 +245,8 @@ function CategoryFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browsePath, setBrowsePath] = useState<string | null>(null);
 
   useEffect(() => {
     setValues(initialValues);
@@ -254,10 +268,25 @@ function CategoryFormCard({
             />
           </Field>
           <Field label={t("categories.destDir")} description={t("categories.destDirDesc")}>
-            <Input
-              value={values.destDir}
-              onChange={(event) => setValues((current) => ({ ...current, destDir: event.target.value }))}
-            />
+            <div className="flex gap-2">
+              <Input
+                value={values.destDir}
+                onChange={(event) =>
+                  setValues((current) => ({ ...current, destDir: event.target.value }))
+                }
+              />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setBrowsePath(values.destDir.trim() || null);
+                  setBrowserOpen(true);
+                }}
+              >
+                <FolderOpen className="size-4" />
+                {t("categories.browse")}
+              </Button>
+            </div>
           </Field>
           <Field label={t("categories.aliases")} description={t("categories.aliasesDesc")}>
             <Input
@@ -267,6 +296,17 @@ function CategoryFormCard({
             />
           </Field>
         </div>
+
+        <DirectoryBrowserDialog
+          open={browserOpen}
+          path={browsePath}
+          onPathChange={setBrowsePath}
+          onClose={() => setBrowserOpen(false)}
+          onChoose={(nextPath) => {
+            setValues((current) => ({ ...current, destDir: nextPath }));
+            setBrowserOpen(false);
+          }}
+        />
 
         <div className="flex flex-wrap gap-3">
           <Button onClick={() => void onSave(values)} disabled={!values.name.trim()}>
@@ -278,6 +318,104 @@ function CategoryFormCard({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function DirectoryBrowserDialog({
+  open,
+  path,
+  onPathChange,
+  onClose,
+  onChoose,
+}: {
+  open: boolean;
+  path: string | null;
+  onPathChange: (path: string | null) => void;
+  onClose: () => void;
+  onChoose: (path: string) => void;
+}) {
+  const t = useTranslate();
+  const [{ data, fetching, error }] = useQuery<{ browseDirectories: DirectoryBrowseResult }>({
+    query: BROWSE_DIRECTORIES_QUERY,
+    variables: { path },
+    pause: !open,
+  });
+
+  const browser = data?.browseDirectories;
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
+      <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("categories.directoryBrowserTitle")}</DialogTitle>
+          <DialogDescription>{t("categories.directoryBrowserDesc")}</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+              {t("categories.currentFolder")}
+            </div>
+            <div className="mt-1 break-all text-sm text-foreground">
+              {browser?.currentPath ?? path ?? t("label.loading")}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => browser?.parentPath && onPathChange(browser.parentPath)}
+              disabled={!browser?.parentPath || fetching}
+            >
+              <MoveUp className="size-4" />
+              {t("categories.up")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => browser && onChoose(browser.currentPath)}
+              disabled={!browser || fetching}
+            >
+              {t("categories.useCurrentFolder")}
+            </Button>
+          </div>
+
+          <div className="max-h-[24rem] overflow-y-auto rounded-2xl border border-border/70 bg-background/70 p-2">
+            {fetching ? (
+              <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                {t("categories.directoryBrowserLoading")}
+              </div>
+            ) : error ? (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive">
+                {error.message}
+              </div>
+            ) : browser && browser.entries.length > 0 ? (
+              <div className="space-y-1">
+                {browser.entries.map((entry) => (
+                  <button
+                    key={entry.path}
+                    type="button"
+                    className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition hover:bg-accent/40"
+                    onClick={() => onPathChange(entry.path)}
+                  >
+                    <div className="flex min-w-0 items-center gap-3">
+                      <FolderOpen className="size-4 shrink-0 text-primary" />
+                      <span className="truncate text-foreground">{entry.name}</span>
+                    </div>
+                    <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="px-3 py-4 text-sm text-muted-foreground">
+                {t("categories.directoryBrowserEmpty")}
+              </div>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -1,4 +1,4 @@
-import { UploadCloud } from "lucide-react";
+import { UploadCloud, X } from "lucide-react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb } from "@/features/upload/hooks/use-upload-nzb";
 import { formatNzbNameForDisplay } from "@/lib/format-nzb-name";
@@ -43,6 +43,7 @@ export function UploadNzbForm({
     setPriority,
     handleDrop,
     handleFiles,
+    removeFile,
     openPicker,
     submit,
     onFileInputChange,
@@ -128,6 +129,17 @@ export function UploadNzbForm({
                 <div className="shrink-0 pt-0.5 text-xs text-muted-foreground">
                   {(file.size / 1024).toFixed(1)} KB
                 </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-8 shrink-0"
+                  onClick={() => removeFile(file)}
+                  aria-label={t("upload.removeFile")}
+                  title={t("upload.removeFile")}
+                >
+                  <X className="size-4" />
+                </Button>
               </div>
             ))}
           </div>

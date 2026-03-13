@@ -97,6 +97,19 @@ const CATEGORY_FIELDS = `
   }
 `;
 
+export const BROWSE_DIRECTORIES_QUERY = gql`
+  query BrowseDirectories($path: String) {
+    browseDirectories(path: $path) {
+      currentPath
+      parentPath
+      entries {
+        name
+        path
+      }
+    }
+  }
+`;
+
 const GENERAL_SETTINGS_FIELDS = `
   fragment GeneralSettingsFields on GeneralSettings {
     dataDir

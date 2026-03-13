@@ -225,6 +225,19 @@ pub struct CategoryInput {
     pub aliases: String,
 }
 
+#[derive(Debug, Clone, SimpleObject)]
+pub struct DirectoryBrowseEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct DirectoryBrowseResult {
+    pub current_path: String,
+    pub parent_path: Option<String>,
+    pub entries: Vec<DirectoryBrowseEntry>,
+}
+
 /// Result of testing a server connection.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct TestConnectionResult {

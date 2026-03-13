@@ -60,6 +60,20 @@ export function useUploadNzb(options?: {
     [t],
   );
 
+  const removeFile = useCallback((targetFile: File) => {
+    setError(null);
+    setFiles((currentFiles) =>
+      currentFiles.filter(
+        (file) =>
+          !(
+            file.name === targetFile.name &&
+            file.size === targetFile.size &&
+            file.lastModified === targetFile.lastModified
+          ),
+      ),
+    );
+  }, []);
+
   const handleDrop = useCallback(
     (event: DragEvent) => {
       event.preventDefault();
@@ -138,6 +152,7 @@ export function useUploadNzb(options?: {
     setPriority,
     handleDrop,
     handleFiles,
+    removeFile,
     openPicker: () => fileInputRef.current?.click(),
     submit,
     onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => {

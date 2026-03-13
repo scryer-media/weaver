@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use async_graphql::{Context, Object, Result};
 
 use weaver_core::config::SharedConfig;
@@ -6,14 +8,36 @@ use weaver_scheduler::SchedulerHandle;
 use crate::auth::AdminGuard;
 use crate::timeline::build_job_timeline;
 use crate::types::{
-    ApiKey, ApiKeyScope, Category, DownloadBlock, EventKind, GeneralSettings, Job, JobEvent,
-    JobStatusGql, JobTimeline, Metrics, RssFeed, RssSeenItem, Server,
+    ApiKey, ApiKeyScope, Category, DirectoryBrowseEntry, DirectoryBrowseResult, DownloadBlock,
+    EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, JobTimeline, Metrics, RssFeed,
+    RssSeenItem, Server,
 };
 
 pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    #[graphql(guard = "AdminGuard")]
+    async fn browse_directories(
+        &self,
+        ctx: &Context<'_>,
+        path: Option<String>,
+    ) -> Result<DirectoryBrowseResult> {
+        let config = ctx.data::<SharedConfig>()?;
+        let default_path = {
+            let cfg = config.read().await;
+            cfg.complete_dir()
+        };
+        let requested_path = path
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_path);
+
+        tokio::task::spawn_blocking(move || browse_directories(Path::new(&requested_path)))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+    }
+
     /// List jobs, optionally filtered by status, category, or metadata key.
     async fn jobs(
         &self,
@@ -242,4 +266,47 @@ impl QueryRoot {
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))
     }
+}
+
+fn browse_directories(path: &Path) -> Result<DirectoryBrowseResult> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| async_graphql::Error::new(format!("failed to read directory metadata: {e}")))?;
+    if !metadata.is_dir() {
+        return Err(async_graphql::Error::new("path is not a directory"));
+    }
+
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let entry_path = entry.path();
+            let metadata = std::fs::metadata(&entry_path).ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            Some(DirectoryBrowseEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path: entry_path.to_string_lossy().into_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let current_path = path.to_string_lossy().into_owned();
+    let parent_path = PathBuf::from(path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|parent| parent != &current_path);
+
+    Ok(DirectoryBrowseResult {
+        current_path,
+        parent_path,
+        entries,
+    })
 }
