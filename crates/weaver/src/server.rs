@@ -434,6 +434,7 @@ pub async fn run_server(
         .route("/admin/backup/export", post(backup_export_handler))
         .route("/admin/backup/inspect", post(backup_inspect_handler))
         .route("/admin/backup/restore", post(backup_restore_handler))
+        .route("/", get(static_handler))
         .fallback(get(static_handler))
         .layer(Extension(handle))
         .layer(Extension(schema))
@@ -444,12 +445,14 @@ pub async fn run_server(
     let app = if base_url.is_empty() {
         inner
     } else {
-        // Redirect bare path (e.g. /weaver) to trailing slash (e.g. /weaver/).
-        let redirect_target = format!("{base_url}/");
+        // The inner router's `.route("/", ...)` is hoisted as an exact match for
+        // `{base_url}` by axum's nest, but `{base_url}/` (trailing slash) falls
+        // through. Add an explicit redirect so both paths work.
+        let bare = base_url.clone();
         Router::new()
             .route(
-                &base_url,
-                get(move || async move { axum::response::Redirect::permanent(&redirect_target) }),
+                &format!("{base_url}/"),
+                get(move || async move { axum::response::Redirect::permanent(&bare) }),
             )
             .nest(&base_url, inner)
     };

@@ -1,46 +1,160 @@
-# Weaver
+<p align="center">
+  <img src="WeaverDark.png" alt="Weaver" width="200" />
+</p>
 
-A unified Usenet binary downloader, repair, and extraction engine written in pure Rust.
+<h1 align="center">Weaver</h1>
 
-Weaver replaces the traditional "download, repair, unpack" pipeline with an integrated job graph where all stages -- NNTP download, yEnc decode, article assembly, PAR2 verification/repair, and RAR extraction -- are orchestrated as a single coordinated workflow.
+<p align="center">
+  A modern, all-in-one Usenet downloader built in Rust.<br/>
+  Download, repair, and extract — in a single binary.
+</p>
 
-## Goals
+<p align="center">
+  <a href="https://github.com/scryer-media/weaver/releases"><img src="https://img.shields.io/github/v/release/scryer-media/weaver" alt="Release" /></a>
+  <a href="https://github.com/scryer-media/weaver/blob/main/LICENSE"><img src="https://img.shields.io/github/license/scryer-media/weaver" alt="License" /></a>
+  <a href="https://ghcr.io/scryer-media/weaver"><img src="https://img.shields.io/badge/container-ghcr.io-blue" alt="Container" /></a>
+</p>
 
-- **Single binary** -- no external `unrar`, `par2`, or other tools required
-- **Job graph scheduling** -- all stages are nodes in a dependency graph, not sequential phases
-- **Archive-aware downloading** -- prioritize first RAR volumes and PAR2 metadata; evaluate extraction readiness in real time
-- **Shared buffer pools** -- minimize copies and disk I/O across decode, verify, and extract stages
-- **Structured failure handling** -- every error is classified (corruption, missing volume, encryption, filesystem), not scraped from subprocess output
-- **Resumable state** -- crash recovery with deterministic replay from journaled checkpoints
-- **GraphQL API with subscriptions** -- real-time per-job and per-file lifecycle events with machine-readable status
+---
 
-## Architecture
+## What is Weaver?
 
+Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and RAR extraction — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
+
+Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver runs all stages concurrently. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
+
+### Key Features
+
+- **Single binary** — everything built in, no external dependencies to install
+- **Streaming extraction** — starts extracting files while still downloading
+- **Modern web UI** — responsive interface with real-time progress updates
+- **Multi-server support** — connect to multiple Usenet providers with priority and failover
+- **Built-in PAR2 repair** — automatic verification and repair without external tools
+- **Built-in RAR extraction** — handles RAR4 and RAR5 archives natively, including solid and encrypted archives
+- **RSS automation** — monitor feeds and auto-download with customizable rules
+- **Categories** — organize downloads with glob-based filename matching
+- **ISP bandwidth caps** — set monthly data limits with configurable billing windows
+- **API key security** — protect the web interface with authentication
+- **Reverse proxy ready** — first-class support for subpath hosting (e.g., `/weaver/`)
+- **Prometheus metrics** — monitor performance with your existing observability stack
+- **Backup & restore** — export and import your complete configuration
+- **Multi-arch Docker images** — runs on `amd64` and `arm64`
+
+## Quick Start with Docker
+
+The fastest way to run Weaver is with Docker Compose. Create a `docker-compose.yml`:
+
+```yaml
+services:
+  weaver:
+    image: ghcr.io/scryer-media/weaver:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - weaver-config:/data
+      - /path/to/downloads:/downloads
+
+volumes:
+  weaver-config:
 ```
-crates/
-  weaver/           # Binary entry point
-  weaver-core/      # Shared types, config, error types, buffer pools
-  weaver-nntp/      # NNTP protocol client
-  weaver-nzb/       # NZB XML parsing
-  weaver-yenc/      # yEnc decoding
-  weaver-assembly/  # Segment/file completeness tracking
-  weaver-par2/      # PAR2 verification and repair
-  weaver-rar/       # RAR decompression
-  weaver-scheduler/ # Global job graph and resource balancing
-  weaver-state/     # Persistent state store and journal
-  weaver-api/       # GraphQL API with subscriptions
 
-apps/
-  weaver-web/       # Vite + React 19 + Tailwind v4 frontend
-```
-
-## Building
+Then:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+docker compose up -d
 ```
+
+Open **http://localhost:9090** and you're ready to go.
+
+### Configuration
+
+Weaver stores its configuration and database in `/data` inside the container. Mount a volume or host directory there to persist settings across restarts.
+
+Set your download directory in **Settings > General** once the UI is running, or mount it as shown above.
+
+### Reverse Proxy (Subpath)
+
+To host Weaver at a subpath like `https://example.com/weaver/`:
+
+```yaml
+services:
+  weaver:
+    image: ghcr.io/scryer-media/weaver:latest
+    command: ["--config", "/data", "serve", "--port", "9090", "--base-url", "/weaver"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - weaver-config:/data
+      - /path/to/downloads:/downloads
+```
+
+Then configure your reverse proxy (nginx, Traefik, Caddy, etc.) to forward `/weaver/` to Weaver's port.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info` |
+
+## Building from Source
+
+Requires **Rust 1.94+** and **Node.js 25+**.
+
+```bash
+# Build the frontend
+cd apps/weaver-web && npm ci && npm run build && cd ../..
+
+# Build the binary
+cargo build --release
+
+# Run
+./target/release/weaver --config /path/to/data serve --port 9090
+```
+
+## How It Works
+
+Weaver models each download as a **job graph** — a directed acyclic graph where each stage (download, decode, verify, repair, extract) is a node with explicit dependencies. This replaces the rigid sequential pipeline of traditional downloaders with a flexible system that can:
+
+- Begin extraction as soon as volume 1 is ready, without waiting for the entire download
+- Prioritize downloading first archive volumes and PAR2 metadata
+- Start PAR2 verification while later segments are still arriving
+- Dynamically adjust concurrency based on system load
+
+The scheduler continuously evaluates what work can proceed, balancing disk I/O, network throughput, CPU usage, and memory across all active jobs.
+
+## Feature Comparison
+
+| Feature | Weaver | NZBGet | SABnzbd |
+|---------|:------:|:------:|:-------:|
+| Single binary (no external tools) | Yes | No | No |
+| Streaming extraction | Yes | No | No |
+| Built-in PAR2 repair | Yes | No (external `par2`) | No (external `par2`) |
+| Built-in RAR extraction | Yes | No (external `unrar`) | No (external `unrar`) |
+| Web interface | Yes | Yes | Yes |
+| Real-time updates (WebSocket) | Yes | Yes | Polling |
+| GraphQL API | Yes | No (XML-RPC / JSON-RPC) | No (REST) |
+| Multi-server support | Yes | Yes | Yes |
+| RSS automation | Yes | Yes | Yes |
+| Categories | Yes | Yes | Yes |
+| ISP bandwidth caps | Yes | No | No |
+| Prometheus metrics | Yes | No | No |
+| Reverse proxy subpath | Yes | Yes | Yes |
+| API authentication | Yes | Yes | Yes |
+| Backup & restore | Yes | No | No |
+| Docker multi-arch | Yes | Yes | Yes |
+| Written in | Rust | C++ | Python |
+| RAR5 support | Yes | Via `unrar` | Via `unrar` |
+| Encrypted archives | Yes | Via `unrar` | Via `unrar` |
+| Obfuscation handling | Planned | Yes | Yes |
+
+> **Note:** NZBGet has been discontinued by its original author. [NZBGet v24+](https://github.com/nzbgetcom/nzbget) is maintained by the community. SABnzbd is actively maintained.
+
+## API
+
+Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
+
+WebSocket subscriptions provide real-time push updates for job progress, server status, and system events.
 
 ## License
 
-GPLv3 -- see [LICENSE](LICENSE) for details.
+GPLv3 — see [LICENSE](LICENSE) for details.
