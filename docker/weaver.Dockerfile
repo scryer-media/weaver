@@ -14,4 +14,5 @@ VOLUME /data
 
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/usr/local/bin/weaver", "--config", "/data", "serve", "--port", "9090"]
+ENTRYPOINT ["/usr/local/bin/weaver"]
+CMD ["--config", "/data", "serve", "--port", "9090"]
