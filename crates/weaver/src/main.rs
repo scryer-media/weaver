@@ -98,7 +98,7 @@ async fn async_main() {
     // When --config points to a directory and data_dir is unset (fresh DB),
     // default data_dir to that directory. This is the common Docker pattern:
     //   weaver --config /data serve
-    if config.data_dir.is_empty() && !cli.config.extension().is_some_and(|e| e == "toml") {
+    if config.data_dir.is_empty() && cli.config.extension().is_none_or(|e| e != "toml") {
         let dir = cli.config.to_string_lossy().to_string();
         info!(data_dir = %dir, "defaulting data_dir to --config directory");
         config.data_dir = dir;
