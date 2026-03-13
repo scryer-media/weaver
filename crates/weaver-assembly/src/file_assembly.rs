@@ -11,7 +11,6 @@ pub struct FileAssembly {
     role: FileRole,
     total_segments: u32,
     total_bytes: u64,
-    segment_sizes: Vec<u32>,
     /// Cumulative byte offsets: cumulative_offsets[i] = sum of segment_sizes[0..i].
     cumulative_offsets: Vec<u64>,
 
@@ -59,7 +58,6 @@ impl FileAssembly {
             cumulative_offsets,
             received: bitvec![0; total_segments as usize],
             received_bytes: 0,
-            segment_sizes,
         }
     }
 
