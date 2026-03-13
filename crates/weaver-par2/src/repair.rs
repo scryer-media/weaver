@@ -329,14 +329,14 @@ pub fn reconstruct_and_write(
             // Per-coefficient region multiply: for each missing slice j and each
             // recovery buffer r, accumulate decode_matrix[j][r] * recovery[r]
             // into output[j]. This enables SIMD and improves cache access patterns.
-            for j in 0..n {
+            for (j, chunk_out) in chunk_output.iter_mut().enumerate() {
                 for (r, recovery) in recovery_buffers.iter().enumerate() {
                     let factor = plan.decode_matrix[j][r];
                     if factor != 0 {
                         crate::gf_simd::mul_acc_region(
                             factor,
                             &recovery[byte_start..byte_start + byte_len],
-                            &mut chunk_output[j],
+                            chunk_out,
                         );
                     }
                 }

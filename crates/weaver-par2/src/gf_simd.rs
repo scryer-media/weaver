@@ -89,7 +89,7 @@ pub fn precompute_mul_tables(factor: u16) -> MulTables {
 #[inline]
 pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
     assert_eq!(src.len(), dst.len(), "src and dst must have equal length");
-    assert!(src.len() % 2 == 0, "region length must be even");
+    assert!(src.len().is_multiple_of(2), "region length must be even");
 
     if factor == 0 || src.is_empty() {
         return;
