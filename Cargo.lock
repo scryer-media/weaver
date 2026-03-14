@@ -576,9 +576,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.56"
+version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
+checksum = "7a0dd1ca384932ff3641c8718a02769f1698e7563dc6974ffd03346116310423"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-api"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "age",
  "async-graphql",
@@ -3921,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-assembly"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bitvec",
  "serde_json",
@@ -3932,7 +3932,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3951,7 +3951,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nntp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "criterion",
@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes",
  "blake2",
@@ -4018,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-scheduler"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "serde",
@@ -4033,7 +4033,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-state"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "crc32fast",
  "rmp-serde",
@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "crc32fast",
  "thiserror 2.0.18",
