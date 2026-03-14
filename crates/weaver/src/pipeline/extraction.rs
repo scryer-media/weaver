@@ -201,9 +201,7 @@ impl Pipeline {
         let total_written = if chunks.len() == 1 {
             let chunk = &chunks[0];
             let size = std::fs::metadata(&chunk.temp_path)
-                .map_err(|e| {
-                    format!("failed to stat extraction chunk {}: {e}", chunk.temp_path)
-                })?
+                .map_err(|e| format!("failed to stat extraction chunk {}: {e}", chunk.temp_path))?
                 .len();
             std::fs::rename(&chunk.temp_path, out_path).map_err(|e| {
                 format!(
