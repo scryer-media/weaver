@@ -246,10 +246,10 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>
                         <div className="flex flex-wrap gap-2">
-                          <Button variant="ghost" size="sm" onClick={() => openEdit(server)}>
+                          <Button variant="outline" size="sm" onClick={() => openEdit(server)}>
                             {t("action.edit")}
                           </Button>
-                          <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(server.id)}>
+                          <Button variant="destructive" size="sm" onClick={() => setDeleteConfirmId(server.id)}>
                             {t("action.delete")}
                           </Button>
                         </div>

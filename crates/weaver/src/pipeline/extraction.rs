@@ -197,36 +197,21 @@ impl Pipeline {
             }
         }
 
-        let mut partial = std::io::BufWriter::with_capacity(
-            8 * 1024 * 1024,
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(partial_path)
+        // Fast path: single chunk → rename directly to final output, no copy needed.
+        let total_written = if chunks.len() == 1 {
+            let chunk = &chunks[0];
+            let size = std::fs::metadata(&chunk.temp_path)
                 .map_err(|e| {
-                    format!(
-                        "failed to create partial output {}: {e}",
-                        partial_path.display()
-                    )
-                })?,
-        );
-        let mut total_written = 0u64;
-        for chunk in chunks {
-            let mut chunk_file = std::io::BufReader::with_capacity(
-                8 * 1024 * 1024,
-                std::fs::File::open(&chunk.temp_path).map_err(|e| {
-                    format!("failed to open extraction chunk {}: {e}", chunk.temp_path)
-                })?,
-            );
-            let written = std::io::copy(&mut chunk_file, &mut partial).map_err(|e| {
+                    format!("failed to stat extraction chunk {}: {e}", chunk.temp_path)
+                })?
+                .len();
+            std::fs::rename(&chunk.temp_path, out_path).map_err(|e| {
                 format!(
-                    "failed to append extraction chunk {} to {}: {e}",
+                    "failed to rename single chunk {} to {}: {e}",
                     chunk.temp_path,
-                    partial_path.display()
+                    out_path.display()
                 )
             })?;
-            total_written += written;
             if let Err(error) =
                 db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
             {
@@ -239,40 +224,75 @@ impl Pipeline {
                     "failed to mark extraction chunk appended"
                 );
             }
-        }
-        partial.flush().map_err(|e| {
-            format!(
-                "failed to flush partial output {}: {e}",
-                partial_path.display()
-            )
-        })?;
-        let partial = partial.into_inner().map_err(|e| {
-            format!(
-                "failed to finalize partial output {}: {e}",
-                partial_path.display()
-            )
-        })?;
-        partial.sync_all().map_err(|e| {
-            format!(
-                "failed to sync partial output {}: {e}",
-                partial_path.display()
-            )
-        })?;
-        std::fs::rename(partial_path, out_path)
-            .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
-
-        for chunk in chunks {
-            match std::fs::remove_file(&chunk.temp_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed to remove extraction chunk {}: {error}",
-                        chunk.temp_path
-                    ));
+            size
+        } else {
+            let mut partial = std::io::BufWriter::with_capacity(
+                8 * 1024 * 1024,
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(partial_path)
+                    .map_err(|e| {
+                        format!(
+                            "failed to create partial output {}: {e}",
+                            partial_path.display()
+                        )
+                    })?,
+            );
+            let mut written_total = 0u64;
+            for chunk in chunks {
+                let mut chunk_file = std::io::BufReader::with_capacity(
+                    8 * 1024 * 1024,
+                    std::fs::File::open(&chunk.temp_path).map_err(|e| {
+                        format!("failed to open extraction chunk {}: {e}", chunk.temp_path)
+                    })?,
+                );
+                let written = std::io::copy(&mut chunk_file, &mut partial).map_err(|e| {
+                    format!(
+                        "failed to append extraction chunk {} to {}: {e}",
+                        chunk.temp_path,
+                        partial_path.display()
+                    )
+                })?;
+                written_total += written;
+                if let Err(error) =
+                    db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
+                {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name,
+                        member = member_name,
+                        volume = chunk.volume_index,
+                        error = %error,
+                        "failed to mark extraction chunk appended"
+                    );
                 }
             }
-        }
+            partial.flush().map_err(|e| {
+                format!(
+                    "failed to flush partial output {}: {e}",
+                    partial_path.display()
+                )
+            })?;
+            drop(partial);
+            std::fs::rename(partial_path, out_path)
+                .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
+
+            for chunk in chunks {
+                match std::fs::remove_file(&chunk.temp_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to remove extraction chunk {}: {error}",
+                            chunk.temp_path
+                        ));
+                    }
+                }
+            }
+            written_total
+        };
         match std::fs::remove_dir_all(chunk_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
