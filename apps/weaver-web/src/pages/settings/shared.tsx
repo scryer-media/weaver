@@ -115,7 +115,7 @@ export function BackupRestoreSection({
   const loadStatus = async () => {
     setStatusLoading(true);
     try {
-      const response = await fetch("/admin/backup/status", {
+      const response = await fetch(new URL("api/backup/status", document.baseURI).href, {
         headers: authHeaders(),
       });
       const payload = (await readJsonOrThrow(response)) as BackupStatusResponse;
@@ -133,7 +133,7 @@ export function BackupRestoreSection({
     setBackupError(null);
     setBackupMessage(null);
     try {
-      const response = await fetch("/admin/backup/export", {
+      const response = await fetch(new URL("api/backup/export", document.baseURI).href, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
@@ -174,7 +174,7 @@ export function BackupRestoreSection({
       if (restorePassword.trim()) {
         form.append("password", restorePassword.trim());
       }
-      const response = await fetch("/admin/backup/inspect", {
+      const response = await fetch(new URL("api/backup/inspect", document.baseURI).href, {
         method: "POST",
         headers: authHeaders(),
         body: form,
@@ -226,7 +226,7 @@ export function BackupRestoreSection({
         );
       }
 
-      const response = await fetch("/admin/backup/restore", {
+      const response = await fetch(new URL("api/backup/restore", document.baseURI).href, {
         method: "POST",
         headers: authHeaders(),
         body: form,

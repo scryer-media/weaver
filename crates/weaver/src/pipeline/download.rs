@@ -158,12 +158,23 @@ impl Pipeline {
         self.pending_decode = remaining;
     }
 
-    /// Dispatch downloads using job-sequential scheduling.
+    /// Dispatch downloads across eligible jobs with FIFO priority.
     ///
-    /// Picks the first job in `job_order` that is Downloading and serves only
-    /// its segments. Jobs are processed to completion before moving to the next.
-    /// Within a job, primary data fills connections first, recovery blocks use
-    /// spare capacity.
+    /// Iterates `job_order` and fills connections greedily: the first eligible
+    /// job gets first pick of connections, the next job fills the remainder, etc.
+    /// A job is eligible if it is `Downloading` with queued segments, or in a
+    /// post-processing state (`Extracting`/`Verifying`/`Repairing`) with
+    /// promoted recovery segments in its download queue.
+    ///
+    /// This enables two key behaviors:
+    /// - **Prefetch**: when the primary job enters extraction, the next job
+    ///   immediately inherits all connections.
+    /// - **Tail overlap**: when the primary job has fewer queued segments than
+    ///   available connections, the next job fills the spare slots.
+    ///
+    /// When a bandwidth cap is enabled and within 15% of exhaustion, reverts
+    /// to single-job dispatch to avoid wasting scarce remaining quota on
+    /// lower-priority work.
     pub(super) fn dispatch_downloads(&mut self) {
         if self.global_paused || self.rate_limiter.should_wait() {
             return;
@@ -187,23 +198,35 @@ impl Pipeline {
         let tuner_max = params.max_concurrent_downloads;
         let max = tuner_max.min(self.connection_ramp);
 
-        // Find the active job: first in job_order with Downloading status
-        // that still has work to do. Skip jobs whose queues are empty
-        // (they're waiting on retries or are effectively done).
-        let active_id = self
+        // When the bandwidth cap is within 15% of exhaustion, revert to
+        // single-job dispatch so remaining quota goes to the highest-priority job.
+        let cap_tight = self.bandwidth_cap.cap_enabled()
+            && self.bandwidth_cap.remaining_bytes() <= self.bandwidth_cap.limit_bytes() * 15 / 100;
+
+        // Collect eligible jobs in FIFO order. Earlier jobs get first pick of
+        // connections; later jobs fill whatever remains.
+        let eligible: Vec<JobId> = self
             .job_order
             .iter()
-            .find(|id| {
-                self.jobs.get(id).is_some_and(|s| {
-                    s.status == JobStatus::Downloading
-                        && (!s.download_queue.is_empty() || !s.recovery_queue.is_empty())
+            .filter(|id| {
+                self.jobs.get(id).is_some_and(|s| match s.status {
+                    JobStatus::Downloading => !s.download_queue.is_empty(),
+                    // Post-processing jobs may have promoted recovery segments.
+                    JobStatus::Extracting | JobStatus::Verifying | JobStatus::Repairing => {
+                        !s.download_queue.is_empty()
+                    }
+                    _ => false,
                 })
             })
-            .copied();
+            .copied()
+            .take(if cap_tight { 1 } else { usize::MAX })
+            .collect();
 
-        if let Some(job_id) = active_id {
-            // Phase 1: Primary segments (from download_queue).
-            // Recovery segments promoted for targeted repair also land here.
+        for job_id in eligible {
+            if self.active_downloads >= max || self.rate_limiter.should_wait() {
+                break;
+            }
+
             while self.active_downloads < max {
                 if self.rate_limiter.should_wait() {
                     break;
@@ -233,14 +256,17 @@ impl Pipeline {
                                     .to_download_block_state(self.global_paused)
                             });
                         }
-                        break;
+                        // Bandwidth cap is the bottleneck — stop all dispatch.
+                        self.update_queue_metrics();
+                        return;
                     }
                     Err(error) => {
                         error!(error = %error, "failed to reserve ISP bandwidth for dispatch");
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             state.download_queue.push(work);
                         }
-                        break;
+                        self.update_queue_metrics();
+                        return;
                     }
                 }
                 let estimate = work.byte_estimate as u64;
@@ -248,11 +274,6 @@ impl Pipeline {
                 self.spawn_download(work, is_recovery);
                 self.rate_limiter.consume(estimate);
             }
-
-            // Recovery files are NOT downloaded proactively. They are only
-            // downloaded when CRC failures trigger targeted recovery promotion, which
-            // moves needed recovery segments from recovery_queue into
-            // download_queue (handled by Phase 1 above).
         }
 
         self.update_queue_metrics();

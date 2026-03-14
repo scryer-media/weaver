@@ -10,6 +10,7 @@ import { ParsedReleaseDetails } from "@/components/ParsedReleaseDetails";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Table,
   TableBody,
@@ -61,6 +62,7 @@ export function JobDetail() {
   const [events, setEvents] = useState<EventEntry[]>([]);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteFiles, setDeleteFiles] = useState(false);
   const [lastLiveJob, setLastLiveJob] = useState<(typeof liveJobs)[number] | null>(null);
   const [polledData, setPolledData] = useState<typeof data>();
   const seededRef = useRef(false);
@@ -319,6 +321,28 @@ export function JobDetail() {
         </CardContent>
       </Card>
 
+      {job.metadata.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>{t("job.metadata")}</CardTitle>
+          </CardHeader>
+          <CardContent className="px-0 pb-0">
+            <Table>
+              <TableBody>
+                {job.metadata.map((entry: { key: string; value: string }) => (
+                  <TableRow key={entry.key}>
+                    <TableCell className="w-1/3 text-xs font-medium text-muted-foreground">
+                      {formatMetadataKey(entry.key)}
+                    </TableCell>
+                    <TableCell className="text-sm">{entry.value}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      ) : null}
+
       <PipelineTimelineCard timeline={timeline} />
 
       <Card>
@@ -388,11 +412,17 @@ export function JobDetail() {
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}
         onConfirm={() => {
-          void deleteHistory({ id: job.id }).then(() => navigate("/history"));
+          void deleteHistory({ id: job.id, deleteFiles }).then(() => navigate("/history"));
           setShowDeleteConfirm(false);
+          setDeleteFiles(false);
         }}
-        onCancel={() => setShowDeleteConfirm(false)}
-      />
+        onCancel={() => { setShowDeleteConfirm(false); setDeleteFiles(false); }}
+      >
+        <label className="flex items-center gap-2">
+          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <span className="text-sm">{t("confirm.deleteFiles")}</span>
+        </label>
+      </ConfirmDialog>
     </div>
   );
 }
@@ -422,3 +452,10 @@ function healthColor(health: number): string {
   if (health >= 950) return "text-amber-600 dark:text-amber-300";
   return "text-red-600 dark:text-red-300";
 }
+
+/** Strip vendor prefixes (e.g. `*scryer_`) and humanize key names. */
+function formatMetadataKey(key: string): string {
+  const stripped = key.replace(/^\*\w+_/, "");
+  return stripped.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+

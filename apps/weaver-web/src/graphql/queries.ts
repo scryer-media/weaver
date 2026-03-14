@@ -417,8 +417,8 @@ export const REPROCESS_JOB_MUTATION = gql`
 `;
 
 export const DELETE_HISTORY_MUTATION = gql`
-  mutation DeleteHistory($id: Int!) {
-    deleteHistory(id: $id) {
+  mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {
+    deleteHistory(id: $id, deleteFiles: $deleteFiles) {
       ...HistoryJobFields
     }
   }
@@ -428,8 +428,8 @@ export const DELETE_HISTORY_MUTATION = gql`
 `;
 
 export const DELETE_ALL_HISTORY_MUTATION = gql`
-  mutation DeleteAllHistory {
-    deleteAllHistory {
+  mutation DeleteAllHistory($deleteFiles: Boolean) {
+    deleteAllHistory(deleteFiles: $deleteFiles) {
       ...HistoryJobFields
     }
   }

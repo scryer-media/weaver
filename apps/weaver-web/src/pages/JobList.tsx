@@ -1,13 +1,14 @@
 import { Fragment, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDown, ChevronRight, Pause, Play, X } from "lucide-react";
-import { useMutation } from "urql";
+import { useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
+  SERVERS_QUERY,
   SET_SPEED_LIMIT_MUTATION,
 } from "@/graphql/queries";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -163,6 +164,9 @@ function formatResetAt(epochMs?: number | null) {
 }
 
 export function JobList() {
+  const [serversResult] = useQuery({ query: SERVERS_QUERY });
+  const hasNoServers = (serversResult.data?.servers?.length ?? 1) === 0;
+
   const { jobs: allJobs, speed, isPaused, downloadBlock } = useLiveData();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
   const blockedJobs = jobs.filter((job) => isBlockedByGlobalPause(job, isPaused)).length;
@@ -299,6 +303,29 @@ export function JobList() {
               <Button onClick={() => void resumeAll({})}>
                 <Play className="size-4" />
                 {t("action.resumeAll")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {hasNoServers ? (
+        <Card className="border-destructive/40 bg-destructive/8">
+          <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="destructive">{t("jobs.noServersBadge")}</Badge>
+                <span className="text-sm font-medium text-foreground">
+                  {t("jobs.noServersTitle")}
+                </span>
+              </div>
+              <div className="text-sm text-muted-foreground">
+                {t("jobs.noServersBody")}
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button asChild variant="outline">
+                <Link to="/settings/servers">{t("jobs.noServersAction")}</Link>
               </Button>
             </div>
           </CardContent>

@@ -9,6 +9,7 @@ import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   Table,
@@ -53,6 +54,7 @@ export function History() {
   const [jobs, setJobs] = useState<HistoryJob[]>([]);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
+  const [deleteFiles, setDeleteFiles] = useState(false);
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [search, setSearch] = useState("");
 
@@ -323,12 +325,18 @@ export function History() {
         cancelLabel={t("confirm.deleteHistoryDismiss")}
         onConfirm={() => {
           if (deleteConfirmId != null) {
-            void deleteHistory({ id: deleteConfirmId });
+            void deleteHistory({ id: deleteConfirmId, deleteFiles });
           }
           setDeleteConfirmId(null);
+          setDeleteFiles(false);
         }}
-        onCancel={() => setDeleteConfirmId(null)}
-      />
+        onCancel={() => { setDeleteConfirmId(null); setDeleteFiles(false); }}
+      >
+        <label className="flex items-center gap-2">
+          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <span className="text-sm">{t("confirm.deleteFiles")}</span>
+        </label>
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={deleteAllConfirm}
@@ -337,11 +345,17 @@ export function History() {
         confirmLabel={t("confirm.deleteAllHistoryConfirm")}
         cancelLabel={t("confirm.deleteAllHistoryDismiss")}
         onConfirm={() => {
-          void deleteAllHistory({});
+          void deleteAllHistory({ deleteFiles });
           setDeleteAllConfirm(false);
+          setDeleteFiles(false);
         }}
-        onCancel={() => setDeleteAllConfirm(false)}
-      />
+        onCancel={() => { setDeleteAllConfirm(false); setDeleteFiles(false); }}
+      >
+        <label className="flex items-center gap-2">
+          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <span className="text-sm">{t("confirm.deleteFiles")}</span>
+        </label>
+      </ConfirmDialog>
     </div>
   );
 }

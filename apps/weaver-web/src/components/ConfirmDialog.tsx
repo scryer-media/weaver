@@ -16,6 +16,7 @@ interface ConfirmDialogProps {
   cancelLabel?: string;
   onConfirm: () => void;
   onCancel: () => void;
+  children?: React.ReactNode;
 }
 
 export function ConfirmDialog({
@@ -26,6 +27,7 @@ export function ConfirmDialog({
   cancelLabel,
   onConfirm,
   onCancel,
+  children,
 }: ConfirmDialogProps) {
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onCancel() : undefined)}>
@@ -34,6 +36,7 @@ export function ConfirmDialog({
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{message}</DialogDescription>
         </DialogHeader>
+        {children}
         <DialogFooter>
           <Button variant="ghost" onClick={onCancel}>
             {cancelLabel ?? "Cancel"}

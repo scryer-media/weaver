@@ -271,7 +271,7 @@ export default defineConfig({
         target: BACKEND_ORIGIN,
         ws: true,
       },
-      "/admin": {
+      "/api": {
         target: BACKEND_ORIGIN,
       },
     },

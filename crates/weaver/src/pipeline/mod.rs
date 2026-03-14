@@ -729,13 +729,23 @@ impl Pipeline {
                 let result = self.reprocess_job(job_id).await;
                 let _ = reply.send(result);
             }
-            SchedulerCommand::DeleteHistory { job_id, reply } => {
+            SchedulerCommand::DeleteHistory {
+                job_id,
+                delete_files,
+                reply,
+            } => {
                 let history_cleanup_dirs = match self.history_cleanup_dirs_for_job(job_id).await {
                     Ok(dirs) => dirs,
                     Err(error) => {
                         let _ = reply.send(Err(error));
                         return;
                     }
+                };
+                // Collect the output dir before we remove the job from memory.
+                let output_dir = if delete_files {
+                    self.output_dir_for_job(job_id).await
+                } else {
+                    None
                 };
                 let result = match self.jobs.get(&job_id).map(|state| state.status.clone()) {
                     Some(status) if !is_terminal_status(&status) => {
@@ -751,6 +761,7 @@ impl Pipeline {
                             let _ = reply.send(Err(error));
                             return;
                         }
+                        self.cleanup_output_dir(output_dir.as_deref()).await;
                         self.purge_terminal_job_runtime(job_id);
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
@@ -769,6 +780,7 @@ impl Pipeline {
                             let _ = reply.send(Err(error));
                             return;
                         }
+                        self.cleanup_output_dir(output_dir.as_deref()).await;
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
                         let delete_result =
@@ -799,7 +811,10 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
-            SchedulerCommand::DeleteAllHistory { reply } => {
+            SchedulerCommand::DeleteAllHistory {
+                delete_files,
+                reply,
+            } => {
                 let history_cleanup_dirs = match self.all_history_cleanup_dirs().await {
                     Ok(dirs) => dirs,
                     Err(error) => {
@@ -813,6 +828,12 @@ impl Pipeline {
                 {
                     let _ = reply.send(Err(error));
                     return;
+                }
+                if delete_files {
+                    let output_dirs = self.all_output_dirs().await;
+                    for dir in &output_dirs {
+                        self.cleanup_output_dir(Some(dir)).await;
+                    }
                 }
                 let terminal_job_ids: Vec<JobId> = self
                     .jobs
@@ -941,6 +962,74 @@ impl Pipeline {
         }
 
         Ok(())
+    }
+
+    /// Get the output directory for a single job (from memory or DB).
+    async fn output_dir_for_job(&self, job_id: JobId) -> Option<PathBuf> {
+        // Try in-memory finished_jobs first.
+        if let Some(dir) = self
+            .finished_jobs
+            .iter()
+            .find(|j| j.job_id == job_id)
+            .and_then(|j| j.output_dir.as_ref())
+        {
+            return Some(PathBuf::from(dir));
+        }
+        // Try in-memory job state.
+        if let Some(state) = self.jobs.get(&job_id) {
+            return Some(state.working_dir.clone());
+        }
+        // Fall back to DB history row.
+        let db = self.db.clone();
+        let row = tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
+            .await
+            .ok()?
+            .ok()?;
+        row.and_then(|r| r.output_dir).map(PathBuf::from)
+    }
+
+    /// Collect output directories for all history jobs.
+    async fn all_output_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        for job in &self.finished_jobs {
+            if let Some(dir) = &job.output_dir {
+                dirs.push(PathBuf::from(dir));
+            }
+        }
+        let db = self.db.clone();
+        if let Ok(Ok(rows)) = tokio::task::spawn_blocking(move || {
+            db.list_job_history(&weaver_state::HistoryFilter::default())
+        })
+        .await
+        {
+            for row in rows {
+                if let Some(dir) = row.output_dir {
+                    let path = PathBuf::from(&dir);
+                    if !dirs.contains(&path) {
+                        dirs.push(path);
+                    }
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Delete an output directory, logging warnings on failure.
+    async fn cleanup_output_dir(&self, dir: Option<&std::path::Path>) {
+        let Some(dir) = dir else { return };
+        match tokio::fs::remove_dir_all(dir).await {
+            Ok(()) => {
+                info!(dir = %dir.display(), "removed complete output directory");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "failed to remove complete output directory"
+                );
+            }
+        }
     }
 
     /// Wait for in-flight work to finish during shutdown.
@@ -2838,7 +2927,11 @@ mod tests {
 
         let (reply, recv) = oneshot::channel();
         pipeline
-            .handle_command(SchedulerCommand::DeleteHistory { job_id, reply })
+            .handle_command(SchedulerCommand::DeleteHistory {
+                job_id,
+                delete_files: false,
+                reply,
+            })
             .await;
         tokio::time::timeout(Duration::from_secs(1), recv)
             .await
@@ -2891,7 +2984,10 @@ mod tests {
 
         let (reply, recv) = oneshot::channel();
         pipeline
-            .handle_command(SchedulerCommand::DeleteAllHistory { reply })
+            .handle_command(SchedulerCommand::DeleteAllHistory {
+                delete_files: false,
+                reply,
+            })
             .await;
         tokio::time::timeout(Duration::from_secs(1), recv)
             .await

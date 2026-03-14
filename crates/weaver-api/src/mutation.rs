@@ -137,9 +137,14 @@ impl MutationRoot {
 
     /// Delete a completed/failed/cancelled job from history.
     /// Returns the remaining history jobs after deletion.
-    async fn delete_history(&self, ctx: &Context<'_>, id: u64) -> Result<Vec<Job>> {
+    async fn delete_history(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        #[graphql(default = false)] delete_files: bool,
+    ) -> Result<Vec<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.delete_history(JobId(id)).await?;
+        handle.delete_history(JobId(id), delete_files).await?;
 
         let jobs = handle
             .list_jobs()
@@ -157,9 +162,13 @@ impl MutationRoot {
     }
 
     /// Delete all completed/failed/cancelled jobs from history.
-    async fn delete_all_history(&self, ctx: &Context<'_>) -> Result<Vec<Job>> {
+    async fn delete_all_history(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = false)] delete_files: bool,
+    ) -> Result<Vec<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.delete_all_history().await?;
+        handle.delete_all_history(delete_files).await?;
         Ok(history_jobs_from_handle(handle))
     }
 

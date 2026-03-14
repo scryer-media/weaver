@@ -190,10 +190,12 @@ pub enum SchedulerCommand {
     /// Delete a completed/failed/cancelled job from history.
     DeleteHistory {
         job_id: JobId,
+        delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Delete all completed/failed/cancelled jobs from history.
     DeleteAllHistory {
+        delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Shutdown the scheduler gracefully.
@@ -339,20 +341,31 @@ impl SchedulerHandle {
     }
 
     /// Delete a completed/failed/cancelled job from history.
-    pub async fn delete_history(&self, job_id: JobId) -> Result<(), SchedulerError> {
+    pub async fn delete_history(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::DeleteHistory { job_id, reply: tx })
+            .send(SchedulerCommand::DeleteHistory {
+                job_id,
+                delete_files,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     /// Delete all completed/failed/cancelled jobs from history.
-    pub async fn delete_all_history(&self) -> Result<(), SchedulerError> {
+    pub async fn delete_all_history(&self, delete_files: bool) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::DeleteAllHistory { reply: tx })
+            .send(SchedulerCommand::DeleteAllHistory {
+                delete_files,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -661,7 +674,7 @@ mod tests {
                     SchedulerCommand::DeleteHistory { reply, .. } => {
                         let _ = reply.send(Ok(()));
                     }
-                    SchedulerCommand::DeleteAllHistory { reply } => {
+                    SchedulerCommand::DeleteAllHistory { reply, .. } => {
                         let _ = reply.send(Ok(()));
                     }
                     SchedulerCommand::ReprocessJob { job_id, reply } => {

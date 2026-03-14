@@ -48,6 +48,7 @@ const en: LocaleDictionary = {
   "confirm.deleteHistoryMessage": "This job and its events will be permanently removed.",
   "confirm.deleteHistoryConfirm": "Delete",
   "confirm.deleteHistoryDismiss": "Keep",
+  "confirm.deleteFiles": "Also delete downloaded files from disk",
   "confirm.deleteAllHistory": "Delete all history?",
   "confirm.deleteAllHistoryMessage": "All completed and failed jobs will be permanently removed.",
   "confirm.deleteAllHistoryConfirm": "Delete All",
@@ -98,6 +99,10 @@ const en: LocaleDictionary = {
   "jobs.bandwidthCapOpenSettings": "Open General Settings",
   "jobs.bandwidthCapShort": "ISP cap",
   "jobs.bandwidthCapEta": "Until {{resetAt}}",
+  "jobs.noServersBadge": "No Servers",
+  "jobs.noServersTitle": "No download servers configured",
+  "jobs.noServersBody": "Downloads will not start until at least one Usenet server is added. Add a server in settings to get started.",
+  "jobs.noServersAction": "Go to Server Settings",
 
   // Table headers
   "table.name": "Name",
@@ -115,6 +120,7 @@ const en: LocaleDictionary = {
   "job.notFound": "Job not found.",
   "job.passwordProtected": "Password protected",
   "job.eventLog": "Event Log",
+  "job.metadata": "Metadata",
   "job.savedBandwidthSkipped": "Skipped unneeded PAR2 recovery download",
   "job.savedBandwidthUsedAll": "All optional PAR2 recovery was needed",
   "job.savedBandwidthLegacy": "This older job completed successfully, but recovery-savings details were not recorded yet.",
