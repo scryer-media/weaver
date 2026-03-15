@@ -216,11 +216,12 @@ fn decode_block_symbols(
         if sym < 256 {
             // Literal — try to batch with previous item.
             if let Some(DecodedItem::Literals { bytes, count }) = items.last_mut()
-                && (*count as usize) < 7 {
-                    *count += 1;
-                    bytes[*count as usize] = sym as u8;
-                    continue;
-                }
+                && (*count as usize) < 7
+            {
+                *count += 1;
+                bytes[*count as usize] = sym as u8;
+                continue;
+            }
             items.push(DecodedItem::Literals {
                 bytes: {
                     let mut b = [0u8; 8];

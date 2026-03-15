@@ -98,7 +98,9 @@ impl HuffmanTable {
         if max_length == 0 {
             let quick_bits = if num_symbols >= HUFF_NC {
                 MAX_QUICK_BITS
-            } else { MAX_QUICK_BITS.saturating_sub(3) };
+            } else {
+                MAX_QUICK_BITS.saturating_sub(3)
+            };
             return Ok(Self {
                 decode_len: [0; 16],
                 decode_pos: [0; 16],
