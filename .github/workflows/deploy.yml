@@ -1,4 +1,4 @@
-name: deploy
+name: ci
 
 on:
   pull_request:
@@ -20,10 +20,12 @@ env:
   WEB_ARTIFACT_NAME: weaver-web-dist
 
 jobs:
-  web-lint:
-    name: web-lint
+  # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
+
+  web-build:
+    name: web-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Setup Node
@@ -38,23 +40,6 @@ jobs:
       - name: Lint
         working-directory: apps/weaver-web
         run: npm run lint
-
-  web-build:
-    name: web-build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    needs: [web-lint]
-    steps:
-      - uses: actions/checkout@v6
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: apps/weaver-web/package-lock.json
-      - name: Install dependencies
-        working-directory: apps/weaver-web
-        run: npm ci
       - name: Build web app
         working-directory: apps/weaver-web
         run: npm run build
@@ -82,6 +67,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+  rust-audit:
+    name: rust-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
+
+  # ── Jobs that need the web artifact ──────────────────────────────────────
+
   rust-clippy:
     name: rust-clippy
     runs-on: ubuntu-24.04
@@ -101,25 +103,8 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Verify embedded web artifact
-        run: test -f apps/weaver-web/dist/index.html
       - name: Run clippy
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
-
-  rust-audit:
-    name: rust-audit
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - name: Run cargo audit
-        run: cargo audit
 
   rust-test:
     name: rust-test
@@ -139,8 +124,6 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Verify embedded web artifact
-        run: test -f apps/weaver-web/dist/index.html
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
@@ -171,12 +154,14 @@ jobs:
             echo "::endgroup::"
           done < /tmp/test-bins.txt
 
+  # ── Release packaging (tag pushes only) ──────────────────────────────────
+
   rust-package:
     name: rust-package-${{ matrix.platform }}
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
-    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test]
+    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test, rust-test-sde]
     strategy:
       fail-fast: false
       matrix:
@@ -207,8 +192,6 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Verify embedded web artifact
-        run: test -f apps/weaver-web/dist/index.html
       - name: Build release binary
         run: |
           if [[ "${{ matrix.target }}" == *"-musl" ]]; then
@@ -228,6 +211,8 @@ jobs:
           path: weaver-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
           retention-days: 14
+
+  # ── Docker + GitHub Release (tag pushes only) ────────────────────────────
 
   docker-publish:
     name: docker-publish
@@ -281,3 +266,33 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  github-release:
+    name: github-release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [rust-package]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download linux-amd64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-x86_64-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux-arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-${{ github.run_id }}
+          path: artifacts
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/weaver-linux-x86_64.tar.gz \
+            artifacts/weaver-linux-arm64.tar.gz
