@@ -129,7 +129,12 @@ pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
     }
 
     // Extract four 8×8 sub-matrices and pack into GFNI format.
-    // GFNI format: row r stored at byte (7-r), column c at bit (7-c).
+    //
+    // GFNI gf2p8affineqb computes: result_bit[i] = popcount(row_i AND input) mod 2
+    // where row_i is byte (7-i) of the matrix qword (row 0 at MSB byte).
+    // The AND operates on matching bit positions: bit j of row ANDs with bit j
+    // of input. In our le byte representation, bit 0 = LSB = GF bit 0.
+    // So matrix column for GF input bit `col` maps to bit `col` in the row byte.
     let pack = |input_shift: usize, output_shift: usize| -> u64 {
         let mut matrix: u64 = 0;
         for row in 0..8u32 {
@@ -138,7 +143,7 @@ pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
             for col in 0..8u32 {
                 let input_bit = input_shift as u32 + col;
                 if (cols[input_bit as usize] >> output_bit) & 1 == 1 {
-                    row_byte |= 1 << (7 - col);
+                    row_byte |= 1 << col;
                 }
             }
             matrix |= (row_byte as u64) << ((7 - row) * 8);
@@ -253,12 +258,13 @@ pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) 
         assert_eq!(fd.dst.len(), len, "all dst slices must match src length");
     }
 
-    // Note: the GFNI multi-region kernel (mul_acc_multi_region_gfni_avx2) is
-    // disabled due to a correctness bug under Intel SDE Ice Lake emulation.
-    // The single-region fallback below still uses GFNI via mul_acc_region,
-    // so we retain hardware acceleration — just without the multi-region
-    // batching optimization. See weaver-v0.1.11 CI for the failure.
-    // TODO: debug and re-enable the multi-region GFNI kernel.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            unsafe { mul_acc_multi_region_gfni_avx2(factors_and_dsts, src) };
+            return;
+        }
+    }
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -1293,18 +1299,14 @@ mod tests {
                 let in_hi = (input >> 8) as u8;
 
                 // Simulate gf2p8affineqb: for each output bit j,
-                // output[j] = XOR over k of (A[j][k] * x[k])
-                // where A[j][k] = bit (7-k) of byte (7-j) in the matrix u64.
+                // output[j] = popcount(row_j AND input_byte) mod 2
+                // where row_j is byte (7-j) of the matrix u64.
+                // The AND operates on matching bit positions.
                 let apply_matrix = |matrix: u64, byte: u8| -> u8 {
                     let mut result: u8 = 0;
                     for j in 0..8u32 {
                         let row_byte = (matrix >> ((7 - j) * 8)) as u8;
-                        let mut dot = 0u32;
-                        for k in 0..8u32 {
-                            let a_jk = (row_byte >> (7 - k)) & 1;
-                            let x_k = (byte >> k) & 1;
-                            dot ^= (a_jk as u32) & (x_k as u32);
-                        }
+                        let dot = (row_byte & byte).count_ones() & 1;
                         result |= (dot as u8) << j;
                     }
                     result
