@@ -7,7 +7,16 @@
 //! dst[i] ^= gf_mul(src[i], factor)    for each u16 word i
 //! ```
 //!
-//! Uses the **split-nibble shuffle** algorithm:
+//! Three kernel families, selected at runtime by CPU capability:
+//!
+//! ## GFNI affine (Ice Lake+ / Zen 4+)
+//!
+//! GF(2^16) multiplication is linear over GF(2), so it's a 16×16 binary matrix.
+//! Split into four 8×8 sub-matrices and apply with `gf2p8affineqb`, which does
+//! 8×8 binary matrix × byte in a single instruction. 4 affine transforms + 2 XORs
+//! replace 8 PSHUFB + 4 nibble extractions + 6 XORs — roughly half the instructions.
+//!
+//! ## Split-nibble shuffle (SSSE3 / AVX2 / NEON)
 //!
 //! 1. Precompute 8 tables of 16 bytes each. Each table maps a 4-bit nibble of
 //!    the input to its contribution to one byte of the 16-bit product.
@@ -15,6 +24,10 @@
 //! 3. For each nibble, do a PSHUFB/VTBL lookup. XOR the 4 contributions for
 //!    the result low byte and the 4 for the result high byte.
 //! 4. Reinterleave and XOR-accumulate into the destination.
+//!
+//! ## Scalar
+//!
+//! One word at a time via log/antilog tables.
 
 use crate::gf;
 
@@ -77,6 +90,71 @@ pub fn precompute_mul_tables(factor: u16) -> MulTables {
     MulTables { tables, factor }
 }
 
+/// Precomputed 8×8 binary affine matrices for GFNI-accelerated GF(2^16) multiply.
+///
+/// GF(2^16) multiplication by a fixed factor is a linear map over GF(2),
+/// representable as a 16×16 binary matrix. We partition it into four 8×8
+/// sub-matrices:
+///
+/// ```text
+/// [result_lo]   [m_ll  m_lh] [input_lo]
+/// [result_hi] = [m_hl  m_hh] [input_hi]
+/// ```
+///
+/// Each 8×8 matrix is packed into a `u64` in the format expected by
+/// `gf2p8affineqb`: byte 7 = row 0, bit 7 of each byte = column 0.
+pub struct AffineMulMatrices {
+    /// Maps input low byte → output low byte.
+    pub m_ll: u64,
+    /// Maps input high byte → output low byte.
+    pub m_lh: u64,
+    /// Maps input low byte → output high byte.
+    pub m_hl: u64,
+    /// Maps input high byte → output high byte.
+    pub m_hh: u64,
+    /// The original factor, for scalar tail processing.
+    pub factor: u16,
+}
+
+/// Build the four 8×8 affine matrices for a given GF(2^16) factor.
+///
+/// For each input bit position, we evaluate `gf_mul(factor, 1 << bit)` and
+/// record which output bits are set. The result is packed into the GFNI
+/// row-major format.
+pub fn precompute_affine_matrices(factor: u16) -> AffineMulMatrices {
+    // Build the full 16×16 binary matrix: column `bit` = gf_mul(factor, 1 << bit).
+    let mut cols = [0u16; 16];
+    for bit in 0..16u32 {
+        cols[bit as usize] = gf::mul(factor, 1 << bit);
+    }
+
+    // Extract four 8×8 sub-matrices and pack into GFNI format.
+    // GFNI format: row r stored at byte (7-r), column c at bit (7-c).
+    let pack = |input_shift: usize, output_shift: usize| -> u64 {
+        let mut matrix: u64 = 0;
+        for row in 0..8u32 {
+            let output_bit = output_shift as u32 + row;
+            let mut row_byte: u8 = 0;
+            for col in 0..8u32 {
+                let input_bit = input_shift as u32 + col;
+                if (cols[input_bit as usize] >> output_bit) & 1 == 1 {
+                    row_byte |= 1 << (7 - col);
+                }
+            }
+            matrix |= (row_byte as u64) << ((7 - row) * 8);
+        }
+        matrix
+    };
+
+    AffineMulMatrices {
+        m_ll: pack(0, 0),
+        m_lh: pack(8, 0),
+        m_hl: pack(0, 8),
+        m_hh: pack(8, 8),
+        factor,
+    }
+}
+
 /// Multiply each u16 word in `src` by `factor` in GF(2^16) and XOR-accumulate
 /// into `dst`.
 ///
@@ -101,6 +179,15 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
             *d ^= *s;
         }
         return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            let matrices = precompute_affine_matrices(factor);
+            unsafe { mul_acc_region_gfni_avx2(&matrices, src, dst) };
+            return;
+        }
     }
 
     let tables = precompute_mul_tables(factor);
@@ -137,6 +224,78 @@ fn mul_acc_region_scalar(factor: u16, src: &[u8], dst: &mut [u8]) {
         let bytes = result.to_le_bytes();
         dst[w * 2] = bytes[0];
         dst[w * 2 + 1] = bytes[1];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GFNI + AVX2 kernel: 32 bytes (16 GF elements) per iteration
+//
+// Uses gf2p8affineqb to apply 8×8 binary matrix transforms instead of
+// PSHUFB nibble lookups. Each 16-bit GF multiply decomposes into:
+//
+//   result_lo = affine(input_lo, M_ll) XOR affine(input_hi, M_lh)
+//   result_hi = affine(input_lo, M_hl) XOR affine(input_hi, M_hh)
+//
+// This is 4 affine + 2 XOR vs. 8 PSHUFB + 4 AND + 4 SRLI + 6 XOR in the
+// split-nibble approach — roughly half the instructions per element.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+    let mut offset = 0usize;
+
+    unsafe {
+        // Broadcast each 8×8 matrix (u64) into all four 64-bit lanes of a __m256i.
+        let m_ll = _mm256_set1_epi64x(matrices.m_ll as i64);
+        let m_lh = _mm256_set1_epi64x(matrices.m_lh as i64);
+        let m_hl = _mm256_set1_epi64x(matrices.m_hl as i64);
+        let m_hh = _mm256_set1_epi64x(matrices.m_hh as i64);
+
+        // Deinterleave masks (same as AVX2 shuffle kernel — per 128-bit lane).
+        let deint_lo_128 =
+            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 =
+            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
+        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+
+        while offset + 32 <= len {
+            let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let d = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+
+            // Deinterleave within each 128-bit lane: separate lo and hi bytes.
+            let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
+            let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+
+            // Apply four 8×8 affine transforms.
+            let result_lo = _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+            );
+            let result_hi = _mm256_xor_si256(
+                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
+                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+            );
+
+            // Reinterleave within each lane.
+            let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+
+            // XOR-accumulate.
+            let result = _mm256_xor_si256(d, product);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
+
+            offset += 32;
+        }
+    }
+
+    // Tail: fall through to SSSE3 for remaining 16-byte chunk + scalar.
+    if offset < len {
+        let tables = precompute_mul_tables(matrices.factor);
+        unsafe { mul_acc_region_ssse3(&tables, &src[offset..], &mut dst[offset..]) };
     }
 }
 
@@ -485,6 +644,51 @@ mod tests {
             mul_acc_region(factor, &src, &mut dst_dispatched);
             mul_acc_region_scalar(factor, &src, &mut dst_scalar);
             assert_eq!(dst_dispatched, dst_scalar, "mismatch for size={size}");
+        }
+    }
+
+    #[test]
+    fn affine_matrices_match_scalar() {
+        // Verify the affine matrix precomputation produces correct results
+        // by checking against scalar gf::mul for a range of factors.
+        for factor in [2u16, 0x1234, 0xABCD, 0xFFFF, 0x8000, 0x0001] {
+            let matrices = precompute_affine_matrices(factor);
+
+            // For each possible input byte pair, verify the matrix multiplication
+            // matches the scalar result.
+            for input in [0u16, 1, 0xFF, 0x100, 0xFFFF, 0x1234, 0x8000, 0x5555] {
+                let expected = gf::mul(factor, input);
+                let in_lo = (input & 0xFF) as u8;
+                let in_hi = (input >> 8) as u8;
+
+                // Simulate gf2p8affineqb: for each output bit j,
+                // output[j] = XOR over k of (A[j][k] * x[k])
+                // where A[j][k] = bit (7-k) of byte (7-j) in the matrix u64.
+                let apply_matrix = |matrix: u64, byte: u8| -> u8 {
+                    let mut result: u8 = 0;
+                    for j in 0..8u32 {
+                        let row_byte = (matrix >> ((7 - j) * 8)) as u8;
+                        let mut dot = 0u32;
+                        for k in 0..8u32 {
+                            let a_jk = (row_byte >> (7 - k)) & 1;
+                            let x_k = (byte >> k) & 1;
+                            dot ^= (a_jk as u32) & (x_k as u32);
+                        }
+                        result |= (dot as u8) << j;
+                    }
+                    result
+                };
+
+                let result_lo = apply_matrix(matrices.m_ll, in_lo) ^ apply_matrix(matrices.m_lh, in_hi);
+                let result_hi = apply_matrix(matrices.m_hl, in_lo) ^ apply_matrix(matrices.m_hh, in_hi);
+                let result = result_lo as u16 | ((result_hi as u16) << 8);
+
+                assert_eq!(
+                    result, expected,
+                    "affine matrix mismatch for factor={factor:#06x}, input={input:#06x}: \
+                     got {result:#06x}, expected {expected:#06x}"
+                );
+            }
         }
     }
 
