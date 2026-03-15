@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
+memchr = { workspace = true }

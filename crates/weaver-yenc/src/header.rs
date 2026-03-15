@@ -42,24 +42,25 @@ fn find_line_start(input: &[u8], prefix: &[u8]) -> Option<usize> {
     None
 }
 
-/// Simple memchr for LF byte.
+/// Find first LF byte using SIMD-accelerated memchr.
 fn memchr_lf(haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == b'\n')
+    memchr::memchr(b'\n', haystack)
 }
 
 /// Find the end of the current line (position of \r\n or \n).
 /// Returns the index of the line terminator start, and the index after the full terminator.
 fn line_end(input: &[u8], start: usize) -> (usize, usize) {
-    for i in start..input.len() {
-        if input[i] == b'\n' {
-            if i > start && input[i - 1] == b'\r' {
-                return (i - 1, i + 1);
-            }
-            return (i, i + 1);
+    if let Some(rel) = memchr::memchr(b'\n', &input[start..]) {
+        let i = start + rel;
+        if i > start && input[i - 1] == b'\r' {
+            (i - 1, i + 1)
+        } else {
+            (i, i + 1)
         }
+    } else {
+        // No line terminator found; line extends to end of input.
+        (input.len(), input.len())
     }
-    // No line terminator found; line extends to end of input.
-    (input.len(), input.len())
 }
 
 /// Convert bytes to a string, trying UTF-8 first, falling back to Latin-1.

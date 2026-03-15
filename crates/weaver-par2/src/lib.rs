@@ -18,6 +18,7 @@ pub mod error;
 pub mod gf;
 pub mod gf_simd;
 pub mod matrix;
+pub mod md5_simd;
 pub mod packet;
 pub mod par2_set;
 pub mod placement;
@@ -32,7 +33,7 @@ pub use checksum::{FileHashState, SliceChecksumState};
 pub use disk::{DiskFileAccess, MultiDirectoryFileAccess, PlacementFileAccess};
 pub use error::{Par2Error, Result};
 pub use gf::{add as gf_add, input_slice_constants, inv as gf_inv, mul as gf_mul, pow as gf_pow};
-pub use gf_simd::mul_acc_region;
+pub use gf_simd::{FactorDst, mul_acc_multi_region, mul_acc_region};
 pub use matrix::{Matrix, build_decode_matrix};
 pub use packet::{
     CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, Packet, PacketHeader, PacketType,

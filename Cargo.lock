@@ -4054,6 +4054,7 @@ name = "weaver-yenc"
 version = "0.1.10"
 dependencies = [
  "crc32fast",
+ "memchr",
  "thiserror 2.0.18",
 ]
 

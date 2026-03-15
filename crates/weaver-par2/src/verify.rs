@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use crate::checksum::{self, SliceChecksumState};
+use crate::checksum;
 use crate::par2_set::Par2FileSet;
 use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
 
@@ -228,31 +228,57 @@ pub fn verify_slices(
 
     let file_data = access.read_file(file_id).ok()?;
 
-    let results: Vec<bool> = checksums
-        .par_iter()
+    // Process slices in batches of 4 for multi-buffer MD5.
+    let mut results = vec![false; checksums.len()];
+
+    results
+        .par_chunks_mut(4)
         .enumerate()
-        .map(|(i, expected)| {
-            let offset = i as u64 * slice_size;
-            let end = ((offset + slice_size) as usize).min(file_data.len());
-            if offset as usize >= file_data.len() {
-                return false;
+        .for_each(|(chunk_idx, result_chunk)| {
+            let base = chunk_idx * 4;
+            let batch_size = result_chunk.len();
+
+            // Gather slice data and compute CRC32 per-slice.
+            let mut slice_refs: Vec<&[u8]> = Vec::with_capacity(batch_size);
+            let mut crcs: Vec<u32> = Vec::with_capacity(batch_size);
+            let mut any_needs_pad = false;
+
+            for j in 0..batch_size {
+                let i = base + j;
+                let offset = i as u64 * slice_size;
+                let end = ((offset + slice_size) as usize).min(file_data.len());
+                if offset as usize >= file_data.len() {
+                    slice_refs.push(&[]);
+                    crcs.push(0);
+                    continue;
+                }
+                let data = &file_data[offset as usize..end];
+                slice_refs.push(data);
+
+                // CRC32 with zero-padding for partial last slice.
+                let pad_len = slice_size.saturating_sub(data.len() as u64);
+                if pad_len > 0 {
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(data);
+                    hasher.update(&vec![0u8; pad_len as usize]);
+                    crcs.push(hasher.finalize());
+                    any_needs_pad = true;
+                } else {
+                    crcs.push(checksum::crc32(data));
+                }
             }
 
-            let slice_data = &file_data[offset as usize..end];
-            let mut state = SliceChecksumState::new();
-            state.update(slice_data);
+            // Multi-buffer MD5 for the batch.
+            let pad_to = if any_needs_pad { Some(slice_size) } else { None };
+            let md5s = crate::md5_simd::md5_multi(&slice_refs, pad_to);
 
-            // Pad last slice if needed
-            let pad_to = if (slice_data.len() as u64) < slice_size {
-                Some(slice_size)
-            } else {
-                None
-            };
-            let (crc, md5) = state.finalize(pad_to);
-
-            crc == expected.crc32 && md5 == expected.md5
-        })
-        .collect();
+            // Compare.
+            for j in 0..batch_size {
+                let i = base + j;
+                result_chunk[j] =
+                    crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
+            }
+        });
 
     Some(results)
 }
@@ -507,7 +533,7 @@ pub fn verify_selected_file_ids_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checksum;
+    use crate::checksum::{self, SliceChecksumState};
     use crate::packet::header;
     use crate::par2_set::Par2FileSet;
     use crate::types::SliceChecksum;

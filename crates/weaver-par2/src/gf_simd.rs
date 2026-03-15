@@ -214,6 +214,62 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
     mul_acc_region_scalar(factor, src, dst);
 }
 
+/// Multiply each u16 word in `src` by multiple factors and XOR-accumulate into
+/// corresponding destination buffers.
+///
+/// For each factor/dst pair, computes `dst[i] ^= gf_mul(src[i], factor)`.
+/// Reads `src` once per SIMD chunk and applies all factors, reducing memory
+/// bandwidth compared to calling `mul_acc_region` in a loop.
+///
+/// Pairs where `factor == 0` are skipped. All dst slices must have the same
+/// length as `src`, and that length must be even.
+///
+/// # Panics
+///
+/// Panics if any `dst` length differs from `src`, or if lengths are odd.
+pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    let len = src.len();
+    assert!(len.is_multiple_of(2), "region length must be even");
+
+    // Filter out zero factors.
+    // (We can't actually filter the slice in place, so just skip in the loop.)
+    if src.is_empty() {
+        return;
+    }
+
+    for fd in factors_and_dsts.iter() {
+        assert_eq!(fd.dst.len(), len, "all dst slices must match src length");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            unsafe { mul_acc_multi_region_gfni_avx2(factors_and_dsts, src) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { mul_acc_multi_region_neon(factors_and_dsts, src) };
+        return;
+    }
+
+    // Fallback: call single-region for each factor.
+    #[allow(unreachable_code)]
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor != 0 {
+            mul_acc_region(fd.factor, src, fd.dst);
+        }
+    }
+}
+
+/// A (factor, destination) pair for multi-region multiply-accumulate.
+pub struct FactorDst<'a> {
+    pub factor: u16,
+    pub dst: &'a mut [u8],
+}
+
 /// Scalar fallback: one word at a time using gf::mul + gf::add.
 fn mul_acc_region_scalar(factor: u16, src: &[u8], dst: &mut [u8]) {
     let word_count = src.len() / 2;
@@ -554,6 +610,210 @@ unsafe fn mul_acc_region_neon(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-region GFNI + AVX2 kernel
+//
+// Reads src once per 32-byte chunk, applies all factors to all destinations.
+// Processes factors in batches of 4 (16 matrix registers fit in 16 YMM regs
+// alongside the deinterleave constants and source data).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+
+    // Precompute affine matrices for all non-zero factors.
+    let all_matrices: Vec<(AffineMulMatrices, usize)> = factors_and_dsts
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
+        .map(|(idx, fd)| (precompute_affine_matrices(fd.factor), idx))
+        .collect();
+
+    // Handle factor=1 (XOR-only) destinations.
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    if all_matrices.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let deint_lo_128 =
+            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 =
+            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
+        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+
+        let mut offset = 0usize;
+        while offset + 32 <= len {
+            let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
+            let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
+            let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+
+            for &(ref matrices, dst_idx) in &all_matrices {
+                let d = _mm256_loadu_si256(
+                    factors_and_dsts[dst_idx].dst.as_ptr().add(offset) as *const __m256i,
+                );
+
+                let m_ll = _mm256_set1_epi64x(matrices.m_ll as i64);
+                let m_lh = _mm256_set1_epi64x(matrices.m_lh as i64);
+                let m_hl = _mm256_set1_epi64x(matrices.m_hl as i64);
+                let m_hh = _mm256_set1_epi64x(matrices.m_hh as i64);
+
+                let result_lo = _mm256_xor_si256(
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+                );
+                let result_hi = _mm256_xor_si256(
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+                );
+
+                let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+                let result = _mm256_xor_si256(d, product);
+                _mm256_storeu_si256(
+                    factors_and_dsts[dst_idx].dst.as_mut_ptr().add(offset) as *mut __m256i,
+                    result,
+                );
+            }
+
+            offset += 32;
+        }
+
+        // Tail: scalar for remaining bytes.
+        if offset < len {
+            for &(ref matrices, dst_idx) in &all_matrices {
+                mul_acc_region_scalar(
+                    matrices.factor,
+                    &src[offset..],
+                    &mut factors_and_dsts[dst_idx].dst[offset..],
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-region NEON kernel (aarch64)
+//
+// Reads src once per 16-byte chunk, applies all factors to all destinations.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::aarch64::*;
+
+    let len = src.len();
+
+    // Precompute shuffle tables for all non-zero/non-one factors.
+    let all_tables: Vec<(MulTables, usize)> = factors_and_dsts
+        .iter()
+        .enumerate()
+        .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
+        .map(|(idx, fd)| (precompute_mul_tables(fd.factor), idx))
+        .collect();
+
+    // Handle factor=1 (XOR-only) destinations.
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    if all_tables.is_empty() {
+        return;
+    }
+
+    // Pre-load all table sets into NEON registers.
+    struct NeonTableSet {
+        t: [uint8x16_t; 8],
+        dst_idx: usize,
+    }
+
+    let table_sets: Vec<NeonTableSet> = unsafe {
+        all_tables
+            .iter()
+            .map(|(tables, dst_idx)| NeonTableSet {
+                t: [
+                    vld1q_u8(tables.tables[0].as_ptr()),
+                    vld1q_u8(tables.tables[1].as_ptr()),
+                    vld1q_u8(tables.tables[2].as_ptr()),
+                    vld1q_u8(tables.tables[3].as_ptr()),
+                    vld1q_u8(tables.tables[4].as_ptr()),
+                    vld1q_u8(tables.tables[5].as_ptr()),
+                    vld1q_u8(tables.tables[6].as_ptr()),
+                    vld1q_u8(tables.tables[7].as_ptr()),
+                ],
+                dst_idx: *dst_idx,
+            })
+            .collect()
+    };
+
+    unsafe {
+        let mask_0f = vdupq_n_u8(0x0F);
+        let mut offset = 0usize;
+
+        while offset + 16 <= len {
+            let s = vld1q_u8(src.as_ptr().add(offset));
+
+            // Deinterleave once, reuse for all factors.
+            let lo_bytes = vuzp1q_u8(s, s);
+            let hi_bytes = vuzp2q_u8(s, s);
+            let lo_n0 = vandq_u8(lo_bytes, mask_0f);
+            let lo_n1 = vandq_u8(vshrq_n_u8(lo_bytes, 4), mask_0f);
+            let hi_n0 = vandq_u8(hi_bytes, mask_0f);
+            let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
+
+            for ts in &table_sets {
+                let d = vld1q_u8(factors_and_dsts[ts.dst_idx].dst.as_ptr().add(offset));
+
+                let p0_lo = vqtbl1q_u8(ts.t[0], lo_n0);
+                let p0_hi = vqtbl1q_u8(ts.t[1], lo_n0);
+                let p1_lo = vqtbl1q_u8(ts.t[2], lo_n1);
+                let p1_hi = vqtbl1q_u8(ts.t[3], lo_n1);
+                let p2_lo = vqtbl1q_u8(ts.t[4], hi_n0);
+                let p2_hi = vqtbl1q_u8(ts.t[5], hi_n0);
+                let p3_lo = vqtbl1q_u8(ts.t[6], hi_n1);
+                let p3_hi = vqtbl1q_u8(ts.t[7], hi_n1);
+
+                let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
+                let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
+                let product = vzip1q_u8(result_lo, result_hi);
+                let result = veorq_u8(d, product);
+                vst1q_u8(
+                    factors_and_dsts[ts.dst_idx].dst.as_mut_ptr().add(offset),
+                    result,
+                );
+            }
+
+            offset += 16;
+        }
+
+        // Scalar tail.
+        if offset < len {
+            for (tables, dst_idx) in &all_tables {
+                mul_acc_region_scalar(
+                    tables.factor,
+                    &src[offset..],
+                    &mut factors_and_dsts[*dst_idx].dst[offset..],
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +983,71 @@ mod tests {
             assert_eq!(
                 dst_dispatched, dst_scalar,
                 "mismatch for factor={factor:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_region_matches_single_region() {
+        let src: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
+        let factors = [0x1234u16, 0xBEEF, 0x0001, 0x0000, 0xFFFF, 0x8000];
+
+        // Compute reference with single-region calls.
+        let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x55u8; 256]).collect();
+        for (i, &factor) in factors.iter().enumerate() {
+            mul_acc_region(factor, &src, &mut reference[i]);
+        }
+
+        // Compute with multi-region.
+        let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x55u8; 256]).collect();
+        {
+            let mut pairs: Vec<FactorDst<'_>> = factors
+                .iter()
+                .zip(multi.iter_mut())
+                .map(|(&factor, dst)| FactorDst {
+                    factor,
+                    dst: dst.as_mut_slice(),
+                })
+                .collect();
+            mul_acc_multi_region(&mut pairs, &src);
+        }
+
+        for (i, &factor) in factors.iter().enumerate() {
+            assert_eq!(
+                multi[i], reference[i],
+                "multi-region mismatch for factor={factor:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_region_large_buffer() {
+        // Test with larger buffer to exercise SIMD main loop + tail.
+        let src: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+        let factors = [0xABCDu16, 0x1234, 0x5678];
+
+        let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0xAAu8; 8192]).collect();
+        for (i, &factor) in factors.iter().enumerate() {
+            mul_acc_region(factor, &src, &mut reference[i]);
+        }
+
+        let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0xAAu8; 8192]).collect();
+        {
+            let mut pairs: Vec<FactorDst<'_>> = factors
+                .iter()
+                .zip(multi.iter_mut())
+                .map(|(&factor, dst)| FactorDst {
+                    factor,
+                    dst: dst.as_mut_slice(),
+                })
+                .collect();
+            mul_acc_multi_region(&mut pairs, &src);
+        }
+
+        for (i, &factor) in factors.iter().enumerate() {
+            assert_eq!(
+                multi[i], reference[i],
+                "multi-region large mismatch for factor={factor:#06x}"
             );
         }
     }

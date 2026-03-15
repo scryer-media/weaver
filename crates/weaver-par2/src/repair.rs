@@ -326,19 +326,30 @@ pub fn reconstruct_and_write(
 
             let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; byte_len]; n];
 
-            // Per-coefficient region multiply: for each missing slice j and each
-            // recovery buffer r, accumulate decode_matrix[j][r] * recovery[r]
-            // into output[j]. This enables SIMD and improves cache access patterns.
-            for (j, chunk_out) in chunk_output.iter_mut().enumerate() {
-                for (r, recovery) in recovery_buffers.iter().enumerate() {
-                    let factor = plan.decode_matrix[j][r];
-                    if factor != 0 {
-                        crate::gf_simd::mul_acc_region(
-                            factor,
-                            &recovery[byte_start..byte_start + byte_len],
-                            chunk_out,
-                        );
-                    }
+            // Transposed loop: iterate recovery buffers in the outer loop so each
+            // buffer is loaded into cache once and reused for all N output slices.
+            // Uses multi-region kernel to read src once per SIMD chunk across all
+            // destinations. GF addition is commutative — accumulation order doesn't
+            // matter.
+            for (r, recovery) in recovery_buffers.iter().enumerate() {
+                let src = &recovery[byte_start..byte_start + byte_len];
+                let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> = chunk_output
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(j, chunk_out)| {
+                        let factor = plan.decode_matrix[j][r];
+                        if factor != 0 {
+                            Some(crate::gf_simd::FactorDst {
+                                factor,
+                                dst: chunk_out.as_mut_slice(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    crate::gf_simd::mul_acc_multi_region(&mut pairs, src);
                 }
             }
 
