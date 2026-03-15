@@ -20,6 +20,11 @@ pub struct JobAssembly {
 pub enum ArchiveType {
     Rar,
     SevenZip,
+    Zip,
+    Tar,
+    TarGz,
+    Gz,
+    Split,
 }
 
 /// Archive topology for extraction readiness.

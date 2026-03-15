@@ -17,6 +17,16 @@ pub enum FileRole {
     SevenZipArchive,
     /// 7z split file: `.7z.001`, `.7z.002`, etc. (0-indexed).
     SevenZipSplit { number: u32 },
+    /// ZIP archive (`.zip`).
+    ZipArchive,
+    /// tar archive (`.tar`).
+    TarArchive,
+    /// Gzipped tar archive (`.tar.gz`, `.tgz`).
+    TarGzArchive,
+    /// Gzipped single file (`.gz`, but not `.tar.gz`).
+    GzArchive,
+    /// Plain split file (`.001`, `.002`, etc.). 0-indexed: `.001` = number 0.
+    SplitFile { number: u32 },
     /// Standalone file (not part of an archive).
     Standalone,
     /// Could not determine role from filename.
@@ -54,6 +64,32 @@ impl FileRole {
             return role;
         }
 
+        // ZIP detection
+        if lower.ends_with(".zip") {
+            return FileRole::ZipArchive;
+        }
+
+        // tar.gz / tgz detection (must be before .gz and .tar checks)
+        if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+            return FileRole::TarGzArchive;
+        }
+
+        // tar detection
+        if lower.ends_with(".tar") {
+            return FileRole::TarArchive;
+        }
+
+        // gz detection (single-file gzip, not tar.gz — already caught above)
+        if lower.ends_with(".gz") {
+            return FileRole::GzArchive;
+        }
+
+        // Plain split files: .001, .002, ... .999
+        // Must not match .7z.001 (already caught by parse_7z_file above)
+        if let Some(role) = parse_split_file(&lower) {
+            return role;
+        }
+
         // Known non-archive extensions -> standalone
         if is_standalone_extension(&lower) {
             return FileRole::Standalone;
@@ -74,9 +110,14 @@ impl FileRole {
             FileRole::Par2 { is_index: true, .. } => 0,
             FileRole::RarVolume { volume_number: 0 } => 1,
             FileRole::SevenZipArchive => 2,
+            FileRole::ZipArchive => 3,
+            FileRole::TarArchive => 3,
+            FileRole::TarGzArchive => 3,
+            FileRole::GzArchive => 3,
+            FileRole::Standalone => 5,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
             FileRole::SevenZipSplit { number } => 10 + *number,
-            FileRole::Standalone => 5,
+            FileRole::SplitFile { number } => 10 + *number,
             FileRole::Unknown => 50,
             FileRole::Par2 {
                 is_index: false, ..
@@ -167,6 +208,25 @@ fn parse_7z_file(lower: &str) -> Option<FileRole> {
     None
 }
 
+/// Parse plain split file from filename (.001, .002, etc.).
+///
+/// Only matches purely numeric 3-digit extensions. Must be called after
+/// `parse_7z_file` to avoid matching `.7z.001` files.
+fn parse_split_file(lower: &str) -> Option<FileRole> {
+    if let Some(dot_pos) = lower.rfind('.') {
+        let ext = &lower[dot_pos + 1..];
+        if ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = ext.parse::<u32>() {
+                // .001 = number 0, .002 = number 1
+                return Some(FileRole::SplitFile {
+                    number: n.saturating_sub(1),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Extract the archive set base name from a filename and its role.
 ///
 /// Groups files that belong to the same archive set. For example:
@@ -202,6 +262,19 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
             } else if lower.len() >= 4 {
                 // Old style: .r00, .s00
                 Some(filename[..filename.len() - 4].to_string())
+            } else {
+                Some(filename.to_string())
+            }
+        }
+        // Single-file archives: the filename IS the base name.
+        FileRole::ZipArchive
+        | FileRole::TarArchive
+        | FileRole::TarGzArchive
+        | FileRole::GzArchive => Some(filename.to_string()),
+        // Split files: strip the .NNN extension.
+        FileRole::SplitFile { .. } => {
+            if let Some(dot_pos) = filename.rfind('.') {
+                Some(filename[..dot_pos].to_string())
             } else {
                 Some(filename.to_string())
             }
@@ -409,6 +482,91 @@ mod tests {
         assert_eq!(
             archive_base_name("movie.r00", &FileRole::RarVolume { volume_number: 1 }),
             Some("movie".into())
+        );
+    }
+
+    #[test]
+    fn zip_archive() {
+        assert_eq!(FileRole::from_filename("archive.zip"), FileRole::ZipArchive);
+        assert_eq!(FileRole::from_filename("Movie.ZIP"), FileRole::ZipArchive);
+    }
+
+    #[test]
+    fn tar_archive() {
+        assert_eq!(FileRole::from_filename("backup.tar"), FileRole::TarArchive);
+        assert_eq!(FileRole::from_filename("data.TAR"), FileRole::TarArchive);
+    }
+
+    #[test]
+    fn tar_gz_archive() {
+        assert_eq!(
+            FileRole::from_filename("backup.tar.gz"),
+            FileRole::TarGzArchive
+        );
+        assert_eq!(
+            FileRole::from_filename("data.tgz"),
+            FileRole::TarGzArchive
+        );
+        assert_eq!(
+            FileRole::from_filename("Archive.TAR.GZ"),
+            FileRole::TarGzArchive
+        );
+    }
+
+    #[test]
+    fn gz_archive() {
+        assert_eq!(FileRole::from_filename("file.gz"), FileRole::GzArchive);
+        assert_eq!(FileRole::from_filename("data.GZ"), FileRole::GzArchive);
+        // .tar.gz should NOT match GzArchive
+        assert_ne!(
+            FileRole::from_filename("backup.tar.gz"),
+            FileRole::GzArchive
+        );
+    }
+
+    #[test]
+    fn split_files() {
+        assert_eq!(
+            FileRole::from_filename("movie.mkv.001"),
+            FileRole::SplitFile { number: 0 }
+        );
+        assert_eq!(
+            FileRole::from_filename("movie.mkv.002"),
+            FileRole::SplitFile { number: 1 }
+        );
+        assert_eq!(
+            FileRole::from_filename("movie.mkv.010"),
+            FileRole::SplitFile { number: 9 }
+        );
+        // .7z.001 should NOT match SplitFile (caught by parse_7z_file first)
+        assert_eq!(
+            FileRole::from_filename("archive.7z.001"),
+            FileRole::SevenZipSplit { number: 0 }
+        );
+    }
+
+    #[test]
+    fn archive_base_name_zip() {
+        assert_eq!(
+            archive_base_name("archive.zip", &FileRole::ZipArchive),
+            Some("archive.zip".into())
+        );
+    }
+
+    #[test]
+    fn archive_base_name_split() {
+        assert_eq!(
+            archive_base_name("movie.mkv.001", &FileRole::SplitFile { number: 0 }),
+            Some("movie.mkv".into())
+        );
+        assert_eq!(
+            archive_base_name("movie.mkv.003", &FileRole::SplitFile { number: 2 }),
+            Some("movie.mkv".into())
+        );
+        // Same base name for different parts
+        assert_eq!(
+            archive_base_name("movie.mkv.001", &FileRole::SplitFile { number: 0 }),
+            archive_base_name("movie.mkv.002", &FileRole::SplitFile { number: 1 }),
         );
     }
 

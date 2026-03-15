@@ -1096,10 +1096,11 @@ impl Pipeline {
         }
     }
 
-    /// When a 7z file completes, build or update the archive topology.
+    /// When a non-RAR archive file completes, build or update the archive topology.
     ///
-    /// Groups files by base name (e.g., "Show.S01E01.7z") so that multiple
-    /// independent archive sets within a single job are tracked separately.
+    /// Handles 7z, zip, tar, tar.gz, gz, and plain split files.
+    /// Groups files by base name so that multiple independent archive sets
+    /// within a single job are tracked separately.
     pub(super) fn try_update_7z_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -1233,6 +1234,127 @@ impl Pipeline {
                     "7z topology set (split archive)"
                 );
             }
+            // Single-file archives: zip, tar, tar.gz, gz
+            weaver_core::classify::FileRole::ZipArchive
+            | weaver_core::classify::FileRole::TarArchive
+            | weaver_core::classify::FileRole::TarGzArchive
+            | weaver_core::classify::FileRole::GzArchive => {
+                if state.assembly.archive_topology_for(&set_name).is_some() {
+                    return;
+                }
+
+                let archive_type = match role {
+                    weaver_core::classify::FileRole::ZipArchive => weaver_assembly::ArchiveType::Zip,
+                    weaver_core::classify::FileRole::TarArchive => weaver_assembly::ArchiveType::Tar,
+                    weaver_core::classify::FileRole::TarGzArchive => weaver_assembly::ArchiveType::TarGz,
+                    weaver_core::classify::FileRole::GzArchive => weaver_assembly::ArchiveType::Gz,
+                    _ => unreachable!(),
+                };
+
+                let mut volume_map = std::collections::HashMap::new();
+                volume_map.insert(filename.clone(), 0);
+
+                let topology = weaver_assembly::ArchiveTopology {
+                    archive_type,
+                    volume_map,
+                    complete_volumes: std::collections::HashSet::new(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: set_name.clone(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: vec![],
+                };
+
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state.assembly.mark_volume_complete(&set_name, 0);
+
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    archive_type = ?archive_type,
+                    "archive topology set (single file)"
+                );
+            }
+
+            // Plain split files (.001, .002, ...)
+            weaver_core::classify::FileRole::SplitFile { number } => {
+                let completing_number = number;
+
+                if state.assembly.archive_topology_for(&set_name).is_some() {
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.assembly.mark_volume_complete(&set_name, completing_number);
+                    debug!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        volume = completing_number,
+                        "split file part complete"
+                    );
+                    return;
+                }
+
+                // Build topology from all known split parts with the same base name.
+                let mut volume_map = std::collections::HashMap::new();
+                let mut max_number = 0u32;
+                for f in state.assembly.files() {
+                    if let weaver_core::classify::FileRole::SplitFile { number: n } = f.role() {
+                        let f_base =
+                            weaver_core::classify::archive_base_name(f.filename(), f.role());
+                        if f_base.as_deref() == Some(&set_name) {
+                            volume_map.insert(f.filename().to_string(), *n);
+                            max_number = max_number.max(*n);
+                        }
+                    }
+                }
+
+                let expected = max_number + 1;
+                let topology = weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::Split,
+                    volume_map,
+                    complete_volumes: std::collections::HashSet::new(),
+                    expected_volume_count: Some(expected),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: set_name.clone(),
+                        first_volume: 0,
+                        last_volume: max_number,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: vec![],
+                };
+
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state.assembly.set_archive_topology(set_name.clone(), topology);
+
+                let completed: Vec<u32> = state
+                    .assembly
+                    .files()
+                    .filter(|f| f.is_complete())
+                    .filter_map(|f| {
+                        if let weaver_core::classify::FileRole::SplitFile { number: n } = f.role() {
+                            let f_base =
+                                weaver_core::classify::archive_base_name(f.filename(), f.role());
+                            if f_base.as_deref() == Some(&set_name) {
+                                return Some(*n);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                for n in completed {
+                    state.assembly.mark_volume_complete(&set_name, n);
+                }
+
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    expected_volumes = expected,
+                    "split file topology set"
+                );
+            }
+
             _ => {}
         }
     }

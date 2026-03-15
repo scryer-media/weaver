@@ -459,12 +459,17 @@ impl Pipeline {
             }
         }
 
-        // Load 7z topology from completed 7z files.
+        // Load non-RAR archive topology from completed files.
         for (file_id, role) in &files {
             if matches!(
                 role,
                 weaver_core::classify::FileRole::SevenZipArchive
                     | weaver_core::classify::FileRole::SevenZipSplit { .. }
+                    | weaver_core::classify::FileRole::ZipArchive
+                    | weaver_core::classify::FileRole::TarArchive
+                    | weaver_core::classify::FileRole::TarGzArchive
+                    | weaver_core::classify::FileRole::GzArchive
+                    | weaver_core::classify::FileRole::SplitFile { .. }
             ) {
                 self.try_update_7z_topology(job_id, *file_id);
             }

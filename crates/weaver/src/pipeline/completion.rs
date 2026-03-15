@@ -1,7 +1,224 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Simple archive type for non-RAR, non-7z extraction.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SimpleArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    Gz,
+    Split,
+}
+
+fn extract_zip(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+    let mut extracted = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
+        let name = entry.name().to_string();
+
+        if entry.is_dir() {
+            let dir_path = output_dir.join(&name);
+            std::fs::create_dir_all(&dir_path)
+                .map_err(|e| format!("failed to create dir {name}: {e}"))?;
+            continue;
+        }
+
+        let out_path = output_dir.join(&name);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create parent dir: {e}"))?;
+        }
+        let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+            job_id,
+            set_name: set_name.to_string(),
+            member: name.clone(),
+        });
+
+        let mut outfile =
+            std::fs::File::create(&out_path).map_err(|e| format!("failed to create {name}: {e}"))?;
+        let bytes_written = std::io::copy(&mut entry, &mut outfile)
+            .map_err(|e| format!("failed to extract {name}: {e}"))?;
+
+        let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+            job_id,
+            set_name: set_name.to_string(),
+            member: name.clone(),
+        });
+        tracing::info!(job_id = job_id.0, member = %name, bytes_written, "zip member extracted");
+        extracted.push(name);
+    }
+
+    Ok(extracted)
+}
+
+fn extract_tar(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
+    extract_tar_from_reader(file, output_dir, event_tx, job_id, set_name)
+}
+
+fn extract_tar_gz(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("failed to open tar.gz: {e}"))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    extract_tar_from_reader(gz, output_dir, event_tx, job_id, set_name)
+}
+
+fn extract_tar_from_reader<R: std::io::Read>(
+    reader: R,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let mut archive = tar::Archive::new(reader);
+    let mut extracted = Vec::new();
+
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("failed to read tar entries: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("failed to read tar entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("invalid tar entry path: {e}"))?
+            .to_path_buf();
+        let name = path.to_string_lossy().to_string();
+
+        let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+            job_id,
+            set_name: set_name.to_string(),
+            member: name.clone(),
+        });
+
+        entry
+            .unpack_in(output_dir)
+            .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?;
+
+        let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+            job_id,
+            set_name: set_name.to_string(),
+            member: name.clone(),
+        });
+        tracing::info!(job_id = job_id.0, member = %name, "tar member extracted");
+        extracted.push(name);
+    }
+
+    Ok(extracted)
+}
+
+fn extract_gz(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
+    let mut gz = flate2::read::GzDecoder::new(file);
+
+    // Output filename: strip .gz extension
+    let archive_name = archive_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let output_name = archive_name
+        .strip_suffix(".gz")
+        .or_else(|| archive_name.strip_suffix(".GZ"))
+        .unwrap_or(&archive_name);
+    let out_path = output_dir.join(output_name);
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+
+    let mut outfile = std::fs::File::create(&out_path)
+        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let bytes_written = std::io::copy(&mut gz, &mut outfile)
+        .map_err(|e| format!("failed to decompress gz: {e}"))?;
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, "gz decompressed");
+
+    Ok(vec![output_name.to_string()])
+}
+
+fn extract_split(
+    file_paths: &[PathBuf],
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    // Output filename: the base name from the set (e.g., "movie.mkv" from "movie.mkv.001")
+    let first_name = file_paths[0]
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let output_name = if let Some(dot_pos) = first_name.rfind('.') {
+        &first_name[..dot_pos]
+    } else {
+        &first_name
+    };
+    let out_path = output_dir.join(output_name);
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+
+    let mut reader = weaver_core::split_reader::SplitFileReader::open(file_paths)
+        .map_err(|e| format!("failed to open split files: {e}"))?;
+    let mut outfile = std::fs::File::create(&out_path)
+        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let bytes_written = std::io::copy(&mut reader, &mut outfile)
+        .map_err(|e| format!("failed to concatenate split files: {e}"))?;
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, parts = file_paths.len(), "split files joined");
+
+    Ok(vec![output_name.to_string()])
+}
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -1379,6 +1596,21 @@ impl Pipeline {
                             weaver_assembly::ArchiveType::Rar => {
                                 self.extract_rar_set(job_id, set_name).await
                             }
+                            weaver_assembly::ArchiveType::Zip => {
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Zip).await
+                            }
+                            weaver_assembly::ArchiveType::Tar => {
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Tar).await
+                            }
+                            weaver_assembly::ArchiveType::TarGz => {
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::TarGz).await
+                            }
+                            weaver_assembly::ArchiveType::Gz => {
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Gz).await
+                            }
+                            weaver_assembly::ArchiveType::Split => {
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Split).await
+                            }
                         };
                         if let Err(e) = result {
                             warn!(job_id = job_id.0, set_name = %set_name, error = %e, "failed to start extraction");
@@ -1801,6 +2033,95 @@ impl Pipeline {
         });
 
         // Return Ok(0) for now — actual result comes through the channel.
+        Ok(0)
+    }
+
+    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, gz, or split.
+    pub(super) async fn extract_simple_archive(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        kind: SimpleArchiveKind,
+    ) -> Result<u32, String> {
+        let (file_paths, working_dir) = {
+            let state = self
+                .jobs
+                .get(&job_id)
+                .ok_or_else(|| format!("job {job_id:?} not found"))?;
+            let topo = state
+                .assembly
+                .archive_topology_for(set_name)
+                .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
+
+            let set_filenames: std::collections::HashSet<&str> =
+                topo.volume_map.keys().map(|s| s.as_str()).collect();
+            let mut parts: Vec<(u32, std::path::PathBuf)> = Vec::new();
+
+            for file_asm in state.assembly.files() {
+                if set_filenames.contains(file_asm.filename()) {
+                    let vol = topo
+                        .volume_map
+                        .get(file_asm.filename())
+                        .copied()
+                        .unwrap_or(0);
+                    parts.push((vol, state.working_dir.join(file_asm.filename())));
+                }
+            }
+            parts.sort_by_key(|(n, _)| *n);
+            let paths: Vec<std::path::PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
+            (paths, state.working_dir.clone())
+        };
+
+        let output_dir = working_dir;
+        let event_tx = self.event_tx.clone();
+        let set_name_owned = set_name.to_string();
+        let extract_done_tx = self.extract_done_tx.clone();
+        let set_name_for_channel = set_name.to_string();
+
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                if file_paths.is_empty() {
+                    return Err(format!("no files found for set '{set_name_owned}'"));
+                }
+
+                let extracted_members = match kind {
+                    SimpleArchiveKind::Zip => {
+                        extract_zip(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
+                    }
+                    SimpleArchiveKind::Tar => {
+                        extract_tar(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
+                    }
+                    SimpleArchiveKind::TarGz => {
+                        extract_tar_gz(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
+                    }
+                    SimpleArchiveKind::Gz => {
+                        extract_gz(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
+                    }
+                    SimpleArchiveKind::Split => {
+                        extract_split(&file_paths, &output_dir, &event_tx, job_id, &set_name_owned)?
+                    }
+                };
+
+                Ok(FullSetExtractionOutcome {
+                    extracted: extracted_members,
+                    failed: Vec::new(),
+                })
+            })
+            .await;
+
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => Err(format!("{kind:?} extraction task panicked: {e}")),
+            };
+            let _ = extract_done_tx
+                .send(ExtractionDone::FullSet {
+                    job_id,
+                    set_name: set_name_for_channel,
+                    result,
+                })
+                .await;
+        });
+
         Ok(0)
     }
 

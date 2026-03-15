@@ -68,6 +68,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 feed-rs = "2.3"
 regex = "1.11"
 tar = "0.4"
+zip = "2"
+flate2 = "1"
 age = "0.11"
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer.git", package = "scryer-release-parser", rev = "114688d" }
 
