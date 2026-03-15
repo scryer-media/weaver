@@ -52,8 +52,8 @@ impl Default for HealthConfig {
             degraded_threshold: 5,
             disable_threshold: 10,
             base_backoff: Duration::from_secs(30),
-            max_backoff: Duration::from_secs(3600),
-            auth_disable_duration: Duration::from_secs(300),
+            max_backoff: Duration::from_hours(1),
+            auth_disable_duration: Duration::from_mins(5),
         }
     }
 }

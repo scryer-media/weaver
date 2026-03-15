@@ -53,7 +53,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             servers: Vec::new(),
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_secs(1),
             stale_check_age: Duration::from_secs(30),
@@ -412,7 +412,7 @@ mod tests {
                 max_connections: max_per_server,
                 group: 0,
             }],
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_secs(1),
             stale_check_age: Duration::from_secs(30),
@@ -446,7 +446,7 @@ mod tests {
                     group: 0,
                 },
             ],
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_secs(1),
             stale_check_age: Duration::from_secs(30),
@@ -493,7 +493,7 @@ mod tests {
                     group: 0,
                 },
             ],
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_secs(1),
             stale_check_age: Duration::from_secs(30),
@@ -521,7 +521,7 @@ mod tests {
                 max_connections: 2,
                 group: 0,
             }],
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_millis(200),
             stale_check_age: Duration::from_secs(30),
@@ -563,7 +563,7 @@ mod tests {
                 max_connections: 2,
                 group: 0,
             }],
-            max_idle_age: Duration::from_secs(300),
+            max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
             reconnect_delay: Duration::from_millis(50),
             stale_check_age: Duration::from_secs(30),
@@ -588,7 +588,7 @@ mod tests {
     fn pool_config_default() {
         let config = PoolConfig::default();
         assert!(config.servers.is_empty());
-        assert_eq!(config.max_idle_age, Duration::from_secs(300));
+        assert_eq!(config.max_idle_age, Duration::from_mins(5));
         assert_eq!(config.reconnect_delay, Duration::from_secs(1));
         assert_eq!(config.stale_check_age, Duration::from_secs(30));
     }

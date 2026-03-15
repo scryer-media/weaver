@@ -26,7 +26,9 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
   const timerRef = useRef<number | null>(null);
   const onDataRef = useRef(onData);
 
-  onDataRef.current = onData;
+  useEffect(() => {
+    onDataRef.current = onData;
+  });
 
   useEffect(() => {
     if (!enabled) {

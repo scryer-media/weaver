@@ -20,6 +20,25 @@ env:
   WEB_ARTIFACT_NAME: weaver-web-dist
 
 jobs:
+  web-lint:
+    name: web-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/weaver-web/package-lock.json
+      - name: Install dependencies
+        working-directory: apps/weaver-web
+        run: npm ci
+      - name: Lint
+        working-directory: apps/weaver-web
+        run: npm run lint
+
   web-build:
     name: web-build
     runs-on: ubuntu-24.04

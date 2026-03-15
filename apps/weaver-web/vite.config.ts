@@ -220,7 +220,7 @@ export default defineConfig({
     buildDevSessionPlugin(),
   ],
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         manualChunks(id) {
           if (!id.includes("node_modules")) {

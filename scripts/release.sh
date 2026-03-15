@@ -96,12 +96,17 @@ ok "Pre-flight OK"
 # ── Validation functions ──────────────────────────────────────────────────────
 
 run_web_validation() {
-    step "Running TypeScript type check"
+    step "Running npm audit fix"
 
     cd "$WEB_DIR"
-    npm run lint 2>&1 || die "TypeScript type check failed — fix before releasing"
+    npm audit fix 2>&1
+    ok "npm audit fix complete"
 
-    ok "TypeScript type check passed"
+    step "Running TypeScript + ESLint"
+
+    npm run lint 2>&1 || die "Web lint failed — fix before releasing"
+
+    ok "Web lint passed"
 
     step "Running web build"
 
