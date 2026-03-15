@@ -99,7 +99,7 @@ run_web_validation() {
     step "Running npm audit fix"
 
     cd "$WEB_DIR"
-    npm audit fix 2>&1
+    npm audit fix --legacy-peer-deps 2>&1
     ok "npm audit fix complete"
 
     step "Running TypeScript + ESLint"

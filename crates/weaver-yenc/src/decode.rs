@@ -833,7 +833,11 @@ mod tests {
         encoded.extend(yenc_encode_byte(b'D'));
 
         // Split right after CRLF.
-        let crlf_end = encoded.array_windows().position(|w: &[u8; 2]| w == b"\r\n").unwrap() + 2;
+        let crlf_end = encoded
+            .array_windows()
+            .position(|w: &[u8; 2]| w == b"\r\n")
+            .unwrap()
+            + 2;
         let chunk1 = &encoded[..crlf_end];
         let chunk2 = &encoded[crlf_end..];
 
@@ -932,7 +936,11 @@ mod tests {
         encoded.extend_from_slice(b"..");
         encoded.extend(yenc_encode_byte(b'B'));
 
-        let crlf_end = encoded.array_windows().position(|w: &[u8; 2]| w == b"\r\n").unwrap() + 2;
+        let crlf_end = encoded
+            .array_windows()
+            .position(|w: &[u8; 2]| w == b"\r\n")
+            .unwrap()
+            + 2;
         let chunk1 = &encoded[..crlf_end];
         let chunk2 = &encoded[crlf_end..];
 
