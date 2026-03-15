@@ -2282,8 +2282,7 @@ fn test_rar5_longname_extract() {
         password: None,
     };
     let result = archive.extract_member(0, &opts, None).unwrap();
-    let long_filename = format!("{}.txt", "a".repeat(200));
-    assert_eq!(result, original(&long_filename));
+    assert_eq!(result, b"long filename test\n");
 }
 
 #[test]
@@ -2307,8 +2306,7 @@ fn test_rar4_longname_extract() {
         password: None,
     };
     let result = archive.extract_member(0, &opts, None).unwrap();
-    let long_filename = format!("{}.txt", "a".repeat(200));
-    assert_eq!(result, original(&long_filename));
+    assert_eq!(result, b"long filename test\n");
 }
 
 // -- Symlink archives (RAR5 only) ---------------------------------------------
