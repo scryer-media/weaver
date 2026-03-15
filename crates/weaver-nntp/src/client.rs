@@ -302,7 +302,7 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            let result = conn.body_by_id(message_id).await;
+            let result = conn.body_by_id_raw(message_id).await;
             match result {
                 Ok(response) => return Ok(response.data),
                 Err(NntpError::ArticleNotFound)
@@ -353,7 +353,7 @@ impl NntpClient {
             let mut conn = self.pool.acquire(server).await?;
 
             let result = match kind {
-                FetchKind::Body => conn.body_by_id(message_id).await,
+                FetchKind::Body => conn.body_by_id_raw(message_id).await,
                 FetchKind::Head => conn.head_by_id(message_id).await,
                 FetchKind::Article => conn.article_by_id(message_id).await,
             };

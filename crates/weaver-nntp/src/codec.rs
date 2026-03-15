@@ -38,6 +38,9 @@ pub enum NntpFrame {
 pub struct NntpCodec {
     multiline: bool,
     streaming_multiline: bool,
+    /// When true, multiline data is returned without dot-unstuffing.
+    /// The caller is responsible for handling dot-stuffed lines.
+    raw_multiline: bool,
 }
 
 #[derive(Debug)]
@@ -53,12 +56,21 @@ impl NntpCodec {
         NntpCodec {
             multiline: false,
             streaming_multiline: false,
+            raw_multiline: false,
         }
     }
 
     /// Switch to multi-line mode for reading the next data block.
     pub fn set_multiline(&mut self, multiline: bool) {
         self.multiline = multiline;
+    }
+
+    /// Enable raw multiline mode: data is returned without dot-unstuffing.
+    /// The dot-terminator is still detected and stripped, but dot-stuffed
+    /// lines retain their leading dot. This allows the caller to handle
+    /// dot-unstuffing inline (e.g., during yEnc decode).
+    pub fn set_raw_multiline(&mut self, raw: bool) {
+        self.raw_multiline = raw;
     }
 
     /// Whether the codec is currently in multi-line mode.
@@ -124,7 +136,12 @@ impl NntpCodec {
 
     /// Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
     fn decode_multiline(&self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
-        match scan_multiline_chunk(src, false) {
+        let scan_result = if self.raw_multiline {
+            scan_multiline_raw(src)
+        } else {
+            scan_multiline_chunk(src, false)
+        };
+        match scan_result {
             Some(scan) => {
                 if scan.data_end > MAX_MULTILINE_LENGTH {
                     return Err(NntpError::MalformedResponse(
@@ -257,6 +274,43 @@ fn scan_multiline_chunk(buf: &[u8], allow_partial: bool) -> Option<MultilineScan
             terminator_len: 0,
             copied,
         });
+    }
+
+    None
+}
+
+/// Scan for the dot-terminator without dot-unstuffing.
+/// Returns the byte offset of the terminator line start and its length,
+/// or None if not found yet.
+fn scan_multiline_raw(buf: &[u8]) -> Option<MultilineScan> {
+    if buf.is_empty() {
+        return None;
+    }
+
+    let mut cursor = 0usize;
+
+    while cursor < buf.len() {
+        let Some(line_rel_end) = memchr::memchr(b'\n', &buf[cursor..]) else {
+            break;
+        };
+        let line_end = cursor + line_rel_end;
+        let content_end = if line_end > cursor && buf[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line_total_end = line_end + 1;
+
+        // Check for single-dot terminator line.
+        if cursor < content_end && buf[cursor] == b'.' && content_end == cursor + 1 {
+            return Some(MultilineScan {
+                data_end: cursor,
+                terminator_len: line_total_end - cursor,
+                copied: None, // raw mode: no copies
+            });
+        }
+
+        cursor = line_total_end;
     }
 
     None

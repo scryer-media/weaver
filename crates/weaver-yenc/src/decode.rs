@@ -19,6 +19,25 @@ pub fn decode(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError
     decode_with_options(input, output, DecodeOptions::default())
 }
 
+/// Decode a yEnc article from raw NNTP data (with dot-stuffing still present).
+///
+/// This is the fast path for the download pipeline: the NNTP codec passes raw
+/// data without dot-unstuffing, and this function handles unstuffing inline
+/// during the yEnc body decode pass. This eliminates a separate scan over the
+/// entire article body.
+///
+/// Headers (`=ybegin`, `=ypart`) are not affected by dot-stuffing (they start
+/// with `=`, not `.`), so header parsing works on raw data without changes.
+pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError> {
+    decode_with_options(
+        input,
+        output,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    )
+}
+
 /// Decode a complete yEnc article with custom options.
 pub fn decode_with_options(
     input: &[u8],

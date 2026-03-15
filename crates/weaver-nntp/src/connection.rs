@@ -357,9 +357,24 @@ impl NntpConnection {
     ///
     /// Call after receiving a status code that indicates multi-line data follows.
     pub async fn read_multiline_data(&mut self) -> Result<Bytes> {
+        self.read_multiline_data_inner(false).await
+    }
+
+    /// Read a multi-line data block without dot-unstuffing.
+    ///
+    /// The returned data retains NNTP dot-stuffing (lines starting with `..`
+    /// keep both dots). The caller is responsible for inline unstuffing during
+    /// content decoding. This avoids a separate scan+copy pass.
+    pub async fn read_multiline_data_raw(&mut self) -> Result<Bytes> {
+        self.read_multiline_data_inner(true).await
+    }
+
+    async fn read_multiline_data_inner(&mut self, raw: bool) -> Result<Bytes> {
         self.codec.set_multiline(true);
+        self.codec.set_raw_multiline(raw);
 
         let frame = self.read_frame().await?;
+        self.codec.set_raw_multiline(false);
         self.trim_read_buffer();
         match frame {
             NntpFrame::MultiLineData(data) => Ok(data.freeze()),
@@ -375,6 +390,22 @@ impl NntpConnection {
     /// If the server responds with 480 (authentication required) and we have
     /// stored credentials, transparently re-authenticates and retries once.
     pub async fn send_multiline_command(&mut self, cmd: &Command) -> Result<MultiLineResponse> {
+        self.send_multiline_command_inner(cmd, false).await
+    }
+
+    /// Like `send_multiline_command` but returns raw data without dot-unstuffing.
+    pub async fn send_multiline_command_raw(
+        &mut self,
+        cmd: &Command,
+    ) -> Result<MultiLineResponse> {
+        self.send_multiline_command_inner(cmd, true).await
+    }
+
+    async fn send_multiline_command_inner(
+        &mut self,
+        cmd: &Command,
+        raw: bool,
+    ) -> Result<MultiLineResponse> {
         let initial = self.send_command(cmd).await?;
 
         // Handle mid-session re-auth (480) transparently.
@@ -382,9 +413,7 @@ impl NntpConnection {
             if let Some((user, pass)) = self.credentials.clone() {
                 debug!("server requested re-authentication (480), re-authenticating");
                 self.authenticate(&user, &pass).await?;
-                // Group state may have been lost; clear it so it's re-sent.
                 self.current_group = None;
-                // Retry the original command once.
                 let retry = self.send_command(cmd).await?;
                 if retry.code.is_error() {
                     return Err(NntpError::from_status(retry.code, &retry.message));
@@ -395,7 +424,7 @@ impl NntpConnection {
                         retry.code.raw()
                     )));
                 }
-                let data = self.read_multiline_data().await?;
+                let data = self.read_multiline_data_inner(raw).await?;
                 return Ok(MultiLineResponse {
                     initial: retry,
                     data,
@@ -415,7 +444,7 @@ impl NntpConnection {
             )));
         }
 
-        let data = self.read_multiline_data().await?;
+        let data = self.read_multiline_data_inner(raw).await?;
         Ok(MultiLineResponse { initial, data })
     }
 
@@ -466,6 +495,15 @@ impl NntpConnection {
     pub async fn body_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         self.send_multiline_command(&cmd).await
+    }
+
+    /// Retrieve the body of an article without dot-unstuffing.
+    ///
+    /// The returned data retains NNTP dot-stuffing. Use with `weaver_yenc::decode_nntp`
+    /// which handles unstuffing inline during decode, avoiding a separate pass.
+    pub async fn body_by_id_raw(&mut self, message_id: &str) -> Result<MultiLineResponse> {
+        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        self.send_multiline_command_raw(&cmd).await
     }
 
     /// Retrieve the headers of an article by message-id.

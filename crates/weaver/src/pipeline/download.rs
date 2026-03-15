@@ -46,7 +46,7 @@ impl Pipeline {
                     return;
                 };
 
-                match weaver_yenc::decode(&work.raw, output_buf) {
+                match weaver_yenc::decode_nntp(&work.raw, output_buf) {
                     Ok(decode_result) => {
                         output.set_len(decode_result.bytes_written);
                         metrics
@@ -60,7 +60,7 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
-                        let crc32 = checksum::crc32(output.as_slice());
+                        let crc32 = decode_result.part_crc;
                         let decoded = DecodedChunk::from(output.as_slice().to_vec());
 
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
@@ -82,7 +82,7 @@ impl Pipeline {
                 }
             } else {
                 let mut output = vec![0u8; work.raw.len()];
-                match weaver_yenc::decode(&work.raw, &mut output) {
+                match weaver_yenc::decode_nntp(&work.raw, &mut output) {
                     Ok(decode_result) => {
                         output.truncate(decode_result.bytes_written);
                         metrics
@@ -96,7 +96,7 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
-                        let crc32 = checksum::crc32(&output);
+                        let crc32 = decode_result.part_crc;
 
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
