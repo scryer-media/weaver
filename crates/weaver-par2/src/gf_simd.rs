@@ -253,13 +253,12 @@ pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) 
         assert_eq!(fd.dst.len(), len, "all dst slices must match src length");
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            unsafe { mul_acc_multi_region_gfni_avx2(factors_and_dsts, src) };
-            return;
-        }
-    }
+    // Note: the GFNI multi-region kernel (mul_acc_multi_region_gfni_avx2) is
+    // disabled due to a correctness bug under Intel SDE Ice Lake emulation.
+    // The single-region fallback below still uses GFNI via mul_acc_region,
+    // so we retain hardware acceleration — just without the multi-region
+    // batching optimization. See weaver-v0.1.11 CI for the failure.
+    // TODO: debug and re-enable the multi-region GFNI kernel.
 
     #[cfg(target_arch = "aarch64")]
     {
