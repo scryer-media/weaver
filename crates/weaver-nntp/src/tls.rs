@@ -103,7 +103,7 @@ fn make_server_name(host: &str) -> Result<ServerName<'static>, NntpError> {
 fn set_keepalive(tcp: &TcpStream) {
     let sock_ref = SockRef::from(tcp);
     let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_mins(1))
+        .with_time(Duration::from_secs(60))
         .with_interval(Duration::from_secs(15));
     let _ = sock_ref.set_tcp_keepalive(&ka);
 }
@@ -178,7 +178,7 @@ mod tests {
         assert!(keepalive, "TCP keepalive should be enabled");
 
         let ka_time = sock_ref.keepalive_time().unwrap();
-        assert_eq!(ka_time, Duration::from_mins(1));
+        assert_eq!(ka_time, Duration::from_secs(60));
 
         let ka_interval = sock_ref.keepalive_interval().unwrap();
         assert_eq!(ka_interval, Duration::from_secs(15));

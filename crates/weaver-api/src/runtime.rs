@@ -84,7 +84,7 @@ pub async fn rebuild_nntp_from_config(
         let total: usize = servers.iter().map(|s| s.max_connections).sum();
         let client = NntpClient::new(NntpClientConfig {
             servers,
-            max_idle_age: std::time::Duration::from_mins(5),
+            max_idle_age: std::time::Duration::from_secs(300),
             max_retries_per_server: 1,
         });
         (client, total)

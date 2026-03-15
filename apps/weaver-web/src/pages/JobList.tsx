@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDown, ChevronRight, Pause, Play, X } from "lucide-react";
 import { useMutation, useQuery } from "urql";
@@ -116,26 +116,27 @@ function useThrottledQueueEta(
     etaById: new Map<number, string>(),
   });
 
-  const signature = jobs
-    .filter((job) => job.status === "DOWNLOADING" || job.status === "QUEUED")
-    .map((job) => `${job.id}:${job.status}:${job.totalBytes}`)
-    .join("|");
+  return useMemo(() => {
+    const signature = jobs
+      .filter((job) => job.status === "DOWNLOADING" || job.status === "QUEUED")
+      .map((job) => `${job.id}:${job.status}:${job.totalBytes}`)
+      .join("|");
+    const now = Date.now();
+    const shouldRefresh =
+      speed <= 0
+      || cache.current.signature !== signature
+      || now - cache.current.at >= ETA_UPDATE_INTERVAL_MS;
 
-  // Signature changed or speed dropped to zero — always refresh.
-  // Otherwise, throttle by checking elapsed time via the ref.
-  const signatureChanged = speed <= 0 || cache.current.signature !== signature;
-  // eslint-disable-next-line react-hooks/purity -- Date.now() is intentional for throttling
-  const stale = !signatureChanged && Date.now() - cache.current.at >= ETA_UPDATE_INTERVAL_MS;
+    if (shouldRefresh) {
+      cache.current = {
+        at: now,
+        signature,
+        etaById: buildQueueEtaById(jobs, speed),
+      };
+    }
 
-  if (signatureChanged || stale) {
-    cache.current = {
-      at: Date.now(), // eslint-disable-line react-hooks/purity
-      signature,
-      etaById: buildQueueEtaById(jobs, speed),
-    };
-  }
-
-  return cache.current.etaById;
+    return cache.current.etaById;
+  }, [jobs, speed]);
 }
 
 function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {

@@ -570,8 +570,7 @@ export function PipelineTimelineCard({
   timeline: JobTimelineData | null | undefined;
 }) {
   const t = useTranslate();
-  const [renderTime] = useState(Date.now);
-  const axisEnd = timeline?.endedAt ?? renderTime;
+  const axisEnd = useMemo(() => timeline?.endedAt ?? Date.now(), [timeline?.endedAt]);
 
   if (!timeline || (timeline.lanes.length === 0 && timeline.extractionGroups.length === 0)) {
     return (

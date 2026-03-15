@@ -206,7 +206,7 @@ pub fn detect_split_files(dir: &Path) -> io::Result<Vec<SplitFileGroup>> {
         let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
 
         // Check contiguity: starts at 1 and no gaps.
-        let contiguous = part_numbers[0] == 1 && part_numbers.array_windows().all(|&[a, b]| b == a + 1);
+        let contiguous = part_numbers[0] == 1 && part_numbers.windows(2).all(|w| w[1] == w[0] + 1);
 
         result.push(SplitFileGroup {
             base_name,

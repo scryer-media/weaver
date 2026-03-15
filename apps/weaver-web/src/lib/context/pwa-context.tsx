@@ -98,13 +98,7 @@ export function PwaProvider({ children }: { children: ReactNode }) {
       }
 
       activeRegistration = registration;
-
-      // Only surface a waiting worker if there's an active controller.
-      // On first visit or hard refresh there's no previous SW to update from,
-      // so showing "Update ready" would be misleading.
-      if (navigator.serviceWorker.controller) {
-        rememberWaitingWorker(registration);
-      }
+      rememberWaitingWorker(registration);
       watchInstallingWorker(registration);
 
       registration.addEventListener("updatefound", () => {

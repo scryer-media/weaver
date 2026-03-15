@@ -187,7 +187,7 @@ mod tests {
     fn drain_respects_ready_at() {
         let config = RetryConfig {
             max_retries: 3,
-            base_delay: Duration::from_mins(1),
+            base_delay: Duration::from_secs(60),
             multiplier: 1.0,
         };
         let mut q = RetryQueue::new(config);

@@ -769,7 +769,7 @@ async function throwJsonError(response: Response): Promise<never> {
     if (error instanceof Error) {
       throw error;
     }
-    throw new Error(`Request failed with status ${response.status}`, { cause: error });
+    throw new Error(`Request failed with status ${response.status}`);
   }
 }
 
