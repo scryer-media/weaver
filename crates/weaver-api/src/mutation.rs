@@ -184,7 +184,9 @@ impl MutationRoot {
         let cat = category.map(|c| if c.is_empty() { None } else { Some(c) });
         let meta = priority.map(|p| vec![("priority".to_string(), p)]);
         for &id in &ids {
-            handle.update_job(JobId(id), cat.clone(), meta.clone()).await?;
+            handle
+                .update_job(JobId(id), cat.clone(), meta.clone())
+                .await?;
         }
         Ok(true)
     }

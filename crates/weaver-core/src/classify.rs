@@ -503,10 +503,7 @@ mod tests {
             FileRole::from_filename("backup.tar.gz"),
             FileRole::TarGzArchive
         );
-        assert_eq!(
-            FileRole::from_filename("data.tgz"),
-            FileRole::TarGzArchive
-        );
+        assert_eq!(FileRole::from_filename("data.tgz"), FileRole::TarGzArchive);
         assert_eq!(
             FileRole::from_filename("Archive.TAR.GZ"),
             FileRole::TarGzArchive

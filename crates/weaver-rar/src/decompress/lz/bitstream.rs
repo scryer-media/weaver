@@ -113,9 +113,7 @@ impl<'a> BitReader<'a> {
         if count == 0 {
             return Ok(0);
         }
-        if (self.acc_bits as usize) < count as usize
-            && self.bits_remaining() < count as usize
-        {
+        if (self.acc_bits as usize) < count as usize && self.bits_remaining() < count as usize {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "bitstream: need {} bits but only {} remaining",

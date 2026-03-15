@@ -152,21 +152,13 @@ impl KdfCache {
     }
 
     /// Derive (or return cached) RAR5 AES-256 key.
-    pub fn derive_key_rar5(
-        &self,
-        password: &str,
-        salt: &[u8; 16],
-        kdf_count: u8,
-    ) -> [u8; 32] {
+    pub fn derive_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
         let mut guard = self.rar5.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
         // Check cache.
         for entry in entries.iter() {
-            if entry.password == password
-                && entry.salt == *salt
-                && entry.kdf_count == kdf_count
-            {
+            if entry.password == password && entry.salt == *salt && entry.kdf_count == kdf_count {
                 return entry.key;
             }
         }
@@ -217,10 +209,7 @@ impl KdfCache {
         let guard = self.rar5.lock().unwrap();
         let (entries, _) = &*guard;
         for entry in entries.iter() {
-            if entry.password == password
-                && entry.salt == *salt
-                && entry.kdf_count == kdf_count
-            {
+            if entry.password == password && entry.salt == *salt && entry.kdf_count == kdf_count {
                 return entry.psw_check == check_data[..8];
             }
         }
@@ -228,11 +217,7 @@ impl KdfCache {
     }
 
     /// Derive (or return cached) RAR4 AES-128 key and IV.
-    pub fn derive_key_rar4(
-        &self,
-        password: &str,
-        salt: &[u8; 8],
-    ) -> ([u8; 16], [u8; 16]) {
+    pub fn derive_key_rar4(&self, password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
         let mut guard = self.rar4.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
@@ -529,8 +514,7 @@ impl<R: Read> Read for DecryptingReader<R> {
         // Read directly into out_buf, prepending any pending partial block.
         let raw_start;
         if self.pending_len > 0 {
-            self.out_buf[..self.pending_len]
-                .copy_from_slice(&self.pending[..self.pending_len]);
+            self.out_buf[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
             raw_start = self.pending_len;
             self.pending_len = 0;
         } else {

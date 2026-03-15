@@ -183,7 +183,8 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx512bw")
+        if is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vl")
         {
             let matrices = precompute_affine_matrices(factor);
@@ -332,10 +333,8 @@ unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst
         let m_hh = _mm256_set1_epi64x(matrices.m_hh as i64);
 
         // Deinterleave masks (same as AVX2 shuffle kernel — per 128-bit lane).
-        let deint_lo_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 
@@ -452,14 +451,22 @@ unsafe fn mul_acc_region_avx512(tables: &MulTables, src: &[u8], dst: &mut [u8]) 
         let mask_0f = _mm512_set1_epi8(0x0F);
 
         // Broadcast each 16-byte table into all four 128-bit lanes.
-        let t0 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[0].as_ptr() as *const __m128i));
-        let t1 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[1].as_ptr() as *const __m128i));
-        let t2 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[2].as_ptr() as *const __m128i));
-        let t3 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[3].as_ptr() as *const __m128i));
-        let t4 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[4].as_ptr() as *const __m128i));
-        let t5 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[5].as_ptr() as *const __m128i));
-        let t6 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[6].as_ptr() as *const __m128i));
-        let t7 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[7].as_ptr() as *const __m128i));
+        let t0 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[0].as_ptr() as *const __m128i));
+        let t1 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[1].as_ptr() as *const __m128i));
+        let t2 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[2].as_ptr() as *const __m128i));
+        let t3 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[3].as_ptr() as *const __m128i));
+        let t4 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[4].as_ptr() as *const __m128i));
+        let t5 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[5].as_ptr() as *const __m128i));
+        let t6 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[6].as_ptr() as *const __m128i));
+        let t7 =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[7].as_ptr() as *const __m128i));
 
         let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
             -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
@@ -804,10 +811,8 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
     }
 
     unsafe {
-        let deint_lo_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint_hi_128 =
-            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 
@@ -819,7 +824,7 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
 
             for &(ref matrices, dst_idx) in &all_matrices {
                 let d = _mm256_loadu_si256(
-                    factors_and_dsts[dst_idx].dst.as_ptr().add(offset) as *const __m256i,
+                    factors_and_dsts[dst_idx].dst.as_ptr().add(offset) as *const __m256i
                 );
 
                 let m_ll = _mm256_set1_epi64x(matrices.m_ll as i64);
@@ -970,17 +975,11 @@ unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src
                 // Compute K = M ^ L ^ H for both halves.
                 let k_lo = veorq_u16(
                     vreinterpretq_u16_p16(mm_lo),
-                    veorq_u16(
-                        vreinterpretq_u16_p16(ll_lo),
-                        vreinterpretq_u16_p16(hh_lo),
-                    ),
+                    veorq_u16(vreinterpretq_u16_p16(ll_lo), vreinterpretq_u16_p16(hh_lo)),
                 );
                 let k_hi = veorq_u16(
                     vreinterpretq_u16_p16(mm_hi),
-                    veorq_u16(
-                        vreinterpretq_u16_p16(ll_hi),
-                        vreinterpretq_u16_p16(hh_hi),
-                    ),
+                    veorq_u16(vreinterpretq_u16_p16(ll_hi), vreinterpretq_u16_p16(hh_hi)),
                 );
 
                 // Deinterleave L, H, K into separate byte lanes.
@@ -992,8 +991,8 @@ unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src
                 let k_hi_u8 = vreinterpretq_u8_u16(k_hi);
 
                 // Separate even bytes (byte0 of each u16) and odd bytes (byte1).
-                let l_bytes = vuzpq_u8(l_lo, l_hi);   // .0 = even bytes (L.lo), .1 = odd bytes (L.hi)
-                let h_bytes = vuzpq_u8(h_lo, h_hi);   // .0 = H.lo, .1 = H.hi
+                let l_bytes = vuzpq_u8(l_lo, l_hi); // .0 = even bytes (L.lo), .1 = odd bytes (L.hi)
+                let h_bytes = vuzpq_u8(h_lo, h_hi); // .0 = H.lo, .1 = H.hi
                 let k_bytes = vuzpq_u8(k_lo_u8, k_hi_u8); // .0 = K.lo, .1 = K.hi
 
                 // Combine into product bytes:
@@ -1312,8 +1311,10 @@ mod tests {
                     result
                 };
 
-                let result_lo = apply_matrix(matrices.m_ll, in_lo) ^ apply_matrix(matrices.m_lh, in_hi);
-                let result_hi = apply_matrix(matrices.m_hl, in_lo) ^ apply_matrix(matrices.m_hh, in_hi);
+                let result_lo =
+                    apply_matrix(matrices.m_ll, in_lo) ^ apply_matrix(matrices.m_lh, in_hi);
+                let result_hi =
+                    apply_matrix(matrices.m_hl, in_lo) ^ apply_matrix(matrices.m_hh, in_hi);
                 let result = result_lo as u16 | ((result_hi as u16) << 8);
 
                 assert_eq!(

@@ -14,7 +14,7 @@ use md5::{Digest, Md5};
 use weaver_par2::checksum::SliceChecksumState;
 use weaver_par2::packet::header;
 use weaver_par2::{
-    FileAccess, FileId, MemoryFileAccess, Repairability, RecoverySlice, execute_repair, gf_pow,
+    FileAccess, FileId, MemoryFileAccess, RecoverySlice, Repairability, execute_repair, gf_pow,
     input_slice_constants, mul_acc_region, par2_set::Par2FileSet, plan_repair, verify_all,
 };
 
@@ -103,10 +103,7 @@ fn build_synthetic_par2(
     }
 
     // Compute total slices across all files (for global slice indexing).
-    let total_slices: usize = files
-        .iter()
-        .map(|f| f.data.len().div_ceil(ss))
-        .sum();
+    let total_slices: usize = files.iter().map(|f| f.data.len().div_ceil(ss)).sum();
 
     // Build padded input: all files concatenated, each file padded to full slices.
     let mut all_slices: Vec<Vec<u8>> = Vec::with_capacity(total_slices);
@@ -258,7 +255,10 @@ fn run_repair_scenario(
     let t0 = Instant::now();
     let result = verify_all(&synthetic.par2_set, &access);
     let verify_ms = t0.elapsed().as_millis();
-    eprintln!("  verify (damaged): {verify_ms}ms — {} missing blocks", result.total_missing_blocks);
+    eprintln!(
+        "  verify (damaged): {verify_ms}ms — {} missing blocks",
+        result.total_missing_blocks
+    );
     assert!(
         matches!(result.repairable, Repairability::Repairable { .. }),
         "{label}: expected repairable, got {:?}",
@@ -305,7 +305,10 @@ fn run_repair_scenario(
         "{label}: expected NotNeeded after repair, got {:?}",
         result.repairable
     );
-    assert_eq!(result.total_missing_blocks, 0, "{label}: blocks still missing");
+    assert_eq!(
+        result.total_missing_blocks, 0,
+        "{label}: blocks still missing"
+    );
 
     eprintln!("  PASS: {label}");
 }
@@ -320,69 +323,73 @@ fn repair_single_file_4mb_8_missing() {
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_0001);
     let synthetic = build_synthetic_par2(&[4 * 1024 * 1024], 65536, 16, &mut rng);
 
-    run_repair_scenario(&synthetic, |files, access| {
-        // Damage 8 evenly-spaced slices out of 64.
-        let f = &files[0];
-        let ss = 65536usize;
-        for i in (0..64).step_by(8) {
-            let offset = i * ss;
-            let end = offset + ss;
-            let zeroed = vec![0xAA; ss];
-            access.add_file(f.file_id, {
-                let mut data = access.read_file(&f.file_id).unwrap();
-                data[offset..end].copy_from_slice(&zeroed);
-                data
-            });
-        }
-    }, "4MB single file, 8/64 slices damaged");
+    run_repair_scenario(
+        &synthetic,
+        |files, access| {
+            // Damage 8 evenly-spaced slices out of 64.
+            let f = &files[0];
+            let ss = 65536usize;
+            for i in (0..64).step_by(8) {
+                let offset = i * ss;
+                let end = offset + ss;
+                let zeroed = vec![0xAA; ss];
+                access.add_file(f.file_id, {
+                    let mut data = access.read_file(&f.file_id).unwrap();
+                    data[offset..end].copy_from_slice(&zeroed);
+                    data
+                });
+            }
+        },
+        "4MB single file, 8/64 slices damaged",
+    );
 }
 
 #[test]
 fn repair_multi_file_set() {
     eprintln!("\n=== repair_multi_file_set ===");
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_0002);
-    let synthetic = build_synthetic_par2(
-        &[1024 * 1024, 1200 * 1024, 900 * 1024],
-        65536,
-        12,
-        &mut rng,
-    );
+    let synthetic =
+        build_synthetic_par2(&[1024 * 1024, 1200 * 1024, 900 * 1024], 65536, 12, &mut rng);
 
-    run_repair_scenario(&synthetic, |files, access| {
-        let ss = 65536usize;
-        // Damage 2 slices in file 0.
-        {
-            let f = &files[0];
-            let mut data = access.read_file(&f.file_id).unwrap();
-            for i in [1, 3] {
-                let offset = i * ss;
-                data[offset..offset + ss].fill(0xBB);
+    run_repair_scenario(
+        &synthetic,
+        |files, access| {
+            let ss = 65536usize;
+            // Damage 2 slices in file 0.
+            {
+                let f = &files[0];
+                let mut data = access.read_file(&f.file_id).unwrap();
+                for i in [1, 3] {
+                    let offset = i * ss;
+                    data[offset..offset + ss].fill(0xBB);
+                }
+                access.add_file(f.file_id, data);
             }
-            access.add_file(f.file_id, data);
-        }
-        // Damage 2 slices in file 1.
-        {
-            let f = &files[1];
-            let mut data = access.read_file(&f.file_id).unwrap();
-            for i in [0, 5] {
-                let offset = i * ss;
-                let end = (offset + ss).min(data.len());
-                data[offset..end].fill(0xCC);
+            // Damage 2 slices in file 1.
+            {
+                let f = &files[1];
+                let mut data = access.read_file(&f.file_id).unwrap();
+                for i in [0, 5] {
+                    let offset = i * ss;
+                    let end = (offset + ss).min(data.len());
+                    data[offset..end].fill(0xCC);
+                }
+                access.add_file(f.file_id, data);
             }
-            access.add_file(f.file_id, data);
-        }
-        // Damage 2 slices in file 2.
-        {
-            let f = &files[2];
-            let mut data = access.read_file(&f.file_id).unwrap();
-            for i in [2, 4] {
-                let offset = i * ss;
-                let end = (offset + ss).min(data.len());
-                data[offset..end].fill(0xDD);
+            // Damage 2 slices in file 2.
+            {
+                let f = &files[2];
+                let mut data = access.read_file(&f.file_id).unwrap();
+                for i in [2, 4] {
+                    let offset = i * ss;
+                    let end = (offset + ss).min(data.len());
+                    data[offset..end].fill(0xDD);
+                }
+                access.add_file(f.file_id, data);
             }
-            access.add_file(f.file_id, data);
-        }
-    }, "3-file set, 6 slices damaged across files");
+        },
+        "3-file set, 6 slices damaged across files",
+    );
 }
 
 #[test]
@@ -391,17 +398,21 @@ fn repair_many_recovery_blocks() {
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_0003);
     let synthetic = build_synthetic_par2(&[2 * 1024 * 1024], 65536, 20, &mut rng);
 
-    run_repair_scenario(&synthetic, |files, access| {
-        // Damage 16 of 32 slices — uses all 20 recovery blocks (well, 16).
-        let f = &files[0];
-        let ss = 65536usize;
-        let mut data = access.read_file(&f.file_id).unwrap();
-        for i in 0..16 {
-            let offset = (i * 2) * ss; // every other slice
-            data[offset..offset + ss].fill(0xEE);
-        }
-        access.add_file(f.file_id, data);
-    }, "2MB, 16/32 slices damaged, 20 recovery blocks");
+    run_repair_scenario(
+        &synthetic,
+        |files, access| {
+            // Damage 16 of 32 slices — uses all 20 recovery blocks (well, 16).
+            let f = &files[0];
+            let ss = 65536usize;
+            let mut data = access.read_file(&f.file_id).unwrap();
+            for i in 0..16 {
+                let offset = (i * 2) * ss; // every other slice
+                data[offset..offset + ss].fill(0xEE);
+            }
+            access.add_file(f.file_id, data);
+        },
+        "2MB, 16/32 slices damaged, 20 recovery blocks",
+    );
 }
 
 #[test]
@@ -411,17 +422,21 @@ fn repair_large_slices() {
     let slice_size = 256 * 1024u64; // 256KB slices
     let synthetic = build_synthetic_par2(&[2 * 1024 * 1024], slice_size, 4, &mut rng);
 
-    run_repair_scenario(&synthetic, |files, access| {
-        let f = &files[0];
-        let ss = slice_size as usize;
-        let mut data = access.read_file(&f.file_id).unwrap();
-        // Damage slices 1 and 5 (out of 8).
-        for i in [1, 5] {
-            let offset = i * ss;
-            data[offset..offset + ss].fill(0xFF);
-        }
-        access.add_file(f.file_id, data);
-    }, "2MB, 256KB slices, 2/8 damaged");
+    run_repair_scenario(
+        &synthetic,
+        |files, access| {
+            let f = &files[0];
+            let ss = slice_size as usize;
+            let mut data = access.read_file(&f.file_id).unwrap();
+            // Damage slices 1 and 5 (out of 8).
+            for i in [1, 5] {
+                let offset = i * ss;
+                data[offset..offset + ss].fill(0xFF);
+            }
+            access.add_file(f.file_id, data);
+        },
+        "2MB, 256KB slices, 2/8 damaged",
+    );
 }
 
 #[test]
@@ -430,10 +445,14 @@ fn repair_fully_missing_file() {
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_0005);
     let synthetic = build_synthetic_par2(&[512 * 1024], 65536, 8, &mut rng);
 
-    run_repair_scenario(&synthetic, |files, access| {
-        // Zero the entire file — all 8 slices missing.
-        let f = &files[0];
-        let zeroed = vec![0u8; f.data.len()];
-        access.add_file(f.file_id, zeroed);
-    }, "512KB fully missing, 8/8 slices from 8 recovery blocks");
+    run_repair_scenario(
+        &synthetic,
+        |files, access| {
+            // Zero the entire file — all 8 slices missing.
+            let f = &files[0];
+            let zeroed = vec![0u8; f.data.len()];
+            access.add_file(f.file_id, zeroed);
+        },
+        "512KB fully missing, 8/8 slices from 8 recovery blocks",
+    );
 }

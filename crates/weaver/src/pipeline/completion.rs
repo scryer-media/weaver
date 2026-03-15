@@ -20,8 +20,7 @@ fn extract_zip(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
     let mut extracted = Vec::new();
@@ -50,8 +49,8 @@ fn extract_zip(
             member: name.clone(),
         });
 
-        let mut outfile =
-            std::fs::File::create(&out_path).map_err(|e| format!("failed to create {name}: {e}"))?;
+        let mut outfile = std::fs::File::create(&out_path)
+            .map_err(|e| format!("failed to create {name}: {e}"))?;
         let bytes_written = std::io::copy(&mut entry, &mut outfile)
             .map_err(|e| format!("failed to extract {name}: {e}"))?;
 
@@ -74,8 +73,7 @@ fn extract_tar(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
     extract_tar_from_reader(file, output_dir, event_tx, job_id, set_name)
 }
 
@@ -86,8 +84,8 @@ fn extract_tar_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path)
-        .map_err(|e| format!("failed to open tar.gz: {e}"))?;
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.gz: {e}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     extract_tar_from_reader(gz, output_dir, event_tx, job_id, set_name)
 }
@@ -142,8 +140,7 @@ fn extract_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
     let mut gz = flate2::read::GzDecoder::new(file);
 
     // Output filename: strip .gz extension
@@ -1597,19 +1594,40 @@ impl Pipeline {
                                 self.extract_rar_set(job_id, set_name).await
                             }
                             weaver_assembly::ArchiveType::Zip => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Zip).await
+                                self.extract_simple_archive(
+                                    job_id,
+                                    set_name,
+                                    SimpleArchiveKind::Zip,
+                                )
+                                .await
                             }
                             weaver_assembly::ArchiveType::Tar => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Tar).await
+                                self.extract_simple_archive(
+                                    job_id,
+                                    set_name,
+                                    SimpleArchiveKind::Tar,
+                                )
+                                .await
                             }
                             weaver_assembly::ArchiveType::TarGz => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::TarGz).await
+                                self.extract_simple_archive(
+                                    job_id,
+                                    set_name,
+                                    SimpleArchiveKind::TarGz,
+                                )
+                                .await
                             }
                             weaver_assembly::ArchiveType::Gz => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Gz).await
+                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Gz)
+                                    .await
                             }
                             weaver_assembly::ArchiveType::Split => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Split).await
+                                self.extract_simple_archive(
+                                    job_id,
+                                    set_name,
+                                    SimpleArchiveKind::Split,
+                                )
+                                .await
                             }
                         };
                         if let Err(e) = result {
@@ -2085,18 +2103,34 @@ impl Pipeline {
                 }
 
                 let extracted_members = match kind {
-                    SimpleArchiveKind::Zip => {
-                        extract_zip(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
-                    }
-                    SimpleArchiveKind::Tar => {
-                        extract_tar(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
-                    }
-                    SimpleArchiveKind::TarGz => {
-                        extract_tar_gz(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
-                    }
-                    SimpleArchiveKind::Gz => {
-                        extract_gz(&file_paths[0], &output_dir, &event_tx, job_id, &set_name_owned)?
-                    }
+                    SimpleArchiveKind::Zip => extract_zip(
+                        &file_paths[0],
+                        &output_dir,
+                        &event_tx,
+                        job_id,
+                        &set_name_owned,
+                    )?,
+                    SimpleArchiveKind::Tar => extract_tar(
+                        &file_paths[0],
+                        &output_dir,
+                        &event_tx,
+                        job_id,
+                        &set_name_owned,
+                    )?,
+                    SimpleArchiveKind::TarGz => extract_tar_gz(
+                        &file_paths[0],
+                        &output_dir,
+                        &event_tx,
+                        job_id,
+                        &set_name_owned,
+                    )?,
+                    SimpleArchiveKind::Gz => extract_gz(
+                        &file_paths[0],
+                        &output_dir,
+                        &event_tx,
+                        job_id,
+                        &set_name_owned,
+                    )?,
                     SimpleArchiveKind::Split => {
                         extract_split(&file_paths, &output_dir, &event_tx, job_id, &set_name_owned)?
                     }

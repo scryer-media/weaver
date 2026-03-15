@@ -1244,9 +1244,15 @@ impl Pipeline {
                 }
 
                 let archive_type = match role {
-                    weaver_core::classify::FileRole::ZipArchive => weaver_assembly::ArchiveType::Zip,
-                    weaver_core::classify::FileRole::TarArchive => weaver_assembly::ArchiveType::Tar,
-                    weaver_core::classify::FileRole::TarGzArchive => weaver_assembly::ArchiveType::TarGz,
+                    weaver_core::classify::FileRole::ZipArchive => {
+                        weaver_assembly::ArchiveType::Zip
+                    }
+                    weaver_core::classify::FileRole::TarArchive => {
+                        weaver_assembly::ArchiveType::Tar
+                    }
+                    weaver_core::classify::FileRole::TarGzArchive => {
+                        weaver_assembly::ArchiveType::TarGz
+                    }
                     weaver_core::classify::FileRole::GzArchive => weaver_assembly::ArchiveType::Gz,
                     _ => unreachable!(),
                 };
@@ -1269,7 +1275,9 @@ impl Pipeline {
                 };
 
                 let state = self.jobs.get_mut(&job_id).unwrap();
-                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
                 state.assembly.mark_volume_complete(&set_name, 0);
 
                 info!(
@@ -1286,7 +1294,9 @@ impl Pipeline {
 
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
-                    state.assembly.mark_volume_complete(&set_name, completing_number);
+                    state
+                        .assembly
+                        .mark_volume_complete(&set_name, completing_number);
                     debug!(
                         job_id = job_id.0,
                         set_name = %set_name,
@@ -1326,7 +1336,9 @@ impl Pipeline {
                 };
 
                 let state = self.jobs.get_mut(&job_id).unwrap();
-                state.assembly.set_archive_topology(set_name.clone(), topology);
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
 
                 let completed: Vec<u32> = state
                     .assembly

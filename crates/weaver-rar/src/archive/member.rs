@@ -273,7 +273,9 @@ impl RarArchive {
                     });
                 }
 
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -563,7 +565,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -736,7 +740,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -1189,7 +1195,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1301,7 +1309,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1541,7 +1551,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1678,7 +1690,9 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self
+                    .kdf_cache
+                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,

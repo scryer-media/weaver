@@ -269,14 +269,17 @@ pub fn verify_slices(
             }
 
             // Multi-buffer MD5 for the batch.
-            let pad_to = if any_needs_pad { Some(slice_size) } else { None };
+            let pad_to = if any_needs_pad {
+                Some(slice_size)
+            } else {
+                None
+            };
             let md5s = crate::md5_simd::md5_multi(&slice_refs, pad_to);
 
             // Compare.
             for j in 0..batch_size {
                 let i = base + j;
-                result_chunk[j] =
-                    crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
+                result_chunk[j] = crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
             }
         });
 

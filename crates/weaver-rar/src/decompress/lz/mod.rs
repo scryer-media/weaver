@@ -495,9 +495,7 @@ impl LzDecoder {
         }
 
         // Try parallel decode if there are enough blocks.
-        if let Some(output_size) =
-            self.try_decompress_parallel(input, unpacked_size, writer)?
-        {
+        if let Some(output_size) = self.try_decompress_parallel(input, unpacked_size, writer)? {
             return Ok(output_size);
         }
 

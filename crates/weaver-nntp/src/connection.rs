@@ -394,10 +394,7 @@ impl NntpConnection {
     }
 
     /// Like `send_multiline_command` but returns raw data without dot-unstuffing.
-    pub async fn send_multiline_command_raw(
-        &mut self,
-        cmd: &Command,
-    ) -> Result<MultiLineResponse> {
+    pub async fn send_multiline_command_raw(&mut self, cmd: &Command) -> Result<MultiLineResponse> {
         self.send_multiline_command_inner(cmd, true).await
     }
 

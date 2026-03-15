@@ -464,11 +464,8 @@ fn apply_decoded_items(
                     block_length,
                     channels,
                 } => {
-                    let ft = FilterType::from_code(filter_type).ok_or(
-                        RarError::UnsupportedFilter {
-                            filter_type,
-                        },
-                    )?;
+                    let ft = FilterType::from_code(filter_type)
+                        .ok_or(RarError::UnsupportedFilter { filter_type })?;
                     pending_filters.push(PendingFilter {
                         filter_type: ft,
                         block_start: *output_size + block_start_delta,

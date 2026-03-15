@@ -161,9 +161,7 @@ impl HuffmanTable {
             let bit_field = (code as u32) << (16 - quick_bits);
 
             // Find the bit length for this left-aligned bit field.
-            while cur_bit_length < decode_len.len()
-                && bit_field >= decode_len[cur_bit_length]
-            {
+            while cur_bit_length < decode_len.len() && bit_field >= decode_len[cur_bit_length] {
                 cur_bit_length += 1;
             }
 
