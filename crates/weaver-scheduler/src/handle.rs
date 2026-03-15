@@ -718,6 +718,9 @@ mod tests {
                         };
                         let _ = reply.send(result);
                     }
+                    SchedulerCommand::UpdateJob { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
                     SchedulerCommand::Shutdown => break,
                 }
                 // Publish updated job list to shared state after every command.
