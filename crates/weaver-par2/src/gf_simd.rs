@@ -1530,4 +1530,107 @@ mod tests {
             }
         }
     }
+
+    /// Verify the SSSE3 kernel in isolation by testing buffer sizes that are
+    /// exactly 16 bytes (one SSSE3 iteration) and 16+tail. On x86 with AVX2,
+    /// mul_acc_region dispatches to AVX2 which falls through to SSSE3 for
+    /// the 16-byte remainder, so we test the SSSE3 path via the tail.
+    #[test]
+    fn ssse3_tail_matches_scalar() {
+        // 48 bytes = one AVX2 iteration (32) + one SSSE3 iteration (16)
+        // The SSSE3 path processes the remaining 16 bytes after AVX2.
+        for size in [16, 48, 80] {
+            for factor in [2u16, 0x1234, 0xABCD, 0xFFFF, 0x8000] {
+                let src: Vec<u8> = (0..size).map(|i| (i * 13 % 256) as u8).collect();
+                let mut dst_dispatched = vec![0x77u8; size];
+                let mut dst_scalar = dst_dispatched.clone();
+
+                mul_acc_region(factor, &src, &mut dst_dispatched);
+                mul_acc_region_scalar(factor, &src, &mut dst_scalar);
+                assert_eq!(
+                    dst_dispatched, dst_scalar,
+                    "SSSE3 tail mismatch for factor={factor:#06x}, size={size}"
+                );
+            }
+        }
+    }
+
+    /// Large-buffer factor sweep: ensures SIMD main loop + tail handling
+    /// is correct across many factors with a buffer large enough to exercise
+    /// multiple SIMD iterations.
+    #[test]
+    fn large_buffer_factor_sweep() {
+        let src: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+
+        for factor in (2..=0xFFFFu16).step_by(127) {
+            let mut dst_dispatched = vec![0x33u8; 4096];
+            let mut dst_scalar = dst_dispatched.clone();
+
+            mul_acc_region(factor, &src, &mut dst_dispatched);
+            mul_acc_region_scalar(factor, &src, &mut dst_scalar);
+            assert_eq!(
+                dst_dispatched, dst_scalar,
+                "large buffer mismatch for factor={factor:#06x}"
+            );
+        }
+    }
+
+    /// Multi-region with many factors and large buffers — exercises the
+    /// multi-region SIMD kernel's main loop across all dispatch paths.
+    #[test]
+    fn multi_region_large_factor_sweep() {
+        let src: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+
+        for base in (2..=0xFFF0u16).step_by(4096) {
+            let factors = [base, base + 1, base + 2, base + 3, base + 4, base + 5];
+
+            let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 4096]).collect();
+            for (i, &factor) in factors.iter().enumerate() {
+                mul_acc_region(factor, &src, &mut reference[i]);
+            }
+
+            let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 4096]).collect();
+            {
+                let mut pairs: Vec<FactorDst<'_>> = factors
+                    .iter()
+                    .zip(multi.iter_mut())
+                    .map(|(&factor, dst)| FactorDst {
+                        factor,
+                        dst: dst.as_mut_slice(),
+                    })
+                    .collect();
+                mul_acc_multi_region(&mut pairs, &src);
+            }
+
+            for (i, &factor) in factors.iter().enumerate() {
+                assert_eq!(
+                    multi[i], reference[i],
+                    "multi-region large sweep mismatch for factor={factor:#06x}"
+                );
+            }
+        }
+    }
+
+    /// Verify dispatch with non-power-of-2 buffer sizes that stress tail
+    /// handling across all SIMD widths (scalar remainder after 64/32/16-byte
+    /// SIMD iterations).
+    #[test]
+    fn non_aligned_sizes_stress() {
+        let factor = 0xCAFEu16;
+        // Sizes chosen to leave different tail lengths:
+        // 2 = scalar only, 18 = 16+2, 34 = 32+2, 50 = 32+16+2,
+        // 66 = 64+2, 98 = 64+32+2, 130 = 64*2+2
+        for size in [2, 6, 10, 14, 18, 22, 30, 34, 46, 50, 62, 66, 98, 130] {
+            let src: Vec<u8> = (0..size).map(|i| ((i * 31) % 256) as u8).collect();
+            let mut dst_dispatched = vec![0xBBu8; size];
+            let mut dst_scalar = dst_dispatched.clone();
+
+            mul_acc_region(factor, &src, &mut dst_dispatched);
+            mul_acc_region_scalar(factor, &src, &mut dst_scalar);
+            assert_eq!(
+                dst_dispatched, dst_scalar,
+                "non-aligned size mismatch for size={size}"
+            );
+        }
+    }
 }
