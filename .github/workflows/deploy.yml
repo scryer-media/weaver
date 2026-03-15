@@ -129,21 +129,15 @@ jobs:
   rust-test-arm:
     name: rust-test-arm
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
-    needs: [web-build]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Run workspace tests
-        run: cargo test --workspace --locked
+      - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
+        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
