@@ -215,13 +215,13 @@ fn parse_7z_file(lower: &str) -> Option<FileRole> {
 fn parse_split_file(lower: &str) -> Option<FileRole> {
     if let Some(dot_pos) = lower.rfind('.') {
         let ext = &lower[dot_pos + 1..];
-        if ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(n) = ext.parse::<u32>() {
-                // .001 = number 0, .002 = number 1
-                return Some(FileRole::SplitFile {
-                    number: n.saturating_sub(1),
-                });
-            }
+        if ext.len() == 3
+            && ext.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = ext.parse::<u32>()
+        {
+            return Some(FileRole::SplitFile {
+                number: n.saturating_sub(1),
+            });
         }
     }
     None
