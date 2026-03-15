@@ -30,7 +30,7 @@ impl RarArchive {
             .map_or(0, |segment| segment.volume_index);
         let mut compressed_offset = 0u64;
         let mut transitions = Vec::new();
-        for &[ref prev, ref next] in sorted_segments.array_windows() {
+        for [prev, next] in sorted_segments.array_windows() {
             compressed_offset = compressed_offset.saturating_add(prev.data_size);
             transitions.push(crate::decompress::VolumeTransition {
                 volume_index: next.volume_index,
