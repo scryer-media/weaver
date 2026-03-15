@@ -8,7 +8,7 @@
 //! 4. Write repaired data back to files
 
 use rayon::prelude::*;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{Par2Error, Result};
 use crate::gf;
@@ -111,28 +111,60 @@ pub fn plan_repair(
     let missing_count = missing_slices.len();
     debug!("repair: {missing_count} missing slices identified");
 
-    // Select recovery exponents (take the first N available).
-    let recovery_exponents: Vec<u32> = par2_set
-        .recovery_slices
-        .keys()
-        .take(missing_count)
-        .copied()
-        .collect();
+    // Select recovery exponents. Try the first N available; if the decode
+    // matrix is singular (bad recovery block), skip that exponent and retry
+    // with the next available one.
+    let all_exponents: Vec<u32> = par2_set.recovery_slices.keys().copied().collect();
 
-    if recovery_exponents.len() < missing_count {
+    if all_exponents.len() < missing_count {
         return Err(Par2Error::InsufficientRecoveryData {
             needed: missing_count as u32,
-            available: recovery_exponents.len() as u32,
-            deficit: (missing_count - recovery_exponents.len()) as u32,
+            available: all_exponents.len() as u32,
+            deficit: (missing_count - all_exponents.len()) as u32,
         });
     }
 
     // Compute constants for all input slices.
     let constants = gf::input_slice_constants(total_input_slices);
 
-    // Build and invert the decode matrix.
-    let decode =
-        matrix::build_decode_matrix(&missing_global_indices, &recovery_exponents, &constants)?;
+    // Try building the decode matrix, skipping singular recovery blocks.
+    let mut skip_set: Vec<usize> = Vec::new();
+    let (recovery_exponents, decode) = loop {
+        let selected: Vec<u32> = all_exponents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !skip_set.contains(i))
+            .map(|(_, &e)| e)
+            .take(missing_count)
+            .collect();
+
+        if selected.len() < missing_count {
+            return Err(Par2Error::InsufficientRecoveryData {
+                needed: missing_count as u32,
+                available: selected.len() as u32,
+                deficit: (missing_count - selected.len()) as u32,
+            });
+        }
+
+        match matrix::build_decode_matrix(&missing_global_indices, &selected, &constants) {
+            Ok(decode) => break (selected, decode),
+            Err(Par2Error::ReedSolomonError { .. }) => {
+                // Find which exponent to skip: try removing each one from the
+                // current selection until we find the culprit, or just skip
+                // the last one added (simplest heuristic).
+                let skip_idx = all_exponents
+                    .iter()
+                    .position(|e| *e == *selected.last().unwrap())
+                    .unwrap();
+                warn!(
+                    "recovery exponent {} produced singular matrix, skipping",
+                    selected.last().unwrap()
+                );
+                skip_set.push(skip_idx);
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     info!(
         "repair plan: {} missing slices, {} recovery blocks selected",

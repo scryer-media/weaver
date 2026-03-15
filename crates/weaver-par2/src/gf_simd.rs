@@ -183,6 +183,13 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            let matrices = precompute_affine_matrices(factor);
+            unsafe { mul_acc_region_gfni_avx512(&matrices, src, dst) };
+            return;
+        }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
             let matrices = precompute_affine_matrices(factor);
             unsafe { mul_acc_region_gfni_avx2(&matrices, src, dst) };
@@ -194,6 +201,10 @@ pub fn mul_acc_region(factor: u16, src: &[u8], dst: &mut [u8]) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            unsafe { mul_acc_region_avx512(&tables, src, dst) };
+            return;
+        }
         if is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_region_avx2(&tables, src, dst) };
             return;
@@ -251,7 +262,16 @@ pub fn mul_acc_multi_region(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) 
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { mul_acc_multi_region_neon(factors_and_dsts, src) };
+        // Use CLMUL (PMULL) kernel when >2 non-zero factors — amortizes reduction cost.
+        let nonzero_count = factors_and_dsts
+            .iter()
+            .filter(|fd| fd.factor != 0 && fd.factor != 1)
+            .count();
+        if nonzero_count > 2 {
+            unsafe { mul_acc_multi_region_clmul(factors_and_dsts, src) };
+        } else {
+            unsafe { mul_acc_multi_region_neon(factors_and_dsts, src) };
+        }
         return;
     }
 
@@ -352,6 +372,143 @@ unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst
     if offset < len {
         let tables = precompute_mul_tables(matrices.factor);
         unsafe { mul_acc_region_ssse3(&tables, &src[offset..], &mut dst[offset..]) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GFNI + AVX-512 kernel: 64 bytes (32 GF elements) per iteration
+//
+// Same algorithm as GFNI+AVX2 but 2× wider (512-bit registers).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn mul_acc_region_gfni_avx512(matrices: &AffineMulMatrices, src: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+    let mut offset = 0usize;
+
+    unsafe {
+        let m_ll = _mm512_set1_epi64(matrices.m_ll as i64);
+        let m_lh = _mm512_set1_epi64(matrices.m_lh as i64);
+        let m_hl = _mm512_set1_epi64(matrices.m_hl as i64);
+        let m_hh = _mm512_set1_epi64(matrices.m_hh as i64);
+
+        // Deinterleave masks (per 128-bit lane — same pattern broadcast to all 4 lanes).
+        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        ));
+
+        while offset + 64 <= len {
+            let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let d = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+
+            let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
+            let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+
+            let result_lo = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
+                _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+            );
+            let result_hi = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
+                _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+            );
+
+            let product = _mm512_unpacklo_epi8(result_lo, result_hi);
+            let result = _mm512_xor_si512(d, product);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+
+            offset += 64;
+        }
+    }
+
+    // Tail: fall through to GFNI+AVX2 for 32-byte chunk, then SSSE3/scalar.
+    if offset < len {
+        unsafe { mul_acc_region_gfni_avx2(matrices, &src[offset..], &mut dst[offset..]) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AVX-512 shuffle kernel: 64 bytes (32 GF elements) per iteration
+//
+// Same split-nibble algorithm as AVX2 but 2× wider (512-bit registers).
+// VPSHUFB in AVX-512 operates within each 128-bit lane independently.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vl")]
+unsafe fn mul_acc_region_avx512(tables: &MulTables, src: &[u8], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let len = src.len();
+    let mut offset = 0usize;
+
+    unsafe {
+        let mask_0f = _mm512_set1_epi8(0x0F);
+
+        // Broadcast each 16-byte table into all four 128-bit lanes.
+        let t0 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[0].as_ptr() as *const __m128i));
+        let t1 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[1].as_ptr() as *const __m128i));
+        let t2 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[2].as_ptr() as *const __m128i));
+        let t3 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[3].as_ptr() as *const __m128i));
+        let t4 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[4].as_ptr() as *const __m128i));
+        let t5 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[5].as_ptr() as *const __m128i));
+        let t6 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[6].as_ptr() as *const __m128i));
+        let t7 = _mm512_broadcast_i32x4(_mm_loadu_si128(tables.tables[7].as_ptr() as *const __m128i));
+
+        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        ));
+
+        while offset + 64 <= len {
+            let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+            let d = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+
+            let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
+            let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+
+            let lo_n0 = _mm512_and_si512(lo_bytes, mask_0f);
+            let lo_n1 = _mm512_and_si512(_mm512_srli_epi16(lo_bytes, 4), mask_0f);
+            let hi_n0 = _mm512_and_si512(hi_bytes, mask_0f);
+            let hi_n1 = _mm512_and_si512(_mm512_srli_epi16(hi_bytes, 4), mask_0f);
+
+            let p0_lo = _mm512_shuffle_epi8(t0, lo_n0);
+            let p0_hi = _mm512_shuffle_epi8(t1, lo_n0);
+            let p1_lo = _mm512_shuffle_epi8(t2, lo_n1);
+            let p1_hi = _mm512_shuffle_epi8(t3, lo_n1);
+            let p2_lo = _mm512_shuffle_epi8(t4, hi_n0);
+            let p2_hi = _mm512_shuffle_epi8(t5, hi_n0);
+            let p3_lo = _mm512_shuffle_epi8(t6, hi_n1);
+            let p3_hi = _mm512_shuffle_epi8(t7, hi_n1);
+
+            let result_lo = _mm512_xor_si512(
+                _mm512_xor_si512(p0_lo, p1_lo),
+                _mm512_xor_si512(p2_lo, p3_lo),
+            );
+            let result_hi = _mm512_xor_si512(
+                _mm512_xor_si512(p0_hi, p1_hi),
+                _mm512_xor_si512(p2_hi, p3_hi),
+            );
+
+            let product = _mm512_unpacklo_epi8(result_lo, result_hi);
+            let result = _mm512_xor_si512(d, product);
+            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, result);
+
+            offset += 64;
+        }
+    }
+
+    // Tail: fall through to AVX2 for 32-byte chunk, then SSSE3/scalar.
+    if offset < len {
+        unsafe { mul_acc_region_avx2(tables, &src[offset..], &mut dst[offset..]) };
     }
 }
 
@@ -704,6 +861,222 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
 }
 
 // ---------------------------------------------------------------------------
+// Multi-region CLMUL kernel (aarch64)
+//
+// Uses ARM polynomial multiply (PMULL/vmull_p8) with Karatsuba decomposition
+// to compute GF(2^16) multiply-accumulate. Each 16-bit GF element is split
+// into lo/hi bytes; three 8×8 polynomial multiplies produce a 30-bit product
+// that is then reduced modulo x^16 + x^12 + x^3 + x + 1.
+//
+// Advantage over VTBL shuffle: 3 PMULL + accumulate per factor vs 8 VTBL,
+// with a single shared reduction at the end. Wins when >2 factors.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_multi_region_clmul(factors_and_dsts: &mut [FactorDst<'_>], src: &[u8]) {
+    use std::arch::aarch64::*;
+
+    let len = src.len();
+
+    // Separate factor=1 (XOR-only) destinations.
+    for fd in factors_and_dsts.iter_mut() {
+        if fd.factor == 1 {
+            for (d, s) in fd.dst.iter_mut().zip(src.iter()) {
+                *d ^= *s;
+            }
+        }
+    }
+
+    // Collect non-trivial factors with precomputed coefficients.
+    // For Karatsuba: store (lo, hi, lo^hi) as poly8x8_t.
+    struct ClmulCoeff {
+        lo: poly8x8_t,
+        hi: poly8x8_t,
+        mid: poly8x8_t, // lo ^ hi
+        lo_full: poly8x16_t,
+        hi_full: poly8x16_t,
+        mid_full: poly8x16_t,
+        dst_idx: usize,
+    }
+
+    let coeffs: Vec<ClmulCoeff> = unsafe {
+        factors_and_dsts
+            .iter()
+            .enumerate()
+            .filter(|(_, fd)| fd.factor > 1)
+            .map(|(idx, fd)| {
+                let lo_byte = (fd.factor & 0xFF) as u8;
+                let hi_byte = (fd.factor >> 8) as u8;
+                let mid_byte = lo_byte ^ hi_byte;
+                ClmulCoeff {
+                    lo: vdup_n_p8(lo_byte),
+                    hi: vdup_n_p8(hi_byte),
+                    mid: vdup_n_p8(mid_byte),
+                    lo_full: vdupq_n_p8(lo_byte),
+                    hi_full: vdupq_n_p8(hi_byte),
+                    mid_full: vdupq_n_p8(mid_byte),
+                    dst_idx: idx,
+                }
+            })
+            .collect()
+    };
+
+    if coeffs.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let mut offset = 0usize;
+
+        while offset + 16 <= len {
+            let s = vld1q_u8(src.as_ptr().add(offset));
+
+            // Deinterleave: separate lo bytes (even) and hi bytes (odd) of each u16.
+            let data_lo = vreinterpretq_p8_u8(vuzp1q_u8(s, s));
+            let data_hi = vreinterpretq_p8_u8(vuzp2q_u8(s, s));
+            let data_mid = vreinterpretq_p8_u8(veorq_u8(
+                vreinterpretq_u8_p8(data_lo),
+                vreinterpretq_u8_p8(data_hi),
+            ));
+
+            let data_lo_half = vget_low_p8(data_lo);
+            let data_hi_half = vget_low_p8(data_hi);
+            let data_mid_half = vget_low_p8(data_mid);
+
+            // For each coefficient, compute Karatsuba products and accumulate,
+            // then reduce and write to that coefficient's destination.
+            for coeff in &coeffs {
+                // Three Karatsuba products (low half: 4 elements, high half: 4 elements).
+                // vmull_p8: poly8x8 × poly8x8 → poly16x8 (8 results from low halves)
+                // vmull_high_p8: poly8x16 × poly8x16 → poly16x8 (8 results from high halves)
+                let ll_lo = vmull_p8(data_lo_half, coeff.lo);
+                let ll_hi = vmull_high_p8(data_lo, coeff.lo_full);
+                let hh_lo = vmull_p8(data_hi_half, coeff.hi);
+                let hh_hi = vmull_high_p8(data_hi, coeff.hi_full);
+                let mm_lo = vmull_p8(data_mid_half, coeff.mid);
+                let mm_hi = vmull_high_p8(data_mid, coeff.mid_full);
+
+                // Karatsuba combination:
+                // Product = L + (M ^ L ^ H) << 8 + H << 16
+                //
+                // In byte terms (each poly16x8 has lo_byte and hi_byte per element):
+                //   product_byte0 = L.lo
+                //   product_byte1 = L.hi ^ K.lo  (K = M ^ L ^ H)
+                //   product_byte2 = H.lo ^ K.hi
+                //   product_byte3 = H.hi
+                //
+                // Bytes 0-1 form the low 16 bits, bytes 2-3 form the high 14 bits.
+
+                // Compute K = M ^ L ^ H for both halves.
+                let k_lo = veorq_u16(
+                    vreinterpretq_u16_p16(mm_lo),
+                    veorq_u16(
+                        vreinterpretq_u16_p16(ll_lo),
+                        vreinterpretq_u16_p16(hh_lo),
+                    ),
+                );
+                let k_hi = veorq_u16(
+                    vreinterpretq_u16_p16(mm_hi),
+                    veorq_u16(
+                        vreinterpretq_u16_p16(ll_hi),
+                        vreinterpretq_u16_p16(hh_hi),
+                    ),
+                );
+
+                // Deinterleave L, H, K into separate byte lanes.
+                let l_lo = vreinterpretq_u8_p16(ll_lo);
+                let l_hi = vreinterpretq_u8_p16(ll_hi);
+                let h_lo = vreinterpretq_u8_p16(hh_lo);
+                let h_hi = vreinterpretq_u8_p16(hh_hi);
+                let k_lo_u8 = vreinterpretq_u8_u16(k_lo);
+                let k_hi_u8 = vreinterpretq_u8_u16(k_hi);
+
+                // Separate even bytes (byte0 of each u16) and odd bytes (byte1).
+                let l_bytes = vuzpq_u8(l_lo, l_hi);   // .0 = even bytes (L.lo), .1 = odd bytes (L.hi)
+                let h_bytes = vuzpq_u8(h_lo, h_hi);   // .0 = H.lo, .1 = H.hi
+                let k_bytes = vuzpq_u8(k_lo_u8, k_hi_u8); // .0 = K.lo, .1 = K.hi
+
+                // Combine into product bytes:
+                let prod_byte0 = l_bytes.0; // L.lo
+                let prod_byte1 = veorq_u8(l_bytes.1, k_bytes.0); // L.hi ^ K.lo
+                let prod_byte2 = veorq_u8(h_bytes.0, k_bytes.1); // H.lo ^ K.hi
+                let prod_byte3 = h_bytes.1; // H.hi
+
+                // Assemble low 16 bits and high 14 bits as uint16x8_t.
+                // low = byte0 | (byte1 << 8) = reinterleave bytes 0,1
+                // high = byte2 | (byte3 << 8) = reinterleave bytes 2,3
+                let result_low = vreinterpretq_u16_u8(vzipq_u8(prod_byte0, prod_byte1).0);
+                let result_high = vreinterpretq_u16_u8(vzipq_u8(prod_byte2, prod_byte3).0);
+
+                // Reduce: high * (x^12 + x^3 + x + 1) folded into low.
+                // Iterative: each pass reduces bits above 15.
+                let reduced = reduce_gf16(result_low, result_high);
+
+                // Reinterleave from u16 back to bytes and XOR-accumulate into dst.
+                let product = vreinterpretq_u8_u16(reduced);
+                let d = vld1q_u8(factors_and_dsts[coeff.dst_idx].dst.as_ptr().add(offset));
+                let result = veorq_u8(d, product);
+                vst1q_u8(
+                    factors_and_dsts[coeff.dst_idx].dst.as_mut_ptr().add(offset),
+                    result,
+                );
+            }
+
+            offset += 16;
+        }
+
+        // Scalar tail.
+        if offset < len {
+            for coeff in &coeffs {
+                mul_acc_region_scalar(
+                    factors_and_dsts[coeff.dst_idx].factor,
+                    &src[offset..],
+                    &mut factors_and_dsts[coeff.dst_idx].dst[offset..],
+                );
+            }
+        }
+    }
+}
+
+/// Reduce a 30-bit GF(2)[x] product to GF(2^16).
+///
+/// Given low (bits 0-15) and high (bits 16-29), computes
+/// `low XOR reduce(high)` where the reduction polynomial is
+/// x^16 + x^12 + x^3 + x + 1.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reduce_gf16(
+    low: std::arch::aarch64::uint16x8_t,
+    high: std::arch::aarch64::uint16x8_t,
+) -> std::arch::aarch64::uint16x8_t {
+    use std::arch::aarch64::*;
+
+    // Reduction: x^16 ≡ x^12 + x^3 + x + 1
+    // For high bits h: contribution = (h << 12) ^ (h << 3) ^ (h << 1) ^ h
+    // Bits that overflow u16 (from h << 12) become the next round's high bits.
+    let mut result = low;
+    let mut h = high;
+
+    // Each pass: max 14 bits → (h >> 4) = 10 bits → 6 bits → 2 bits → 0.
+    // Unroll 4 iterations (always sufficient for 14-bit input).
+    unsafe {
+        for _ in 0..4 {
+            let contrib = veorq_u16(
+                veorq_u16(vshlq_n_u16::<12>(h), vshlq_n_u16::<3>(h)),
+                veorq_u16(vshlq_n_u16::<1>(h), h),
+            );
+            result = veorq_u16(result, contrib);
+            // Overflow from h << 12: bits that shifted past position 15.
+            // h >> 4 captures bits 4+ of h that land at position 16+ after << 12.
+            // h >> 13 captures the single bit from h << 3 that overflows.
+            h = veorq_u16(vshrq_n_u16::<4>(h), vshrq_n_u16::<13>(h));
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Multi-region NEON kernel (aarch64)
 //
 // Reads src once per 16-byte chunk, applies all factors to all destinations.
@@ -1049,6 +1422,110 @@ mod tests {
                 multi[i], reference[i],
                 "multi-region large mismatch for factor={factor:#06x}"
             );
+        }
+    }
+
+    /// Test the CLMUL dispatch path specifically (>2 non-zero factors).
+    #[test]
+    fn multi_region_clmul_path() {
+        // 8 factors ensures CLMUL is selected on aarch64 (threshold is >2).
+        let src: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        let factors = [
+            0x1234u16, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444,
+        ];
+
+        let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 4096]).collect();
+        for (i, &factor) in factors.iter().enumerate() {
+            mul_acc_region(factor, &src, &mut reference[i]);
+        }
+
+        let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 4096]).collect();
+        {
+            let mut pairs: Vec<FactorDst<'_>> = factors
+                .iter()
+                .zip(multi.iter_mut())
+                .map(|(&factor, dst)| FactorDst {
+                    factor,
+                    dst: dst.as_mut_slice(),
+                })
+                .collect();
+            mul_acc_multi_region(&mut pairs, &src);
+        }
+
+        for (i, &factor) in factors.iter().enumerate() {
+            assert_eq!(
+                multi[i], reference[i],
+                "CLMUL path mismatch for factor={factor:#06x}"
+            );
+        }
+    }
+
+    /// Test CLMUL with all possible factor edge cases mixed in.
+    #[test]
+    fn multi_region_clmul_with_edge_factors() {
+        let src: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
+        // Mix of: zero (skip), one (XOR), normal, and high-bit factors.
+        let factors = [0x0000u16, 0x0001, 0xFFFF, 0x8000, 0x0002, 0x7FFF];
+
+        let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x55u8; 256]).collect();
+        for (i, &factor) in factors.iter().enumerate() {
+            mul_acc_region(factor, &src, &mut reference[i]);
+        }
+
+        let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0x55u8; 256]).collect();
+        {
+            let mut pairs: Vec<FactorDst<'_>> = factors
+                .iter()
+                .zip(multi.iter_mut())
+                .map(|(&factor, dst)| FactorDst {
+                    factor,
+                    dst: dst.as_mut_slice(),
+                })
+                .collect();
+            mul_acc_multi_region(&mut pairs, &src);
+        }
+
+        for (i, &factor) in factors.iter().enumerate() {
+            assert_eq!(
+                multi[i], reference[i],
+                "CLMUL edge mismatch for factor={factor:#06x}"
+            );
+        }
+    }
+
+    /// Exhaustive factor sweep for the CLMUL multi-region path.
+    #[test]
+    fn multi_region_clmul_factor_sweep() {
+        let src: Vec<u8> = (0..32).collect();
+
+        // Test groups of 4 factors at a time across the full range.
+        for base in (2..=0xFFFCu16).step_by(1024) {
+            let factors = [base, base + 1, base + 2, base + 3];
+
+            let mut reference: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 32]).collect();
+            for (i, &factor) in factors.iter().enumerate() {
+                mul_acc_region(factor, &src, &mut reference[i]);
+            }
+
+            let mut multi: Vec<Vec<u8>> = factors.iter().map(|_| vec![0u8; 32]).collect();
+            {
+                let mut pairs: Vec<FactorDst<'_>> = factors
+                    .iter()
+                    .zip(multi.iter_mut())
+                    .map(|(&factor, dst)| FactorDst {
+                        factor,
+                        dst: dst.as_mut_slice(),
+                    })
+                    .collect();
+                mul_acc_multi_region(&mut pairs, &src);
+            }
+
+            for (i, &factor) in factors.iter().enumerate() {
+                assert_eq!(
+                    multi[i], reference[i],
+                    "CLMUL sweep mismatch for factor={factor:#06x}"
+                );
+            }
         }
     }
 }
