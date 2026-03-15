@@ -34,6 +34,7 @@ const MAX_CODE_LENGTH: usize = 15;
 const MAX_QUICK_BITS: u8 = 9;
 
 /// A Huffman decoding table using unrar's sorted-threshold scheme.
+#[derive(Clone)]
 ///
 /// Instead of a binary tree, uses left-aligned upper-limit codes per bit
 /// length (`decode_len`) and a flat symbol array (`decode_num`). The hot

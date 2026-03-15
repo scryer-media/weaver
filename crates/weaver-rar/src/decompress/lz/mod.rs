@@ -20,6 +20,7 @@
 pub mod bitstream;
 pub mod filter;
 pub mod huffman;
+mod parallel;
 pub mod window;
 
 use std::io::Write;
@@ -493,6 +494,14 @@ impl LzDecoder {
             return Ok(0);
         }
 
+        // Try parallel decode if there are enough blocks.
+        if let Some(output_size) =
+            self.try_decompress_parallel(input, unpacked_size, writer)?
+        {
+            return Ok(output_size);
+        }
+
+        // Fall back to single-threaded decode.
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
         let flush_threshold = (self.window.dict_size() / 2).max(1);

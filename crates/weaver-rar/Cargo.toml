@@ -23,6 +23,7 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

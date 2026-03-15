@@ -210,8 +210,12 @@ impl<'a> BitReader<'a> {
         }
         let mut remaining = count;
         // Consume from accumulator first.
-        if remaining as u8 <= self.acc_bits {
-            self.acc <<= remaining;
+        if remaining <= self.acc_bits as u32 {
+            if remaining < 64 {
+                self.acc <<= remaining;
+            } else {
+                self.acc = 0;
+            }
             self.acc_bits -= remaining as u8;
             self.refill();
             return Ok(());

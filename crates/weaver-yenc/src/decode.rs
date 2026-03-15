@@ -100,9 +100,9 @@ pub fn decode_body(
     let mut dst = 0usize;
     let mut at_line_start = true;
 
-    // We feed the CRC hasher in chunks for better performance.
-    // Track where the last CRC update ended.
-    let mut crc_pos = 0usize;
+    // CRC is updated once at the end for better hardware utilization
+    // (crc32fast's PCLMULQDQ path needs >= 128 bytes).
+    let crc_pos = 0usize;
 
     while src < input.len() {
         let byte = input[src];
@@ -140,15 +140,8 @@ pub fn decode_body(
 
         match byte {
             b'\r' | b'\n' => {
-                // Skip line terminators.
                 at_line_start = byte == b'\n' || (byte == b'\r');
-                // Feed CRC in chunks at line boundaries.
-                if dst > crc_pos {
-                    crc.update(&output[crc_pos..dst]);
-                    crc_pos = dst;
-                }
                 src += 1;
-                // After \n, we're at line start.
                 if byte == b'\n' {
                     at_line_start = true;
                 }
@@ -269,8 +262,9 @@ pub fn decode_chunk(
     let mut src = 0usize;
     let mut dst = 0usize;
 
-    // Track where the last CRC update ended within this output buffer.
-    let mut crc_pos = 0usize;
+    // CRC is updated once at the end (or on early return) for better
+    // hardware utilization (crc32fast's PCLMULQDQ path needs >= 128 bytes).
+    let crc_pos = 0usize;
 
     // Handle a pending escape from the previous chunk.
     if state.escape_pending {
@@ -370,11 +364,6 @@ pub fn decode_chunk(
 
         match byte {
             b'\r' | b'\n' => {
-                // Feed CRC in chunks at line boundaries.
-                if dst > crc_pos {
-                    state.crc.update(&output[crc_pos..dst]);
-                    crc_pos = dst;
-                }
                 src += 1;
                 if byte == b'\n' {
                     state.at_line_start = true;
