@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use weaver_assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use weaver_assembly::{ExtractionReadiness, JobAssembly};
 use weaver_core::buffer::{BufferHandle, BufferPool};
+#[cfg(test)]
 use weaver_core::checksum;
 use weaver_core::event::PipelineEvent;
 use weaver_core::id::{JobId, NzbFileId, SegmentId};
