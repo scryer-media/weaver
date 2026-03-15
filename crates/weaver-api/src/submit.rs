@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use weaver_core::config::SharedConfig;
 use weaver_core::id::JobId;
@@ -38,8 +38,6 @@ pub enum SubmitNzbError {
     CreateStorageDir(std::io::Error),
     #[error("failed to save NZB: {0}")]
     Save(std::io::Error),
-    #[error("unknown category: {0}")]
-    UnknownCategory(String),
     #[error("scheduler error: {0}")]
     Scheduler(#[from] weaver_scheduler::SchedulerError),
 }
@@ -68,7 +66,10 @@ pub async fn submit_nzb_bytes(
         } else {
             match weaver_core::config::resolve_category(&cfg.categories, cat) {
                 Some(canonical) => Some(canonical),
-                None => return Err(SubmitNzbError::UnknownCategory(cat.clone())),
+                None => {
+                    warn!(category = %cat, "unknown category, submitting without category");
+                    None
+                }
             }
         }
     } else {

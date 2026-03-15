@@ -1,18 +1,24 @@
-FROM busybox:1.37 AS prep
-RUN mkdir -p /data && chown 65532:65532 /data
+FROM alpine:latest
 
-FROM gcr.io/distroless/cc-debian13:nonroot
+ARG TARGETARCH
+
+RUN apk add --no-cache su-exec tzdata
 
 WORKDIR /app
 
-COPY --chown=65532:65532 weaver /usr/local/bin/weaver
+COPY ${TARGETARCH}/weaver /usr/local/bin/weaver
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 9090
 
-COPY --from=prep --chown=65532:65532 /data /data
+RUN mkdir -p /data
 VOLUME /data
+
+ENV PUID=1000
+ENV PGID=1000
 
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/usr/local/bin/weaver"]
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["--config", "/data", "serve", "--port", "9090"]
