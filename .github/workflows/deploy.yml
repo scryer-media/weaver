@@ -144,7 +144,7 @@ jobs:
       - name: Build par2 tests (GFNI + AVX2)
         env:
           RUSTFLAGS: "-C target-feature=+avx2,+gfni,+ssse3"
-        run: cargo test --package weaver-par2 --features slow-tests --no-run --locked --message-format=json 2>/dev/null | jq -r 'select(.executable != null) | .executable' | sort -u > /tmp/test-bins.txt
+        run: cargo test --package weaver-par2 --features slow-tests --no-run --locked --message-format=json 2>/dev/null | jq -r 'select(.executable != null and .profile.test == true) | .executable' | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (Ice Lake emulation)
         run: |
           while IFS= read -r bin; do
