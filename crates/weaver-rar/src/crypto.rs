@@ -454,8 +454,11 @@ impl CbcDecryptorAny {
     }
 }
 
-/// Decryption buffer size: 4096 bytes = 256 AES blocks.
-const DECRYPT_BUF_SIZE: usize = 4096;
+/// Decryption buffer size: 256KB = 16384 AES blocks.
+/// Larger buffers let the `cbc` crate pipeline AES-NI operations.
+/// unrar uses a 32KB I/O buffer but decrypts in bulk after read;
+/// we match that throughput with a single larger decrypt buffer.
+const DECRYPT_BUF_SIZE: usize = 256 * 1024;
 
 /// A `Read` adapter that decrypts AES-CBC on-the-fly.
 ///
@@ -471,8 +474,8 @@ pub struct DecryptingReader<R: Read> {
     /// Bytes read from inner but not yet forming a complete AES block.
     pending: [u8; AES_BLOCK],
     pending_len: usize,
-    /// Decrypted data ready to be consumed by the caller.
-    out_buf: [u8; DECRYPT_BUF_SIZE],
+    /// Heap-allocated decryption buffer (too large for stack).
+    out_buf: Box<[u8]>,
     out_pos: usize,
     out_len: usize,
     /// Inner reader hit EOF.
@@ -487,7 +490,7 @@ impl<R: Read> DecryptingReader<R> {
             decryptor: CbcDecryptorAny::Rar5(Box::new(CbcDecryptor::new(key, iv))),
             pending: [0u8; AES_BLOCK],
             pending_len: 0,
-            out_buf: [0u8; DECRYPT_BUF_SIZE],
+            out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
             out_pos: 0,
             out_len: 0,
             inner_eof: false,
@@ -501,7 +504,7 @@ impl<R: Read> DecryptingReader<R> {
             decryptor: CbcDecryptorAny::Rar4(Box::new(Rar4CbcDecryptor::new(key, iv))),
             pending: [0u8; AES_BLOCK],
             pending_len: 0,
-            out_buf: [0u8; DECRYPT_BUF_SIZE],
+            out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
             out_pos: 0,
             out_len: 0,
             inner_eof: false,
@@ -523,32 +526,39 @@ impl<R: Read> Read for DecryptingReader<R> {
             return Ok(0);
         }
 
-        // Read from inner into a temp buffer, prepending any pending bytes.
-        // We want to fill out_buf with complete AES blocks.
-        let mut raw = [0u8; DECRYPT_BUF_SIZE + AES_BLOCK];
+        // Read directly into out_buf, prepending any pending partial block.
         let raw_start;
         if self.pending_len > 0 {
-            raw[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+            self.out_buf[..self.pending_len]
+                .copy_from_slice(&self.pending[..self.pending_len]);
             raw_start = self.pending_len;
             self.pending_len = 0;
         } else {
             raw_start = 0;
         }
 
-        // Read more from inner.
-        let bytes_read = if !self.inner_eof {
-            let n = self
-                .inner
-                .read(&mut raw[raw_start..raw_start + DECRYPT_BUF_SIZE])?;
-            if n == 0 {
-                self.inner_eof = true;
+        // Fill out_buf as much as possible from inner.
+        // Loop to fill the buffer since a single read() may return short.
+        let mut total = raw_start;
+        if !self.inner_eof {
+            // Read at least enough to make progress, ideally fill the buffer.
+            while total < DECRYPT_BUF_SIZE {
+                let n = self
+                    .inner
+                    .read(&mut self.out_buf[total..DECRYPT_BUF_SIZE])?;
+                if n == 0 {
+                    self.inner_eof = true;
+                    break;
+                }
+                total += n;
+                // Don't loop forever on small reads — one good read is enough
+                // to make progress. But try to fill the buffer for pipeline efficiency.
+                if total >= DECRYPT_BUF_SIZE / 2 {
+                    break;
+                }
             }
-            n
-        } else {
-            0
-        };
+        }
 
-        let total = raw_start + bytes_read;
         if total == 0 {
             return Ok(0);
         }
@@ -559,25 +569,21 @@ impl<R: Read> Read for DecryptingReader<R> {
 
         // Save leftover for next call.
         if leftover > 0 {
-            self.pending[..leftover].copy_from_slice(&raw[complete..total]);
+            self.pending[..leftover].copy_from_slice(&self.out_buf[complete..total]);
             self.pending_len = leftover;
         }
 
         if complete == 0 {
-            // Not enough data for a full block yet. If inner is EOF, this
-            // means the data wasn't block-aligned — shouldn't happen.
             if self.inner_eof {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "encrypted data not aligned to AES block size",
                 ));
             }
-            // Try reading more.
             return self.read(buf);
         }
 
-        // Decrypt complete blocks in-place.
-        self.out_buf[..complete].copy_from_slice(&raw[..complete]);
+        // Decrypt complete blocks in-place (no extra copy).
         self.decryptor.decrypt_blocks(&mut self.out_buf[..complete]);
         self.out_pos = 0;
         self.out_len = complete;

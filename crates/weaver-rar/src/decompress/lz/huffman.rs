@@ -141,14 +141,13 @@ impl HuffmanTable {
             }
         }
 
-        // Choose quick bits based on table size (matching unrar).
-        let quick_bits = if num_symbols >= HUFF_NC {
-            // NC and NC30 and NC20 all get max quick bits
-            MAX_QUICK_BITS
-        } else if MAX_QUICK_BITS > 3 {
-            MAX_QUICK_BITS - 3
-        } else {
-            0
+        // Choose quick bits based on table size (matching unrar's MakeDecodeTables).
+        // unrar: NC(306), NC30(299), NC20(298) all get MAX_QUICK_DECODE_BITS (9).
+        // All smaller tables get MAX_QUICK_DECODE_BITS - 3 (6).
+        let quick_bits = match num_symbols {
+            306 | 299 | 298 => MAX_QUICK_BITS, // NC, NC30, NC20
+            _ if MAX_QUICK_BITS > 3 => MAX_QUICK_BITS - 3,
+            _ => 0,
         };
 
         let quick_data_size = 1usize << quick_bits;
@@ -251,10 +250,8 @@ impl HuffmanTable {
         let dist = dist >> (16 - bits);
         let pos = (self.decode_pos[bits] + dist) as usize;
 
-        // Safety check for corrupt data.
-        if pos >= self.num_symbols {
-            return Ok(0);
-        }
+        // Safety check for corrupt data (matching unrar: Pos=0 if out of bounds).
+        let pos = if pos >= self.num_symbols { 0 } else { pos };
 
         Ok(self.decode_num[pos])
     }

@@ -45,9 +45,12 @@ impl Window {
         self.total_written += 1;
     }
 
-    /// Maximum match length that the fast path must accommodate.
-    /// Matches unrar's MAX_INC_LZ_MATCH (264 for RAR5).
-    const MAX_MATCH: usize = 264;
+    /// Safety margin for the no-wrap fast path.
+    ///
+    /// unrar uses MAX_INC_LZ_MATCH = 0x1004 (4100) here. Our fast path
+    /// additionally bounds by `length`, so a smaller margin is safe. We use
+    /// the unrar value anyway for parity.
+    const NO_WRAP_MARGIN: usize = 0x1004;
 
     /// Copy `length` bytes from `distance` bytes back in the output.
     ///
@@ -73,14 +76,12 @@ impl Window {
             let byte = self.buf[src];
             let dst = self.pos;
             if dst + length <= dict_size {
-                // No wrap — single fill.
                 self.buf[dst..dst + length].fill(byte);
                 self.pos = dst + length;
                 if self.pos >= dict_size {
                     self.pos = 0;
                 }
             } else {
-                // Wraps around — two fills.
                 let first = dict_size - dst;
                 self.buf[dst..dict_size].fill(byte);
                 let second = length - first;
@@ -93,13 +94,33 @@ impl Window {
 
         // Fast path: both src and dst are far enough from the window boundary
         // that neither will wrap during this copy. Skip all modulo arithmetic.
-        // Matches unrar's "if (SrcPtr<MaxWinSize-MAX_INC_LZ_MATCH && UnpPtr<MaxWinSize-MAX_INC_LZ_MATCH)".
-        if src + length + Self::MAX_MATCH <= dict_size
-            && self.pos + length + Self::MAX_MATCH <= dict_size
-            && distance >= length
+        // Matches unrar's CopyString check:
+        //   if (SrcPtr < MaxWinSize - MAX_INC_LZ_MATCH &&
+        //       UnpPtr < MaxWinSize - MAX_INC_LZ_MATCH)
+        // Unlike unrar, we don't need the large margin because we bound by
+        // `length` explicitly. But we use the same margin for parity.
+        if src < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
+            && self.pos < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
         {
-            // Non-overlapping, no wrap — single copy_within.
-            self.buf.copy_within(src..src + length, self.pos);
+            if distance >= length {
+                // Non-overlapping — single copy_within (memmove).
+                self.buf.copy_within(src..src + length, self.pos);
+            } else {
+                // Overlapping — copy in distance-sized chunks.
+                // Each chunk is non-overlapping so copy_within is safe.
+                // This matches unrar's byte-by-byte approach but uses
+                // larger chunks (distance bytes at a time).
+                let mut s = src;
+                let mut d = self.pos;
+                let mut rem = length;
+                while rem > 0 {
+                    let chunk = rem.min(distance);
+                    self.buf.copy_within(s..s + chunk, d);
+                    s += chunk;
+                    d += chunk;
+                    rem -= chunk;
+                }
+            }
             self.pos += length;
             self.total_written += length as u64;
             return Ok(());
