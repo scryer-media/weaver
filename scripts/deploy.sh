@@ -64,7 +64,7 @@ echo "==> Cleaning old logs..."
 
 echo "==> Building frontend..."
 cd "$PROJ_DIR/apps/weaver-web"
-npm run build 2>&1 | tail -3
+npm run build 2>&1 | tail -10
 
 echo "==> Building release..."
 cd "$PROJ_DIR"

@@ -96,7 +96,7 @@ impl Default for ServerConfig {
             username: None,
             password: None,
             connect_timeout: Duration::from_secs(30),
-            command_timeout: Duration::from_secs(60),
+            command_timeout: Duration::from_mins(1),
             buffer_profile: NntpBufferProfile::default(),
         }
     }
