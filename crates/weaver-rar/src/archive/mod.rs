@@ -109,6 +109,8 @@ pub struct RarArchive {
     pub(super) limits: Limits,
     /// Password for decrypting encrypted archives/members.
     pub(super) password: Option<String>,
+    /// Cache for expensive key derivation (shared across member extractions).
+    pub(super) kdf_cache: crate::crypto::KdfCache,
 }
 
 #[derive(Debug, Clone)]

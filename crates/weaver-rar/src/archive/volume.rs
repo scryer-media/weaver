@@ -398,6 +398,7 @@ mod tests {
             solid_next_index: 0,
             limits: Limits::default(),
             password: None,
+            kdf_cache: crate::crypto::KdfCache::new(),
         }
     }
 

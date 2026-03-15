@@ -232,6 +232,13 @@ impl LzDecoder {
     /// Decode symbols from one LZ block.
     ///
     /// Returns the updated output_size.
+    ///
+    /// Hot loop optimized to match unrar's Unpack5:
+    /// - Precompute block end position — compare against it instead of
+    ///   decrementing block_bits_remaining per symbol
+    /// - No range checks — ordered `if/else if` with simple comparisons
+    ///   matching unrar's frequency order (literal first, match >= 262 second)
+    /// - `has_bits()` instead of `bits_remaining() < 1`
     fn decode_block(
         &mut self,
         reader: &mut BitReader,
@@ -239,36 +246,65 @@ impl LzDecoder {
         mut output_size: u64,
         yield_threshold: Option<usize>,
     ) -> RarResult<u64> {
-        while output_size < unpacked_size && self.block_bits_remaining > 0 {
-            if reader.bits_remaining() < 1 {
+        // Precompute the bitstream position at which this block ends.
+        // This replaces per-symbol block_bits_remaining decrement with a
+        // single comparison per iteration (matching unrar's ReadBorder check).
+        let block_end_pos = reader.position() as i64 + self.block_bits_remaining;
+
+        while output_size < unpacked_size && (reader.position() as i64) < block_end_pos {
+            if !reader.has_bits() {
                 break;
             }
-
-            let pos_before = reader.position();
 
             let sym = self.nc_table.as_ref().unwrap().decode(reader)? as u32;
 
             if sym < 256 {
-                // Literal byte.
+                // Literal byte (most common case — first).
                 self.window.put_byte(sym as u8);
                 output_size += 1;
-                trace!("literal: {:#04x}", sym);
-            } else if sym == 256 {
-                // Filter marker. Read full filter descriptor and enqueue.
+                continue;
+            }
+            if sym >= 262 {
+                // Inline length-distance pair (second most common).
+                let length_idx = (sym - 262) as usize;
+                let mut length = Self::slot_to_length(reader, length_idx)?;
+                let dc = self.dc_table.as_ref().unwrap();
+                let ldc = self.ldc_table.as_ref().unwrap();
+                let distance = self.decode_distance(reader, dc, ldc)?;
+                length = Self::adjust_length_for_distance(length, distance);
+                let remaining = (unpacked_size - output_size) as usize;
+                length = length.min(remaining);
+
+                // Update distance cache (unrolled, matching unrar's InsertOldDist).
+                self.dist_cache[3] = self.dist_cache[2];
+                self.dist_cache[2] = self.dist_cache[1];
+                self.dist_cache[1] = self.dist_cache[0];
+                self.dist_cache[0] = distance;
+
+                self.last_length = length;
+                self.window.copy(distance, length)?;
+                output_size += length as u64;
+                continue;
+            }
+            if sym == 256 {
+                // Filter marker.
                 output_size = self.handle_filter(reader, output_size)?;
-            } else if sym == 257 {
-                // Repeat previous match (same length, same distance[0]).
+                continue;
+            }
+            if sym == 257 {
+                // Repeat previous match.
                 if self.last_length != 0 {
                     let distance = self.dist_cache[0];
                     let mut length = self.last_length;
                     let remaining = (unpacked_size - output_size) as usize;
                     length = length.min(remaining);
-                    trace!("repeat last: dist={}, len={}", distance, length);
                     self.window.copy(distance, length)?;
                     output_size += length as u64;
                 }
-            } else if (258..=261).contains(&sym) {
-                // Repeat distance from cache.
+                continue;
+            }
+            // sym 258..=261: repeat distance from cache.
+            {
                 let cache_idx = (sym - 258) as usize;
                 let distance = self.dist_cache[cache_idx];
                 if distance == 0 {
@@ -277,14 +313,12 @@ impl LzDecoder {
                     });
                 }
 
-                // Read length from RC table.
-                // Note: cache references do NOT get distance-based length adjustment.
                 let rc = self.rc_table.as_ref().unwrap();
                 let mut length = self.decode_rc_length(reader, rc)?;
                 let remaining = (unpacked_size - output_size) as usize;
                 length = length.min(remaining);
 
-                // Promote this cache entry to front.
+                // Promote cache entry to front.
                 if cache_idx > 0 {
                     let dist = self.dist_cache[cache_idx];
                     for i in (1..=cache_idx).rev() {
@@ -294,38 +328,9 @@ impl LzDecoder {
                 }
 
                 self.last_length = length;
-                trace!("repeat match: dist={}, len={}", distance, length);
                 self.window.copy(distance, length)?;
                 output_size += length as u64;
-            } else if (262..=305).contains(&sym) {
-                // Inline length-distance pair.
-                let length_idx = (sym - 262) as usize;
-                let mut length = self.decode_inline_length(reader, length_idx)?;
-                let dc = self.dc_table.as_ref().unwrap();
-                let ldc = self.ldc_table.as_ref().unwrap();
-                let distance = self.decode_distance(reader, dc, ldc)?;
-                length = Self::adjust_length_for_distance(length, distance);
-                let remaining = (unpacked_size - output_size) as usize;
-                length = length.min(remaining);
-
-                // Update distance cache.
-                self.dist_cache[3] = self.dist_cache[2];
-                self.dist_cache[2] = self.dist_cache[1];
-                self.dist_cache[1] = self.dist_cache[0];
-                self.dist_cache[0] = distance;
-
-                self.last_length = length;
-                trace!("match: dist={}, len={}", distance, length);
-                self.window.copy(distance, length)?;
-                output_size += length as u64;
-            } else {
-                return Err(RarError::CorruptArchive {
-                    detail: format!("invalid NC symbol: {sym}"),
-                });
             }
-
-            let bits_consumed = (reader.position() - pos_before) as i64;
-            self.block_bits_remaining -= bits_consumed;
 
             if let Some(threshold) = yield_threshold
                 && self.pending_filters.is_empty()
@@ -334,6 +339,9 @@ impl LzDecoder {
                 break;
             }
         }
+
+        // Update block_bits_remaining from final position.
+        self.block_bits_remaining = block_end_pos - reader.position() as i64;
 
         Ok(output_size)
     }
@@ -362,11 +370,6 @@ impl LzDecoder {
             0
         };
         Ok(base + extra_val)
-    }
-
-    /// Decode an inline length value from a length slot index (0-43).
-    fn decode_inline_length(&self, reader: &mut BitReader, idx: usize) -> RarResult<usize> {
-        Self::slot_to_length(reader, idx)
     }
 
     /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).

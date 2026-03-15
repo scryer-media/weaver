@@ -506,7 +506,7 @@ function memberRows(
       group.members.map((member) => ({
         key: `${group.setName}:${member.member}`,
         title: memberName(member.member),
-        displayTitle: "",
+        displayTitle: memberName(member.member),
         tone: "member" as const,
         details: [
           {

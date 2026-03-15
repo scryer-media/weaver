@@ -1,84 +1,121 @@
-//! Bit-level reader over a byte slice.
+//! Bit-level reader over a byte slice using a 64-bit accumulator.
 //!
-//! Reads individual bits and multi-bit values from a compressed data stream,
-//! tracking byte position and bit offset within the current byte.
+//! Reads individual bits and multi-bit values from a compressed data stream.
+//! Uses a 64-bit register that is bulk-refilled from the source, eliminating
+//! per-bit bounds checks in the hot path. This matches the approach used by
+//! production decompressors (zlib, zstd, brotli).
+//!
+//! Bits are read MSB-first within each byte, matching RAR's bitstream convention.
 
 use crate::error::{RarError, RarResult};
 
-/// Bit-level reader that wraps a byte slice.
+/// Bit-level reader with a 64-bit accumulator for fast bit extraction.
 ///
-/// Bits are read MSB-first within each byte, which matches RAR5's bitstream
-/// convention. The reader tracks a byte position and a bit offset (0-7)
-/// within the current byte.
+/// The accumulator holds up to 56 bits (7 bytes) of pre-loaded data.
+/// Bits are stored left-aligned in the u64: the next bit to read is
+/// always at bit 63 (MSB). `peek_bits(n)` is a single right-shift,
+/// and `skip_bits(n)` is a left-shift + counter decrement.
 pub struct BitReader<'a> {
     /// Source data.
     data: &'a [u8],
-    /// Current byte position in the data.
+    /// Next byte to load from data into the accumulator.
     byte_pos: usize,
-    /// Bit offset within the current byte (0 = MSB, 7 = LSB).
-    bit_pos: u8,
+    /// Left-aligned accumulator. Next bit to read is at bit 63.
+    acc: u64,
+    /// Number of valid bits currently in the accumulator (0..=64).
+    acc_bits: u8,
 }
 
 impl<'a> BitReader<'a> {
     /// Create a new BitReader over the given byte slice.
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
+        let mut reader = Self {
             data,
             byte_pos: 0,
-            bit_pos: 0,
+            acc: 0,
+            acc_bits: 0,
+        };
+        reader.refill();
+        reader
+    }
+
+    /// Refill the accumulator from the source data.
+    ///
+    /// Loads bytes until we have at least 56 bits (or the source is exhausted).
+    /// This is designed to be called infrequently — typically every ~4-7 bytes
+    /// consumed, not on every bit read.
+    #[inline]
+    fn refill(&mut self) {
+        // Fast path: load 8 bytes at once if available.
+        // We can always fit more bytes when acc_bits <= 56.
+        while self.acc_bits <= 56 && self.byte_pos < self.data.len() {
+            // Place the new byte into the correct position (left-aligned,
+            // just below the existing valid bits).
+            self.acc |= (self.data[self.byte_pos] as u64) << (56 - self.acc_bits);
+            self.byte_pos += 1;
+            self.acc_bits += 8;
         }
     }
 
-    /// Returns the total number of bits remaining.
+    /// Returns the total number of bits remaining (accumulator + unread source).
+    #[inline]
     pub fn bits_remaining(&self) -> usize {
-        if self.byte_pos >= self.data.len() {
-            return 0;
-        }
-        (self.data.len() - self.byte_pos) * 8 - self.bit_pos as usize
+        self.acc_bits as usize + (self.data.len() - self.byte_pos) * 8
     }
 
     /// Returns true if there are no more bits to read.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bits_remaining() == 0
+        self.acc_bits == 0 && self.byte_pos >= self.data.len()
+    }
+
+    /// Returns true if the accumulator has at least one bit ready.
+    /// Cheaper than `bits_remaining()` — no multiplication.
+    #[inline]
+    pub fn has_bits(&self) -> bool {
+        self.acc_bits > 0 || self.byte_pos < self.data.len()
     }
 
     /// Returns the current position in bits from the start.
+    #[inline]
     pub fn position(&self) -> usize {
-        self.byte_pos * 8 + self.bit_pos as usize
+        // Total bits in source minus bits we haven't consumed yet.
+        self.data.len() * 8 - self.bits_remaining()
     }
 
     /// Returns the current byte position (rounded down from bit position).
+    #[inline]
     pub fn byte_position(&self) -> usize {
-        self.byte_pos
+        self.position() / 8
     }
 
     /// Read a single bit. Returns 0 or 1.
+    #[inline]
     pub fn read_bit(&mut self) -> RarResult<u32> {
-        if self.byte_pos >= self.data.len() {
+        if self.acc_bits == 0 {
             return Err(RarError::CorruptArchive {
                 detail: "bitstream: unexpected end of data".into(),
             });
         }
-        let byte = self.data[self.byte_pos];
-        // MSB-first: bit_pos 0 reads the highest bit
-        let bit = (byte >> (7 - self.bit_pos)) & 1;
-        self.bit_pos += 1;
-        if self.bit_pos >= 8 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-        }
-        Ok(bit as u32)
+        let bit = (self.acc >> 63) as u32;
+        self.acc <<= 1;
+        self.acc_bits -= 1;
+        self.refill();
+        Ok(bit)
     }
 
     /// Read N bits (up to 32), MSB-first.
     ///
     /// Returns the bits packed into the lower N bits of a u32.
+    #[inline]
     pub fn read_bits(&mut self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
         if count == 0 {
             return Ok(0);
         }
-        if self.bits_remaining() < count as usize {
+        if (self.acc_bits as usize) < count as usize
+            && self.bits_remaining() < count as usize
+        {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "bitstream: need {} bits but only {} remaining",
@@ -87,77 +124,80 @@ impl<'a> BitReader<'a> {
                 ),
             });
         }
-
-        let mut result: u32 = 0;
-        let mut remaining = count;
-
-        while remaining > 0 {
-            let byte = self.data[self.byte_pos];
-            // How many bits are available in the current byte
-            let avail = 8 - self.bit_pos;
-            let take = remaining.min(avail);
-
-            // Extract `take` bits starting from bit_pos, MSB-first
-            // Shift byte right to align the bits we want at the LSB side,
-            // then mask off `take` bits.
-            let shift = avail - take;
-            let mask = if take >= 8 { 0xFF } else { (1u8 << take) - 1 };
-            let bits = ((byte >> shift) & mask) as u32;
-
-            result = (result << take) | bits;
-            remaining -= take;
-            self.bit_pos += take;
-            if self.bit_pos >= 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
+        // If accumulator doesn't have enough, refill first.
+        // This shouldn't normally happen since refill keeps acc_bits >= 56,
+        // but handles edge cases near end of stream.
+        if self.acc_bits < count {
+            self.refill();
+            if self.acc_bits < count {
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "bitstream: need {} bits but only {} remaining",
+                        count,
+                        self.bits_remaining()
+                    ),
+                });
             }
         }
 
+        // Extract top `count` bits from accumulator.
+        let result = (self.acc >> (64 - count as u32)) as u32;
+        self.acc <<= count as u32;
+        self.acc_bits -= count;
+        self.refill();
         Ok(result)
     }
 
     /// Peek at the next N bits without advancing the position (up to 32 bits).
+    #[inline]
     pub fn peek_bits(&self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
         if count == 0 {
             return Ok(0);
         }
-        if self.bits_remaining() < count as usize {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "bitstream: need {} bits to peek but only {} remaining",
-                    count,
-                    self.bits_remaining()
-                ),
-            });
-        }
-
-        // Temporarily clone state for peeking
-        let mut byte_pos = self.byte_pos;
-        let mut bit_pos = self.bit_pos;
-        let mut result: u32 = 0;
-        let mut remaining = count;
-
-        while remaining > 0 {
-            let byte = self.data[byte_pos];
-            let avail = 8 - bit_pos;
-            let take = remaining.min(avail);
-            let shift = avail - take;
-            let mask = if take >= 8 { 0xFF } else { (1u8 << take) - 1 };
-            let bits = ((byte >> shift) & mask) as u32;
-            result = (result << take) | bits;
-            remaining -= take;
-            bit_pos += take;
-            if bit_pos >= 8 {
-                bit_pos = 0;
-                byte_pos += 1;
+        if (self.acc_bits as usize) < count as usize {
+            // Near end of stream — not enough in accumulator.
+            // We can't refill (self is &self), so fall back to checking total.
+            if self.bits_remaining() < count as usize {
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "bitstream: need {} bits to peek but only {} remaining",
+                        count,
+                        self.bits_remaining()
+                    ),
+                });
             }
+            // We have enough bits total but not in the accumulator.
+            // This can happen when acc_bits < count at end of stream.
+            // Build the result by combining acc + next source bytes.
+            let mut result = if self.acc_bits > 0 {
+                (self.acc >> (64 - self.acc_bits as u32)) as u32
+            } else {
+                0
+            };
+            let have = self.acc_bits;
+            let need = count - have;
+            let mut bp = self.byte_pos;
+            let mut remaining = need;
+            while remaining > 0 && bp < self.data.len() {
+                let byte = self.data[bp] as u32;
+                bp += 1;
+                if remaining >= 8 {
+                    result = (result << 8) | byte;
+                    remaining -= 8;
+                } else {
+                    result = (result << remaining) | (byte >> (8 - remaining));
+                    remaining = 0;
+                }
+            }
+            return Ok(result);
         }
-
-        Ok(result)
+        // Fast path: just shift the accumulator.
+        Ok((self.acc >> (64 - count as u32)) as u32)
     }
 
     /// Skip N bits.
+    #[inline]
     pub fn skip_bits(&mut self, count: u32) -> RarResult<()> {
         if self.bits_remaining() < count as usize {
             return Err(RarError::CorruptArchive {
@@ -168,17 +208,43 @@ impl<'a> BitReader<'a> {
                 ),
             });
         }
-        let total_bits = self.bit_pos as u32 + count;
-        self.byte_pos += (total_bits / 8) as usize;
-        self.bit_pos = (total_bits % 8) as u8;
+        let mut remaining = count;
+        // Consume from accumulator first.
+        if remaining as u8 <= self.acc_bits {
+            self.acc <<= remaining;
+            self.acc_bits -= remaining as u8;
+            self.refill();
+            return Ok(());
+        }
+        // Drain accumulator.
+        remaining -= self.acc_bits as u32;
+        self.acc = 0;
+        self.acc_bits = 0;
+        // Skip full bytes directly.
+        let skip_bytes = (remaining / 8) as usize;
+        self.byte_pos += skip_bytes;
+        remaining -= (skip_bytes * 8) as u32;
+        // Refill and skip remaining bits.
+        self.refill();
+        if remaining > 0 {
+            self.acc <<= remaining;
+            self.acc_bits -= remaining as u8;
+            self.refill();
+        }
         Ok(())
     }
 
     /// Align to the next byte boundary by skipping remaining bits in the current byte.
     pub fn align_byte(&mut self) {
-        if self.bit_pos != 0 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
+        let bit_offset = self.position() % 8;
+        if bit_offset != 0 {
+            let skip = 8 - bit_offset;
+            // We know we have at least `skip` bits (we're mid-byte).
+            if skip as u8 <= self.acc_bits {
+                self.acc <<= skip as u32;
+                self.acc_bits -= skip as u8;
+                self.refill();
+            }
         }
     }
 
@@ -202,10 +268,16 @@ impl<'a> BitReader<'a> {
     ///
     /// If the reader is mid-byte, the partial byte is skipped.
     pub fn remaining_bytes(&self) -> &'a [u8] {
-        let start = if self.bit_pos == 0 {
-            self.byte_pos
+        // Calculate the source byte position accounting for bits in the accumulator.
+        // byte_pos is where we'd next load from, but we have acc_bits still buffered.
+        // The "consumed" position in the source is: byte_pos - ceil(acc_bits / 8)
+        // But for remaining_bytes we want to return from the next byte boundary
+        // after the current bit position.
+        let bit_position = self.position();
+        let start = if bit_position % 8 == 0 {
+            bit_position / 8
         } else {
-            self.byte_pos + 1
+            bit_position / 8 + 1
         };
         if start >= self.data.len() {
             &[]

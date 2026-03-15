@@ -437,6 +437,7 @@ fn build_extraction_groups(
                 member.open_extract_idx = Some(member.spans.len() - 1);
             }
             EventKind::ExtractionMemberAppendStarted => {
+                close_open_member_extract_span(member, at, TimelineSpanState::Complete);
                 if let Some(index) = member.open_wait_idx.take() {
                     member.spans[index].ended_at = Some(at);
                     member.spans[index].state = TimelineSpanState::Complete;

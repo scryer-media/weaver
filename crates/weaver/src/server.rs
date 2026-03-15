@@ -430,6 +430,14 @@ async fn static_handler(
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 
+        // Hashed assets (Vite output in assets/) are immutable — cache for 1 year.
+        // Everything else (sw.js, manifest, etc.) gets no-cache.
+        let cache_control = if path.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+
         // Serve pre-compressed .gz variant if client accepts gzip.
         if accepts_gzip(&headers) {
             let gz_path = format!("{path}.gz");
@@ -439,6 +447,7 @@ async fn static_handler(
                     [
                         (header::CONTENT_TYPE, mime.as_ref().to_string()),
                         (header::CONTENT_ENCODING, "gzip".to_string()),
+                        (header::CACHE_CONTROL, cache_control.to_string()),
                     ],
                     gz_file.data,
                 )
@@ -448,7 +457,10 @@ async fn static_handler(
 
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+            ],
             file.data,
         )
             .into_response()

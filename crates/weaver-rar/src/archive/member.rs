@@ -245,7 +245,7 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
             } else {
                 // RAR5: AES-256-CBC with PBKDF2-HMAC-SHA256.
@@ -261,7 +261,7 @@ impl RarArchive {
                 // and is the only detection mechanism for encrypted Store+HASHMAC
                 // (where CRC verification is skipped).
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -273,7 +273,7 @@ impl RarArchive {
                     });
                 }
 
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -542,7 +542,7 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
             } else {
                 let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -552,7 +552,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -563,7 +563,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -715,7 +715,7 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
             } else {
                 let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -725,7 +725,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -736,7 +736,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
             }
         }
@@ -1166,7 +1166,7 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 Box::new(crate::crypto::DecryptingReader::new_rar4(
                     chained, &key, &iv,
                 ))
@@ -1178,7 +1178,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -1189,7 +1189,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1278,7 +1278,7 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 Box::new(crate::crypto::DecryptingReader::new_rar4(
                     chained, &key, &iv,
                 ))
@@ -1290,7 +1290,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -1301,7 +1301,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1518,7 +1518,7 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 Box::new(crate::crypto::DecryptingReader::new_rar4(
                     chained, &key, &iv,
                 ))
@@ -1530,7 +1530,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -1541,7 +1541,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,
@@ -1655,7 +1655,7 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = crate::crypto::rar4_derive_key(pwd, &salt);
+                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
                 Box::new(crate::crypto::DecryptingReader::new_rar4(
                     chained, &key, &iv,
                 ))
@@ -1667,7 +1667,7 @@ impl RarArchive {
                     ),
                 })?;
                 if let Some(ref check_data) = enc_info.check_data
-                    && !crate::crypto::verify_password_check(
+                    && !self.kdf_cache.verify_password_rar5(
                         pwd,
                         &enc_info.salt,
                         enc_info.kdf_count,
@@ -1678,7 +1678,7 @@ impl RarArchive {
                         member: fh.name.clone(),
                     });
                 }
-                let (key, _) = crate::crypto::derive_key(pwd, &enc_info.salt, enc_info.kdf_count);
+                let key = self.kdf_cache.derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
                 Box::new(crate::crypto::DecryptingReader::new_rar5(
                     chained,
                     &key,

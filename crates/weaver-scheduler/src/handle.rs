@@ -154,6 +154,13 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// Update a job's category and/or metadata.
+    UpdateJob {
+        job_id: JobId,
+        category: Option<Option<String>>,
+        metadata: Option<Vec<(String, String)>>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Pause all jobs globally (pipeline-wide).
     PauseAll { reply: oneshot::Sender<()> },
     /// Resume all jobs globally.
@@ -325,6 +332,26 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::CancelJob { job_id, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Update a job's category and/or metadata.
+    pub async fn update_job(
+        &self,
+        job_id: JobId,
+        category: Option<Option<String>>,
+        metadata: Option<Vec<(String, String)>>,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateJob {
+                job_id,
+                category,
+                metadata,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

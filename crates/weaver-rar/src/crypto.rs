@@ -6,8 +6,13 @@
 //! Provides both batch decryption (`decrypt_data`) and streaming decryption
 //! via [`DecryptingReader`], which wraps any `Read` source and decrypts
 //! AES-CBC on-the-fly using manual block-level operations.
+//!
+//! Includes a [`KdfCache`] that avoids re-deriving keys when the same
+//! password+salt combination is used across multiple members (which is
+//! the common case). Matches unrar's `KDF3Cache`/`KDF5Cache` approach.
 
 use std::io::Read;
+use std::sync::Mutex;
 
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
@@ -102,6 +107,167 @@ pub fn verify_password_check(
     }
 
     psw_check == check_data[..8]
+}
+
+// =============================================================================
+// KDF cache — avoids re-deriving keys for repeated password+salt combinations
+// =============================================================================
+
+const KDF_CACHE_SLOTS: usize = 4;
+
+/// Cached RAR5 key derivation result.
+struct Kdf5Entry {
+    password: String,
+    salt: [u8; 16],
+    kdf_count: u8,
+    key: [u8; 32],
+    psw_check: [u8; 8],
+}
+
+/// Cached RAR4 key derivation result.
+struct Kdf3Entry {
+    password: String,
+    salt: [u8; 8],
+    key: [u8; 16],
+    iv: [u8; 16],
+}
+
+/// Thread-safe KDF cache matching unrar's `KDF3Cache[4]`/`KDF5Cache[4]`.
+///
+/// Stores the most recent key derivation results and returns cached values
+/// when the same password+salt combination is requested again. This avoids
+/// re-running expensive KDF iterations (262k SHA-1 for RAR4, up to 2^24
+/// PBKDF2 rounds for RAR5) on every member in an encrypted archive.
+pub struct KdfCache {
+    rar5: Mutex<(Vec<Kdf5Entry>, usize)>,
+    rar4: Mutex<(Vec<Kdf3Entry>, usize)>,
+}
+
+impl KdfCache {
+    pub fn new() -> Self {
+        Self {
+            rar5: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
+            rar4: Mutex::new((Vec::with_capacity(KDF_CACHE_SLOTS), 0)),
+        }
+    }
+
+    /// Derive (or return cached) RAR5 AES-256 key.
+    pub fn derive_key_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+    ) -> [u8; 32] {
+        let mut guard = self.rar5.lock().unwrap();
+        let (entries, pos) = &mut *guard;
+
+        // Check cache.
+        for entry in entries.iter() {
+            if entry.password == password
+                && entry.salt == *salt
+                && entry.kdf_count == kdf_count
+            {
+                return entry.key;
+            }
+        }
+
+        // Cache miss — derive key.
+        let (key, _) = derive_key(password, salt, kdf_count);
+
+        // Compute psw_check too (count+32 iterations) so verify is free.
+        let iterations_check = (1u32 << (kdf_count as u32)) + 32;
+        let mut v2 = [0u8; 32];
+        pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations_check, &mut v2)
+            .expect("HMAC can be initialized with any key length");
+        let mut psw_check = [0u8; 8];
+        for (i, &byte) in v2.iter().enumerate() {
+            psw_check[i % 8] ^= byte;
+        }
+
+        let entry = Kdf5Entry {
+            password: password.to_string(),
+            salt: *salt,
+            kdf_count,
+            key,
+            psw_check,
+        };
+
+        // Rotating insertion into fixed-size cache.
+        if entries.len() < KDF_CACHE_SLOTS {
+            entries.push(entry);
+        } else {
+            entries[*pos] = entry;
+        }
+        *pos = (*pos + 1) % KDF_CACHE_SLOTS;
+
+        key
+    }
+
+    /// Verify password check value using cached data (avoids separate PBKDF2).
+    pub fn verify_password_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+        check_data: &[u8; 12],
+    ) -> bool {
+        // This populates the cache (including psw_check).
+        let _ = self.derive_key_rar5(password, salt, kdf_count);
+
+        let guard = self.rar5.lock().unwrap();
+        let (entries, _) = &*guard;
+        for entry in entries.iter() {
+            if entry.password == password
+                && entry.salt == *salt
+                && entry.kdf_count == kdf_count
+            {
+                return entry.psw_check == check_data[..8];
+            }
+        }
+        false
+    }
+
+    /// Derive (or return cached) RAR4 AES-128 key and IV.
+    pub fn derive_key_rar4(
+        &self,
+        password: &str,
+        salt: &[u8; 8],
+    ) -> ([u8; 16], [u8; 16]) {
+        let mut guard = self.rar4.lock().unwrap();
+        let (entries, pos) = &mut *guard;
+
+        // Check cache.
+        for entry in entries.iter() {
+            if entry.password == password && entry.salt == *salt {
+                return (entry.key, entry.iv);
+            }
+        }
+
+        // Cache miss — derive key.
+        let (key, iv) = rar4_derive_key(password, salt);
+
+        let entry = Kdf3Entry {
+            password: password.to_string(),
+            salt: *salt,
+            key,
+            iv,
+        };
+
+        if entries.len() < KDF_CACHE_SLOTS {
+            entries.push(entry);
+        } else {
+            entries[*pos] = entry;
+        }
+        *pos = (*pos + 1) % KDF_CACHE_SLOTS;
+
+        (key, iv)
+    }
+}
+
+impl Default for KdfCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // =============================================================================

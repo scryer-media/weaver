@@ -95,6 +95,7 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
+            kdf_cache: crate::crypto::KdfCache::new(),
         })
     }
 
@@ -154,6 +155,7 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
+            kdf_cache: crate::crypto::KdfCache::new(),
         })
     }
 

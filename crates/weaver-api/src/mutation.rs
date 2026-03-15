@@ -172,6 +172,23 @@ impl MutationRoot {
         Ok(history_jobs_from_handle(handle))
     }
 
+    /// Update category and/or priority for one or more jobs.
+    async fn update_jobs(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        category: Option<String>,
+        priority: Option<String>,
+    ) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let cat = category.map(|c| if c.is_empty() { None } else { Some(c) });
+        let meta = priority.map(|p| vec![("priority".to_string(), p)]);
+        for &id in &ids {
+            handle.update_job(JobId(id), cat.clone(), meta.clone()).await?;
+        }
+        Ok(true)
+    }
+
     /// Pause all download dispatch globally.
     async fn pause_all(&self, ctx: &Context<'_>) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;

@@ -1,6 +1,6 @@
 import { Fragment, useRef, useState } from "react";
 import { Link } from "react-router";
-import { ChevronDown, ChevronRight, Pause, Play, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Pause, Pencil, Play, X } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
@@ -10,7 +10,9 @@ import {
   RESUME_JOB_MUTATION,
   SERVERS_QUERY,
   SET_SPEED_LIMIT_MUTATION,
+  UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
+import { BulkEditModal } from "@/components/BulkEditModal";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { JobProgress } from "@/components/JobProgress";
@@ -24,6 +26,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -178,11 +181,15 @@ export function JobList() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, setSpeedLimit] = useMutation(SET_SPEED_LIMIT_MUTATION);
+  const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [speedLimitValue, setSpeedLimitValue] = useState("0");
   const [cancelConfirmId, setCancelConfirmId] = useState<number | null>(null);
   const [expandedJobIds, setExpandedJobIds] = useState<Set<number>>(new Set());
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [cancelSelectedConfirm, setCancelSelectedConfirm] = useState(false);
   const t = useTranslate();
 
   const toggleExpanded = (jobId: number) => {
@@ -195,6 +202,45 @@ export function JobList() {
       }
       return next;
     });
+  };
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedIds.size === jobs.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(jobs.map((j) => j.id)));
+    }
+  };
+
+  const handleBulkEdit = async (category: string | null, priority: string | null) => {
+    const ids = Array.from(selectedIds);
+    await updateJobs({ ids, category, priority });
+    setSelectedIds(new Set());
+    setBulkEditOpen(false);
+  };
+
+  const handleBulkPause = async () => {
+    for (const id of selectedIds) {
+      await pauseJob({ id });
+    }
+    setSelectedIds(new Set());
+  };
+
+  const handleBulkCancel = async () => {
+    for (const id of selectedIds) {
+      await cancelJob({ id });
+    }
+    setSelectedIds(new Set());
+    setCancelSelectedConfirm(false);
   };
 
   const queueEtaById = useThrottledQueueEta(jobs, speed);
@@ -331,6 +377,30 @@ export function JobList() {
         </Card>
       ) : null}
 
+      {selectedIds.size > 0 ? (
+        <Card className="border-primary/40 bg-primary/5">
+          <CardContent className="flex items-center justify-between py-3">
+            <span className="text-sm font-medium">
+              {t("bulk.selected", { count: selectedIds.size })}
+            </span>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setBulkEditOpen(true)}>
+                <Pencil className="size-3.5" />
+                {t("bulk.editSelected")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void handleBulkPause()}>
+                <Pause className="size-3.5" />
+                {t("bulk.pauseSelected")}
+              </Button>
+              <Button variant="destructive" size="sm" onClick={() => setCancelSelectedConfirm(true)}>
+                <X className="size-3.5" />
+                {t("bulk.cancelSelected")}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
       {jobs.length === 0 ? (
         <EmptyState
           title={t("jobs.empty")}
@@ -345,7 +415,13 @@ export function JobList() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-7 w-[34%] px-2 text-[13px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[4%] px-2">
+                      <Checkbox
+                        checked={selectedIds.size === jobs.length && jobs.length > 0 ? true : selectedIds.size > 0 ? "indeterminate" : false}
+                        onCheckedChange={toggleSelectAll}
+                      />
+                    </TableHead>
+                    <TableHead className="h-7 w-[30%] px-2 text-[13px]">{t("table.name")}</TableHead>
                     <TableHead className="h-7 w-[11%] px-2 text-[13px]">{t("table.status")}</TableHead>
                     <TableHead className="h-7 w-[7%] px-2 text-[13px]">{t("table.priority")}</TableHead>
                     <TableHead className="h-7 w-[8%] px-2 text-[13px]">{t("table.category")}</TableHead>
@@ -363,6 +439,12 @@ export function JobList() {
                     return (
                       <Fragment key={job.id}>
                         <TableRow key={job.id} className="text-xs">
+                          <TableCell className="px-2 py-1.5">
+                            <Checkbox
+                              checked={selectedIds.has(job.id)}
+                              onCheckedChange={() => toggleSelected(job.id)}
+                            />
+                          </TableCell>
                           <TableCell className="min-w-0 px-2 py-1.5">
                             <div className="flex min-w-0 items-center gap-1.5">
                               <Button
@@ -464,7 +546,7 @@ export function JobList() {
                         </TableRow>
                         {expanded ? (
                           <TableRow className="bg-accent/10 hover:bg-accent/10">
-                            <TableCell colSpan={8} className="px-4 py-4">
+                            <TableCell colSpan={9} className="px-4 py-4">
                               <ParsedReleaseDetails
                                 originalTitle={job.originalTitle}
                                 parsedRelease={job.parsedRelease}
@@ -492,6 +574,10 @@ export function JobList() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
+                          <Checkbox
+                            checked={selectedIds.has(job.id)}
+                            onCheckedChange={() => toggleSelected(job.id)}
+                          />
                           <Button
                             variant="ghost"
                             size="icon"
@@ -581,6 +667,23 @@ export function JobList() {
           setCancelConfirmId(null);
         }}
         onCancel={() => setCancelConfirmId(null)}
+      />
+
+      <ConfirmDialog
+        open={cancelSelectedConfirm}
+        title={t("confirm.cancelSelected", { count: selectedIds.size })}
+        message={t("confirm.cancelSelectedMessage")}
+        confirmLabel={t("confirm.cancelJobConfirm")}
+        cancelLabel={t("confirm.cancelJobDismiss")}
+        onConfirm={() => void handleBulkCancel()}
+        onCancel={() => setCancelSelectedConfirm(false)}
+      />
+
+      <BulkEditModal
+        open={bulkEditOpen}
+        selectedCount={selectedIds.size}
+        onClose={() => setBulkEditOpen(false)}
+        onApply={(category, priority) => void handleBulkEdit(category, priority)}
       />
 
       <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />

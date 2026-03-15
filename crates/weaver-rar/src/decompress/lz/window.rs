@@ -45,10 +45,15 @@ impl Window {
         self.total_written += 1;
     }
 
+    /// Maximum match length that the fast path must accommodate.
+    /// Matches unrar's MAX_INC_LZ_MATCH (264 for RAR5).
+    const MAX_MATCH: usize = 264;
+
     /// Copy `length` bytes from `distance` bytes back in the output.
     ///
     /// Handles overlapping copies correctly (e.g., distance=1, length=100
     /// repeats the last byte 100 times).
+    #[inline]
     pub fn copy(&mut self, distance: usize, length: usize) -> RarResult<()> {
         let dict_size = self.buf.len();
         if distance == 0 || distance > dict_size {
@@ -57,21 +62,57 @@ impl Window {
             });
         }
 
-        let mut src = if distance <= self.pos {
+        let src = if distance <= self.pos {
             self.pos - distance
         } else {
             dict_size - (distance - self.pos)
         };
+
+        // Fast path: distance=1 is byte-fill (very common RLE pattern).
+        if distance == 1 {
+            let byte = self.buf[src];
+            let dst = self.pos;
+            if dst + length <= dict_size {
+                // No wrap — single fill.
+                self.buf[dst..dst + length].fill(byte);
+                self.pos = dst + length;
+                if self.pos >= dict_size {
+                    self.pos = 0;
+                }
+            } else {
+                // Wraps around — two fills.
+                let first = dict_size - dst;
+                self.buf[dst..dict_size].fill(byte);
+                let second = length - first;
+                self.buf[..second].fill(byte);
+                self.pos = second;
+            }
+            self.total_written += length as u64;
+            return Ok(());
+        }
+
+        // Fast path: both src and dst are far enough from the window boundary
+        // that neither will wrap during this copy. Skip all modulo arithmetic.
+        // Matches unrar's "if (SrcPtr<MaxWinSize-MAX_INC_LZ_MATCH && UnpPtr<MaxWinSize-MAX_INC_LZ_MATCH)".
+        if src + length + Self::MAX_MATCH <= dict_size
+            && self.pos + length + Self::MAX_MATCH <= dict_size
+            && distance >= length
+        {
+            // Non-overlapping, no wrap — single copy_within.
+            self.buf.copy_within(src..src + length, self.pos);
+            self.pos += length;
+            self.total_written += length as u64;
+            return Ok(());
+        }
+
+        // General path with wrap handling and overlap support.
+        let mut src = src;
         let mut dst = self.pos;
         let mut remaining = length;
 
         while remaining > 0 {
-            // Contiguous bytes available before src or dst wraps.
             let src_contig = dict_size - src;
             let dst_contig = dict_size - dst;
-            // For overlapping copies (distance < length), limit chunk size to
-            // the gap between src and dst so that copy_within (memmove) produces
-            // the correct byte-replication pattern.
             let gap = if src < dst {
                 dst - src
             } else {

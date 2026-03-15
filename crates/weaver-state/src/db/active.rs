@@ -98,6 +98,37 @@ impl Database {
         Ok(())
     }
 
+    /// Update category and/or metadata of an active job.
+    pub fn update_active_job(
+        &self,
+        job_id: JobId,
+        category: Option<Option<&str>>,
+        metadata: Option<&[(String, String)]>,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        let id = job_id.0 as i64;
+        if let Some(cat) = category {
+            conn.execute(
+                "UPDATE active_jobs SET category = ?1 WHERE job_id = ?2",
+                rusqlite::params![cat, id],
+            )
+            .map_err(db_err)?;
+        }
+        if let Some(meta) = metadata {
+            let json = if meta.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(meta).map_err(db_err)?)
+            };
+            conn.execute(
+                "UPDATE active_jobs SET metadata = ?1 WHERE job_id = ?2",
+                rusqlite::params![json, id],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
     /// Update the status of an active job.
     pub fn set_active_job_status(
         &self,

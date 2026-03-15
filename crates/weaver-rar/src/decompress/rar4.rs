@@ -445,17 +445,16 @@ impl Rar4LzDecoder {
         mut output_size: u64,
     ) -> RarResult<u64> {
         while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
+            if !reader.has_bits() {
                 break;
             }
 
             let number = self.ld_table.as_ref().unwrap().decode(reader)? as usize;
 
             if number < 256 {
-                // Literal byte.
+                // Literal byte (most common — first).
                 self.window.put_byte(number as u8);
                 output_size += 1;
-                trace!("rar4 literal: {:#04x}", number);
                 continue;
             }
 
@@ -487,7 +486,6 @@ impl Rar4LzDecoder {
                 self.last_length = length;
                 let remaining = (unpacked_size - output_size) as usize;
                 let copy_len = length.min(remaining);
-                trace!("rar4 match: dist={}, len={}", distance, copy_len);
                 self.window.copy(distance, copy_len)?;
                 output_size += copy_len as u64;
                 continue;
@@ -515,7 +513,6 @@ impl Rar4LzDecoder {
                     let remaining = (unpacked_size - output_size) as usize;
                     let copy_len = self.last_length.min(remaining);
                     if distance > 0 {
-                        trace!("rar4 repeat last: dist={}, len={}", distance, copy_len);
                         self.window.copy(distance, copy_len)?;
                         output_size += copy_len as u64;
                     }
@@ -555,10 +552,6 @@ impl Rar4LzDecoder {
                 self.last_length = length;
                 let remaining = (unpacked_size - output_size) as usize;
                 let copy_len = length.min(remaining);
-                trace!(
-                    "rar4 cache ref: idx={}, dist={}, len={}",
-                    cache_idx, distance, copy_len
-                );
                 self.window.copy(distance, copy_len)?;
                 output_size += copy_len as u64;
                 continue;
@@ -577,7 +570,6 @@ impl Rar4LzDecoder {
                 self.last_length = 2;
                 let remaining = (unpacked_size - output_size) as usize;
                 let copy_len = 2usize.min(remaining);
-                trace!("rar4 short match: dist={}, len=2", distance);
                 self.window.copy(distance, copy_len)?;
                 output_size += copy_len as u64;
                 continue;

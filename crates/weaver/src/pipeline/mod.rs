@@ -658,6 +658,31 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            SchedulerCommand::UpdateJob {
+                job_id,
+                category,
+                metadata,
+                reply,
+            } => {
+                let result = if let Some(state) = self.jobs.get_mut(&job_id) {
+                    if let Some(cat) = &category {
+                        state.spec.category = cat.clone();
+                    }
+                    if let Some(meta) = &metadata {
+                        state.spec.metadata = meta.clone();
+                    }
+                    let cat_ref = category.as_ref().map(|c| c.as_deref());
+                    let meta_ref = metadata.as_deref();
+                    if let Err(e) = self.db.update_active_job(job_id, cat_ref, meta_ref) {
+                        error!(error = %e, "db write failed for UpdateJob");
+                    }
+                    self.publish_snapshot();
+                    Ok(())
+                } else {
+                    Err(weaver_scheduler::SchedulerError::JobNotFound(job_id))
+                };
+                let _ = reply.send(result);
+            }
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.shared_state.set_paused(true);

@@ -1,4 +1,4 @@
-//! Huffman table construction and decoding for RAR5 LZ decompression.
+//! Huffman table construction and decoding for RAR LZ decompression.
 //!
 //! RAR5 uses 5 canonical Huffman tables:
 //! - `HUFF_BC = 20` — bit-length bootstrap codes (used to decode other tables)
@@ -7,10 +7,10 @@
 //! - `HUFF_LDC = 16` — lower distance bits codes
 //! - `HUFF_RC = 44` — repeating/cached distance codes
 //!
-//! Table construction from libarchive reference (BSD-licensed constants):
-//! Tables are built from arrays of bit-lengths using canonical Huffman coding.
-//! Zero-run encoding: when a bit-length value is 15, the next 4 bits encode
-//! a run of zeros.
+//! Decoding uses the same sorted-threshold scheme as unrar:
+//! - Quick table (9-bit lookup) for the most common short codes
+//! - Linear scan of 15 left-aligned thresholds for longer codes
+//! - No tree pointers — just flat arrays (cache-friendly)
 
 use crate::error::{RarError, RarResult};
 
@@ -30,35 +30,39 @@ pub const HUFF_RC: usize = 44;
 /// Maximum Huffman code length in bits.
 const MAX_CODE_LENGTH: usize = 15;
 
-/// Lookup table size for fast decoding (2^MAX_CODE_LENGTH would be too large;
-/// we use a smaller table for quick lookup and fall back to tree walk).
-/// For tables up to 306 entries, a 10-bit quick table is a good tradeoff.
-const QUICK_BITS: u8 = 10;
-const QUICK_TABLE_SIZE: usize = 1 << QUICK_BITS;
+/// Maximum quick decode bits (matches unrar MAX_QUICK_DECODE_BITS = 9).
+const MAX_QUICK_BITS: u8 = 9;
 
-/// A single entry in the quick-lookup table.
-#[derive(Clone, Copy, Default)]
-struct QuickEntry {
-    /// The decoded symbol, or 0xFFFF if this entry requires tree walk.
-    symbol: u16,
-    /// Number of bits consumed for this symbol.
-    length: u8,
-}
-
-/// A Huffman decoding table built from an array of bit-lengths.
+/// A Huffman decoding table using unrar's sorted-threshold scheme.
+///
+/// Instead of a binary tree, uses left-aligned upper-limit codes per bit
+/// length (`decode_len`) and a flat symbol array (`decode_num`). The hot
+/// path does a single 16-bit peek + quick table lookup. The slow path
+/// scans at most 15 threshold values (fits in one cache line).
 pub struct HuffmanTable {
-    /// Quick lookup table for codes up to QUICK_BITS long.
-    quick: Vec<QuickEntry>,
-    /// For codes longer than QUICK_BITS: decode_tree[left/right child].
-    /// Each node stores either a symbol (leaf) or an index to child nodes.
-    /// Organized as pairs: tree[i*2] = left child, tree[i*2+1] = right child.
-    /// Value >= 0 means symbol; value < 0 means -(child_pair_index).
-    decode_tree: Vec<i32>,
-    /// Number of tree node pairs allocated.
-    #[allow(dead_code)]
-    tree_nodes: usize,
+    /// Left-aligned upper limit codes for each bit length.
+    /// `decode_len[i]` is the left-aligned (16-bit) upper limit code for
+    /// bit length `i`. Codes < decode_len[i] have bit length <= i.
+    decode_len: [u32; 16],
+
+    /// Start position in decode_num for each bit length.
+    decode_pos: [u32; 16],
+
+    /// Maps position in code list to alphabet symbol.
+    decode_num: Vec<u16>,
+
+    /// Quick lookup: bit length for each quick-decodable prefix.
+    quick_len: Vec<u8>,
+
+    /// Quick lookup: alphabet symbol for each quick-decodable prefix.
+    quick_num: Vec<u16>,
+
+    /// Number of bits used for quick decode (6 for small tables, 9 for NC).
+    quick_bits: u8,
+
     /// Maximum code length in the table.
     max_length: u8,
+
     /// Number of symbols in this table.
     num_symbols: usize,
 }
@@ -68,160 +72,131 @@ impl HuffmanTable {
     ///
     /// `bit_lengths[i]` is the code length for symbol `i`.
     /// A length of 0 means the symbol is not present.
+    ///
+    /// Matches unrar's `MakeDecodeTables`.
     pub fn build(bit_lengths: &[u8]) -> RarResult<Self> {
         let num_symbols = bit_lengths.len();
 
         // Count codes of each length.
-        let mut bl_count = [0u32; MAX_CODE_LENGTH + 1];
+        let mut length_count = [0u32; 16];
         let mut max_length: u8 = 0;
         for &bl in bit_lengths {
             if bl > 0 {
                 if bl as usize > MAX_CODE_LENGTH {
                     return Err(RarError::InvalidHuffmanTable);
                 }
-                bl_count[bl as usize] += 1;
+                length_count[bl as usize] += 1;
                 if bl > max_length {
                     max_length = bl;
                 }
             }
         }
+        length_count[0] = 0;
 
-        // If no symbols have nonzero length, the table is empty.
+        // If no symbols have nonzero length, build an empty table.
         if max_length == 0 {
+            let quick_bits = if num_symbols >= HUFF_NC {
+                MAX_QUICK_BITS
+            } else if MAX_QUICK_BITS > 3 {
+                MAX_QUICK_BITS - 3
+            } else {
+                0
+            };
             return Ok(Self {
-                quick: vec![QuickEntry::default(); QUICK_TABLE_SIZE],
-                decode_tree: Vec::new(),
-                tree_nodes: 0,
+                decode_len: [0; 16],
+                decode_pos: [0; 16],
+                decode_num: vec![0; num_symbols],
+                quick_len: vec![0; 1 << quick_bits],
+                quick_num: vec![0; 1 << quick_bits],
+                quick_bits,
                 max_length: 0,
                 num_symbols,
             });
         }
 
-        // Compute the starting code for each length (canonical Huffman).
-        let mut next_code = [0u32; MAX_CODE_LENGTH + 1];
-        {
-            let mut code = 0u32;
-            for bits in 1..=MAX_CODE_LENGTH {
-                code = (code + bl_count[bits - 1]) << 1;
-                next_code[bits] = code;
-            }
+        // Build decode_len (left-aligned upper limits) and decode_pos.
+        let mut decode_len = [0u32; 16];
+        let mut decode_pos = [0u32; 16];
+
+        let mut upper_limit: u32 = 0;
+        for i in 1..16 {
+            upper_limit += length_count[i];
+            let left_aligned = upper_limit << (16 - i);
+            upper_limit *= 2;
+            decode_len[i] = left_aligned;
+            decode_pos[i] = decode_pos[i - 1] + length_count[i - 1];
         }
 
-        // Assign codes to symbols.
-        let mut symbol_codes = vec![(0u32, 0u8); num_symbols]; // (code, length)
+        // Build decode_num: maps position in code list → alphabet symbol.
+        let mut decode_num = vec![0u16; num_symbols];
+        let mut copy_pos = decode_pos;
         for (sym, &bl) in bit_lengths.iter().enumerate() {
-            if bl > 0 {
-                symbol_codes[sym] = (next_code[bl as usize], bl);
-                next_code[bl as usize] += 1;
+            let bl = bl & 0xF;
+            if bl != 0 {
+                let pos = copy_pos[bl as usize] as usize;
+                if pos < num_symbols {
+                    decode_num[pos] = sym as u16;
+                }
+                copy_pos[bl as usize] += 1;
             }
         }
 
-        // Build quick lookup table.
-        let mut quick = vec![
-            QuickEntry {
-                symbol: 0xFFFF,
-                length: 0,
-            };
-            QUICK_TABLE_SIZE
-        ];
+        // Choose quick bits based on table size (matching unrar).
+        let quick_bits = if num_symbols >= HUFF_NC {
+            // NC and NC30 and NC20 all get max quick bits
+            MAX_QUICK_BITS
+        } else if MAX_QUICK_BITS > 3 {
+            MAX_QUICK_BITS - 3
+        } else {
+            0
+        };
 
-        // Pre-allocate tree for codes longer than QUICK_BITS.
-        // Each unique QUICK_BITS prefix gets its own subtree.
-        // Tree is stored as pairs: tree[idx*2] = left, tree[idx*2+1] = right.
-        // Positive value = symbol (leaf). Negative value = -(child pair index).
-        // Zero = uninitialized node.
-        let mut decode_tree: Vec<i32> = Vec::new();
-        let mut tree_nodes: usize = 0; // pairs allocated
+        let quick_data_size = 1usize << quick_bits;
+        let mut quick_len_table = vec![0u8; quick_data_size];
+        let mut quick_num_table = vec![0u16; quick_data_size];
 
-        for (sym, &(code, length)) in symbol_codes.iter().enumerate() {
-            if length == 0 {
-                continue;
+        // Build quick decode tables.
+        let mut cur_bit_length: usize = 1;
+        for code in 0..quick_data_size {
+            let bit_field = (code as u32) << (16 - quick_bits);
+
+            // Find the bit length for this left-aligned bit field.
+            while cur_bit_length < decode_len.len()
+                && bit_field >= decode_len[cur_bit_length]
+            {
+                cur_bit_length += 1;
             }
 
-            if length <= QUICK_BITS {
-                // Fill all quick table entries that share this prefix.
-                let pad_bits = QUICK_BITS - length;
-                let base_index = (code as usize) << pad_bits;
-                let count = 1usize << pad_bits;
-                for j in 0..count {
-                    let idx = base_index + j;
-                    if idx < QUICK_TABLE_SIZE {
-                        quick[idx] = QuickEntry {
-                            symbol: sym as u16,
-                            length,
-                        };
-                    }
-                }
-            } else {
-                // Codes longer than QUICK_BITS: use tree.
-                // The QUICK_BITS prefix selects a tree root via the quick table.
-                let prefix = (code >> (length - QUICK_BITS)) as usize;
+            quick_len_table[code] = cur_bit_length as u8;
 
-                // Get or create a tree root for this prefix.
-                let tree_root = if prefix < QUICK_TABLE_SIZE && quick[prefix].length > QUICK_BITS {
-                    // Already has a tree root.
-                    quick[prefix].symbol as usize
-                } else {
-                    // Allocate a new tree root pair.
-                    let root = tree_nodes;
-                    tree_nodes += 1;
-                    let needed = root * 2 + 2;
-                    if needed > decode_tree.len() {
-                        decode_tree.resize(needed, 0);
-                    }
-                    if prefix < QUICK_TABLE_SIZE {
-                        quick[prefix] = QuickEntry {
-                            symbol: root as u16,
-                            length: QUICK_BITS + 1, // sentinel: tree walk required
-                        };
-                    }
-                    root
-                };
-
-                // Walk the tree for bits after QUICK_BITS.
-                let suffix_len = length - QUICK_BITS;
-                let mut node_idx = tree_root;
-
-                for bit_idx in (0..suffix_len).rev() {
-                    let bit = ((code >> bit_idx) & 1) as usize;
-                    let slot = node_idx * 2 + bit;
-
-                    // Ensure tree is large enough.
-                    if slot >= decode_tree.len() {
-                        decode_tree.resize(slot + 2, 0);
-                    }
-
-                    if bit_idx == 0 {
-                        // Leaf: store symbol (encoded as sym + 1 so 0 stays "empty").
-                        decode_tree[slot] = (sym as i32) + 1;
-                    } else if decode_tree[slot] == 0 {
-                        // Allocate a new child node pair.
-                        let new_node = tree_nodes;
-                        tree_nodes += 1;
-                        let needed = new_node * 2 + 2;
-                        if needed > decode_tree.len() {
-                            decode_tree.resize(needed, 0);
-                        }
-                        decode_tree[slot] = -(new_node as i32) - 1;
-                        node_idx = new_node;
-                    } else {
-                        // Existing internal node.
-                        node_idx = (-(decode_tree[slot] + 1)) as usize;
-                    }
+            // Calculate position in decode_num.
+            if cur_bit_length > 0 && cur_bit_length < decode_pos.len() {
+                let dist = bit_field.wrapping_sub(decode_len[cur_bit_length - 1]);
+                let dist = dist >> (16 - cur_bit_length);
+                let pos = (decode_pos[cur_bit_length] + dist) as usize;
+                if pos < num_symbols {
+                    quick_num_table[code] = decode_num[pos];
                 }
             }
         }
 
         Ok(Self {
-            quick,
-            decode_tree,
-            tree_nodes,
+            decode_len,
+            decode_pos,
+            decode_num,
+            quick_len: quick_len_table,
+            quick_num: quick_num_table,
+            quick_bits,
             max_length,
             num_symbols,
         })
     }
 
     /// Decode the next symbol from the bitstream.
+    ///
+    /// Matches unrar's `DecodeNumber`: peek 16 left-aligned bits, try quick
+    /// table, fall back to linear threshold scan.
+    #[inline]
     pub fn decode(&self, reader: &mut BitReader) -> RarResult<u16> {
         if self.max_length == 0 {
             return Err(RarError::InvalidHuffmanTable);
@@ -234,67 +209,54 @@ impl HuffmanTable {
             });
         }
 
-        // Try quick lookup first.
-        let peek_len = (QUICK_BITS as usize)
-            .min(self.max_length as usize)
-            .min(bits_avail) as u8;
-        let peeked = reader.peek_bits(peek_len)?;
-        let index = if peek_len < QUICK_BITS {
-            (peeked as usize) << (QUICK_BITS - peek_len)
+        // Peek 16 left-aligned bits (or fewer if near end of stream).
+        let peek_count = 16.min(bits_avail) as u8;
+        let raw = reader.peek_bits(peek_count)?;
+        // Left-align to 16 bits and mask off LSB (matching unrar's & 0xfffe).
+        let bit_field = if peek_count < 16 {
+            (raw << (16 - peek_count)) & 0xfffe
         } else {
-            peeked as usize
+            raw & 0xfffe
         };
 
-        let entry = &self.quick[index];
-        if entry.length > 0 && entry.length <= QUICK_BITS {
-            // Direct hit in quick table.
-            if (entry.length as usize) <= bits_avail {
-                reader.skip_bits(entry.length as u32)?;
-                return Ok(entry.symbol);
+        // Quick path: if bit_field is below the threshold for quick_bits length.
+        if bit_field < self.decode_len[self.quick_bits as usize] {
+            let code = (bit_field >> (16 - self.quick_bits)) as usize;
+            let len = self.quick_len[code];
+            if len as usize <= bits_avail {
+                reader.skip_bits(len as u32)?;
+                return Ok(self.quick_num[code]);
             }
-        } else if entry.length > QUICK_BITS {
-            // Tree walk required. Skip the QUICK_BITS prefix.
-            reader.skip_bits(peek_len as u32)?;
-            let mut node_idx = entry.symbol as usize; // tree root for this prefix
+        }
 
-            let remaining_bits = self.max_length - QUICK_BITS;
-            for _ in 0..remaining_bits {
-                if reader.bits_remaining() == 0 {
-                    return Err(RarError::CorruptArchive {
-                        detail: "huffman: truncated code".into(),
-                    });
-                }
-                let bit = reader.read_bit()? as usize;
-                let slot = node_idx * 2 + bit;
-                if slot >= self.decode_tree.len() {
-                    return Err(RarError::CorruptArchive {
-                        detail: "huffman: invalid code in tree".into(),
-                    });
-                }
-
-                let val = self.decode_tree[slot];
-                if val > 0 {
-                    // Leaf: symbol = val - 1.
-                    return Ok((val - 1) as u16);
-                } else if val < 0 {
-                    // Internal node: follow to child.
-                    node_idx = (-(val + 1)) as usize;
-                } else {
-                    // Uninitialized node — invalid code.
-                    return Err(RarError::CorruptArchive {
-                        detail: "huffman: invalid code (uninitialized tree node)".into(),
-                    });
-                }
+        // Slow path: linear scan of thresholds to find bit length.
+        let mut bits: usize = MAX_CODE_LENGTH;
+        for i in (self.quick_bits as usize + 1)..MAX_CODE_LENGTH {
+            if bit_field < self.decode_len[i] {
+                bits = i;
+                break;
             }
+        }
 
+        if bits > bits_avail {
             return Err(RarError::CorruptArchive {
-                detail: "huffman: code exceeds max length".into(),
+                detail: "huffman: truncated code".into(),
             });
         }
 
-        Err(RarError::CorruptArchive {
-            detail: "huffman: invalid code".into(),
-        })
+        reader.skip_bits(bits as u32)?;
+
+        // Calculate position in decode_num.
+        let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
+        let dist = dist >> (16 - bits);
+        let pos = (self.decode_pos[bits] + dist) as usize;
+
+        // Safety check for corrupt data.
+        if pos >= self.num_symbols {
+            return Ok(0);
+        }
+
+        Ok(self.decode_num[pos])
     }
 
     /// Returns the number of symbols this table can decode.
@@ -528,10 +490,8 @@ mod tests {
 
     #[test]
     fn test_large_table() {
-        // Build a table with many symbols where all lengths fit in QUICK_BITS
+        // Build a table with many symbols where all lengths fit in quick bits
         let mut lengths = [0u8; 256];
-        // 128 symbols at length 8, 64 at length 9, 64 at length 10
-        // All fit within QUICK_BITS (10), so no tree walk needed
         for item in lengths.iter_mut().take(128) {
             *item = 8;
         }
@@ -549,14 +509,14 @@ mod tests {
 
     #[test]
     fn test_table_with_tree_walk() {
-        // Build a table where some codes exceed QUICK_BITS (10)
+        // Build a table where some codes exceed quick bits
         // 4 symbols: lengths 1, 2, 3, 11
-        // This forces one symbol through the tree walk path
+        // This forces one symbol through the slow path
         let mut lengths = [0u8; 4];
         lengths[0] = 1; // code: 0
         lengths[1] = 3; // code: 100
         lengths[2] = 3; // code: 101
-        lengths[3] = 11; // long code requiring tree walk
+        lengths[3] = 11; // long code requiring slow path
 
         let table = HuffmanTable::build(&lengths).unwrap();
         assert_eq!(table.max_length, 11);

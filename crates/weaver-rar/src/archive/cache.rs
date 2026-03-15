@@ -199,6 +199,7 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.into(),
+            kdf_cache: crate::crypto::KdfCache::new(),
         }
     }
 
