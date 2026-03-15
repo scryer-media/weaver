@@ -85,7 +85,7 @@ struct TableSet {
 /// state (for solid archive continuity).
 fn preparse_blocks(
     input: &[u8],
-    code_lengths: &mut Vec<u8>,
+    code_lengths: &mut [u8],
     existing_tables: Option<&TableSet>,
 ) -> RarResult<(Vec<BlockInfo>, Vec<TableSet>)> {
     let mut reader = BitReader::new(input);
@@ -149,17 +149,16 @@ fn preparse_blocks(
         let mut block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
 
         // Read tables if present — this advances the reader and consumes bits.
-        let table_set_index;
-        if table_present || table_sets.is_empty() {
+        let table_set_index = if table_present || table_sets.is_empty() {
             let pos_before = reader.position();
             let (nc, dc, ldc, rc) = huffman::read_tables(&mut reader, code_lengths)?;
             let bits_used = (reader.position() - pos_before) as i64;
             block_bits_remaining -= bits_used;
             table_sets.push(TableSet { nc, dc, ldc, rc });
-            table_set_index = table_sets.len() - 1;
+            table_sets.len() - 1
         } else {
-            table_set_index = table_sets.len() - 1;
-        }
+            table_sets.len() - 1
+        };
 
         let data_bit_offset = reader.position();
         let is_large = block_bits_remaining > LARGE_BLOCK_BITS;
@@ -216,13 +215,12 @@ fn decode_block_symbols(
 
         if sym < 256 {
             // Literal — try to batch with previous item.
-            if let Some(DecodedItem::Literals { bytes, count }) = items.last_mut() {
-                if (*count as usize) < 7 {
+            if let Some(DecodedItem::Literals { bytes, count }) = items.last_mut()
+                && (*count as usize) < 7 {
                     *count += 1;
                     bytes[*count as usize] = sym as u8;
                     continue;
                 }
-            }
             items.push(DecodedItem::Literals {
                 bytes: {
                     let mut b = [0u8; 8];
@@ -408,8 +406,8 @@ fn apply_decoded_items(
             match *item {
                 DecodedItem::Literals { bytes, count } => {
                     let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
-                    for i in 0..n {
-                        window.put_byte(bytes[i]);
+                    for b in &bytes[..n] {
+                        window.put_byte(*b);
                     }
                     *output_size += n as u64;
                 }
@@ -510,12 +508,17 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<Option<u64>> {
         // Phase 1: pre-parse block headers.
-        let existing_tables = if self.nc_table.is_some() {
+        let existing_tables = if let (Some(nc), Some(dc), Some(ldc), Some(rc)) = (
+            &self.nc_table,
+            &self.dc_table,
+            &self.ldc_table,
+            &self.rc_table,
+        ) {
             Some(TableSet {
-                nc: self.nc_table.as_ref().unwrap().clone(),
-                dc: self.dc_table.as_ref().unwrap().clone(),
-                ldc: self.ldc_table.as_ref().unwrap().clone(),
-                rc: self.rc_table.as_ref().unwrap().clone(),
+                nc: nc.clone(),
+                dc: dc.clone(),
+                ldc: ldc.clone(),
+                rc: rc.clone(),
             })
         } else {
             None

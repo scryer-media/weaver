@@ -276,7 +276,7 @@ impl<'a> BitReader<'a> {
         // But for remaining_bytes we want to return from the next byte boundary
         // after the current bit position.
         let bit_position = self.position();
-        let start = if bit_position % 8 == 0 {
+        let start = if bit_position.is_multiple_of(8) {
             bit_position / 8
         } else {
             bit_position / 8 + 1
