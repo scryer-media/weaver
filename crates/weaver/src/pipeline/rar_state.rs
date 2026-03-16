@@ -224,7 +224,31 @@ pub(super) fn build_plan(
         if !extracted.contains(&member.name) {
             claims.extend(missing_for_member(member));
         }
-        member_claims.insert(member.name.clone(), claims);
+        member_claims
+            .entry(member.name.clone())
+            .or_default()
+            .extend(claims);
+    }
+
+    // Supplemental claims from topology members. This covers orphan
+    // continuation entries (split_before=true, single segment) that
+    // metadata() filters out. Without this, boundary volumes between
+    // members have zero owners during incremental topology rebuilds.
+    for member in &topology_members {
+        if member.is_directory {
+            continue;
+        }
+        // Continuation headers from out-of-order volume arrival can have
+        // empty names — skip these to avoid phantom owners.
+        if member.name.is_empty() {
+            continue;
+        }
+        let first_volume = member.volumes.first_volume as u32;
+        let last_volume = member.volumes.last_volume as u32;
+        member_claims
+            .entry(member.name.clone())
+            .or_default()
+            .extend(first_volume..=last_volume);
     }
 
     if facts
@@ -290,12 +314,15 @@ pub(super) fn build_plan(
 
     let mut delete_decisions = BTreeMap::new();
     let mut ownerless_volumes = Vec::new();
+    // Iterate all members with claims (not just member_names from metadata),
+    // so topology-only members (orphan continuations) contribute ownership.
+    let all_claiming_members: Vec<String> = member_claims.keys().cloned().collect();
     for volume in facts.keys().copied() {
         let mut owners = Vec::new();
         let mut clean_owners = Vec::new();
         let mut failed_owners = Vec::new();
         let mut pending_owners = Vec::new();
-        for member in &member_names {
+        for member in &all_claiming_members {
             if !member_claims
                 .get(member)
                 .is_some_and(|claims| claims.contains(&volume))
@@ -669,6 +696,203 @@ mod tests {
         assert!(plan.waiting_on_volumes.contains(&3));
         assert!(!plan.deletion_eligible.contains(&3));
         let decision = plan.delete_decisions.get(&3).unwrap();
+        assert!(decision.unresolved_boundary);
+        assert!(!decision.ownership_eligible);
+    }
+
+    /// Build a 5-volume RAR set with a single member spanning all volumes.
+    /// Used to test gap scenarios where volumes arrive out of order.
+    fn build_single_member_five_volume_rar_set() -> Vec<(String, Vec<u8>)> {
+        let payload = b"abcdefghijklmnopqrstuvwxy"; // 25 bytes
+        let payload_crc = checksum::crc32(payload);
+        let chunk_size = 5;
+
+        let mut volumes = Vec::new();
+        for vol in 0u64..5 {
+            let chunk_start = vol as usize * chunk_size;
+            let chunk = &payload[chunk_start..chunk_start + chunk_size];
+
+            let is_first = vol == 0;
+            let is_last = vol == 4;
+
+            let main_flags = if is_first { 0x0001 } else { 0x0001 | 0x0002 };
+            let vol_num = if is_first { None } else { Some(vol) };
+
+            let mut file_common_flags = 0u64;
+            if !is_first {
+                file_common_flags |= 0x0008; // SPLIT_BEFORE
+            }
+            if !is_last {
+                file_common_flags |= 0x0010; // SPLIT_AFTER
+            }
+
+            let data_crc = if is_last { Some(payload_crc) } else { None };
+
+            let mut volume_data = Vec::new();
+            volume_data.extend_from_slice(&TEST_RAR5_SIG);
+            volume_data.extend_from_slice(&build_test_rar_main_header(main_flags, vol_num));
+            volume_data.extend_from_slice(&build_test_rar_file_header(
+                "E01.mkv",
+                file_common_flags,
+                chunk.len() as u64,
+                payload.len() as u64,
+                data_crc,
+            ));
+            volume_data.extend_from_slice(chunk);
+            volume_data.extend_from_slice(&build_test_rar_end_header(!is_last));
+
+            let filename = format!("show.part{:02}.rar", vol + 1);
+            volumes.push((filename, volume_data));
+        }
+        volumes
+    }
+
+    #[test]
+    fn build_plan_split_chain_gap_preserves_claims_from_both_halves() {
+        // Build 5 volumes for a single member E01.mkv spanning vols 0-4.
+        // Add vols 0, 1, 3, 4 to the archive (skip vol 2 to create a gap).
+        // This creates two MemberEntry records for E01.mkv that can't merge.
+        // The fix ensures claims from both halves are preserved.
+        let files = build_single_member_five_volume_rar_set();
+        let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        archive
+            .add_volume(1, Box::new(Cursor::new(files[1].1.clone())))
+            .unwrap();
+        // Skip volume 2 — creates a gap
+        archive
+            .add_volume(3, Box::new(Cursor::new(files[3].1.clone())))
+            .unwrap();
+        archive
+            .add_volume(4, Box::new(Cursor::new(files[4].1.clone())))
+            .unwrap();
+
+        // Include all 5 volumes in facts (all downloaded).
+        let facts: BTreeMap<u32, RarVolumeFacts> = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (_, bytes))| {
+                (
+                    volume as u32,
+                    RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+                )
+            })
+            .collect();
+        let volume_map = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+            .collect();
+
+        let plan = build_plan(
+            volume_map,
+            &facts,
+            &archive,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+
+        // Volumes 0, 1 should be owned by E01.mkv (first half of split chain).
+        for vol in [0, 1] {
+            let decision = plan.delete_decisions.get(&vol).unwrap();
+            assert!(
+                !decision.owners.is_empty(),
+                "volume {vol} should have at least one owner"
+            );
+            assert!(
+                decision.owners.contains(&"E01.mkv".to_string()),
+                "volume {vol} should be owned by E01.mkv, got {:?}",
+                decision.owners
+            );
+        }
+
+        // Volumes 3, 4 should also be owned by E01.mkv (second half).
+        for vol in [3, 4] {
+            let decision = plan.delete_decisions.get(&vol).unwrap();
+            assert!(
+                !decision.owners.is_empty(),
+                "volume {vol} should have at least one owner"
+            );
+            assert!(
+                decision.owners.contains(&"E01.mkv".to_string()),
+                "volume {vol} should be owned by E01.mkv, got {:?}",
+                decision.owners
+            );
+        }
+
+        // No volumes should be ownerless (except vol 2 which is in facts but
+        // not covered by any member segment range — it's a gap volume that
+        // should still have an owner from topology_members supplemental claims
+        // since the topology entry for the second half covers vol 3-4, and the
+        // first half covers 0-1. Vol 2 has facts but no topology coverage).
+        let ownerless: Vec<u32> = plan
+            .delete_decisions
+            .iter()
+            .filter_map(|(vol, decision)| decision.owners.is_empty().then_some(*vol))
+            .collect();
+        // Vol 2 may be ownerless since it's in facts but not in any archive
+        // member's segment range (it wasn't added to the archive). That's
+        // acceptable — the important thing is 0, 1, 3, 4 are NOT ownerless.
+        let unexpected_ownerless: Vec<u32> =
+            ownerless.iter().copied().filter(|v| *v != 2).collect();
+        assert!(
+            unexpected_ownerless.is_empty(),
+            "unexpected ownerless volumes: {unexpected_ownerless:?}"
+        );
+    }
+
+    #[test]
+    fn build_plan_boundary_orphan_continuation_has_owner() {
+        // Build the standard 4-volume set (E01 on vols 0-1, E02 on vols 2-3).
+        // Add only vol 0 and vol 3 to the archive. Volume 3 has an E02.mkv
+        // continuation entry (split_before=true) with a single segment that
+        // can't merge — creating an orphan filtered from metadata.members.
+        // After the fix, vol 3 should have an owner from topology_members.
+        let files = build_multifile_multivolume_rar_set();
+        let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        archive
+            .add_volume(3, Box::new(Cursor::new(files[3].1.clone())))
+            .unwrap();
+
+        let facts: BTreeMap<u32, RarVolumeFacts> = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (_, bytes))| {
+                (
+                    volume as u32,
+                    RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+                )
+            })
+            .collect();
+        let volume_map = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+            .collect();
+
+        let plan = build_plan(
+            volume_map,
+            &facts,
+            &archive,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+
+        // Volume 3 should have an owner (E02.mkv from topology_members).
+        let decision = plan.delete_decisions.get(&3).unwrap();
+        assert!(
+            !decision.owners.is_empty(),
+            "boundary orphan volume 3 should have at least one owner, got zero"
+        );
+        assert!(
+            decision.owners.contains(&"E02.mkv".to_string()),
+            "volume 3 should be owned by E02.mkv, got {:?}",
+            decision.owners
+        );
+        // It should still be unresolved and not deletion-eligible.
         assert!(decision.unresolved_boundary);
         assert!(!decision.ownership_eligible);
     }
