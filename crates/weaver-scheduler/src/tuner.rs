@@ -55,16 +55,11 @@ impl RuntimeTuner {
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
         let cores = profile.cpu.physical_cores.max(1);
 
-        // Fast storage (>1000 IOPS): start with all configured connections —
-        // network latency is the bottleneck, not disk. The tuner will reduce
-        // if decode can't keep up.
-        // Slow storage: conservative start since random I/O contention hurts.
-        let fast = profile.disk.random_read_iops >= FAST_STORAGE_IOPS;
-        let max_concurrent_downloads = if fast {
-            total_connections
-        } else {
-            cores.min(total_connections).min(8)
-        };
+        // Start with all configured connections — the adaptive tuner will
+        // reduce if decode pressure builds or disk can't keep up. Never cap
+        // below what the user configured; if throttling is needed, the
+        // decode_pressure_streak mechanism handles it automatically.
+        let max_concurrent_downloads = total_connections;
 
         let repair_threads = cores.max(1);
         let extract_threads = (cores / 2).max(1);
@@ -204,15 +199,7 @@ impl RuntimeTuner {
     /// Upper limit for max_concurrent_downloads based on system profile
     /// and configured connection count.
     fn max_downloads_limit(&self) -> usize {
-        if self.is_fast_storage() {
-            self.total_connections
-        } else {
-            self.profile
-                .cpu
-                .physical_cores
-                .min(self.total_connections)
-                .min(8)
-        }
+        self.total_connections
     }
 
     /// Update the connection limit (e.g. after adding/removing a server) and
@@ -357,11 +344,11 @@ mod tests {
 
     #[test]
     fn initial_params_hdd() {
-        let tuner = RuntimeTuner::new(hdd_profile(8));
+        let tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
         let p = tuner.params();
-        assert_eq!(p.max_concurrent_downloads, 8); // min(8, 8)
-        assert_eq!(p.max_decode_queue, 16);
-        assert_eq!(p.max_write_queue, 16);
+        assert_eq!(p.max_concurrent_downloads, 20); // all configured connections
+        assert_eq!(p.max_decode_queue, 40);
+        assert_eq!(p.max_write_queue, 40);
         assert_eq!(p.decode_thread_count, 8);
     }
 
@@ -426,19 +413,18 @@ mod tests {
 
     #[test]
     fn pp_throttles_hdd_aggressively() {
-        let mut tuner = RuntimeTuner::new(hdd_profile(8));
-        // HDD with 8 cores: max_concurrent_downloads = 8.
-        assert_eq!(tuner.params().max_concurrent_downloads, 8);
+        let mut tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
+        assert_eq!(tuner.params().max_concurrent_downloads, 20);
 
         let mut m = empty_metrics();
         m.extract_active = 1;
 
         // PP streak threshold is 2.
         tuner.adjust(&m);
-        assert_eq!(tuner.params().max_concurrent_downloads, 8); // not yet
+        assert_eq!(tuner.params().max_concurrent_downloads, 20); // not yet
         tuner.adjust(&m);
-        // HDD: reduced to baseline/4 = 8/4 = 2.
-        assert_eq!(tuner.params().max_concurrent_downloads, 2);
+        // HDD: reduced to baseline/4 = 20/4 = 5.
+        assert_eq!(tuner.params().max_concurrent_downloads, 5);
     }
 
     #[test]
@@ -458,21 +444,21 @@ mod tests {
 
     #[test]
     fn pp_restores_after_completion() {
-        let mut tuner = RuntimeTuner::new(hdd_profile(8));
-        assert_eq!(tuner.params().max_concurrent_downloads, 8);
+        let mut tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
+        assert_eq!(tuner.params().max_concurrent_downloads, 20);
 
         // Trigger PP throttling.
         let mut pp = empty_metrics();
         pp.repair_active = 1;
         tuner.adjust(&pp);
         tuner.adjust(&pp);
-        assert_eq!(tuner.params().max_concurrent_downloads, 2);
+        assert_eq!(tuner.params().max_concurrent_downloads, 5);
 
         // PP finishes.
         let idle = empty_metrics();
         tuner.adjust(&idle);
         // Should restore to pre-PP value.
-        assert_eq!(tuner.params().max_concurrent_downloads, 8);
+        assert_eq!(tuner.params().max_concurrent_downloads, 20);
     }
 
     #[test]
