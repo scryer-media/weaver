@@ -181,17 +181,11 @@ impl Pipeline {
             })
             .collect();
 
-        if self
-            .write_req_tx
-            .try_send(WriteRequest {
-                file_id,
-                file_path,
-                segments,
-            })
-            .is_err()
-        {
-            warn!(file_id = %file_id, "write channel full — writer backpressure");
-        }
+        let _ = self.write_req_tx.send(WriteRequest {
+            file_id,
+            file_path,
+            segments,
+        });
     }
 
     fn enforce_file_write_backlog(&mut self, file_id: NzbFileId) {
@@ -268,7 +262,7 @@ impl Pipeline {
             crc32: segment.crc32,
             yenc_name: segment.yenc_name,
         };
-        let _ = self.write_req_tx.try_send(WriteRequest {
+        let _ = self.write_req_tx.send(WriteRequest {
             file_id,
             file_path,
             segments: vec![(offset, segment.data.into_boxed_bytes(), ci)],
@@ -407,7 +401,7 @@ impl Pipeline {
                                     (offset, seg.data.into_boxed_bytes(), ci)
                                 })
                                 .collect();
-                            let _ = self.write_req_tx.try_send(WriteRequest {
+                            let _ = self.write_req_tx.send(WriteRequest {
                                 file_id,
                                 file_path,
                                 segments,

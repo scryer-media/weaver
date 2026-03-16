@@ -243,7 +243,7 @@ pub struct Pipeline {
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
     /// Channel to send write requests to the background writer task.
-    pub(super) write_req_tx: mpsc::Sender<WriteRequest>,
+    pub(super) write_req_tx: mpsc::UnboundedSender<WriteRequest>,
     /// Channel to receive write completions from the background writer task.
     pub(super) write_complete_rx: mpsc::Receiver<WriteComplete>,
     /// Whether all downloads are globally paused.
@@ -418,9 +418,15 @@ impl Pipeline {
 
     /// Spawn the background writer task. Returns the request sender and
     /// completion receiver for the pipeline to use.
-    fn spawn_writer_task() -> (mpsc::Sender<WriteRequest>, mpsc::Receiver<WriteComplete>) {
-        let (req_tx, mut req_rx) = mpsc::channel::<WriteRequest>(64);
-        let (complete_tx, complete_rx) = mpsc::channel::<WriteComplete>(64);
+    fn spawn_writer_task() -> (
+        mpsc::UnboundedSender<WriteRequest>,
+        mpsc::Receiver<WriteComplete>,
+    ) {
+        // Unbounded channel: backpressure is handled by write_buffered_bytes /
+        // write_backlog_budget_bytes in the pipeline. A bounded channel here
+        // would silently drop segments on NFS where writes are slow.
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WriteRequest>();
+        let (complete_tx, complete_rx) = mpsc::channel::<WriteComplete>(256);
 
         // Single dedicated blocking thread with file handle cache.
         // On NFS/network filesystems, open() is expensive (~1.8s round-trip).
