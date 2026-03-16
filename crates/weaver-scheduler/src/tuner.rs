@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use weaver_core::system::{StorageClass, SystemProfile};
+use weaver_core::system::SystemProfile;
 
 use crate::metrics::MetricsSnapshot;
+
+/// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
+/// bottleneck and we can use all configured connections. Below this, we
+/// throttle to avoid disk contention.
+const FAST_STORAGE_IOPS: f64 = 1_000.0;
 
 /// Runtime-tunable parameters. The tuner adjusts these based on observed performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,12 +55,15 @@ impl RuntimeTuner {
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
         let cores = profile.cpu.physical_cores.max(1);
 
-        // SSD: start with all configured connections — network latency is the
-        // bottleneck, not disk. The tuner will reduce if decode can't keep up.
-        // HDD: conservative start since random I/O contention hurts.
-        let max_concurrent_downloads = match profile.disk.storage_class {
-            StorageClass::Ssd => total_connections,
-            _ => cores.min(total_connections).min(8),
+        // Fast storage (>1000 IOPS): start with all configured connections —
+        // network latency is the bottleneck, not disk. The tuner will reduce
+        // if decode can't keep up.
+        // Slow storage: conservative start since random I/O contention hurts.
+        let fast = profile.disk.random_read_iops >= FAST_STORAGE_IOPS;
+        let max_concurrent_downloads = if fast {
+            total_connections
+        } else {
+            cores.min(total_connections).min(8)
         };
 
         let repair_threads = cores.max(1);
@@ -82,6 +90,14 @@ impl RuntimeTuner {
             pre_pp_max_downloads: None,
             bandwidth_ema: 0.0,
         }
+    }
+
+    /// Whether the detected storage is fast enough that disk I/O is not the
+    /// bottleneck (SSD/NVMe). Based on measured IOPS, not storage class enum,
+    /// so it works correctly in Docker and other environments where
+    /// `/sys/block` detection fails.
+    fn is_fast_storage(&self) -> bool {
+        self.profile.disk.random_read_iops >= FAST_STORAGE_IOPS
     }
 
     /// Get current tuned parameters.
@@ -140,10 +156,10 @@ impl RuntimeTuner {
             if self.pre_pp_max_downloads.is_none() {
                 self.pre_pp_max_downloads = Some(self.current.max_concurrent_downloads);
             }
-            let reduced = match self.profile.disk.storage_class {
-                StorageClass::Hdd => (baseline / 4).max(1),
-                StorageClass::Ssd => (baseline * 3 / 4).max(1),
-                _ => (baseline / 2).max(1),
+            let reduced = if self.is_fast_storage() {
+                (baseline * 3 / 4).max(1)
+            } else {
+                (baseline / 4).max(1)
             };
             if self.current.max_concurrent_downloads != reduced {
                 self.current.max_concurrent_downloads = reduced;
@@ -188,14 +204,14 @@ impl RuntimeTuner {
     /// Upper limit for max_concurrent_downloads based on system profile
     /// and configured connection count.
     fn max_downloads_limit(&self) -> usize {
-        match self.profile.disk.storage_class {
-            StorageClass::Ssd => self.total_connections,
-            _ => self
-                .profile
+        if self.is_fast_storage() {
+            self.total_connections
+        } else {
+            self.profile
                 .cpu
                 .physical_cores
                 .min(self.total_connections)
-                .min(8),
+                .min(8)
         }
     }
 
@@ -222,22 +238,18 @@ impl RuntimeTuner {
     /// HDD: seeking between concurrent read positions kills throughput (1-2).
     /// Network/Unknown: moderate (2).
     pub fn max_concurrent_extractions(&self) -> usize {
-        match self.profile.disk.storage_class {
-            StorageClass::Ssd => {
-                // SSD: bottleneck is CPU decompression, not I/O
-                let cores = self.profile.cpu.physical_cores;
-                cores.clamp(2, 6)
+        if self.is_fast_storage() {
+            // Fast storage: bottleneck is CPU decompression, not I/O.
+            let cores = self.profile.cpu.physical_cores;
+            cores.clamp(2, 6)
+        } else {
+            // Slow storage: head seeks between concurrent streams hurt.
+            // Allow 2 only if IOPS suggests a decent drive.
+            if self.profile.disk.random_read_iops > 500.0 {
+                2
+            } else {
+                1
             }
-            StorageClass::Hdd => {
-                // HDD: head seeks between concurrent streams are devastating.
-                // Allow 2 only if IOPS suggests a decent drive.
-                if self.profile.disk.random_read_iops > 500.0 {
-                    2
-                } else {
-                    1
-                }
-            }
-            _ => 2,
         }
     }
 
