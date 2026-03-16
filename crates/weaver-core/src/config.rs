@@ -292,4 +292,7 @@ pub struct TunerOverrides {
     pub max_concurrent_downloads: Option<usize>,
     pub max_decode_queue: Option<usize>,
     pub decode_thread_count: Option<usize>,
+    /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
+    /// Defaults to `(physical_cores / 2).max(1)`.
+    pub extract_thread_count: Option<usize>,
 }

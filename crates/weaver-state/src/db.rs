@@ -62,6 +62,7 @@ impl Database {
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
              PRAGMA auto_vacuum=INCREMENTAL;
              PRAGMA cache_size=-32000;
              PRAGMA mmap_size=67108864;

@@ -8,5 +8,6 @@ pub mod id;
 pub mod release_name;
 pub mod split_reader;
 pub mod system;
+pub mod threadpool;
 
 pub use error::Error;

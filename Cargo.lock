@@ -3995,6 +3995,7 @@ dependencies = [
  "flate2",
  "libc",
  "mime_guess",
+ "rayon",
  "rmp-serde",
  "rust-embed",
  "serde",
@@ -4073,7 +4074,9 @@ dependencies = [
  "bytes",
  "crc32fast",
  "crossbeam-queue",
+ "libc",
  "md-5",
+ "rayon",
  "scryer-release-parser",
  "serde",
  "serde_json",
@@ -4150,7 +4153,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "weaver-core",
 ]
 
 [[package]]

@@ -19,6 +19,8 @@ crossbeam-queue = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 scryer-release-parser = { workspace = true }
+rayon = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

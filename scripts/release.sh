@@ -269,3 +269,6 @@ ok "Pushed $BRANCH and tag $TAG_NAME"
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}Released $TAG_NAME${RESET}"
+echo ""
+echo -e "${YELLOW}${BOLD}Reminder:${RESET} Scryer depends on weaver-rar."
+echo -e "   Update the weaver tag reference in Scryer's Cargo.toml to ${BOLD}${TAG_NAME}${RESET}"

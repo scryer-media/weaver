@@ -700,74 +700,79 @@ impl Pipeline {
                 let set_name_owned = set_name.clone();
                 let set_name_for_task = set_name.clone();
                 let set_name_for_archive = set_name.clone();
+                let pp_pool = self.pp_pool.clone();
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let mut archive = Self::open_rar_archive_from_snapshot_or_disk(
-                            &set_name_for_archive,
-                            volume_paths_map.clone(),
-                            password.clone(),
-                            cached_headers,
-                        )?;
+                        pp_pool.install(move || {
+                            let mut archive = Self::open_rar_archive_from_snapshot_or_disk(
+                                &set_name_for_archive,
+                                volume_paths_map.clone(),
+                                password.clone(),
+                                cached_headers,
+                            )?;
 
-                        let options = weaver_rar::ExtractOptions {
-                            verify: true,
-                            password: password.clone(),
-                        };
-                        let mut outcome = BatchExtractionOutcome {
-                            extracted: Vec::new(),
-                            failed: Vec::new(),
-                        };
-
-                        for member_name in &members_to_extract {
-                            let Some(idx) = archive.find_member_sanitized(member_name) else {
-                                outcome.failed.push((
-                                    member_name.clone(),
-                                    "member not found in archive".to_string(),
-                                ));
-                                continue;
+                            let options = weaver_rar::ExtractOptions {
+                                verify: true,
+                                password: password.clone(),
+                            };
+                            let mut outcome = BatchExtractionOutcome {
+                                extracted: Vec::new(),
+                                failed: Vec::new(),
                             };
 
-                            match Self::extract_rar_member_to_output(
-                                &mut archive,
-                                RarExtractionContext {
-                                    volume_paths: &volume_paths_map,
-                                    db: &db,
-                                    event_tx: &event_tx,
-                                    job_id,
-                                    set_name: &set_name_for_task,
-                                    output_dir: &output_dir,
-                                    options: &options,
-                                },
-                                idx,
-                            ) {
-                                Ok((extracted_name, bytes_written, total_bytes)) => {
-                                    let _ = event_tx.send(PipelineEvent::ExtractionProgress {
+                            for member_name in &members_to_extract {
+                                let Some(idx) = archive.find_member_sanitized(member_name) else {
+                                    outcome.failed.push((
+                                        member_name.clone(),
+                                        "member not found in archive".to_string(),
+                                    ));
+                                    continue;
+                                };
+
+                                match Self::extract_rar_member_to_output(
+                                    &mut archive,
+                                    RarExtractionContext {
+                                        volume_paths: &volume_paths_map,
+                                        db: &db,
+                                        event_tx: &event_tx,
                                         job_id,
-                                        member: extracted_name.clone(),
-                                        bytes_written,
-                                        total_bytes,
-                                    });
-                                    let _ =
-                                        event_tx.send(PipelineEvent::ExtractionMemberFinished {
+                                        set_name: &set_name_for_task,
+                                        output_dir: &output_dir,
+                                        options: &options,
+                                    },
+                                    idx,
+                                ) {
+                                    Ok((extracted_name, bytes_written, total_bytes)) => {
+                                        let _ = event_tx.send(PipelineEvent::ExtractionProgress {
                                             job_id,
-                                            set_name: set_name_for_task.clone(),
                                             member: extracted_name.clone(),
+                                            bytes_written,
+                                            total_bytes,
                                         });
-                                    outcome.extracted.push(extracted_name);
-                                }
-                                Err(error) => {
-                                    let _ = event_tx.send(PipelineEvent::ExtractionMemberFailed {
-                                        job_id,
-                                        set_name: set_name_for_task.clone(),
-                                        member: member_name.clone(),
-                                        error: error.clone(),
-                                    });
-                                    outcome.failed.push((member_name.clone(), error));
+                                        let _ = event_tx.send(
+                                            PipelineEvent::ExtractionMemberFinished {
+                                                job_id,
+                                                set_name: set_name_for_task.clone(),
+                                                member: extracted_name.clone(),
+                                            },
+                                        );
+                                        outcome.extracted.push(extracted_name);
+                                    }
+                                    Err(error) => {
+                                        let _ =
+                                            event_tx.send(PipelineEvent::ExtractionMemberFailed {
+                                                job_id,
+                                                set_name: set_name_for_task.clone(),
+                                                member: member_name.clone(),
+                                                error: error.clone(),
+                                            });
+                                        outcome.failed.push((member_name.clone(), error));
+                                    }
                                 }
                             }
-                        }
 
-                        Ok(outcome)
+                            Ok(outcome)
+                        })
                     })
                     .await;
 
@@ -892,21 +897,26 @@ impl Pipeline {
             (state.working_dir.clone(), par2_set)
         };
 
-        let lower_bound = tokio::task::spawn_blocking(move || -> Result<u32, String> {
-            let plan = weaver_par2::scan_placement(&working_dir, &par2_set)
-                .map_err(|e| format!("placement scan failed: {e}"))?;
-            let selected: HashSet<weaver_par2::FileId> = file_ids.iter().copied().collect();
-            if plan
-                .conflicts
-                .iter()
-                .any(|file_id| selected.contains(file_id))
-            {
-                return Err("placement conflicts in suspect files".to_string());
-            }
+        let pp_pool = self.pp_pool.clone();
+        let lower_bound = tokio::task::spawn_blocking(move || {
+            pp_pool.install(move || -> Result<u32, String> {
+                let plan = weaver_par2::scan_placement(&working_dir, &par2_set)
+                    .map_err(|e| format!("placement scan failed: {e}"))?;
+                let selected: HashSet<weaver_par2::FileId> = file_ids.iter().copied().collect();
+                if plan
+                    .conflicts
+                    .iter()
+                    .any(|file_id| selected.contains(file_id))
+                {
+                    return Err("placement conflicts in suspect files".to_string());
+                }
 
-            let access = weaver_par2::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
-            let verification = weaver_par2::verify_selected_file_ids(&par2_set, &access, &file_ids);
-            Ok(verification.total_missing_blocks)
+                let access =
+                    weaver_par2::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
+                let verification =
+                    weaver_par2::verify_selected_file_ids(&par2_set, &access, &file_ids);
+                Ok(verification.total_missing_blocks)
+            })
         })
         .await;
 

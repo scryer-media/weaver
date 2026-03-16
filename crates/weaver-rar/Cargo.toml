@@ -10,7 +10,6 @@ repository.workspace = true
 slow-tests = []
 
 [dependencies]
-weaver-core = { path = "../weaver-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }

@@ -629,13 +629,15 @@ impl Pipeline {
                 .collect()
         };
 
-        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
-            error!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to clear persisted verified suspect RAR volumes"
-            );
-        }
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.clear_verified_suspect_volumes(job_id) {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to clear persisted verified suspect RAR volumes"
+                );
+            }
+        });
 
         for (set_name, suspect) in plans {
             if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
@@ -1010,9 +1012,11 @@ impl Pipeline {
                 && state.status != JobStatus::Extracting
             {
                 state.status = JobStatus::Extracting;
-                if let Err(error) = self.db.set_active_job_status(job_id, "extracting", None) {
-                    error!(error = %error, "db write failed for extracting status");
-                }
+                self.db_fire_and_forget(move |db| {
+                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
+                        tracing::error!(error = %e, "db write failed for extracting status");
+                    }
+                });
                 self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
                 let _ = self
                     .event_tx
@@ -1068,9 +1072,11 @@ impl Pipeline {
                 && state.status != JobStatus::Extracting
             {
                 state.status = JobStatus::Extracting;
-                if let Err(error) = self.db.set_active_job_status(job_id, "extracting", None) {
-                    error!(error = %error, "db write failed for extracting status");
-                }
+                self.db_fire_and_forget(move |db| {
+                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
+                        tracing::error!(error = %e, "db write failed for extracting status");
+                    }
+                });
                 self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
                 let _ = self
                     .event_tx
@@ -1150,9 +1156,11 @@ impl Pipeline {
             let state = self.jobs.get_mut(&job_id).unwrap();
             if state.status == JobStatus::Downloading {
                 state.status = JobStatus::Extracting;
-                if let Err(e) = self.db.set_active_job_status(job_id, "extracting", None) {
-                    error!(error = %e, "db write failed for extracting status");
-                }
+                self.db_fire_and_forget(move |db| {
+                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
+                        tracing::error!(error = %e, "db write failed for extracting status");
+                    }
+                });
                 self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1183,9 +1191,11 @@ impl Pipeline {
                     }
                     state.status = JobStatus::Verifying;
                 }
-                if let Err(e) = self.db.set_active_job_status(job_id, "verifying", None) {
-                    error!(error = %e, "db write failed for verifying status");
-                }
+                self.db_fire_and_forget(move |db| {
+                    if let Err(e) = db.set_active_job_status(job_id, "verifying", None) {
+                        tracing::error!(error = %e, "db write failed for verifying status");
+                    }
+                });
                 self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
                 info!(job_id = job_id.0, "par2 verification started");
                 let _ = self
@@ -1202,25 +1212,28 @@ impl Pipeline {
                 let par2_for_verify = Arc::clone(&par2_set);
                 let verify_dir = working_dir.clone();
 
+                let pp_pool = self.pp_pool.clone();
                 let verify_result = tokio::task::spawn_blocking(move || {
-                    let plan = weaver_par2::scan_placement(&verify_dir, &par2_for_verify)
-                        .map_err(|e| format!("placement scan failed: {e}"))?;
-                    if !plan.conflicts.is_empty() {
-                        return Err(format!(
-                            "placement scan found {} conflicting file matches",
-                            plan.conflicts.len()
-                        ));
-                    }
+                    pp_pool.install(move || {
+                        let plan = weaver_par2::scan_placement(&verify_dir, &par2_for_verify)
+                            .map_err(|e| format!("placement scan failed: {e}"))?;
+                        if !plan.conflicts.is_empty() {
+                            return Err(format!(
+                                "placement scan found {} conflicting file matches",
+                                plan.conflicts.len()
+                            ));
+                        }
 
-                    let file_access = weaver_par2::PlacementFileAccess::from_plan(
-                        verify_dir,
-                        &par2_for_verify,
-                        &plan,
-                    );
-                    Ok((
-                        weaver_par2::verify_all(&par2_for_verify, &file_access),
-                        plan,
-                    ))
+                        let file_access = weaver_par2::PlacementFileAccess::from_plan(
+                            verify_dir,
+                            &par2_for_verify,
+                            &plan,
+                        );
+                        Ok((
+                            weaver_par2::verify_all(&par2_for_verify, &file_access),
+                            plan,
+                        ))
+                    })
                 })
                 .await;
 
@@ -1346,9 +1359,11 @@ impl Pipeline {
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             state.status = JobStatus::Downloading;
                         }
-                        if let Err(e) = self.db.set_active_job_status(job_id, "downloading", None) {
-                            error!(error = %e, "db write failed");
-                        }
+                        self.db_fire_and_forget(move |db| {
+                            if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                                tracing::error!(error = %e, "db write failed for downloading status");
+                            }
+                        });
                         self.try_partial_extraction(job_id).await;
                         return;
                     }
@@ -1404,9 +1419,11 @@ impl Pipeline {
                         if let Some(state) = self.jobs.get_mut(&job_id) {
                             state.status = JobStatus::Downloading;
                         }
-                        if let Err(e) = self.db.set_active_job_status(job_id, "downloading", None) {
-                            error!(error = %e, "db write failed for downloading status");
-                        }
+                        self.db_fire_and_forget(move |db| {
+                            if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                                tracing::error!(error = %e, "db write failed for downloading status");
+                            }
+                        });
                         return;
                     }
 
@@ -1414,24 +1431,29 @@ impl Pipeline {
                         let state = self.jobs.get_mut(&job_id).unwrap();
                         state.status = JobStatus::Repairing;
                     }
-                    if let Err(e) = self.db.set_active_job_status(job_id, "repairing", None) {
-                        error!(error = %e, "db write failed for repairing status");
-                    }
+                    self.db_fire_and_forget(move |db| {
+                        if let Err(e) = db.set_active_job_status(job_id, "repairing", None) {
+                            tracing::error!(error = %e, "db write failed for repairing status");
+                        }
+                    });
                     self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
                     let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
 
                     let par2_for_repair = Arc::clone(&par2_set);
                     let repair_dir = working_dir.clone();
 
+                    let pp_pool = self.pp_pool.clone();
                     let repair_result = tokio::task::spawn_blocking(move || {
-                        let mut file_access =
-                            weaver_par2::DiskFileAccess::new(repair_dir, &par2_for_repair);
-                        let plan = weaver_par2::plan_repair(&par2_for_repair, &verification)
-                            .map_err(|e| format!("repair planning failed: {e}"))?;
-                        let slices = plan.missing_slices.len() as u32;
-                        weaver_par2::execute_repair(&plan, &par2_for_repair, &mut file_access)
-                            .map_err(|e| format!("repair execution failed: {e}"))?;
-                        Ok(slices)
+                        pp_pool.install(move || {
+                            let mut file_access =
+                                weaver_par2::DiskFileAccess::new(repair_dir, &par2_for_repair);
+                            let plan = weaver_par2::plan_repair(&par2_for_repair, &verification)
+                                .map_err(|e| format!("repair planning failed: {e}"))?;
+                            let slices = plan.missing_slices.len() as u32;
+                            weaver_par2::execute_repair(&plan, &par2_for_repair, &mut file_access)
+                                .map_err(|e| format!("repair execution failed: {e}"))?;
+                            Ok(slices)
+                        })
                     })
                     .await;
 
@@ -1464,11 +1486,11 @@ impl Pipeline {
                             if let Some(state) = self.jobs.get_mut(&job_id) {
                                 state.status = JobStatus::Downloading;
                             }
-                            if let Err(e) =
-                                self.db.set_active_job_status(job_id, "downloading", None)
-                            {
-                                error!(error = %e, "db write failed for downloading status");
-                            }
+                            self.db_fire_and_forget(move |db| {
+                                if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                                    tracing::error!(error = %e, "db write failed for downloading status");
+                                }
+                            });
 
                             self.try_partial_extraction(job_id).await;
                             return;
@@ -1575,9 +1597,11 @@ impl Pipeline {
                     let state = self.jobs.get_mut(&job_id).unwrap();
                     if state.status != JobStatus::Extracting {
                         state.status = JobStatus::Extracting;
-                        if let Err(e) = self.db.set_active_job_status(job_id, "extracting", None) {
-                            error!(error = %e, "db write failed for extracting status");
-                        }
+                        self.db_fire_and_forget(move |db| {
+                            if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
+                                tracing::error!(error = %e, "db write failed for extracting status");
+                            }
+                        });
                         self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
                         let _ = self
                             .event_tx
@@ -1804,8 +1828,9 @@ impl Pipeline {
         let db = self.db.clone();
         let output_dir = working_dir;
         let set_name_for_result = set_name_owned.clone();
+        let pp_pool = self.pp_pool.clone();
         tokio::task::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 if volume_paths.is_empty() {
                     return Err(format!("no on-disk RAR volumes for set '{set_name_owned}'"));
                 }
@@ -1879,7 +1904,7 @@ impl Pipeline {
                     extracted: extracted_members,
                     failed: failed_members,
                 })
-            })
+            }))
             .await;
 
             let result = match result {
@@ -1945,94 +1970,97 @@ impl Pipeline {
 
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
+        let pp_pool = self.pp_pool.clone();
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                if file_paths.is_empty() {
-                    return Err(format!("no 7z files found for set '{set_name_owned}'"));
-                }
-
-                let pw = if let Some(ref p) = password {
-                    sevenz_rust2::Password::new(p)
-                } else {
-                    sevenz_rust2::Password::empty()
-                };
-
-                let mut extracted_members = Vec::new();
-                let extracted_members_ref = &mut extracted_members;
-                let event_tx_ref = &event_tx;
-                let output_dir_ref = &output_dir;
-
-                let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
-                                  reader: &mut dyn std::io::Read,
-                                  _dest: &PathBuf|
-                 -> Result<bool, sevenz_rust2::Error> {
-                    if entry.is_directory() {
-                        let dir_path = output_dir_ref.join(entry.name());
-                        std::fs::create_dir_all(&dir_path)?;
-                        return Ok(true);
+                pp_pool.install(move || {
+                    if file_paths.is_empty() {
+                        return Err(format!("no 7z files found for set '{set_name_owned}'"));
                     }
 
-                    let out_path = output_dir_ref.join(entry.name());
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                    let pw = if let Some(ref p) = password {
+                        sevenz_rust2::Password::new(p)
+                    } else {
+                        sevenz_rust2::Password::empty()
+                    };
+
+                    let mut extracted_members = Vec::new();
+                    let extracted_members_ref = &mut extracted_members;
+                    let event_tx_ref = &event_tx;
+                    let output_dir_ref = &output_dir;
+
+                    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
+                                      reader: &mut dyn std::io::Read,
+                                      _dest: &PathBuf|
+                     -> Result<bool, sevenz_rust2::Error> {
+                        if entry.is_directory() {
+                            let dir_path = output_dir_ref.join(entry.name());
+                            std::fs::create_dir_all(&dir_path)?;
+                            return Ok(true);
+                        }
+
+                        let out_path = output_dir_ref.join(entry.name());
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
+                            job_id,
+                            set_name: set_name_owned.clone(),
+                            member: entry.name().to_string(),
+                        });
+
+                        let mut file = std::fs::File::create(&out_path)?;
+                        let bytes_written = std::io::copy(reader, &mut file)?;
+
+                        tracing::info!(
+                            job_id = job_id.0,
+                            member = entry.name(),
+                            bytes_written,
+                            total_bytes = entry.size(),
+                            "member extracted"
+                        );
+                        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
+                            job_id,
+                            member: entry.name().to_string(),
+                            bytes_written,
+                            total_bytes: entry.size(),
+                        });
+                        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
+                            job_id,
+                            set_name: set_name_owned.clone(),
+                            member: entry.name().to_string(),
+                        });
+
+                        extracted_members_ref.push(entry.name().to_string());
+                        Ok(true)
+                    };
+
+                    if file_paths.len() == 1 {
+                        let file = std::fs::File::open(&file_paths[0])
+                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
+                        sevenz_rust2::decompress_with_extract_fn_and_password(
+                            file,
+                            &output_dir,
+                            pw,
+                            extract_fn,
+                        )
+                        .map_err(|e| format!("7z extraction failed: {e}"))?;
+                    } else {
+                        let reader = weaver_core::split_reader::SplitFileReader::open(&file_paths)
+                            .map_err(|e| format!("failed to open 7z split files: {e}"))?;
+                        sevenz_rust2::decompress_with_extract_fn_and_password(
+                            reader,
+                            &output_dir,
+                            pw,
+                            extract_fn,
+                        )
+                        .map_err(|e| format!("7z extraction failed: {e}"))?;
                     }
-                    let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
-                        job_id,
-                        set_name: set_name_owned.clone(),
-                        member: entry.name().to_string(),
-                    });
 
-                    let mut file = std::fs::File::create(&out_path)?;
-                    let bytes_written = std::io::copy(reader, &mut file)?;
-
-                    tracing::info!(
-                        job_id = job_id.0,
-                        member = entry.name(),
-                        bytes_written,
-                        total_bytes = entry.size(),
-                        "member extracted"
-                    );
-                    let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-                        job_id,
-                        member: entry.name().to_string(),
-                        bytes_written,
-                        total_bytes: entry.size(),
-                    });
-                    let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
-                        job_id,
-                        set_name: set_name_owned.clone(),
-                        member: entry.name().to_string(),
-                    });
-
-                    extracted_members_ref.push(entry.name().to_string());
-                    Ok(true)
-                };
-
-                if file_paths.len() == 1 {
-                    let file = std::fs::File::open(&file_paths[0])
-                        .map_err(|e| format!("failed to open 7z file: {e}"))?;
-                    sevenz_rust2::decompress_with_extract_fn_and_password(
-                        file,
-                        &output_dir,
-                        pw,
-                        extract_fn,
-                    )
-                    .map_err(|e| format!("7z extraction failed: {e}"))?;
-                } else {
-                    let reader = weaver_core::split_reader::SplitFileReader::open(&file_paths)
-                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
-                    sevenz_rust2::decompress_with_extract_fn_and_password(
-                        reader,
-                        &output_dir,
-                        pw,
-                        extract_fn,
-                    )
-                    .map_err(|e| format!("7z extraction failed: {e}"))?;
-                }
-
-                Ok(FullSetExtractionOutcome {
-                    extracted: extracted_members,
-                    failed: Vec::new(),
+                    Ok(FullSetExtractionOutcome {
+                        extracted: extracted_members,
+                        failed: Vec::new(),
+                    })
                 })
             })
             .await;
@@ -2095,50 +2123,57 @@ impl Pipeline {
         let set_name_owned = set_name.to_string();
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
+        let pp_pool = self.pp_pool.clone();
 
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                if file_paths.is_empty() {
-                    return Err(format!("no files found for set '{set_name_owned}'"));
-                }
-
-                let extracted_members = match kind {
-                    SimpleArchiveKind::Zip => extract_zip(
-                        &file_paths[0],
-                        &output_dir,
-                        &event_tx,
-                        job_id,
-                        &set_name_owned,
-                    )?,
-                    SimpleArchiveKind::Tar => extract_tar(
-                        &file_paths[0],
-                        &output_dir,
-                        &event_tx,
-                        job_id,
-                        &set_name_owned,
-                    )?,
-                    SimpleArchiveKind::TarGz => extract_tar_gz(
-                        &file_paths[0],
-                        &output_dir,
-                        &event_tx,
-                        job_id,
-                        &set_name_owned,
-                    )?,
-                    SimpleArchiveKind::Gz => extract_gz(
-                        &file_paths[0],
-                        &output_dir,
-                        &event_tx,
-                        job_id,
-                        &set_name_owned,
-                    )?,
-                    SimpleArchiveKind::Split => {
-                        extract_split(&file_paths, &output_dir, &event_tx, job_id, &set_name_owned)?
+                pp_pool.install(move || {
+                    if file_paths.is_empty() {
+                        return Err(format!("no files found for set '{set_name_owned}'"));
                     }
-                };
 
-                Ok(FullSetExtractionOutcome {
-                    extracted: extracted_members,
-                    failed: Vec::new(),
+                    let extracted_members = match kind {
+                        SimpleArchiveKind::Zip => extract_zip(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Tar => extract_tar(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::TarGz => extract_tar_gz(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Gz => extract_gz(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Split => extract_split(
+                            &file_paths,
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                    };
+
+                    Ok(FullSetExtractionOutcome {
+                        extracted: extracted_members,
+                        failed: Vec::new(),
+                    })
                 })
             })
             .await;
@@ -2305,22 +2340,25 @@ impl Pipeline {
                 .get(&job_id)
                 .is_some_and(|deleted| deleted.contains(&filename));
             let par2_clean = claim_clean && !verification_blocked;
-            if let Err(error) = self.db.set_volume_status(
-                job_id,
-                set_name,
-                volume,
-                decision.ownership_eligible,
-                par2_clean,
-                deleted,
-            ) {
-                error!(
-                    job_id = job_id.0,
-                    set_name,
+            let set_name_owned = set_name.to_string();
+            let eligible = decision.ownership_eligible;
+            self.db_fire_and_forget(move |db| {
+                if let Err(error) = db.set_volume_status(
+                    job_id,
+                    &set_name_owned,
                     volume,
-                    error = %error,
-                    "failed to persist RAR volume eligibility"
-                );
-            }
+                    eligible,
+                    par2_clean,
+                    deleted,
+                ) {
+                    tracing::error!(
+                        job_id = job_id.0,
+                        volume,
+                        error = %error,
+                        "failed to persist RAR volume eligibility"
+                    );
+                }
+            });
         }
 
         info!(

@@ -268,6 +268,10 @@ pub struct Pipeline {
     pub(super) db: weaver_state::Database,
     /// Shared config for runtime category lookups (dest_dir overrides).
     pub(super) config: weaver_core::config::SharedConfig,
+    /// Dedicated low-priority rayon thread pool for post-processing
+    /// (extraction, PAR2 verify/repair). Niced on Unix so the OS scheduler
+    /// prefers download/decode threads when CPU is contended.
+    pub(super) pp_pool: Arc<rayon::ThreadPool>,
 }
 
 impl Pipeline {
@@ -315,6 +319,8 @@ impl Pipeline {
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         shared_state.set_paused(initial_global_paused);
+        let pp_pool =
+            weaver_core::threadpool::build_postprocess_pool(tuner.params().extract_thread_count);
         let mut bandwidth_cap = BandwidthCapRuntime::default();
         bandwidth_cap.set_policy(initial_bandwidth_policy);
 
@@ -369,9 +375,33 @@ impl Pipeline {
             shared_state,
             db,
             config,
+            pp_pool,
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
         Ok(pipeline)
+    }
+
+    /// Run a DB operation on the blocking pool and await its result.
+    /// Prevents SQLite Mutex contention from blocking the tokio async thread.
+    async fn db_blocking<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&weaver_state::Database) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || f(&db))
+            .await
+            .expect("db task panicked")
+    }
+
+    /// Fire-and-forget DB write on the blocking pool.
+    /// Used for non-critical writes (caches, UI metadata).
+    fn db_fire_and_forget<F>(&self, f: F)
+    where
+        F: FnOnce(&weaver_state::Database) + Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || f(&db));
     }
 
     /// Run the pipeline main loop until shutdown.
@@ -562,9 +592,11 @@ impl Pipeline {
                             .send(PipelineEvent::DownloadFinished { job_id });
                     }
                     let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
-                    if let Err(e) = self.db.set_active_job_status(job_id, "paused", None) {
-                        error!(error = %e, "db write failed for PauseJob");
-                    }
+                    self.db_fire_and_forget(move |db| {
+                        if let Err(e) = db.set_active_job_status(job_id, "paused", None) {
+                            error!(error = %e, "db write failed for PauseJob");
+                        }
+                    });
                 }
                 let _ = reply.send(result);
             }
@@ -572,9 +604,11 @@ impl Pipeline {
                 let result = self.set_job_status(job_id, JobStatus::Downloading);
                 if result.is_ok() {
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
-                    if let Err(e) = self.db.set_active_job_status(job_id, "downloading", None) {
-                        error!(error = %e, "db write failed for ResumeJob");
-                    }
+                    self.db_fire_and_forget(move |db| {
+                        if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                            error!(error = %e, "db write failed for ResumeJob");
+                        }
+                    });
                 }
                 let _ = reply.send(result);
             }
@@ -672,11 +706,13 @@ impl Pipeline {
                     if let Some(meta) = &metadata {
                         state.spec.metadata = meta.clone();
                     }
-                    let cat_ref = category.as_ref().map(|c| c.as_deref());
-                    let meta_ref = metadata.as_deref();
-                    if let Err(e) = self.db.update_active_job(job_id, cat_ref, meta_ref) {
-                        error!(error = %e, "db write failed for UpdateJob");
-                    }
+                    self.db_fire_and_forget(move |db| {
+                        let cat_ref = category.as_ref().map(|c| c.as_deref());
+                        let meta_ref = metadata.as_deref();
+                        if let Err(e) = db.update_active_job(job_id, cat_ref, meta_ref) {
+                            error!(error = %e, "db write failed for UpdateJob");
+                        }
+                    });
                     self.publish_snapshot();
                     Ok(())
                 } else {
@@ -689,7 +725,10 @@ impl Pipeline {
                 self.shared_state.set_paused(true);
                 self.shared_state
                     .set_download_block(self.bandwidth_cap.to_download_block_state(true));
-                if let Err(e) = self.db.set_setting("global_paused", "true") {
+                if let Err(e) = self
+                    .db_blocking(move |db| db.set_setting("global_paused", "true"))
+                    .await
+                {
                     error!(error = %e, "db write failed for PauseAll");
                 }
                 let _ = self.event_tx.send(PipelineEvent::GlobalPaused);
@@ -699,7 +738,10 @@ impl Pipeline {
                 self.global_paused = false;
                 self.shared_state.set_paused(false);
                 let _ = self.refresh_bandwidth_cap_window();
-                if let Err(e) = self.db.set_setting("global_paused", "false") {
+                if let Err(e) = self
+                    .db_blocking(move |db| db.set_setting("global_paused", "false"))
+                    .await
+                {
                     error!(error = %e, "db write failed for ResumeAll");
                 }
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
@@ -1091,18 +1133,24 @@ pub(super) async fn write_segment_to_disk(
     offset: u64,
     data: &[u8],
 ) -> Result<(), std::io::Error> {
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .await?;
-
-    file.seek(std::io::SeekFrom::Start(offset)).await?;
-    file.write_all(data).await?;
-    Ok(())
+    // Use std::fs in a single spawn_blocking call instead of tokio::fs which
+    // internally spawns 3 separate blocking tasks (open, seek, write).
+    // Under high throughput this reduces blocking pool pressure by ~66%.
+    let path = path.to_owned();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(&data)?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<BufferPool>) -> usize {
@@ -1234,14 +1282,17 @@ impl Pipeline {
             .entry(job_id)
             .or_default()
             .insert(member_name.to_string());
-        if let Err(error) = self.db.add_failed_extraction(job_id, member_name) {
-            error!(
-                job_id = job_id.0,
-                member = %member_name,
-                error = %error,
-                "failed to persist failed extraction member"
-            );
-        }
+        let member_owned = member_name.to_string();
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.add_failed_extraction(job_id, &member_owned) {
+                error!(
+                    job_id = job_id.0,
+                    member = %member_owned,
+                    error = %error,
+                    "failed to persist failed extraction member"
+                );
+            }
+        });
     }
 
     pub(super) fn replace_failed_extraction_members(
@@ -1254,13 +1305,16 @@ impl Pipeline {
         } else {
             self.failed_extractions.insert(job_id, members.clone());
         }
-        if let Err(error) = self.db.replace_failed_extractions(job_id, &members) {
-            error!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to persist failed extraction member set"
-            );
-        }
+        let members_clone = members.clone();
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.replace_failed_extractions(job_id, &members_clone) {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to persist failed extraction member set"
+                );
+            }
+        });
     }
 
     pub(super) fn set_normalization_retried_state(
@@ -3318,6 +3372,8 @@ mod tests {
         assert!(!working_dir.join("show.part02.rar").exists());
         assert!(working_dir.join("show.part03.rar").exists());
         assert!(working_dir.join("show.part04.rar").exists());
+        // Yield to let fire-and-forget db writes complete.
+        tokio::task::yield_now().await;
         let deleted_rows = pipeline.db.load_deleted_volume_statuses(job_id).unwrap();
         assert_eq!(
             deleted_rows,

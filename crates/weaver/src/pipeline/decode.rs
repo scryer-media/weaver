@@ -438,11 +438,17 @@ impl Pipeline {
                         });
                     }
 
-                    if let Err(e) =
-                        self.db
-                            .complete_file(job_id, file_id.file_index, filename, &[0u8; 16])
                     {
-                        error!(error = %e, "db write failed for complete_file");
+                        let file_index = file_id.file_index;
+                        let fname = filename.to_string();
+                        if let Err(e) = self
+                            .db_blocking(move |db| {
+                                db.complete_file(job_id, file_index, &fname, &[0u8; 16])
+                            })
+                            .await
+                        {
+                            error!(error = %e, "db write failed for complete_file");
+                        }
                     }
 
                     self.try_load_par2_metadata(job_id, file_id).await;

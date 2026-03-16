@@ -35,7 +35,8 @@ axum = { workspace = true, features = ["multipart"] }
 tower-http = { workspace = true }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
-libc = "0.2"
+libc = { workspace = true }
+rayon = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 sha2 = { workspace = true }

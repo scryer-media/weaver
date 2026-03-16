@@ -149,11 +149,19 @@ impl Database {
             let decode_threads = settings
                 .get("tuner.decode_thread_count")
                 .and_then(|v| v.parse().ok());
-            if max_dl.is_some() || max_dq.is_some() || decode_threads.is_some() {
+            let extract_threads = settings
+                .get("tuner.extract_thread_count")
+                .and_then(|v| v.parse().ok());
+            if max_dl.is_some()
+                || max_dq.is_some()
+                || decode_threads.is_some()
+                || extract_threads.is_some()
+            {
                 Some(TunerOverrides {
                     max_concurrent_downloads: max_dl,
                     max_decode_queue: max_dq,
                     decode_thread_count: decode_threads,
+                    extract_thread_count: extract_threads,
                 })
             } else {
                 None
