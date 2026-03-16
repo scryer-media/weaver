@@ -422,53 +422,66 @@ impl Pipeline {
         let (req_tx, mut req_rx) = mpsc::channel::<WriteRequest>(64);
         let (complete_tx, complete_rx) = mpsc::channel::<WriteComplete>(64);
 
-        tokio::spawn(async move {
-            while let Some(req) = req_rx.recv().await {
-                let tx = complete_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    use std::io::{Seek, Write};
-                    let t = std::time::Instant::now();
-                    let mut total_bytes = 0usize;
-                    let seg_count = req.segments.len();
-                    let mut written = Vec::with_capacity(seg_count);
+        // Single dedicated blocking thread with file handle cache.
+        // On NFS/network filesystems, open() is expensive (~1.8s round-trip).
+        // Keeping handles open avoids this per-segment penalty.
+        tokio::task::spawn_blocking(move || {
+            use std::collections::HashMap;
+            use std::io::{Seek, Write};
 
-                    let result: Result<(), std::io::Error> = (|| {
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .truncate(false)
-                            .write(true)
-                            .open(&req.file_path)?;
-                        for (offset, data, _info) in &req.segments {
-                            file.seek(std::io::SeekFrom::Start(*offset))?;
-                            file.write_all(data)?;
-                            total_bytes += data.len();
+            let mut file_cache: HashMap<PathBuf, std::fs::File> = HashMap::new();
+
+            while let Some(req) = req_rx.blocking_recv() {
+                let t = std::time::Instant::now();
+                let mut total_bytes = 0usize;
+                let seg_count = req.segments.len();
+                let mut written = Vec::with_capacity(seg_count);
+
+                let result: Result<(), std::io::Error> = (|| {
+                    let file = match file_cache.get_mut(&req.file_path) {
+                        Some(f) => f,
+                        None => {
+                            let f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .truncate(false)
+                                .write(true)
+                                .open(&req.file_path)?;
+                            file_cache.entry(req.file_path.clone()).or_insert(f)
                         }
-                        Ok(())
-                    })();
-
-                    let error = result.err().map(|e| e.to_string());
-                    // Return commit info for all segments (even on error — partial writes
-                    // are tracked by the pipeline for crash recovery).
-                    for (offset, _data, info) in req.segments {
-                        written.push((offset, info));
+                    };
+                    for (offset, data, _info) in &req.segments {
+                        file.seek(std::io::SeekFrom::Start(*offset))?;
+                        file.write_all(data)?;
+                        total_bytes += data.len();
                     }
+                    Ok(())
+                })();
 
-                    let latency = t.elapsed().as_micros() as u64;
-                    if latency > 1_000_000 {
-                        tracing::warn!(
-                            ms = latency / 1000,
-                            count = seg_count,
-                            "slow disk write batch"
-                        );
-                    }
-                    let _ = tx.blocking_send(WriteComplete {
-                        file_id: req.file_id,
-                        written,
-                        bytes_written: total_bytes,
-                        segments_written: seg_count,
-                        write_latency_us: latency,
-                        error,
-                    });
+                if result.is_err() {
+                    // Remove cached handle on error (file may have been deleted/moved).
+                    file_cache.remove(&req.file_path);
+                }
+
+                let error = result.err().map(|e| e.to_string());
+                for (offset, _data, info) in req.segments {
+                    written.push((offset, info));
+                }
+
+                let latency = t.elapsed().as_micros() as u64;
+                if latency > 1_000_000 {
+                    tracing::warn!(
+                        ms = latency / 1000,
+                        count = seg_count,
+                        "slow disk write batch"
+                    );
+                }
+                let _ = complete_tx.blocking_send(WriteComplete {
+                    file_id: req.file_id,
+                    written,
+                    bytes_written: total_bytes,
+                    segments_written: seg_count,
+                    write_latency_us: latency,
+                    error,
                 });
             }
         });
