@@ -1856,16 +1856,13 @@ mod tests {
     /// are committed before asserting on pipeline state.
     async fn drain_write_completions(pipeline: &mut Pipeline) {
         use tokio::time::{Duration, timeout};
-        loop {
-            match timeout(
-                Duration::from_millis(500),
-                pipeline.write_complete_rx.recv(),
-            )
-            .await
-            {
-                Ok(Some(complete)) => pipeline.handle_write_complete(complete).await,
-                _ => break,
-            }
+        while let Ok(Some(complete)) = timeout(
+            Duration::from_millis(500),
+            pipeline.write_complete_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_write_complete(complete).await;
         }
     }
 
