@@ -177,6 +177,13 @@ impl Pipeline {
     /// lower-priority work.
     pub(super) fn dispatch_downloads(&mut self) {
         if self.global_paused || self.rate_limiter.should_wait() {
+            if self.active_downloads == 0 {
+                debug!(
+                    global_paused = self.global_paused,
+                    rate_wait = self.rate_limiter.should_wait(),
+                    "dispatch blocked: paused/rate"
+                );
+            }
             return;
         }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
@@ -185,6 +192,9 @@ impl Pipeline {
         }
         if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
             self.update_queue_metrics();
+            if self.active_downloads == 0 {
+                debug!("dispatch blocked: bandwidth cap exhausted");
+            }
             return;
         }
 
@@ -192,6 +202,13 @@ impl Pipeline {
         let decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed);
         if decode_pending >= params.max_decode_queue {
             self.update_queue_metrics();
+            if self.active_downloads == 0 {
+                debug!(
+                    decode_pending,
+                    max = params.max_decode_queue,
+                    "dispatch blocked: decode backpressure"
+                );
+            }
             return;
         }
 
@@ -221,6 +238,21 @@ impl Pipeline {
             .copied()
             .take(if cap_tight { 1 } else { usize::MAX })
             .collect();
+
+        if eligible.is_empty() && self.active_downloads == 0 {
+            for (i, jid) in self.job_order.iter().enumerate() {
+                if let Some(s) = self.jobs.get(jid) {
+                    warn!(
+                        job_id = jid.0,
+                        idx = i,
+                        status = ?s.status,
+                        queue_len = s.download_queue.len(),
+                        recovery_len = s.recovery_queue.len(),
+                        "dispatch stall: job not eligible"
+                    );
+                }
+            }
+        }
 
         for job_id in eligible {
             if self.active_downloads >= max || self.rate_limiter.should_wait() {
