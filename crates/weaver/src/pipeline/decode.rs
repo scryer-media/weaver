@@ -181,11 +181,11 @@ impl Pipeline {
             })
             .collect();
 
-        let _ = self.write_req_tx.send(WriteRequest {
+        let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
             file_id,
             file_path,
             segments,
-        });
+        }));
     }
 
     fn enforce_file_write_backlog(&mut self, file_id: NzbFileId) {
@@ -262,11 +262,11 @@ impl Pipeline {
             crc32: segment.crc32,
             yenc_name: segment.yenc_name,
         };
-        let _ = self.write_req_tx.send(WriteRequest {
+        let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
             file_id,
             file_path,
             segments: vec![(offset, segment.data.into_boxed_bytes(), ci)],
-        });
+        }));
     }
 
     fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {
@@ -295,33 +295,61 @@ impl Pipeline {
 
     /// Handle completed disk writes from the background writer task.
     pub(super) async fn handle_write_complete(&mut self, complete: WriteComplete) {
-        self.release_write_buffered(complete.bytes_written, complete.segments_written);
-        self.metrics
-            .disk_write_latency_us
-            .store(complete.write_latency_us, Ordering::Relaxed);
-
-        if let Some(error) = &complete.error {
-            warn!(
-                file_id = %complete.file_id,
+        match complete {
+            WriteComplete::Barrier { id } => {
+                // All writes submitted before this barrier are durable.
+                // Recompute RAR state (now that all segment writes are on disk)
+                // then make irreversible deletion decisions.
+                if let Some(pending) = self.pending_delete_barriers.remove(&id) {
+                    for (job_id, set_name) in pending {
+                        if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                error,
+                                "failed to recompute RAR state after write barrier"
+                            );
+                        }
+                        self.try_delete_volumes(job_id, &set_name);
+                    }
+                }
+            }
+            WriteComplete::Segments {
+                file_id,
+                written,
+                bytes_written,
+                segments_written,
+                write_latency_us,
                 error,
-                "background disk write failed"
-            );
-            return;
+            } => {
+                self.release_write_buffered(bytes_written, segments_written);
+                self.metrics
+                    .disk_write_latency_us
+                    .store(write_latency_us, Ordering::Relaxed);
+
+                if let Some(ref error) = error {
+                    warn!(
+                        file_id = %file_id,
+                        error,
+                        "background disk write failed"
+                    );
+                    return;
+                }
+
+                let Some((_job_id, filename, working_dir, _file_path)) =
+                    self.write_target_for_file(file_id)
+                else {
+                    return;
+                };
+
+                for (offset, info) in written {
+                    self.commit_persisted_segment(offset, info, &filename, &working_dir)
+                        .await;
+                }
+
+                self.remove_empty_write_buffer(file_id);
+            }
         }
-
-        // Look up the filename and working_dir for this file.
-        let Some((_job_id, filename, working_dir, _file_path)) =
-            self.write_target_for_file(complete.file_id)
-        else {
-            return;
-        };
-
-        for (offset, info) in complete.written {
-            self.commit_persisted_segment(offset, info, &filename, &working_dir)
-                .await;
-        }
-
-        self.remove_empty_write_buffer(complete.file_id);
     }
 
     async fn commit_persisted_segment(
@@ -401,11 +429,11 @@ impl Pipeline {
                                     (offset, seg.data.into_boxed_bytes(), ci)
                                 })
                                 .collect();
-                            let _ = self.write_req_tx.send(WriteRequest {
+                            let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
                                 file_id,
                                 file_path,
                                 segments,
-                            });
+                            }));
                         }
                     }
 

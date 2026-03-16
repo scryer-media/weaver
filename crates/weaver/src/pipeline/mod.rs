@@ -78,7 +78,16 @@ pub(super) struct SegmentCommitInfo {
     pub(super) yenc_name: String,
 }
 
-/// Request to write decoded segments to disk (sent to background writer task).
+/// Message sent to the background writer task.
+pub(super) enum WriteMessage {
+    /// Write decoded segments to disk.
+    Segments(WriteRequest),
+    /// Barrier: writer echoes this back after all prior writes are durable.
+    /// Used to synchronize before irreversible operations (eager volume delete).
+    Barrier { id: u64 },
+}
+
+/// Request to write decoded segments to disk.
 pub(super) struct WriteRequest {
     pub(super) file_id: NzbFileId,
     pub(super) file_path: PathBuf,
@@ -87,14 +96,18 @@ pub(super) struct WriteRequest {
 }
 
 /// Acknowledgment from the background writer task.
-pub(super) struct WriteComplete {
-    pub(super) file_id: NzbFileId,
-    /// Segments successfully written (offset, commit_info) in order.
-    pub(super) written: Vec<(u64, SegmentCommitInfo)>,
-    pub(super) bytes_written: usize,
-    pub(super) segments_written: usize,
-    pub(super) write_latency_us: u64,
-    pub(super) error: Option<String>,
+pub(super) enum WriteComplete {
+    /// Segments written to disk.
+    Segments {
+        file_id: NzbFileId,
+        written: Vec<(u64, SegmentCommitInfo)>,
+        bytes_written: usize,
+        segments_written: usize,
+        write_latency_us: u64,
+        error: Option<String>,
+    },
+    /// Barrier acknowledgment: all writes submitted before this barrier are durable.
+    Barrier { id: u64 },
 }
 
 /// Result of a background extraction task.
@@ -243,9 +256,14 @@ pub struct Pipeline {
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
     /// Channel to send write requests to the background writer task.
-    pub(super) write_req_tx: mpsc::UnboundedSender<WriteRequest>,
+    pub(super) write_req_tx: mpsc::UnboundedSender<WriteMessage>,
+    /// Monotonic counter for barrier IDs.
+    pub(super) next_barrier_id: u64,
+    /// Pending eager-delete evaluations waiting on a write barrier.
+    /// Maps barrier_id → (job_id, set_name).
+    pub(super) pending_delete_barriers: HashMap<u64, Vec<(JobId, String)>>,
     /// Channel to receive write completions from the background writer task.
-    pub(super) write_complete_rx: mpsc::Receiver<WriteComplete>,
+    pub(super) write_complete_rx: mpsc::UnboundedReceiver<WriteComplete>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// ISP bandwidth cap runtime state.
@@ -387,6 +405,8 @@ impl Pipeline {
             extract_done_rx,
             write_req_tx,
             write_complete_rx,
+            next_barrier_id: 0,
+            pending_delete_barriers: HashMap::new(),
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
@@ -419,76 +439,77 @@ impl Pipeline {
     /// Spawn the background writer task. Returns the request sender and
     /// completion receiver for the pipeline to use.
     fn spawn_writer_task() -> (
-        mpsc::UnboundedSender<WriteRequest>,
-        mpsc::Receiver<WriteComplete>,
+        mpsc::UnboundedSender<WriteMessage>,
+        mpsc::UnboundedReceiver<WriteComplete>,
     ) {
-        // Unbounded channel: backpressure is handled by write_buffered_bytes /
-        // write_backlog_budget_bytes in the pipeline. A bounded channel here
-        // would silently drop segments on NFS where writes are slow.
-        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WriteRequest>();
-        let (complete_tx, complete_rx) = mpsc::channel::<WriteComplete>(256);
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WriteMessage>();
+        let (complete_tx, complete_rx) = mpsc::unbounded_channel::<WriteComplete>();
 
         // Single dedicated blocking thread with file handle cache.
-        // On NFS/network filesystems, open() is expensive (~1.8s round-trip).
-        // Keeping handles open avoids this per-segment penalty.
         tokio::task::spawn_blocking(move || {
             use std::collections::HashMap;
             use std::io::{Seek, Write};
 
             let mut file_cache: HashMap<PathBuf, std::fs::File> = HashMap::new();
 
-            while let Some(req) = req_rx.blocking_recv() {
-                let t = std::time::Instant::now();
-                let mut total_bytes = 0usize;
-                let seg_count = req.segments.len();
-                let mut written = Vec::with_capacity(seg_count);
-
-                let result: Result<(), std::io::Error> = (|| {
-                    let file = match file_cache.get_mut(&req.file_path) {
-                        Some(f) => f,
-                        None => {
-                            let f = std::fs::OpenOptions::new()
-                                .create(true)
-                                .truncate(false)
-                                .write(true)
-                                .open(&req.file_path)?;
-                            file_cache.entry(req.file_path.clone()).or_insert(f)
-                        }
-                    };
-                    for (offset, data, _info) in &req.segments {
-                        file.seek(std::io::SeekFrom::Start(*offset))?;
-                        file.write_all(data)?;
-                        total_bytes += data.len();
+            while let Some(msg) = req_rx.blocking_recv() {
+                match msg {
+                    WriteMessage::Barrier { id } => {
+                        let _ = complete_tx.send(WriteComplete::Barrier { id });
                     }
-                    Ok(())
-                })();
+                    WriteMessage::Segments(req) => {
+                        let t = std::time::Instant::now();
+                        let mut total_bytes = 0usize;
+                        let seg_count = req.segments.len();
+                        let mut written = Vec::with_capacity(seg_count);
 
-                if result.is_err() {
-                    // Remove cached handle on error (file may have been deleted/moved).
-                    file_cache.remove(&req.file_path);
-                }
+                        let result: Result<(), std::io::Error> = (|| {
+                            let file = match file_cache.get_mut(&req.file_path) {
+                                Some(f) => f,
+                                None => {
+                                    let f = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .truncate(false)
+                                        .write(true)
+                                        .open(&req.file_path)?;
+                                    file_cache.entry(req.file_path.clone()).or_insert(f)
+                                }
+                            };
+                            for (offset, data, _info) in &req.segments {
+                                file.seek(std::io::SeekFrom::Start(*offset))?;
+                                file.write_all(data)?;
+                                total_bytes += data.len();
+                            }
+                            Ok(())
+                        })();
 
-                let error = result.err().map(|e| e.to_string());
-                for (offset, _data, info) in req.segments {
-                    written.push((offset, info));
-                }
+                        if result.is_err() {
+                            file_cache.remove(&req.file_path);
+                        }
 
-                let latency = t.elapsed().as_micros() as u64;
-                if latency > 1_000_000 {
-                    tracing::warn!(
-                        ms = latency / 1000,
-                        count = seg_count,
-                        "slow disk write batch"
-                    );
+                        let error = result.err().map(|e| e.to_string());
+                        for (offset, _data, info) in req.segments {
+                            written.push((offset, info));
+                        }
+
+                        let latency = t.elapsed().as_micros() as u64;
+                        if latency > 1_000_000 {
+                            tracing::warn!(
+                                ms = latency / 1000,
+                                count = seg_count,
+                                "slow disk write batch"
+                            );
+                        }
+                        let _ = complete_tx.send(WriteComplete::Segments {
+                            file_id: req.file_id,
+                            written,
+                            bytes_written: total_bytes,
+                            segments_written: seg_count,
+                            write_latency_us: latency,
+                            error,
+                        });
+                    }
                 }
-                let _ = complete_tx.blocking_send(WriteComplete {
-                    file_id: req.file_id,
-                    written,
-                    bytes_written: total_bytes,
-                    segments_written: seg_count,
-                    write_latency_us: latency,
-                    error,
-                });
             }
         });
 
@@ -512,6 +533,20 @@ impl Pipeline {
             warn!(ms, "db_blocking took too long (blocking pool saturation?)");
         }
         result
+    }
+
+    /// Submit a write barrier and defer eager volume deletion until all
+    /// prior writes are durable. The writer task processes the barrier FIFO,
+    /// so when the barrier completion arrives, every write submitted before
+    /// it is guaranteed to be on disk.
+    pub(super) fn submit_delete_barrier(&mut self, job_id: JobId, set_name: &str) {
+        let id = self.next_barrier_id;
+        self.next_barrier_id += 1;
+        self.pending_delete_barriers
+            .entry(id)
+            .or_default()
+            .push((job_id, set_name.to_string()));
+        let _ = self.write_req_tx.send(WriteMessage::Barrier { id });
     }
 
     /// Fire-and-forget DB write on the blocking pool.
@@ -1875,11 +1910,8 @@ mod tests {
     /// are committed before asserting on pipeline state.
     async fn drain_write_completions(pipeline: &mut Pipeline) {
         use tokio::time::{Duration, timeout};
-        while let Ok(Some(complete)) = timeout(
-            Duration::from_millis(500),
-            pipeline.write_complete_rx.recv(),
-        )
-        .await
+        while let Ok(Some(complete)) =
+            timeout(Duration::from_secs(2), pipeline.write_complete_rx.recv()).await
         {
             pipeline.handle_write_complete(complete).await;
         }
@@ -4113,12 +4145,14 @@ mod tests {
             _ => panic!("expected batch extraction completion"),
         }
         pipeline.handle_extraction_done(first_done).await;
+        drain_write_completions(&mut pipeline).await;
 
         assert!(!working_dir.join("show.part01.rar").exists());
         assert!(!working_dir.join("show.part02.rar").exists());
 
         write_and_complete_rar_volume(&mut pipeline, job_id, 2, &files[2].0, &files[2].1).await;
         write_and_complete_rar_volume(&mut pipeline, job_id, 3, &files[3].0, &files[3].1).await;
+        drain_write_completions(&mut pipeline).await;
         pipeline.try_partial_extraction(job_id).await;
 
         let second_done = next_extraction_done(&mut pipeline).await;
@@ -4140,6 +4174,7 @@ mod tests {
             _ => panic!("expected batch extraction completion"),
         }
         pipeline.handle_extraction_done(second_done).await;
+        drain_write_completions(&mut pipeline).await;
 
         assert!(matches!(
             job_status_for_assert(&pipeline, job_id),
