@@ -69,47 +69,6 @@ pub(super) struct ProbeUpdate {
     pub(super) done: bool,
 }
 
-/// Metadata for a segment that has been written to disk, needed by
-/// `commit_persisted_segment` to update assembly state.
-pub(super) struct SegmentCommitInfo {
-    pub(super) segment_id: SegmentId,
-    pub(super) decoded_size: u32,
-    pub(super) crc32: u32,
-    pub(super) yenc_name: String,
-}
-
-/// Message sent to the background writer task.
-pub(super) enum WriteMessage {
-    /// Write decoded segments to disk.
-    Segments(WriteRequest),
-    /// Barrier: writer echoes this back after all prior writes are durable.
-    /// Used to synchronize before irreversible operations (eager volume delete).
-    Barrier { id: u64 },
-}
-
-/// Request to write decoded segments to disk.
-pub(super) struct WriteRequest {
-    pub(super) file_id: NzbFileId,
-    pub(super) file_path: PathBuf,
-    /// (file_offset, raw_data, commit_info)
-    pub(super) segments: Vec<(u64, Box<[u8]>, SegmentCommitInfo)>,
-}
-
-/// Acknowledgment from the background writer task.
-pub(super) enum WriteComplete {
-    /// Segments written to disk.
-    Segments {
-        file_id: NzbFileId,
-        written: Vec<(u64, SegmentCommitInfo)>,
-        bytes_written: usize,
-        segments_written: usize,
-        write_latency_us: u64,
-        error: Option<String>,
-    },
-    /// Barrier acknowledgment: all writes submitted before this barrier are durable.
-    Barrier { id: u64 },
-}
-
 /// Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
@@ -175,8 +134,8 @@ pub(super) enum DecodeDone {
 pub(super) struct DecodedChunk(Box<[u8]>);
 
 impl DecodedChunk {
-    pub(super) fn into_boxed_bytes(self) -> Box<[u8]> {
-        self.0
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 
     pub(super) fn len_bytes(&self) -> usize {
@@ -255,15 +214,6 @@ pub struct Pipeline {
     /// Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
-    /// Channel to send write requests to the background writer task.
-    pub(super) write_req_tx: mpsc::UnboundedSender<WriteMessage>,
-    /// Monotonic counter for barrier IDs.
-    pub(super) next_barrier_id: u64,
-    /// Pending eager-delete evaluations waiting on a write barrier.
-    /// Maps barrier_id → (job_id, set_name).
-    pub(super) pending_delete_barriers: HashMap<u64, Vec<(JobId, String)>>,
-    /// Channel to receive write completions from the background writer task.
-    pub(super) write_complete_rx: mpsc::UnboundedReceiver<WriteComplete>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// ISP bandwidth cap runtime state.
@@ -368,7 +318,6 @@ impl Pipeline {
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
-        let (write_req_tx, write_complete_rx) = Self::spawn_writer_task();
         shared_state.set_paused(initial_global_paused);
         let pp_pool =
             weaver_core::threadpool::build_postprocess_pool(tuner.params().extract_thread_count);
@@ -403,10 +352,6 @@ impl Pipeline {
             probe_result_rx,
             extract_done_tx,
             extract_done_rx,
-            write_req_tx,
-            write_complete_rx,
-            next_barrier_id: 0,
-            pending_delete_barriers: HashMap::new(),
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
@@ -436,86 +381,6 @@ impl Pipeline {
         Ok(pipeline)
     }
 
-    /// Spawn the background writer task. Returns the request sender and
-    /// completion receiver for the pipeline to use.
-    fn spawn_writer_task() -> (
-        mpsc::UnboundedSender<WriteMessage>,
-        mpsc::UnboundedReceiver<WriteComplete>,
-    ) {
-        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WriteMessage>();
-        let (complete_tx, complete_rx) = mpsc::unbounded_channel::<WriteComplete>();
-
-        // Single dedicated blocking thread with file handle cache.
-        tokio::task::spawn_blocking(move || {
-            use std::collections::HashMap;
-            use std::io::{Seek, Write};
-
-            let mut file_cache: HashMap<PathBuf, std::fs::File> = HashMap::new();
-
-            while let Some(msg) = req_rx.blocking_recv() {
-                match msg {
-                    WriteMessage::Barrier { id } => {
-                        let _ = complete_tx.send(WriteComplete::Barrier { id });
-                    }
-                    WriteMessage::Segments(req) => {
-                        let t = std::time::Instant::now();
-                        let mut total_bytes = 0usize;
-                        let seg_count = req.segments.len();
-                        let mut written = Vec::with_capacity(seg_count);
-
-                        let result: Result<(), std::io::Error> = (|| {
-                            let file = match file_cache.get_mut(&req.file_path) {
-                                Some(f) => f,
-                                None => {
-                                    let f = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .truncate(false)
-                                        .write(true)
-                                        .open(&req.file_path)?;
-                                    file_cache.entry(req.file_path.clone()).or_insert(f)
-                                }
-                            };
-                            for (offset, data, _info) in &req.segments {
-                                file.seek(std::io::SeekFrom::Start(*offset))?;
-                                file.write_all(data)?;
-                                total_bytes += data.len();
-                            }
-                            Ok(())
-                        })();
-
-                        if result.is_err() {
-                            file_cache.remove(&req.file_path);
-                        }
-
-                        let error = result.err().map(|e| e.to_string());
-                        for (offset, _data, info) in req.segments {
-                            written.push((offset, info));
-                        }
-
-                        let latency = t.elapsed().as_micros() as u64;
-                        if latency > 1_000_000 {
-                            tracing::warn!(
-                                ms = latency / 1000,
-                                count = seg_count,
-                                "slow disk write batch"
-                            );
-                        }
-                        let _ = complete_tx.send(WriteComplete::Segments {
-                            file_id: req.file_id,
-                            written,
-                            bytes_written: total_bytes,
-                            segments_written: seg_count,
-                            write_latency_us: latency,
-                            error,
-                        });
-                    }
-                }
-            }
-        });
-
-        (req_tx, complete_rx)
-    }
-
     /// Run a DB operation on the blocking pool and await its result.
     /// Prevents SQLite Mutex contention from blocking the tokio async thread.
     async fn db_blocking<F, R>(&self, f: F) -> R
@@ -524,29 +389,9 @@ impl Pipeline {
         R: Send + 'static,
     {
         let db = self.db.clone();
-        let t = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || f(&db))
+        tokio::task::spawn_blocking(move || f(&db))
             .await
-            .expect("db task panicked");
-        let ms = t.elapsed().as_millis();
-        if ms > 500 {
-            warn!(ms, "db_blocking took too long (blocking pool saturation?)");
-        }
-        result
-    }
-
-    /// Submit a write barrier and defer eager volume deletion until all
-    /// prior writes are durable. The writer task processes the barrier FIFO,
-    /// so when the barrier completion arrives, every write submitted before
-    /// it is guaranteed to be on disk.
-    pub(super) fn submit_delete_barrier(&mut self, job_id: JobId, set_name: &str) {
-        let id = self.next_barrier_id;
-        self.next_barrier_id += 1;
-        self.pending_delete_barriers
-            .entry(id)
-            .or_default()
-            .push((job_id, set_name.to_string()));
-        let _ = self.write_req_tx.send(WriteMessage::Barrier { id });
+            .expect("db task panicked")
     }
 
     /// Fire-and-forget DB write on the blocking pool.
@@ -598,29 +443,18 @@ impl Pipeline {
                             info!("pipeline shutting down");
                             break;
                         }
-                        Some(cmd) => {
-                            let t = std::time::Instant::now();
-                            self.handle_command(cmd).await;
-                            let ms = t.elapsed().as_millis();
-                            if ms > 100 { warn!(ms, "slow handler: command"); }
-                        }
+                        Some(cmd) => self.handle_command(cmd).await,
                     }
                 }
 
                 // Download stage completed.
                 Some(result) = self.download_done_rx.recv() => {
-                    let t = std::time::Instant::now();
                     self.handle_download_done(result).await;
-                    let ms = t.elapsed().as_millis();
-                    if ms > 100 { warn!(ms, "slow handler: download_done"); }
                 }
 
                 // Decode stage completed.
                 Some(result) = self.decode_done_rx.recv() => {
-                    let t = std::time::Instant::now();
                     self.handle_decode_done(result).await;
-                    let ms = t.elapsed().as_millis();
-                    if ms > 500 { warn!(ms, "slow handler: decode_done"); }
                 }
 
                 // Health probe completed — check if job should be failed.
@@ -630,15 +464,7 @@ impl Pipeline {
 
                 // Background extraction completed.
                 Some(done) = self.extract_done_rx.recv() => {
-                    let t = std::time::Instant::now();
                     self.handle_extraction_done(done).await;
-                    let ms = t.elapsed().as_millis();
-                    if ms > 100 { warn!(ms, "slow handler: extraction_done"); }
-                }
-
-                // Background disk write completed.
-                Some(complete) = self.write_complete_rx.recv() => {
-                    self.handle_write_complete(complete).await;
                 }
 
                 // Delayed retries arriving after backoff sleep.
@@ -658,7 +484,7 @@ impl Pipeline {
 
                 // Periodic tuning.
                 _ = tune_interval.tick() => {
-                    self.flush_quiescent_write_backlog();
+                    self.flush_quiescent_write_backlog().await;
 
                     let snapshot = self.metrics.snapshot();
                     let not_found = snapshot.articles_not_found;
@@ -1301,6 +1127,32 @@ impl Pipeline {
     }
 }
 
+/// Write decoded segment data to the correct offset in the output file.
+pub(super) async fn write_segment_to_disk(
+    path: &std::path::Path,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), std::io::Error> {
+    // Use std::fs in a single spawn_blocking call instead of tokio::fs which
+    // internally spawns 3 separate blocking tasks (open, seek, write).
+    // Under high throughput this reduces blocking pool pressure by ~66%.
+    let path = path.to_owned();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(&data)?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<BufferPool>) -> usize {
     use weaver_core::buffer::BufferTier;
     use weaver_core::system::StorageClass;
@@ -1903,18 +1755,6 @@ mod tests {
             0,
         )
         .await
-    }
-
-    /// Drain all pending write completions from the background writer.
-    /// Tests call this after sending decode results to ensure segments
-    /// are committed before asserting on pipeline state.
-    async fn drain_write_completions(pipeline: &mut Pipeline) {
-        use tokio::time::{Duration, timeout};
-        while let Ok(Some(complete)) =
-            timeout(Duration::from_secs(2), pipeline.write_complete_rx.recv()).await
-        {
-            pipeline.handle_write_complete(complete).await;
-        }
     }
 
     fn encode_article_part(
@@ -2745,7 +2585,6 @@ mod tests {
         }
 
         drain_decode_results(&mut pipeline, 2).await;
-        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
         assert_eq!(
@@ -2788,7 +2627,6 @@ mod tests {
             })
             .await;
         drain_decode_results(&mut pipeline, 1).await;
-        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
         assert_eq!(pipeline.write_buffered_bytes, 0);
@@ -2875,7 +2713,6 @@ mod tests {
         }
 
         drain_decode_results(&mut pipeline, segment_count as usize).await;
-        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.write_buffered_bytes, 0);
         assert_eq!(pipeline.write_buffered_segments, 0);
@@ -3424,8 +3261,7 @@ mod tests {
         state.download_queue = DownloadQueue::new();
         assert_eq!(state.recovery_queue.len(), 1);
 
-        pipeline.flush_quiescent_write_backlog();
-        drain_write_completions(&mut pipeline).await;
+        pipeline.flush_quiescent_write_backlog().await;
 
         assert_eq!(pipeline.write_buffered_bytes, 0);
         assert_eq!(pipeline.write_buffered_segments, 0);
@@ -3536,9 +3372,8 @@ mod tests {
         assert!(!working_dir.join("show.part02.rar").exists());
         assert!(working_dir.join("show.part03.rar").exists());
         assert!(working_dir.join("show.part04.rar").exists());
-        // Let fire-and-forget db writes and background writer complete.
-        drain_write_completions(&mut pipeline).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Yield to let fire-and-forget db writes complete.
+        tokio::task::yield_now().await;
         let deleted_rows = pipeline.db.load_deleted_volume_statuses(job_id).unwrap();
         assert_eq!(
             deleted_rows,
@@ -4145,14 +3980,12 @@ mod tests {
             _ => panic!("expected batch extraction completion"),
         }
         pipeline.handle_extraction_done(first_done).await;
-        drain_write_completions(&mut pipeline).await;
 
         assert!(!working_dir.join("show.part01.rar").exists());
         assert!(!working_dir.join("show.part02.rar").exists());
 
         write_and_complete_rar_volume(&mut pipeline, job_id, 2, &files[2].0, &files[2].1).await;
         write_and_complete_rar_volume(&mut pipeline, job_id, 3, &files[3].0, &files[3].1).await;
-        drain_write_completions(&mut pipeline).await;
         pipeline.try_partial_extraction(job_id).await;
 
         let second_done = next_extraction_done(&mut pipeline).await;
@@ -4174,7 +4007,6 @@ mod tests {
             _ => panic!("expected batch extraction completion"),
         }
         pipeline.handle_extraction_done(second_done).await;
-        drain_write_completions(&mut pipeline).await;
 
         assert!(matches!(
             job_status_for_assert(&pipeline, job_id),

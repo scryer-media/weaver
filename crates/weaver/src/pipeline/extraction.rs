@@ -1042,10 +1042,7 @@ impl Pipeline {
                         "failed to refresh RAR set state after batch extraction"
                     );
                 }
-                // Defer eager deletion behind a write barrier: all segment writes
-                // queued before this point must be durable before we can safely
-                // decide which volumes to delete.
-                self.submit_delete_barrier(job_id, &set_name);
+                self.try_delete_volumes(job_id, &set_name);
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
@@ -1111,7 +1108,7 @@ impl Pipeline {
                     if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
                         let _ = self.recompute_rar_set_state(job_id, &set_name).await;
                     }
-                    self.submit_delete_barrier(job_id, &set_name);
+                    self.try_delete_volumes(job_id, &set_name);
                     self.check_job_completion(job_id).await;
                 }
                 Err(e) => {

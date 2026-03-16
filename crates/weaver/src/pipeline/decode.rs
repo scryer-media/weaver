@@ -1,7 +1,9 @@
+use std::time::Instant;
+
 use super::*;
 
 impl Pipeline {
-    pub(super) fn flush_quiescent_write_backlog(&mut self) {
+    pub(super) async fn flush_quiescent_write_backlog(&mut self) {
         if self.active_downloads > 0
             || !self.pending_decode.is_empty()
             || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
@@ -52,7 +54,18 @@ impl Pipeline {
                         self.remove_empty_write_buffer(file_id);
                         break;
                     };
-                    self.send_evicted_segment_to_writer(file_id, offset, segment);
+
+                    if let Err(e) = self
+                        .persist_out_of_order_segment(file_id, offset, segment)
+                        .await
+                    {
+                        warn!(
+                            file_id = %file_id,
+                            error = %e,
+                            "failed to flush quiescent buffered segment"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -140,75 +153,91 @@ impl Pipeline {
         };
         self.note_write_buffered(buffered_len, 1);
 
-        self.send_ready_segments_to_writer(file_id, ready);
-
-        self.enforce_file_write_backlog(file_id);
-
-        self.relieve_global_write_backlog();
-    }
-
-    /// Send ready segments to the background writer task. Returns immediately —
-    /// the pipeline loop is never blocked on disk I/O.
-    fn send_ready_segments_to_writer(
-        &mut self,
-        file_id: NzbFileId,
-        ready: Vec<(u64, BufferedDecodedSegment)>,
-    ) {
-        if ready.is_empty() {
-            self.remove_empty_write_buffer(file_id);
+        if let Err(e) = self.persist_ready_segments(file_id, ready).await {
+            warn!(
+                file_id = %file_id,
+                error = %e,
+                "disk write failed for sequential decoded segments"
+            );
             return;
         }
 
-        let Some((_job_id, _filename, _working_dir, file_path)) =
-            self.write_target_for_file(file_id)
-        else {
-            let released_bytes: usize = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
-            self.release_write_buffered(released_bytes, ready.len());
-            self.remove_empty_write_buffer(file_id);
+        if let Err(e) = self.enforce_file_write_backlog(file_id).await {
+            warn!(
+                file_id = %file_id,
+                error = %e,
+                "failed to relieve per-file write backlog"
+            );
             return;
-        };
+        }
 
-        let segments: Vec<_> = ready
-            .into_iter()
-            .map(|(offset, seg)| {
-                let ci = SegmentCommitInfo {
-                    segment_id: seg.segment_id,
-                    decoded_size: seg.decoded_size,
-                    crc32: seg.crc32,
-                    yenc_name: seg.yenc_name,
-                };
-                (offset, seg.data.into_boxed_bytes(), ci)
-            })
-            .collect();
-
-        let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
-            file_id,
-            file_path,
-            segments,
-        }));
+        if let Err(e) = self.relieve_global_write_backlog().await {
+            warn!(error = %e, "failed to relieve global write backlog");
+        }
     }
 
-    fn enforce_file_write_backlog(&mut self, file_id: NzbFileId) {
+    async fn persist_ready_segments(
+        &mut self,
+        file_id: NzbFileId,
+        ready: Vec<(u64, BufferedDecodedSegment)>,
+    ) -> Result<(), std::io::Error> {
+        if ready.is_empty() {
+            self.remove_empty_write_buffer(file_id);
+            return Ok(());
+        }
+
+        let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
+        else {
+            let released_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
+            self.release_write_buffered(released_bytes, ready.len());
+            self.remove_empty_write_buffer(file_id);
+            return Ok(());
+        };
+
+        let write_start = Instant::now();
+        for (offset, segment) in ready {
+            let segment_bytes = segment.len_bytes();
+            let write_result =
+                write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
+            self.release_write_buffered(segment_bytes, 1);
+            write_result?;
+            self.commit_persisted_segment(offset, segment, &filename, &working_dir)
+                .await;
+        }
+        let write_us = write_start.elapsed().as_micros() as u64;
+        self.metrics
+            .disk_write_latency_us
+            .store(write_us, Ordering::Relaxed);
+
+        self.remove_empty_write_buffer(file_id);
+        Ok(())
+    }
+
+    async fn enforce_file_write_backlog(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Result<(), std::io::Error> {
         loop {
-            let to_evict = {
+            let to_persist = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
-                    return;
+                    return Ok(());
                 };
                 if !write_buf.exceeds_max_pending() {
-                    return;
+                    return Ok(());
                 }
                 write_buf.take_oldest_buffered()
             };
 
-            let Some((offset, segment)) = to_evict else {
+            let Some((offset, segment)) = to_persist else {
                 self.remove_empty_write_buffer(file_id);
-                return;
+                return Ok(());
             };
-            self.send_evicted_segment_to_writer(file_id, offset, segment);
+            self.persist_out_of_order_segment(file_id, offset, segment)
+                .await?;
         }
     }
 
-    fn relieve_global_write_backlog(&mut self) {
+    async fn relieve_global_write_backlog(&mut self) -> Result<(), std::io::Error> {
         while self.write_buffered_bytes > self.write_backlog_budget_bytes {
             let candidate_file = self
                 .write_buffers
@@ -230,24 +259,35 @@ impl Pipeline {
                 continue;
             };
 
-            self.send_evicted_segment_to_writer(file_id, offset, segment);
+            self.persist_out_of_order_segment(file_id, offset, segment)
+                .await?;
         }
+
+        Ok(())
     }
 
-    fn send_evicted_segment_to_writer(
+    async fn persist_out_of_order_segment(
         &mut self,
         file_id: NzbFileId,
         offset: u64,
         segment: BufferedDecodedSegment,
-    ) {
+    ) -> Result<(), std::io::Error> {
         let segment_bytes = segment.len_bytes();
-        let Some((_job_id, _filename, _working_dir, file_path)) =
-            self.write_target_for_file(file_id)
+        let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
         else {
             self.release_write_buffered(segment_bytes, 1);
             self.remove_empty_write_buffer(file_id);
-            return;
+            return Ok(());
         };
+
+        let write_start = Instant::now();
+        let write_result = write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
+        let write_us = write_start.elapsed().as_micros() as u64;
+        self.metrics
+            .disk_write_latency_us
+            .store(write_us, Ordering::Relaxed);
+        self.release_write_buffered(segment_bytes, 1);
+        write_result?;
 
         if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
             write_buf.mark_persisted(offset, segment_bytes);
@@ -256,17 +296,10 @@ impl Pipeline {
             .direct_write_evictions
             .fetch_add(1, Ordering::Relaxed);
 
-        let ci = SegmentCommitInfo {
-            segment_id: segment.segment_id,
-            decoded_size: segment.decoded_size,
-            crc32: segment.crc32,
-            yenc_name: segment.yenc_name,
-        };
-        let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
-            file_id,
-            file_path,
-            segments: vec![(offset, segment.data.into_boxed_bytes(), ci)],
-        }));
+        self.commit_persisted_segment(offset, segment, &filename, &working_dir)
+            .await;
+        self.remove_empty_write_buffer(file_id);
+        Ok(())
     }
 
     fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {
@@ -293,74 +326,15 @@ impl Pipeline {
         }
     }
 
-    /// Handle completed disk writes from the background writer task.
-    pub(super) async fn handle_write_complete(&mut self, complete: WriteComplete) {
-        match complete {
-            WriteComplete::Barrier { id } => {
-                // All writes submitted before this barrier are durable.
-                // Recompute RAR state (now that all segment writes are on disk)
-                // then make irreversible deletion decisions.
-                if let Some(pending) = self.pending_delete_barriers.remove(&id) {
-                    for (job_id, set_name) in pending {
-                        if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                            warn!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                error,
-                                "failed to recompute RAR state after write barrier"
-                            );
-                        }
-                        self.try_delete_volumes(job_id, &set_name);
-                    }
-                }
-            }
-            WriteComplete::Segments {
-                file_id,
-                written,
-                bytes_written,
-                segments_written,
-                write_latency_us,
-                error,
-            } => {
-                self.release_write_buffered(bytes_written, segments_written);
-                self.metrics
-                    .disk_write_latency_us
-                    .store(write_latency_us, Ordering::Relaxed);
-
-                if let Some(ref error) = error {
-                    warn!(
-                        file_id = %file_id,
-                        error,
-                        "background disk write failed"
-                    );
-                    return;
-                }
-
-                let Some((_job_id, filename, working_dir, _file_path)) =
-                    self.write_target_for_file(file_id)
-                else {
-                    return;
-                };
-
-                for (offset, info) in written {
-                    self.commit_persisted_segment(offset, info, &filename, &working_dir)
-                        .await;
-                }
-
-                self.remove_empty_write_buffer(file_id);
-            }
-        }
-    }
-
     async fn commit_persisted_segment(
         &mut self,
         file_offset: u64,
-        info: SegmentCommitInfo,
+        segment: BufferedDecodedSegment,
         filename: &str,
         working_dir: &std::path::Path,
     ) {
-        let job_id = info.segment_id.file_id.job_id;
-        let file_id = info.segment_id.file_id;
+        let job_id = segment.segment_id.file_id.job_id;
+        let file_id = segment.segment_id.file_id;
 
         let commit_result = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
@@ -370,7 +344,7 @@ impl Pipeline {
                 return;
             };
 
-            match file_asm.commit_segment(info.segment_id.segment_number, info.decoded_size) {
+            match file_asm.commit_segment(segment.segment_id.segment_number, segment.decoded_size) {
                 Ok(commit) => Ok((commit.file_complete, file_asm.total_bytes())),
                 Err(e) => Err(e),
             }
@@ -380,22 +354,22 @@ impl Pipeline {
             Ok((file_complete, total_bytes)) => {
                 self.metrics
                     .bytes_committed
-                    .fetch_add(info.decoded_size as u64, Ordering::Relaxed);
+                    .fetch_add(segment.decoded_size as u64, Ordering::Relaxed);
                 self.metrics
                     .segments_committed
                     .fetch_add(1, Ordering::Relaxed);
 
                 let _ = self.event_tx.send(PipelineEvent::SegmentCommitted {
-                    segment_id: info.segment_id,
+                    segment_id: segment.segment_id,
                 });
 
                 self.segment_batch.push(CommittedSegment {
                     job_id,
-                    file_index: info.segment_id.file_id.file_index,
-                    segment_number: info.segment_id.segment_number,
+                    file_index: segment.segment_id.file_id.file_index,
+                    segment_number: segment.segment_id.segment_number,
                     file_offset,
-                    decoded_size: info.decoded_size,
-                    crc32: info.crc32,
+                    decoded_size: segment.decoded_size,
+                    crc32: segment.crc32,
                 });
                 if self.segment_batch.len() >= 100 {
                     let batch = std::mem::take(&mut self.segment_batch);
@@ -414,34 +388,35 @@ impl Pipeline {
                             warn!(
                                 file_id = %file_id,
                                 leftover_segments = leftovers.len(),
-                                "file reached complete state with buffered decoded segments still pending; flushing via writer"
+                                "file reached complete state with buffered decoded segments still pending; flushing directly"
                             );
                             let file_path = working_dir.join(filename);
-                            let segments: Vec<_> = leftovers
-                                .into_iter()
-                                .map(|(offset, seg)| {
-                                    let ci = SegmentCommitInfo {
-                                        segment_id: seg.segment_id,
-                                        decoded_size: seg.decoded_size,
-                                        crc32: seg.crc32,
-                                        yenc_name: seg.yenc_name,
-                                    };
-                                    (offset, seg.data.into_boxed_bytes(), ci)
-                                })
-                                .collect();
-                            let _ = self.write_req_tx.send(WriteMessage::Segments(WriteRequest {
-                                file_id,
-                                file_path,
-                                segments,
-                            }));
+                            for (offset, buffered) in leftovers {
+                                let buffered_bytes = buffered.len_bytes();
+                                if let Err(e) = write_segment_to_disk(
+                                    &file_path,
+                                    offset,
+                                    buffered.data.as_slice(),
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        file = %filename,
+                                        offset,
+                                        error = %e,
+                                        "disk write failed during final buffered flush"
+                                    );
+                                }
+                                self.release_write_buffered(buffered_bytes, 1);
+                            }
                         }
                     }
 
-                    if !info.yenc_name.is_empty() && info.yenc_name != filename {
+                    if !segment.yenc_name.is_empty() && segment.yenc_name != filename {
                         warn!(
                             job_id = job_id.0,
                             assembly = %filename,
-                            yenc = %info.yenc_name,
+                            yenc = %segment.yenc_name,
                             "yEnc name disagrees with assembly filename"
                         );
                     }
@@ -490,7 +465,7 @@ impl Pipeline {
             }
             Err(e) => {
                 warn!(
-                    segment = %info.segment_id,
+                    segment = %segment.segment_id,
                     error = %e,
                     "assembly commit failed"
                 );
