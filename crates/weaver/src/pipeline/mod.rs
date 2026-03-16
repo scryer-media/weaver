@@ -389,9 +389,15 @@ impl Pipeline {
         R: Send + 'static,
     {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || f(&db))
+        let t = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || f(&db))
             .await
-            .expect("db task panicked")
+            .expect("db task panicked");
+        let ms = t.elapsed().as_millis();
+        if ms > 500 {
+            warn!(ms, "db_blocking took too long (blocking pool saturation?)");
+        }
+        result
     }
 
     /// Fire-and-forget DB write on the blocking pool.
@@ -443,18 +449,29 @@ impl Pipeline {
                             info!("pipeline shutting down");
                             break;
                         }
-                        Some(cmd) => self.handle_command(cmd).await,
+                        Some(cmd) => {
+                            let t = std::time::Instant::now();
+                            self.handle_command(cmd).await;
+                            let ms = t.elapsed().as_millis();
+                            if ms > 100 { warn!(ms, "slow handler: command"); }
+                        }
                     }
                 }
 
                 // Download stage completed.
                 Some(result) = self.download_done_rx.recv() => {
+                    let t = std::time::Instant::now();
                     self.handle_download_done(result).await;
+                    let ms = t.elapsed().as_millis();
+                    if ms > 100 { warn!(ms, "slow handler: download_done"); }
                 }
 
                 // Decode stage completed.
                 Some(result) = self.decode_done_rx.recv() => {
+                    let t = std::time::Instant::now();
                     self.handle_decode_done(result).await;
+                    let ms = t.elapsed().as_millis();
+                    if ms > 500 { warn!(ms, "slow handler: decode_done"); }
                 }
 
                 // Health probe completed — check if job should be failed.
@@ -464,7 +481,10 @@ impl Pipeline {
 
                 // Background extraction completed.
                 Some(done) = self.extract_done_rx.recv() => {
+                    let t = std::time::Instant::now();
                     self.handle_extraction_done(done).await;
+                    let ms = t.elapsed().as_millis();
+                    if ms > 100 { warn!(ms, "slow handler: extraction_done"); }
                 }
 
                 // Delayed retries arriving after backoff sleep.
@@ -1138,7 +1158,8 @@ pub(super) async fn write_segment_to_disk(
     // Under high throughput this reduces blocking pool pressure by ~66%.
     let path = path.to_owned();
     let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
+    let t = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
         use std::io::{Seek, Write};
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1150,7 +1171,12 @@ pub(super) async fn write_segment_to_disk(
         Ok(())
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    let ms = t.elapsed().as_millis();
+    if ms > 1000 {
+        tracing::warn!(ms, "write_segment_to_disk slow (overlayfs?)");
+    }
+    result
 }
 
 fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<BufferPool>) -> usize {
