@@ -254,6 +254,17 @@ impl Pipeline {
             }
         }
 
+        if !eligible.is_empty() && self.active_downloads == 0 {
+            debug!(
+                eligible_count = eligible.len(),
+                max,
+                tuner_max,
+                connection_ramp = self.connection_ramp,
+                rate_wait = self.rate_limiter.should_wait(),
+                "dispatch: eligible jobs found, attempting dispatch"
+            );
+        }
+
         for job_id in eligible {
             if self.active_downloads >= max || self.rate_limiter.should_wait() {
                 break;
