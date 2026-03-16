@@ -6,11 +6,12 @@ import {
 } from "graphql-ws";
 
 const graphqlUrl = "graphql";
-const sessionToken: string | undefined = (window as unknown as Record<string, unknown>)
+let sessionToken: string | undefined = (window as unknown as Record<string, unknown>)
   .__WEAVER_SESSION__ as string | undefined;
 const WS_KEEP_ALIVE_MS = 10_000;
 const WS_PONG_TIMEOUT_MS = 5_000;
 const CLIENT_RESTART_THROTTLE_MS = 2_000;
+const SESSION_TOKEN_PATTERN = /window\.__WEAVER_SESSION__\s*=\s*"([^"]+)"/;
 
 export type GraphqlConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -149,9 +150,8 @@ function createGraphqlClientResources(): GraphqlClientResources {
       url: graphqlUrl,
       preferGetMethod: false,
       requestPolicy: "network-only",
-      fetchOptions: sessionToken
-        ? { headers: { "x-api-key": sessionToken } }
-        : undefined,
+      fetchOptions: () =>
+        sessionToken ? { headers: { "x-api-key": sessionToken } } : {},
       exchanges: [
         subscriptionExchange({
           forwardSubscription(request) {
@@ -173,16 +173,21 @@ function createGraphqlClientResources(): GraphqlClientResources {
 function createTrackedWsClient(transportId: number): GraphqlWsClient {
   const wsClient = createWSClient({
     url: wsUrl(),
-    connectionParams: sessionToken ? { api_key: sessionToken } : undefined,
+    connectionParams: () => (sessionToken ? { api_key: sessionToken } : undefined),
     keepAlive: WS_KEEP_ALIVE_MS,
     // Keep the socket alive briefly across React StrictMode unmount/remount
     // cycles so subscriptions don't get killed and re-created.
     lazyCloseTimeout: 3_000,
     retryAttempts: Number.POSITIVE_INFINITY,
-    retryWait: async (retries) =>
-      new Promise((resolve) =>
-        setTimeout(resolve, retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000)),
-      ),
+    // Always retry — auth failures (4401) after a server restart are
+    // recoverable once refreshSessionToken() picks up the new token.
+    shouldRetry: () => true,
+    retryWait: async (retries) => {
+      const delay = retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      // Try to pick up a new session token before the next connection attempt.
+      await refreshSessionToken();
+    },
     on: {
       connecting: (isRetry) => {
         if (!isCurrentTransport(transportId)) {
@@ -285,13 +290,35 @@ export function authHeaders(): Record<string, string> {
   return sessionToken ? { "x-api-key": sessionToken } : {};
 }
 
-export function requestGraphqlClientRestart() {
+/**
+ * Fetch the index page from the server and extract a fresh session token.
+ * After a server restart, the token embedded in the original HTML is stale —
+ * the server injects a new one into every response for `/`.
+ */
+async function refreshSessionToken(): Promise<boolean> {
+  try {
+    const res = await fetch("/", { credentials: "same-origin" });
+    if (!res.ok) return false;
+    const html = await res.text();
+    const match = SESSION_TOKEN_PATTERN.exec(html);
+    if (match && match[1] && match[1] !== sessionToken) {
+      sessionToken = match[1];
+      return true;
+    }
+  } catch {
+    // Server still down — leave token as-is, will retry later.
+  }
+  return false;
+}
+
+export async function requestGraphqlClientRestart() {
   const now = Date.now();
   if (now - lastClientRestartAt < CLIENT_RESTART_THROTTLE_MS) {
     return;
   }
 
   lastClientRestartAt = now;
+  await refreshSessionToken();
   const previousResources = currentResources;
   clearPongTimeout();
   currentResources = createGraphqlClientResources();

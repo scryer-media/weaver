@@ -601,7 +601,7 @@ impl Pipeline {
                     if ms > 100 { warn!(ms, "slow handler: extraction_done"); }
                 }
 
-                // Background disk writes completed.
+                // Background disk write completed.
                 Some(complete) = self.write_complete_rx.recv() => {
                     self.handle_write_complete(complete).await;
                 }

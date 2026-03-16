@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use async_graphql::{Context, Object, Result};
 use base64::Engine;
 use regex::Regex;
@@ -641,6 +643,18 @@ impl MutationRoot {
         }
         if let Some(cap) = input.isp_bandwidth_cap {
             let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
+        }
+
+        // Apply directory changes immediately so new jobs use them without restart.
+        if input.intermediate_dir.is_some() || input.complete_dir.is_some() {
+            let cfg = config.read().await;
+            let _ = handle
+                .update_runtime_paths(
+                    PathBuf::from(&cfg.data_dir),
+                    PathBuf::from(cfg.intermediate_dir()),
+                    PathBuf::from(cfg.complete_dir()),
+                )
+                .await;
         }
 
         Ok(settings)
