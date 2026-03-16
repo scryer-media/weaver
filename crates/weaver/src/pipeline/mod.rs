@@ -69,6 +69,34 @@ pub(super) struct ProbeUpdate {
     pub(super) done: bool,
 }
 
+/// Metadata for a segment that has been written to disk, needed by
+/// `commit_persisted_segment` to update assembly state.
+pub(super) struct SegmentCommitInfo {
+    pub(super) segment_id: SegmentId,
+    pub(super) decoded_size: u32,
+    pub(super) crc32: u32,
+    pub(super) yenc_name: String,
+}
+
+/// Request to write decoded segments to disk (sent to background writer task).
+pub(super) struct WriteRequest {
+    pub(super) file_id: NzbFileId,
+    pub(super) file_path: PathBuf,
+    /// (file_offset, raw_data, commit_info)
+    pub(super) segments: Vec<(u64, Box<[u8]>, SegmentCommitInfo)>,
+}
+
+/// Acknowledgment from the background writer task.
+pub(super) struct WriteComplete {
+    pub(super) file_id: NzbFileId,
+    /// Segments successfully written (offset, commit_info) in order.
+    pub(super) written: Vec<(u64, SegmentCommitInfo)>,
+    pub(super) bytes_written: usize,
+    pub(super) segments_written: usize,
+    pub(super) write_latency_us: u64,
+    pub(super) error: Option<String>,
+}
+
 /// Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
@@ -134,8 +162,8 @@ pub(super) enum DecodeDone {
 pub(super) struct DecodedChunk(Box<[u8]>);
 
 impl DecodedChunk {
-    pub(super) fn as_slice(&self) -> &[u8] {
-        &self.0
+    pub(super) fn into_boxed_bytes(self) -> Box<[u8]> {
+        self.0
     }
 
     pub(super) fn len_bytes(&self) -> usize {
@@ -214,6 +242,10 @@ pub struct Pipeline {
     /// Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
+    /// Channel to send write requests to the background writer task.
+    pub(super) write_req_tx: mpsc::Sender<WriteRequest>,
+    /// Channel to receive write completions from the background writer task.
+    pub(super) write_complete_rx: mpsc::Receiver<WriteComplete>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// ISP bandwidth cap runtime state.
@@ -318,6 +350,7 @@ impl Pipeline {
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
+        let (write_req_tx, write_complete_rx) = Self::spawn_writer_task();
         shared_state.set_paused(initial_global_paused);
         let pp_pool =
             weaver_core::threadpool::build_postprocess_pool(tuner.params().extract_thread_count);
@@ -352,6 +385,8 @@ impl Pipeline {
             probe_result_rx,
             extract_done_tx,
             extract_done_rx,
+            write_req_tx,
+            write_complete_rx,
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
@@ -379,6 +414,66 @@ impl Pipeline {
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
         Ok(pipeline)
+    }
+
+    /// Spawn the background writer task. Returns the request sender and
+    /// completion receiver for the pipeline to use.
+    fn spawn_writer_task() -> (mpsc::Sender<WriteRequest>, mpsc::Receiver<WriteComplete>) {
+        let (req_tx, mut req_rx) = mpsc::channel::<WriteRequest>(64);
+        let (complete_tx, complete_rx) = mpsc::channel::<WriteComplete>(64);
+
+        tokio::spawn(async move {
+            while let Some(req) = req_rx.recv().await {
+                let tx = complete_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::{Seek, Write};
+                    let t = std::time::Instant::now();
+                    let mut total_bytes = 0usize;
+                    let seg_count = req.segments.len();
+                    let mut written = Vec::with_capacity(seg_count);
+
+                    let result: Result<(), std::io::Error> = (|| {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(&req.file_path)?;
+                        for (offset, data, _info) in &req.segments {
+                            file.seek(std::io::SeekFrom::Start(*offset))?;
+                            file.write_all(data)?;
+                            total_bytes += data.len();
+                        }
+                        Ok(())
+                    })();
+
+                    let error = result.err().map(|e| e.to_string());
+                    // Return commit info for all segments (even on error — partial writes
+                    // are tracked by the pipeline for crash recovery).
+                    for (offset, _data, info) in req.segments {
+                        written.push((offset, info));
+                    }
+
+                    let latency = t.elapsed().as_micros() as u64;
+                    if latency > 1_000_000 {
+                        tracing::warn!(
+                            ms = latency / 1000,
+                            count = seg_count,
+                            "slow disk write batch"
+                        );
+                    }
+                    let _ = tx.blocking_send(WriteComplete {
+                        file_id: req.file_id,
+                        written,
+                        bytes_written: total_bytes,
+                        segments_written: seg_count,
+                        write_latency_us: latency,
+                        error,
+                    });
+                });
+            }
+        });
+
+        (req_tx, complete_rx)
     }
 
     /// Run a DB operation on the blocking pool and await its result.
@@ -487,6 +582,11 @@ impl Pipeline {
                     if ms > 100 { warn!(ms, "slow handler: extraction_done"); }
                 }
 
+                // Background disk writes completed.
+                Some(complete) = self.write_complete_rx.recv() => {
+                    self.handle_write_complete(complete).await;
+                }
+
                 // Delayed retries arriving after backoff sleep.
                 Some(work) = self.retry_rx.recv() => {
                     let job_id = work.segment_id.file_id.job_id;
@@ -504,7 +604,7 @@ impl Pipeline {
 
                 // Periodic tuning.
                 _ = tune_interval.tick() => {
-                    self.flush_quiescent_write_backlog().await;
+                    self.flush_quiescent_write_backlog();
 
                     let snapshot = self.metrics.snapshot();
                     let not_found = snapshot.articles_not_found;
@@ -1147,38 +1247,6 @@ impl Pipeline {
     }
 }
 
-/// Write decoded segment data to the correct offset in the output file.
-pub(super) async fn write_segment_to_disk(
-    path: &std::path::Path,
-    offset: u64,
-    data: &[u8],
-) -> Result<(), std::io::Error> {
-    // Use std::fs in a single spawn_blocking call instead of tokio::fs which
-    // internally spawns 3 separate blocking tasks (open, seek, write).
-    // Under high throughput this reduces blocking pool pressure by ~66%.
-    let path = path.to_owned();
-    let data = data.to_vec();
-    let t = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::{Seek, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)?;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(&data)?;
-        Ok(())
-    })
-    .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
-    let ms = t.elapsed().as_millis();
-    if ms > 1000 {
-        tracing::warn!(ms, "write_segment_to_disk slow (overlayfs?)");
-    }
-    result
-}
-
 fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<BufferPool>) -> usize {
     use weaver_core::buffer::BufferTier;
     use weaver_core::system::StorageClass;
@@ -1781,6 +1849,24 @@ mod tests {
             0,
         )
         .await
+    }
+
+    /// Drain all pending write completions from the background writer.
+    /// Tests call this after sending decode results to ensure segments
+    /// are committed before asserting on pipeline state.
+    async fn drain_write_completions(pipeline: &mut Pipeline) {
+        use tokio::time::{Duration, timeout};
+        loop {
+            match timeout(
+                Duration::from_millis(500),
+                pipeline.write_complete_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(complete)) => pipeline.handle_write_complete(complete).await,
+                _ => break,
+            }
+        }
     }
 
     fn encode_article_part(
@@ -2611,6 +2697,7 @@ mod tests {
         }
 
         drain_decode_results(&mut pipeline, 2).await;
+        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
         assert_eq!(
@@ -2653,6 +2740,7 @@ mod tests {
             })
             .await;
         drain_decode_results(&mut pipeline, 1).await;
+        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
         assert_eq!(pipeline.write_buffered_bytes, 0);
@@ -2739,6 +2827,7 @@ mod tests {
         }
 
         drain_decode_results(&mut pipeline, segment_count as usize).await;
+        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.write_buffered_bytes, 0);
         assert_eq!(pipeline.write_buffered_segments, 0);
@@ -3287,7 +3376,8 @@ mod tests {
         state.download_queue = DownloadQueue::new();
         assert_eq!(state.recovery_queue.len(), 1);
 
-        pipeline.flush_quiescent_write_backlog().await;
+        pipeline.flush_quiescent_write_backlog();
+        drain_write_completions(&mut pipeline).await;
 
         assert_eq!(pipeline.write_buffered_bytes, 0);
         assert_eq!(pipeline.write_buffered_segments, 0);
