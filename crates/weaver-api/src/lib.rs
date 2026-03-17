@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod jwt;
 mod backup;
 mod mutation;
 mod query;

@@ -7,6 +7,7 @@ use crate::StateError;
 
 mod active;
 mod api_keys;
+mod auth;
 mod backup;
 mod bandwidth;
 mod config;
@@ -17,6 +18,7 @@ mod rss;
 
 pub use active::{ActiveJob, ActivePar2File, CommittedSegment, ExtractionChunk, RecoveredJob};
 pub use api_keys::ApiKeyRow;
+pub use auth::AuthCredentials;
 pub use backup::StableStateExport;
 pub use events::JobEvent;
 pub use history::{HistoryFilter, JobHistoryRow};
@@ -273,6 +275,14 @@ impl Database {
                 scope        TEXT NOT NULL DEFAULT 'integration',
                 created_at   INTEGER NOT NULL,
                 last_used_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_credentials (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                username      TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS categories (

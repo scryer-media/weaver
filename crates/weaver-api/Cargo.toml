@@ -21,6 +21,7 @@ tracing = { workspace = true }
 async-graphql = { workspace = true }
 zstd = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
