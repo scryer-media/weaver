@@ -4052,7 +4052,7 @@ mod tests {
     #[tokio::test]
     async fn non_solid_incremental_rar_batches_cleanup_chunks_after_finalize() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+        let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
         let job_id = JobId(30007);
         let files = build_multifile_multivolume_rar_set();
         let spec = rar_job_spec("RAR Incremental Chunks", &files);
