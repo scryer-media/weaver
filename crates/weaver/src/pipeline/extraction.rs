@@ -375,10 +375,26 @@ impl Pipeline {
             format!("failed to extract {member_name}: {error}")
         })?;
 
-        // Flush the shared writer now that extraction is complete.
-        if let Ok(mut shared_file) = shared.try_borrow_mut() {
-            let _ = shared_file.inner.flush();
+        // Flush, sync to NFS, and close the file handle before finalizing.
+        // Without this, the rename() in finalize forces the NFS client to
+        // flush all dirty pages (potentially 60+ GB) synchronously, causing
+        // a multi-minute stall attributed to the "append" phase.
+        {
+            let mut shared_file = shared.borrow_mut();
+            shared_file.inner.flush().map_err(|e| {
+                format!(
+                    "failed to flush partial output {}: {e}",
+                    partial_path.display()
+                )
+            })?;
+            shared_file.inner.get_ref().sync_all().map_err(|e| {
+                format!(
+                    "failed to sync partial output {}: {e}",
+                    partial_path.display()
+                )
+            })?;
         }
+        drop(shared);
 
         // Persist chunk offset records to DB for progress tracking.
         let partial_path_str = partial_path.to_string_lossy().to_string();
