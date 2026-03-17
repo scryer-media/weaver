@@ -18,7 +18,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
-use weaver_api::auth::{CallerScope, generate_api_key, hash_api_key};
+use weaver_api::auth::{CallerScope, generate_api_key, hash_api_key, verify_password};
+use weaver_api::jwt::{self, JWT_TTL_SECS};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
 use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_scheduler::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
@@ -34,44 +35,87 @@ struct BaseUrl(Arc<String>);
 #[derive(Clone)]
 struct SessionToken(Arc<String>);
 
-/// Resolve the caller scope from an optional API key header.
+/// Extract the `weaver_jwt` cookie value from request headers.
+fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix("weaver_jwt=").map(|v| v.to_string()))
+}
+
+/// Check if login auth is enabled and return the JWT secret if so.
+async fn jwt_secret_if_auth_enabled(db: &Database) -> Option<[u8; 32]> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.get_auth_credentials()
+            .ok()
+            .flatten()
+            .map(|creds| jwt::derive_jwt_secret(&creds.password_hash))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Resolve the caller scope from API key header, JWT cookie, or session token.
 async fn resolve_scope(
     db: &Database,
     session_token: &str,
-    api_key_header: Option<&axum::http::HeaderValue>,
+    headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
-    let Some(hdr) = api_key_header else {
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-    let raw_key = hdr.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-    if raw_key == session_token {
-        return Ok(CallerScope::Local);
-    }
-    let key_hash = hash_api_key(raw_key);
-    let db = db.clone();
-    let db2 = db.clone();
-    let row = tokio::task::spawn_blocking(move || db.lookup_api_key(&key_hash))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match row {
-        Some(row) => {
-            // Fire-and-forget last_used_at update.
+    let api_key_header = headers.get("x-api-key");
+
+    // 1. API key header (session token or stored key).
+    if let Some(hdr) = api_key_header {
+        let raw_key = hdr.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if raw_key == session_token {
+            return Ok(CallerScope::Local);
+        }
+        let key_hash = hash_api_key(raw_key);
+        let db_clone = db.clone();
+        let db_touch = db.clone();
+        let row = tokio::task::spawn_blocking(move || db_clone.lookup_api_key(&key_hash))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(row) = row {
             let id = row.id;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
             tokio::task::spawn_blocking(move || {
-                let _ = db2.touch_api_key_last_used(id, now);
+                let _ = db_touch.touch_api_key_last_used(id, now);
             });
-            match row.scope.as_str() {
+            return match row.scope.as_str() {
                 "admin" => Ok(CallerScope::Admin),
                 _ => Ok(CallerScope::Integration),
-            }
+            };
         }
-        None => Err(StatusCode::UNAUTHORIZED),
     }
+
+    // 2. JWT cookie (when login auth is enabled).
+    if let Some(token) = extract_jwt_cookie(headers)
+        && let Some(secret) = jwt_secret_if_auth_enabled(db).await
+        && jwt::verify_jwt(&token, &secret).is_ok()
+    {
+        return Ok(CallerScope::Admin);
+    }
+
+    // 3. No auth enabled → open access (backward compat).
+    if jwt_secret_if_auth_enabled(db).await.is_none() {
+        // Auth is not configured — allow open access with session token.
+        if api_key_header.is_some() {
+            // They sent a key but it didn't match anything.
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        return Ok(CallerScope::Local);
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 async fn graphql_handler(
@@ -81,7 +125,7 @@ async fn graphql_handler(
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
-    let scope = resolve_scope(&db, &session_token, headers.get("x-api-key")).await?;
+    let scope = resolve_scope(&db, &session_token, &headers).await?;
     let mut request = req.into_inner();
     request = request.data(scope);
     Ok(schema.execute(request).await.into())
@@ -95,9 +139,9 @@ struct BackupExportRequest {
 async fn require_admin(
     db: &Database,
     session_token: &str,
-    api_key_header: Option<&axum::http::HeaderValue>,
+    headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    let scope = resolve_scope(db, session_token, api_key_header).await?;
+    let scope = resolve_scope(db, session_token, headers).await?;
     if scope.is_admin() {
         Ok(())
     } else {
@@ -111,7 +155,7 @@ async fn backup_status_handler(
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
 ) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(&db, &session_token, headers.get("x-api-key")).await?;
+    require_admin(&db, &session_token, &headers).await?;
     let status = backup
         .status()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -125,7 +169,7 @@ async fn backup_export_handler(
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, &headers).await {
         return status.into_response();
     }
     match backup.create_backup(body.password).await {
@@ -151,7 +195,7 @@ async fn backup_inspect_handler(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, &headers).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -173,7 +217,7 @@ async fn backup_restore_handler(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, headers.get("x-api-key")).await {
+    if let Err(status) = require_admin(&db, &session_token, &headers).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -316,21 +360,33 @@ async fn ws_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(db): Extension<Database>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
+    headers: HeaderMap,
     protocol: GraphQLProtocol,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Browsers cannot send custom HTTP headers on WebSocket upgrade requests,
-    // so we skip auth here and rely on `connection_init` payload instead.
+    // Pre-resolve scope from cookies on the upgrade request. Browsers
+    // automatically send cookies on WebSocket upgrade, so JWT auth works
+    // without needing api_key in connection_init.
+    let upgrade_scope = resolve_scope(&db, &session_token, &headers).await.ok();
+
     ws.protocols(["graphql-transport-ws", "graphql-ws"])
         .on_upgrade(move |stream| {
             let ws = GraphQLWebSocket::new(stream, schema, protocol).on_connection_init(
                 move |payload: serde_json::Value| async move {
+                    // If the upgrade request was already authenticated (via cookie),
+                    // use that scope directly.
+                    if let Some(scope) = upgrade_scope {
+                        let mut data = Data::default();
+                        data.insert(scope);
+                        return Ok(data);
+                    }
+
+                    // Fall back to connection_init payload (api_key field).
                     let Some(key) = payload.get("api_key").and_then(|v| v.as_str()) else {
                         return Err(async_graphql::Error::new(
                             "Missing api_key in connection_init",
                         ));
                     };
-                    // Check session token first.
                     if key == session_token.as_str() {
                         let mut data = Data::default();
                         data.insert(CallerScope::Local);
@@ -423,6 +479,7 @@ async fn static_handler(
     headers: HeaderMap,
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
+    Extension(db): Extension<Database>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
@@ -464,18 +521,209 @@ async fn static_handler(
             file.data,
         )
             .into_response()
-    } else if let Some(index) = FrontendAssets::get("index.html") {
-        let mime = mime_guess::from_path("index.html").first_or_octet_stream();
-        let body = rewrite_index_html(&index.data, &base_url, &session_token);
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-            body,
-        )
-            .into_response()
     } else {
-        StatusCode::NOT_FOUND.into_response()
+        // SPA fallback: serve index.html (or login page if auth is enabled).
+        // When auth is enabled and the user doesn't have a valid JWT cookie,
+        // serve the standalone login page instead of the React app.
+        if let Some(secret) = jwt_secret_if_auth_enabled(&db).await {
+            let has_valid_jwt = extract_jwt_cookie(&headers)
+                .is_some_and(|token| jwt::verify_jwt(&token, &secret).is_ok());
+            if !has_valid_jwt {
+                return login_page_response();
+            }
+        }
+
+        if let Some(index) = FrontendAssets::get("index.html") {
+            let mime = mime_guess::from_path("index.html").first_or_octet_stream();
+            let body = rewrite_index_html(&index.data, &base_url, &session_token);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                body,
+            )
+                .into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
+}
+
+// ── Login / Logout / Auth Status ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn login_handler(
+    Extension(db): Extension<Database>,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    let db_clone = db.clone();
+    let creds = match tokio::task::spawn_blocking(move || db_clone.get_auth_credentials())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+    {
+        Some(c) => c,
+        None => {
+            return error_response(StatusCode::BAD_REQUEST, "login is not enabled");
+        }
+    };
+
+    if body.username != creds.username {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+    }
+
+    let hash = creds.password_hash.clone();
+    let pw = body.password.clone();
+    let valid = tokio::task::spawn_blocking(move || verify_password(&pw, &hash))
+        .await
+        .unwrap_or(false);
+
+    if !valid {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
+    }
+
+    let secret = jwt::derive_jwt_secret(&creds.password_hash);
+    let token = jwt::create_jwt(&creds.username, &secret, JWT_TTL_SECS);
+    let cookie =
+        format!("weaver_jwt={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}");
+
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn logout_handler() -> Response {
+    let cookie = "weaver_jwt=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie.to_string())],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn auth_status_handler(
+    Extension(db): Extension<Database>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    let db_clone = db.clone();
+    let creds = tokio::task::spawn_blocking(move || db_clone.get_auth_credentials())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+
+    let enabled = creds.is_some();
+    let authenticated = if let Some(creds) = creds {
+        if let Some(token) = extract_jwt_cookie(&headers) {
+            let secret = jwt::derive_jwt_secret(&creds.password_hash);
+            jwt::verify_jwt(&token, &secret).is_ok()
+        } else {
+            false
+        }
+    } else {
+        true // auth not enabled → everyone is "authenticated"
+    };
+
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "authenticated": authenticated,
+    }))
+}
+
+// ── Standalone Login Page ────────────────────────────────────────────────
+
+const LOGIN_PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Weaver - Login</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    background:#0a0e1a;color:#e2e8f0;display:flex;align-items:center;
+    justify-content:center;min-height:100vh}
+  .card{background:#111827;border:1px solid rgba(255,255,255,.08);
+    border-radius:20px;padding:40px;width:100%;max-width:380px;
+    box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  h1{font-size:1.5rem;font-weight:600;margin-bottom:8px;letter-spacing:-.02em}
+  .subtitle{font-size:.8rem;color:#64748b;text-transform:uppercase;
+    letter-spacing:.2em;margin-bottom:32px}
+  label{display:block;font-size:.85rem;color:#94a3b8;margin-bottom:6px}
+  input{width:100%;padding:10px 14px;border:1px solid rgba(255,255,255,.1);
+    border-radius:10px;background:#0f172a;color:#e2e8f0;font-size:.95rem;
+    margin-bottom:16px;outline:none;transition:border .2s}
+  input:focus{border-color:#6366f1}
+  button{width:100%;padding:11px;border:none;border-radius:10px;
+    background:#6366f1;color:#fff;font-size:.95rem;font-weight:500;
+    cursor:pointer;transition:background .2s}
+  button:hover{background:#4f46e5}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .error{color:#f87171;font-size:.85rem;margin-bottom:12px;display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Weaver</h1>
+  <div class="subtitle">Sign In</div>
+  <form id="form">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" required autofocus/>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required/>
+    <div class="error" id="error"></div>
+    <button type="submit" id="btn">Sign In</button>
+  </form>
+</div>
+<script>
+const form=document.getElementById("form"),
+  err=document.getElementById("error"),
+  btn=document.getElementById("btn");
+form.addEventListener("submit",async e=>{
+  e.preventDefault();
+  err.style.display="none";
+  btn.disabled=true;
+  btn.textContent="Signing in\u2026";
+  try{
+    const r=await fetch("/api/login",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        username:form.username.value,
+        password:form.password.value
+      })
+    });
+    if(r.ok){window.location.href="/";return}
+    const d=await r.json().catch(()=>({}));
+    err.textContent=d.error||"Login failed";
+    err.style.display="block";
+  }catch{
+    err.textContent="Connection error";
+    err.style.display="block";
+  }
+  btn.disabled=false;
+  btn.textContent="Sign In";
+});
+</script>
+</body>
+</html>"#;
+
+fn login_page_response() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+        LOGIN_PAGE_HTML,
+    )
+        .into_response()
 }
 
 pub async fn run_server(
@@ -497,6 +745,9 @@ pub async fn run_server(
         .route("/api/backup/export", post(backup_export_handler))
         .route("/api/backup/inspect", post(backup_inspect_handler))
         .route("/api/backup/restore", post(backup_restore_handler))
+        .route("/api/login", post(login_handler))
+        .route("/api/logout", post(logout_handler))
+        .route("/api/auth/status", get(auth_status_handler))
         .route("/", get(static_handler))
         .fallback(get(static_handler))
         .layer(Extension(handle))

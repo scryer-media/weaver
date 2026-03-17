@@ -671,6 +671,35 @@ export const DELETE_API_KEY_MUTATION = gql`
   ${API_KEY_FIELDS}
 `;
 
+// --- Login Protection ---
+
+export const LOGIN_STATUS_MUTATION = gql`
+  mutation LoginStatus {
+    loginStatus {
+      enabled
+      username
+    }
+  }
+`;
+
+export const ENABLE_LOGIN_MUTATION = gql`
+  mutation EnableLogin($username: String!, $password: String!) {
+    enableLogin(username: $username, password: $password)
+  }
+`;
+
+export const DISABLE_LOGIN_MUTATION = gql`
+  mutation DisableLogin {
+    disableLogin
+  }
+`;
+
+export const CHANGE_PASSWORD_MUTATION = gql`
+  mutation ChangePassword($currentPassword: String!, $newPassword: String!) {
+    changePassword(currentPassword: $currentPassword, newPassword: $newPassword)
+  }
+`;
+
 // --- RSS ---
 
 export const RSS_SETTINGS_QUERY = gql`

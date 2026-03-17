@@ -97,21 +97,20 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
 }
 
 fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
 
 fn base64url_encode(data: &[u8]) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     URL_SAFE_NO_PAD.encode(data)
 }
 
 fn base64url_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     URL_SAFE_NO_PAD.decode(s)
 }
 
@@ -157,7 +156,10 @@ mod tests {
         let token = create_jwt("admin", &secret, 0); // 0 TTL = already expired
         // Sleep briefly to ensure we're past the expiry.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        assert!(matches!(verify_jwt(&token, &secret), Err(JwtError::Expired)));
+        assert!(matches!(
+            verify_jwt(&token, &secret),
+            Err(JwtError::Expired)
+        ));
     }
 
     #[test]

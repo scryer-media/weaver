@@ -48,6 +48,29 @@ pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Hash a password with scrypt for storage.
+pub fn hash_password(password: &str) -> Result<String, String> {
+    use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    let params = scrypt::Params::recommended();
+    let hasher = scrypt::Scrypt;
+    hasher
+        .hash_password_customized(password.as_bytes(), None, None, params, &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("scrypt hash failed: {e}"))
+}
+
+/// Verify a password against a stored scrypt hash.
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    use scrypt::password_hash::{PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    scrypt::Scrypt
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +101,13 @@ mod tests {
         assert!(CallerScope::Local.is_admin());
         assert!(CallerScope::Admin.is_admin());
         assert!(!CallerScope::Integration.is_admin());
+    }
+
+    #[test]
+    fn password_hash_and_verify() {
+        let hash = hash_password("hunter2").unwrap();
+        assert!(hash.starts_with("$scrypt$"));
+        assert!(verify_password("hunter2", &hash));
+        assert!(!verify_password("wrong", &hash));
     }
 }

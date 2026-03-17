@@ -1,6 +1,6 @@
 pub mod auth;
-pub mod jwt;
 mod backup;
+pub mod jwt;
 mod mutation;
 mod query;
 pub mod rss;

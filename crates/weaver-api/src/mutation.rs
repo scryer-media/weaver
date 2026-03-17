@@ -23,6 +23,13 @@ use crate::types::{
 
 pub struct MutationRoot;
 
+/// Result of the loginStatus query.
+#[derive(async_graphql::SimpleObject)]
+pub struct LoginStatusResult {
+    pub enabled: bool,
+    pub username: Option<String>,
+}
+
 #[Object]
 impl MutationRoot {
     /// Submit an NZB file for download.
@@ -732,6 +739,101 @@ impl MutationRoot {
                 last_used_at: row.last_used_at.map(|value| value as f64),
             })
             .collect())
+    }
+
+    /// Enable login protection with a username and password.
+    #[graphql(guard = "AdminGuard")]
+    async fn enable_login(
+        &self,
+        ctx: &Context<'_>,
+        username: String,
+        password: String,
+    ) -> Result<bool> {
+        if username.is_empty() || password.is_empty() {
+            return Err(async_graphql::Error::new(
+                "username and password must not be empty",
+            ));
+        }
+        let hash = tokio::task::spawn_blocking(move || crate::auth::hash_password(&password))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(async_graphql::Error::new)?;
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.set_auth_credentials(&username, &hash))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        info!("login protection enabled");
+        Ok(true)
+    }
+
+    /// Disable login protection.
+    #[graphql(guard = "AdminGuard")]
+    async fn disable_login(&self, ctx: &Context<'_>) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || db.clear_auth_credentials())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        info!("login protection disabled");
+        Ok(true)
+    }
+
+    /// Change the login password. Requires the current password for verification.
+    #[graphql(guard = "AdminGuard")]
+    async fn change_password(
+        &self,
+        ctx: &Context<'_>,
+        current_password: String,
+        new_password: String,
+    ) -> Result<bool> {
+        if new_password.is_empty() {
+            return Err(async_graphql::Error::new("new password must not be empty"));
+        }
+        let db = ctx.data::<Database>()?.clone();
+        let db2 = db.clone();
+        let creds = tokio::task::spawn_blocking(move || db.get_auth_credentials())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .ok_or_else(|| async_graphql::Error::new("login is not enabled"))?;
+
+        let hash = creds.password_hash.clone();
+        let current = current_password.clone();
+        let valid =
+            tokio::task::spawn_blocking(move || crate::auth::verify_password(&current, &hash))
+                .await
+                .unwrap_or(false);
+        if !valid {
+            return Err(async_graphql::Error::new("current password is incorrect"));
+        }
+
+        let new_hash =
+            tokio::task::spawn_blocking(move || crate::auth::hash_password(&new_password))
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .map_err(async_graphql::Error::new)?;
+        let username = creds.username;
+        tokio::task::spawn_blocking(move || db2.set_auth_credentials(&username, &new_hash))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        info!("login password changed");
+        Ok(true)
+    }
+
+    /// Query whether login protection is currently enabled.
+    #[graphql(guard = "AdminGuard")]
+    async fn login_status(&self, ctx: &Context<'_>) -> Result<LoginStatusResult> {
+        let db = ctx.data::<Database>()?.clone();
+        let creds = tokio::task::spawn_blocking(move || db.get_auth_credentials())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(LoginStatusResult {
+            enabled: creds.is_some(),
+            username: creds.map(|c| c.username),
+        })
     }
 
     /// Add a new RSS feed.
