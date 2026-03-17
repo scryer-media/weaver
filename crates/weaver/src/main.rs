@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use weaver_core::buffer::{BufferPool, BufferPoolConfig};
@@ -94,6 +94,14 @@ async fn async_main() {
             std::process::exit(1);
         }
     };
+
+    // Escape hatch: WEAVER_RESET_LOGIN=1 disables login protection on startup.
+    if std::env::var("WEAVER_RESET_LOGIN").is_ok_and(|v| v == "1" || v == "true") {
+        match db.clear_auth_credentials() {
+            Ok(()) => warn!("WEAVER_RESET_LOGIN set — login protection has been disabled"),
+            Err(e) => error!("failed to reset login credentials: {e}"),
+        }
+    }
 
     // When --config points to a directory and data_dir is unset (fresh DB),
     // default data_dir to that directory. This is the common Docker pattern:

@@ -669,6 +669,14 @@ const LOGIN_PAGE_HTML: &str = r#"<!DOCTYPE html>
   button:hover{background:#4f46e5}
   button:disabled{opacity:.5;cursor:not-allowed}
   .error{color:#f87171;font-size:.85rem;margin-bottom:12px;display:none}
+  .forgot{margin-top:16px;text-align:center}
+  .forgot a{color:#6366f1;font-size:.85rem;text-decoration:none;cursor:pointer}
+  .forgot a:hover{text-decoration:underline}
+  .reset-help{display:none;margin-top:12px;padding:12px;border-radius:10px;
+    background:#0f172a;border:1px solid rgba(255,255,255,.08);font-size:.8rem;
+    color:#94a3b8;line-height:1.5}
+  .reset-help code{background:#1e293b;padding:2px 6px;border-radius:4px;
+    color:#e2e8f0;font-size:.8rem}
 </style>
 </head>
 <body>
@@ -683,6 +691,19 @@ const LOGIN_PAGE_HTML: &str = r#"<!DOCTYPE html>
     <div class="error" id="error"></div>
     <button type="submit" id="btn">Sign In</button>
   </form>
+  <div class="forgot">
+    <a id="forgot-link">Forgot password?</a>
+    <div class="reset-help" id="reset-help">
+      Stop weaver, then restart with:<br/><br/>
+      <code>WEAVER_RESET_LOGIN=1</code><br/><br/>
+      This disables login protection on startup. You can then set a new password in Settings &rarr; Security.
+      <br/><br/>
+      <strong>Docker:</strong><br/>
+      <code>docker run -e WEAVER_RESET_LOGIN=1 ...</code><br/><br/>
+      <strong>Bare metal:</strong><br/>
+      <code>WEAVER_RESET_LOGIN=1 weaver serve</code>
+    </div>
+  </div>
 </div>
 <script>
 const form=document.getElementById("form"),
@@ -712,6 +733,10 @@ form.addEventListener("submit",async e=>{
   }
   btn.disabled=false;
   btn.textContent="Sign In";
+});
+document.getElementById("forgot-link").addEventListener("click",()=>{
+  const el=document.getElementById("reset-help");
+  el.style.display=el.style.display==="block"?"none":"block";
 });
 </script>
 </body>
