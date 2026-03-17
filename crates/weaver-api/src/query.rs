@@ -17,6 +17,11 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    /// The running weaver binary version.
+    async fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn browse_directories(
         &self,

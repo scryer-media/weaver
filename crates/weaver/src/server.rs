@@ -1039,6 +1039,7 @@ fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::Verifying => "verifying",
         JobStatus::Repairing => "repairing",
         JobStatus::Extracting => "extracting",
+        JobStatus::Moving => "moving",
         JobStatus::Complete => "complete",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",

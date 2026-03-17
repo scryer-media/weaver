@@ -350,16 +350,21 @@ impl Pipeline {
     ///
     /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
     pub(super) async fn move_to_complete(&mut self, job_id: JobId) -> Result<PathBuf, String> {
-        let (working_dir, job_name, category) = {
+        let (working_dir, staging_dir, job_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Err(format!("job {} not found for move_to_complete", job_id.0));
             };
             (
                 state.working_dir.clone(),
+                state.staging_dir.clone(),
                 state.spec.name.clone(),
                 state.spec.category.clone(),
             )
         };
+
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.status = JobStatus::Moving;
+        }
 
         let _ = self
             .event_tx
@@ -369,17 +374,19 @@ impl Pipeline {
             .compute_complete_destination(job_id, &job_name, category.as_deref())
             .await;
 
-        // List files in the working directory before creating the destination so
-        // a missing source directory doesn't leave behind an empty complete dir.
-        let mut entries = match tokio::fs::read_dir(&working_dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                return Err(format!(
-                    "failed to read working directory {} for move: {e}",
-                    working_dir.display()
-                ));
-            }
-        };
+        // Verify at least one source directory exists before creating
+        // the destination, so a missing source doesn't leave behind an
+        // empty complete dir.
+        let staging_exists = staging_dir
+            .as_ref()
+            .is_some_and(|s| s.exists());
+        let working_exists = working_dir.exists();
+        if !staging_exists && !working_exists {
+            return Err(format!(
+                "failed to read working directory {} for move: No such file or directory (os error 2)",
+                working_dir.display()
+            ));
+        }
 
         // Ensure destination exists.
         if let Err(e) = tokio::fs::create_dir_all(&dest).await {
@@ -391,54 +398,111 @@ impl Pipeline {
 
         let mut moved = 0u32;
         let mut failures = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let src = entry.path();
-            let file_name = entry.file_name();
-            if file_name == ".weaver-chunks" {
-                if let Err(error) = tokio::fs::remove_dir_all(&src).await
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(
-                        path = %src.display(),
-                        error = %error,
-                        "failed to remove extraction chunk workspace before final move"
-                    );
-                }
-                continue;
-            }
-            let dst = dest.join(&file_name);
 
-            // Try rename first (fast, same filesystem).
-            match tokio::fs::rename(&src, &dst).await {
-                Ok(()) => {
-                    moved += 1;
-                }
-                Err(rename_err) => {
-                    let src_fallback = src.clone();
-                    let dst_fallback = dst.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        move_path_with_copy_fallback(&src_fallback, &dst_fallback)
-                    })
-                    .await
-                    {
-                        Ok(Ok(())) => {
+        // Move extracted files from the staging directory (same filesystem as
+        // complete_dir, so renames are instant).
+        if let Some(ref staging) = staging_dir
+            && let Ok(mut entries) = tokio::fs::read_dir(staging).await
+        {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let file_name = entry.file_name();
+                    if file_name == ".weaver-chunks" {
+                        let src = entry.path();
+                        if let Err(error) = tokio::fs::remove_dir_all(&src).await
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            warn!(
+                                path = %src.display(),
+                                error = %error,
+                                "failed to remove chunk workspace during final move"
+                            );
+                        }
+                        continue;
+                    }
+                    let src = entry.path();
+                    let dst = dest.join(&file_name);
+                    match tokio::fs::rename(&src, &dst).await {
+                        Ok(()) => {
                             moved += 1;
                         }
-                        Ok(Err(copy_err)) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                copy_err
-                            ));
+                        Err(rename_err) => {
+                            let src_fb = src.clone();
+                            let dst_fb = dst.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                move_path_with_copy_fallback(&src_fb, &dst_fb)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    moved += 1;
+                                }
+                                Ok(Err(copy_err)) => {
+                                    failures.push(format!(
+                                        "{}: rename failed: {}; fallback failed: {}",
+                                        file_name.to_string_lossy(),
+                                        rename_err,
+                                        copy_err
+                                    ));
+                                }
+                                Err(join_err) => {
+                                    failures.push(format!(
+                                        "{}: rename failed: {}; fallback task failed: {}",
+                                        file_name.to_string_lossy(),
+                                        rename_err,
+                                        join_err
+                                    ));
+                                }
+                            }
                         }
-                        Err(join_err) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback task failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                join_err
-                            ));
+                    }
+                }
+        }
+
+        // Move any remaining non-archive files from working_dir (NFOs, SRTs, etc.).
+        if let Ok(mut entries) = tokio::fs::read_dir(&working_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let file_name = entry.file_name();
+                // Skip leftover chunk workspaces and staging dirs.
+                if file_name == ".weaver-chunks" || file_name == ".weaver-staging" {
+                    continue;
+                }
+                let src = entry.path();
+                let dst = dest.join(&file_name);
+                // Skip if the destination already has this file (from staging).
+                if dst.exists() {
+                    continue;
+                }
+                match tokio::fs::rename(&src, &dst).await {
+                    Ok(()) => {
+                        moved += 1;
+                    }
+                    Err(rename_err) => {
+                        let src_fb = src.clone();
+                        let dst_fb = dst.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            move_path_with_copy_fallback(&src_fb, &dst_fb)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                moved += 1;
+                            }
+                            Ok(Err(copy_err)) => {
+                                failures.push(format!(
+                                    "{}: rename failed: {}; fallback failed: {}",
+                                    file_name.to_string_lossy(),
+                                    rename_err,
+                                    copy_err
+                                ));
+                            }
+                            Err(join_err) => {
+                                failures.push(format!(
+                                    "{}: rename failed: {}; fallback task failed: {}",
+                                    file_name.to_string_lossy(),
+                                    rename_err,
+                                    join_err
+                                ));
+                            }
                         }
                     }
                 }
@@ -456,6 +520,19 @@ impl Pipeline {
             ));
         }
 
+        // Remove the now-empty staging directory.
+        if let Some(ref staging) = staging_dir
+            && let Err(e) = tokio::fs::remove_dir_all(staging).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                dir = %staging.display(),
+                error = %e,
+                "failed to remove staging directory after move"
+            );
+        }
+
         // Remove the now-empty intermediate directory.
         if let Err(e) = tokio::fs::remove_dir(&working_dir).await
             && e.kind() != std::io::ErrorKind::NotFound
@@ -471,6 +548,7 @@ impl Pipeline {
         // Update working_dir to point to the complete path (for API reporting).
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.working_dir = dest.clone();
+            state.staging_dir = None;
         }
 
         info!(
@@ -1550,14 +1628,21 @@ impl Pipeline {
                     self.cleanup_par2_files(job_id).await;
                 }
                 // No archives — move to complete and finish.
+                let was_extracting = self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| state.status == JobStatus::Extracting);
                 if let Err(error) = self.move_to_complete(job_id).await {
+                    if was_extracting {
+                        self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+                    }
                     self.fail_job(job_id, error);
                     return;
                 }
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                if state.status == JobStatus::Extracting {
+                if was_extracting {
                     self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
                 }
+                let state = self.jobs.get_mut(&job_id).unwrap();
                 state.status = JobStatus::Complete;
                 if self.active_download_passes.remove(&job_id) {
                     let _ = self
@@ -1776,7 +1861,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let (volume_paths, cached_headers, password, working_dir) = {
+        let (volume_paths, cached_headers, password) = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -1801,7 +1886,6 @@ impl Pipeline {
                 parts,
                 self.load_rar_snapshot(job_id, set_name),
                 state.spec.password.clone(),
-                state.working_dir.clone(),
             )
         };
 
@@ -1826,7 +1910,7 @@ impl Pipeline {
         let set_name_for_task = set_name.to_string();
         let event_tx = self.event_tx.clone();
         let db = self.db.clone();
-        let output_dir = working_dir;
+        let output_dir = self.extraction_staging_dir(job_id);
         let set_name_for_result = set_name_owned.clone();
         let pp_pool = self.pp_pool.clone();
         tokio::task::spawn(async move {
@@ -1930,7 +2014,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let (file_paths, password, working_dir) = {
+        let (file_paths, password) = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -1957,14 +2041,10 @@ impl Pipeline {
             }
             parts.sort_by_key(|(n, _)| *n);
             let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
-            (
-                paths,
-                state.spec.password.clone(),
-                state.working_dir.clone(),
-            )
+            (paths, state.spec.password.clone())
         };
 
-        let output_dir = working_dir;
+        let output_dir = self.extraction_staging_dir(job_id);
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
 
@@ -2089,7 +2169,7 @@ impl Pipeline {
         set_name: &str,
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
-        let (file_paths, working_dir) = {
+        let file_paths = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -2115,10 +2195,10 @@ impl Pipeline {
             }
             parts.sort_by_key(|(n, _)| *n);
             let paths: Vec<std::path::PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
-            (paths, state.working_dir.clone())
+            paths
         };
 
-        let output_dir = working_dir;
+        let output_dir = self.extraction_staging_dir(job_id);
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
         let extract_done_tx = self.extract_done_tx.clone();

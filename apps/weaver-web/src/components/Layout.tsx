@@ -19,7 +19,7 @@ import {
   requestGraphqlClientRestart,
   useGraphqlConnectionState,
 } from "@/graphql/client";
-import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY } from "@/graphql/queries";
+import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY, VERSION_QUERY } from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { LiveDataContext } from "@/lib/context/live-data-context";
@@ -155,6 +155,9 @@ export function Layout() {
 
   const [{ data: queryData }] = useQuery<Snapshot>({
     query: JOBS_PAGE_QUERY,
+  });
+  const [{ data: versionData }] = useQuery<{ version: string }>({
+    query: VERSION_QUERY,
   });
   const handleSubscription = useCallback(
     (_prev: Snapshot | undefined, response: { jobUpdates: Snapshot }) =>
@@ -344,6 +347,11 @@ export function Layout() {
                     <FolderUp className="size-4" />
                     {t("nav.upload")}
                   </Button>
+                  {versionData?.version ? (
+                    <div className="text-center text-[10px] text-muted-foreground/60">
+                      v{versionData.version}
+                    </div>
+                  ) : null}
                 </div>
               </aside>
 

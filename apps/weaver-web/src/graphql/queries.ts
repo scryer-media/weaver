@@ -97,6 +97,12 @@ const CATEGORY_FIELDS = `
   }
 `;
 
+export const VERSION_QUERY = gql`
+  query Version {
+    version
+  }
+`;
+
 export const BROWSE_DIRECTORIES_QUERY = gql`
   query BrowseDirectories($path: String) {
     browseDirectories(path: $path) {

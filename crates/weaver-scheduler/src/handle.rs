@@ -611,6 +611,7 @@ mod tests {
                             held_segments: Vec::new(),
                             download_queue: DownloadQueue::new(),
                             recovery_queue: DownloadQueue::new(),
+                            staging_dir: None,
                         };
                         let _ = event_tx.send(PipelineEvent::JobCreated {
                             job_id,
@@ -694,6 +695,7 @@ mod tests {
                             held_segments: Vec::new(),
                             download_queue: DownloadQueue::new(),
                             recovery_queue: DownloadQueue::new(),
+                            staging_dir: None,
                         };
                         jobs.insert(job_id, state);
                         let _ = reply.send(Ok(()));

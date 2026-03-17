@@ -668,10 +668,13 @@ impl Pipeline {
                 }
                 let cached_headers = self.load_rar_snapshot(job_id, &set_name);
 
-                let (password, working_dir) = {
-                    let state = self.jobs.get(&job_id).unwrap();
-                    (state.spec.password.clone(), state.working_dir.clone())
-                };
+                let password = self
+                    .jobs
+                    .get(&job_id)
+                    .unwrap()
+                    .spec
+                    .password
+                    .clone();
 
                 info!(
                     job_id = job_id.0,
@@ -692,7 +695,7 @@ impl Pipeline {
                 }
                 scheduled_slots += 1;
 
-                let output_dir = working_dir.clone();
+                let output_dir = self.extraction_staging_dir(job_id);
                 let event_tx = self.event_tx.clone();
                 let db = self.db.clone();
                 let attempted = members_to_extract.clone();

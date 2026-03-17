@@ -673,8 +673,9 @@ impl Pipeline {
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
 
-                    // Delete per-job working directory.
+                    // Delete per-job working and staging directories.
                     let working_dir = state.working_dir.clone();
+                    let staging_dir = state.staging_dir.clone();
                     tokio::spawn(async move {
                         if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
                             && e.kind() != std::io::ErrorKind::NotFound
@@ -683,6 +684,16 @@ impl Pipeline {
                                 dir = %working_dir.display(),
                                 error = %e,
                                 "failed to clean up cancelled job directory"
+                            );
+                        }
+                        if let Some(staging) = staging_dir
+                            && let Err(e) = tokio::fs::remove_dir_all(&staging).await
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(
+                                dir = %staging.display(),
+                                error = %e,
+                                "failed to clean up cancelled job staging directory"
                             );
                         }
                     });
@@ -1220,6 +1231,28 @@ pub(super) fn is_terminal_status(status: &JobStatus) -> bool {
 }
 
 impl Pipeline {
+    /// Get or create the extraction staging directory for a job.
+    ///
+    /// Staging lives under `{complete_dir}/.weaver-staging/{job_id}/` so that
+    /// extracted chunks and assembled files are written directly to the
+    /// complete filesystem (typically NFS/NAS), keeping local intermediate
+    /// storage usage to just RAR volumes.
+    pub(super) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
+        if let Some(state) = self.jobs.get(&job_id)
+            && let Some(ref staging) = state.staging_dir
+        {
+            return staging.clone();
+        }
+        let staging = self
+            .complete_dir
+            .join(".weaver-staging")
+            .join(job_id.0.to_string());
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.staging_dir = Some(staging.clone());
+        }
+        staging
+    }
+
     pub(super) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
         self.write_buffered_bytes += bytes;
         self.write_buffered_segments += segments;
@@ -1638,6 +1671,7 @@ mod tests {
             held_segments: Vec::new(),
             download_queue: DownloadQueue::new(),
             recovery_queue: DownloadQueue::new(),
+            staging_dir: None,
         }
     }
 
@@ -2272,6 +2306,7 @@ mod tests {
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
+                staging_dir: None,
             },
         );
         pipeline.job_order.push(job_id);
@@ -4017,11 +4052,12 @@ mod tests {
     #[tokio::test]
     async fn non_solid_incremental_rar_batches_cleanup_chunks_after_finalize() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
         let job_id = JobId(30007);
         let files = build_multifile_multivolume_rar_set();
         let spec = rar_job_spec("RAR Incremental Chunks", &files);
-        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        let staging_dir = pipeline.extraction_staging_dir(job_id);
 
         for (file_index, (filename, bytes)) in files.iter().take(2).enumerate() {
             write_and_complete_rar_volume(
@@ -4053,9 +4089,9 @@ mod tests {
 
         let chunks = pipeline.db.get_extraction_chunks(job_id, "show").unwrap();
         assert!(chunks.iter().all(|chunk| chunk.member_name != "E01.mkv"));
-        assert!(working_dir.join("E01.mkv").exists());
+        assert!(staging_dir.join("E01.mkv").exists());
         assert!(
-            !working_dir
+            !staging_dir
                 .join(".weaver-chunks")
                 .join("show")
                 .join("E01.mkv")

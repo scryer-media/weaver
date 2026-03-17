@@ -117,6 +117,7 @@ impl Pipeline {
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
+            staging_dir: None,
         };
         self.jobs.insert(job_id, state);
         self.job_order.push(job_id);
@@ -304,6 +305,7 @@ impl Pipeline {
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
+                staging_dir: None,
             };
             self.jobs.insert(job_id, state);
         }
@@ -560,6 +562,7 @@ impl Pipeline {
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
+            staging_dir: None,
         };
         self.jobs.insert(job_id, state);
         self.job_order.push(job_id);

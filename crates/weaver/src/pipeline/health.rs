@@ -160,7 +160,7 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
-        if let Some(state) = self.jobs.get_mut(&job_id) {
+        let staging_dir = if let Some(state) = self.jobs.get_mut(&job_id) {
             state.status = JobStatus::Failed {
                 error: error.clone(),
             };
@@ -168,6 +168,23 @@ impl Pipeline {
             // Clear per-job queues to free memory.
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
+            state.staging_dir.take()
+        } else {
+            None
+        };
+        // Clean up staging directory if it was created.
+        if let Some(staging) = staging_dir {
+            tokio::spawn(async move {
+                if let Err(e) = tokio::fs::remove_dir_all(&staging).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        dir = %staging.display(),
+                        error = %e,
+                        "failed to clean up staging directory on job failure"
+                    );
+                }
+            });
         }
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);

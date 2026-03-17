@@ -19,6 +19,8 @@ pub enum JobStatus {
     Verifying,
     Repairing,
     Extracting,
+    /// Moving extracted files to the final destination directory.
+    Moving,
     Complete,
     Failed {
         error: String,
@@ -93,6 +95,10 @@ pub struct JobState {
     pub download_queue: DownloadQueue,
     /// Recovery download queue (PAR2 repair blocks, spare bandwidth).
     pub recovery_queue: DownloadQueue,
+    /// Staging directory for extraction output (under complete_dir).
+    /// Extraction writes chunks and assembled files here instead of
+    /// working_dir, keeping local storage usage low for NFS setups.
+    pub staging_dir: Option<PathBuf>,
 }
 
 /// Current wall-clock time as Unix epoch milliseconds.
