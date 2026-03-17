@@ -1,41 +1,43 @@
 use super::*;
+use std::cell::RefCell;
 use std::io::Write;
+use std::rc::Rc;
 
-struct ChunkFileWriter {
+/// Shared output file that multiple `DirectOutputWriter` instances write to.
+/// Each writer tracks per-volume bytes but the underlying file is the same.
+struct SharedOutputFile {
     inner: std::io::BufWriter<std::fs::File>,
+}
+
+/// Per-volume writer wrapper returned by the extraction writer factory.
+/// Wraps a shared output file via `Rc<RefCell<...>>` and tracks bytes
+/// written during this volume's contribution.
+struct DirectOutputWriter {
+    shared: Rc<RefCell<SharedOutputFile>>,
     bytes_written: u64,
 }
 
-impl ChunkFileWriter {
-    fn new(inner: std::io::BufWriter<std::fs::File>) -> Self {
-        Self {
-            inner,
-            bytes_written: 0,
-        }
-    }
-}
-
-impl std::io::Write for ChunkFileWriter {
+impl std::io::Write for DirectOutputWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(buf)?;
+        let written = self.shared.borrow_mut().inner.write(buf)?;
         self.bytes_written += written as u64;
         Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.shared.borrow_mut().inner.flush()
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(buf)?;
+        self.shared.borrow_mut().inner.write_all(buf)?;
         self.bytes_written += buf.len() as u64;
         Ok(())
     }
 }
 
-impl Drop for ChunkFileWriter {
+impl Drop for DirectOutputWriter {
     fn drop(&mut self) {
-        let _ = self.inner.flush();
+        let _ = self.shared.borrow_mut().inner.flush();
     }
 }
 
@@ -111,10 +113,6 @@ impl Pipeline {
             .join(member_name)
     }
 
-    fn member_chunk_path(chunk_dir: &std::path::Path, volume_index: u32) -> PathBuf {
-        chunk_dir.join(format!("{volume_index:05}.chunk"))
-    }
-
     fn clear_member_extraction_artifacts(
         db: &weaver_state::Database,
         job_id: JobId,
@@ -166,10 +164,7 @@ impl Pipeline {
         Ok(())
     }
 
-    fn finalize_member_output(
-        ctx: FinalizeMemberContext<'_>,
-        chunks: &[weaver_state::ExtractionChunk],
-    ) -> Result<u64, String> {
+    fn finalize_member_output(ctx: FinalizeMemberContext<'_>) -> Result<u64, String> {
         let FinalizeMemberContext {
             db,
             event_tx,
@@ -186,6 +181,7 @@ impl Pipeline {
             member: member_name.to_string(),
         });
 
+        // Remove stale final output if it exists (e.g., from a previous attempt).
         match std::fs::remove_file(out_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -197,108 +193,31 @@ impl Pipeline {
             }
         }
 
-        // Fast path: single chunk → rename directly to final output, no copy needed.
-        let total_written = if chunks.len() == 1 {
-            let chunk = &chunks[0];
-            let size = std::fs::metadata(&chunk.temp_path)
-                .map_err(|e| format!("failed to stat extraction chunk {}: {e}", chunk.temp_path))?
-                .len();
-            std::fs::rename(&chunk.temp_path, out_path).map_err(|e| {
+        // The partial file already contains the complete decompressed output
+        // (written directly during extraction). Just rename to final path.
+        let size = std::fs::metadata(partial_path)
+            .map_err(|e| {
                 format!(
-                    "failed to rename single chunk {} to {}: {e}",
-                    chunk.temp_path,
-                    out_path.display()
-                )
-            })?;
-            if let Err(error) =
-                db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
-            {
-                warn!(
-                    job_id = job_id.0,
-                    set_name,
-                    member = member_name,
-                    volume = chunk.volume_index,
-                    error = %error,
-                    "failed to mark extraction chunk appended"
-                );
-            }
-            size
-        } else {
-            let mut partial = std::io::BufWriter::with_capacity(
-                8 * 1024 * 1024,
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(partial_path)
-                    .map_err(|e| {
-                        format!(
-                            "failed to create partial output {}: {e}",
-                            partial_path.display()
-                        )
-                    })?,
-            );
-            let mut written_total = 0u64;
-            for chunk in chunks {
-                let mut chunk_file = std::io::BufReader::with_capacity(
-                    8 * 1024 * 1024,
-                    std::fs::File::open(&chunk.temp_path).map_err(|e| {
-                        format!("failed to open extraction chunk {}: {e}", chunk.temp_path)
-                    })?,
-                );
-                let written = std::io::copy(&mut chunk_file, &mut partial).map_err(|e| {
-                    format!(
-                        "failed to append extraction chunk {} to {}: {e}",
-                        chunk.temp_path,
-                        partial_path.display()
-                    )
-                })?;
-                written_total += written;
-                if let Err(error) =
-                    db.mark_chunk_appended(job_id, set_name, member_name, chunk.volume_index)
-                {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name,
-                        member = member_name,
-                        volume = chunk.volume_index,
-                        error = %error,
-                        "failed to mark extraction chunk appended"
-                    );
-                }
-            }
-            partial.flush().map_err(|e| {
-                format!(
-                    "failed to flush partial output {}: {e}",
+                    "failed to stat partial output {}: {e}",
                     partial_path.display()
                 )
-            })?;
-            drop(partial);
-            std::fs::rename(partial_path, out_path)
-                .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
+            })?
+            .len();
+        std::fs::rename(partial_path, out_path)
+            .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
 
-            for chunk in chunks {
-                match std::fs::remove_file(&chunk.temp_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to remove extraction chunk {}: {error}",
-                            chunk.temp_path
-                        ));
-                    }
-                }
-            }
-            written_total
-        };
+        // Clean up legacy chunk directory if it exists (backward compat
+        // for interrupted upgrades from chunk-file extraction).
         match std::fs::remove_dir_all(chunk_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!(
-                    "failed to remove extraction chunk dir {}: {error}",
-                    chunk_dir.display()
-                ));
+                warn!(
+                    job_id = job_id.0,
+                    path = %chunk_dir.display(),
+                    error = %error,
+                    "failed to remove legacy chunk dir during finalize"
+                );
             }
         }
 
@@ -318,7 +237,7 @@ impl Pipeline {
             member: member_name.to_string(),
         });
 
-        Ok(total_written)
+        Ok(size)
     }
 
     pub(super) fn extract_rar_member_to_output(
@@ -364,6 +283,7 @@ impl Pipeline {
             member: member_name.clone(),
         });
 
+        // Clean up any stale artifacts from previous extraction attempts.
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
         Self::clear_member_extraction_artifacts(
             db,
@@ -373,13 +293,25 @@ impl Pipeline {
             &partial_path,
             &chunk_dir,
         )?;
-        std::fs::create_dir_all(&chunk_dir).map_err(|e| {
-            format!(
-                "failed to create extraction chunk dir {}: {e}",
-                chunk_dir.display()
-            )
-        })?;
+
+        // Open the shared output file — all volumes write directly here.
+        let partial_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&partial_path)
+            .map_err(|e| {
+                format!(
+                    "failed to create partial output {}: {e}",
+                    partial_path.display()
+                )
+            })?;
+        let shared = Rc::new(RefCell::new(SharedOutputFile {
+            inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
+        }));
+
         let chunk_records: Result<Vec<(u32, u64)>, weaver_rar::RarError> = if is_solid {
+            let shared_ref = Rc::clone(&shared);
             archive
                 .extract_member_solid_chunked(idx, options, |absolute_volume| {
                     let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
@@ -389,16 +321,11 @@ impl Pipeline {
                             ),
                         }
                     })?;
-                    let chunk_path = Self::member_chunk_path(&chunk_dir, absolute_volume);
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&chunk_path)
-                        .map_err(weaver_rar::RarError::Io)?;
-                    Ok(Box::new(ChunkFileWriter::new(
-                        std::io::BufWriter::with_capacity(8 * 1024 * 1024, file),
-                    )))
+                    let _ = absolute_volume; // used only for the u32 check
+                    Ok(Box::new(DirectOutputWriter {
+                        shared: Rc::clone(&shared_ref),
+                        bytes_written: 0,
+                    }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
                     records
@@ -426,19 +353,13 @@ impl Pipeline {
                 provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
             }
             let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
+            let shared_ref = Rc::clone(&shared);
             archive
-                .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
-                    let absolute_volume = first_volume + local_volume as u32;
-                    let chunk_path = Self::member_chunk_path(&chunk_dir, absolute_volume);
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&chunk_path)
-                        .map_err(weaver_rar::RarError::Io)?;
-                    Ok(Box::new(ChunkFileWriter::new(
-                        std::io::BufWriter::with_capacity(8 * 1024 * 1024, file),
-                    )))
+                .extract_member_streaming_chunked(idx, options, &provider, |_local_volume| {
+                    Ok(Box::new(DirectOutputWriter {
+                        shared: Rc::clone(&shared_ref),
+                        bytes_written: 0,
+                    }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
                     records
@@ -454,23 +375,28 @@ impl Pipeline {
             format!("failed to extract {member_name}: {error}")
         })?;
 
+        // Flush the shared writer now that extraction is complete.
+        if let Ok(mut shared_file) = shared.try_borrow_mut() {
+            let _ = shared_file.inner.flush();
+        }
+
+        // Persist chunk offset records to DB for progress tracking.
+        let partial_path_str = partial_path.to_string_lossy().to_string();
         let mut persisted_chunks = Vec::with_capacity(chunk_records.len());
         let mut next_offset = 0u64;
-        for (absolute_volume, bytes_written) in chunk_records {
+        for (absolute_volume, bytes_written) in &chunk_records {
             let start_offset = next_offset;
             let end_offset = start_offset + bytes_written;
             next_offset = end_offset;
             persisted_chunks.push(weaver_state::ExtractionChunk {
                 member_name: member_name.clone(),
-                volume_index: absolute_volume,
-                bytes_written,
-                temp_path: Self::member_chunk_path(&chunk_dir, absolute_volume)
-                    .to_string_lossy()
-                    .to_string(),
+                volume_index: *absolute_volume,
+                bytes_written: *bytes_written,
+                temp_path: partial_path_str.clone(),
                 start_offset,
                 end_offset,
                 verified: true,
-                appended: false,
+                appended: true,
             });
         }
         if let Err(error) =
@@ -480,19 +406,17 @@ impl Pipeline {
             return Err(format!("failed to persist extraction chunks: {error}"));
         }
 
-        let bytes_written = match Self::finalize_member_output(
-            FinalizeMemberContext {
-                db,
-                event_tx,
-                job_id,
-                set_name,
-                member_name: &member_name,
-                partial_path: &partial_path,
-                out_path: &out_path,
-                chunk_dir: &chunk_dir,
-            },
-            &persisted_chunks,
-        ) {
+        // Finalize: rename .partial → final output, emit events, clear DB rows.
+        let bytes_written = match Self::finalize_member_output(FinalizeMemberContext {
+            db,
+            event_tx,
+            job_id,
+            set_name,
+            member_name: &member_name,
+            partial_path: &partial_path,
+            out_path: &out_path,
+            chunk_dir: &chunk_dir,
+        }) {
             Ok(bytes_written) => bytes_written,
             Err(error) => {
                 let _ = std::fs::remove_file(&partial_path);
