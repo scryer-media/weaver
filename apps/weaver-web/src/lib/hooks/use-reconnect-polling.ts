@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { type AnyVariables, type DocumentInput, useClient } from "urql";
+import { refreshSessionToken } from "@/graphql/client";
 
 const INITIAL_POLL_DELAY_MS = 0;
 const POLL_INTERVAL_MS = 2_000;
@@ -58,6 +59,10 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
       }
 
       setIsPolling(true);
+
+      // After a backend restart the session token is stale — refresh it
+      // from the server's index HTML before attempting the query.
+      await refreshSessionToken();
 
       try {
         const result = await client

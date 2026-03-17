@@ -295,7 +295,7 @@ export function authHeaders(): Record<string, string> {
  * After a server restart, the token embedded in the original HTML is stale —
  * the server injects a new one into every response for `/`.
  */
-async function refreshSessionToken(): Promise<boolean> {
+export async function refreshSessionToken(): Promise<boolean> {
   try {
     const res = await fetch("/", { credentials: "same-origin" });
     if (!res.ok) return false;
