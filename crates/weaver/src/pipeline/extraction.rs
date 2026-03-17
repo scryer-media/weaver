@@ -668,13 +668,7 @@ impl Pipeline {
                 }
                 let cached_headers = self.load_rar_snapshot(job_id, &set_name);
 
-                let password = self
-                    .jobs
-                    .get(&job_id)
-                    .unwrap()
-                    .spec
-                    .password
-                    .clone();
+                let password = self.jobs.get(&job_id).unwrap().spec.password.clone();
 
                 info!(
                     job_id = job_id.0,

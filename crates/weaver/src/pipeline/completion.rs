@@ -377,9 +377,7 @@ impl Pipeline {
         // Verify at least one source directory exists before creating
         // the destination, so a missing source doesn't leave behind an
         // empty complete dir.
-        let staging_exists = staging_dir
-            .as_ref()
-            .is_some_and(|s| s.exists());
+        let staging_exists = staging_dir.as_ref().is_some_and(|s| s.exists());
         let working_exists = working_dir.exists();
         if !staging_exists && !working_exists {
             return Err(format!(
@@ -404,58 +402,58 @@ impl Pipeline {
         if let Some(ref staging) = staging_dir
             && let Ok(mut entries) = tokio::fs::read_dir(staging).await
         {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let file_name = entry.file_name();
-                    if file_name == ".weaver-chunks" {
-                        let src = entry.path();
-                        if let Err(error) = tokio::fs::remove_dir_all(&src).await
-                            && error.kind() != std::io::ErrorKind::NotFound
-                        {
-                            warn!(
-                                path = %src.display(),
-                                error = %error,
-                                "failed to remove chunk workspace during final move"
-                            );
-                        }
-                        continue;
-                    }
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let file_name = entry.file_name();
+                if file_name == ".weaver-chunks" {
                     let src = entry.path();
-                    let dst = dest.join(&file_name);
-                    match tokio::fs::rename(&src, &dst).await {
-                        Ok(()) => {
-                            moved += 1;
-                        }
-                        Err(rename_err) => {
-                            let src_fb = src.clone();
-                            let dst_fb = dst.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                move_path_with_copy_fallback(&src_fb, &dst_fb)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {
-                                    moved += 1;
-                                }
-                                Ok(Err(copy_err)) => {
-                                    failures.push(format!(
-                                        "{}: rename failed: {}; fallback failed: {}",
-                                        file_name.to_string_lossy(),
-                                        rename_err,
-                                        copy_err
-                                    ));
-                                }
-                                Err(join_err) => {
-                                    failures.push(format!(
-                                        "{}: rename failed: {}; fallback task failed: {}",
-                                        file_name.to_string_lossy(),
-                                        rename_err,
-                                        join_err
-                                    ));
-                                }
+                    if let Err(error) = tokio::fs::remove_dir_all(&src).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            path = %src.display(),
+                            error = %error,
+                            "failed to remove chunk workspace during final move"
+                        );
+                    }
+                    continue;
+                }
+                let src = entry.path();
+                let dst = dest.join(&file_name);
+                match tokio::fs::rename(&src, &dst).await {
+                    Ok(()) => {
+                        moved += 1;
+                    }
+                    Err(rename_err) => {
+                        let src_fb = src.clone();
+                        let dst_fb = dst.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            move_path_with_copy_fallback(&src_fb, &dst_fb)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                moved += 1;
+                            }
+                            Ok(Err(copy_err)) => {
+                                failures.push(format!(
+                                    "{}: rename failed: {}; fallback failed: {}",
+                                    file_name.to_string_lossy(),
+                                    rename_err,
+                                    copy_err
+                                ));
+                            }
+                            Err(join_err) => {
+                                failures.push(format!(
+                                    "{}: rename failed: {}; fallback task failed: {}",
+                                    file_name.to_string_lossy(),
+                                    rename_err,
+                                    join_err
+                                ));
                             }
                         }
                     }
                 }
+            }
         }
 
         // Move any remaining non-archive files from working_dir (NFOs, SRTs, etc.).
