@@ -629,19 +629,7 @@ impl NntpConnection {
         F: FnMut(&[u8]) -> Result<()>,
     {
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
-        let mut initial = self.send_command(&cmd).await?;
-
-        // Handle mid-session re-auth (480) transparently.
-        if initial.code.raw() == 480 {
-            if let Some((user, pass)) = self.credentials.clone() {
-                debug!("stream_body_chunked: re-authenticating after 480");
-                self.authenticate(&user, &pass).await?;
-                self.current_group = None;
-                initial = self.send_command(&cmd).await?;
-            } else {
-                return Err(NntpError::AuthenticationRequired);
-            }
-        }
+        let initial = self.send_command(&cmd).await?;
 
         if initial.code.is_error() {
             return Err(NntpError::from_status(initial.code, &initial.message));

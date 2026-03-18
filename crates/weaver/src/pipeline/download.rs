@@ -339,10 +339,6 @@ impl Pipeline {
     }
 
     /// Spawn a download task for a single segment.
-    ///
-    /// Uses the streaming NNTP path to avoid full-article buffering in the
-    /// codec, but still hands the accumulated body to the existing decode
-    /// queue to preserve backpressure and scheduler semantics.
     pub(super) fn spawn_download(&mut self, work: DownloadWork, is_recovery: bool) {
         let job_id = work.segment_id.file_id.job_id;
         self.active_downloads += 1;
@@ -360,22 +356,10 @@ impl Pipeline {
         let retry_count = work.retry_count;
 
         tokio::spawn(async move {
-            // Stream body chunks from NNTP, accumulating into a buffer.
-            // Unlike the old path (body_by_id_raw → full codec scan), this
-            // avoids the codec's full-buffer terminator scan — chunks are
-            // yielded as they arrive from the socket.
-            let mut accumulated = Vec::new();
-            let result = nntp
-                .fetch_body_streaming(&message_id, &groups, |chunk| {
-                    accumulated.extend_from_slice(chunk);
-                    Ok(())
-                })
-                .await;
-
-            let data = match result {
-                Ok(_total_bytes) => Ok(Bytes::from(accumulated)),
-                Err(e) => Err(e.to_string()),
-            };
+            let data = nntp
+                .fetch_body_with_groups(&message_id, &groups)
+                .await
+                .map_err(|e| e.to_string());
 
             let _ = tx
                 .send(DownloadResult {
@@ -437,6 +421,8 @@ impl Pipeline {
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
+
+                // (Per-job byte tracking moved to handle_decode_done to use decoded size.)
 
                 let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,

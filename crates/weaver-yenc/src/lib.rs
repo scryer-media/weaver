@@ -27,7 +27,6 @@ pub mod encode;
 pub mod error;
 pub mod header;
 pub mod simd;
-pub mod streaming;
 pub mod types;
 
 // Convenience re-exports.
@@ -37,5 +36,4 @@ pub use decode::{
 pub use encode::{encode, encode_part};
 pub use error::YencError;
 pub use header::extract_filename_from_subject;
-pub use streaming::StreamingYencDecoder;
 pub use types::{DecodeResult, YencMetadata};
