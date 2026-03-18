@@ -33,11 +33,10 @@ Instead of the traditional sequential approach (download everything, then repair
 - **Built-in RAR extraction** — handles RAR4 and RAR5 archives natively, including solid and encrypted archives
 - **RSS automation** — monitor feeds and auto-download with customizable rules
 - **Categories** — organize downloads with glob-based filename matching
-- **ISP bandwidth caps** — set monthly data limits with configurable billing windows
+- **Monthly quotas** — set monthly, weekly, or daily data limits with configurable billing windows
 - **API key security** — protect the web interface with authentication
 - **Reverse proxy ready** — first-class support for subpath hosting (e.g., `/weaver/`)
 - **Prometheus metrics** — monitor performance with your existing observability stack
-- **Backup & restore** — export and import your complete configuration
 - **Multi-arch Docker images** — runs on `amd64` and `arm64`
 
 ## Install
@@ -163,11 +162,10 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | Multi-server | Yes | Yes | Yes |
 | RSS automation | Yes | Yes | Yes |
 | Categories | Yes | Yes | Yes |
-| ISP bandwidth caps | Yes | No | No |
+| Monthly quotas | Yes | No | Yes |
 | Prometheus metrics | Yes | No | No |
 | Reverse proxy subpath | Yes | Yes | Yes |
 | API authentication | Yes | Yes | Yes |
-| Backup & restore | Yes | No | No |
 | Docker multi-arch | Yes | Yes | Yes |
 | Obfuscation handling | Planned | Yes | Yes |
 
