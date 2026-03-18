@@ -333,8 +333,8 @@ jobs:
           REPO="${{ github.repository }}"
 
           mkdir -p formula
-          cat > formula/weaver.rb << 'FORMULA'
-          class Weaver < Formula
+          cat > formula/weaver-usenet.rb << 'FORMULA'
+          class WeaverUsenet < Formula
             desc "Unified Usenet binary downloader, repair, and extraction engine"
             homepage "https://github.com/REPO_PLACEHOLDER"
             version "VERSION_PLACEHOLDER"
@@ -362,15 +362,15 @@ jobs:
           end
           FORMULA
 
-          sed -i 's/^          //' formula/weaver.rb
-          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" formula/weaver.rb
-          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" formula/weaver.rb
-          sed -i "s|ARM_SHA_PLACEHOLDER|${ARM_SHA}|g" formula/weaver.rb
-          sed -i "s|X86_SHA_PLACEHOLDER|${X86_SHA}|g" formula/weaver.rb
+          sed -i 's/^          //' formula/weaver-usenet.rb
+          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" formula/weaver-usenet.rb
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" formula/weaver-usenet.rb
+          sed -i "s|ARM_SHA_PLACEHOLDER|${ARM_SHA}|g" formula/weaver-usenet.rb
+          sed -i "s|X86_SHA_PLACEHOLDER|${X86_SHA}|g" formula/weaver-usenet.rb
 
           git clone "https://${TAP_TOKEN}@github.com/scryer-media/homebrew-weaver.git" tap-repo
           mkdir -p tap-repo/Formula
-          cp formula/weaver.rb tap-repo/Formula/weaver.rb
+          cp formula/weaver-usenet.rb tap-repo/Formula/weaver-usenet.rb
           cd tap-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
