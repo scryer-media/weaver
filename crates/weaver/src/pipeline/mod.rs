@@ -2659,7 +2659,6 @@ mod tests {
                 data: Ok(raw),
                 is_recovery: false,
                 retry_count: 0,
-                decoded_inline: false,
             })
             .await;
         drain_decode_results(&mut pipeline, 1).await;
@@ -2968,7 +2967,6 @@ mod tests {
                 data: Ok(Bytes::from_static(b"not a yenc article")),
                 is_recovery: false,
                 retry_count: 0,
-                decoded_inline: false,
             })
             .await;
 
