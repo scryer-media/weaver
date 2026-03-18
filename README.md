@@ -42,16 +42,24 @@ Instead of the traditional sequential approach (download everything, then repair
 
 ## Install
 
-### Homebrew (Linux)
+### Homebrew (macOS / Linux)
 
 ```bash
 brew tap scryer-media/weaver
 brew install weaver-usenet
 ```
 
+To run as a background service (auto-starts on login, restarts on crash):
+
+```bash
+brew services start weaver-usenet
+brew services stop weaver-usenet
+brew services restart weaver-usenet
+```
+
 ### Binary
 
-Download the latest release from the [releases page](https://github.com/scryer-media/weaver/releases).
+Download the latest release from the [releases page](https://github.com/scryer-media/weaver/releases). Available for Linux (x86_64, arm64) and macOS (Apple Silicon, Intel).
 
 ### Docker
 
