@@ -50,6 +50,10 @@ pub(super) struct DownloadResult {
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
     pub(super) retry_count: u32,
+    /// True if decode was done inline during streaming download.
+    /// When set, `data` is `Ok(empty)` and a separate `DecodeDone`
+    /// has already been sent — skip the decode queue.
+    pub(super) decoded_inline: bool,
 }
 
 /// Successful download payload waiting for decode scheduling.
@@ -2613,6 +2617,7 @@ mod tests {
                     data: Ok(raw),
                     is_recovery: false,
                     retry_count: 0,
+                    decoded_inline: false,
                 }),
             )
             .await
@@ -2659,6 +2664,7 @@ mod tests {
                 data: Ok(raw),
                 is_recovery: false,
                 retry_count: 0,
+                decoded_inline: false,
             })
             .await;
         drain_decode_results(&mut pipeline, 1).await;
@@ -2743,6 +2749,7 @@ mod tests {
                     data: Ok(raw),
                     is_recovery: false,
                     retry_count: 0,
+                    decoded_inline: false,
                 })
                 .await;
         }
@@ -2967,6 +2974,7 @@ mod tests {
                 data: Ok(Bytes::from_static(b"not a yenc article")),
                 is_recovery: false,
                 retry_count: 0,
+                decoded_inline: false,
             })
             .await;
 

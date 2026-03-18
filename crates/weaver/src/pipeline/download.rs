@@ -339,6 +339,10 @@ impl Pipeline {
     }
 
     /// Spawn a download task for a single segment.
+    ///
+    /// Uses the streaming path: chunks are forwarded via a bounded channel
+    /// to a blocking decode worker that runs `StreamingYencDecoder`. The
+    /// article body is never fully buffered in memory.
     pub(super) fn spawn_download(&mut self, work: DownloadWork, is_recovery: bool) {
         let job_id = work.segment_id.file_id.job_id;
         self.active_downloads += 1;
@@ -349,27 +353,156 @@ impl Pipeline {
         self.mark_download_pass_started(job_id);
 
         let nntp = Arc::clone(&self.nntp);
-        let tx = self.download_done_tx.clone();
+        let download_done_tx = self.download_done_tx.clone();
+        let decode_done_tx = self.decode_done_tx.clone();
         let segment_id = work.segment_id;
         let message_id = work.message_id.to_string();
         let groups = work.groups;
         let retry_count = work.retry_count;
+        let metrics = Arc::clone(&self.metrics);
 
         tokio::spawn(async move {
-            let data = nntp
-                .fetch_body_with_groups(&message_id, &groups)
-                .await
-                .map_err(|e| e.to_string());
+            // Bounded channel: 4 slots × ~64KB = ~256KB max buffered.
+            // Backpressure: if the decode worker falls behind, the async
+            // task blocks on send, which slows socket reads.
+            let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
 
-            let _ = tx
-                .send(DownloadResult {
-                    segment_id,
-                    data,
-                    is_recovery,
-                    retry_count,
+            // Spawn the blocking decode worker.
+            let decode_metrics = Arc::clone(&metrics);
+            let decode_handle = tokio::task::spawn_blocking(move || {
+                Self::streaming_decode_worker(segment_id, chunk_rx, decode_metrics)
+            });
+
+            // Stream body chunks from NNTP → channel.
+            let stream_result = nntp
+                .fetch_body_streaming(&message_id, &groups, |chunk| {
+                    // Blocking send in async context: this is fine because
+                    // the bounded channel provides natural backpressure.
+                    // Use blocking_send from the async side via a sync wrapper.
+                    chunk_tx
+                        .blocking_send(chunk.to_vec())
+                        .map_err(|_| weaver_nntp::NntpError::ConnectionClosed)
                 })
                 .await;
+
+            // Drop the sender to signal EOF to the decode worker.
+            drop(chunk_tx);
+
+            match stream_result {
+                Ok(_total_bytes) => {
+                    // Wait for the decode worker to finish.
+                    match decode_handle.await {
+                        Ok(Ok(decode_result)) => {
+                            let _ = download_done_tx
+                                .send(DownloadResult {
+                                    segment_id,
+                                    data: Ok(bytes::Bytes::new()), // placeholder
+                                    is_recovery,
+                                    retry_count,
+                                    decoded_inline: true,
+                                })
+                                .await;
+                            // Send decode result directly — bypass the pending
+                            // decode queue since decode is already done.
+                            let _ = decode_done_tx.blocking_send(decode_result);
+                        }
+                        Ok(Err(error)) => {
+                            let _ = download_done_tx
+                                .send(DownloadResult {
+                                    segment_id,
+                                    data: Err(error),
+                                    is_recovery,
+                                    retry_count,
+                                    decoded_inline: false,
+                                })
+                                .await;
+                        }
+                        Err(join_err) => {
+                            let _ = download_done_tx
+                                .send(DownloadResult {
+                                    segment_id,
+                                    data: Err(format!("decode worker panicked: {join_err}")),
+                                    is_recovery,
+                                    retry_count,
+                                    decoded_inline: false,
+                                })
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = download_done_tx
+                        .send(DownloadResult {
+                            segment_id,
+                            data: Err(e.to_string()),
+                            is_recovery,
+                            retry_count,
+                            decoded_inline: false,
+                        })
+                        .await;
+                }
+            }
         });
+    }
+
+    /// Blocking decode worker: reads chunks from channel, feeds to
+    /// StreamingYencDecoder, produces DecodeDone when complete.
+    fn streaming_decode_worker(
+        segment_id: SegmentId,
+        chunk_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        metrics: Arc<weaver_scheduler::PipelineMetrics>,
+    ) -> Result<DecodeDone, String> {
+        let mut chunk_rx = chunk_rx;
+        let mut decoder = weaver_yenc::StreamingYencDecoder::new();
+        // Output buffer: typical yEnc articles decode to ~750KB.
+        let mut output = vec![0u8; 1024 * 1024];
+        let mut total_written = 0usize;
+
+        while let Some(chunk) = chunk_rx.blocking_recv() {
+            // Grow output buffer if needed.
+            if total_written + chunk.len() > output.len() {
+                output.resize(output.len() * 2, 0);
+            }
+            match decoder.feed(&chunk, &mut output[total_written..]) {
+                Ok(written) => {
+                    total_written += written;
+                }
+                Err(e) => {
+                    metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(format!("streaming yEnc decode failed: {e}"));
+                }
+            }
+        }
+
+        match decoder.finish() {
+            Ok(result) => {
+                output.truncate(total_written);
+                metrics
+                    .bytes_decoded
+                    .fetch_add(total_written as u64, Ordering::Relaxed);
+                metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
+
+                let file_offset = result
+                    .metadata
+                    .begin
+                    .map(|b| b.saturating_sub(1))
+                    .unwrap_or(0);
+
+                Ok(DecodeDone::Success(DecodeResult {
+                    segment_id,
+                    file_offset,
+                    decoded_size: total_written as u32,
+                    crc_valid: result.crc_valid,
+                    crc32: result.part_crc,
+                    data: DecodedChunk::from(output),
+                    yenc_name: result.metadata.name,
+                }))
+            }
+            Err(e) => {
+                metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                Err(format!("streaming yEnc finish failed: {e}"))
+            }
+        }
     }
 
     /// Handle a completed download — queue for decode.
@@ -422,12 +555,18 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
 
-                // (Per-job byte tracking moved to handle_decode_done to use decoded size.)
-
                 let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
                     raw_size,
                 });
+
+                // Streaming path: decode was done inline during download.
+                // A separate DecodeDone has already been sent — skip the
+                // decode queue entirely.
+                if result.decoded_inline {
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
 
                 self.metrics.decode_pending.fetch_add(1, Ordering::Relaxed);
                 self.pending_decode.push_back(PendingDecodeWork {

@@ -8,7 +8,6 @@
 //! This decoder has **no NNTP knowledge** — it receives clean payload bytes
 //! with dot-unstuffing already handled by the transport layer.
 
-use crate::crc::Crc32;
 use crate::error::YencError;
 use crate::header;
 use crate::types::{DecodeResult, YencMetadata};
@@ -84,7 +83,7 @@ impl StreamingYencDecoder {
     /// Assert that a complete article was seen and validate CRC/size.
     /// Does NOT parse trailer bytes — those were consumed by `feed()`.
     pub fn finish(self) -> Result<StreamingDecodeResult, YencError> {
-        let metadata = self.metadata.ok_or_else(|| YencError::MissingHeader)?;
+        let metadata = self.metadata.ok_or(YencError::MissingHeader)?;
         let bytes_written = self.decode_state.bytes_decoded as usize;
         let part_crc = self.decode_state.finalize_crc();
 
