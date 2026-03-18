@@ -23,7 +23,7 @@ jobs:
 
   web-build:
     name: web-build
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -54,7 +54,7 @@ jobs:
 
   rust-fmt:
     name: rust-fmt
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -68,7 +68,7 @@ jobs:
 
   rust-audit:
     name: rust-audit
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -85,7 +85,7 @@ jobs:
 
   rust-clippy:
     name: rust-clippy
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 20
     needs: [web-build]
     steps:
@@ -107,7 +107,7 @@ jobs:
 
   rust-test:
     name: rust-test
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 45
     needs: [web-build]
     steps:
@@ -128,7 +128,7 @@ jobs:
 
   rust-test-arm:
     name: rust-test-arm
-    runs-on: ubuntu-24.04-arm
+    runs-on: scryer-arm-linux
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -141,7 +141,7 @@ jobs:
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -190,16 +190,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             platform: linux-x86_64
-            runs_on: ubuntu-24.04
+            runs_on: scryer-x86-linux
           - target: aarch64-unknown-linux-musl
             platform: linux-arm64
-            runs_on: ubuntu-24.04-arm
+            runs_on: scryer-arm-linux
           - target: aarch64-apple-darwin
             platform: darwin-arm64
-            runs_on: macos-latest
+            runs_on: macos-26-xlarge
           - target: x86_64-apple-darwin
             platform: darwin-x86_64
-            runs_on: macos-latest-large
+            runs_on: macos-26-large
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -245,7 +245,7 @@ jobs:
   docker-publish:
     name: docker-publish
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 20
     needs: [rust-package]
     permissions:
@@ -298,7 +298,7 @@ jobs:
   github-release:
     name: github-release
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    runs-on: ubuntu-24.04
+    runs-on: scryer-x86-linux
     timeout-minutes: 10
     needs: [rust-package]
     permissions:
