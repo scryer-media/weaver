@@ -266,6 +266,80 @@ git push origin "$BRANCH"
 git push origin "$TAG_NAME"
 ok "Pushed $BRANCH and tag $TAG_NAME"
 
+# ── Cull old release artifacts (keep most recent 4) ───────────────────────────
+step "Culling old release artifacts (keeping 4 most recent)"
+
+KEEP=4
+ORG="scryer-media"
+PACKAGE="weaver"
+
+# Delete old GitHub Releases (keeps tags for rebuilding from source).
+OLD_RELEASES="$(gh release list --json tagName -q '.[].tagName' | tail -n +$((KEEP + 1)))"
+if [[ -n "$OLD_RELEASES" ]]; then
+    while IFS= read -r tag; do
+        echo "   Deleting release $tag..."
+        gh release delete "$tag" --yes 2>/dev/null || true
+    done <<< "$OLD_RELEASES"
+    ok "Old releases deleted"
+else
+    ok "No old releases to cull"
+fi
+
+# Delete old GHCR Docker images. Each release produces a tagged manifest
+# plus untagged platform layers. Find the cutoff timestamp from the Nth
+# most recent tagged image, then delete everything older.
+if gh api "orgs/$ORG/packages/container/$PACKAGE" &>/dev/null; then
+    # Get the created_at of the Nth most recent tagged image, then subtract
+    # 60 seconds to ensure we keep all layers from that CI run.
+    RAW_CUTOFF="$(
+        gh api "orgs/$ORG/packages/container/$PACKAGE/versions" \
+            --paginate \
+            -q "[.[] | select(.metadata.container.tags | length > 0)]
+                | sort_by(.created_at) | reverse
+                | .[$((KEEP - 1))].created_at // empty"
+    )"
+
+    if [[ -n "$RAW_CUTOFF" ]]; then
+        # Subtract 60s from the cutoff to keep all layers from the same CI run.
+        if date --version &>/dev/null 2>&1; then
+            # GNU date
+            CUTOFF_TS="$(date -u -d "$RAW_CUTOFF - 60 seconds" +%Y-%m-%dT%H:%M:%SZ)"
+        else
+            # BSD date (macOS)
+            EPOCH="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$RAW_CUTOFF" +%s)"
+            CUTOFF_TS="$(date -j -u -f "%s" "$((EPOCH - 60))" +%Y-%m-%dT%H:%M:%SZ)"
+        fi
+    fi
+    CUTOFF_TS="${CUTOFF_TS:-}"
+
+    if [[ -n "$CUTOFF_TS" ]]; then
+        # Delete all versions created before the cutoff (older than Nth release).
+        OLD_IDS="$(
+            gh api "orgs/$ORG/packages/container/$PACKAGE/versions" \
+                --paginate \
+                -q ".[] | select(.created_at < \"$CUTOFF_TS\") | .id"
+        )"
+
+        DELETED=0
+        while IFS= read -r vid; do
+            [[ -z "$vid" ]] && continue
+            gh api --method DELETE \
+                "orgs/$ORG/packages/container/$PACKAGE/versions/$vid" 2>/dev/null || true
+            DELETED=$((DELETED + 1))
+        done <<< "$OLD_IDS"
+
+        if [[ $DELETED -gt 0 ]]; then
+            ok "Deleted $DELETED old Docker image versions"
+        else
+            ok "No old Docker images to cull"
+        fi
+    else
+        ok "Fewer than $KEEP Docker releases — nothing to cull"
+    fi
+else
+    ok "No GHCR package found — skipping Docker cleanup"
+fi
+
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}Released $TAG_NAME${RESET}"
