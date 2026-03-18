@@ -26,7 +26,7 @@ Instead of the traditional sequential approach (download everything, then repair
 ### Key Features
 
 - **Single binary** — everything built in, no external dependencies to install
-- **Streaming extraction** — starts extracting files while still downloading
+- **Incremental extraction** — starts extracting files while still downloading
 - **Modern web UI** — responsive interface with real-time progress updates
 - **Multi-server support** — connect to multiple Usenet providers with priority and failover
 - **Built-in PAR2 repair** — automatic verification and repair without external tools
@@ -157,9 +157,9 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | External tools required | None | `unrar`, `par2` | `unrar`, `par2` |
 | PAR2 repair | Built-in | External `par2` | External `par2` |
 | RAR extraction | Built-in (RAR4 + RAR5) | External `unrar` | External `unrar` |
-| Streaming extraction | Yes | No | No |
+| Incremental extraction | Yes | Yes | No |
 | API type | GraphQL | XML-RPC / JSON-RPC | REST |
-| Real-time updates | WebSocket | WebSocket | Polling |
+| Real-time updates | WebSocket | Polling | Polling |
 | Multi-server | Yes | Yes | Yes |
 | RSS automation | Yes | Yes | Yes |
 | Categories | Yes | Yes | Yes |
