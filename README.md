@@ -157,7 +157,6 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | Prometheus metrics | Yes | No | No |
 | Obfuscation handling | Planned | Yes | Yes |
 
-> **Note:** NZBGet has been discontinued by its original author. [NZBGet v24+](https://github.com/nzbgetcom/nzbget) is maintained by the community. SABnzbd is actively maintained.
 
 ## API
 
