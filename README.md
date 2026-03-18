@@ -70,7 +70,7 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - weaver-config:/data
+      - weaver-config:/config
       - /path/to/downloads:/downloads
 
 volumes:
@@ -87,7 +87,7 @@ Open **http://localhost:9090** and you're ready to go.
 
 ### Configuration
 
-Weaver stores its configuration and database in `/data` inside the container. Mount a volume or host directory there to persist settings across restarts.
+Weaver stores its configuration and database in `/config` inside the container. Mount a volume or host directory there to persist settings across restarts.
 
 Set your download directory in **Settings > General** once the UI is running, or mount it as shown above.
 
@@ -99,11 +99,11 @@ To host Weaver at a subpath like `https://example.com/weaver/`:
 services:
   weaver:
     image: ghcr.io/scryer-media/weaver:latest
-    command: ["--config", "/data", "serve", "--port", "9090", "--base-url", "/weaver"]
+    command: ["--config", "/config", "serve", "--port", "9090", "--base-url", "/weaver"]
     ports:
       - "9090:9090"
     volumes:
-      - weaver-config:/data
+      - weaver-config:/config
       - /path/to/downloads:/downloads
 ```
 
