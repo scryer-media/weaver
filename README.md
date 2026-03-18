@@ -115,21 +115,6 @@ Then configure your reverse proxy (nginx, Traefik, Caddy, etc.) to forward `/wea
 |----------|-------------|
 | `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info` |
 
-## Building from Source
-
-Requires **Rust 1.94+** and **Node.js 25+**.
-
-```bash
-# Build the frontend
-cd apps/weaver-web && npm ci && npm run build && cd ../..
-
-# Build the binary
-cargo build --release
-
-# Run
-./target/release/weaver --config /path/to/data serve --port 9090
-```
-
 ## How It Works
 
 Weaver models each download as a **job graph** — a directed acyclic graph where each stage (download, decode, verify, repair, extract) is a node with explicit dependencies. This replaces the rigid sequential pipeline of traditional downloaders with a flexible system that can:
