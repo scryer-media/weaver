@@ -152,6 +152,78 @@ impl NntpClient {
         Err(last_error.unwrap_or(NntpError::PoolExhausted))
     }
 
+    /// Fetch a body in streaming mode, yielding dot-unstuffed payload chunks
+    /// via callback. Supports multi-server failover and group selection.
+    ///
+    /// Unlike `fetch_body_with_groups`, the article body is NOT fully buffered.
+    /// Each chunk of payload data is passed to `on_chunk` as it arrives from
+    /// the server, suitable for incremental yEnc decode.
+    pub async fn fetch_body_streaming<F>(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        mut on_chunk: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let server_count = self.pool.server_count();
+        let mut last_error: Option<NntpError> = None;
+
+        let mut order: Vec<usize> = (0..server_count).collect();
+        let server_groups = self.pool.server_groups();
+        order.sort_by_key(|&i| server_groups[i]);
+
+        for idx in order {
+            let server = ServerId(idx);
+            let mut conn = match self.pool.acquire(server).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            if !groups.is_empty() {
+                match Self::try_select_group(&mut conn, groups).await {
+                    Err(e) if is_transient(&e) => {
+                        if is_connection_error(&e) {
+                            conn.discard();
+                            self.pool.drain_all_idle().await;
+                        }
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(_) => {}
+                }
+            }
+
+            match conn.stream_body_chunked(message_id, &mut on_chunk).await {
+                Ok(total) => return Ok(total),
+                Err(NntpError::ArticleNotFound)
+                | Err(NntpError::NoSuchArticle { .. })
+                | Err(NntpError::NoArticleWithNumber) => {
+                    last_error = Some(NntpError::NoSuchArticle {
+                        message_id: message_id.to_string(),
+                    });
+                    continue;
+                }
+                Err(e) if is_transient(&e) => {
+                    if is_connection_error(&e) {
+                        conn.discard();
+                        self.pool.drain_all_idle().await;
+                    }
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_error.unwrap_or(NntpError::PoolExhausted))
+    }
+
     /// Fetch the headers of an article by message-id, with multi-server failover.
     pub async fn fetch_head(&self, message_id: &str) -> Result<Bytes> {
         self.fetch_with_failover(message_id, FetchKind::Head).await
