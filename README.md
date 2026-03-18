@@ -40,6 +40,23 @@ Instead of the traditional sequential approach (download everything, then repair
 - **Backup & restore** — export and import your complete configuration
 - **Multi-arch Docker images** — runs on `amd64` and `arm64`
 
+## Install
+
+### Homebrew (Linux)
+
+```bash
+brew tap scryer-media/weaver
+brew install weaver-usenet
+```
+
+### Binary
+
+Download the latest release from the [releases page](https://github.com/scryer-media/weaver/releases).
+
+### Docker
+
+See below.
+
 ## Quick Start with Docker
 
 The fastest way to run Weaver is with Docker Compose. Create a `docker-compose.yml`:
