@@ -31,13 +31,8 @@ Instead of the traditional sequential approach (download everything, then repair
 - **Multi-server support** — connect to multiple Usenet providers with priority and failover
 - **Built-in PAR2 repair** — automatic verification and repair without external tools
 - **Built-in RAR extraction** — handles RAR4 and RAR5 archives natively, including solid and encrypted archives
-- **RSS automation** — monitor feeds and auto-download with customizable rules
-- **Categories** — organize downloads with glob-based filename matching
 - **Monthly quotas** — set monthly, weekly, or daily data limits with configurable billing windows
-- **API key security** — protect the web interface with authentication
-- **Reverse proxy ready** — first-class support for subpath hosting (e.g., `/weaver/`)
 - **Prometheus metrics** — monitor performance with your existing observability stack
-- **Multi-arch Docker images** — runs on `amd64` and `arm64`
 
 ## Install
 
@@ -157,16 +152,9 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | PAR2 repair | Built-in | External `par2` | External `par2` |
 | RAR extraction | Built-in (RAR4 + RAR5) | External `unrar` | External `unrar` |
 | Incremental extraction | Yes | Yes | No |
-| API type | GraphQL | XML-RPC / JSON-RPC | REST |
 | Real-time updates | WebSocket | Polling | Polling |
-| Multi-server | Yes | Yes | Yes |
-| RSS automation | Yes | Yes | Yes |
-| Categories | Yes | Yes | Yes |
 | Monthly quotas | Yes | No | Yes |
 | Prometheus metrics | Yes | No | No |
-| Reverse proxy subpath | Yes | Yes | Yes |
-| API authentication | Yes | Yes | Yes |
-| Docker multi-arch | Yes | Yes | Yes |
 | Obfuscation handling | Planned | Yes | Yes |
 
 > **Note:** NZBGet has been discontinued by its original author. [NZBGet v24+](https://github.com/nzbgetcom/nzbget) is maintained by the community. SABnzbd is actively maintained.
