@@ -25,14 +25,13 @@ Instead of the traditional sequential approach (download everything, then repair
 
 ### Key Features
 
-- **Single binary** — everything built in, no external dependencies to install
+- **Single binary** — no external `unrar`, `par2`, or other tools required
+- **Built-in PAR2 repair** — automatic verification and repair, pure Rust
+- **Built-in RAR extraction** — RAR4 and RAR5 including solid and encrypted archives
 - **Incremental extraction** — starts extracting files while still downloading
-- **Modern web UI** — responsive interface with real-time progress updates
-- **Multi-server support** — connect to multiple Usenet providers with priority and failover
-- **Built-in PAR2 repair** — automatic verification and repair without external tools
-- **Built-in RAR extraction** — handles RAR4 and RAR5 archives natively, including solid and encrypted archives
-- **Monthly quotas** — set monthly, weekly, or daily data limits with configurable billing windows
-- **Prometheus metrics** — monitor performance with your existing observability stack
+- **Real-time updates** — WebSocket push for job progress and system events
+- **Monthly quotas** — daily, weekly, or monthly data limits with configurable billing windows
+- **Prometheus metrics** — native `/metrics` endpoint for observability
 
 ## Install
 
