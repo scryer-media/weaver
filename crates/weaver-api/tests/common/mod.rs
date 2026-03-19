@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use weaver_api::auth::CallerScope;
@@ -109,10 +109,8 @@ impl TestHarness {
         metadata: &[(&str, &str)],
     ) -> u64 {
         let nzb = make_test_nzb(name);
-        let nzb_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            nzb.as_bytes(),
-        );
+        let nzb_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nzb.as_bytes());
 
         let cat_arg = category
             .map(|c| format!(r#", category: "{c}""#))
@@ -228,9 +226,8 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     reply,
                 } => {
                     if jobs.contains_key(&job_id) {
-                        let _ = reply.send(Err(
-                            weaver_scheduler::SchedulerError::JobExists(job_id),
-                        ));
+                        let _ =
+                            reply.send(Err(weaver_scheduler::SchedulerError::JobExists(job_id)));
                         shared_state.publish_jobs(build_job_list(&jobs));
                         continue;
                     }
@@ -350,10 +347,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 }
                 SchedulerCommand::DeleteAllHistory { reply, .. } => {
                     jobs.retain(|_, state| {
-                        !matches!(
-                            state.status,
-                            JobStatus::Complete | JobStatus::Failed { .. }
-                        )
+                        !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
                     });
                     let _ = reply.send(Ok(()));
                 }

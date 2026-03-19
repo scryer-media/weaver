@@ -280,7 +280,10 @@ impl QueryRoot {
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+        Ok(entries
+            .into_iter()
+            .map(crate::types::Schedule::from)
+            .collect())
     }
 }
 

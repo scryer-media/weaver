@@ -10,16 +10,17 @@ async fn browse_specific_path() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["browseDirectories"]["currentPath"].as_str().unwrap(), "/tmp");
+    assert_eq!(
+        data["browseDirectories"]["currentPath"].as_str().unwrap(),
+        "/tmp"
+    );
 }
 
 #[tokio::test]
 async fn browse_nonexistent_path() {
     let h = TestHarness::new().await;
     let resp = h
-        .execute(
-            r#"{ browseDirectories(path: "/nonexistent_weaver_test_path") { currentPath } }"#,
-        )
+        .execute(r#"{ browseDirectories(path: "/nonexistent_weaver_test_path") { currentPath } }"#)
         .await;
     assert_has_errors(&resp);
 }
@@ -59,11 +60,11 @@ async fn browse_has_parent_path() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let parent = data["browseDirectories"]["parentPath"].as_str();
-    assert!(parent.is_some(), "browsing a subdirectory should have a parentPath");
-    assert_eq!(
-        parent.unwrap(),
-        tempdir.path().to_string_lossy().as_ref()
+    assert!(
+        parent.is_some(),
+        "browsing a subdirectory should have a parentPath"
     );
+    assert_eq!(parent.unwrap(), tempdir.path().to_string_lossy().as_ref());
 }
 
 #[tokio::test]
@@ -83,6 +84,9 @@ async fn browse_entries_sorted() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let entries = data["browseDirectories"]["entries"].as_array().unwrap();
-    let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["apple", "banana", "cherry"]);
 }

@@ -9,7 +9,9 @@ use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 #[tokio::test]
 async fn list_feeds_empty() {
     let h = TestHarness::new().await;
-    let resp = h.execute("{ rssFeeds { id name url enabled rules { id } } }").await;
+    let resp = h
+        .execute("{ rssFeeds { id name url enabled rules { id } } }")
+        .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let feeds = data["rssFeeds"].as_array().unwrap();
@@ -130,7 +132,10 @@ async fn update_nonexistent_feed() {
         .await;
     assert_has_errors(&resp);
     let err_msg = format!("{:?}", resp.errors);
-    assert!(err_msg.contains("not found"), "expected 'not found' error, got: {err_msg}");
+    assert!(
+        err_msg.contains("not found"),
+        "expected 'not found' error, got: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -187,7 +192,10 @@ async fn list_feeds_with_rules() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let feeds = data["rssFeeds"].as_array().unwrap();
-    let feed = feeds.iter().find(|f| f["id"].as_u64().unwrap() == feed_id).unwrap();
+    let feed = feeds
+        .iter()
+        .find(|f| f["id"].as_u64().unwrap() == feed_id)
+        .unwrap();
     let rules = feed["rules"].as_array().unwrap();
     assert!(!rules.is_empty(), "feed should have at least one rule");
 }
@@ -209,7 +217,9 @@ async fn get_single_feed() {
     let id = response_data(&resp)["addRssFeed"]["id"].as_u64().unwrap();
 
     let resp = h
-        .execute(&format!(r#"{{ rssFeed(id: {id}) {{ id name url enabled }} }}"#))
+        .execute(&format!(
+            r#"{{ rssFeed(id: {id}) {{ id name url enabled }} }}"#
+        ))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -421,9 +431,7 @@ async fn delete_rule() {
 #[tokio::test]
 async fn list_seen_items_empty() {
     let h = TestHarness::new().await;
-    let resp = h
-        .execute(r#"{ rssSeenItems { feedId itemId } }"#)
-        .await;
+    let resp = h.execute(r#"{ rssSeenItems { feedId itemId } }"#).await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let items = data["rssSeenItems"].as_array().unwrap();

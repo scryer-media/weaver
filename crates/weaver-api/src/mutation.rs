@@ -1013,7 +1013,9 @@ impl MutationRoot {
         input: crate::types::ScheduleInput,
     ) -> Result<Vec<crate::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let schedules_state = ctx
+            .data::<weaver_scheduler::schedule::SharedSchedules>()?
+            .clone();
         let entry = input.into_entry();
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
@@ -1024,7 +1026,10 @@ impl MutationRoot {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+        Ok(entries
+            .into_iter()
+            .map(crate::types::Schedule::from)
+            .collect())
     }
 
     async fn update_schedule(
@@ -1034,7 +1039,9 @@ impl MutationRoot {
         input: crate::types::ScheduleInput,
     ) -> Result<Vec<crate::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let schedules_state = ctx
+            .data::<weaver_scheduler::schedule::SharedSchedules>()?
+            .clone();
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -1051,7 +1058,10 @@ impl MutationRoot {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+        Ok(entries
+            .into_iter()
+            .map(crate::types::Schedule::from)
+            .collect())
     }
 
     async fn delete_schedule(
@@ -1060,7 +1070,9 @@ impl MutationRoot {
         id: String,
     ) -> Result<Vec<crate::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let schedules_state = ctx
+            .data::<weaver_scheduler::schedule::SharedSchedules>()?
+            .clone();
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -1070,7 +1082,10 @@ impl MutationRoot {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+        Ok(entries
+            .into_iter()
+            .map(crate::types::Schedule::from)
+            .collect())
     }
 
     async fn toggle_schedule(
@@ -1080,7 +1095,9 @@ impl MutationRoot {
         enabled: bool,
     ) -> Result<Vec<crate::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let schedules_state = ctx
+            .data::<weaver_scheduler::schedule::SharedSchedules>()?
+            .clone();
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -1092,7 +1109,10 @@ impl MutationRoot {
         let entries_for_save = entries.clone();
         tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
         *schedules_state.write().await = entries.clone();
-        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+        Ok(entries
+            .into_iter()
+            .map(crate::types::Schedule::from)
+            .collect())
     }
 }
 

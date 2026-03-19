@@ -40,7 +40,9 @@ impl Database {
     // ── Schedule CRUD ─────────────────────────────────────────────────────
 
     pub fn list_schedules(&self) -> Result<Vec<weaver_core::config::ScheduleEntry>, StateError> {
-        let json = self.get_setting("schedules")?.unwrap_or_else(|| "[]".into());
+        let json = self
+            .get_setting("schedules")?
+            .unwrap_or_else(|| "[]".into());
         serde_json::from_str(&json).map_err(|e| StateError::Database(e.to_string()))
     }
 
@@ -48,8 +50,8 @@ impl Database {
         &self,
         entries: &[weaver_core::config::ScheduleEntry],
     ) -> Result<(), StateError> {
-        let json = serde_json::to_string(entries)
-            .map_err(|e| StateError::Database(e.to_string()))?;
+        let json =
+            serde_json::to_string(entries).map_err(|e| StateError::Database(e.to_string()))?;
         self.set_setting("schedules", &json)
     }
 

@@ -1353,7 +1353,11 @@ impl From<weaver_core::config::ScheduleEntry> for Schedule {
             id: e.id,
             enabled: e.enabled,
             label: e.label,
-            days: e.days.iter().map(|d| format!("{d:?}").to_lowercase()).collect(),
+            days: e
+                .days
+                .iter()
+                .map(|d| format!("{d:?}").to_lowercase())
+                .collect(),
             time: e.time,
             action_type,
             speed_limit_bytes,

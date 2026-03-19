@@ -96,7 +96,8 @@ pub fn is_obfuscated(filename: &str) -> bool {
         let has_upper = bare.chars().any(|c| c.is_ascii_uppercase());
         let has_lower = bare.chars().any(|c| c.is_ascii_lowercase());
         let has_digit = bare.chars().any(|c| c.is_ascii_digit());
-        let mixed = (has_upper && has_lower) || (has_upper && has_digit) || (has_lower && has_digit);
+        let mixed =
+            (has_upper && has_lower) || (has_upper && has_digit) || (has_lower && has_digit);
         if mixed && bare.len() >= 14 {
             return true;
         }
@@ -107,7 +108,10 @@ pub fn is_obfuscated(filename: &str) -> bool {
 
     // ALL CAPS + trailing digits (e.g. "ABCDEFGHIJK001")
     if bare.len() >= 14 {
-        let alpha_prefix: String = bare.chars().take_while(|c| c.is_ascii_uppercase()).collect();
+        let alpha_prefix: String = bare
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase())
+            .collect();
         let digit_suffix: String = bare.chars().skip(alpha_prefix.len()).collect();
         if alpha_prefix.len() >= 11
             && digit_suffix.len() >= 3
@@ -289,7 +293,9 @@ fn extract_fallback(subject: &str) -> Option<String> {
 
     // Take the last whitespace-delimited token. Prefer tokens with dots (filenames),
     // but accept dotless tokens as a last resort (handles "Re: A" edge cases).
-    let token = after_prefix.rsplit_once(' ').map_or(after_prefix, |(_, t)| t);
+    let token = after_prefix
+        .rsplit_once(' ')
+        .map_or(after_prefix, |(_, t)| t);
     if !token.is_empty() {
         Some(token.to_string())
     } else {
@@ -350,7 +356,11 @@ fn is_clearly_named(stem: &str) -> bool {
         for c in stem.chars() {
             match c {
                 '[' => depth += 1,
-                ']' => { if depth > 0 { depth -= 1; } }
+                ']' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
                 _ if depth == 0 => result.push(c),
                 _ => {}
             }
@@ -360,7 +370,8 @@ fn is_clearly_named(stem: &str) -> bool {
 
     // Split on separators and check for word-like tokens.
     // Tokens must be 4+ chars to avoid matching file extensions (mkv, avi, bin).
-    let tokens: Vec<&str> = without_brackets.split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
+    let tokens: Vec<&str> = without_brackets
+        .split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
         .filter(|t| !t.is_empty())
         .collect();
 
@@ -463,7 +474,9 @@ mod tests {
 
     #[test]
     fn normal_release_name_not_obfuscated() {
-        assert!(!is_obfuscated("Some.Show.S01E18.720p.WEB-DL.x264-GROUP.rar"));
+        assert!(!is_obfuscated(
+            "Some.Show.S01E18.720p.WEB-DL.x264-GROUP.rar"
+        ));
         assert!(!is_obfuscated("Movie.2024.1080p.BluRay.mkv"));
         assert!(!is_obfuscated("album.mp3"));
         assert!(!is_obfuscated("setup.exe"));
@@ -495,10 +508,9 @@ mod tests {
 
     #[test]
     fn private_format_path_first() {
-        let (name, conf) = extract_filename(
-            r#"[PRiVATE]-[WtFnZb]-[series/Any.Show.S01E01.mkv]-[1/7] - "" yEnc"#,
-        )
-        .unwrap();
+        let (name, conf) =
+            extract_filename(r#"[PRiVATE]-[WtFnZb]-[series/Any.Show.S01E01.mkv]-[1/7] - "" yEnc"#)
+                .unwrap();
         assert_eq!(name, "Any.Show.S01E01.mkv");
         assert_eq!(conf, 0.8);
     }
@@ -543,10 +555,7 @@ mod tests {
 
     #[test]
     fn strips_par2() {
-        assert_eq!(
-            strip_archive_extension("abc.vol0+1.par2"),
-            "abc.vol0+1"
-        );
+        assert_eq!(strip_archive_extension("abc.vol0+1.par2"), "abc.vol0+1");
     }
 
     #[test]
@@ -583,10 +592,8 @@ mod tests {
 
     #[test]
     fn private_pure_numeric_segments() {
-        let (name, conf) = extract_filename(
-            r#"[PRiVATE]-[WtFnZb]-[24]-[setup_app_1.bin] - "" yEnc"#,
-        )
-        .unwrap();
+        let (name, conf) =
+            extract_filename(r#"[PRiVATE]-[WtFnZb]-[24]-[setup_app_1.bin] - "" yEnc"#).unwrap();
         assert_eq!(name, "setup_app_1.bin");
         assert_eq!(conf, 0.8);
     }
@@ -625,9 +632,7 @@ mod tests {
 
     #[test]
     fn bracketed_hex_is_obfuscated() {
-        assert!(is_obfuscated(
-            "b2.bef89a622e4a23f07b0d3757ad5e8a.a0"
-        ));
+        assert!(is_obfuscated("b2.bef89a622e4a23f07b0d3757ad5e8a.a0"));
     }
 
     #[test]

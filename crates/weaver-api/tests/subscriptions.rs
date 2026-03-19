@@ -58,9 +58,8 @@ async fn job_updates_includes_new_job() {
     // Submit a job first.
     h.submit_test_nzb("sub-test").await;
 
-    let request =
-        Request::new("subscription { jobUpdates { jobs { id name } isPaused } }")
-            .data(CallerScope::Local);
+    let request = Request::new("subscription { jobUpdates { jobs { id name } isPaused } }")
+        .data(CallerScope::Local);
 
     let mut stream = h.schema.execute_stream(request);
 

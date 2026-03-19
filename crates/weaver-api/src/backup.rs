@@ -440,20 +440,22 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 }
 
 fn encrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), std::io::Error> {
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
     use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 
     let mut plaintext = Vec::new();
     File::open(input)?.read_to_end(&mut plaintext)?;
 
     let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    getrandom::fill(&mut salt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     let key = derive_key(password, &salt);
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::fill(&mut nonce_bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let nonce = GenericArray::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -487,11 +489,14 @@ fn maybe_decrypt_archive(
 }
 
 fn decrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), BackupServiceError> {
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
     use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 
     let mut data = Vec::new();
-    File::open(input).map_err(io_err)?.read_to_end(&mut data).map_err(io_err)?;
+    File::open(input)
+        .map_err(io_err)?
+        .read_to_end(&mut data)
+        .map_err(io_err)?;
 
     let header_len = ENCRYPT_MAGIC.len() + SALT_LEN + 12;
     if data.len() < header_len {

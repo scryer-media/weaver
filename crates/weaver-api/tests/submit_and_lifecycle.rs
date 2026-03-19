@@ -107,10 +107,7 @@ async fn submit_with_category() {
 
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(
-        data["submitNzb"]["category"].as_str().unwrap(),
-        "movies"
-    );
+    assert_eq!(data["submitNzb"]["category"].as_str().unwrap(), "movies");
 }
 
 #[tokio::test]
@@ -126,9 +123,7 @@ async fn submit_with_metadata() {
         .await;
 
     let resp = h
-        .execute(&format!(
-            r#"{{ jobs {{ id metadata {{ key value }} }} }}"#
-        ))
+        .execute(&format!(r#"{{ jobs {{ id metadata {{ key value }} }} }}"#))
         .await;
 
     assert_no_errors(&resp);
@@ -247,9 +242,7 @@ async fn pause_queued_job() {
     let id = h.submit_test_nzb("pause-test").await;
 
     let resp = h
-        .execute(&format!(
-            r#"mutation {{ pauseJob(id: {id}) }}"#
-        ))
+        .execute(&format!(r#"mutation {{ pauseJob(id: {id}) }}"#))
         .await;
 
     assert_no_errors(&resp);
@@ -277,9 +270,7 @@ async fn resume_paused_job() {
         .await;
 
     let resp = h
-        .execute(&format!(
-            r#"mutation {{ resumeJob(id: {id}) }}"#
-        ))
+        .execute(&format!(r#"mutation {{ resumeJob(id: {id}) }}"#))
         .await;
 
     assert_no_errors(&resp);
@@ -386,9 +377,7 @@ async fn cancel_paused_job() {
 async fn pause_nonexistent_job() {
     let h = TestHarness::new().await;
 
-    let resp = h
-        .execute(r#"mutation { pauseJob(id: 999999) }"#)
-        .await;
+    let resp = h.execute(r#"mutation { pauseJob(id: 999999) }"#).await;
 
     assert_has_errors(&resp);
 }
@@ -397,9 +386,7 @@ async fn pause_nonexistent_job() {
 async fn resume_nonexistent_job() {
     let h = TestHarness::new().await;
 
-    let resp = h
-        .execute(r#"mutation { resumeJob(id: 999999) }"#)
-        .await;
+    let resp = h.execute(r#"mutation { resumeJob(id: 999999) }"#).await;
 
     assert_has_errors(&resp);
 }
@@ -408,9 +395,7 @@ async fn resume_nonexistent_job() {
 async fn cancel_nonexistent_job() {
     let h = TestHarness::new().await;
 
-    let resp = h
-        .execute(r#"mutation { cancelJob(id: 999999) }"#)
-        .await;
+    let resp = h.execute(r#"mutation { cancelJob(id: 999999) }"#).await;
 
     assert_has_errors(&resp);
 }
@@ -503,9 +488,7 @@ async fn download_block_reflects_pause() {
 async fn reprocess_nonexistent_job() {
     let h = TestHarness::new().await;
 
-    let resp = h
-        .execute(r#"mutation { reprocessJob(id: 999999) }"#)
-        .await;
+    let resp = h.execute(r#"mutation { reprocessJob(id: 999999) }"#).await;
 
     assert_has_errors(&resp);
 }

@@ -53,18 +53,14 @@ async fn update_jobs_category() {
 
     // Verify both jobs have the new category.
     let resp = h
-        .execute(&format!(
-            r#"{{ job(id: {id1}) {{ category }} }}"#
-        ))
+        .execute(&format!(r#"{{ job(id: {id1}) {{ category }} }}"#))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert_eq!(data["job"]["category"].as_str().unwrap(), "movies");
 
     let resp = h
-        .execute(&format!(
-            r#"{{ job(id: {id2}) {{ category }} }}"#
-        ))
+        .execute(&format!(r#"{{ job(id: {id2}) {{ category }} }}"#))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);

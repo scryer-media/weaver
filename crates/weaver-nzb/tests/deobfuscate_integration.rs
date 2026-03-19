@@ -67,9 +67,7 @@ fn nzbget_not_obfuscated_r00_archive() {
 #[test]
 fn nzbget_not_obfuscated_7z_split() {
     assert!(!is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.15"));
-    assert!(!is_obfuscated(
-        "2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.015"
-    ));
+    assert!(!is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.015"));
 }
 
 #[test]
@@ -280,28 +278,24 @@ fn nzbget_extract_private_with_brackets_in_name() {
 
 #[test]
 fn nzbget_extract_private_mpls() {
-    let (name, _) = extract_filename(
-        "[PRiVATE]-[WtFnZb]-[00101.mpls]-[163/591] - \"\" yEnc (2/12345)",
-    )
-    .unwrap();
+    let (name, _) =
+        extract_filename("[PRiVATE]-[WtFnZb]-[00101.mpls]-[163/591] - \"\" yEnc (2/12345)")
+            .unwrap();
     assert_eq!(name, "00101.mpls");
 }
 
 #[test]
 fn nzbget_extract_private_numeric_segment_first() {
-    let (name, _) = extract_filename(
-        "[PRiVATE]-[WtFnZb]-[24]-[12/filename.ext] - \"\" yEnc (2/12345)",
-    )
-    .unwrap();
+    let (name, _) =
+        extract_filename("[PRiVATE]-[WtFnZb]-[24]-[12/filename.ext] - \"\" yEnc (2/12345)")
+            .unwrap();
     assert_eq!(name, "filename.ext");
 }
 
 #[test]
 fn nzbget_extract_private_dotless_filename() {
-    let (name, _) = extract_filename(
-        "[PRiVATE]-[WtFnZb]-[24]-[filename] - \"\" yEnc (2/12345)",
-    )
-    .unwrap();
+    let (name, _) =
+        extract_filename("[PRiVATE]-[WtFnZb]-[24]-[filename] - \"\" yEnc (2/12345)").unwrap();
     assert_eq!(name, "filename");
 }
 
@@ -329,10 +323,8 @@ fn nzbget_extract_private_encryptnzb_subsplease() {
 
 #[test]
 fn nzbget_extract_quoted_hash() {
-    let (name, _) = extract_filename(
-        "\"2c0837e5fa42c8cfb5d5e583168a2af4.10\" yEnc (1/111)",
-    )
-    .unwrap();
+    let (name, _) =
+        extract_filename("\"2c0837e5fa42c8cfb5d5e583168a2af4.10\" yEnc (1/111)").unwrap();
     assert_eq!(name, "2c0837e5fa42c8cfb5d5e583168a2af4.10");
 }
 

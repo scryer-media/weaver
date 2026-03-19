@@ -51,9 +51,7 @@ async fn jobs_filter_by_downloading_status() {
     let h = TestHarness::new().await;
     h.submit_test_nzb("still-queued").await;
 
-    let resp = h
-        .execute("{ jobs(status: [DOWNLOADING]) { id } }")
-        .await;
+    let resp = h.execute("{ jobs(status: [DOWNLOADING]) { id } }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let jobs = data["jobs"].as_array().unwrap();
@@ -89,9 +87,7 @@ async fn jobs_filter_multiple_statuses() {
     let pause_resp = h.execute(&pause_query).await;
     assert_no_errors(&pause_resp);
 
-    let resp = h
-        .execute("{ jobs(status: [QUEUED, PAUSED]) { id } }")
-        .await;
+    let resp = h.execute("{ jobs(status: [QUEUED, PAUSED]) { id } }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let jobs = data["jobs"].as_array().unwrap();
@@ -243,9 +239,8 @@ async fn job_by_id() {
     let h = TestHarness::new().await;
     let id = h.submit_test_nzb("single-job").await;
 
-    let query = format!(
-        r#"{{ job(id: {id}) {{ id name status totalBytes progress health createdAt }} }}"#
-    );
+    let query =
+        format!(r#"{{ job(id: {id}) {{ id name status totalBytes progress health createdAt }} }}"#);
     let resp = h.execute(&query).await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -260,9 +255,7 @@ async fn job_by_id() {
 #[tokio::test]
 async fn job_nonexistent_returns_null() {
     let h = TestHarness::new().await;
-    let resp = h
-        .execute("{ job(id: 999999) { id name } }")
-        .await;
+    let resp = h.execute("{ job(id: 999999) { id name } }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["job"].is_null());
@@ -285,9 +278,7 @@ async fn delete_history_nonexistent() {
 #[tokio::test]
 async fn delete_all_history_when_empty() {
     let h = TestHarness::new().await;
-    let resp = h
-        .execute("mutation { deleteAllHistory { id } }")
-        .await;
+    let resp = h.execute("mutation { deleteAllHistory { id } }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let jobs = data["deleteAllHistory"].as_array().unwrap();
@@ -298,14 +289,10 @@ async fn delete_all_history_when_empty() {
 async fn delete_all_history_idempotent() {
     let h = TestHarness::new().await;
 
-    let resp1 = h
-        .execute("mutation { deleteAllHistory { id } }")
-        .await;
+    let resp1 = h.execute("mutation { deleteAllHistory { id } }").await;
     assert_no_errors(&resp1);
 
-    let resp2 = h
-        .execute("mutation { deleteAllHistory { id } }")
-        .await;
+    let resp2 = h.execute("mutation { deleteAllHistory { id } }").await;
     assert_no_errors(&resp2);
     let data = response_data(&resp2);
     let jobs = data["deleteAllHistory"].as_array().unwrap();
@@ -359,11 +346,18 @@ async fn job_has_all_fields() {
 
     let meta = job["metadata"].as_array().unwrap();
     // submit_nzb_bytes may add internal metadata (e.g. *original_title), so check >= 2.
-    assert!(meta.len() >= 2, "expected at least 2 metadata entries, got {}", meta.len());
+    assert!(
+        meta.len() >= 2,
+        "expected at least 2 metadata entries, got {}",
+        meta.len()
+    );
     let keys: Vec<&str> = meta.iter().map(|m| m["key"].as_str().unwrap()).collect();
     assert!(keys.contains(&"tvdbId"));
     assert!(keys.contains(&"season"));
-    let tvdb_entry = meta.iter().find(|m| m["key"].as_str().unwrap() == "tvdbId").unwrap();
+    let tvdb_entry = meta
+        .iter()
+        .find(|m| m["key"].as_str().unwrap() == "tvdbId")
+        .unwrap();
     assert_eq!(tvdb_entry["value"].as_str().unwrap(), "42");
 
     assert!(job["totalBytes"].as_u64().is_some());

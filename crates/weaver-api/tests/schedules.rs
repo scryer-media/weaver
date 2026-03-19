@@ -117,7 +117,10 @@ async fn update_schedule() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let schedules = data["updateSchedule"].as_array().unwrap();
-    let sched = schedules.iter().find(|s| s["id"].as_str().unwrap() == id).unwrap();
+    let sched = schedules
+        .iter()
+        .find(|s| s["id"].as_str().unwrap() == id)
+        .unwrap();
     assert_eq!(sched["label"].as_str().unwrap(), "Updated");
     assert_eq!(sched["time"].as_str().unwrap(), "09:00");
 }
@@ -149,7 +152,9 @@ async fn delete_schedule() {
         .to_string();
 
     let resp = h
-        .execute(&format!(r#"mutation {{ deleteSchedule(id: "{id}") {{ id }} }}"#))
+        .execute(&format!(
+            r#"mutation {{ deleteSchedule(id: "{id}") {{ id }} }}"#
+        ))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -190,6 +195,9 @@ async fn toggle_schedule() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let schedules = data["toggleSchedule"].as_array().unwrap();
-    let sched = schedules.iter().find(|s| s["id"].as_str().unwrap() == id).unwrap();
+    let sched = schedules
+        .iter()
+        .find(|s| s["id"].as_str().unwrap() == id)
+        .unwrap();
     assert!(!sched["enabled"].as_bool().unwrap());
 }

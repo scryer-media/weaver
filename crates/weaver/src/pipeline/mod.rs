@@ -788,7 +788,9 @@ impl Pipeline {
                     }
                     ScheduleAction::SpeedLimit { bytes_per_sec } => {
                         self.rate_limiter.set_rate(bytes_per_sec);
-                        let mut block = self.bandwidth_cap.to_download_block_state(self.global_paused);
+                        let mut block = self
+                            .bandwidth_cap
+                            .to_download_block_state(self.global_paused);
                         block.scheduled_speed_limit = bytes_per_sec;
                         self.shared_state.set_download_block(block);
                         info!(bytes_per_sec, "schedule: set speed limit");

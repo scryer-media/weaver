@@ -1379,7 +1379,9 @@ impl Pipeline {
                     if let Some(par2) = self.par2_set(job_id).cloned() {
                         let rename_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                         if !weaver_nzb::is_protected_media_structure(&rename_dir) {
-                            if let Ok(suggestions) = weaver_par2::scan_for_renames(&rename_dir, &par2) {
+                            if let Ok(suggestions) =
+                                weaver_par2::scan_for_renames(&rename_dir, &par2)
+                            {
                                 for s in &suggestions {
                                     let old = &s.current_path;
                                     let new = old.parent().unwrap().join(&s.correct_name);
@@ -1577,52 +1579,59 @@ impl Pipeline {
                             // Must happen after repair and before extraction retry.
                             // Skip if inside a DVD/Bluray structure.
                             if let Some(par2) = self.par2_set(job_id).cloned() {
-                                let rename_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                                let rename_dir =
+                                    self.jobs.get(&job_id).unwrap().working_dir.clone();
                                 if weaver_nzb::is_protected_media_structure(&rename_dir) {
-                                    info!(job_id = job_id.0, "skipping PAR2 rename inside protected media structure");
+                                    info!(
+                                        job_id = job_id.0,
+                                        "skipping PAR2 rename inside protected media structure"
+                                    );
                                 } else {
-                                match weaver_par2::scan_for_renames(&rename_dir, &par2) {
-                                    Ok(suggestions) => {
-                                        for s in &suggestions {
-                                            let old = &s.current_path;
-                                            let new = old.parent().unwrap().join(&s.correct_name);
-                                            if old.file_name().map(|n| n.to_string_lossy().to_string())
-                                                == Some(s.correct_name.clone())
-                                            {
-                                                continue; // already correct
+                                    match weaver_par2::scan_for_renames(&rename_dir, &par2) {
+                                        Ok(suggestions) => {
+                                            for s in &suggestions {
+                                                let old = &s.current_path;
+                                                let new =
+                                                    old.parent().unwrap().join(&s.correct_name);
+                                                if old
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    == Some(s.correct_name.clone())
+                                                {
+                                                    continue; // already correct
+                                                }
+                                                match std::fs::rename(old, &new) {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            job_id = job_id.0,
+                                                            from = %old.file_name().unwrap().to_string_lossy(),
+                                                            to = %s.correct_name,
+                                                            "deobfuscated file via PAR2 metadata"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(
+                                                            job_id = job_id.0,
+                                                            from = %old.display(),
+                                                            to = %new.display(),
+                                                            error = %e,
+                                                            "PAR2 rename failed"
+                                                        );
+                                                    }
+                                                }
                                             }
-                                            match std::fs::rename(old, &new) {
-                                                Ok(()) => {
-                                                    info!(
-                                                        job_id = job_id.0,
-                                                        from = %old.file_name().unwrap().to_string_lossy(),
-                                                        to = %s.correct_name,
-                                                        "deobfuscated file via PAR2 metadata"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        job_id = job_id.0,
-                                                        from = %old.display(),
-                                                        to = %new.display(),
-                                                        error = %e,
-                                                        "PAR2 rename failed"
-                                                    );
-                                                }
+                                            if !suggestions.is_empty() {
+                                                info!(
+                                                    job_id = job_id.0,
+                                                    renamed = suggestions.len(),
+                                                    "PAR2 deobfuscation complete"
+                                                );
                                             }
                                         }
-                                        if !suggestions.is_empty() {
-                                            info!(
-                                                job_id = job_id.0,
-                                                renamed = suggestions.len(),
-                                                "PAR2 deobfuscation complete"
-                                            );
+                                        Err(e) => {
+                                            warn!(job_id = job_id.0, error = %e, "PAR2 rename scan failed");
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(job_id = job_id.0, error = %e, "PAR2 rename scan failed");
-                                    }
-                                }
                                 }
                             }
 

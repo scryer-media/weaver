@@ -102,10 +102,7 @@ async fn update_max_retries() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(
-        data["updateSettings"]["maxRetries"].as_u64().unwrap(),
-        5
-    );
+    assert_eq!(data["updateSettings"]["maxRetries"].as_u64().unwrap(), 5);
 }
 
 #[tokio::test]
@@ -146,9 +143,7 @@ async fn settings_persist_across_queries() {
 
     // Query twice and verify the value is the same both times.
     for _ in 0..2 {
-        let resp = h
-            .execute(r#"{ settings { completeDir } }"#)
-            .await;
+        let resp = h.execute(r#"{ settings { completeDir } }"#).await;
         assert_no_errors(&resp);
         let data = response_data(&resp);
         assert_eq!(
