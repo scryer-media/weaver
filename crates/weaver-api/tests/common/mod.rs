@@ -1,3 +1,6 @@
+// Test helper module — not all items are used by every test binary.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

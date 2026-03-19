@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="WeaverDark.png" alt="Weaver" width="200" />
+  <img src="docs/img/weaver-hero.webp" alt="Weaver" width="200" />
 </p>
 
 <h1 align="center">Weaver</h1>
