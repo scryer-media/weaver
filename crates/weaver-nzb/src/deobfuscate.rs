@@ -32,40 +32,83 @@ pub fn is_obfuscated(filename: &str) -> bool {
         return false;
     }
 
+    // Also strip the final file extension for obfuscation checks — we care
+    // about the name, not whether it ends in .mkv or .avi.
+    let bare = stem
+        .rfind('.')
+        .filter(|&dot| dot > 0 && stem.len() - dot <= 5)
+        .map_or(stem, |dot| &stem[..dot]);
+
+    // Long hex run anywhere in the string (30+ contiguous hex+dot chars).
+    // Check BEFORE clear-naming, since obfuscated strings can have real words
+    // as bracketed tags around the hash.
+    {
+        let mut hex_run = 0_usize;
+        let mut max_hex_run = 0_usize;
+        for c in stem.chars() {
+            if c.is_ascii_hexdigit() || c == '.' {
+                hex_run += 1;
+                max_hex_run = max_hex_run.max(hex_run);
+            } else {
+                hex_run = 0;
+            }
+        }
+        if max_hex_run >= 30 {
+            return true;
+        }
+    }
+
     // Clear-naming signals: if the name looks like a real release or title,
     // it's not obfuscated. Adapted from SABnzbd's explicit false returns.
-    if is_clearly_named(stem) {
+    if is_clearly_named(bare) {
         return false;
+    }
+
+    // Single uppercase letter + 5+ digits (e.g. "T306077") — tracking ID pattern
+    if bare.len() >= 6 {
+        let mut chars = bare.chars();
+        if let Some(first) = chars.next() {
+            if first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    // Known obfuscator prefixes (NZBGet patterns)
+    let lower_bare = bare.to_ascii_lowercase();
+    if lower_bare.starts_with("abc.xyz.") || lower_bare.starts_with("b00bs.") {
+        return true;
     }
 
     // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash.
     // Matches NZBGet's `[0-9a-f.]{16}` pattern.
     {
-        let hex_chars: usize = stem.chars().filter(|c| c.is_ascii_hexdigit()).count();
-        let all_hex_or_dot = stem.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
+        let hex_chars: usize = bare.chars().filter(|c| c.is_ascii_hexdigit()).count();
+        let all_hex_or_dot = bare.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
         if hex_chars >= 16 && all_hex_or_dot {
             return true;
         }
     }
 
-    // Alphanumeric only, 24+ characters, no dots/dashes/underscores: hash or UUID
-    if stem.len() >= 24 && stem.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return true;
-    }
-
-    // Lowercase alphanumeric only, 16+ characters
-    if stem.len() >= 16
-        && stem
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return true;
+    // Alphanumeric only, no separators — hash or UUID.
+    // 14+ chars for mixed case, 24+ chars if uniform case.
+    if bare.chars().all(|c| c.is_ascii_alphanumeric()) {
+        let has_upper = bare.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = bare.chars().any(|c| c.is_ascii_lowercase());
+        let has_digit = bare.chars().any(|c| c.is_ascii_digit());
+        let mixed = (has_upper && has_lower) || (has_upper && has_digit) || (has_lower && has_digit);
+        if mixed && bare.len() >= 14 {
+            return true;
+        }
+        if !mixed && bare.len() >= 24 {
+            return true;
+        }
     }
 
     // ALL CAPS + trailing digits (e.g. "ABCDEFGHIJK001")
-    if stem.len() >= 14 {
-        let alpha_prefix: String = stem.chars().take_while(|c| c.is_ascii_uppercase()).collect();
-        let digit_suffix: String = stem.chars().skip(alpha_prefix.len()).collect();
+    if bare.len() >= 14 {
+        let alpha_prefix: String = bare.chars().take_while(|c| c.is_ascii_uppercase()).collect();
+        let digit_suffix: String = bare.chars().skip(alpha_prefix.len()).collect();
         if alpha_prefix.len() >= 11
             && digit_suffix.len() >= 3
             && digit_suffix.chars().all(|c| c.is_ascii_digit())
@@ -75,8 +118,8 @@ pub fn is_obfuscated(filename: &str) -> bool {
     }
 
     // Backup_NNNNN_SNN-NN pattern (NZBGet: `Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
-    if stem.starts_with("Backup_") {
-        let rest = &stem[7..];
+    if bare.starts_with("Backup_") {
+        let rest = &bare[7..];
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
             let after = &rest[digits.len()..];
@@ -92,8 +135,8 @@ pub fn is_obfuscated(filename: &str) -> bool {
     }
 
     // Timestamp-like: NNNNNN_NN (NZBGet: `[0-9]{6}_[0-9]{2}`)
-    if stem.len() >= 9 {
-        let parts: Vec<&str> = stem.splitn(2, '_').collect();
+    if bare.len() >= 9 {
+        let parts: Vec<&str> = bare.splitn(2, '_').collect();
         if parts.len() == 2
             && parts[0].len() >= 6
             && parts[0].chars().all(|c| c.is_ascii_digit())
@@ -106,20 +149,19 @@ pub fn is_obfuscated(filename: &str) -> bool {
 
     // Bracketed tags wrapping a hex hash (SABnzbd pattern):
     // e.g. "[BlaBla] something [More] b2.bef89a622e4a23f07b0d3757ad5e8a.a0 [Brrr]"
+    // If there are 30+ contiguous hex+dot characters anywhere in the string, it's obfuscated.
     {
-        let stripped = stem
-            .split('[')
-            .flat_map(|s| s.split(']'))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let hex_chars: usize = stripped
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .count();
-        let all_hex_space_dot = stripped
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ' ');
-        if hex_chars >= 30 && all_hex_space_dot {
+        let mut hex_run = 0_usize;
+        let mut max_hex_run = 0_usize;
+        for c in stem.chars() {
+            if c.is_ascii_hexdigit() || c == '.' {
+                hex_run += 1;
+                max_hex_run = max_hex_run.max(hex_run);
+            } else {
+                hex_run = 0;
+            }
+        }
+        if max_hex_run >= 30 {
             return true;
         }
     }
@@ -182,17 +224,20 @@ fn extract_private(subject: &str) -> Option<String> {
     let rest = rest.strip_prefix("-[")?;
 
     // We now have two bracketed sections: one is path, one is segments.
-    // Find the first closing bracket.
-    let first_end = rest.find(']')?;
-    let first_section = &rest[..first_end];
-    let after_first = rest.get(first_end + 1..)?;
+    // Use "]-[" as the section boundary to handle brackets inside filenames
+    // (e.g. "Movie_[TBoP].mkv").
+    if let Some(boundary) = rest.find("]-[") {
+        let first_section = &rest[..boundary];
+        let second_section_start = boundary + 3; // skip "]-["
+        let after_second = &rest[second_section_start..];
+        // Find the closing "]" for the second section — but it might also
+        // contain brackets, so find "] - " or "]" at end-ish
+        let second_end = after_second
+            .find("] - ")
+            .or_else(|| after_second.rfind(']'))
+            .unwrap_or(after_second.len());
+        let second_section = &after_second[..second_end];
 
-    // Check if there's a second bracketed section
-    if let Some(second_rest) = after_first.strip_prefix("-[") {
-        let second_end = second_rest.find(']')?;
-        let second_section = &second_rest[..second_end];
-
-        // The section that looks like "N/N" is segments; the other is path
         let (path_section, _) = if is_segment_marker(first_section) {
             (second_section, first_section)
         } else {
@@ -202,8 +247,12 @@ fn extract_private(subject: &str) -> Option<String> {
         return Some(extract_basename(path_section));
     }
 
-    // Only one section after group — treat it as the path
-    Some(extract_basename(first_section))
+    // Only one section — find closing "] - " or last "]"
+    let end = rest
+        .find("] - ")
+        .or_else(|| rest.rfind(']'))
+        .unwrap_or(rest.len());
+    Some(extract_basename(&rest[..end]))
 }
 
 /// Strategy 3: Fallback heuristic for unquoted, non-PRiVATE subjects.
@@ -294,28 +343,46 @@ fn strip_trailing_part_info(s: &str) -> &str {
 /// Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
 /// with dots still fall through to the obfuscation checks.
 fn is_clearly_named(stem: &str) -> bool {
-    // Split on separators and check for word-like tokens
-    let tokens: Vec<&str> = stem.split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
+    // Strip bracketed tags before tokenizing — [Group] tags shouldn't count as words.
+    let without_brackets: String = {
+        let mut result = String::with_capacity(stem.len());
+        let mut depth = 0u32;
+        for c in stem.chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => { if depth > 0 { depth -= 1; } }
+                _ if depth == 0 => result.push(c),
+                _ => {}
+            }
+        }
+        result
+    };
+
+    // Split on separators and check for word-like tokens.
+    // Tokens must be 4+ chars to avoid matching file extensions (mkv, avi, bin).
+    let tokens: Vec<&str> = without_brackets.split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
         .filter(|t| !t.is_empty())
         .collect();
 
     // Known obfuscator prefixes that look like words but aren't
     const NOISE_WORDS: &[&str] = &["Backup", "backup", "BACKUP"];
 
-    // Need at least 2 tokens with 3+ alpha characters each
+    // Need at least 2 word-like tokens (4+ chars, has alpha, not all hex, not noise)
     let word_tokens = tokens
         .iter()
         .filter(|t| {
-            t.len() >= 3
+            t.len() >= 4
                 && t.chars().any(|c| c.is_ascii_alphabetic())
+                && !t.chars().all(|c| c.is_ascii_hexdigit())
                 && !NOISE_WORDS.contains(t)
         })
         .count();
 
     if word_tokens >= 2 {
-        // Also require mixed case or a known pattern (not all-hex tokens)
+        // Require at least one token that isn't pure hex (avoids false positives
+        // on hash.hash.ext patterns where hex segments are 4+ chars)
         let has_non_hex_word = tokens.iter().any(|t| {
-            t.len() >= 3
+            t.len() >= 4
                 && t.chars().any(|c| c.is_ascii_alphabetic())
                 && !t.chars().all(|c| c.is_ascii_hexdigit())
         });
@@ -382,6 +449,11 @@ mod tests {
     fn long_alphanum_is_obfuscated() {
         assert!(is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP"));
         assert!(is_obfuscated("abcdefghijklmnopqrstuvwx"));
+    }
+
+    #[test]
+    fn b00bs_prefix_obfuscated() {
+        assert!(is_obfuscated("b00bs.a1b2c3d4e5f678.mkv"));
     }
 
     #[test]
