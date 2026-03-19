@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
+use weaver_core::classify::FileRole;
 use weaver_core::config::SharedConfig;
 use weaver_core::id::JobId;
 use weaver_core::release_name::{append_original_title_metadata, derive_release_name};
@@ -159,8 +160,15 @@ fn nzb_to_spec(
     let mut total_bytes: u64 = 0;
 
     for nzb_file in &nzb.files {
-        let fname = nzb_file.filename().unwrap_or("unknown").to_string();
-        let role = nzb_file.role();
+        // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
+        // If the extracted name is obfuscated, keep it — PAR2 deobfuscation will
+        // rename it post-repair using 16KB hash matching.
+        let fname = nzb_file
+            .extract_filename()
+            .map(|(name, _confidence)| name)
+            .or_else(|| nzb_file.filename().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        let role = FileRole::from_filename(&fname);
 
         let segments: Vec<SegmentSpec> = nzb_file
             .segments
