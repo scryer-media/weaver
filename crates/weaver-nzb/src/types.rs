@@ -87,6 +87,27 @@ impl NzbFile {
         None
     }
 
+    /// Enhanced filename extraction using three parsing strategies.
+    ///
+    /// Returns `(filename, confidence)` where confidence is:
+    /// - 1.0: from quoted string
+    /// - 0.8: from PRiVATE format
+    /// - 0.5: heuristic fallback
+    ///
+    /// Use this over [`filename()`] when you need the confidence level
+    /// or PRiVATE format support.
+    pub fn extract_filename(&self) -> Option<(String, f32)> {
+        crate::deobfuscate::extract_filename(&self.subject)
+    }
+
+    /// Returns `true` if the extracted filename appears to be obfuscated.
+    pub fn is_obfuscated(&self) -> bool {
+        match self.filename() {
+            Some(name) => crate::deobfuscate::is_obfuscated(name),
+            None => true,
+        }
+    }
+
     /// Total expected bytes across all segments.
     pub fn total_bytes(&self) -> u64 {
         self.segments.iter().map(|s| u64::from(s.bytes)).sum()
