@@ -223,6 +223,16 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-*)
+              echo "RUSTFLAGS=-C target-cpu=haswell" >> "$GITHUB_ENV" ;;
+            aarch64-apple-*)
+              echo "RUSTFLAGS=-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
+            aarch64-*-linux-*)
+              echo "RUSTFLAGS=--cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
+          esac
       - name: Build release binary
         run: |
           if [[ "${{ matrix.target }}" == *"-musl" ]]; then
