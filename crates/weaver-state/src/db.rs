@@ -80,7 +80,6 @@ impl Database {
     }
 
     /// Open an in-memory database (for tests).
-    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, StateError> {
         let conn = Connection::open_in_memory().map_err(|e| StateError::Database(e.to_string()))?;
         let db = Self {

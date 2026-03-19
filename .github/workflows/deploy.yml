@@ -240,6 +240,25 @@ jobs:
           else
             cargo build -p weaver --release --locked --target ${{ matrix.target }}
           fi
+      - name: Codesign binary (macOS)
+        if: contains(matrix.target, '-apple-darwin')
+        env:
+          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          KEYCHAIN_PASS="ci-ephemeral"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/${{ matrix.target }}/release/weaver
+          codesign --verify --verbose target/${{ matrix.target }}/release/weaver
+          rm /tmp/cert.p12
+          security delete-keychain "$KEYCHAIN"
       - name: Package tarball
         run: |
           mkdir -p dist/package

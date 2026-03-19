@@ -18,7 +18,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
-use weaver_api::auth::{CallerScope, generate_api_key, hash_api_key, verify_password};
+use weaver_api::auth::{
+    CallerScope, generate_api_key, hash_api_key, hash_password, needs_rehash, verify_password,
+};
 use weaver_api::jwt::{self, JWT_TTL_SECS};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
 use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
@@ -587,7 +589,31 @@ async fn login_handler(
         return error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
 
-    let secret = jwt::derive_jwt_secret(&creds.password_hash);
+    // Transparent rehash: upgrade legacy scrypt hashes to argon2id on successful login.
+    let password_hash = if needs_rehash(&creds.password_hash) {
+        let pw = body.password.clone();
+        let db_rehash = db.clone();
+        let username = creds.username.clone();
+        if let Ok(new_hash) = tokio::task::spawn_blocking(move || {
+            hash_password(&pw).and_then(|h| {
+                db_rehash
+                    .set_auth_credentials(&username, &h)
+                    .map_err(|e| format!("db update failed: {e}"))?;
+                Ok(h)
+            })
+        })
+        .await
+        .unwrap_or(Err("task failed".into()))
+        {
+            new_hash
+        } else {
+            creds.password_hash.clone()
+        }
+    } else {
+        creds.password_hash.clone()
+    };
+
+    let secret = jwt::derive_jwt_secret(&password_hash);
     let token = jwt::create_jwt(&creds.username, &secret, JWT_TTL_SECS);
     let cookie =
         format!("weaver_jwt={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}");

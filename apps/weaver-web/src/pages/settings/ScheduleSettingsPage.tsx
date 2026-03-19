@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "urql";
-import { Clock, Plus, Trash2 } from "lucide-react";
+import { Pencil, Plus, Trash2 } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ import { formatSpeed } from "@/components/SpeedDisplay";
 import {
   SCHEDULES_QUERY,
   CREATE_SCHEDULE_MUTATION,
+  UPDATE_SCHEDULE_MUTATION,
   DELETE_SCHEDULE_MUTATION,
   TOGGLE_SCHEDULE_MUTATION,
 } from "@/graphql/queries";
@@ -50,19 +51,59 @@ export function ScheduleSettingsPage() {
   const t = useTranslate();
   const [result, reexecute] = useQuery({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
+  const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
   const [, deleteSchedule] = useMutation(DELETE_SCHEDULE_MUTATION);
   const [, toggleSchedule] = useMutation(TOGGLE_SCHEDULE_MUTATION);
 
   const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [formTime, setFormTime] = useState("08:00");
   const [formAction, setFormAction] = useState("pause");
   const [formDays, setFormDays] = useState<string[]>([]);
   const [formLabel, setFormLabel] = useState("");
   const [formSpeed, setFormSpeed] = useState("5");
+  const [formSpeedUnlimited, setFormSpeedUnlimited] = useState(false);
 
   const schedules: Schedule[] = result.data?.schedules ?? [];
 
-  const handleCreate = async () => {
+  const resetForm = () => {
+    setShowForm(false);
+    setEditingId(null);
+    setFormTime("08:00");
+    setFormAction("pause");
+    setFormLabel("");
+    setFormDays([]);
+    setFormSpeed("5");
+    setFormSpeedUnlimited(false);
+  };
+
+  const openCreate = () => {
+    resetForm();
+    setShowForm(true);
+  };
+
+  const openEdit = (entry: Schedule) => {
+    setEditingId(entry.id);
+    setFormTime(entry.time);
+    setFormAction(entry.actionType);
+    setFormDays(entry.days);
+    setFormLabel(entry.label ?? "");
+    if (entry.actionType === "speed_limit") {
+      if (entry.speedLimitBytes === 0 || entry.speedLimitBytes == null) {
+        setFormSpeedUnlimited(true);
+        setFormSpeed("5");
+      } else {
+        setFormSpeedUnlimited(false);
+        setFormSpeed(String(entry.speedLimitBytes / (1024 * 1024)));
+      }
+    } else {
+      setFormSpeedUnlimited(false);
+      setFormSpeed("5");
+    }
+    setShowForm(true);
+  };
+
+  const buildInput = () => {
     const input: Record<string, unknown> = {
       time: formTime,
       actionType: formAction,
@@ -71,13 +112,20 @@ export function ScheduleSettingsPage() {
       enabled: true,
     };
     if (formAction === "speed_limit") {
-      input.speedLimitBytes = parseFloat(formSpeed) * 1024 * 1024;
+      input.speedLimitBytes = formSpeedUnlimited ? 0 : parseFloat(formSpeed) * 1024 * 1024;
     }
-    await createSchedule({ input });
+    return input;
+  };
+
+  const handleSave = async () => {
+    const input = buildInput();
+    if (editingId) {
+      await updateSchedule({ id: editingId, input });
+    } else {
+      await createSchedule({ input });
+    }
     reexecute({ requestPolicy: "network-only" });
-    setShowForm(false);
-    setFormLabel("");
-    setFormDays([]);
+    resetForm();
   };
 
   const handleDelete = async (id: string) => {
@@ -106,7 +154,7 @@ export function ScheduleSettingsPage() {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>{t("schedule.entries")}</CardTitle>
-          <Button size="sm" onClick={() => setShowForm(!showForm)}>
+          <Button size="sm" onClick={openCreate}>
             <Plus className="mr-1 h-4 w-4" />
             {t("schedule.add")}
           </Button>
@@ -144,11 +192,24 @@ export function ScheduleSettingsPage() {
                   <div className="flex items-center gap-2">
                     <Input
                       type="number"
+                      inputMode="decimal"
+                      min="0"
                       value={formSpeed}
-                      onChange={(e) => setFormSpeed(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === "" || Number(val) >= 0) setFormSpeed(val);
+                      }}
                       className="w-24"
+                      disabled={formSpeedUnlimited}
                     />
                     <span className="text-sm text-muted-foreground">MB/s</span>
+                    <label className="flex items-center gap-1.5 text-sm cursor-pointer ml-2">
+                      <Checkbox
+                        checked={formSpeedUnlimited}
+                        onCheckedChange={(checked) => setFormSpeedUnlimited(checked === true)}
+                      />
+                      {t("settings.unlimited")}
+                    </label>
                   </div>
                 </div>
               )}
@@ -182,13 +243,13 @@ export function ScheduleSettingsPage() {
               </div>
 
               <div className="flex gap-2">
-                <Button size="sm" onClick={handleCreate}>
-                  {t("schedule.create")}
+                <Button size="sm" onClick={handleSave}>
+                  {editingId ? t("action.save") : t("schedule.create")}
                 </Button>
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => setShowForm(false)}
+                  onClick={resetForm}
                 >
                   {t("action.cancel")}
                 </Button>
@@ -198,7 +259,6 @@ export function ScheduleSettingsPage() {
 
           {schedules.length === 0 && !showForm && (
             <EmptyState
-              icon={<Clock className="h-10 w-10" />}
               title={t("schedule.empty")}
               description={t("schedule.emptyDesc")}
             />
@@ -221,7 +281,7 @@ export function ScheduleSettingsPage() {
                     <span className="font-mono">{entry.time}</span>
                     <span className="capitalize">
                       {entry.actionType === "speed_limit"
-                        ? `${t("schedule.actionSpeedLimit")}: ${formatSpeed(entry.speedLimitBytes ?? 0)}`
+                        ? `${t("schedule.actionSpeedLimit")}: ${entry.speedLimitBytes === 0 || entry.speedLimitBytes == null ? t("settings.unlimited") : formatSpeed(entry.speedLimitBytes)}`
                         : entry.actionType === "pause"
                           ? t("schedule.actionPause")
                           : t("schedule.actionResume")}
@@ -235,13 +295,22 @@ export function ScheduleSettingsPage() {
                   </div>
                 </div>
               </div>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => handleDelete(entry.id)}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
+              <div className="flex items-center gap-1">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => openEdit(entry)}
+                >
+                  <Pencil className="h-4 w-4" />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => handleDelete(entry.id)}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
           ))}
         </CardContent>

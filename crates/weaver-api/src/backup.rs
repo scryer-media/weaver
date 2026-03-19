@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
-use std::iter;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use age::secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -430,15 +428,44 @@ fn write_plain_archive(
     Ok(())
 }
 
+/// File format: `WEAVER_ENC\0` (10 bytes) + salt (32 bytes) + nonce (12 bytes) + ciphertext+tag
+const ENCRYPT_MAGIC: &[u8; 10] = b"WEAVER_ENC";
+const SALT_LEN: usize = 32;
+const PBKDF2_ROUNDS: u32 = 600_000;
+
+fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), salt, PBKDF2_ROUNDS, &mut key);
+    key
+}
+
 fn encrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), std::io::Error> {
-    let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(password.to_owned()));
-    let mut input_file = File::open(input)?;
-    let output_file = File::create(output)?;
-    let mut writer = encryptor
-        .wrap_output(output_file)
-        .map_err(std::io::Error::other)?;
-    std::io::copy(&mut input_file, &mut writer)?;
-    writer.finish().map_err(std::io::Error::other)?;
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray;
+
+    let mut plaintext = Vec::new();
+    File::open(input)?.read_to_end(&mut plaintext)?;
+
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::fill(&mut salt).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let key = derive_key(password, &salt);
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let nonce = GenericArray::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_ref())
+        .map_err(|e| std::io::Error::other(format!("encryption failed: {e}")))?;
+
+    let mut out = File::create(output)?;
+    use std::io::Write;
+    out.write_all(ENCRYPT_MAGIC)?;
+    out.write_all(&salt)?;
+    out.write_all(&nonce_bytes)?;
+    out.write_all(&ciphertext)?;
     Ok(())
 }
 
@@ -447,7 +474,7 @@ fn maybe_decrypt_archive(
     password: Option<String>,
     work_dir: &Path,
 ) -> Result<PathBuf, BackupServiceError> {
-    if !is_age_encrypted(input)? {
+    if !is_encrypted(input)? {
         return Ok(input.to_path_buf());
     }
 
@@ -460,15 +487,30 @@ fn maybe_decrypt_archive(
 }
 
 fn decrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), BackupServiceError> {
-    let input_file = File::open(input).map_err(io_err)?;
-    let decryptor = age::Decryptor::new(BufReader::new(input_file))
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray;
+
+    let mut data = Vec::new();
+    File::open(input).map_err(io_err)?.read_to_end(&mut data).map_err(io_err)?;
+
+    let header_len = ENCRYPT_MAGIC.len() + SALT_LEN + 12;
+    if data.len() < header_len {
+        return Err(BackupServiceError::InvalidPassword);
+    }
+
+    let salt = &data[ENCRYPT_MAGIC.len()..ENCRYPT_MAGIC.len() + SALT_LEN];
+    let nonce_bytes = &data[ENCRYPT_MAGIC.len() + SALT_LEN..header_len];
+    let ciphertext = &data[header_len..];
+
+    let key = derive_key(password, salt);
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+    let nonce = GenericArray::from_slice(nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|_| BackupServiceError::InvalidPassword)?;
-    let identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
-    let mut reader = decryptor
-        .decrypt(iter::once(&identity as &dyn age::Identity))
-        .map_err(|_| BackupServiceError::InvalidPassword)?;
-    let mut output_file = File::create(output).map_err(io_err)?;
-    std::io::copy(&mut reader, &mut output_file).map_err(io_err)?;
+
+    std::fs::write(output, plaintext).map_err(io_err)?;
     Ok(())
 }
 
@@ -480,11 +522,11 @@ fn unpack_plain_archive(input: &Path, output_dir: &Path) -> Result<(), BackupSer
     Ok(())
 }
 
-fn is_age_encrypted(path: &Path) -> Result<bool, BackupServiceError> {
-    let mut header = [0u8; 32];
+fn is_encrypted(path: &Path) -> Result<bool, BackupServiceError> {
+    let mut header = [0u8; 10];
     let mut file = File::open(path).map_err(io_err)?;
     let read = file.read(&mut header).map_err(io_err)?;
-    Ok(header[..read].starts_with(b"age-encryption.org/"))
+    Ok(read >= ENCRYPT_MAGIC.len() && header[..ENCRYPT_MAGIC.len()] == *ENCRYPT_MAGIC)
 }
 
 fn validate_manifest(db: &Database, manifest: &BackupManifest) -> Result<(), BackupServiceError> {

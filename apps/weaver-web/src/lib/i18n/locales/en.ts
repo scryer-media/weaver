@@ -450,6 +450,7 @@ const en: LocaleDictionary = {
   "confirm.clearRssSeenConfirm": "Clear Seen History",
   "confirm.clearRssSeenDismiss": "Keep History",
   "action.edit": "Edit",
+  "action.save": "Save",
   "action.copy": "Copy",
   "action.copied": "Copied!",
   "rss.addFeed": "Add Feed",

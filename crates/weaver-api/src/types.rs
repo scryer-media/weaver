@@ -413,6 +413,8 @@ pub struct DownloadBlock {
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
+    /// Speed limit imposed by the active schedule (0 = no scheduled limit).
+    pub scheduled_speed_limit: u64,
 }
 
 impl From<&DownloadBlockState> for DownloadBlock {
@@ -428,6 +430,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
             window_starts_at_epoch_ms: value.window_starts_at_epoch_ms,
             window_ends_at_epoch_ms: value.window_ends_at_epoch_ms,
             timezone_name: value.timezone_name.clone(),
+            scheduled_speed_limit: value.scheduled_speed_limit,
         }
     }
 }

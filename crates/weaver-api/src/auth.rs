@@ -48,27 +48,31 @@ pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Hash a password with scrypt for storage.
+/// Hash a password with argon2id for storage.
 pub fn hash_password(password: &str) -> Result<String, String> {
-    use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
     let salt = SaltString::generate(&mut OsRng);
-    let params = scrypt::Params::recommended();
-    let hasher = scrypt::Scrypt;
-    hasher
-        .hash_password_customized(password.as_bytes(), None, None, params, &salt)
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| format!("scrypt hash failed: {e}"))
+        .map_err(|e| format!("argon2 hash failed: {e}"))
 }
 
-/// Verify a password against a stored scrypt hash.
+/// Verify a password against a stored hash (argon2id or legacy scrypt).
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    use scrypt::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
-    scrypt::Scrypt
+    argon2::Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// Returns true if the stored hash uses a legacy algorithm that should be
+/// re-hashed on next successful login.
+pub fn needs_rehash(hash: &str) -> bool {
+    !hash.starts_with("$argon2")
 }
 
 #[cfg(test)]
@@ -106,8 +110,14 @@ mod tests {
     #[test]
     fn password_hash_and_verify() {
         let hash = hash_password("hunter2").unwrap();
-        assert!(hash.starts_with("$scrypt$"));
+        assert!(hash.starts_with("$argon2"));
         assert!(verify_password("hunter2", &hash));
         assert!(!verify_password("wrong", &hash));
+        assert!(!needs_rehash(&hash));
+    }
+
+    #[test]
+    fn legacy_scrypt_needs_rehash() {
+        assert!(needs_rehash("$scrypt$ln=17,r=8,p=1$somesalt$somehash"));
     }
 }

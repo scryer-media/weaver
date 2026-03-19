@@ -59,6 +59,7 @@ interface Snapshot {
     windowStartsAtEpochMs?: number | null;
     windowEndsAtEpochMs?: number | null;
     timezoneName: string;
+    scheduledSpeedLimit: number;
   };
 }
 
@@ -202,6 +203,7 @@ export function Layout() {
         windowStartsAtEpochMs: null,
         windowEndsAtEpochMs: null,
         timezoneName: "",
+        scheduledSpeedLimit: 0,
       },
       connection: {
         status: connectionState.status,
@@ -275,16 +277,14 @@ export function Layout() {
             <div className="relative grid min-h-[calc(100vh-1.5rem)] md:grid-cols-[224px_minmax(0,1fr)]">
               <aside className="hidden border-r border-border/60 bg-background/90 md:flex md:flex-col">
                 <div className="flex items-center justify-between border-b border-border/60 px-4 py-4">
-                  <div>
-                    <div>
-                      <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
-                        Weaver
-                      </div>
-                      <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
-                        Queue Control
-                      </div>
+                  <Link to="/">
+                    <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
+                      Weaver
                     </div>
-                  </div>
+                    <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
+                      Queue Control
+                    </div>
+                  </Link>
                   <ThemeToggle />
                 </div>
 

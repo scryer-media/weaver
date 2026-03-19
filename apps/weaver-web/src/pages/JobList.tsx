@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDown, ChevronRight, Pause, Pencil, Play, X } from "lucide-react";
 import { useMutation, useQuery } from "urql";
@@ -19,7 +19,7 @@ import { JobProgress } from "@/components/JobProgress";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { PageHeader } from "@/components/PageHeader";
 import { ParsedReleaseDetails } from "@/components/ParsedReleaseDetails";
-import { SpeedDisplay, formatBytes } from "@/components/SpeedDisplay";
+import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -28,12 +28,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Table,
   TableBody,
@@ -42,16 +44,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-
-const SPEED_LIMIT_PRESETS = [
-  { label: "Unlimited", value: 0 },
-  { label: "1 MB/s", value: 1024 * 1024 },
-  { label: "5 MB/s", value: 5 * 1024 * 1024 },
-  { label: "10 MB/s", value: 10 * 1024 * 1024 },
-  { label: "25 MB/s", value: 25 * 1024 * 1024 },
-  { label: "50 MB/s", value: 50 * 1024 * 1024 },
-  { label: "100 MB/s", value: 100 * 1024 * 1024 },
-];
 
 function getJobPriority(job: { metadata: { key: string; value: string }[] }): "LOW" | "NORMAL" | "HIGH" {
   const rawPriority = job.metadata.find((entry) => entry.key === "priority")?.value?.toUpperCase();
@@ -184,7 +176,35 @@ export function JobList() {
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [speedLimitValue, setSpeedLimitValue] = useState("0");
+  const [speedLimitOpen, setSpeedLimitOpen] = useState(false);
+  const [speedLimitInput, setSpeedLimitInput] = useState("");
+  const [speedLimitIsUnlimited, setSpeedLimitIsUnlimited] = useState(true);
+
+  // Track the effective speed limit for display (scheduled overrides manual)
+  const [effectiveSpeedLimit, setEffectiveSpeedLimit] = useState(0);
+  const lastScheduledRef = useRef(0);
+  useEffect(() => {
+    const scheduled = downloadBlock.scheduledSpeedLimit ?? 0;
+    if (scheduled !== lastScheduledRef.current) {
+      lastScheduledRef.current = scheduled;
+      setEffectiveSpeedLimit(scheduled);
+    }
+  }, [downloadBlock.scheduledSpeedLimit]);
+
+  const openSpeedLimitDialog = () => {
+    const isUnlimited = effectiveSpeedLimit === 0;
+    setSpeedLimitIsUnlimited(isUnlimited);
+    setSpeedLimitInput(isUnlimited ? "" : String(effectiveSpeedLimit / (1024 * 1024)));
+    setSpeedLimitOpen(true);
+  };
+
+  const applySpeedLimit = () => {
+    const bytes = speedLimitIsUnlimited ? 0 : Math.max(0, parseFloat(speedLimitInput) || 0) * 1024 * 1024;
+    setEffectiveSpeedLimit(bytes);
+    void setSpeedLimit({ bytesPerSec: Math.round(bytes) });
+    setSpeedLimitOpen(false);
+  };
+
   const [cancelConfirmId, setCancelConfirmId] = useState<number | null>(null);
   const [expandedJobIds, setExpandedJobIds] = useState<Set<number>>(new Set());
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -260,35 +280,31 @@ export function JobList() {
         }
         actions={
           <>
-            <div className="rounded-xl border border-border/70 bg-background/70 px-4 py-2">
+            <div className="min-w-[120px] rounded-xl border border-border/70 bg-background/70 px-4 py-2">
               <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
                 {t("label.downloadSpeed")}
               </div>
-              <SpeedDisplay bytesPerSec={speed} className="text-lg font-semibold text-foreground" />
+              <div className="text-base font-semibold text-foreground">
+                {formatSpeed(speed)}
+              </div>
               {isPaused ? (
                 <div className="mt-1 text-[11px] font-medium uppercase tracking-[0.16em] text-amber-600 dark:text-amber-300">
                   {t("jobs.downloadsPaused")}
                 </div>
               ) : null}
             </div>
-            <Select
-              value={speedLimitValue}
-              onValueChange={(value) => {
-                setSpeedLimitValue(value);
-                void setSpeedLimit({ bytesPerSec: Number(value) });
-              }}
+            <button
+              type="button"
+              onClick={openSpeedLimitDialog}
+              className="min-w-[120px] rounded-xl border border-border/70 bg-background/70 px-4 py-2 text-left transition hover:bg-accent/40"
             >
-              <SelectTrigger className="w-36">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SPEED_LIMIT_PRESETS.map((preset) => (
-                  <SelectItem key={preset.value} value={String(preset.value)}>
-                    {preset.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                {t("settings.speedLimit")}
+              </div>
+              <div className={`text-base font-semibold ${effectiveSpeedLimit === 0 ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-300"}`}>
+                {effectiveSpeedLimit === 0 ? t("settings.unlimited") : formatSpeed(effectiveSpeedLimit)}
+              </div>
+            </button>
             <Button
               variant={isPaused ? "default" : "outline"}
               onClick={() => void (isPaused ? resumeAll({}) : pauseAll({}))}
@@ -687,6 +703,50 @@ export function JobList() {
       />
 
       <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
+
+      <Dialog open={speedLimitOpen} onOpenChange={setSpeedLimitOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t("settings.speedLimit")}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label>{t("settings.speedLimit")}</Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  value={speedLimitInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === "" || Number(val) >= 0) setSpeedLimitInput(val);
+                  }}
+                  className="w-28"
+                  disabled={speedLimitIsUnlimited}
+                  autoFocus={!speedLimitIsUnlimited}
+                />
+                <span className="text-sm text-muted-foreground">MB/s</span>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <Checkbox
+                checked={speedLimitIsUnlimited}
+                onCheckedChange={(checked) => setSpeedLimitIsUnlimited(checked === true)}
+              />
+              <span className="text-sm font-medium">{t("settings.unlimited")}</span>
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSpeedLimitOpen(false)}>
+              {t("action.cancel")}
+            </Button>
+            <Button onClick={applySpeedLimit}>
+              {t("action.apply")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

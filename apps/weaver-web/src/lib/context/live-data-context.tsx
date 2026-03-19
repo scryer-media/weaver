@@ -19,6 +19,7 @@ export interface DownloadBlockState {
   windowStartsAtEpochMs?: number | null;
   windowEndsAtEpochMs?: number | null;
   timezoneName: string;
+  scheduledSpeedLimit: number;
 }
 
 export interface LiveData {
@@ -44,6 +45,7 @@ export const LiveDataContext = createContext<LiveData>({
     windowStartsAtEpochMs: null,
     windowEndsAtEpochMs: null,
     timezoneName: "",
+    scheduledSpeedLimit: 0,
   },
   connection: {
     status: "connecting",

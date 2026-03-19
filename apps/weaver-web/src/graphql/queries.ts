@@ -153,6 +153,7 @@ const DOWNLOAD_BLOCK_FIELDS = `
     windowStartsAtEpochMs
     windowEndsAtEpochMs
     timezoneName
+    scheduledSpeedLimit
   }
 `;
 
