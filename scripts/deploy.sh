@@ -68,7 +68,7 @@ npm run build 2>&1 | tail -10
 
 echo "==> Building release..."
 cd "$PROJ_DIR"
-cargo build --release -p weaver 2>&1 | tail -5
+RUSTFLAGS="-C target-cpu=native" cargo build --release -p weaver 2>&1 | tail -5
 
 echo "==> Starting weaver (RUST_LOG=$RUST_LOG, logging to $LOG_FILE)..."
 RUST_LOG="$RUST_LOG" "$BINARY" serve >>"$LOG_FILE" 2>&1 &

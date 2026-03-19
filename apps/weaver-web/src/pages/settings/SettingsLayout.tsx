@@ -22,6 +22,11 @@ export const settingsNav = [
     descriptionKey: "settings.rssDesc",
   },
   {
+    to: "/settings/schedules",
+    labelKey: "schedule.title",
+    descriptionKey: "schedule.desc",
+  },
+  {
     to: "/settings/categories",
     labelKey: "categories.title",
     descriptionKey: "settings.categoriesDesc",

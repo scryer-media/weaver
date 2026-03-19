@@ -805,3 +805,75 @@ export const CLEAR_RSS_SEEN_ITEMS_MUTATION = gql`
     clearRssSeenItems(feedId: $feedId)
   }
 `;
+
+// ── Schedules ───────────────────────────────────────────────────────────────
+
+export const SCHEDULES_QUERY = gql`
+  query Schedules {
+    schedules {
+      id
+      enabled
+      label
+      days
+      time
+      actionType
+      speedLimitBytes
+    }
+  }
+`;
+
+export const CREATE_SCHEDULE_MUTATION = gql`
+  mutation CreateSchedule($input: ScheduleInput!) {
+    createSchedule(input: $input) {
+      id
+      enabled
+      label
+      days
+      time
+      actionType
+      speedLimitBytes
+    }
+  }
+`;
+
+export const UPDATE_SCHEDULE_MUTATION = gql`
+  mutation UpdateSchedule($id: String!, $input: ScheduleInput!) {
+    updateSchedule(id: $id, input: $input) {
+      id
+      enabled
+      label
+      days
+      time
+      actionType
+      speedLimitBytes
+    }
+  }
+`;
+
+export const DELETE_SCHEDULE_MUTATION = gql`
+  mutation DeleteSchedule($id: String!) {
+    deleteSchedule(id: $id) {
+      id
+      enabled
+      label
+      days
+      time
+      actionType
+      speedLimitBytes
+    }
+  }
+`;
+
+export const TOGGLE_SCHEDULE_MUTATION = gql`
+  mutation ToggleSchedule($id: String!, $enabled: Boolean!) {
+    toggleSchedule(id: $id, enabled: $enabled) {
+      id
+      enabled
+      label
+      days
+      time
+      actionType
+      speedLimitBytes
+    }
+  }
+`;

@@ -12,6 +12,7 @@ import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
 import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
 import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
+import { ScheduleSettingsPage } from "@/pages/settings/ScheduleSettingsPage";
 
 const basename = window.__WEAVER_BASE__ || "/";
 
@@ -35,6 +36,7 @@ export const router = createBrowserRouter([
           { path: "security", element: <SecuritySettingsPage /> },
           { path: "backup", element: <BackupSettingsPage /> },
           { path: "rss", element: <RssSettingsPage /> },
+          { path: "schedules", element: <ScheduleSettingsPage /> },
           { path: "categories", element: <Categories embedded /> },
           { path: "servers", element: <Servers embedded /> },
         ],

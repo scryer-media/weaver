@@ -541,6 +541,25 @@ const en: LocaleDictionary = {
   "rss.itemsAccepted": "Items Accepted",
   "rss.itemsSubmitted": "Items Submitted",
   "rss.itemsIgnored": "Items Ignored",
+  // ── Schedules ──────────────────────────────────────────────────────────
+  "schedule.title": "Schedules",
+  "schedule.desc": "Time-based rules that pause, resume, or limit download speed on a recurring schedule.",
+  "schedule.entries": "Schedule Rules",
+  "schedule.add": "Add Rule",
+  "schedule.time": "Time",
+  "schedule.action": "Action",
+  "schedule.actionPause": "Pause",
+  "schedule.actionResume": "Resume",
+  "schedule.actionSpeedLimit": "Speed Limit",
+  "schedule.speedLimit": "Speed Limit",
+  "schedule.days": "Days",
+  "schedule.daysHint": "Leave all unchecked for every day.",
+  "schedule.label": "Label",
+  "schedule.labelPlaceholder": "e.g. Off-peak window",
+  "schedule.create": "Create",
+  "schedule.empty": "No schedules",
+  "schedule.emptyDesc": "Add a schedule rule to automatically pause or limit downloads at specific times.",
+  "schedule.everyDay": "Every day",
 };
 
 export default en;
