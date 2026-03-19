@@ -199,13 +199,13 @@ jobs:
             runs_on: macos-26
           - target: x86_64-apple-darwin
             platform: darwin-x86_64
-            runs_on: macos-26-intel
+            runs_on: macos-26
           - target: x86_64-pc-windows-msvc
             platform: windows-x86_64
             runs_on: windows-latest
           - target: aarch64-pc-windows-msvc
             platform: windows-arm64
-            runs_on: windows-latest
+            runs_on: windows-11-arm
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -217,12 +217,15 @@ jobs:
         if: contains(matrix.target, '-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
-      - name: Install native build deps (macOS)
-        if: contains(matrix.target, '-apple-darwin')
+          sudo apt-get install -y musl-tools mold
+      - name: Install NASM (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y nasm
+      - name: Install NASM (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin'
         run: brew install nasm
-      - name: Install NASM (Windows)
-        if: contains(matrix.target, '-windows-')
+      - name: Install NASM (Windows x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
@@ -231,12 +234,13 @@ jobs:
           $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
           echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Exclude build dir from Windows Defender
-        if: contains(matrix.target, '-windows-')
+        if: runner.os == 'Windows'
         shell: pwsh
         run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
+          key: ${{ matrix.platform }}
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -258,9 +262,9 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ matrix.target }}" -like "x86_64-*") {
-            echo "RUSTFLAGS=-C target-cpu=haswell -C linker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            echo "RUSTFLAGS=-C target-cpu=haswell -C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           } else {
-            echo "RUSTFLAGS=-C target-cpu=cortex-a76 -C linker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            echo "RUSTFLAGS=-C target-cpu=cortex-a76 -C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           }
       - name: Build release binary (Unix)
         if: runner.os != 'Windows'
@@ -284,7 +288,7 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
           security set-keychain-settings -lut 900 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          echo "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
           security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
@@ -492,6 +496,13 @@ jobs:
             git push origin HEAD:main
           fi
       - name: Trigger marketing site rebuild
+        if: ${{ secrets.WEB_DISPATCH_TOKEN != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api repos/scryer-media/web/dispatches -f event_type=release-published
+          WEB_TOKEN: ${{ secrets.WEB_DISPATCH_TOKEN }}
+        run: |
+          git clone "https://${WEB_TOKEN}@github.com/scryer-media/web.git" web-repo
+          cd web-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "rebuild: ${{ github.ref_name }}"
+          git push origin HEAD:main

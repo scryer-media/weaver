@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/weaver"
