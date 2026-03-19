@@ -26,14 +26,66 @@ Instead of the traditional sequential approach (download everything, then repair
 ### Key Features
 
 - **Single binary** — no external `unrar`, `par2`, or other tools required
-- **Built-in PAR2 repair** — automatic verification and repair, pure Rust
-- **Built-in RAR extraction** — RAR4 and RAR5 including solid and encrypted archives
+- **Faster** — 15-18% faster side by side with NZBGet downloading large files, due to running all operations in one process and not shelling out to external tools
 - **Incremental extraction** — starts extracting files while still downloading
 - **Real-time updates** — WebSocket push for job progress and system events
 - **Monthly quotas** — daily, weekly, or monthly data limits with configurable billing windows
 - **Prometheus metrics** — native `/metrics` endpoint for observability
 
 ## Install
+
+### Docker
+
+Create a `docker-compose.yml`:
+
+```yaml
+services:
+  weaver:
+    image: ghcr.io/scryer-media/weaver:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - weaver-config:/config
+      - /path/to/downloads:/downloads
+
+volumes:
+  weaver-config:
+```
+
+```bash
+docker compose up -d
+```
+
+Open **http://localhost:9090** and you're ready to go.
+
+Weaver stores its configuration and database in `/config` inside the container. Mount a volume or host directory there to persist settings across restarts.
+
+#### Reverse Proxy (Subpath)
+
+To host Weaver at a subpath like `https://example.com/weaver/`:
+
+```yaml
+services:
+  weaver:
+    image: ghcr.io/scryer-media/weaver:latest
+    command: ["--config", "/config", "serve", "--port", "9090", "--base-url", "/weaver"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - weaver-config:/config
+      - /path/to/downloads:/downloads
+
+volumes:
+  weaver-config:
+```
+
+Then configure your reverse proxy (nginx, Traefik, Caddy, etc.) to forward `/weaver/` to Weaver's port.
+
+#### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info` |
 
 ### Homebrew (macOS / Linux)
 
@@ -54,77 +106,6 @@ brew services restart weaver-usenet
 
 Download the latest release from the [releases page](https://github.com/scryer-media/weaver/releases). Available for Linux (x86_64, arm64) and macOS (Apple Silicon, Intel).
 
-### Docker
-
-See below.
-
-## Quick Start with Docker
-
-The fastest way to run Weaver is with Docker Compose. Create a `docker-compose.yml`:
-
-```yaml
-services:
-  weaver:
-    image: ghcr.io/scryer-media/weaver:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - weaver-config:/config
-      - /path/to/downloads:/downloads
-
-volumes:
-  weaver-config:
-```
-
-Then:
-
-```bash
-docker compose up -d
-```
-
-Open **http://localhost:9090** and you're ready to go.
-
-### Configuration
-
-Weaver stores its configuration and database in `/config` inside the container. Mount a volume or host directory there to persist settings across restarts.
-
-Set your download directory in **Settings > General** once the UI is running, or mount it as shown above.
-
-### Reverse Proxy (Subpath)
-
-To host Weaver at a subpath like `https://example.com/weaver/`:
-
-```yaml
-services:
-  weaver:
-    image: ghcr.io/scryer-media/weaver:latest
-    command: ["--config", "/config", "serve", "--port", "9090", "--base-url", "/weaver"]
-    ports:
-      - "9090:9090"
-    volumes:
-      - weaver-config:/config
-      - /path/to/downloads:/downloads
-```
-
-Then configure your reverse proxy (nginx, Traefik, Caddy, etc.) to forward `/weaver/` to Weaver's port.
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `RUST_LOG` | Logging level (`error`, `warn`, `info`, `debug`, `trace`). Default: `info` |
-
-## How It Works
-
-Weaver models each download as a **job graph** — a directed acyclic graph where each stage (download, decode, verify, repair, extract) is a node with explicit dependencies. This replaces the rigid sequential pipeline of traditional downloaders with a flexible system that can:
-
-- Begin extraction as soon as volume 1 is ready, without waiting for the entire download
-- Prioritize downloading first archive volumes and PAR2 metadata
-- Start PAR2 verification while later segments are still arriving
-- Dynamically adjust concurrency based on system load
-
-The scheduler continuously evaluates what work can proceed, balancing disk I/O, network throughput, CPU usage, and memory across all active jobs.
-
 ## Comparison
 
 | | Weaver | NZBGet | SABnzbd |
@@ -140,7 +121,6 @@ The scheduler continuously evaluates what work can proceed, balancing disk I/O, 
 | Monthly quotas | Yes | No | Yes |
 | Prometheus metrics | Yes | No | No |
 | Obfuscation handling | Planned | Yes | Yes |
-
 
 ## API
 
