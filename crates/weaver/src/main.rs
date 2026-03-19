@@ -669,9 +669,22 @@ async fn run_server_command(
         rss.clone(),
     );
 
+    // Load schedules from DB and spawn the schedule evaluator.
+    let shared_schedules: weaver_scheduler::schedule::SharedSchedules = {
+        let initial = db.list_schedules().unwrap_or_default();
+        std::sync::Arc::new(tokio::sync::RwLock::new(initial))
+    };
+    weaver_scheduler::schedule::spawn_evaluator(handle.clone(), shared_schedules.clone());
+
     // Build GraphQL schema with shared config and database.
     let pipeline_config = shared_config.clone();
-    let schema = weaver_api::build_schema(handle.clone(), shared_config, db.clone(), rss.clone());
+    let schema = weaver_api::build_schema(
+        handle.clone(),
+        shared_config,
+        db.clone(),
+        rss.clone(),
+        shared_schedules,
+    );
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
     {

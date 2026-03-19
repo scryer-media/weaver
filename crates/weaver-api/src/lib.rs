@@ -35,11 +35,13 @@ pub fn build_schema(
     config: SharedConfig,
     db: Database,
     rss: rss::RssService,
+    schedules: weaver_scheduler::schedule::SharedSchedules,
 ) -> WeaverSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(handle)
         .data(config)
         .data(db)
         .data(rss)
+        .data(schedules)
         .finish()
 }
