@@ -30,7 +30,7 @@ async fn is_paused_false_by_default() {
     let resp = h.execute("{ isPaused }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["isPaused"].as_bool().unwrap(), false);
+    assert!(!data["isPaused"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn is_paused_true_after_pause_all() {
     let resp = h.execute("{ isPaused }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["isPaused"].as_bool().unwrap(), true);
+    assert!(data["isPaused"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -54,7 +54,7 @@ async fn is_paused_false_after_resume_all() {
     let resp = h.execute("{ isPaused }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["isPaused"].as_bool().unwrap(), false);
+    assert!(!data["isPaused"].as_bool().unwrap());
 }
 
 #[tokio::test]

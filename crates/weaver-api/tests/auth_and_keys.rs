@@ -130,7 +130,7 @@ async fn enable_login() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["enableLogin"].as_bool().unwrap(), true);
+    assert!(data["enableLogin"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn login_status_when_enabled() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let status = &data["loginStatus"];
-    assert_eq!(status["enabled"].as_bool().unwrap(), true);
+    assert!(status["enabled"].as_bool().unwrap());
     assert_eq!(status["username"].as_str().unwrap(), "admin");
 }
 
@@ -181,7 +181,7 @@ async fn login_status_when_disabled() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let status = &data["loginStatus"];
-    assert_eq!(status["enabled"].as_bool().unwrap(), false);
+    assert!(!status["enabled"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -202,7 +202,7 @@ async fn disable_login() {
     let resp = h.execute(r#"mutation { loginStatus { enabled } }"#).await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["loginStatus"]["enabled"].as_bool().unwrap(), false);
+    assert!(!data["loginStatus"]["enabled"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn change_password_correct() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["changePassword"].as_bool().unwrap(), true);
+    assert!(data["changePassword"].as_bool().unwrap());
 }
 
 #[tokio::test]

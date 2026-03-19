@@ -123,7 +123,7 @@ async fn submit_with_metadata() {
         .await;
 
     let resp = h
-        .execute(&format!(r#"{{ jobs {{ id metadata {{ key value }} }} }}"#))
+        .execute(&r#"{ jobs { id metadata { key value } } }"#.to_string())
         .await;
 
     assert_no_errors(&resp);
@@ -477,7 +477,7 @@ async fn download_block_reflects_pause() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["downloadBlock"]["kind"].is_string());
-    assert_eq!(data["isPaused"].as_bool().unwrap(), true);
+    assert!(data["isPaused"].as_bool().unwrap());
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ async fn set_speed_limit() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["setSpeedLimit"].as_bool().unwrap(), true);
+    assert!(data["setSpeedLimit"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -21,7 +21,7 @@ async fn set_speed_limit_unlimited() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["setSpeedLimit"].as_bool().unwrap(), true);
+    assert!(data["setSpeedLimit"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -32,7 +32,7 @@ async fn set_speed_limit_very_high() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["setSpeedLimit"].as_bool().unwrap(), true);
+    assert!(data["setSpeedLimit"].as_bool().unwrap());
 }
 
 #[tokio::test]

@@ -39,7 +39,7 @@ async fn add_server_basic() {
     assert!(server["id"].as_u64().unwrap() > 0);
     assert_eq!(server["host"].as_str().unwrap(), "news.example.com");
     assert_eq!(server["port"].as_u64().unwrap(), 119);
-    assert_eq!(server["tls"].as_bool().unwrap(), false);
+    assert!(!server["tls"].as_bool().unwrap());
     assert_eq!(server["connections"].as_u64().unwrap(), 5);
 }
 
@@ -67,7 +67,7 @@ async fn add_server_with_tls() {
     let data = response_data(&resp);
     let server = &data["addServer"];
     assert_eq!(server["port"].as_u64().unwrap(), 563);
-    assert_eq!(server["tls"].as_bool().unwrap(), true);
+    assert!(server["tls"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -338,7 +338,7 @@ async fn test_connection_invalid_host() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let result = &data["testConnection"];
-    assert_eq!(result["success"].as_bool().unwrap(), false);
+    assert!(!result["success"].as_bool().unwrap());
     assert!(!result["message"].as_str().unwrap().is_empty());
 }
 
@@ -363,5 +363,5 @@ async fn add_server_active_false() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["addServer"]["active"].as_bool().unwrap(), false);
+    assert!(!data["addServer"]["active"].as_bool().unwrap());
 }

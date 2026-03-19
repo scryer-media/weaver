@@ -1,6 +1,6 @@
 mod common;
 
-use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use common::{TestHarness, assert_no_errors, response_data};
 
 // ---------------------------------------------------------------------------
 // List Jobs
@@ -341,7 +341,7 @@ async fn job_has_all_fields() {
     assert_eq!(job["id"].as_u64().unwrap(), id);
     assert!(job["name"].as_str().unwrap().contains("full-fields"));
     assert_eq!(job["status"].as_str().unwrap(), "QUEUED");
-    assert_eq!(job["hasPassword"].as_bool().unwrap(), true);
+    assert!(job["hasPassword"].as_bool().unwrap());
     assert_eq!(job["category"].as_str().unwrap(), "tv");
 
     let meta = job["metadata"].as_array().unwrap();

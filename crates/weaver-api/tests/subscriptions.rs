@@ -91,5 +91,5 @@ async fn job_updates_reflects_pause_state() {
     let response = item.unwrap().unwrap();
     assert!(response.errors.is_empty());
     let data = response.data.into_json().unwrap();
-    assert_eq!(data["jobUpdates"]["isPaused"].as_bool().unwrap(), true);
+    assert!(data["jobUpdates"]["isPaused"].as_bool().unwrap());
 }

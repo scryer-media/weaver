@@ -19,7 +19,7 @@ async fn get_settings_defaults() {
     assert!(!s["intermediateDir"].as_str().unwrap().is_empty());
     assert!(!s["completeDir"].as_str().unwrap().is_empty());
     // cleanupAfterExtract defaults to true.
-    assert_eq!(s["cleanupAfterExtract"].as_bool().unwrap(), true);
+    assert!(s["cleanupAfterExtract"].as_bool().unwrap());
     // maxDownloadSpeed defaults to 0 (unlimited).
     assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), 0);
     // maxRetries defaults to 3.
@@ -80,11 +80,10 @@ async fn update_cleanup_flag() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(
-        data["updateSettings"]["cleanupAfterExtract"]
+    assert!(
+        !data["updateSettings"]["cleanupAfterExtract"]
             .as_bool()
-            .unwrap(),
-        false
+            .unwrap()
     );
 }
 

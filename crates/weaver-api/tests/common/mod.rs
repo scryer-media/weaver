@@ -14,7 +14,7 @@ use weaver_core::event::PipelineEvent;
 use weaver_core::id::JobId;
 use weaver_scheduler::download_queue::DownloadQueue;
 use weaver_scheduler::handle::{JobInfo, SharedPipelineState};
-use weaver_scheduler::job::{JobSpec, JobState, JobStatus, epoch_ms_now};
+use weaver_scheduler::job::{JobState, JobStatus, epoch_ms_now};
 use weaver_scheduler::metrics::PipelineMetrics;
 use weaver_scheduler::{SchedulerCommand, SchedulerHandle};
 use weaver_state::Database;
