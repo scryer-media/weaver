@@ -32,6 +32,12 @@ pub fn is_obfuscated(filename: &str) -> bool {
         return false;
     }
 
+    // Clear-naming signals: if the name looks like a real release or title,
+    // it's not obfuscated. Adapted from SABnzbd's explicit false returns.
+    if is_clearly_named(stem) {
+        return false;
+    }
+
     // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash.
     // Matches NZBGet's `[0-9a-f.]{16}` pattern.
     {
@@ -94,6 +100,26 @@ pub fn is_obfuscated(filename: &str) -> bool {
             && parts[1].len() >= 2
             && parts[1].chars().all(|c| c.is_ascii_digit())
         {
+            return true;
+        }
+    }
+
+    // Bracketed tags wrapping a hex hash (SABnzbd pattern):
+    // e.g. "[BlaBla] something [More] b2.bef89a622e4a23f07b0d3757ad5e8a.a0 [Brrr]"
+    {
+        let stripped = stem
+            .split('[')
+            .flat_map(|s| s.split(']'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hex_chars: usize = stripped
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .count();
+        let all_hex_space_dot = stripped
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ' ');
+        if hex_chars >= 30 && all_hex_space_dot {
             return true;
         }
     }
@@ -260,6 +286,57 @@ fn strip_trailing_part_info(s: &str) -> &str {
         }
     }
     trimmed
+}
+
+/// Returns `true` if the filename clearly looks like a real title or release name
+/// rather than an obfuscated hash. Adapted from SABnzbd's explicit false-return rules.
+///
+/// Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
+/// with dots still fall through to the obfuscation checks.
+fn is_clearly_named(stem: &str) -> bool {
+    // Split on separators and check for word-like tokens
+    let tokens: Vec<&str> = stem.split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // Known obfuscator prefixes that look like words but aren't
+    const NOISE_WORDS: &[&str] = &["Backup", "backup", "BACKUP"];
+
+    // Need at least 2 tokens with 3+ alpha characters each
+    let word_tokens = tokens
+        .iter()
+        .filter(|t| {
+            t.len() >= 3
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+                && !NOISE_WORDS.contains(t)
+        })
+        .count();
+
+    if word_tokens >= 2 {
+        // Also require mixed case or a known pattern (not all-hex tokens)
+        let has_non_hex_word = tokens.iter().any(|t| {
+            t.len() >= 3
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+                && !t.chars().all(|c| c.is_ascii_hexdigit())
+        });
+        if has_non_hex_word {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if the path is inside a DVD/Bluray structure that should
+/// never be renamed. SABnzbd skips deobfuscation for these.
+pub fn is_protected_media_structure(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/VIDEO_TS/")
+        || s.contains("/AUDIO_TS/")
+        || s.contains("/BDMV/")
+        || s.contains("\\VIDEO_TS\\")
+        || s.contains("\\AUDIO_TS\\")
+        || s.contains("\\BDMV\\")
 }
 
 /// Strip known archive extensions to get the filename stem for obfuscation checks.
@@ -457,5 +534,41 @@ mod tests {
     #[test]
     fn seven_z_split_not_obfuscated() {
         assert!(!is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.015"));
+    }
+
+    // ── SABnzbd parity tests ────────────────────────────────────────────
+
+    #[test]
+    fn clear_naming_not_obfuscated() {
+        // 2+ upper + 2+ lower + separator
+        assert!(!is_obfuscated("Great Distro"));
+        assert!(!is_obfuscated("Some.Show.S01E04"));
+        assert!(!is_obfuscated("My_Cool_File"));
+        // 3+ separators
+        assert!(!is_obfuscated("this is a download"));
+        // 4+ letters + 4+ digits + separator
+        assert!(!is_obfuscated("Beast 2020"));
+        assert!(!is_obfuscated("Movie.2024"));
+    }
+
+    #[test]
+    fn bracketed_hex_is_obfuscated() {
+        assert!(is_obfuscated(
+            "b2.bef89a622e4a23f07b0d3757ad5e8a.a0"
+        ));
+    }
+
+    #[test]
+    fn dvd_structure_protected() {
+        use std::path::Path;
+        assert!(is_protected_media_structure(Path::new(
+            "/downloads/movie/VIDEO_TS/VTS_01_1.VOB"
+        )));
+        assert!(is_protected_media_structure(Path::new(
+            "/downloads/bluray/BDMV/STREAM/00000.m2ts"
+        )));
+        assert!(!is_protected_media_structure(Path::new(
+            "/downloads/movie/movie.mkv"
+        )));
     }
 }
