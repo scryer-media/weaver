@@ -231,7 +231,7 @@ jobs:
             aarch64-apple-*)
               echo "RUSTFLAGS=-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
             aarch64-*-linux-*)
-              echo "RUSTFLAGS=--cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
+              echo "RUSTFLAGS=-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
           esac
       - name: Build release binary
         run: |
