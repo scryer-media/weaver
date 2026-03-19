@@ -1,4 +1,5 @@
 pub mod db;
+pub mod encryption;
 mod error;
 
 pub use db::{

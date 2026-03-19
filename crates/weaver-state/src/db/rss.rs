@@ -137,6 +137,7 @@ impl Database {
     }
 
     pub fn list_rss_feeds(&self) -> Result<Vec<RssFeedRow>, StateError> {
+        use crate::encryption::maybe_decrypt;
         let conn = self.conn();
         let mut stmt = conn
             .prepare_cached(
@@ -171,12 +172,15 @@ impl Database {
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(db_err)?);
+            let mut feed = row.map_err(db_err)?;
+            feed.password = maybe_decrypt(self.encryption_key(), feed.password);
+            out.push(feed);
         }
         Ok(out)
     }
 
     pub fn get_rss_feed(&self, id: u32) -> Result<Option<RssFeedRow>, StateError> {
+        use crate::encryption::maybe_decrypt;
         let conn = self.conn();
         let mut stmt = conn
             .prepare_cached(
@@ -209,12 +213,17 @@ impl Database {
             })
             .optional()
             .map_err(db_err)?;
-        Ok(row)
+        Ok(row.map(|mut feed| {
+            feed.password = maybe_decrypt(self.encryption_key(), feed.password);
+            feed
+        }))
     }
 
     pub fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+        use crate::encryption::maybe_encrypt;
         let conn = self.conn();
         let metadata = encode_metadata(&feed.default_metadata)?;
+        let encrypted_password = maybe_encrypt(self.encryption_key(), &feed.password);
         conn.execute(
             "INSERT INTO rss_feeds
              (id, name, url, enabled, poll_interval_secs, username, password, default_category,
@@ -228,7 +237,7 @@ impl Database {
                 feed.enabled,
                 feed.poll_interval_secs,
                 feed.username,
-                feed.password,
+                encrypted_password,
                 feed.default_category,
                 metadata,
                 feed.etag,
@@ -244,8 +253,10 @@ impl Database {
     }
 
     pub fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+        use crate::encryption::maybe_encrypt;
         let conn = self.conn();
         let metadata = encode_metadata(&feed.default_metadata)?;
+        let encrypted_password = maybe_encrypt(self.encryption_key(), &feed.password);
         conn.execute(
             "UPDATE rss_feeds
              SET name = ?2, url = ?3, enabled = ?4, poll_interval_secs = ?5, username = ?6,
@@ -260,7 +271,7 @@ impl Database {
                 feed.enabled,
                 feed.poll_interval_secs,
                 feed.username,
-                feed.password,
+                encrypted_password,
                 feed.default_category,
                 metadata,
                 feed.etag,

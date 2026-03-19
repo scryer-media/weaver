@@ -309,6 +309,7 @@ fn detect_disk(output_dir: &Path) -> DiskProfile {
 ///
 /// Creates a temporary 4 MB file, issues 200 random `pread()` calls,
 /// and returns measured IOPS. Takes <1 ms on SSD, ~1 s on HDD.
+#[cfg(unix)]
 fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
     use std::io::Write;
 
@@ -362,6 +363,13 @@ fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
     } else {
         Some(NUM_READS as f64 * 1_000_000.0) // sub-microsecond → very fast
     }
+}
+
+/// Windows fallback: assume SSD-class IOPS since we cannot easily benchmark
+/// without pread(). The tuner will adjust based on observed throughput.
+#[cfg(not(unix))]
+fn benchmark_random_read_iops(_dir: &Path) -> Option<f64> {
+    Some(50_000.0)
 }
 
 fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {

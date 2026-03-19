@@ -733,6 +733,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1707,6 +1717,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "byteorder",
+ "log",
+ "windows-sys 0.60.2",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2618,6 +2640,29 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scryer-release-parser"
 version = "0.8.1"
 source = "git+https://github.com/scryer-media/scryer.git?rev=114688d#114688d2c6ef44f6b9a5b84d72f1e1a5d5fbbb2e"
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "semver"
@@ -3532,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3573,7 +3618,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-api"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3610,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-assembly"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "bitvec",
  "serde_json",
@@ -3621,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-core"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "bytes",
  "chrono",
@@ -3643,7 +3688,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nntp"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "bytes",
  "criterion",
@@ -3662,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3673,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3688,7 +3733,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "aes",
  "blake2",
@@ -3710,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-scheduler"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "chrono",
  "serde",
@@ -3725,11 +3770,16 @@ dependencies = [
 
 [[package]]
 name = "weaver-state"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
+ "aes-gcm",
+ "base64",
  "crc32fast",
+ "keyring",
  "rmp-serde",
  "rusqlite",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tempfile",
@@ -3742,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "crc32fast",
  "memchr",

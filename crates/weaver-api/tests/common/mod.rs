@@ -28,6 +28,7 @@ use weaver_assembly::JobAssembly;
 /// backed by an in-memory database and a mock scheduler.
 ///
 /// Each test should create its own harness for full isolation.
+#[allow(dead_code)]
 pub struct TestHarness {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
@@ -90,6 +91,7 @@ impl TestHarness {
     }
 
     /// Execute a GraphQL query/mutation with variables.
+    #[allow(dead_code)]
     pub async fn execute_with_variables(&self, query: &str, variables: Variables) -> Response {
         let request = Request::new(query)
             .data(CallerScope::Local)
@@ -185,6 +187,7 @@ pub fn make_test_nzb(name: &str) -> String {
 }
 
 /// Generate a multi-file NZB for testing jobs with multiple files.
+#[allow(dead_code)]
 pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
     let mut files = String::new();
     for i in 1..=file_count {

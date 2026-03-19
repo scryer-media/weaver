@@ -52,6 +52,7 @@ fn ensure_column(
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    encryption_key: Option<crate::encryption::EncryptionKey>,
 }
 
 impl Database {
@@ -74,6 +75,7 @@ impl Database {
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema()?;
         Ok(db)
@@ -84,9 +86,20 @@ impl Database {
         let conn = Connection::open_in_memory().map_err(|e| StateError::Database(e.to_string()))?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema()?;
         Ok(db)
+    }
+
+    /// Set the encryption key used to protect sensitive fields (passwords).
+    pub fn set_encryption_key(&mut self, key: crate::encryption::EncryptionKey) {
+        self.encryption_key = Some(key);
+    }
+
+    /// Get a reference to the encryption key, if set.
+    pub(crate) fn encryption_key(&self) -> Option<&crate::encryption::EncryptionKey> {
+        self.encryption_key.as_ref()
     }
 
     /// Check if the database has no settings (i.e. fresh / needs migration).
@@ -479,6 +492,85 @@ impl Database {
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
     }
+
+    /// Re-encrypt any plaintext passwords in the database.
+    ///
+    /// On upgrade from a version without encryption, passwords are stored as
+    /// plaintext. This reads each one and re-writes it, which triggers the
+    /// encrypt-on-write path. Idempotent — already-encrypted values pass through.
+    pub fn migrate_plaintext_credentials(&self) -> Result<(), StateError> {
+        use crate::encryption::{is_encrypted, maybe_encrypt};
+
+        let Some(key) = self.encryption_key() else {
+            return Ok(()); // no key set, nothing to do
+        };
+
+        let conn = self.conn();
+
+        // Migrate server passwords
+        let mut stmt = conn
+            .prepare_cached("SELECT id, password FROM servers WHERE password IS NOT NULL")
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        let server_rows: Vec<(u32, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, pw)| !pw.is_empty() && !is_encrypted(pw))
+            .collect();
+        drop(stmt);
+
+        for (id, plaintext) in &server_rows {
+            let val: Option<String> = Some(plaintext.clone());
+            if let Some(encrypted) = maybe_encrypt(Some(key), &val) {
+                conn.execute(
+                    "UPDATE servers SET password = ?1 WHERE id = ?2",
+                    rusqlite::params![encrypted, id],
+                )
+                .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+        }
+        if !server_rows.is_empty() {
+            tracing::info!(
+                count = server_rows.len(),
+                "encrypted plaintext server passwords"
+            );
+        }
+
+        // Migrate RSS feed passwords
+        let mut stmt = conn
+            .prepare_cached("SELECT id, password FROM rss_feeds WHERE password IS NOT NULL")
+            .map_err(|e| StateError::Database(e.to_string()))?;
+        let feed_rows: Vec<(u32, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, pw)| !pw.is_empty() && !is_encrypted(pw))
+            .collect();
+        drop(stmt);
+
+        for (id, plaintext) in &feed_rows {
+            let val: Option<String> = Some(plaintext.clone());
+            if let Some(encrypted) = maybe_encrypt(Some(key), &val) {
+                conn.execute(
+                    "UPDATE rss_feeds SET password = ?1 WHERE id = ?2",
+                    rusqlite::params![encrypted, id],
+                )
+                .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+        }
+        if !feed_rows.is_empty() {
+            tracing::info!(
+                count = feed_rows.len(),
+                "encrypted plaintext RSS feed passwords"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +627,7 @@ mod tests {
 
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema().unwrap();
 
@@ -566,6 +659,7 @@ mod tests {
 
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema().unwrap();
 
@@ -629,6 +723,7 @@ mod tests {
 
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema().unwrap();
 
@@ -671,6 +766,7 @@ mod tests {
 
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema().unwrap();
 
@@ -719,6 +815,7 @@ mod tests {
 
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
         };
         db.create_schema().unwrap();
 

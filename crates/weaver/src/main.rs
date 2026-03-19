@@ -87,7 +87,7 @@ async fn async_main() {
     let cli = Cli::parse();
 
     // Open database and load config.
-    let (db, mut config) = match open_db_and_config(&cli.config) {
+    let (mut db, mut config) = match open_db_and_config(&cli.config) {
         Ok(r) => r,
         Err(e) => {
             error!("failed to load config: {e}");
@@ -119,8 +119,19 @@ async fn async_main() {
         std::process::exit(1);
     }
 
-    // Preflight: ensure required directories exist and are writable.
+    // Bootstrap encryption key for sensitive fields (NNTP/RSS passwords).
     let data_dir = PathBuf::from(&config.data_dir);
+    match weaver_state::encryption::ensure_encryption_key(Some(data_dir.clone())) {
+        Ok(key) => {
+            db.set_encryption_key(key);
+            if let Err(e) = db.migrate_plaintext_credentials() {
+                error!("failed to encrypt existing passwords: {e}");
+            }
+        }
+        Err(e) => error!("failed to bootstrap encryption key: {e}"),
+    }
+
+    // Preflight: ensure required directories exist and are writable.
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());
 

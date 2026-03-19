@@ -200,6 +200,12 @@ jobs:
           - target: x86_64-apple-darwin
             platform: darwin-x86_64
             runs_on: macos-26-intel
+          - target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            runs_on: windows-latest
+          - target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            runs_on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -215,6 +221,19 @@ jobs:
       - name: Install native build deps (macOS)
         if: contains(matrix.target, '-apple-darwin')
         run: brew install nasm
+      - name: Install NASM (Windows)
+        if: contains(matrix.target, '-windows-')
+        shell: pwsh
+        run: |
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        if: contains(matrix.target, '-windows-')
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
@@ -223,7 +242,8 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags
+      - name: Set target CPU flags (Unix)
+        if: runner.os != 'Windows'
         run: |
           case "${{ matrix.target }}" in
             x86_64-*)
@@ -233,13 +253,26 @@ jobs:
             aarch64-*-linux-*)
               echo "RUSTFLAGS=-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
           esac
-      - name: Build release binary
+      - name: Set target CPU flags (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ("${{ matrix.target }}" -like "x86_64-*") {
+            echo "RUSTFLAGS=-C target-cpu=haswell -C linker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            echo "RUSTFLAGS=-C target-cpu=cortex-a76 -C linker=lld-link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           if [[ "${{ matrix.target }}" == *"-musl" ]]; then
             mold -run cargo build -p weaver --release --locked --target ${{ matrix.target }}
           else
             cargo build -p weaver --release --locked --target ${{ matrix.target }}
           fi
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build -p weaver --release --locked --target ${{ matrix.target }}
       - name: Codesign binary (macOS)
         if: contains(matrix.target, '-apple-darwin')
         env:
@@ -259,16 +292,30 @@ jobs:
           codesign --verify --verbose target/${{ matrix.target }}/release/weaver
           rm /tmp/cert.p12
           security delete-keychain "$KEYCHAIN"
-      - name: Package tarball
+      - name: Package tarball (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist/package
           cp target/${{ matrix.target }}/release/weaver dist/package/weaver
           tar -czf weaver-${{ matrix.platform }}.tar.gz -C dist/package .
-      - name: Upload release package
+      - name: Package zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target\${{ matrix.target }}\release\weaver.exe -DestinationPath weaver-${{ matrix.platform }}.zip
+      - name: Upload release package (Unix)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: weaver-${{ matrix.platform }}-${{ github.run_id }}
           path: weaver-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload release package (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-${{ matrix.platform }}-${{ github.run_id }}
+          path: weaver-${{ matrix.platform }}.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -350,7 +397,8 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            artifacts/weaver-*.tar.gz
+            artifacts/weaver-*.tar.gz \
+            artifacts/weaver-*.zip
       - name: Update Homebrew tap
         env:
           TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}

@@ -318,6 +318,7 @@ impl Database {
     // ── Servers ───────────────────────────────────────────────────────
 
     pub fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError> {
+        use crate::encryption::maybe_decrypt;
         let conn = self.conn();
         let mut stmt = conn
             .prepare_cached(
@@ -345,13 +346,17 @@ impl Database {
 
         let mut servers = Vec::new();
         for row in rows {
-            servers.push(row.map_err(|e| StateError::Database(e.to_string()))?);
+            let mut server = row.map_err(|e| StateError::Database(e.to_string()))?;
+            server.password = maybe_decrypt(self.encryption_key(), server.password);
+            servers.push(server);
         }
         Ok(servers)
     }
 
     pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+        use crate::encryption::maybe_encrypt;
         let conn = self.conn();
+        let encrypted_password = maybe_encrypt(self.encryption_key(), &server.password);
         conn.execute(
             "INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -361,7 +366,7 @@ impl Database {
                 server.port,
                 server.tls,
                 server.username,
-                server.password,
+                encrypted_password,
                 server.connections,
                 server.active,
                 server.supports_pipelining,
@@ -373,7 +378,9 @@ impl Database {
     }
 
     pub fn update_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+        use crate::encryption::maybe_encrypt;
         let conn = self.conn();
+        let encrypted_password = maybe_encrypt(self.encryption_key(), &server.password);
         conn.execute(
             "UPDATE servers SET host=?2, port=?3, tls=?4, username=?5, password=?6,
              connections=?7, active=?8, supports_pipelining=?9, priority=?10
@@ -384,7 +391,7 @@ impl Database {
                 server.port,
                 server.tls,
                 server.username,
-                server.password,
+                encrypted_password,
                 server.connections,
                 server.active,
                 server.supports_pipelining,

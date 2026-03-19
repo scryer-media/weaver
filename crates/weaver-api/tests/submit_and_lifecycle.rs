@@ -122,9 +122,7 @@ async fn submit_with_metadata() {
         )
         .await;
 
-    let resp = h
-        .execute(&r#"{ jobs { id metadata { key value } } }"#.to_string())
-        .await;
+    let resp = h.execute(r#"{ jobs { id metadata { key value } } }"#).await;
 
     assert_no_errors(&resp);
     let data = response_data(&resp);

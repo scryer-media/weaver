@@ -1231,31 +1231,43 @@ fn compute_write_backlog_budget_bytes(profile: &SystemProfile, buffers: &Arc<Buf
 /// Logs a warning if space appears insufficient; does not hard-fail since
 /// estimates from NZB metadata may be inaccurate.
 pub(super) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    let path_cstr = match std::ffi::CString::new(output_dir.to_str().unwrap_or(".").as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    #[cfg(unix)]
+    {
+        let path_cstr = match std::ffi::CString::new(output_dir.to_str().unwrap_or(".").as_bytes())
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(path_cstr.as_ptr(), &mut stat) == 0 {
-            #[allow(clippy::unnecessary_cast)]
-            let available = stat.f_bavail as u64 * stat.f_frsize as u64;
-            if available < needed_bytes {
-                let avail_mb = available / (1024 * 1024);
-                let need_mb = needed_bytes / (1024 * 1024);
-                warn!(
-                    available_mb = avail_mb,
-                    needed_mb = need_mb,
-                    "output directory may not have enough free disk space"
-                );
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(path_cstr.as_ptr(), &mut stat) == 0 {
+                #[allow(clippy::unnecessary_cast)]
+                let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+                if available < needed_bytes {
+                    let avail_mb = available / (1024 * 1024);
+                    let need_mb = needed_bytes / (1024 * 1024);
+                    warn!(
+                        available_mb = avail_mb,
+                        needed_mb = need_mb,
+                        "output directory may not have enough free disk space"
+                    );
+                } else {
+                    let avail_mb = available / (1024 * 1024);
+                    debug!(available_mb = avail_mb, "disk space check passed");
+                }
             } else {
-                let avail_mb = available / (1024 * 1024);
-                debug!(available_mb = avail_mb, "disk space check passed");
+                debug!("could not check free disk space (statvfs failed)");
             }
-        } else {
-            debug!("could not check free disk space (statvfs failed)");
         }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On Windows, use std::fs metadata as a basic check. A full disk space
+        // query would need GetDiskFreeSpaceExW; for now just skip the check.
+        let _ = (output_dir, needed_bytes);
+        debug!("disk space check not available on this platform");
     }
 }
 

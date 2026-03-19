@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.34"
+version = "0.1.35"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/weaver"
@@ -73,6 +73,10 @@ regex = "1.11"
 tar = "0.4"
 zip = "2"
 flate2 = "1"
+base64 = "0.22"
+security-framework = "3"
+security-framework-sys = "2"
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer.git", package = "scryer-release-parser", rev = "114688d" }
 
 [profile.release]
