@@ -443,3 +443,7 @@ jobs:
             git commit -m "weaver ${VERSION}"
             git push origin HEAD:main
           fi
+      - name: Trigger marketing site rebuild
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api repos/scryer-media/web/dispatches -f event_type=release-published
