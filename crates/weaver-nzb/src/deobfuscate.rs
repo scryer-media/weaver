@@ -67,10 +67,11 @@ pub fn is_obfuscated(filename: &str) -> bool {
     // Single uppercase letter + 5+ digits (e.g. "T306077") — tracking ID pattern
     if bare.len() >= 6 {
         let mut chars = bare.chars();
-        if let Some(first) = chars.next() {
-            if first.is_ascii_uppercase() && chars.all(|c| c.is_ascii_digit()) {
-                return true;
-            }
+        if let Some(first) = chars.next()
+            && first.is_ascii_uppercase()
+            && chars.all(|c| c.is_ascii_digit())
+        {
+            return true;
         }
     }
 
@@ -96,8 +97,8 @@ pub fn is_obfuscated(filename: &str) -> bool {
         let has_upper = bare.chars().any(|c| c.is_ascii_uppercase());
         let has_lower = bare.chars().any(|c| c.is_ascii_lowercase());
         let has_digit = bare.chars().any(|c| c.is_ascii_digit());
-        let mixed =
-            (has_upper && has_lower) || (has_upper && has_digit) || (has_lower && has_digit);
+        let char_classes = has_upper as u8 + has_lower as u8 + has_digit as u8;
+        let mixed = char_classes >= 2;
         if mixed && bare.len() >= 14 {
             return true;
         }
@@ -122,8 +123,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
     }
 
     // Backup_NNNNN_SNN-NN pattern (NZBGet: `Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
-    if bare.starts_with("Backup_") {
-        let rest = &bare[7..];
+    if let Some(rest) = bare.strip_prefix("Backup_") {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
             let after = &rest[digits.len()..];
