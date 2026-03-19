@@ -1374,6 +1374,28 @@ impl Pipeline {
                         "PAR2 verification passed — no damaged slices"
                     );
 
+                    // Rename obfuscated files using PAR2 metadata even when
+                    // verification is clean (files may be intact but obfuscated).
+                    if let Some(par2) = self.par2_set(job_id).cloned() {
+                        let rename_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                        if let Ok(suggestions) = weaver_par2::scan_for_renames(&rename_dir, &par2) {
+                            for s in &suggestions {
+                                let old = &s.current_path;
+                                let new = old.parent().unwrap().join(&s.correct_name);
+                                if old.file_name().map(|n| n.to_string_lossy().to_string())
+                                    == Some(s.correct_name.clone())
+                                {
+                                    continue;
+                                }
+                                if let Err(e) = std::fs::rename(old, &new) {
+                                    warn!(job_id = job_id.0, from = %old.display(), to = %new.display(), error = %e, "PAR2 rename failed");
+                                } else {
+                                    info!(job_id = job_id.0, from = %old.file_name().unwrap().to_string_lossy(), to = %s.correct_name, "deobfuscated file via PAR2 metadata");
+                                }
+                            }
+                        }
+                    }
+
                     if has_crc_failures {
                         if self.normalization_retried.contains(&job_id) {
                             let msg =
