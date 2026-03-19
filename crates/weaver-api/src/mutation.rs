@@ -1004,6 +1004,96 @@ impl MutationRoot {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(cleared as u32)
     }
+
+    // ── Schedules ───────────────────────────────────────────────────────
+
+    async fn create_schedule(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::types::ScheduleInput,
+    ) -> Result<Vec<crate::types::Schedule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let entry = input.into_entry();
+        let mut entries = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.list_schedules()
+        })
+        .await??;
+        entries.push(entry);
+        let entries_for_save = entries.clone();
+        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        *schedules_state.write().await = entries.clone();
+        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+    }
+
+    async fn update_schedule(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        input: crate::types::ScheduleInput,
+    ) -> Result<Vec<crate::types::Schedule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let mut entries = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.list_schedules()
+        })
+        .await??;
+        if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
+            let updated = input.into_entry();
+            existing.enabled = updated.enabled;
+            existing.label = updated.label;
+            existing.days = updated.days;
+            existing.time = updated.time;
+            existing.action = updated.action;
+        }
+        let entries_for_save = entries.clone();
+        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        *schedules_state.write().await = entries.clone();
+        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+    }
+
+    async fn delete_schedule(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> Result<Vec<crate::types::Schedule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let mut entries = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.list_schedules()
+        })
+        .await??;
+        entries.retain(|e| e.id != id);
+        let entries_for_save = entries.clone();
+        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        *schedules_state.write().await = entries.clone();
+        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+    }
+
+    async fn toggle_schedule(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        enabled: bool,
+    ) -> Result<Vec<crate::types::Schedule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let schedules_state = ctx.data::<weaver_scheduler::schedule::SharedSchedules>()?.clone();
+        let mut entries = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.list_schedules()
+        })
+        .await??;
+        if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
+            existing.enabled = enabled;
+        }
+        let entries_for_save = entries.clone();
+        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
+        *schedules_state.write().await = entries.clone();
+        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
+    }
 }
 
 fn history_jobs_from_handle(handle: &SchedulerHandle) -> Vec<Job> {

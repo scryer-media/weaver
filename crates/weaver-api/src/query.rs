@@ -4,6 +4,7 @@ use async_graphql::{Context, Object, Result};
 
 use weaver_core::config::SharedConfig;
 use weaver_scheduler::SchedulerHandle;
+use weaver_state::Database;
 
 use crate::auth::AdminGuard;
 use crate::timeline::build_job_timeline;
@@ -270,6 +271,16 @@ impl QueryRoot {
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::types::Schedule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let entries: Vec<weaver_core::config::ScheduleEntry> =
+            tokio::task::spawn_blocking(move || db.list_schedules())
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(entries.into_iter().map(crate::types::Schedule::from).collect())
     }
 }
 

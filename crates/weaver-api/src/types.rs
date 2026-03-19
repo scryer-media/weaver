@@ -1322,3 +1322,92 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
         }
     }
 }
+
+// ── Schedules ───────────────────────────────────────────────────────────────
+
+/// A schedule entry as returned by GraphQL queries.
+#[derive(SimpleObject)]
+pub struct Schedule {
+    pub id: String,
+    pub enabled: bool,
+    pub label: String,
+    pub days: Vec<String>,
+    pub time: String,
+    pub action_type: String,
+    pub speed_limit_bytes: Option<u64>,
+}
+
+impl From<weaver_core::config::ScheduleEntry> for Schedule {
+    fn from(e: weaver_core::config::ScheduleEntry) -> Self {
+        let (action_type, speed_limit_bytes) = match &e.action {
+            weaver_core::config::ScheduleAction::Pause => ("pause".into(), None),
+            weaver_core::config::ScheduleAction::Resume => ("resume".into(), None),
+            weaver_core::config::ScheduleAction::SpeedLimit { bytes_per_sec } => {
+                ("speed_limit".into(), Some(*bytes_per_sec))
+            }
+        };
+        Schedule {
+            id: e.id,
+            enabled: e.enabled,
+            label: e.label,
+            days: e.days.iter().map(|d| format!("{d:?}").to_lowercase()).collect(),
+            time: e.time,
+            action_type,
+            speed_limit_bytes,
+        }
+    }
+}
+
+/// Input type for creating/updating a schedule entry.
+#[derive(InputObject)]
+pub struct ScheduleInput {
+    pub enabled: Option<bool>,
+    pub label: Option<String>,
+    pub days: Option<Vec<String>>,
+    pub time: String,
+    pub action_type: String,
+    pub speed_limit_bytes: Option<u64>,
+}
+
+impl ScheduleInput {
+    pub fn into_entry(self) -> weaver_core::config::ScheduleEntry {
+        use weaver_core::config::{ScheduleAction, Weekday};
+        let action = match self.action_type.as_str() {
+            "pause" => ScheduleAction::Pause,
+            "resume" => ScheduleAction::Resume,
+            "speed_limit" => ScheduleAction::SpeedLimit {
+                bytes_per_sec: self.speed_limit_bytes.unwrap_or(0),
+            },
+            _ => ScheduleAction::Resume,
+        };
+        let days: Vec<Weekday> = self
+            .days
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| match d.to_lowercase().as_str() {
+                "mon" => Some(Weekday::Mon),
+                "tue" => Some(Weekday::Tue),
+                "wed" => Some(Weekday::Wed),
+                "thu" => Some(Weekday::Thu),
+                "fri" => Some(Weekday::Fri),
+                "sat" => Some(Weekday::Sat),
+                "sun" => Some(Weekday::Sun),
+                _ => None,
+            })
+            .collect();
+        weaver_core::config::ScheduleEntry {
+            id: format!(
+                "sched-{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
+            enabled: self.enabled.unwrap_or(true),
+            label: self.label.unwrap_or_default(),
+            days,
+            time: self.time,
+            action,
+        }
+    }
+}
