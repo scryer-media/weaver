@@ -11,14 +11,35 @@
 /// are stripped before checking — `a8f3b2c1d4e5.rar` is still obfuscated even
 /// though it has a valid extension.
 pub fn is_obfuscated(filename: &str) -> bool {
+    // Archive files with hash-like names are normal (obfuscated archives are still
+    // valid — PAR2 rename handles them). Only flag non-archive files as obfuscated.
+    let lower = filename.to_ascii_lowercase();
+    let is_archive = [".rar", ".par2", ".zip", ".7z", ".nzb"]
+        .iter()
+        .any(|ext| lower.contains(ext))
+        || (lower.rfind('.').is_some_and(|dot| {
+            let ext = &lower[dot + 1..];
+            ext.len() <= 3
+                && (ext.chars().all(|c| c.is_ascii_digit())
+                    || (ext.starts_with('r') && ext[1..].chars().all(|c| c.is_ascii_digit())))
+        }));
+    if is_archive {
+        return false;
+    }
+
     let stem = strip_archive_extension(filename);
     if stem.is_empty() {
         return false;
     }
 
-    // Pure hex, 16+ characters: almost certainly a hash
-    if stem.len() >= 16 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
-        return true;
+    // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash.
+    // Matches NZBGet's `[0-9a-f.]{16}` pattern.
+    {
+        let hex_chars: usize = stem.chars().filter(|c| c.is_ascii_hexdigit()).count();
+        let all_hex_or_dot = stem.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
+        if hex_chars >= 16 && all_hex_or_dot {
+            return true;
+        }
     }
 
     // Alphanumeric only, 24+ characters, no dots/dashes/underscores: hash or UUID
@@ -42,6 +63,36 @@ pub fn is_obfuscated(filename: &str) -> bool {
         if alpha_prefix.len() >= 11
             && digit_suffix.len() >= 3
             && digit_suffix.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+
+    // Backup_NNNNN_SNN-NN pattern (NZBGet: `Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
+    if stem.starts_with("Backup_") {
+        let rest = &stem[7..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 5 {
+            let after = &rest[digits.len()..];
+            if after.starts_with('S')
+                && after.len() >= 6
+                && after[1..3].chars().all(|c| c.is_ascii_digit())
+                && after.as_bytes().get(3) == Some(&b'-')
+                && after[4..6].chars().all(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+
+    // Timestamp-like: NNNNNN_NN (NZBGet: `[0-9]{6}_[0-9]{2}`)
+    if stem.len() >= 9 {
+        let parts: Vec<&str> = stem.splitn(2, '_').collect();
+        if parts.len() == 2
+            && parts[0].len() >= 6
+            && parts[0].chars().all(|c| c.is_ascii_digit())
+            && parts[1].len() >= 2
+            && parts[1].chars().all(|c| c.is_ascii_digit())
         {
             return true;
         }
@@ -161,21 +212,29 @@ fn extract_fallback(subject: &str) -> Option<String> {
         trimmed
     };
 
-    // Take the last whitespace-delimited token that contains a dot
+    // Take the last whitespace-delimited token. Prefer tokens with dots (filenames),
+    // but accept dotless tokens as a last resort (handles "Re: A" edge cases).
     let token = after_prefix.rsplit_once(' ').map_or(after_prefix, |(_, t)| t);
-    if token.contains('.') && !token.is_empty() {
+    if !token.is_empty() {
         Some(token.to_string())
     } else {
         None
     }
 }
 
-/// Check if a string looks like a segment marker (e.g. "1/10", "34/44").
+/// Check if a string looks like a segment marker (e.g. "1/10", "34/44")
+/// or a pure number (e.g. "24" — segment count without slash).
 fn is_segment_marker(s: &str) -> bool {
+    // N/N format
     let parts: Vec<&str> = s.split('/').collect();
-    parts.len() == 2
+    if parts.len() == 2
         && parts[0].chars().all(|c| c.is_ascii_digit())
         && parts[1].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    // Pure number (used in some PRiVATE variants)
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Extract the last path component (basename) from a path string.
@@ -237,8 +296,9 @@ mod tests {
     #[test]
     fn hex_hash_is_obfuscated() {
         assert!(is_obfuscated("2c0837e5fa42c8cfb5d5e583168a2af4"));
-        assert!(is_obfuscated("2c0837e5fa42c8cfb5d5e583168a2af4.rar"));
-        assert!(is_obfuscated("2c0837e5fa42c8cfb5d5e583168a2af4.10"));
+        // Archive extensions are excluded — PAR2 rename handles those
+        assert!(!is_obfuscated("2c0837e5fa42c8cfb5d5e583168a2af4.rar"));
+        assert!(!is_obfuscated("2c0837e5fa42c8cfb5d5e583168a2af4.10"));
     }
 
     #[test]
@@ -349,5 +409,53 @@ mod tests {
     #[test]
     fn preserves_normal_ext() {
         assert_eq!(strip_archive_extension("movie.mkv"), "movie.mkv");
+    }
+
+    // ── NZBGet parity tests (patterns from nzbget/tests/queue/Deobfuscation.cpp)
+
+    #[test]
+    fn hex_with_dots_is_obfuscated() {
+        // Non-archive files with hex+dot stems
+        assert!(is_obfuscated("a1b2.c3d4.e5f6.7890.abcd.ef01"));
+        assert!(is_obfuscated("abcdef01.23456789"));
+    }
+
+    #[test]
+    fn backup_pattern_is_obfuscated() {
+        assert!(is_obfuscated("Backup_12345S01-02"));
+        assert!(is_obfuscated("Backup_999999S99-99"));
+    }
+
+    #[test]
+    fn timestamp_pattern_is_obfuscated() {
+        assert!(is_obfuscated("123456_02"));
+        assert!(is_obfuscated("20240315_14"));
+    }
+
+    #[test]
+    fn private_pure_numeric_segments() {
+        let (name, conf) = extract_filename(
+            r#"[PRiVATE]-[WtFnZb]-[24]-[setup_app_1.bin] - "" yEnc"#,
+        )
+        .unwrap();
+        assert_eq!(name, "setup_app_1.bin");
+        assert_eq!(conf, 0.8);
+    }
+
+    #[test]
+    fn fallback_no_dot_filename() {
+        let (name, _) = extract_filename("Re: A (2/3)").unwrap();
+        assert_eq!(name, "A");
+    }
+
+    #[test]
+    fn fallback_re_prefix_no_parens() {
+        let (name, _) = extract_filename("Re: A").unwrap();
+        assert_eq!(name, "A");
+    }
+
+    #[test]
+    fn seven_z_split_not_obfuscated() {
+        assert!(!is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.015"));
     }
 }
