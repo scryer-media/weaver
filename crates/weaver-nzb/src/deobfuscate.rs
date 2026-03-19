@@ -357,9 +357,7 @@ fn is_clearly_named(stem: &str) -> bool {
             match c {
                 '[' => depth += 1,
                 ']' => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                    depth = depth.saturating_sub(1);
                 }
                 _ if depth == 0 => result.push(c),
                 _ => {}
@@ -371,7 +369,7 @@ fn is_clearly_named(stem: &str) -> bool {
     // Split on separators and check for word-like tokens.
     // Tokens must be 4+ chars to avoid matching file extensions (mkv, avi, bin).
     let tokens: Vec<&str> = without_brackets
-        .split(|c: char| c == ' ' || c == '.' || c == '_' || c == '-')
+        .split([' ', '.', '_', '-'])
         .filter(|t| !t.is_empty())
         .collect();
 
