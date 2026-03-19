@@ -386,6 +386,7 @@ impl From<IspBandwidthCapSettingsInput> for IspBandwidthCapConfig {
 pub enum DownloadBlockKindGql {
     None,
     ManualPause,
+    Scheduled,
     IspCap,
 }
 
@@ -394,6 +395,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
         match value {
             DownloadBlockKind::None => Self::None,
             DownloadBlockKind::ManualPause => Self::ManualPause,
+            DownloadBlockKind::Scheduled => Self::Scheduled,
             DownloadBlockKind::IspCap => Self::IspCap,
         }
     }

@@ -1390,6 +1390,7 @@ mod tests {
                 window_starts_at_epoch_ms: None,
                 window_ends_at_epoch_ms: None,
                 timezone_name: "MDT".into(),
+                scheduled_speed_limit: 0,
             },
         );
 

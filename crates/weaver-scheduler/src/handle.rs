@@ -86,6 +86,7 @@ impl SharedPipelineState {
 pub enum DownloadBlockKind {
     None,
     ManualPause,
+    Scheduled,
     IspCap,
 }
 
@@ -101,6 +102,9 @@ pub struct DownloadBlockState {
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
+    /// Speed limit imposed by the active schedule (0 = no scheduled limit).
+    #[serde(default)]
+    pub scheduled_speed_limit: u64,
 }
 
 impl Default for DownloadBlockState {
@@ -116,6 +120,7 @@ impl Default for DownloadBlockState {
             window_starts_at_epoch_ms: None,
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
+            scheduled_speed_limit: 0,
         }
     }
 }
@@ -170,6 +175,14 @@ pub enum SchedulerCommand {
         bytes_per_sec: u64,
         reply: oneshot::Sender<()>,
     },
+    /// Apply a scheduled action (pause, resume, or speed limit).
+    /// Sent by the schedule evaluator background task.
+    ApplyScheduleAction {
+        action: weaver_core::config::ScheduleAction,
+        reply: oneshot::Sender<()>,
+    },
+    /// Clear any schedule-imposed pause or speed limit.
+    ClearScheduleAction { reply: oneshot::Sender<()> },
     /// Set or clear the ISP bandwidth cap policy.
     SetBandwidthCapPolicy {
         policy: Option<IspBandwidthCapConfig>,
@@ -472,6 +485,31 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    /// Apply a scheduled action (called by the schedule evaluator).
+    pub async fn apply_schedule_action(
+        &self,
+        action: weaver_core::config::ScheduleAction,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ApplyScheduleAction { action, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    /// Clear any schedule-imposed pause or speed limit.
+    pub async fn clear_schedule_action(&self) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ClearScheduleAction { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
     /// Replace the NNTP client at runtime (e.g. after server config changes).
     pub async fn rebuild_nntp<T: Send + 'static>(
         &self,
@@ -671,6 +709,12 @@ mod tests {
                     }
                     SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
                         let _ = reply.send(Ok(()));
+                    }
+                    SchedulerCommand::ApplyScheduleAction { reply, .. } => {
+                        let _ = reply.send(());
+                    }
+                    SchedulerCommand::ClearScheduleAction { reply } => {
+                        let _ = reply.send(());
                     }
                     SchedulerCommand::RestoreJob {
                         job_id,

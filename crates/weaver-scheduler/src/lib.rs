@@ -5,6 +5,7 @@ pub mod job;
 pub mod metrics;
 pub mod rate_limiter;
 pub mod retry_queue;
+pub mod schedule;
 pub mod tuner;
 
 pub use download_queue::{DownloadQueue, DownloadWork};

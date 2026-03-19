@@ -769,6 +769,45 @@ impl Pipeline {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);
             }
+            SchedulerCommand::ApplyScheduleAction { action, reply } => {
+                use weaver_core::config::ScheduleAction;
+                match action {
+                    ScheduleAction::Pause => {
+                        self.global_paused = true;
+                        self.shared_state.set_paused(true);
+                        let mut block = self.bandwidth_cap.to_download_block_state(true);
+                        block.kind = weaver_scheduler::handle::DownloadBlockKind::Scheduled;
+                        self.shared_state.set_download_block(block);
+                        info!("schedule: paused downloads");
+                    }
+                    ScheduleAction::Resume => {
+                        self.global_paused = false;
+                        self.shared_state.set_paused(false);
+                        let _ = self.refresh_bandwidth_cap_window();
+                        info!("schedule: resumed downloads");
+                    }
+                    ScheduleAction::SpeedLimit { bytes_per_sec } => {
+                        self.rate_limiter.set_rate(bytes_per_sec);
+                        let mut block = self.bandwidth_cap.to_download_block_state(self.global_paused);
+                        block.scheduled_speed_limit = bytes_per_sec;
+                        self.shared_state.set_download_block(block);
+                        info!(bytes_per_sec, "schedule: set speed limit");
+                    }
+                }
+                let _ = reply.send(());
+            }
+            SchedulerCommand::ClearScheduleAction { reply } => {
+                // Restore to manual state — clear scheduled pause, restore normal speed
+                if self.global_paused {
+                    // Only unpause if the pause was from the schedule, not manual
+                    self.global_paused = false;
+                    self.shared_state.set_paused(false);
+                }
+                self.rate_limiter.set_rate(0); // unlimited
+                let _ = self.refresh_bandwidth_cap_window();
+                info!("schedule: cleared scheduled action");
+                let _ = reply.send(());
+            }
             SchedulerCommand::RebuildNntp {
                 client,
                 total_connections,

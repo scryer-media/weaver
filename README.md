@@ -17,6 +17,10 @@
 
 ---
 
+<p align="center">
+  <img src="docs/img/weaver-overview.webp" alt="weaver overview" width="800"/>
+</p>
+
 ## What is Weaver?
 
 Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and RAR extraction — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
