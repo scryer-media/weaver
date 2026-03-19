@@ -222,6 +222,9 @@ fn open_db_and_config(
         (dir.join("weaver.db"), toml)
     };
 
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let db = Database::open(&db_path)?;
 
     // Migrate from TOML if the DB is fresh.
