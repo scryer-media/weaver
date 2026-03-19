@@ -72,11 +72,11 @@ pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
 ///
 /// Returns the entry whose `time` is closest to (but not after) `current_time`
 /// on the current day. If multiple entries have the same time, the last one wins.
-fn find_active_entry<'a>(
-    entries: &'a [ScheduleEntry],
+fn find_active_entry(
+    entries: &[ScheduleEntry],
     current_day: Weekday,
     current_time: NaiveTime,
-) -> Option<&'a ScheduleEntry> {
+) -> Option<&ScheduleEntry> {
     let mut best: Option<&ScheduleEntry> = None;
     let mut best_time: Option<NaiveTime> = None;
 
