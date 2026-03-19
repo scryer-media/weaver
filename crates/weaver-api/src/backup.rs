@@ -448,14 +448,14 @@ fn encrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), st
 
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let key = derive_key(password, &salt);
     let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let nonce = GenericArray::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
