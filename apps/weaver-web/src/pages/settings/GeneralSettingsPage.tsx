@@ -20,7 +20,8 @@ import {
   SETTINGS_QUERY,
   UPDATE_SETTINGS_MUTATION,
 } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, useLanguageSettings } from "@/lib/context/translate-context";
+import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
 
 const MAX_SPEED = 100 * 1024 * 1024;
 
@@ -86,6 +87,7 @@ function timeInputToMinutes(raw: string) {
 
 export function GeneralSettingsPage() {
   const t = useTranslate();
+  const { uiLanguage, setLanguagePreference } = useLanguageSettings();
   const [{ data }, reexecuteQuery] = useQuery<{ settings: GeneralSettings; downloadBlock: DownloadBlock }>({
     query: SETTINGS_QUERY,
   });
@@ -182,6 +184,27 @@ export function GeneralSettingsPage() {
         title={t("settings.general")}
         description={t("settings.generalPageDesc")}
       />
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.language")}</CardTitle>
+          <CardDescription>{t("settings.languageDesc")}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Select value={uiLanguage} onValueChange={setLanguagePreference}>
+            <SelectTrigger className="w-[220px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {AVAILABLE_LANGUAGES.map((lang) => (
+                <SelectItem key={lang.code} value={lang.code}>
+                  {lang.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

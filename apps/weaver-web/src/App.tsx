@@ -1,18 +1,24 @@
+import { useMemo } from "react";
 import { Provider } from "urql";
 import { RouterProvider } from "react-router";
 import { ThemeProvider } from "next-themes";
 import { useGraphqlClient } from "./graphql/client";
 import { router } from "./router";
 import { useLanguage } from "@/lib/hooks/use-language";
-import { TranslateContext } from "@/lib/context/translate-context";
+import { TranslateContext, type TranslateContextValue } from "@/lib/context/translate-context";
 import { PwaProvider } from "@/lib/context/pwa-context";
 
 function AppProviders() {
-  const { t } = useLanguage();
+  const { t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
   const client = useGraphqlClient();
 
+  const contextValue = useMemo<TranslateContextValue>(
+    () => ({ t, uiLanguage, setLanguagePreference, selectedLanguage }),
+    [t, uiLanguage, setLanguagePreference, selectedLanguage],
+  );
+
   return (
-    <TranslateContext.Provider value={t}>
+    <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
         <RouterProvider router={router} />
       </Provider>

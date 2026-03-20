@@ -1,19 +1,26 @@
 import type { LocaleDictionary } from "./types";
 import { DEFAULT_LANGUAGE, interpolate } from "./types";
 import en from "./locales/en";
+import es from "./locales/es";
+import zh from "./locales/zh";
+import fr from "./locales/fr";
+import pt from "./locales/pt";
+import ja from "./locales/ja";
+import de from "./locales/de";
+import it from "./locales/it";
+import ko from "./locales/ko";
 export { DEFAULT_LANGUAGE } from "./types";
 
 export type LocaleCode =
   | "eng"
   | "spa"
   | "zho"
-  | "hin"
-  | "ara"
   | "fra"
-  | "rus"
   | "por"
   | "jpn"
-  | "deu";
+  | "deu"
+  | "ita"
+  | "kor";
 
 export type LanguageOption = {
   code: LocaleCode;
@@ -26,39 +33,36 @@ const LOCALE_ALIASES: Record<string, LocaleCode> = {
   en: "eng",
   es: "spa",
   zh: "zho",
-  hi: "hin",
-  ar: "ara",
   fr: "fra",
-  ru: "rus",
   pt: "por",
   de: "deu",
   ja: "jpn",
+  it: "ita",
+  ko: "kor",
 };
 
 const locales: LocaleMap = {
   eng: en,
-  spa: en,
-  zho: en,
-  hin: en,
-  ara: en,
-  fra: en,
-  rus: en,
-  por: en,
-  jpn: en,
-  deu: en,
+  spa: es,
+  zho: zh,
+  fra: fr,
+  por: pt,
+  jpn: ja,
+  deu: de,
+  ita: it,
+  kor: ko,
 };
 
 export const AVAILABLE_LANGUAGES: LanguageOption[] = [
   { code: "eng", label: "English" },
-  { code: "zho", label: "Chinese" },
-  { code: "spa", label: "Spanish" },
-  { code: "hin", label: "Hindi" },
-  { code: "ara", label: "Arabic" },
-  { code: "fra", label: "French" },
-  { code: "rus", label: "Russian" },
-  { code: "por", label: "Portuguese" },
-  { code: "jpn", label: "Japanese" },
-  { code: "deu", label: "German" },
+  { code: "deu", label: "Deutsch" },
+  { code: "spa", label: "Español" },
+  { code: "fra", label: "Français" },
+  { code: "ita", label: "Italiano" },
+  { code: "jpn", label: "日本語" },
+  { code: "kor", label: "한국어" },
+  { code: "por", label: "Português" },
+  { code: "zho", label: "中文" },
 ];
 
 export function getLanguageLabel(code: string): string {
