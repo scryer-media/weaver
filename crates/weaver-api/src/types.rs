@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{Enum, InputObject, OneofObject, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_core::config::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
@@ -595,6 +595,15 @@ pub struct ParsedRelease {
 pub struct MetadataInput {
     pub key: String,
     pub value: String,
+}
+
+/// NZB source — either inline base64 content or a URL to fetch from.
+#[derive(Debug, OneofObject)]
+pub enum NzbSourceInput {
+    /// Base64-encoded NZB file content.
+    NzbBase64(String),
+    /// URL to fetch the NZB from.
+    Url(String),
 }
 
 /// GraphQL representation of a job.

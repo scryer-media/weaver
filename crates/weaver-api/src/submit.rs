@@ -41,6 +41,10 @@ pub enum SubmitNzbError {
     Save(std::io::Error),
     #[error("scheduler error: {0}")]
     Scheduler(#[from] weaver_scheduler::SchedulerError),
+    #[error("NZB fetch failed: {0}")]
+    Fetch(String),
+    #[error("NZB response was not valid XML")]
+    NotXml,
 }
 
 pub async fn submit_nzb_bytes(
@@ -128,6 +132,83 @@ fn write_compressed_nzb(nzb_path: &Path, nzb_bytes: &[u8]) -> Result<(), std::io
     let mut writer = encoder.finish()?;
     writer.flush()?;
     Ok(())
+}
+
+/// Fetch an NZB from a URL. Returns `(nzb_bytes, optional_filename)`.
+pub async fn fetch_nzb_from_url(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(Vec<u8>, Option<String>), SubmitNzbError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| SubmitNzbError::Fetch(format!("request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(SubmitNzbError::Fetch(format!("HTTP {}", response.status())));
+    }
+
+    let filename = extract_filename_from_response(&response, url);
+
+    let nzb_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| SubmitNzbError::Fetch(format!("body read failed: {e}")))?;
+
+    if nzb_bytes.is_empty() {
+        return Err(SubmitNzbError::Fetch("empty response body".into()));
+    }
+
+    let text = String::from_utf8_lossy(&nzb_bytes);
+    if !text.trim_start().starts_with('<') {
+        return Err(SubmitNzbError::NotXml);
+    }
+
+    Ok((nzb_bytes.to_vec(), filename))
+}
+
+/// Extract a filename from the `Content-Disposition` header or URL path.
+fn extract_filename_from_response(response: &reqwest::Response, url: &str) -> Option<String> {
+    // Try Content-Disposition: attachment; filename="something.nzb"
+    if let Some(cd) = response.headers().get(reqwest::header::CONTENT_DISPOSITION)
+        && let Ok(value) = cd.to_str()
+        && let Some(name) = parse_content_disposition_filename(value)
+    {
+        return Some(name);
+    }
+
+    // Fall back to last path segment of the URL.
+    let path = url.split('?').next().unwrap_or(url);
+    let segment = path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && s.contains('.'))?;
+    Some(segment.to_string())
+}
+
+/// Parse `filename="value"` or `filename=value` from a Content-Disposition header value.
+fn parse_content_disposition_filename(header: &str) -> Option<String> {
+    let lower = header.to_ascii_lowercase();
+    let idx = lower.find("filename=")?;
+    let rest = &header[idx + "filename=".len()..];
+    let rest = rest.trim_start();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        // Quoted value.
+        let end = stripped.find('"')?;
+        let name = &stripped[..end];
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    } else {
+        // Unquoted — take until semicolon or end.
+        let name = rest.split(';').next()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    }
 }
 
 fn nzb_to_spec(

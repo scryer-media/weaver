@@ -31,7 +31,7 @@ async fn submit_valid_nzb() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{nzb_b64}") {{
+                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}) {{
                     id
                     status
                 }}
@@ -54,7 +54,7 @@ async fn submit_with_filename() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{nzb_b64}", filename: "test.nzb") {{
+                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}, filename: "test.nzb") {{
                     id
                     name
                     status
@@ -76,7 +76,7 @@ async fn submit_with_password() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{nzb_b64}", password: "secret123") {{
+                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}, password: "secret123") {{
                     id
                     hasPassword
                 }}
@@ -97,7 +97,7 @@ async fn submit_with_category() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{nzb_b64}", category: "movies") {{
+                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}, category: "movies") {{
                     id
                     category
                 }}
@@ -150,7 +150,7 @@ async fn submit_invalid_base64() {
     let resp = h
         .execute(
             r#"mutation {
-                submitNzb(nzbBase64: "!!!not-valid-base64!!!") {
+                submitNzb(source: { nzbBase64: "!!!not-valid-base64!!!" }) {
                     id
                 }
             }"#,
@@ -168,7 +168,7 @@ async fn submit_not_xml() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{not_xml}") {{
+                submitNzb(source: {{ nzbBase64: "{not_xml}" }}) {{
                     id
                 }}
             }}"#
@@ -189,7 +189,7 @@ async fn submit_empty_nzb() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{empty_nzb}") {{
+                submitNzb(source: {{ nzbBase64: "{empty_nzb}" }}) {{
                     id
                 }}
             }}"#
@@ -210,7 +210,7 @@ async fn submit_nzb_missing_root() {
     let resp = h
         .execute(&format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{bad_xml}") {{
+                submitNzb(source: {{ nzbBase64: "{bad_xml}" }}) {{
                     id
                 }}
             }}"#

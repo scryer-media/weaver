@@ -14,11 +14,11 @@ use weaver_state::{Database, RssFeedRow, RssRuleRow};
 use crate::auth::{AdminGuard, generate_api_key, hash_api_key};
 use crate::rss::RssService;
 use crate::runtime::rebuild_nntp_from_config;
-use crate::submit::submit_nzb_bytes;
+use crate::submit::{fetch_nzb_from_url, submit_nzb_bytes};
 use crate::types::{
     ApiKey, ApiKeyScope, Category, CategoryInput, CreateApiKeyResult, GeneralSettings,
-    GeneralSettingsInput, Job, RssFeed, RssFeedInput, RssRule, RssRuleActionGql, RssRuleInput,
-    RssSyncReport, Server, ServerInput, TestConnectionResult,
+    GeneralSettingsInput, Job, NzbSourceInput, RssFeed, RssFeedInput, RssRule, RssRuleActionGql,
+    RssRuleInput, RssSyncReport, Server, ServerInput, TestConnectionResult,
 };
 
 pub struct MutationRoot;
@@ -32,13 +32,13 @@ pub struct LoginStatusResult {
 
 #[Object]
 impl MutationRoot {
-    /// Submit an NZB file for download.
+    /// Submit an NZB for download.
     ///
-    /// The NZB content must be base64-encoded. Returns the created job.
+    /// Provide exactly one of `nzbBase64` (inline content) or `url` (fetch from URL).
     async fn submit_nzb(
         &self,
         ctx: &Context<'_>,
-        nzb_base64: String,
+        source: NzbSourceInput,
         filename: Option<String>,
         password: Option<String>,
         category: Option<String>,
@@ -47,9 +47,22 @@ impl MutationRoot {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<weaver_core::config::SharedConfig>()?;
 
-        let nzb_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&nzb_base64)
-            .map_err(|e| async_graphql::Error::new(format!("invalid base64: {e}")))?;
+        let (nzb_bytes, filename) = match source {
+            NzbSourceInput::NzbBase64(b64) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| async_graphql::Error::new(format!("invalid base64: {e}")))?;
+                (bytes, filename)
+            }
+            NzbSourceInput::Url(url) => {
+                let client = ctx.data::<reqwest::Client>()?;
+                let (bytes, url_filename) = fetch_nzb_from_url(client, &url)
+                    .await
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                // Caller-provided filename takes precedence over URL-derived one.
+                (bytes, filename.or(url_filename))
+            }
+        };
 
         let meta_vec: Vec<(String, String)> = metadata
             .as_ref()

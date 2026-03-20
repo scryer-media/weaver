@@ -95,7 +95,7 @@ export function useUploadNzb(options?: {
       let submittedCount = 0;
       for (const file of files) {
         const result = await submitNzb({
-          nzbBase64: await toBase64(file),
+          source: { nzbBase64: await toBase64(file) },
           filename: file.name,
           password: password.trim() || null,
           category: category.trim() && category !== NO_CATEGORY_VALUE ? category : null,

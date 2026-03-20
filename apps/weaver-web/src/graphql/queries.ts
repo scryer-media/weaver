@@ -387,8 +387,8 @@ export const SETTINGS_PAGE_QUERY = gql`
 `;
 
 export const SUBMIT_NZB_MUTATION = gql`
-  mutation SubmitNzb($nzbBase64: String!, $filename: String, $password: String, $category: String, $metadata: [MetadataInput!]) {
-    submitNzb(nzbBase64: $nzbBase64, filename: $filename, password: $password, category: $category, metadata: $metadata) {
+  mutation SubmitNzb($source: NzbSourceInput!, $filename: String, $password: String, $category: String, $metadata: [MetadataInput!]) {
+    submitNzb(source: $source, filename: $filename, password: $password, category: $category, metadata: $metadata) {
       ...JobListItemFields
       error
       outputDir

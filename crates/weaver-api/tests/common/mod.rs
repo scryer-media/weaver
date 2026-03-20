@@ -135,7 +135,7 @@ impl TestHarness {
 
         let query = format!(
             r#"mutation {{
-                submitNzb(nzbBase64: "{nzb_b64}", filename: "{name}.nzb"{cat_arg}{pwd_arg}{meta_arg}) {{
+                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}, filename: "{name}.nzb"{cat_arg}{pwd_arg}{meta_arg}) {{
                     id
                     name
                     status
