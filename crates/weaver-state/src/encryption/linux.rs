@@ -1,7 +1,5 @@
 use super::keystore::KeyStore;
 
-pub use super::key_file::KeyFile;
-
 const DOCKER_SECRET_PATH: &str = "/run/secrets/weaver_encryption_key";
 
 pub struct DockerSecret;
