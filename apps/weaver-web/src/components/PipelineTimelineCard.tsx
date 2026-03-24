@@ -572,6 +572,7 @@ export function PipelineTimelineCard({
 }) {
   const t = useTranslate();
   const [renderTime] = useState(Date.now);
+  const [membersExpanded, setMembersExpanded] = useState(false);
   const axisEnd = timeline?.endedAt ?? renderTime;
 
   if (!timeline || (timeline.lanes.length === 0 && timeline.extractionGroups.length === 0)) {
@@ -588,7 +589,6 @@ export function PipelineTimelineCard({
   }
 
   const axisStart = timeline.startedAt;
-  const [membersExpanded, setMembersExpanded] = useState(false);
 
   const stageRows: PlotRow[] = timeline.lanes.map((lane) => ({
     key: `stage:${lane.stage}`,

@@ -22,7 +22,7 @@ function statusColor(status?: string): string {
 export function JobProgress({
   progress,
   status,
-  health,
+  health: _health,
   failedPct,
   showLabel = true,
   compact = false,
