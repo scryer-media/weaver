@@ -131,9 +131,16 @@ async fn async_main() {
                 error!("failed to encrypt existing passwords: {e}");
             }
             // Reload config now that the encryption key is set, so passwords
-            // are properly decrypted.
+            // are properly decrypted. Preserve data_dir which was defaulted
+            // from --config before the reload.
+            let saved_data_dir = config.data_dir.clone();
             match db.load_config() {
-                Ok(reloaded) => config = reloaded,
+                Ok(mut reloaded) => {
+                    if reloaded.data_dir.is_empty() {
+                        reloaded.data_dir = saved_data_dir;
+                    }
+                    config = reloaded;
+                }
                 Err(e) => error!("failed to reload config after setting encryption key: {e}"),
             }
         }
