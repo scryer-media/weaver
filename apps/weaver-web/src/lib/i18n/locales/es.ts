@@ -305,6 +305,10 @@ const es: LocaleDictionary = {
   "confirm.deleteCategoryDismiss": "Conservar categoría",
   "confirm.deleteServerConfirm": "Eliminar servidor",
   "confirm.deleteServerDismiss": "Conservar servidor",
+  "confirm.disableTls": "\u00bfDesactivar TLS?",
+  "confirm.disableTlsMessage": "Sin TLS, todo el tr\u00e1fico hacia este servidor \u2014 incluida tu clave API, usuario y contrase\u00f1a \u2014 se env\u00eda en texto plano. Cualquiera en tu red puede leerlo.",
+  "confirm.disableTlsConfirm": "Desactivar TLS",
+  "confirm.disableTlsDismiss": "Mantener TLS activado",
 
   // General settings
   "settings.general": "General",

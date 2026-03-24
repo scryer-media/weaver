@@ -109,16 +109,20 @@ impl RssService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                match service.run_due_sync().await {
-                    Ok(Some(report)) if report.feeds_polled > 0 => {
+                let svc = service.clone();
+                match tokio::spawn(async move { svc.run_due_sync().await }).await {
+                    Ok(Ok(Some(report))) if report.feeds_polled > 0 => {
                         info!(
                             feeds_polled = report.feeds_polled,
                             items_submitted = report.items_submitted,
                             "RSS due sync complete"
                         );
                     }
-                    Ok(_) => {}
-                    Err(error) => warn!(error = %error, "RSS due sync failed"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(error = %error, "RSS due sync failed"),
+                    Err(panic) => {
+                        tracing::error!(error = %panic, "CRITICAL: RSS sync task panicked — loop continues");
+                    }
                 }
             }
         })

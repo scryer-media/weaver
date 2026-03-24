@@ -50,7 +50,7 @@ type ServerFormValues = {
 
 const defaultForm: ServerFormValues = {
   host: "",
-  port: 563,
+  port: 443,
   tls: true,
   username: "",
   password: "",
@@ -300,10 +300,32 @@ function ServerFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
+  const [showTlsWarning, setShowTlsWarning] = useState(false);
 
   useEffect(() => {
     setValues(initialValues);
   }, [initialValues]);
+
+  const handleTlsChange = (checked: boolean) => {
+    if (!checked && values.tls) {
+      setShowTlsWarning(true);
+    } else {
+      setValues((current) => ({
+        ...current,
+        tls: checked,
+        port: checked && current.port === 119 ? 443 : current.port,
+      }));
+    }
+  };
+
+  const confirmDisableTls = () => {
+    setValues((current) => ({
+      ...current,
+      tls: false,
+      port: (current.port === 443 || current.port === 563) ? 119 : current.port,
+    }));
+    setShowTlsWarning(false);
+  };
 
   return (
     <Card>
@@ -364,7 +386,7 @@ function ServerFormCard({
           <ToggleField
             label={t("servers.tls")}
             checked={values.tls}
-            onCheckedChange={(checked) => setValues((current) => ({ ...current, tls: checked }))}
+            onCheckedChange={handleTlsChange}
           />
           <ToggleField
             label={t("servers.active")}
@@ -372,6 +394,16 @@ function ServerFormCard({
             onCheckedChange={(checked) => setValues((current) => ({ ...current, active: checked }))}
           />
         </div>
+
+        <ConfirmDialog
+          open={showTlsWarning}
+          title={t("confirm.disableTls")}
+          message={t("confirm.disableTlsMessage")}
+          confirmLabel={t("confirm.disableTlsConfirm")}
+          cancelLabel={t("confirm.disableTlsDismiss")}
+          onConfirm={confirmDisableTls}
+          onCancel={() => setShowTlsWarning(false)}
+        />
 
         {testResult ? (
           <div className={testResult.success ? "rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-700 dark:text-emerald-300" : "rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"}>

@@ -303,8 +303,12 @@ const zh: LocaleDictionary = {
   "confirm.deleteCategoryMessage": "使用此分类的现有任务不会受到影响。",
   "confirm.deleteCategoryConfirm": "删除分类",
   "confirm.deleteCategoryDismiss": "保留分类",
-  "confirm.deleteServerConfirm": "删除服务器",
-  "confirm.deleteServerDismiss": "保留服务器",
+  "confirm.deleteServerConfirm": "\u5220\u9664\u670d\u52a1\u5668",
+  "confirm.deleteServerDismiss": "\u4fdd\u7559\u670d\u52a1\u5668",
+  "confirm.disableTls": "\u7981\u7528 TLS\uff1f",
+  "confirm.disableTlsMessage": "\u6ca1\u6709 TLS\uff0c\u53d1\u5f80\u6b64\u670d\u52a1\u5668\u7684\u6240\u6709\u6d41\u91cf\u2014\u2014\u5305\u62ec\u60a8\u7684 API \u5bc6\u94a5\u3001\u7528\u6237\u540d\u548c\u5bc6\u7801\u2014\u2014\u5c06\u4ee5\u660e\u6587\u53d1\u9001\u3002\u7f51\u7edc\u4e0a\u7684\u4efb\u4f55\u4eba\u90fd\u53ef\u4ee5\u8bfb\u53d6\u3002",
+  "confirm.disableTlsConfirm": "\u7981\u7528 TLS",
+  "confirm.disableTlsDismiss": "\u4fdd\u6301 TLS \u542f\u7528",
 
   // General settings
   "settings.general": "常规",

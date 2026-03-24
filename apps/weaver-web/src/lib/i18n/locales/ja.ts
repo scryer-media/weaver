@@ -303,8 +303,12 @@ const ja: LocaleDictionary = {
   "confirm.deleteCategoryMessage": "このカテゴリを使用している既存のジョブには影響しません。",
   "confirm.deleteCategoryConfirm": "カテゴリを削除",
   "confirm.deleteCategoryDismiss": "カテゴリを残す",
-  "confirm.deleteServerConfirm": "サーバーを削除",
-  "confirm.deleteServerDismiss": "サーバーを残す",
+  "confirm.deleteServerConfirm": "\u30b5\u30fc\u30d0\u30fc\u3092\u524a\u9664",
+  "confirm.deleteServerDismiss": "\u30b5\u30fc\u30d0\u30fc\u3092\u6b8b\u3059",
+  "confirm.disableTls": "TLS \u3092\u7121\u52b9\u306b\u3057\u307e\u3059\u304b\uff1f",
+  "confirm.disableTlsMessage": "TLS \u304c\u306a\u3044\u3068\u3001\u3053\u306e\u30b5\u30fc\u30d0\u30fc\u3078\u306e\u3059\u3079\u3066\u306e\u30c8\u30e9\u30d5\u30a3\u30c3\u30af\u2014\u2014API \u30ad\u30fc\u3001\u30e6\u30fc\u30b6\u30fc\u540d\u3001\u30d1\u30b9\u30ef\u30fc\u30c9\u3092\u542b\u3080\u2014\u2014\u304c\u5e73\u6587\u3067\u9001\u4fe1\u3055\u308c\u307e\u3059\u3002\u30cd\u30c3\u30c8\u30ef\u30fc\u30af\u4e0a\u306e\u8ab0\u3067\u3082\u8aad\u307f\u53d6\u308c\u307e\u3059\u3002",
+  "confirm.disableTlsConfirm": "TLS \u3092\u7121\u52b9\u306b\u3059\u308b",
+  "confirm.disableTlsDismiss": "TLS \u3092\u6709\u52b9\u306e\u307e\u307e\u306b\u3059\u308b",
 
   // General settings
   "settings.general": "一般",

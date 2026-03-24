@@ -30,40 +30,53 @@ pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
         loop {
             interval.tick().await;
 
-            let entries = schedules.read().await;
-            let now = Local::now();
-            let current_day = Weekday::from_chrono(now.weekday());
-            let current_time = now.time();
+            let schedules = schedules.clone();
+            let handle = handle.clone();
+            let prev_action = last_action.clone();
 
-            let active = find_active_entry(&entries, current_day, current_time);
+            let result = tokio::spawn(async move {
+                let entries = schedules.read().await;
+                let now = Local::now();
+                let current_day = Weekday::from_chrono(now.weekday());
+                let current_time = now.time();
 
-            let desired_action = active.map(|e| e.action.clone());
+                let active = find_active_entry(&entries, current_day, current_time);
+                let desired_action = active.map(|e| e.action.clone());
 
-            if desired_action == last_action {
-                continue; // no transition
-            }
-
-            match &desired_action {
-                Some(action) => {
-                    info!(
-                        action = ?action,
-                        "schedule transition: applying new action"
-                    );
-                    if let Err(e) = handle.apply_schedule_action(action.clone()).await {
-                        warn!(error = %e, "failed to apply schedule action");
-                    }
+                if desired_action == prev_action {
+                    return desired_action; // no transition
                 }
-                None => {
-                    if last_action.is_some() {
-                        info!("schedule transition: clearing scheduled action");
-                        if let Err(e) = handle.clear_schedule_action().await {
-                            warn!(error = %e, "failed to clear schedule action");
+
+                match &desired_action {
+                    Some(action) => {
+                        info!(
+                            action = ?action,
+                            "schedule transition: applying new action"
+                        );
+                        if let Err(e) = handle.apply_schedule_action(action.clone()).await {
+                            warn!(error = %e, "failed to apply schedule action");
+                        }
+                    }
+                    None => {
+                        if prev_action.is_some() {
+                            info!("schedule transition: clearing scheduled action");
+                            if let Err(e) = handle.clear_schedule_action().await {
+                                warn!(error = %e, "failed to clear schedule action");
+                            }
                         }
                     }
                 }
-            }
 
-            last_action = desired_action;
+                desired_action
+            })
+            .await;
+
+            match result {
+                Ok(action) => last_action = action,
+                Err(panic) => {
+                    tracing::error!(error = %panic, "CRITICAL: schedule evaluator tick panicked — loop continues");
+                }
+            }
         }
     });
 }

@@ -303,8 +303,12 @@ const ko: LocaleDictionary = {
   "confirm.deleteCategoryMessage": "이 카테고리를 사용하는 기존 작업에는 영향이 없습니다.",
   "confirm.deleteCategoryConfirm": "카테고리 삭제",
   "confirm.deleteCategoryDismiss": "카테고리 유지",
-  "confirm.deleteServerConfirm": "서버 삭제",
-  "confirm.deleteServerDismiss": "서버 유지",
+  "confirm.deleteServerConfirm": "\uc11c\ubc84 \uc0ad\uc81c",
+  "confirm.deleteServerDismiss": "\uc11c\ubc84 \uc720\uc9c0",
+  "confirm.disableTls": "TLS\ub97c \ube44\ud65c\uc131\ud654\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?",
+  "confirm.disableTlsMessage": "TLS \uc5c6\uc774\ub294 \uc774 \uc11c\ubc84\ub85c\uc758 \ubaa8\ub4e0 \ud2b8\ub798\ud53d\u2014API \ud0a4, \uc0ac\uc6a9\uc790\uba85, \ube44\ubc00\ubc88\ud638 \ud3ec\ud568\u2014\uc774 \ud3c9\ubb38\uc73c\ub85c \uc804\uc1a1\ub429\ub2c8\ub2e4. \ub124\ud2b8\uc6cc\ud06c\uc758 \ub204\uad6c\ub098 \uc774\ub97c \uc77d\uc744 \uc218 \uc788\uc2b5\ub2c8\ub2e4.",
+  "confirm.disableTlsConfirm": "TLS \ube44\ud65c\uc131\ud654",
+  "confirm.disableTlsDismiss": "TLS \ud65c\uc131 \uc720\uc9c0",
 
   // General settings
   "settings.general": "일반",

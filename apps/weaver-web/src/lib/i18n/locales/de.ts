@@ -303,8 +303,12 @@ const de: LocaleDictionary = {
   "confirm.deleteCategoryMessage": "Bestehende Aufträge mit dieser Kategorie werden nicht beeinflusst.",
   "confirm.deleteCategoryConfirm": "Kategorie löschen",
   "confirm.deleteCategoryDismiss": "Kategorie behalten",
-  "confirm.deleteServerConfirm": "Server löschen",
+  "confirm.deleteServerConfirm": "Server l\u00f6schen",
   "confirm.deleteServerDismiss": "Server behalten",
+  "confirm.disableTls": "TLS deaktivieren?",
+  "confirm.disableTlsMessage": "Ohne TLS wird der gesamte Datenverkehr zu diesem Server \u2014 einschlie\u00dflich API-Schl\u00fcssel, Benutzername und Passwort \u2014 im Klartext gesendet. Jeder in Ihrem Netzwerk kann ihn mitlesen.",
+  "confirm.disableTlsConfirm": "TLS deaktivieren",
+  "confirm.disableTlsDismiss": "TLS aktiviert lassen",
 
   // General settings
   "settings.general": "Allgemein",

@@ -305,6 +305,10 @@ const en: LocaleDictionary = {
   "confirm.deleteCategoryDismiss": "Keep Category",
   "confirm.deleteServerConfirm": "Delete Server",
   "confirm.deleteServerDismiss": "Keep Server",
+  "confirm.disableTls": "Disable TLS?",
+  "confirm.disableTlsMessage": "Without TLS, all traffic to this server — including your API key, username, and password — is sent in plaintext. Anyone on your network can read it.",
+  "confirm.disableTlsConfirm": "Disable TLS",
+  "confirm.disableTlsDismiss": "Keep TLS Enabled",
 
   // General settings
   "settings.general": "General",
