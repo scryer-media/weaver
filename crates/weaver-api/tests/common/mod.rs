@@ -72,6 +72,7 @@ impl TestHarness {
             db.clone(),
             rss,
             shared_schedules,
+            weaver_core::log_buffer::LogRingBuffer::with_default_capacity(),
         );
 
         Self {
