@@ -714,9 +714,7 @@ async fn run_server_command(
         let event_rx = event_tx.subscribe();
         let db_for_events = db.clone();
         tokio::spawn(async move {
-            if let Err(panic) =
-                tokio::spawn(persist_events(event_rx, db_for_events)).await
-            {
+            if let Err(panic) = tokio::spawn(persist_events(event_rx, db_for_events)).await {
                 tracing::error!(
                     error = %panic,
                     "CRITICAL: event persistence task panicked — events will not be recorded"

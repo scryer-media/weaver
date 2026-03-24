@@ -220,7 +220,9 @@ impl Pipeline {
             .values()
             .filter(|s| matches!(s.status, JobStatus::Checking))
             .count();
-        let max = tuner_max.min(self.connection_ramp).saturating_sub(active_probes);
+        let max = tuner_max
+            .min(self.connection_ramp)
+            .saturating_sub(active_probes);
 
         // When the bandwidth cap is within 15% of exhaustion, revert to
         // single-job dispatch so remaining quota goes to the highest-priority job.
