@@ -3463,8 +3463,8 @@ mod tests {
         assert!(!working_dir.join("show.part02.rar").exists());
         assert!(working_dir.join("show.part03.rar").exists());
         assert!(working_dir.join("show.part04.rar").exists());
-        // Yield to let fire-and-forget db writes complete.
-        tokio::task::yield_now().await;
+        // Wait for fire-and-forget spawn_blocking db writes to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let deleted_rows = pipeline.db.load_deleted_volume_statuses(job_id).unwrap();
         assert_eq!(
             deleted_rows,
