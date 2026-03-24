@@ -456,8 +456,8 @@ impl Pipeline {
                     self.try_update_archive_topology(job_id, file_id).await;
                     debug!(job_id = job_id.0, "post-topology");
                     self.try_update_7z_topology(job_id, file_id);
-                    debug!(job_id = job_id.0, "entering try_partial_extraction");
-                    self.try_partial_extraction(job_id).await;
+                    debug!(job_id = job_id.0, "entering try_rar_extraction");
+                    self.try_rar_extraction(job_id).await;
                     debug!(job_id = job_id.0, "post-extraction");
                     self.check_job_completion(job_id).await;
                     debug!(job_id = job_id.0, "post-completion-check");

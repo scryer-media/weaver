@@ -273,6 +273,10 @@ export function getGraphqlClient(): Client {
   return currentResources.client;
 }
 
+export function getGraphqlWsClient() {
+  return currentResources.wsClient;
+}
+
 export function useGraphqlConnectionState(): GraphqlConnectionSnapshot {
   return useSyncExternalStore(
     subscribeToConnectionSnapshot,

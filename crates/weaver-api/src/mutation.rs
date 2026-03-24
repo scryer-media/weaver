@@ -183,6 +183,21 @@ impl MutationRoot {
         Ok(jobs)
     }
 
+    /// Delete multiple completed/failed/cancelled jobs from history by ID.
+    /// Returns the remaining history jobs after deletion.
+    async fn delete_history_batch(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+        #[graphql(default = false)] delete_files: bool,
+    ) -> Result<Vec<Job>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        for &id in &ids {
+            handle.delete_history(JobId(id), delete_files).await?;
+        }
+        Ok(history_jobs_from_handle(handle))
+    }
+
     /// Delete all completed/failed/cancelled jobs from history.
     async fn delete_all_history(
         &self,

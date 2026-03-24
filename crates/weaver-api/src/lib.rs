@@ -40,6 +40,7 @@ pub fn build_schema(
     db: Database,
     rss: rss::RssService,
     schedules: weaver_scheduler::schedule::SharedSchedules,
+    log_buffer: weaver_core::log_buffer::LogRingBuffer,
 ) -> WeaverSchema {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -59,5 +60,6 @@ pub fn build_schema(
         .data(rss)
         .data(schedules)
         .data(http_client)
+        .data(log_buffer)
         .finish()
 }

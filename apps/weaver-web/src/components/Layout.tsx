@@ -5,11 +5,12 @@ import {
   BarChart3,
   Clock3,
   FolderUp,
-  RefreshCw,
   ListOrdered,
   Menu,
   Monitor,
   MoonStar,
+  RefreshCw,
+  ScrollText,
   Settings,
   Sun,
   Unplug,
@@ -41,6 +42,7 @@ const navItems = [
   { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
   { to: "/metrics", labelKey: "nav.metrics", icon: BarChart3 },
+  { to: "/logs", labelKey: "nav.logs", icon: ScrollText },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 

@@ -238,6 +238,26 @@ pub struct DirectoryBrowseResult {
     pub entries: Vec<DirectoryBrowseEntry>,
 }
 
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobOutputFile {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobOutputResult {
+    pub output_dir: String,
+    pub files: Vec<JobOutputFile>,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ServiceLogsPayload {
+    pub lines: Vec<String>,
+    pub count: i32,
+}
+
 /// Result of testing a server connection.
 #[derive(Debug, Clone, SimpleObject)]
 pub struct TestConnectionResult {

@@ -1,6 +1,10 @@
 use super::keystore::KeyStore;
 
-const SERVICE: &str = "media.weaver.app";
+const SERVICE: &str = if cfg!(debug_assertions) {
+    "media.weaver.app.dev"
+} else {
+    "media.weaver.app"
+};
 const ACCOUNT: &str = "encryption-master-key";
 
 pub struct MacOSKeychain;

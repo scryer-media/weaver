@@ -237,10 +237,14 @@ pub struct Pipeline {
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
-    /// Members already extracted per job (for partial extraction).
+    /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
-    /// Archive sets already extracted per job (for multi-set 7z).
-    pub(super) extracted_sets: HashMap<JobId, HashSet<String>>,
+    /// Archives whose extraction has completed successfully (by archive name).
+    /// For RAR this is the set name; for 7z/zip/tar/gz it's the archive name.
+    pub(super) extracted_archives: HashMap<JobId, HashSet<String>>,
+    /// Archives with in-flight extraction tasks (spawned but not yet completed).
+    /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
+    pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
     /// Members whose incremental extraction failed (corrupt volume, CRC error, etc).
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.
@@ -364,7 +368,8 @@ impl Pipeline {
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
             extracted_members: HashMap::new(),
-            extracted_sets: HashMap::new(),
+            extracted_archives: HashMap::new(),
+            inflight_extractions: HashMap::new(),
             failed_extractions: HashMap::new(),
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
@@ -1351,7 +1356,8 @@ impl Pipeline {
 
     pub(super) fn clear_job_extraction_runtime(&mut self, job_id: JobId) {
         self.extracted_members.remove(&job_id);
-        self.extracted_sets.remove(&job_id);
+        self.extracted_archives.remove(&job_id);
+        self.inflight_extractions.remove(&job_id);
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
@@ -4055,7 +4061,7 @@ mod tests {
             .await;
         }
 
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
         let first_done = next_extraction_done(&mut pipeline).await;
         match &first_done {
             ExtractionDone::Batch {
@@ -4077,7 +4083,7 @@ mod tests {
 
         write_and_complete_rar_volume(&mut pipeline, job_id, 2, &files[2].0, &files[2].1).await;
         write_and_complete_rar_volume(&mut pipeline, job_id, 3, &files[3].0, &files[3].1).await;
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
 
         let second_done = next_extraction_done(&mut pipeline).await;
         match &second_done {
@@ -4126,7 +4132,7 @@ mod tests {
             .await;
         }
 
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
         let done = next_extraction_done(&mut pipeline).await;
         match &done {
             ExtractionDone::Batch {
@@ -4199,7 +4205,7 @@ mod tests {
             .await;
         }
 
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
 
         let set_state = pipeline
             .rar_sets
@@ -4308,7 +4314,7 @@ mod tests {
             },
         ];
 
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
 
         let set_state = pipeline
             .rar_sets
@@ -4557,7 +4563,7 @@ mod tests {
             &[(4, par2_filename, 1, true)],
         );
 
-        pipeline.try_partial_extraction(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
         let done = next_extraction_done(&mut pipeline).await;
         match &done {
             ExtractionDone::Batch {

@@ -20,10 +20,12 @@ function DetailItem({
 export function ParsedReleaseDetails({
   originalTitle,
   parsedRelease,
+  category,
   compact = false,
 }: {
   originalTitle: string;
   parsedRelease: ParsedReleaseData;
+  category?: string | null;
   compact?: boolean;
 }) {
   const fields = [
@@ -39,7 +41,9 @@ export function ParsedReleaseDetails({
       ? { label: "Service", value: parsedRelease.streamingService }
       : null,
     parsedRelease.edition ? { label: "Edition", value: parsedRelease.edition } : null,
-    parsedRelease.episode?.raw ? { label: "Episode", value: parsedRelease.episode.raw } : null,
+    parsedRelease.episode?.raw && category !== "movies"
+      ? { label: "Episode", value: parsedRelease.episode.raw }
+      : null,
     parsedRelease.languagesAudio.length > 0
       ? { label: "Audio Lang", value: parsedRelease.languagesAudio.join(", ") }
       : null,

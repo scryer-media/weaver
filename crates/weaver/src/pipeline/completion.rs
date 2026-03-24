@@ -1122,7 +1122,7 @@ impl Pipeline {
                                 .all(|member| extracted.contains(member))
                     });
             if set_complete {
-                self.extracted_sets
+                self.extracted_archives
                     .entry(job_id)
                     .or_default()
                     .insert(set_name.clone());
@@ -1160,7 +1160,7 @@ impl Pipeline {
             }
 
             if has_ready_incremental_work {
-                self.try_partial_extraction(job_id).await;
+                self.try_rar_extraction(job_id).await;
                 return;
             }
 
@@ -1465,7 +1465,7 @@ impl Pipeline {
                                 tracing::error!(error = %e, "db write failed for downloading status");
                             }
                         });
-                        self.try_partial_extraction(job_id).await;
+                        self.try_rar_extraction(job_id).await;
                         return;
                     }
                 } else {
@@ -1653,7 +1653,7 @@ impl Pipeline {
                                 }
                             });
 
-                            self.try_partial_extraction(job_id).await;
+                            self.try_rar_extraction(job_id).await;
                             return;
                         }
                         Err(error_msg) => {
@@ -1743,7 +1743,12 @@ impl Pipeline {
                 // Collect sets that still need extraction (some may have been
                 // extracted during the partial extraction phase).
                 let already_extracted = self
-                    .extracted_sets
+                    .extracted_archives
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let already_spawned = self
+                    .inflight_extractions
                     .get(&job_id)
                     .cloned()
                     .unwrap_or_default();
@@ -1753,10 +1758,17 @@ impl Pipeline {
                         .assembly
                         .archive_topologies()
                         .iter()
-                        .filter(|(name, _)| !already_extracted.contains(*name))
+                        .filter(|(name, _)| {
+                            !already_extracted.contains(*name) && !already_spawned.contains(*name)
+                        })
                         .map(|(name, topo)| (name.clone(), topo.archive_type))
                         .collect()
                 };
+
+                // If extractions are still in-flight, wait for them to complete.
+                if !already_spawned.is_empty() && sets_to_extract.is_empty() {
+                    return;
+                }
 
                 if !sets_to_extract.is_empty() {
                     // Spawn extraction tasks in the background.
@@ -1777,55 +1789,7 @@ impl Pipeline {
                         info!(job_id = job_id.0, "extraction ready");
                     }
 
-                    for (set_name, archive_type) in &sets_to_extract {
-                        let result = match archive_type {
-                            weaver_assembly::ArchiveType::SevenZip => {
-                                self.extract_7z_set(job_id, set_name).await
-                            }
-                            weaver_assembly::ArchiveType::Rar => {
-                                self.extract_rar_set(job_id, set_name).await
-                            }
-                            weaver_assembly::ArchiveType::Zip => {
-                                self.extract_simple_archive(
-                                    job_id,
-                                    set_name,
-                                    SimpleArchiveKind::Zip,
-                                )
-                                .await
-                            }
-                            weaver_assembly::ArchiveType::Tar => {
-                                self.extract_simple_archive(
-                                    job_id,
-                                    set_name,
-                                    SimpleArchiveKind::Tar,
-                                )
-                                .await
-                            }
-                            weaver_assembly::ArchiveType::TarGz => {
-                                self.extract_simple_archive(
-                                    job_id,
-                                    set_name,
-                                    SimpleArchiveKind::TarGz,
-                                )
-                                .await
-                            }
-                            weaver_assembly::ArchiveType::Gz => {
-                                self.extract_simple_archive(job_id, set_name, SimpleArchiveKind::Gz)
-                                    .await
-                            }
-                            weaver_assembly::ArchiveType::Split => {
-                                self.extract_simple_archive(
-                                    job_id,
-                                    set_name,
-                                    SimpleArchiveKind::Split,
-                                )
-                                .await
-                            }
-                        };
-                        if let Err(e) = result {
-                            warn!(job_id = job_id.0, set_name = %set_name, error = %e, "failed to start extraction");
-                        }
-                    }
+                    self.spawn_extractions(job_id, &sets_to_extract).await;
                     // Return — extraction runs in background.
                     // handle_extraction_done will call check_job_completion again.
                     return;
@@ -1928,11 +1892,58 @@ impl Pipeline {
                 extractable,
                 waiting_on,
             } => {
-                debug!(
+                // Some archives are ready (e.g. all 7z split files arrived)
+                // while others are still downloading. Spawn what we can.
+                let already_done = self
+                    .extracted_archives
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let already_inflight = self
+                    .inflight_extractions
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let to_spawn: Vec<(String, weaver_assembly::ArchiveType)> = {
+                    let state = self.jobs.get(&job_id).unwrap();
+                    extractable
+                        .iter()
+                        .filter(|name| {
+                            !already_done.contains(*name) && !already_inflight.contains(*name)
+                        })
+                        .filter_map(|name| {
+                            state
+                                .assembly
+                                .archive_topology_for(name)
+                                .map(|topo| (name.clone(), topo.archive_type))
+                        })
+                        .collect()
+                };
+
+                if to_spawn.is_empty() {
+                    return;
+                }
+
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                if state.status != JobStatus::Extracting {
+                    state.status = JobStatus::Extracting;
+                    self.db_fire_and_forget(move |db| {
+                        if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
+                            tracing::error!(error = %e, "db write failed for extracting status");
+                        }
+                    });
+                    self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+                    let _ = self
+                        .event_tx
+                        .send(PipelineEvent::ExtractionReady { job_id });
+                }
+
+                let spawned = self.spawn_extractions(job_id, &to_spawn).await;
+                info!(
                     job_id = job_id.0,
-                    extractable = ?extractable,
+                    spawned,
                     waiting = ?waiting_on,
-                    "partial extraction possible — waiting for remaining volumes"
+                    "started extraction for ready archives, waiting on remaining"
                 );
             }
         }
@@ -2089,6 +2100,57 @@ impl Pipeline {
 
         // Extraction runs in background — result comes through extract_done_tx channel.
         Ok(0)
+    }
+
+    /// Spawn extraction for a list of archives, tracking each in `inflight_extractions`.
+    /// Dispatches to the correct extractor based on archive type. Returns the number
+    /// of extractions successfully spawned.
+    async fn spawn_extractions(
+        &mut self,
+        job_id: JobId,
+        archives: &[(String, weaver_assembly::ArchiveType)],
+    ) -> usize {
+        let mut spawned = 0;
+        for (name, archive_type) in archives {
+            self.inflight_extractions
+                .entry(job_id)
+                .or_default()
+                .insert(name.clone());
+
+            let result = match archive_type {
+                weaver_assembly::ArchiveType::SevenZip => {
+                    self.extract_7z_set(job_id, name).await
+                }
+                weaver_assembly::ArchiveType::Rar => {
+                    self.extract_rar_set(job_id, name).await
+                }
+                weaver_assembly::ArchiveType::Zip => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zip).await
+                }
+                weaver_assembly::ArchiveType::Tar => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Tar).await
+                }
+                weaver_assembly::ArchiveType::TarGz => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarGz).await
+                }
+                weaver_assembly::ArchiveType::Gz => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz).await
+                }
+                weaver_assembly::ArchiveType::Split => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Split).await
+                }
+            };
+            match result {
+                Ok(_) => spawned += 1,
+                Err(e) => {
+                    warn!(job_id = job_id.0, archive = %name, error = %e, "failed to start extraction");
+                    if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
+                        inflight.remove(name);
+                    }
+                }
+            }
+        }
+        spawned
     }
 
     /// Extract a single 7z archive set. Only collects files belonging to the named set.

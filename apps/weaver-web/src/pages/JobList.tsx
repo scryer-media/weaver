@@ -510,7 +510,7 @@ export function JobList() {
                             {job.category ?? "\u2014"}
                           </TableCell>
                           <TableCell className="min-w-0 px-2 py-1.5" title={`${(job.progress * 100).toFixed(1)}%`}>
-                            <JobProgress progress={job.progress} status={job.status} compact showLabel={false} />
+                            <JobProgress progress={job.progress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} compact showLabel={false} />
                           </TableCell>
                           <TableCell className="px-2 py-1.5 text-right text-[11px] text-muted-foreground">
                             {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
@@ -640,7 +640,7 @@ export function JobList() {
                         ) : null}
                       </div>
                     </div>
-                    <JobProgress progress={job.progress} status={job.status} compact />
+                    <JobProgress progress={job.progress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} compact />
                     {expanded ? (
                       <ParsedReleaseDetails
                         originalTitle={job.originalTitle}

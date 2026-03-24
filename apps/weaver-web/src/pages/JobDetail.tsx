@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
+import { ChevronRight } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JobProgress } from "@/components/JobProgress";
@@ -23,6 +24,7 @@ import {
   CANCEL_JOB_MUTATION,
   DELETE_HISTORY_MUTATION,
   EVENTS_SUBSCRIPTION,
+  JOB_OUTPUT_FILES_QUERY,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
@@ -31,6 +33,7 @@ import {
 import { requestGraphqlClientRestart } from "@/graphql/client";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 
 interface EventEntry {
@@ -272,6 +275,7 @@ export function JobDetail() {
         }
       />
 
+      {/* Progress & stats */}
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-center gap-3">
@@ -282,7 +286,7 @@ export function JobDetail() {
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
-          <JobProgress progress={displayProgress} status={job.status} />
+          <JobProgress progress={displayProgress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} />
           <div
             className={`grid grid-cols-2 gap-4 ${showSavedBandwidthTile ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}
           >
@@ -309,88 +313,79 @@ export function JobDetail() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Release Details</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ParsedReleaseDetails
-            originalTitle={job.originalTitle}
-            parsedRelease={job.parsedRelease}
-          />
-        </CardContent>
-      </Card>
+      {/* Output files */}
+      <JobOutputFilesCard jobId={job.id} status={job.status} />
 
-      {job.metadata.length > 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("job.metadata")}</CardTitle>
-          </CardHeader>
-          <CardContent className="px-0 pb-0">
-            <Table>
-              <TableBody>
-                {job.metadata.map((entry: { key: string; value: string }) => (
-                  <TableRow key={entry.key}>
-                    <TableCell className="w-1/3 text-xs font-medium text-muted-foreground">
-                      {formatMetadataKey(entry.key)}
-                    </TableCell>
-                    <TableCell className="text-sm">{entry.value}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      ) : null}
-
+      {/* Timeline */}
       <PipelineTimelineCard timeline={timeline} />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("job.eventLog")}</CardTitle>
-        </CardHeader>
-        <CardContent className="px-0 pb-0">
-          {events.length === 0 ? (
-            <div className="px-6 pb-6 text-sm text-muted-foreground">{t("job.waitingForEvents")}</div>
-          ) : (
-            <div className="max-h-[150lh] overflow-y-auto">
-              <div className="hidden sm:block">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="hover:bg-transparent">
-                      <TableHead>{t("table.time")}</TableHead>
-                      <TableHead>{t("table.kind")}</TableHead>
-                      <TableHead>{t("table.message")}</TableHead>
+      {/* Release details (collapsed) */}
+      <CollapsibleCard title="Release Details">
+        <ParsedReleaseDetails
+          originalTitle={job.originalTitle}
+          parsedRelease={job.parsedRelease}
+          category={job.category}
+        />
+      </CollapsibleCard>
+
+      {/* Metadata (collapsed) */}
+      <CollapsibleCard title={t("job.metadata")} noPadding hidden={job.metadata.length === 0}>
+        <Table>
+          <TableBody>
+            {job.metadata.map((entry: { key: string; value: string }) => (
+              <TableRow key={entry.key}>
+                <TableCell className="w-1/3 text-xs font-medium text-muted-foreground">
+                  {formatMetadataKey(entry.key)}
+                </TableCell>
+                <TableCell className="text-sm">{entry.value}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </CollapsibleCard>
+
+      {/* Event log (collapsed) */}
+      <CollapsibleCard title={t("job.eventLog")} noPadding>
+        {events.length === 0 ? (
+          <div className="px-6 pb-6 text-sm text-muted-foreground">{t("job.waitingForEvents")}</div>
+        ) : (
+          <div className="max-h-[150lh] overflow-y-auto">
+            <div className="hidden sm:block">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead>{t("table.time")}</TableHead>
+                    <TableHead>{t("table.kind")}</TableHead>
+                    <TableHead>{t("table.message")}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {events.map((event, index) => (
+                    <TableRow key={`${event.timestamp}-${index}`}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        {new Date(event.timestamp).toLocaleTimeString()}
+                      </TableCell>
+                      <TableCell className="text-xs">{event.kind}</TableCell>
+                      <TableCell>{event.message}</TableCell>
                     </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {events.map((event, index) => (
-                      <TableRow key={`${event.timestamp}-${index}`}>
-                        <TableCell className="font-mono text-xs text-muted-foreground">
-                          {new Date(event.timestamp).toLocaleTimeString()}
-                        </TableCell>
-                        <TableCell className="text-xs">{event.kind}</TableCell>
-                        <TableCell>{event.message}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-              <div className="divide-y divide-border/50 sm:hidden">
-                {events.map((event, index) => (
-                  <div key={`${event.timestamp}-${index}`} className="px-6 py-3">
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <span className="font-mono">{new Date(event.timestamp).toLocaleTimeString()}</span>
-                      <span className="text-foreground">{event.kind}</span>
-                    </div>
-                    <div className="mt-1 text-sm text-foreground">{event.message}</div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
-          )}
-        </CardContent>
-      </Card>
+            <div className="divide-y divide-border/50 sm:hidden">
+              {events.map((event, index) => (
+                <div key={`${event.timestamp}-${index}`} className="px-6 py-3">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <span className="font-mono">{new Date(event.timestamp).toLocaleTimeString()}</span>
+                    <span className="text-foreground">{event.kind}</span>
+                  </div>
+                  <div className="mt-1 text-sm text-foreground">{event.message}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </CollapsibleCard>
 
       <ConfirmDialog
         open={showCancelConfirm}
@@ -453,9 +448,130 @@ function healthColor(health: number): string {
   return "text-red-600 dark:text-red-300";
 }
 
+function CollapsibleCard({
+  title,
+  noPadding,
+  hidden,
+  children,
+}: {
+  title: string;
+  noPadding?: boolean;
+  hidden?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  if (hidden) return null;
+  return (
+    <Card>
+      <CardHeader>
+        <button
+          type="button"
+          className="flex w-full items-center gap-2 text-left"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <ChevronRight
+            className={cn(
+              "size-4 text-muted-foreground transition-transform",
+              open && "rotate-90",
+            )}
+          />
+          <CardTitle>{title}</CardTitle>
+        </button>
+      </CardHeader>
+      {open ? (
+        <CardContent className={noPadding ? "px-0 pb-0" : undefined}>
+          {children}
+        </CardContent>
+      ) : null}
+    </Card>
+  );
+}
+
 /** Strip vendor prefixes (e.g. `*scryer_`) and humanize key names. */
 function formatMetadataKey(key: string): string {
   const stripped = key.replace(/^\*\w+_/, "");
   return stripped.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+type OutputFile = { name: string; path: string; sizeBytes: number };
+type OutputResult = { outputDir: string; files: OutputFile[]; totalBytes: number };
+
+function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }) {
+  const t = useTranslate();
+  const isTerminal = status === "COMPLETE" || status === "FAILED";
+  const [{ data, fetching }] = useQuery<{ jobOutputFiles: OutputResult | null }>({
+    query: JOB_OUTPUT_FILES_QUERY,
+    variables: { jobId },
+    pause: !isTerminal,
+  });
+
+  if (!isTerminal) return null;
+
+  const result = data?.jobOutputFiles;
+
+  if (fetching) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Output Files</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="text-sm text-muted-foreground">{t("label.loading")}</div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!result || result.files.length === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Output Files</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="text-sm text-muted-foreground">
+            No output files found
+            {result?.outputDir ? (
+              <span className="ml-1 font-mono text-xs">({result.outputDir})</span>
+            ) : null}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle>Output Files</CardTitle>
+          <span className="text-xs text-muted-foreground">
+            {result.files.length} file{result.files.length !== 1 ? "s" : ""} &middot; {formatBytes(result.totalBytes)}
+          </span>
+        </div>
+        <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
+      </CardHeader>
+      <CardContent className="px-0 pb-0">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="text-xs">Name</TableHead>
+              <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {result.files.map((file) => (
+              <TableRow key={file.path}>
+                <TableCell className="font-mono text-xs">{file.name}</TableCell>
+                <TableCell className="text-right text-xs text-muted-foreground">
+                  {formatBytes(file.sizeBytes)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
 }
 

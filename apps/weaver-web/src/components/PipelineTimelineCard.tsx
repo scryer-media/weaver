@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -587,6 +588,8 @@ export function PipelineTimelineCard({
   }
 
   const axisStart = timeline.startedAt;
+  const [membersExpanded, setMembersExpanded] = useState(false);
+
   const stageRows: PlotRow[] = timeline.lanes.map((lane) => ({
     key: `stage:${lane.stage}`,
     title: t(JOB_STAGE_KEYS[lane.stage]),
@@ -625,7 +628,6 @@ export function PipelineTimelineCard({
     })),
   }));
   const extractionRows = memberRows(t, timeline, axisEnd);
-  const rows = [...stageRows, ...extractionRows];
 
   return (
     <Card>
@@ -653,8 +655,32 @@ export function PipelineTimelineCard({
           </div>
         </div>
       </CardHeader>
-      <CardContent>
-        <SharedPlot axisStart={axisStart} axisEnd={axisEnd} rows={rows} />
+      <CardContent className="space-y-3">
+        <SharedPlot axisStart={axisStart} axisEnd={axisEnd} rows={stageRows} />
+        {extractionRows.length > 0 ? (
+          <div>
+            <button
+              type="button"
+              className="flex items-center gap-1.5 text-xs text-muted-foreground transition hover:text-foreground"
+              onClick={() => setMembersExpanded((v) => !v)}
+            >
+              <ChevronRight
+                className={cn(
+                  "size-3.5 transition-transform",
+                  membersExpanded && "rotate-90",
+                )}
+              />
+              <span>
+                Extracted files ({extractionRows.length})
+              </span>
+            </button>
+            {membersExpanded ? (
+              <div className="mt-2">
+                <SharedPlot axisStart={axisStart} axisEnd={axisEnd} rows={extractionRows} />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

@@ -4,12 +4,11 @@ import {
   useEffect,
   useMemo,
   useRef,
-  useState,
   type ReactNode,
 } from "react";
 
 type PwaContextValue = {
-  updateAvailable: boolean;
+  updateAvailable: false;
   applyUpdate: () => void;
 };
 
@@ -27,7 +26,6 @@ function canRegisterServiceWorker() {
 }
 
 export function PwaProvider({ children }: { children: ReactNode }) {
-  const [waitingWorker, setWaitingWorker] = useState<ServiceWorker | null>(null);
   const reloadingRef = useRef(false);
   const lastUpdateCheckRef = useRef(0);
 
@@ -41,11 +39,14 @@ export function PwaProvider({ children }: { children: ReactNode }) {
     let updateTimer: number | null = null;
     const serviceWorkerUrl = `${import.meta.env.BASE_URL}sw.js`;
 
-    const rememberWaitingWorker = (registration: ServiceWorkerRegistration | null) => {
-      if (disposed) {
+    // Auto-apply updates: tell the waiting worker to activate immediately
+    // and reload the page. No user prompt needed for a local network app.
+    const autoApplyUpdate = (worker: ServiceWorker) => {
+      if (disposed || reloadingRef.current) {
         return;
       }
-      setWaitingWorker(registration?.waiting ?? null);
+      reloadingRef.current = true;
+      worker.postMessage({ type: "SKIP_WAITING" });
     };
 
     const triggerUpdateCheck = () => {
@@ -67,7 +68,7 @@ export function PwaProvider({ children }: { children: ReactNode }) {
           installing.state === "installed" &&
           navigator.serviceWorker.controller
         ) {
-          rememberWaitingWorker(registration);
+          autoApplyUpdate(installing);
         }
       });
     };
@@ -99,11 +100,9 @@ export function PwaProvider({ children }: { children: ReactNode }) {
 
       activeRegistration = registration;
 
-      // Only surface a waiting worker if there's an active controller.
-      // On first visit or hard refresh there's no previous SW to update from,
-      // so showing "Update ready" would be misleading.
-      if (navigator.serviceWorker.controller) {
-        rememberWaitingWorker(registration);
+      // If a worker is already waiting, apply immediately.
+      if (navigator.serviceWorker.controller && registration.waiting) {
+        autoApplyUpdate(registration.waiting);
       }
       watchInstallingWorker(registration);
 
@@ -130,16 +129,10 @@ export function PwaProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<PwaContextValue>(
     () => ({
-      updateAvailable: waitingWorker !== null,
-      applyUpdate: () => {
-        if (!waitingWorker) {
-          return;
-        }
-        reloadingRef.current = true;
-        waitingWorker.postMessage({ type: "SKIP_WAITING" });
-      },
+      updateAvailable: false,
+      applyUpdate: () => {},
     }),
-    [waitingWorker],
+    [],
   );
 
   return <PwaContext.Provider value={value}>{children}</PwaContext.Provider>;

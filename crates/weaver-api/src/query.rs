@@ -8,10 +8,12 @@ use weaver_state::Database;
 
 use crate::auth::AdminGuard;
 use crate::timeline::build_job_timeline;
+use weaver_core::log_buffer::LogRingBuffer;
+
 use crate::types::{
     ApiKey, ApiKeyScope, Category, DirectoryBrowseEntry, DirectoryBrowseResult, DownloadBlock,
-    EventKind, GeneralSettings, Job, JobEvent, JobStatusGql, JobTimeline, Metrics, RssFeed,
-    RssSeenItem, Server,
+    EventKind, GeneralSettings, Job, JobEvent, JobOutputFile, JobOutputResult, JobStatusGql,
+    JobTimeline, Metrics, RssFeed, RssSeenItem, Server, ServiceLogsPayload,
 };
 
 pub struct QueryRoot;
@@ -88,6 +90,41 @@ impl QueryRoot {
             Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// List files in a completed job's output directory.
+    async fn job_output_files(&self, ctx: &Context<'_>, job_id: u64) -> Result<Option<JobOutputResult>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let job = match handle.get_job(weaver_core::id::JobId(job_id)) {
+            Ok(info) => info,
+            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let output_dir = match job.output_dir {
+            Some(ref dir) => dir.clone(),
+            None => return Ok(None),
+        };
+
+        let dir_path = PathBuf::from(&output_dir);
+        let result = tokio::task::spawn_blocking(move || list_output_files(&dir_path))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        Ok(Some(result))
+    }
+
+    /// Return recent log lines from the in-memory ring buffer.
+    #[graphql(guard = "AdminGuard")]
+    async fn service_logs(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 250)] limit: i32,
+    ) -> Result<ServiceLogsPayload> {
+        let buffer = ctx.data::<LogRingBuffer>()?;
+        let clamped = (limit.max(1).min(2000)) as usize;
+        let lines = buffer.snapshot(clamped);
+        let count = lines.len() as i32;
+        Ok(ServiceLogsPayload { lines, count })
     }
 
     /// Get synthesized waterfall/timeline data for a job.
@@ -329,4 +366,52 @@ fn browse_directories(path: &Path) -> Result<DirectoryBrowseResult> {
         parent_path,
         entries,
     })
+}
+
+fn list_output_files(dir: &Path) -> Result<JobOutputResult> {
+    let output_dir = dir.to_string_lossy().into_owned();
+
+    if !dir.is_dir() {
+        return Ok(JobOutputResult {
+            output_dir,
+            files: Vec::new(),
+            total_bytes: 0,
+        });
+    }
+
+    let mut files = Vec::new();
+    collect_files_recursive(dir, &mut files)?;
+    files.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    let total_bytes = files.iter().map(|f| f.size_bytes).sum();
+
+    Ok(JobOutputResult {
+        output_dir,
+        files,
+        total_bytes,
+    })
+}
+
+fn collect_files_recursive(dir: &Path, out: &mut Vec<JobOutputFile>) -> Result<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            collect_files_recursive(&path, out)?;
+        } else {
+            out.push(JobOutputFile {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+            });
+        }
+    }
+    Ok(())
 }

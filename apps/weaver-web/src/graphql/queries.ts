@@ -116,6 +116,20 @@ export const BROWSE_DIRECTORIES_QUERY = gql`
   }
 `;
 
+export const JOB_OUTPUT_FILES_QUERY = gql`
+  query JobOutputFiles($jobId: Int!) {
+    jobOutputFiles(jobId: $jobId) {
+      outputDir
+      files {
+        name
+        path
+        sizeBytes
+      }
+      totalBytes
+    }
+  }
+`;
+
 const GENERAL_SETTINGS_FIELDS = `
   fragment GeneralSettingsFields on GeneralSettings {
     dataDir
@@ -434,6 +448,17 @@ export const DELETE_HISTORY_MUTATION = gql`
   ${PARSED_RELEASE_FIELDS}
 `;
 
+export const DELETE_HISTORY_BATCH_MUTATION = gql`
+  mutation DeleteHistoryBatch($ids: [Int!]!, $deleteFiles: Boolean) {
+    deleteHistoryBatch(ids: $ids, deleteFiles: $deleteFiles) {
+      ...HistoryJobFields
+    }
+  }
+  ${JOB_LIST_ITEM_FIELDS}
+  ${HISTORY_JOB_FIELDS}
+  ${PARSED_RELEASE_FIELDS}
+`;
+
 export const DELETE_ALL_HISTORY_MUTATION = gql`
   mutation DeleteAllHistory($deleteFiles: Boolean) {
     deleteAllHistory(deleteFiles: $deleteFiles) {
@@ -514,6 +539,21 @@ export const METRICS_PAGE_SUBSCRIPTION = gql`
   }
   ${METRICS_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const SERVICE_LOGS_QUERY = gql`
+  query ServiceLogs($limit: Int) {
+    serviceLogs(limit: $limit) {
+      lines
+      count
+    }
+  }
+`;
+
+export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
+  subscription ServiceLogLines {
+    serviceLogLines
+  }
 `;
 
 export const HISTORY_JOBS_QUERY = gql`

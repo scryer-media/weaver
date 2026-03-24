@@ -2638,8 +2638,8 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scryer-release-parser"
-version = "0.8.1"
-source = "git+https://github.com/scryer-media/scryer.git?rev=114688d#114688d2c6ef44f6b9a5b84d72f1e1a5d5fbbb2e"
+version = "0.9.14"
+source = "git+https://github.com/scryer-media/scryer.git?rev=87ce3e0#87ce3e049df6053ad3688cd7165de89abf80caa0"
 
 [[package]]
 name = "security-framework"

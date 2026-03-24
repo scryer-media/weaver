@@ -7,6 +7,11 @@ export const settingsNav = [
     descriptionKey: "settings.generalPageDesc",
   },
   {
+    to: "/settings/bandwidth",
+    labelKey: "settings.bandwidthCap",
+    descriptionKey: "settings.bandwidthCapDesc",
+  },
+  {
     to: "/settings/security",
     labelKey: "settings.security",
     descriptionKey: "settings.securityDesc",

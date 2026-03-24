@@ -12,8 +12,16 @@ pub trait KeyStore: Send + Sync {
 pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> {
     let mut stores: Vec<Box<dyn KeyStore>> = Vec::new();
 
+    // Skip macOS Keychain in debug builds — each recompile changes the binary
+    // hash, causing repeated password prompts. Use file-based key instead.
     #[cfg(target_os = "macos")]
-    stores.push(Box::new(super::macos::MacOSKeychain));
+    if cfg!(debug_assertions) {
+        if let Some(dir) = _data_dir.clone() {
+            stores.push(Box::new(super::key_file::KeyFile::new(dir)));
+        }
+    } else {
+        stores.push(Box::new(super::macos::MacOSKeychain));
+    }
 
     #[cfg(target_os = "windows")]
     stores.push(Box::new(super::windows::WindowsCredentialManager));
@@ -22,7 +30,7 @@ pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> 
     {
         stores.push(Box::new(super::linux::DockerSecret));
         if let Some(dir) = _data_dir {
-            stores.push(Box::new(super::linux::KeyFile::new(dir)));
+            stores.push(Box::new(super::key_file::KeyFile::new(dir)));
         }
     }
 

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { Link } from "react-router";
-import { useMutation, useQuery } from "urql";
+import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
@@ -21,7 +21,9 @@ import {
 } from "@/components/ui/table";
 import {
   DELETE_ALL_HISTORY_MUTATION,
+  DELETE_HISTORY_BATCH_MUTATION,
   DELETE_HISTORY_MUTATION,
+  EVENTS_SUBSCRIPTION,
   HISTORY_JOBS_QUERY,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -47,12 +49,15 @@ type HistoryFilter = "all" | "success" | "failure";
 
 export function History() {
   const t = useTranslate();
-  const [{ data, fetching }] = useQuery({ query: HISTORY_JOBS_QUERY });
+  const [{ data, fetching }, reexecuteQuery] = useQuery({ query: HISTORY_JOBS_QUERY });
   const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
+  const [deleteBatchState, deleteHistoryBatch] = useMutation(DELETE_HISTORY_BATCH_MUTATION);
   const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
 
   const [jobs, setJobs] = useState<HistoryJob[]>([]);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [filter, setFilter] = useState<HistoryFilter>("all");
@@ -71,10 +76,31 @@ export function History() {
   }, [deleteState.data]);
 
   useEffect(() => {
+    if (deleteBatchState.data?.deleteHistoryBatch) {
+      setJobs(deleteBatchState.data.deleteHistoryBatch);
+      setSelectedIds(new Set());
+    }
+  }, [deleteBatchState.data]);
+
+  useEffect(() => {
     if (deleteAllState.data?.deleteAllHistory) {
       setJobs(deleteAllState.data.deleteAllHistory);
+      setSelectedIds(new Set());
     }
   }, [deleteAllState.data]);
+
+  // Re-fetch history when jobs complete or fail (queue -> history transition)
+  const handleSubscription = useCallback(
+    (_prev: unknown, response: { events: { kind: string; jobId: number | null } }) => {
+      const event = response.events;
+      if (event.kind === "JOB_COMPLETED" || event.kind === "JOB_FAILED") {
+        void reexecuteQuery({ requestPolicy: "network-only" });
+      }
+      return [];
+    },
+    [reexecuteQuery],
+  );
+  useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
 
   const counts = useMemo(
     () => ({
@@ -125,6 +151,45 @@ export function History() {
     [filter, normalizedSearch, sortedJobs],
   );
 
+  const filteredIds = useMemo(() => new Set(filteredJobs.map((j) => j.id)), [filteredJobs]);
+  const visibleSelectedCount = useMemo(
+    () => [...selectedIds].filter((id) => filteredIds.has(id)).length,
+    [selectedIds, filteredIds],
+  );
+  const allVisibleSelected = filteredJobs.length > 0 && visibleSelectedCount === filteredJobs.length;
+
+  function toggleSelect(id: number) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function toggleSelectAll() {
+    if (allVisibleSelected) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of filteredIds) {
+          next.delete(id);
+        }
+        return next;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of filteredIds) {
+          next.add(id);
+        }
+        return next;
+      });
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -132,9 +197,16 @@ export function History() {
         description={t("history.empty")}
         actions={
           jobs.length > 0 ? (
-            <Button variant="outline" onClick={() => setDeleteAllConfirm(true)}>
-              {t("action.deleteAll")}
-            </Button>
+            <div className="flex gap-2">
+              {visibleSelectedCount > 0 ? (
+                <Button variant="destructive" onClick={() => setDeleteBatchConfirm(true)}>
+                  {t("action.delete")} ({visibleSelectedCount})
+                </Button>
+              ) : null}
+              <Button variant="outline" onClick={() => setDeleteAllConfirm(true)}>
+                {t("action.deleteAll")}
+              </Button>
+            </div>
           ) : undefined
         }
       />
@@ -219,9 +291,16 @@ export function History() {
               <Table className="table-fixed">
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-7 w-[34%] px-2 text-[9px]">{t("table.name")}</TableHead>
-                    <TableHead className="h-7 w-[12%] px-2 text-[9px]">{t("table.status")}</TableHead>
-                    <TableHead className="h-7 w-[18%] px-2 text-[9px]">{t("table.time")}</TableHead>
+                    <TableHead className="h-7 w-[4%] px-2">
+                      <Checkbox
+                        checked={allVisibleSelected}
+                        onCheckedChange={toggleSelectAll}
+                        aria-label="Select all"
+                      />
+                    </TableHead>
+                    <TableHead className="h-7 w-[32%] px-2 text-[9px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.status")}</TableHead>
+                    <TableHead className="h-7 w-[16%] px-2 text-[9px]">{t("table.time")}</TableHead>
                     <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.health")}</TableHead>
                     <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
                     <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.category")}</TableHead>
@@ -230,7 +309,17 @@ export function History() {
                 </TableHeader>
                 <TableBody>
                   {filteredJobs.map((job) => (
-                    <TableRow key={job.id} className="text-[11px]">
+                    <TableRow
+                      key={job.id}
+                      className={cn("text-[11px]", selectedIds.has(job.id) && "bg-muted/50")}
+                    >
+                      <TableCell className="px-2 py-1.5">
+                        <Checkbox
+                          checked={selectedIds.has(job.id)}
+                          onCheckedChange={() => toggleSelect(job.id)}
+                          aria-label={`Select ${job.displayTitle}`}
+                        />
+                      </TableCell>
                       <TableCell className="min-w-0 px-2 py-1.5">
                         <Link
                           to={`/jobs/${job.id}`}
@@ -286,16 +375,24 @@ export function History() {
 
           <div className="space-y-3 lg:hidden">
             {filteredJobs.map((job) => (
-              <Card key={job.id}>
+              <Card key={job.id} className={cn(selectedIds.has(job.id) && "ring-1 ring-primary/40")}>
                 <CardContent className="space-y-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <Link
-                        to={`/jobs/${job.id}`}
-                        className="block truncate font-medium text-foreground transition hover:text-primary"
-                      >
-                        {job.displayTitle}
-                      </Link>
+                  <div className="flex items-start gap-3">
+                    <Checkbox
+                      checked={selectedIds.has(job.id)}
+                      onCheckedChange={() => toggleSelect(job.id)}
+                      className="mt-1"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-3">
+                        <Link
+                          to={`/jobs/${job.id}`}
+                          className="block truncate font-medium text-foreground transition hover:text-primary"
+                        >
+                          {job.displayTitle}
+                        </Link>
+                        <JobStatusBadge status={job.status} compact />
+                      </div>
                       <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
                         <span>{formatHistoryTimestamp(job.createdAt, timestampFormatter)}</span>
                         <span>{formatBytes(job.totalBytes)}</span>
@@ -303,7 +400,6 @@ export function History() {
                         {job.category ? <span>{job.category}</span> : null}
                       </div>
                     </div>
-                    <JobStatusBadge status={job.status} compact />
                   </div>
                   <div className="flex justify-end">
                     <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
@@ -317,6 +413,7 @@ export function History() {
         </>
       )}
 
+      {/* Single delete confirm */}
       <ConfirmDialog
         open={deleteConfirmId != null}
         title={t("confirm.deleteHistory")}
@@ -326,6 +423,11 @@ export function History() {
         onConfirm={() => {
           if (deleteConfirmId != null) {
             void deleteHistory({ id: deleteConfirmId, deleteFiles });
+            setSelectedIds((prev) => {
+              const next = new Set(prev);
+              next.delete(deleteConfirmId);
+              return next;
+            });
           }
           setDeleteConfirmId(null);
           setDeleteFiles(false);
@@ -338,6 +440,30 @@ export function History() {
         </label>
       </ConfirmDialog>
 
+      {/* Batch delete confirm */}
+      <ConfirmDialog
+        open={deleteBatchConfirm}
+        title={t("confirm.deleteHistory")}
+        message={`Delete ${visibleSelectedCount} selected item${visibleSelectedCount === 1 ? "" : "s"} from history?`}
+        confirmLabel={t("confirm.deleteHistoryConfirm")}
+        cancelLabel={t("confirm.deleteHistoryDismiss")}
+        onConfirm={() => {
+          const ids = [...selectedIds].filter((id) => filteredIds.has(id));
+          if (ids.length > 0) {
+            void deleteHistoryBatch({ ids, deleteFiles });
+          }
+          setDeleteBatchConfirm(false);
+          setDeleteFiles(false);
+        }}
+        onCancel={() => { setDeleteBatchConfirm(false); setDeleteFiles(false); }}
+      >
+        <label className="flex items-center gap-2">
+          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <span className="text-sm">{t("confirm.deleteFiles")}</span>
+        </label>
+      </ConfirmDialog>
+
+      {/* Delete all confirm */}
       <ConfirmDialog
         open={deleteAllConfirm}
         title={t("confirm.deleteAllHistory")}

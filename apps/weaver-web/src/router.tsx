@@ -13,6 +13,12 @@ import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
 import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
 import { ScheduleSettingsPage } from "@/pages/settings/ScheduleSettingsPage";
+import { BandwidthCapSettingsPage } from "@/pages/settings/BandwidthCapSettingsPage";
+import { lazy } from "react";
+
+const LogViewerPage = lazy(() =>
+  import("@/pages/LogViewerPage").then((m) => ({ default: m.LogViewerPage })),
+);
 
 const basename = window.__WEAVER_BASE__ || "/";
 
@@ -25,6 +31,7 @@ export const router = createBrowserRouter([
       { path: "upload", element: <Upload /> },
       { path: "metrics", element: <MetricsPage /> },
       { path: "history", element: <History /> },
+      { path: "logs", element: <LogViewerPage /> },
       { path: "servers", element: <Navigate to="/settings/servers" replace /> },
       { path: "categories", element: <Navigate to="/settings/categories" replace /> },
       {
@@ -33,6 +40,7 @@ export const router = createBrowserRouter([
         children: [
           { index: true, element: <Navigate to="general" replace /> },
           { path: "general", element: <GeneralSettingsPage /> },
+          { path: "bandwidth", element: <BandwidthCapSettingsPage /> },
           { path: "security", element: <SecuritySettingsPage /> },
           { path: "backup", element: <BackupSettingsPage /> },
           { path: "rss", element: <RssSettingsPage /> },

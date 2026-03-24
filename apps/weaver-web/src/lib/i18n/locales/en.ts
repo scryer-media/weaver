@@ -9,6 +9,7 @@ const en: LocaleDictionary = {
   "nav.metrics": "Metrics",
   "nav.upload": "Upload",
   "nav.settings": "Settings",
+  "nav.logs": "Logs",
 
   // Status labels
   "status.queued": "Queued",
@@ -216,6 +217,7 @@ const en: LocaleDictionary = {
   "settings.languageDesc": "Choose the display language for the Weaver interface.",
   "settings.bandwidthCap": "ISP Bandwidth Cap",
   "settings.bandwidthCapDesc": "Block new download dispatch once the current ISP allowance is used. Queued jobs still hold position and post-processing already in flight can continue.",
+  "settings.bandwidthCapConfiguration": "Configuration",
   "settings.bandwidthCapEnabled": "Enable ISP cap",
   "settings.bandwidthCapEnabledDesc": "Track usage continuously and block only new article downloads when the active window is exhausted.",
   "settings.bandwidthCapPeriod": "Window",

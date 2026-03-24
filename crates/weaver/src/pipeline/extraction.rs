@@ -492,48 +492,11 @@ impl Pipeline {
         Ok(archive)
     }
 
-    /// Try partial extraction: extract archive members whose volumes are all present.
+    /// Try incremental RAR extraction: extract members whose volumes are all present.
     /// Called after each file completes, not just when all files are done.
-    pub(super) async fn try_partial_extraction(&mut self, job_id: JobId) {
-        // Check for ready 7z sets — extract each independently.
-        let ready_sets: Vec<String> = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
-            state
-                .assembly
-                .ready_archive_sets()
-                .into_iter()
-                .filter(|set_name| {
-                    let dominated = state
-                        .assembly
-                        .archive_topology_for(set_name)
-                        .is_some_and(|t| t.archive_type == weaver_assembly::ArchiveType::SevenZip);
-                    dominated
-                        && !self
-                            .extracted_sets
-                            .get(&job_id)
-                            .is_some_and(|s| s.contains(set_name))
-                })
-                .collect()
-        };
-
-        for set_name in ready_sets {
-            self.extracted_sets
-                .entry(job_id)
-                .or_default()
-                .insert(set_name.clone());
-
-            info!(job_id = job_id.0, set_name = %set_name, "spawning extraction for ready 7z set");
-            let result = self.extract_7z_set(job_id, &set_name).await;
-            if let Err(e) = result {
-                warn!(job_id = job_id.0, set_name = %set_name, error = %e, "set extraction failed to start");
-                if let Some(sets) = self.extracted_sets.get_mut(&job_id) {
-                    sets.remove(&set_name);
-                }
-            }
-        }
-
+    /// Non-RAR archives (7z, zip, tar) are handled in check_job_completion via
+    /// ExtractionReadiness::Partial/Ready — they are all-or-nothing, not incremental.
+    pub(super) async fn try_rar_extraction(&mut self, job_id: JobId) {
         self.try_batch_extraction(job_id).await;
     }
 
@@ -986,7 +949,7 @@ impl Pipeline {
                 if all_downloaded {
                     self.check_job_completion(job_id).await;
                 } else {
-                    self.try_partial_extraction(job_id).await;
+                    self.try_rar_extraction(job_id).await;
                 }
             }
             ExtractionDone::FullSet {
@@ -1018,8 +981,11 @@ impl Pipeline {
                             members = outcome.extracted.len(),
                             "set extraction complete"
                         );
-                        // Set was pre-marked in extracted_sets; confirm it.
-                        self.extracted_sets
+                        // Promote from spawned to extracted now that the task is done.
+                        if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
+                            sets.remove(&set_name);
+                        }
+                        self.extracted_archives
                             .entry(job_id)
                             .or_default()
                             .insert(set_name.clone());
@@ -1059,8 +1025,8 @@ impl Pipeline {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();
                     }
-                    // Remove the pre-mark so it doesn't look extracted.
-                    if let Some(sets) = self.extracted_sets.get_mut(&job_id) {
+                    // Remove from spawned tracking so it doesn't block retries.
+                    if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                         sets.remove(&set_name);
                     }
                     // Fail the job.

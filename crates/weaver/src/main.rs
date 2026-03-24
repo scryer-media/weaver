@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use weaver_core::buffer::{BufferPool, BufferPoolConfig};
 use weaver_core::config::{Config, SharedConfig};
@@ -79,9 +81,15 @@ fn main() {
 }
 
 async fn async_main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_ansi(false)
+    let log_ring_buffer = weaver_core::log_buffer::LogRingBuffer::with_default_capacity();
+    let buffer_layer = tracing_subscriber::fmt::layer()
+        .with_writer(LogBufferWriter(log_ring_buffer.clone()))
+        .with_ansi(false);
+    let stdout_layer = tracing_subscriber::fmt::layer();
+    tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(stdout_layer)
+        .with(buffer_layer)
         .init();
 
     let cli = Cli::parse();
@@ -206,7 +214,7 @@ async fn async_main() {
             } else {
                 base_url
             };
-            if let Err(e) = run_server_command(config, db, port, &base_url).await {
+            if let Err(e) = run_server_command(config, db, port, &base_url, log_ring_buffer.clone()).await {
                 error!("server failed: {e}");
                 std::process::exit(1);
             }
@@ -445,6 +453,7 @@ async fn run_server_command(
     db: Database,
     port: u16,
     base_url: &str,
+    log_ring_buffer: weaver_core::log_buffer::LogRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
@@ -714,6 +723,7 @@ async fn run_server_command(
         db.clone(),
         rss.clone(),
         shared_schedules,
+        log_ring_buffer,
     );
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
@@ -1007,5 +1017,17 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
     // Flush remaining events on shutdown.
     if !batch.is_empty() {
         let _ = db.insert_job_events(&batch);
+    }
+}
+
+/// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
+#[derive(Clone)]
+struct LogBufferWriter(weaver_core::log_buffer::LogRingBuffer);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferWriter {
+    type Writer = weaver_core::log_buffer::LogRingBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.clone()
     }
 }

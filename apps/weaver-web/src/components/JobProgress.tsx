@@ -1,7 +1,6 @@
-import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 
-function indicatorClassName(status?: string): string {
+function statusColor(status?: string): string {
   switch (status) {
     case "VERIFYING":
       return "bg-amber-500";
@@ -23,23 +22,45 @@ function indicatorClassName(status?: string): string {
 export function JobProgress({
   progress,
   status,
+  health,
+  failedPct,
   showLabel = true,
   compact = false,
 }: {
   progress: number;
   status?: string;
+  health?: number;
+  /** Failed bytes as a fraction of total (0..1) */
+  failedPct?: number;
   showLabel?: boolean;
   compact?: boolean;
 }) {
-  const pct = Math.min(100, Math.max(0, progress * 100));
+  const goodPct = Math.min(100, Math.max(0, progress * 100));
+  const badPct = Math.min(100, Math.max(0, (failedPct ?? 0) * 100));
+  const isDownloading = status === "DOWNLOADING" || status === "QUEUED";
+  const hasFailed = badPct > 0 && isDownloading;
 
   return (
     <div className={cn("flex items-center gap-3", compact && "gap-2")}>
-      <Progress
-        value={pct}
-        indicatorClassName={indicatorClassName(status)}
-        className={cn("flex-1", compact && "h-1.5")}
-      />
+      <div
+        className={cn(
+          "relative h-2.5 w-full overflow-hidden rounded-full bg-muted",
+          compact && "h-1.5",
+        )}
+      >
+        {/* Good progress (downloaded) */}
+        <div
+          className={cn("absolute inset-y-0 left-0", statusColor(status))}
+          style={{ width: `${goodPct}%` }}
+        />
+        {/* Failed segments (stacked after good) */}
+        {hasFailed ? (
+          <div
+            className="absolute inset-y-0 bg-red-500"
+            style={{ left: `${goodPct}%`, width: `${Math.min(badPct, 100 - goodPct)}%` }}
+          />
+        ) : null}
+      </div>
       {showLabel ? (
         <span
           className={cn(
@@ -47,7 +68,7 @@ export function JobProgress({
             compact && "w-10 text-[10px]",
           )}
         >
-          {pct.toFixed(1)}%
+          {goodPct.toFixed(1)}%
         </span>
       ) : null}
     </div>

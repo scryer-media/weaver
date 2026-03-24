@@ -77,7 +77,7 @@ base64 = "0.22"
 security-framework = "3"
 security-framework-sys = "2"
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
-scryer-release-parser = { git = "https://github.com/scryer-media/scryer.git", package = "scryer-release-parser", rev = "114688d" }
+scryer-release-parser = { git = "https://github.com/scryer-media/scryer.git", package = "scryer-release-parser", rev = "87ce3e0" }
 
 [profile.release]
 lto = "thin"

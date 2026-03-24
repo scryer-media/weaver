@@ -14,12 +14,14 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
         if parsed.parse_confidence >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME {
             let extracted = extract_title_from_candidate(trimmed, &parsed);
             if !extracted.is_empty() {
-                return finalize_release_name(extracted);
+                let name = finalize_release_name(extracted);
+                return append_episode_suffix(name, parsed.episode.as_ref());
             }
 
             let normalized = basic_release_name(parsed.normalized_title.trim());
             if !normalized.is_empty() {
-                return finalize_release_name(normalized);
+                let name = finalize_release_name(normalized);
+                return append_episode_suffix(name, parsed.episode.as_ref());
             }
         }
 
@@ -30,6 +32,33 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
     }
 
     "Untitled".to_string()
+}
+
+/// Append a human-readable episode suffix (e.g. " — S04E29") when episode
+/// metadata is available from the release parser.
+fn append_episode_suffix(name: String, episode: Option<&ParsedEpisodeMetadata>) -> String {
+    let Some(ep) = episode else {
+        return name;
+    };
+
+    if let Some(season) = ep.season {
+        if !ep.episode_numbers.is_empty() {
+            let episodes: String = ep
+                .episode_numbers
+                .iter()
+                .map(|e| format!("E{e:02}"))
+                .collect::<Vec<_>>()
+                .join("-");
+            return format!("{name} — S{season:02}{episodes}");
+        }
+        return format!("{name} — S{season:02}");
+    }
+
+    if let Some(abs) = ep.absolute_episode {
+        return format!("{name} — {abs:03}");
+    }
+
+    name
 }
 
 pub fn append_original_title_metadata(
@@ -236,12 +265,35 @@ mod tests {
 
     #[test]
     fn prefers_parsed_release_title() {
+        // Season-only pack: parser doesn't produce episode metadata for bare S01
         assert_eq!(
             derive_release_name(
                 Some("Frieren.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu"),
                 None,
             ),
             "Frieren Beyond Journeys End"
+        );
+    }
+
+    #[test]
+    fn display_title_includes_season_episode() {
+        assert_eq!(
+            derive_release_name(
+                Some("Attack.on.Titan.S04E29.The.Final.Chapters.1080p.WEB-DL.H.265"),
+                None,
+            ),
+            "Attack on Titan — S04E29"
+        );
+    }
+
+    #[test]
+    fn display_title_movie_no_episode_suffix() {
+        assert_eq!(
+            derive_release_name(
+                Some("Dune.2024.2160p.BluRay.Remux.H.265"),
+                None,
+            ),
+            "Dune"
         );
     }
 

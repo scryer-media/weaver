@@ -23,7 +23,7 @@ function Progress({ className, value, indicatorClassName, ...props }: ProgressPr
       {...props}
     >
       <ProgressPrimitive.Indicator
-        className={cn("h-full w-full flex-1 transition-all", indicatorClassName)}
+        className={cn("h-full w-full flex-1", indicatorClassName)}
         style={{ transform: `translateX(-${100 - progressValue}%)` }}
       />
     </ProgressPrimitive.Root>

@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod checksum;
+pub mod log_buffer;
 pub mod classify;
 pub mod config;
 pub mod error;

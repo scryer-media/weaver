@@ -3,8 +3,10 @@ use std::time::Duration;
 use async_graphql::{Context, Result, SimpleObject, Subscription};
 use tokio_stream::{Stream, StreamExt};
 
+use weaver_core::log_buffer::LogRingBuffer;
 use weaver_scheduler::SchedulerHandle;
 
+use crate::auth::AdminGuard;
 use crate::types::{DownloadBlock, Job, Metrics, PipelineEventGql};
 
 /// Snapshot of all jobs + metrics, pushed over WebSocket.
@@ -27,6 +29,17 @@ impl SubscriptionRoot {
 
         Ok(tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(|result| result.ok().map(|event| PipelineEventGql::from(&event))))
+    }
+
+    /// Subscribe to live log lines from the service.
+    #[graphql(guard = "AdminGuard")]
+    async fn service_log_lines(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = String>> {
+        let buffer = ctx.data::<LogRingBuffer>()?;
+        let rx = buffer.subscribe();
+        Ok(
+            tokio_stream::wrappers::BroadcastStream::new(rx)
+                .filter_map(|result| result.ok()),
+        )
     }
 
     /// Subscribe to real-time job state snapshots.
