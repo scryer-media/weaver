@@ -125,7 +125,7 @@ impl QueryRoot {
         #[graphql(default = 250)] limit: i32,
     ) -> Result<ServiceLogsPayload> {
         let buffer = ctx.data::<LogRingBuffer>()?;
-        let clamped = (limit.max(1).min(2000)) as usize;
+        let clamped = limit.clamp(1, 2000) as usize;
         let lines = buffer.snapshot(clamped);
         let count = lines.len() as i32;
         Ok(ServiceLogsPayload { lines, count })
