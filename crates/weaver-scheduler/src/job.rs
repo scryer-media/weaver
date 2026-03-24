@@ -46,6 +46,18 @@ pub struct JobSpec {
     pub metadata: Vec<(String, String)>,
 }
 
+impl JobSpec {
+    /// Total bytes of PAR2 recovery files in this spec.
+    pub fn par2_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|f| matches!(f.role, weaver_core::classify::FileRole::Par2 { .. }))
+            .flat_map(|f| f.segments.iter())
+            .map(|s| s.bytes as u64)
+            .sum()
+    }
+}
+
 /// Specification for a single file within a job.
 #[derive(Clone)]
 pub struct FileSpec {
@@ -86,6 +98,8 @@ pub struct JobState {
     pub downloaded_bytes: u64,
     /// Bytes from segments that are permanently lost (430 / max retries exhausted).
     pub failed_bytes: u64,
+    /// Total bytes of PAR2 recovery files, cached from spec at job creation.
+    pub par2_bytes: u64,
     /// Whether health probes have been dispatched for this job.
     pub health_probing: bool,
     /// Segments pulled from queues while health probe runs. Restored on

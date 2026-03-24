@@ -27,14 +27,7 @@ impl Pipeline {
 
             let health = (total.saturating_sub(state.failed_bytes) * 1000 / total) as u32;
 
-            let par2_bytes: u64 = state
-                .spec
-                .files
-                .iter()
-                .filter(|f| matches!(f.role, weaver_core::classify::FileRole::Par2 { .. }))
-                .flat_map(|f| f.segments.iter())
-                .map(|s| s.bytes as u64)
-                .sum();
+            let par2_bytes = state.par2_bytes;
 
             let critical = if par2_bytes == 0 {
                 850

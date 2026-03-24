@@ -238,6 +238,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         continue;
                     }
                     let assembly = JobAssembly::new(job_id);
+                    let par2_bytes = spec.par2_bytes();
                     let state = JobState {
                         job_id,
                         spec,
@@ -248,6 +249,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         working_dir: PathBuf::from("/tmp/test"),
                         downloaded_bytes: 0,
                         failed_bytes: 0,
+                        par2_bytes,
                         health_probing: false,
                         held_segments: Vec::new(),
                         download_queue: DownloadQueue::new(),
@@ -328,6 +330,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     ..
                 } => {
                     let assembly = JobAssembly::new(job_id);
+                    let par2_bytes = spec.par2_bytes();
                     let state = JobState {
                         job_id,
                         spec,
@@ -338,6 +341,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         working_dir,
                         downloaded_bytes: 0,
                         failed_bytes: 0,
+                        par2_bytes,
                         health_probing: false,
                         held_segments: Vec::new(),
                         download_queue: DownloadQueue::new(),

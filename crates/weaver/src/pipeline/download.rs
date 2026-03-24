@@ -213,7 +213,14 @@ impl Pipeline {
         }
 
         let tuner_max = params.max_concurrent_downloads;
-        let max = tuner_max.min(self.connection_ramp);
+        // Reserve one connection slot per active health probe so the probe
+        // task can acquire a pool permit without being starved by downloads.
+        let active_probes = self
+            .jobs
+            .values()
+            .filter(|s| matches!(s.status, JobStatus::Checking))
+            .count();
+        let max = tuner_max.min(self.connection_ramp).saturating_sub(active_probes);
 
         // When the bandwidth cap is within 15% of exhaustion, revert to
         // single-job dispatch so remaining quota goes to the highest-priority job.

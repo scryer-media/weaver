@@ -103,6 +103,7 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        let par2_bytes = spec.par2_bytes();
         let state = JobState {
             job_id,
             spec,
@@ -113,6 +114,7 @@ impl Pipeline {
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             failed_bytes: 0,
+            par2_bytes,
             health_probing: false,
             held_segments: Vec::new(),
             download_queue,
@@ -291,6 +293,7 @@ impl Pipeline {
             let (assembly, download_queue, recovery_queue) =
                 Self::build_job_assembly(job_id, &spec, &all_segments);
 
+            let par2_bytes = spec.par2_bytes();
             let state = JobState {
                 job_id,
                 spec,
@@ -301,6 +304,7 @@ impl Pipeline {
                 working_dir,
                 downloaded_bytes: info.downloaded_bytes,
                 failed_bytes: 0,
+                par2_bytes,
                 health_probing: false,
                 held_segments: Vec::new(),
                 download_queue,
@@ -548,6 +552,7 @@ impl Pipeline {
             total_bytes: spec.total_bytes,
         });
 
+        let par2_bytes = spec.par2_bytes();
         let state = JobState {
             job_id,
             spec,
@@ -558,6 +563,7 @@ impl Pipeline {
             working_dir,
             downloaded_bytes,
             failed_bytes: 0,
+            par2_bytes,
             health_probing: false,
             held_segments: Vec::new(),
             download_queue,

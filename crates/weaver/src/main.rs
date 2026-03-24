@@ -120,12 +120,21 @@ async fn async_main() {
     }
 
     // Bootstrap encryption key for sensitive fields (NNTP/RSS passwords).
+    // Must happen before any code reads passwords from the config — the
+    // initial load_config above ran without a key, so encrypted passwords
+    // were returned as ciphertext.
     let data_dir = PathBuf::from(&config.data_dir);
     match weaver_state::encryption::ensure_encryption_key(Some(data_dir.clone())) {
         Ok(key) => {
             db.set_encryption_key(key);
             if let Err(e) = db.migrate_plaintext_credentials() {
                 error!("failed to encrypt existing passwords: {e}");
+            }
+            // Reload config now that the encryption key is set, so passwords
+            // are properly decrypted.
+            match db.load_config() {
+                Ok(reloaded) => config = reloaded,
+                Err(e) => error!("failed to reload config after setting encryption key: {e}"),
             }
         }
         Err(e) => error!("failed to bootstrap encryption key: {e}"),
@@ -704,7 +713,16 @@ async fn run_server_command(
     {
         let event_rx = event_tx.subscribe();
         let db_for_events = db.clone();
-        tokio::spawn(persist_events(event_rx, db_for_events));
+        tokio::spawn(async move {
+            if let Err(panic) =
+                tokio::spawn(persist_events(event_rx, db_for_events)).await
+            {
+                tracing::error!(
+                    error = %panic,
+                    "CRITICAL: event persistence task panicked — events will not be recorded"
+                );
+            }
+        });
     }
 
     // Create and start the pipeline.

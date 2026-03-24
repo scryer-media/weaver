@@ -1720,6 +1720,7 @@ mod tests {
             working_dir,
             downloaded_bytes: 0,
             failed_bytes: 0,
+            par2_bytes: 0,
             health_probing: false,
             held_segments: Vec::new(),
             download_queue: DownloadQueue::new(),
@@ -2343,6 +2344,7 @@ mod tests {
             .unwrap();
         let (assembly, download_queue, recovery_queue) =
             Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        let par2_bytes = spec.par2_bytes();
         pipeline.jobs.insert(
             job_id,
             JobState {
@@ -2355,6 +2357,7 @@ mod tests {
                 working_dir: working_dir.clone(),
                 downloaded_bytes: 0,
                 failed_bytes: 0,
+                par2_bytes,
                 health_probing: false,
                 held_segments: Vec::new(),
                 download_queue,
