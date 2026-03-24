@@ -214,7 +214,9 @@ async fn async_main() {
             } else {
                 base_url
             };
-            if let Err(e) = run_server_command(config, db, port, &base_url, log_ring_buffer.clone()).await {
+            if let Err(e) =
+                run_server_command(config, db, port, &base_url, log_ring_buffer.clone()).await
+            {
                 error!("server failed: {e}");
                 std::process::exit(1);
             }

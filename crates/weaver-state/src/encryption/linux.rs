@@ -36,4 +36,3 @@ impl KeyStore for DockerSecret {
         "Docker secret"
     }
 }
-

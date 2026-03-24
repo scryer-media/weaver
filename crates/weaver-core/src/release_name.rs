@@ -289,10 +289,7 @@ mod tests {
     #[test]
     fn display_title_movie_no_episode_suffix() {
         assert_eq!(
-            derive_release_name(
-                Some("Dune.2024.2160p.BluRay.Remux.H.265"),
-                None,
-            ),
+            derive_release_name(Some("Dune.2024.2160p.BluRay.Remux.H.265"), None,),
             "Dune"
         );
     }

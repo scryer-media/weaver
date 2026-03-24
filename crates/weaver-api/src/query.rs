@@ -93,7 +93,11 @@ impl QueryRoot {
     }
 
     /// List files in a completed job's output directory.
-    async fn job_output_files(&self, ctx: &Context<'_>, job_id: u64) -> Result<Option<JobOutputResult>> {
+    async fn job_output_files(
+        &self,
+        ctx: &Context<'_>,
+        job_id: u64,
+    ) -> Result<Option<JobOutputResult>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let job = match handle.get_job(weaver_core::id::JobId(job_id)) {
             Ok(info) => info,
@@ -381,7 +385,11 @@ fn list_output_files(dir: &Path) -> Result<JobOutputResult> {
 
     let mut files = Vec::new();
     collect_files_recursive(dir, &mut files)?;
-    files.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    files.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     let total_bytes = files.iter().map(|f| f.size_bytes).sum();
 
     Ok(JobOutputResult {

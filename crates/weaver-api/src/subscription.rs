@@ -36,10 +36,7 @@ impl SubscriptionRoot {
     async fn service_log_lines(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = String>> {
         let buffer = ctx.data::<LogRingBuffer>()?;
         let rx = buffer.subscribe();
-        Ok(
-            tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|result| result.ok()),
-        )
+        Ok(tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| result.ok()))
     }
 
     /// Subscribe to real-time job state snapshots.

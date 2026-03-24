@@ -2118,26 +2118,27 @@ impl Pipeline {
                 .insert(name.clone());
 
             let result = match archive_type {
-                weaver_assembly::ArchiveType::SevenZip => {
-                    self.extract_7z_set(job_id, name).await
-                }
-                weaver_assembly::ArchiveType::Rar => {
-                    self.extract_rar_set(job_id, name).await
-                }
+                weaver_assembly::ArchiveType::SevenZip => self.extract_7z_set(job_id, name).await,
+                weaver_assembly::ArchiveType::Rar => self.extract_rar_set(job_id, name).await,
                 weaver_assembly::ArchiveType::Zip => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zip).await
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zip)
+                        .await
                 }
                 weaver_assembly::ArchiveType::Tar => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Tar).await
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Tar)
+                        .await
                 }
                 weaver_assembly::ArchiveType::TarGz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarGz).await
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarGz)
+                        .await
                 }
                 weaver_assembly::ArchiveType::Gz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz).await
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz)
+                        .await
                 }
                 weaver_assembly::ArchiveType::Split => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Split).await
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Split)
+                        .await
                 }
             };
             match result {
