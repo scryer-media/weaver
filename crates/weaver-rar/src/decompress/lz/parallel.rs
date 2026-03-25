@@ -435,7 +435,7 @@ impl LzDecoder {
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
-        let flush_threshold = (self.window.dict_size() / 2).max(1);
+        let flush_threshold = self.flush_threshold();
 
         for block_items in all_items {
             for item in block_items {

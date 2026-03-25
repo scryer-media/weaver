@@ -58,6 +58,10 @@ const LOW_DIST_REP_COUNT: usize = 16;
 /// Maximum dictionary size (256 MB).
 const MAX_DICT_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Maximum number of bytes to accumulate before flushing decoded output.
+/// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
+const UNPACK_MAX_WRITE: usize = 0x400000;
+
 /// Block type: LZ or PPMd.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockType {
@@ -137,6 +141,10 @@ impl Rar4LzDecoder {
             ppm_esc_char: 2,
             tables_read: false,
         }
+    }
+
+    fn flush_threshold(&self) -> usize {
+        self.window.dict_size().min(UNPACK_MAX_WRITE).max(1)
     }
 
     /// Decompress RAR4 LZ data, returning the decompressed output.
@@ -227,8 +235,8 @@ impl Rar4LzDecoder {
         }
 
         let mut output_size: u64 = 0;
-        let flush_threshold = self.window.dict_size() / 2;
-        let decode_chunk = flush_threshold.max(1) as u64;
+        let flush_threshold = self.flush_threshold();
+        let decode_chunk = flush_threshold as u64;
 
         while output_size < unpacked_size {
             if reader.bits_remaining() < 1 {
@@ -282,8 +290,8 @@ impl Rar4LzDecoder {
         }
 
         let mut output_size: u64 = 0;
-        let flush_threshold = self.window.dict_size() / 2;
-        let decode_chunk = flush_threshold.max(1) as u64;
+        let flush_threshold = self.flush_threshold();
+        let decode_chunk = flush_threshold as u64;
         let mut boundary_idx = 0;
 
         let mut chunks: Vec<(usize, u64)> = Vec::new();

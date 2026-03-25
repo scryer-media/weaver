@@ -51,6 +51,10 @@ const MAX_PENDING_FILTERS: usize = 8192;
 /// Mirrors unrar's `MAX_FILTER_BLOCK_SIZE` bound.
 const MAX_FILTER_BLOCK_SIZE: usize = 0x400000;
 
+/// Maximum number of bytes to accumulate before flushing decoded output.
+/// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
+const UNPACK_MAX_WRITE: usize = 0x400000;
+
 /// State for the LZ decompressor.
 pub struct LzDecoder {
     /// Sliding window / ring buffer.
@@ -93,6 +97,10 @@ impl LzDecoder {
             is_last_block: false,
             pending_filters: Vec::new(),
         }
+    }
+
+    fn flush_threshold(&self) -> usize {
+        self.window.dict_size().min(UNPACK_MAX_WRITE).max(1)
     }
 
     /// Read a RAR5 block header.
@@ -527,7 +535,7 @@ impl LzDecoder {
         // Fall back to single-threaded decode.
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
-        let flush_threshold = (self.window.dict_size() / 2).max(1);
+        let flush_threshold = self.flush_threshold();
 
         while output_size < unpacked_size {
             if self.block_bits_remaining <= 0 {
@@ -576,7 +584,7 @@ impl LzDecoder {
 
         let mut reader = StreamingBitReader::new(input);
         let mut output_size: u64 = 0;
-        let flush_threshold = (self.window.dict_size() / 2).max(1);
+        let flush_threshold = self.flush_threshold();
 
         while output_size < unpacked_size {
             if self.block_bits_remaining <= 0 {
@@ -636,7 +644,7 @@ impl LzDecoder {
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
         let mut boundary_idx = 0;
-        let flush_threshold = (self.window.dict_size() / 2).max(1);
+        let flush_threshold = self.flush_threshold();
 
         // Track per-chunk output.
         let mut chunks: Vec<(usize, u64)> = Vec::new();
