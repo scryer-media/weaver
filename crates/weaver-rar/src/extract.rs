@@ -2,10 +2,12 @@
 //!
 //! Supports both stored (method 0) and LZ-compressed (methods 1-5) extraction.
 
+use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use blake2::Blake2s256;
 use blake2::Digest;
+use tempfile::NamedTempFile;
 
 use crate::decompress;
 use crate::error::{RarError, RarResult};
@@ -32,6 +34,189 @@ impl Default for ExtractOptions {
 
 /// Buffer size for copying data during store extraction.
 const COPY_BUF_SIZE: usize = 64 * 1024;
+
+/// Batch extraction keeps small members in memory and spills larger outputs to a temp file.
+/// This prevents the default batch API from always forcing a heap Vec for large members.
+const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+
+fn spool_threshold_bytes() -> usize {
+    std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SPOOL_THRESHOLD_BYTES)
+}
+
+pub enum ExtractedMember {
+    InMemory(Vec<u8>),
+    TempFile { file: NamedTempFile, len: usize },
+}
+
+impl ExtractedMember {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::InMemory(data) => data.len(),
+            Self::TempFile { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_bytes(&self) -> RarResult<Vec<u8>> {
+        match self {
+            Self::InMemory(data) => Ok(data.clone()),
+            Self::TempFile { file, len } => {
+                let mut reopened = file.reopen().map_err(RarError::Io)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut data = Vec::with_capacity(*len);
+                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                Ok(data)
+            }
+        }
+    }
+
+    pub fn into_bytes(self) -> RarResult<Vec<u8>> {
+        match self {
+            Self::InMemory(data) => Ok(data),
+            Self::TempFile { file, len } => {
+                let mut reopened = file.reopen().map_err(RarError::Io)?;
+                reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+                let mut data = Vec::with_capacity(len);
+                reopened.read_to_end(&mut data).map_err(RarError::Io)?;
+                Ok(data)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ExtractedMember {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InMemory(data) => f
+                .debug_struct("ExtractedMember")
+                .field("storage", &"memory")
+                .field("len", &data.len())
+                .finish(),
+            Self::TempFile { len, .. } => f
+                .debug_struct("ExtractedMember")
+                .field("storage", &"tempfile")
+                .field("len", len)
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq<Vec<u8>> for ExtractedMember {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.to_bytes().is_ok_and(|data| data == *other)
+    }
+}
+
+impl PartialEq<&[u8]> for ExtractedMember {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.to_bytes().is_ok_and(|data| data.as_slice() == *other)
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for ExtractedMember {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.to_bytes().is_ok_and(|data| data.as_slice() == other.as_slice())
+    }
+}
+
+impl PartialEq<ExtractedMember> for Vec<u8> {
+    fn eq(&self, other: &ExtractedMember) -> bool {
+        other == self
+    }
+}
+
+pub struct ExtractedMemberSink {
+    storage: ExtractedMemberSinkStorage,
+    threshold: usize,
+    len: usize,
+}
+
+enum ExtractedMemberSinkStorage {
+    Memory(Vec<u8>),
+    TempFile(NamedTempFile),
+}
+
+impl ExtractedMemberSink {
+    pub fn with_capacity_hint(capacity_hint: usize) -> Self {
+        let threshold = spool_threshold_bytes();
+        Self {
+            storage: ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint.min(threshold))),
+            threshold,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn into_extracted(self) -> RarResult<ExtractedMember> {
+        Ok(match self.storage {
+            ExtractedMemberSinkStorage::Memory(data) => ExtractedMember::InMemory(data),
+            ExtractedMemberSinkStorage::TempFile(file) => ExtractedMember::TempFile {
+                file,
+                len: self.len,
+            },
+        })
+    }
+
+    fn promote_to_tempfile(&mut self) -> std::io::Result<()> {
+        let ExtractedMemberSinkStorage::Memory(data) =
+            std::mem::replace(&mut self.storage, ExtractedMemberSinkStorage::Memory(Vec::new()))
+        else {
+            return Ok(());
+        };
+
+        let mut file = NamedTempFile::new()?;
+        if !data.is_empty() {
+            file.write_all(&data)?;
+        }
+        self.storage = ExtractedMemberSinkStorage::TempFile(file);
+        Ok(())
+    }
+}
+
+impl Write for ExtractedMemberSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match &mut self.storage {
+            ExtractedMemberSinkStorage::Memory(data)
+                if data.len().saturating_add(buf.len()) <= self.threshold =>
+            {
+                data.extend_from_slice(buf);
+            }
+            ExtractedMemberSinkStorage::Memory(_) => {
+                self.promote_to_tempfile()?;
+                if let ExtractedMemberSinkStorage::TempFile(file) = &mut self.storage {
+                    file.write_all(buf)?;
+                }
+            }
+            ExtractedMemberSinkStorage::TempFile(file) => {
+                file.write_all(buf)?;
+            }
+        }
+        self.len = self.len.saturating_add(buf.len());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.storage {
+            ExtractedMemberSinkStorage::Memory(_) => Ok(()),
+            ExtractedMemberSinkStorage::TempFile(file) => file.flush(),
+        }
+    }
+}
 
 /// Extract a stored (method 0, uncompressed) file from the archive.
 ///
@@ -149,7 +334,7 @@ pub fn extract_member<R: Read + Seek>(
     progress: Option<&dyn ProgressHandler>,
     member_info: Option<&MemberInfo>,
     hash: Option<&FileHash>,
-) -> RarResult<Vec<u8>> {
+) -> RarResult<ExtractedMember> {
     // Reject encrypted members — callers must decrypt before extraction.
     if file_header.is_encrypted {
         return Err(RarError::EncryptedMember {
@@ -195,12 +380,13 @@ pub fn extract_member<R: Read + Seek>(
     let output = match file_header.compression.method {
         CompressionMethod::Store => {
             // For store, the CRC is verified inside decompress.
-            decompress::decompress(
+            let data = decompress::decompress(
                 &compressed,
                 unpacked_size,
                 &file_header.compression,
                 expected_crc,
-            )?
+            )?;
+            ExtractedMember::InMemory(data)
         }
         _ => {
             // For compressed data, decompress first then verify CRC.
@@ -227,7 +413,7 @@ pub fn extract_member<R: Read + Seek>(
                 }
             }
 
-            decompressed
+            ExtractedMember::InMemory(decompressed)
         }
     };
 
@@ -239,7 +425,7 @@ pub fn extract_member<R: Read + Seek>(
     // Verify BLAKE2sp hash if provided.
     if options.verify
         && let Some(FileHash::Blake2sp(expected)) = hash
-        && !verify_blake2(&output, expected)
+        && !verify_blake2_member(&output, expected)?
     {
         return Err(RarError::Blake2Mismatch {
             member: file_header.name.clone(),
@@ -260,6 +446,27 @@ pub fn verify_blake2(data: &[u8], expected: &[u8; 32]) -> bool {
     hasher.update(data);
     let result = hasher.finalize();
     result.as_slice() == expected
+}
+
+pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarResult<bool> {
+    match data {
+        ExtractedMember::InMemory(bytes) => Ok(verify_blake2(bytes, expected)),
+        ExtractedMember::TempFile { file, .. } => {
+            let mut reopened = file.reopen().map_err(RarError::Io)?;
+            reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+            let mut hasher = Blake2s256::new();
+            let mut buf = vec![0u8; COPY_BUF_SIZE];
+            loop {
+                let n = reopened.read(&mut buf).map_err(RarError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let result = hasher.finalize();
+            Ok(result.as_slice() == expected)
+        }
+    }
 }
 
 #[cfg(test)]

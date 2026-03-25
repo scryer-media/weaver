@@ -29,6 +29,14 @@ const BLOCKS_PER_THREAD: usize = 2;
 /// Matches unrar's LargeBlockSize = 0x20000 bytes = 1,048,576 bits.
 const LARGE_BLOCK_BITS: i64 = 0x20000 * 8;
 
+/// Maximum number of pending filters to hold at once.
+/// Mirrors unrar's defensive `MAX_UNPACK_FILTERS` bound.
+const MAX_PENDING_FILTERS: usize = 8192;
+
+/// Maximum accepted filter block size.
+/// Mirrors unrar's `MAX_FILTER_BLOCK_SIZE` bound.
+const MAX_FILTER_BLOCK_SIZE: u32 = 0x400000;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A decoded Huffman item — one logical operation extracted from the bitstream.
@@ -305,6 +313,15 @@ fn read_filter_descriptor(reader: &mut BitReader) -> RarResult<(u8, u64, u32, u8
         0
     };
 
+    if block_length > MAX_FILTER_BLOCK_SIZE {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "RAR5 filter block length {} exceeds limit {}",
+                block_length, MAX_FILTER_BLOCK_SIZE
+            ),
+        });
+    }
+
     let channels = if filter_code == 0 && use_counts != 0 {
         // DELTA filter with channel count
         (reader.read_bits(5)? + 1) as u8
@@ -494,6 +511,16 @@ impl LzDecoder {
                             block_length: block_length as usize,
                             channels,
                         });
+
+                        if self.pending_filters.len() > MAX_PENDING_FILTERS {
+                            return Err(RarError::CorruptArchive {
+                                detail: format!(
+                                    "RAR5 pending filter count {} exceeds limit {}",
+                                    self.pending_filters.len(),
+                                    MAX_PENDING_FILTERS
+                                ),
+                            });
+                        }
                     }
                 }
 
@@ -524,6 +551,12 @@ impl LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<Option<u64>> {
+        if std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_some()
+            || std::env::var_os("WEAVER_RAR_ENABLE_PARALLEL").is_none()
+        {
+            return Ok(None);
+        }
+
         // Phase 1: pre-parse block headers.
         let existing_tables = if let (Some(nc), Some(dc), Some(ldc), Some(rc)) = (
             &self.nc_table,

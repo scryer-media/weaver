@@ -39,7 +39,7 @@ pub use archive::{
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};
-pub use extract::ExtractOptions;
+pub use extract::{ExtractOptions, ExtractedMember};
 pub use limits::Limits;
 pub use path::sanitize_path;
 pub use probe::{ProbeFile, VolumeProbe, probe_volume};

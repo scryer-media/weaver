@@ -14,6 +14,9 @@
 
 use crate::error::{RarError, RarResult};
 
+use super::bitstream::BitRead;
+
+#[cfg(test)]
 use super::bitstream::BitReader;
 
 /// Number of bit-length bootstrap codes.
@@ -199,7 +202,7 @@ impl HuffmanTable {
     /// Matches unrar's `DecodeNumber`: peek 16 left-aligned bits, try quick
     /// table, fall back to linear threshold scan.
     #[inline]
-    pub fn decode(&self, reader: &mut BitReader) -> RarResult<u16> {
+    pub fn decode<R: BitRead>(&self, reader: &mut R) -> RarResult<u16> {
         if self.max_length == 0 {
             return Err(RarError::InvalidHuffmanTable);
         }
@@ -271,8 +274,8 @@ impl HuffmanTable {
 /// On first call, pass a zero-initialized vec of length `HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC`.
 ///
 /// Returns (nc_table, dc_table, ldc_table, rc_table).
-pub fn read_tables(
-    reader: &mut BitReader,
+pub fn read_tables<R: BitRead>(
+    reader: &mut R,
     prev_lengths: &mut [u8],
 ) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     // Step 1: Read 20 x 4-bit lengths for the BC (bit-length code) table.
