@@ -112,6 +112,8 @@ jobs:
     needs: [web-build]
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -132,6 +134,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
