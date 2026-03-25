@@ -144,7 +144,7 @@ impl Rar4LzDecoder {
     }
 
     fn flush_threshold(&self) -> usize {
-        self.window.dict_size().min(UNPACK_MAX_WRITE).max(1)
+        self.window.dict_size().clamp(1, UNPACK_MAX_WRITE)
     }
 
     /// Decompress RAR4 LZ data, returning the decompressed output.

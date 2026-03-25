@@ -100,7 +100,7 @@ impl LzDecoder {
     }
 
     fn flush_threshold(&self) -> usize {
-        self.window.dict_size().min(UNPACK_MAX_WRITE).max(1)
+        self.window.dict_size().clamp(1, UNPACK_MAX_WRITE)
     }
 
     /// Read a RAR5 block header.
