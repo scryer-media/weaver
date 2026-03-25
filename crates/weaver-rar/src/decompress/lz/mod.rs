@@ -380,11 +380,7 @@ impl LzDecoder {
     }
 
     /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).
-    fn decode_rc_length<R: BitRead>(
-        &self,
-        reader: &mut R,
-        rc: &HuffmanTable,
-    ) -> RarResult<usize> {
+    fn decode_rc_length<R: BitRead>(&self, reader: &mut R, rc: &HuffmanTable) -> RarResult<usize> {
         let slot = rc.decode(reader)? as usize;
         Self::slot_to_length(reader, slot)
     }
@@ -749,9 +745,13 @@ impl LzDecoder {
                 written_up_to = filter.block_start;
             }
 
-            let block_end = filter.block_start.saturating_add(filter.block_length as u64);
+            let block_end = filter
+                .block_start
+                .saturating_add(filter.block_length as u64);
             if block_end <= total {
-                let mut buf = self.window.copy_output(filter.block_start, filter.block_length);
+                let mut buf = self
+                    .window
+                    .copy_output(filter.block_start, filter.block_length);
                 match filter.filter_type {
                     FilterType::Delta => filter::apply_delta(&mut buf, filter.channels),
                     FilterType::E8 => filter::apply_e8(&mut buf, filter.block_start),

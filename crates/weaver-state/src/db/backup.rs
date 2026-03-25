@@ -241,6 +241,7 @@ mod tests {
                 active: true,
                 supports_pipelining: true,
                 priority: 0,
+                tls_ca_cert: None,
             }],
             categories: vec![CategoryConfig {
                 id: 1,

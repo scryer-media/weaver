@@ -36,6 +36,40 @@ pub mod flags {
     pub const UNPACKED_SIZE_UNKNOWN: u64 = 0x0008;
 }
 
+fn repair_private_use_utf8_name(name: &str) -> Option<String> {
+    let marker = name.find('\u{fffe}')?;
+    let prefix = &name[..marker];
+    let suffix = &name[marker + '\u{fffe}'.len_utf8()..];
+
+    let mut repaired_bytes = Vec::with_capacity(suffix.len());
+    let mut saw_encoded_byte = false;
+
+    for ch in suffix.chars() {
+        let scalar = ch as u32;
+        if let Some(byte) = scalar.checked_sub(0xE000).filter(|value| *value <= 0xFF) {
+            repaired_bytes.push(byte as u8);
+            saw_encoded_byte = true;
+        } else if ch.is_ascii() {
+            repaired_bytes.push(ch as u8);
+        } else {
+            return None;
+        }
+    }
+
+    if !saw_encoded_byte {
+        return None;
+    }
+
+    String::from_utf8(repaired_bytes)
+        .ok()
+        .map(|decoded| format!("{prefix}{decoded}"))
+}
+
+fn decode_rar5_name(name_bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(name_bytes).into_owned();
+    repair_private_use_utf8_name(&decoded).unwrap_or(decoded)
+}
+
 /// Parsed file header.
 #[derive(Debug, Clone)]
 pub struct FileHeader {
@@ -104,7 +138,6 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
     let (attrs, n) = vint::read_vint(&type_fields[pos..])?;
     pos += n;
 
-    // mtime (uint32 Unix timestamp)
     let mtime = if file_flags & flags::TIME_PRESENT != 0 {
         if pos + 4 > type_fields.len() {
             return Err(RarError::TruncatedHeader { offset: raw.offset });
@@ -146,7 +179,7 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
     if name_end > type_fields.len() {
         return Err(RarError::TruncatedHeader { offset: raw.offset });
     }
-    let name = String::from_utf8_lossy(&type_fields[pos..name_end]).into_owned();
+    let name = decode_rar5_name(&type_fields[pos..name_end]);
 
     Ok(FileHeader {
         name,
@@ -249,6 +282,12 @@ mod tests {
         );
         assert_eq!(fh.host_os, HostOs::Unix);
         assert!(fh.mtime.is_some());
+    }
+
+    #[test]
+    fn test_decode_rar5_private_use_utf8_name() {
+        let raw = b"tmp/uni/\xef\xbf\xbe\xee\x83\xa6\xee\x82\x98\xee\x82\xa0\xee\x83\xa7\xee\x82\x94\xee\x82\xbb\xee\x83\xa3\xee\x82\x83\xee\x82\x86\xee\x83\xa3\xee\x82\x82\xee\x82\xb9\xee\x83\xa3\xee\x82\x83\xee\x82\x88.mkv";
+        assert_eq!(decode_rar5_name(raw), "tmp/uni/映画テスト.mkv");
     }
 
     #[test]

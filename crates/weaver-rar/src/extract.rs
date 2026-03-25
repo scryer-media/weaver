@@ -38,7 +38,7 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 /// Batch extraction keeps small members in memory and spills larger outputs to a temp file.
 /// Keep the default threshold low so `extract_member()` does not retain large
 /// heap buffers by default on archives that are better served by file-backed output.
-const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
+const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1024 * 1024;
 
 fn spool_threshold_bytes() -> usize {
     std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
@@ -123,7 +123,8 @@ impl PartialEq<&[u8]> for ExtractedMember {
 
 impl<const N: usize> PartialEq<&[u8; N]> for ExtractedMember {
     fn eq(&self, other: &&[u8; N]) -> bool {
-        self.to_bytes().is_ok_and(|data| data.as_slice() == other.as_slice())
+        self.to_bytes()
+            .is_ok_and(|data| data.as_slice() == other.as_slice())
     }
 }
 
@@ -164,6 +165,10 @@ impl ExtractedMemberSink {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn into_extracted(self) -> RarResult<ExtractedMember> {
         Ok(match self.storage {
             ExtractedMemberSinkStorage::Memory(data) => ExtractedMember::InMemory(data),
@@ -175,9 +180,10 @@ impl ExtractedMemberSink {
     }
 
     fn promote_to_tempfile(&mut self) -> std::io::Result<()> {
-        let ExtractedMemberSinkStorage::Memory(data) =
-            std::mem::replace(&mut self.storage, ExtractedMemberSinkStorage::Memory(Vec::new()))
-        else {
+        let ExtractedMemberSinkStorage::Memory(data) = std::mem::replace(
+            &mut self.storage,
+            ExtractedMemberSinkStorage::Memory(Vec::new()),
+        ) else {
             return Ok(());
         };
 

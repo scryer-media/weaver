@@ -445,8 +445,7 @@ impl LzDecoder {
 
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
-                        let n =
-                            (count as usize + 1).min((unpacked_size - *output_size) as usize);
+                        let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
                         for b in &bytes[..n] {
                             self.window.put_byte(*b);
                         }

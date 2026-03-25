@@ -17,7 +17,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use crate::decompress::lz::LzDecoder;
 use crate::decompress::rar4::Rar4LzDecoder;
 use crate::error::{RarError, RarResult};
-use crate::extract::{self, ExtractOptions};
+use crate::extract::ExtractOptions;
 use crate::header;
 use crate::header::file::FileHeader;
 use crate::limits::Limits;

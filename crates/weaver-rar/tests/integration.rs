@@ -1266,7 +1266,11 @@ fn open_single_with_password(dir: &str, filename: &str, password: &str) -> weave
     weaver_rar::RarArchive::open_with_password(Cursor::new(data), password).unwrap()
 }
 
-fn open_single_file_with_password(dir: &str, filename: &str, password: &str) -> weaver_rar::RarArchive {
+fn open_single_file_with_password(
+    dir: &str,
+    filename: &str,
+    password: &str,
+) -> weaver_rar::RarArchive {
     let file = std::fs::File::open(fixture(dir, filename)).unwrap();
     weaver_rar::RarArchive::open_with_password(file, password).unwrap()
 }
@@ -1898,7 +1902,8 @@ fn test_rar5_hp_encrypted_large_disk_open_to_file() {
         eprintln!("skipping: rar5_hp_large.rar not present");
         return;
     }
-    let mut archive = open_single_file_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
+    let mut archive =
+        open_single_file_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
     let opts = weaver_rar::ExtractOptions {
         verify: true,
         password: Some("e2e-test-password".into()),
@@ -2101,6 +2106,40 @@ fn test_rar5_unicode_extract() {
     assert_eq!(r1, original("café-résumé.txt"));
 }
 
+#[test]
+fn test_rar5_unicode_cjk_filename() {
+    let archive = open_single("rar5", "rar5_unicode_cjk.rar");
+    let names = archive.member_names();
+    assert_eq!(names.len(), 1);
+    assert!(
+        names[0].contains("映画テスト"),
+        "got mangled name: {}",
+        names[0]
+    );
+}
+
+#[test]
+fn test_rar5_unicode_cjk_extract() {
+    let mut archive = open_single("rar5", "rar5_unicode_cjk.rar");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let index = archive
+        .member_names()
+        .iter()
+        .position(|name| name.contains("映画テスト"))
+        .expect("expected CJK filename in archive");
+    let expected_size = archive.member_info(index).unwrap().unpacked_size.unwrap();
+    let data = archive.extract_member(index, &opts, None).unwrap();
+    assert_eq!(data.len() as u64, expected_size);
+    assert!(
+        !data.is_empty(),
+        "CJK-named member should extract successfully"
+    );
+}
+
 // -- Directory entries --------------------------------------------------------
 
 #[test]
@@ -2171,7 +2210,7 @@ fn test_rar5_solid_metadata() {
     let archive = open_single("rar5", "rar5_solid.rar");
     assert!(archive.is_solid(), "archive should be marked solid");
     let names = archive.member_names();
-    assert_eq!(names.len(), 4);
+    assert_eq!(names, vec!["sample.mkv", "file1.txt", "file2.txt"]);
 }
 
 #[test]
@@ -2256,6 +2295,103 @@ fn test_rar5_solid_reopen_archive_for_later_member() {
 }
 
 #[test]
+fn test_rar5_solid_encrypted_extract_all_members_sequentially() {
+    let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+
+    let mut archive = weaver_rar::RarArchive::open_with_password(
+        std::fs::File::open(&fixture).unwrap(),
+        "e2e-test-password",
+    )
+    .unwrap();
+
+    let names = archive.member_names();
+    assert_eq!(names.len(), 2);
+
+    let first = archive.extract_member(0, &options, None).unwrap();
+    assert!(
+        !first.is_empty(),
+        "first encrypted solid member should extract"
+    );
+
+    let second = archive.extract_member(1, &options, None).unwrap();
+    let second_info = archive.member_info(1).unwrap();
+    assert_eq!(second.len() as u64, second_info.unpacked_size.unwrap());
+    assert!(
+        !second.is_empty(),
+        "second encrypted solid member should extract"
+    );
+}
+
+#[test]
+fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
+    let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+
+    let mut expected_archive = weaver_rar::RarArchive::open_with_password(
+        std::fs::File::open(&fixture).unwrap(),
+        "e2e-test-password",
+    )
+    .unwrap();
+    let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
+    let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
+
+    let mut archive = weaver_rar::RarArchive::open_with_password(
+        std::fs::File::open(&fixture).unwrap(),
+        "e2e-test-password",
+    )
+    .unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let first_chunk_dir = temp_dir.path().join("first");
+    let first_chunks = archive
+        .extract_member_solid_chunked(0, &options, |volume_index| {
+            let path = first_chunk_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+    assert!(!first_chunks.is_empty());
+    let mut actual_first = Vec::new();
+    for (volume_index, bytes_written) in &first_chunks {
+        let data = std::fs::read(first_chunk_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        actual_first.extend_from_slice(&data);
+    }
+    assert_eq!(actual_first, expected_first);
+
+    let second_chunk_dir = temp_dir.path().join("second");
+    let second_chunks = archive
+        .extract_member_solid_chunked(1, &options, |volume_index| {
+            let path = second_chunk_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+    assert!(!second_chunks.is_empty());
+    let mut actual_second = Vec::new();
+    for (volume_index, bytes_written) in &second_chunks {
+        let data =
+            std::fs::read(second_chunk_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        actual_second.extend_from_slice(&data);
+    }
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
 fn test_rar4_solid_metadata() {
     let archive = open_single("rar4", "rar4_solid.rar");
     assert!(archive.is_solid(), "archive should be marked solid");
@@ -2298,9 +2434,15 @@ fn test_rar4_solid_extracts_all_members_sequentially() {
     let metadata = archive.metadata().clone();
 
     for member_index in 0..metadata.members.len() {
-        let extracted = archive.extract_member(member_index, &options, None).unwrap();
+        let extracted = archive
+            .extract_member(member_index, &options, None)
+            .unwrap();
         let expected_size = metadata.members[member_index].unpacked_size.unwrap_or(0);
-        assert_eq!(extracted.len() as u64, expected_size, "member index {member_index}");
+        assert_eq!(
+            extracted.len() as u64,
+            expected_size,
+            "member index {member_index}"
+        );
     }
 }
 
@@ -2345,7 +2487,11 @@ fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
         let mut actual = Vec::new();
         for (volume_index, bytes_written) in &chunks {
             let data = std::fs::read(member_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
-            assert_eq!(data.len() as u64, *bytes_written, "member index {member_index}");
+            assert_eq!(
+                data.len() as u64,
+                *bytes_written,
+                "member index {member_index}"
+            );
             actual.extend_from_slice(&data);
         }
         assert_eq!(actual, *expected, "member index {member_index}");

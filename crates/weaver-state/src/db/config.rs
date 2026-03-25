@@ -565,6 +565,7 @@ mod tests {
             active: true,
             supports_pipelining: false,
             priority: 0,
+            tls_ca_cert: None,
         };
 
         db.insert_server(&server).unwrap();
@@ -611,6 +612,7 @@ mod tests {
                 active: true,
                 supports_pipelining: true,
                 priority: 0,
+                tls_ca_cert: None,
             }],
             categories: vec![CategoryConfig {
                 id: 1,

@@ -100,9 +100,9 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
             )));
         }
         for cert in certs {
-            root_store.add(cert).map_err(|e| {
-                NntpError::MalformedResponse(format!("invalid CA cert: {e}"))
-            })?;
+            root_store
+                .add(cert)
+                .map_err(|e| NntpError::MalformedResponse(format!("invalid CA cert: {e}")))?;
         }
     }
 

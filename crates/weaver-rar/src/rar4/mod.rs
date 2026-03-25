@@ -406,11 +406,16 @@ mod tests {
         let mut cursor = Cursor::new(&data[7..]);
         let vol = parse_rar4_headers(&mut cursor, Some("e2e-test-password")).unwrap();
         assert!(vol.archive_header.is_encrypted);
-        assert!(!vol.files.is_empty(), "should have parsed at least one file header");
+        assert!(
+            !vol.files.is_empty(),
+            "should have parsed at least one file header"
+        );
         eprintln!("parsed {} files from -hp archive", vol.files.len());
         for f in &vol.files {
-            eprintln!("  file: {:?} packed={} unpacked={} method={:?} encrypted={} salt={:?} flags={:#06x}",
-                f.name, f.packed_size, f.unpacked_size, f.method, f.is_encrypted, f.salt, f.flags);
+            eprintln!(
+                "  file: {:?} packed={} unpacked={} method={:?} encrypted={} salt={:?} flags={:#06x}",
+                f.name, f.packed_size, f.unpacked_size, f.method, f.is_encrypted, f.salt, f.flags
+            );
         }
     }
 

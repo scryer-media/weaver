@@ -23,7 +23,9 @@ fn bench_solid_extract_all_members(c: &mut Criterion, dir: &str, name: &str, ben
                 weaver_rar::RarArchive::open(std::fs::File::open(&path).unwrap()).unwrap();
             let member_count = archive.metadata().members.len();
             for member_index in 0..member_count {
-                let data = archive.extract_member(member_index, &options, None).unwrap();
+                let data = archive
+                    .extract_member(member_index, &options, None)
+                    .unwrap();
                 black_box(data);
             }
         });

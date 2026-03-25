@@ -2407,10 +2407,11 @@ mod tests {
                 return;
             }
 
-            let done = tokio::time::timeout(Duration::from_secs(60), pipeline.extract_done_rx.recv())
-                .await
-                .expect("timed out waiting for extraction completion")
-                .expect("extraction channel should stay open");
+            let done =
+                tokio::time::timeout(Duration::from_secs(60), pipeline.extract_done_rx.recv())
+                    .await
+                    .expect("timed out waiting for extraction completion")
+                    .expect("extraction channel should stay open");
             pipeline.handle_extraction_done(done).await;
         }
 
@@ -2677,20 +2678,16 @@ mod tests {
             &[(fixture_name.to_string(), fixture_bytes.clone())],
         );
         let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-        write_and_complete_rar_volume(
-            &mut pipeline,
-            job_id,
-            0,
-            fixture_name,
-            &fixture_bytes,
-        )
-            .await;
+        write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
         pipeline.check_job_completion(job_id).await;
         drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
 
         let dest = complete_dir.join(job::sanitize_dirname("Nested RAR Two Deep"));
-        assert!(matches!(job_status_for_assert(&pipeline, job_id), Some(JobStatus::Complete)));
+        assert!(matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ));
         assert!(dest.join("sample.mkv").exists());
         assert!(!dest.join("inner.rar").exists());
     }
@@ -2707,20 +2704,16 @@ mod tests {
             &[(fixture_name.to_string(), fixture_bytes.clone())],
         );
         let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-        write_and_complete_rar_volume(
-            &mut pipeline,
-            job_id,
-            0,
-            fixture_name,
-            &fixture_bytes,
-        )
-        .await;
+        write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
         pipeline.check_job_completion(job_id).await;
         drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
 
         let dest = complete_dir.join(job::sanitize_dirname("Nested RAR Three Deep"));
-        assert!(matches!(job_status_for_assert(&pipeline, job_id), Some(JobStatus::Complete)));
+        assert!(matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ));
         assert!(dest.join("sample.mkv").exists());
         assert!(!dest.join("middle.rar").exists());
         assert!(!dest.join("inner.7z").exists());
@@ -2738,20 +2731,16 @@ mod tests {
             &[(fixture_name.to_string(), fixture_bytes.clone())],
         );
         let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-        write_and_complete_rar_volume(
-            &mut pipeline,
-            job_id,
-            0,
-            fixture_name,
-            &fixture_bytes,
-        )
-        .await;
+        write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
         pipeline.check_job_completion(job_id).await;
         drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
 
         let dest = complete_dir.join(job::sanitize_dirname("Nested RAR Five Deep"));
-        assert!(matches!(job_status_for_assert(&pipeline, job_id), Some(JobStatus::Complete)));
+        assert!(matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ));
         assert!(dest.join("level2.rar").exists());
         assert!(!dest.join("sample.mkv").exists());
     }
@@ -4576,7 +4565,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(
-            matches!(job_status_for_assert(&pipeline, job_id), Some(JobStatus::Complete)),
+            matches!(
+                job_status_for_assert(&pipeline, job_id),
+                Some(JobStatus::Complete)
+            ),
             "job status: {:?}, dest entries: {:?}, working entries: {:?}",
             job_status_for_assert(&pipeline, job_id),
             dest_entries,
@@ -4588,8 +4580,16 @@ mod tests {
             dest_entries,
             working_entries
         );
-        assert!(dest.join("file1.txt").exists(), "dest entries: {:?}", dest_entries);
-        assert!(dest.join("file2.txt").exists(), "dest entries: {:?}", dest_entries);
+        assert!(
+            dest.join("file1.txt").exists(),
+            "dest entries: {:?}",
+            dest_entries
+        );
+        assert!(
+            dest.join("file2.txt").exists(),
+            "dest entries: {:?}",
+            dest_entries
+        );
         assert!(!working_dir.join("solid.rar").exists());
     }
 

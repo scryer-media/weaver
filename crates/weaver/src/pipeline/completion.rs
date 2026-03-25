@@ -619,7 +619,9 @@ impl Pipeline {
         role: &weaver_core::classify::FileRole,
     ) -> Option<weaver_assembly::ArchiveType> {
         match role {
-            weaver_core::classify::FileRole::RarVolume { .. } => Some(weaver_assembly::ArchiveType::Rar),
+            weaver_core::classify::FileRole::RarVolume { .. } => {
+                Some(weaver_assembly::ArchiveType::Rar)
+            }
             weaver_core::classify::FileRole::SevenZipArchive
             | weaver_core::classify::FileRole::SevenZipSplit { .. } => {
                 Some(weaver_assembly::ArchiveType::SevenZip)
@@ -630,7 +632,9 @@ impl Pipeline {
                 Some(weaver_assembly::ArchiveType::TarGz)
             }
             weaver_core::classify::FileRole::GzArchive => Some(weaver_assembly::ArchiveType::Gz),
-            weaver_core::classify::FileRole::SplitFile { .. } => Some(weaver_assembly::ArchiveType::Split),
+            weaver_core::classify::FileRole::SplitFile { .. } => {
+                Some(weaver_assembly::ArchiveType::Split)
+            }
             _ => None,
         }
     }
@@ -672,9 +676,9 @@ impl Pipeline {
                     format!("failed to read entry in {}: {error}", current.display())
                 })?;
                 let path = entry.path();
-                let file_type = entry.file_type().map_err(|error| {
-                    format!("failed to stat {}: {error}", path.display())
-                })?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
                 if file_type.is_dir() {
                     walk(root, &path, files)?;
                     continue;
@@ -721,9 +725,9 @@ impl Pipeline {
                     format!("failed to read entry in {}: {error}", current.display())
                 })?;
                 let path = entry.path();
-                let file_type = entry.file_type().map_err(|error| {
-                    format!("failed to stat {}: {error}", path.display())
-                })?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
                 if file_type.is_dir() {
                     if prune(root, &path)? {
                         has_entries = true;
@@ -842,7 +846,8 @@ impl Pipeline {
             .iter()
             .filter_map(|file| {
                 let archive_type = Self::archive_type_for_role(&file.role)?;
-                let set_name = weaver_core::classify::archive_base_name(&file.relative_path, &file.role)?;
+                let set_name =
+                    weaver_core::classify::archive_base_name(&file.relative_path, &file.role)?;
                 Some(NestedArchiveFile {
                     relative_path: file.relative_path.clone(),
                     role: file.role.clone(),
@@ -1898,10 +1903,9 @@ impl Pipeline {
                             warn!(job_id = job_id.0, %msg);
                             let state = self.jobs.get_mut(&job_id).unwrap();
                             state.status = JobStatus::Failed { error: msg.clone() };
-                            let _ = self.event_tx.send(PipelineEvent::JobFailed {
-                                job_id,
-                                error: msg,
-                            });
+                            let _ = self
+                                .event_tx
+                                .send(PipelineEvent::JobFailed { job_id, error: msg });
                             self.record_job_history(job_id);
                             return;
                         }

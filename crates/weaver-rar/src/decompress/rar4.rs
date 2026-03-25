@@ -111,8 +111,8 @@ pub struct Rar4LzDecoder {
     ppm_model: Option<Model>,
     /// PPMd escape character (default 2).
     ppm_esc_char: u8,
-        /// Equivalent to unrar's TablesRead3 flag.
-        tables_read: bool,
+    /// Equivalent to unrar's TablesRead3 flag.
+    tables_read: bool,
 }
 
 impl Rar4LzDecoder {
@@ -239,10 +239,12 @@ impl Rar4LzDecoder {
 
             match self.block_type {
                 BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(&mut reader, target_output, output_size)?;
+                    output_size =
+                        self.decode_lz_symbols(&mut reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
+                    output_size =
+                        self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
                 }
             }
 
@@ -281,7 +283,7 @@ impl Rar4LzDecoder {
 
         let mut output_size: u64 = 0;
         let flush_threshold = self.window.dict_size() / 2;
-    let decode_chunk = flush_threshold.max(1) as u64;
+        let decode_chunk = flush_threshold.max(1) as u64;
         let mut boundary_idx = 0;
 
         let mut chunks: Vec<(usize, u64)> = Vec::new();
@@ -298,10 +300,12 @@ impl Rar4LzDecoder {
             let target_output = output_size.saturating_add(decode_chunk).min(unpacked_size);
             match self.block_type {
                 BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(&mut reader, target_output, output_size)?;
+                    output_size =
+                        self.decode_lz_symbols(&mut reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
+                    output_size =
+                        self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
                 }
             }
             let decoded_this_round = output_size - prev_output;

@@ -1,17 +1,89 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use blake2::{Blake2s256, Digest};
+use memmap2::Mmap;
+use tempfile::NamedTempFile;
 use tracing::debug;
 
 use super::*;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_SOLID_COMPRESSED_SPOOL_THRESHOLD_BYTES: usize = 512 * 1024 * 1024;
+
+enum BufferedMemberData {
+    InMemory(Vec<u8>),
+    TempFile { _file: NamedTempFile, map: Mmap },
+}
+
+impl BufferedMemberData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::InMemory(data) => data,
+            Self::TempFile { map, .. } => map,
+        }
+    }
+}
 
 impl RarArchive {
+    fn decrypt_member_data(
+        &mut self,
+        compressed: &[u8],
+        fh: &FileHeader,
+        file_enc: Option<&FileEncryptionInfo>,
+        rar4_salt: Option<[u8; 8]>,
+        password: &str,
+    ) -> RarResult<Vec<u8>> {
+        if self.format == ArchiveFormat::Rar4 {
+            let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
+                detail: format!(
+                    "RAR4 member {} is marked encrypted but has no salt",
+                    fh.name,
+                ),
+            })?;
+            let (key, iv) = self.kdf_cache.derive_key_rar4(password, &salt);
+            crate::crypto::rar4_decrypt_data(&key, &iv, compressed)
+        } else {
+            let enc_info = file_enc.ok_or_else(|| RarError::CorruptArchive {
+                detail: format!(
+                    "member {} is marked encrypted but has no encryption parameters",
+                    fh.name,
+                ),
+            })?;
+
+            if let Some(ref check_data) = enc_info.check_data
+                && !self.kdf_cache.verify_password_rar5(
+                    password,
+                    &enc_info.salt,
+                    enc_info.kdf_count,
+                    check_data,
+                )
+            {
+                return Err(RarError::WrongPassword {
+                    member: fh.name.clone(),
+                });
+            }
+
+            let key = self
+                .kdf_cache
+                .derive_key_rar5(password, &enc_info.salt, enc_info.kdf_count);
+            crate::crypto::decrypt_data(&key, &enc_info.iv, compressed)
+        }
+    }
+
+    fn solid_compressed_spool_threshold_bytes() -> usize {
+        std::env::var("WEAVER_RAR_SOLID_COMPRESSED_SPOOL_THRESHOLD_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_SOLID_COMPRESSED_SPOOL_THRESHOLD_BYTES)
+    }
+
     fn normalize_rar4_encrypted_compressed_data(
         &self,
         mut compressed: Vec<u8>,
@@ -82,6 +154,22 @@ impl RarArchive {
             .min(usize::MAX as u64) as usize
     }
 
+    fn read_member_data_buffered(&mut self, entry_index: usize) -> RarResult<BufferedMemberData> {
+        let entry = &self.members[entry_index];
+        let total_size = Self::compressed_capacity_hint(&entry.segments);
+        if total_size <= Self::solid_compressed_spool_threshold_bytes() {
+            return self
+                .read_member_data(entry_index)
+                .map(BufferedMemberData::InMemory);
+        }
+
+        let mut file = NamedTempFile::new().map_err(RarError::Io)?;
+        self.read_member_data_into(entry_index, &mut file, None)?;
+        file.as_file_mut().flush().map_err(RarError::Io)?;
+        let map = unsafe { Mmap::map(file.as_file()) }.map_err(RarError::Io)?;
+        Ok(BufferedMemberData::TempFile { _file: file, map })
+    }
+
     fn solid_volume_transitions(
         segments: &[DataSegment],
     ) -> (usize, Vec<crate::decompress::VolumeTransition>) {
@@ -112,12 +200,37 @@ impl RarArchive {
 
         while self.solid_next_index < index {
             let skip_idx = self.solid_next_index;
-            let skip_entry = &self.members[skip_idx];
-            let skip_fh = skip_entry.file_header.clone();
+            let (skip_fh, skip_is_encrypted, skip_file_encryption, skip_rar4_salt) = {
+                let skip_entry = &self.members[skip_idx];
+                (
+                    skip_entry.file_header.clone(),
+                    skip_entry.is_encrypted,
+                    skip_entry.file_encryption.clone(),
+                    skip_entry.rar4_salt,
+                )
+            };
             if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_data = self.read_member_data(skip_idx)?;
+                let skip_data = self.read_member_data_buffered(skip_idx)?;
                 let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
-                self.replay_solid_decoder(&skip_data, skip_unpacked, &skip_fh)?;
+                let replay_data = if skip_is_encrypted {
+                    let password = self
+                        .password
+                        .as_deref()
+                        .ok_or_else(|| RarError::EncryptedMember {
+                            member: skip_fh.name.clone(),
+                        })?
+                        .to_owned();
+                    Cow::Owned(self.decrypt_member_data(
+                        skip_data.as_slice(),
+                        &skip_fh,
+                        skip_file_encryption.as_ref(),
+                        skip_rar4_salt,
+                        &password,
+                    )?)
+                } else {
+                    Cow::Borrowed(skip_data.as_slice())
+                };
+                self.replay_solid_decoder(replay_data.as_ref(), skip_unpacked, &skip_fh)?;
             }
             self.solid_next_index += 1;
         }
@@ -204,7 +317,23 @@ impl RarArchive {
         // Sort segments by volume index to handle out-of-order volume addition.
         segments.sort_by_key(|s| s.volume_index);
 
-        let mut data = Vec::new();
+        let total_size = segments.iter().try_fold(0usize, |acc, segment| {
+            let segment_size =
+                usize::try_from(segment.data_size).map_err(|_| RarError::ResourceLimit {
+                    detail: format!(
+                        "data segment size {} exceeds addressable memory",
+                        segment.data_size
+                    ),
+                })?;
+            acc.checked_add(segment_size)
+                .ok_or_else(|| RarError::ResourceLimit {
+                    detail: format!(
+                        "member {} total compressed size exceeds addressable memory",
+                        name
+                    ),
+                })
+        })?;
+        let mut data = Vec::with_capacity(total_size);
 
         for seg in &segments {
             // Guard against unreasonably large data segments.
@@ -229,19 +358,22 @@ impl RarArchive {
             vol.reader
                 .seek(SeekFrom::Start(seg.data_offset))
                 .map_err(RarError::Io)?;
-            let mut buf = vec![0u8; seg.data_size as usize];
+            let start = data.len();
+            let read_len = seg.data_size as usize;
+            data.resize(start + read_len, 0);
             if seg.data_size > 0 {
-                vol.reader.read_exact(&mut buf).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        RarError::TruncatedData {
-                            offset: seg.data_offset,
+                vol.reader
+                    .read_exact(&mut data[start..start + read_len])
+                    .map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            RarError::TruncatedData {
+                                offset: seg.data_offset,
+                            }
+                        } else {
+                            RarError::Io(e)
                         }
-                    } else {
-                        RarError::Io(e)
-                    }
-                })?;
+                    })?;
             }
-            data.extend_from_slice(&buf);
         }
 
         Ok(data)
@@ -453,12 +585,8 @@ impl RarArchive {
 
             let actual_crc = {
                 let segments = self.members[index].segments.clone();
-                let base_reader = ArchiveSegmentReader::new(
-                    &mut self.volumes,
-                    &self.limits,
-                    &segments,
-                    &fh.name,
-                );
+                let base_reader =
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let mut crc_writer = CrcWriter::new(&mut output, expected_crc.is_some());
 
                 if let Some((key, iv)) = decrypt_key {
@@ -516,7 +644,15 @@ impl RarArchive {
         }
 
         // Read all data segments for this member.
-        let mut compressed = self.read_member_data(index)?;
+        let solid_compressed = if is_solid {
+            Some(self.read_member_data_buffered(index)?)
+        } else {
+            None
+        };
+        let mut compressed = match solid_compressed.as_ref() {
+            Some(data) => Cow::Borrowed(data.as_slice()),
+            None => Cow::Owned(self.read_member_data(index)?),
+        };
 
         // Decrypt the data if the member is encrypted.
         if let Some(ref pwd) = member_password {
@@ -528,38 +664,21 @@ impl RarArchive {
                         fh.name,
                     ),
                 })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    None,
+                    Some(salt),
+                    pwd,
+                )?);
             } else {
-                // RAR5: AES-256-CBC with PBKDF2-HMAC-SHA256.
-                let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "member {} is marked encrypted but has no encryption parameters",
-                        fh.name,
-                    ),
-                })?;
-
-                // Pre-check password using check_data if available.
-                // This catches wrong passwords before expensive decryption,
-                // and is the only detection mechanism for encrypted Store+HASHMAC
-                // (where CRC verification is skipped).
-                if let Some(ref check_data) = enc_info.check_data
-                    && !self.kdf_cache.verify_password_rar5(
-                        pwd,
-                        &enc_info.salt,
-                        enc_info.kdf_count,
-                        check_data,
-                    )
-                {
-                    return Err(RarError::WrongPassword {
-                        member: fh.name.clone(),
-                    });
-                }
-
-                let key = self
-                    .kdf_cache
-                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    file_enc.as_ref(),
+                    None,
+                    pwd,
+                )?);
             }
         }
         // For encrypted store files, decrypted data may be padded to AES block
@@ -568,14 +687,16 @@ impl RarArchive {
             && fh.compression.method == CompressionMethod::Store
             && compressed.len() as u64 > unpacked_size
         {
-            compressed.truncate(unpacked_size as usize);
+            let mut owned = compressed.into_owned();
+            owned.truncate(unpacked_size as usize);
+            compressed = Cow::Owned(owned);
         } else if member_password.is_some() {
-            compressed = self.normalize_rar4_encrypted_compressed_data(
-                compressed,
+            compressed = Cow::Owned(self.normalize_rar4_encrypted_compressed_data(
+                compressed.into_owned(),
                 &fh,
                 unpacked_size,
                 options.verify && !skip_hash_verify,
-            )?;
+            )?);
         }
 
         // Dispatch to decompressor.
@@ -587,16 +708,71 @@ impl RarArchive {
                     None
                 };
                 crate::extract::ExtractedMember::InMemory(crate::decompress::decompress(
-                    &compressed,
+                    compressed.as_ref(),
                     unpacked_size,
                     &fh.compression,
                     expected_crc,
                 )?)
             }
             _ => {
-                // For solid archives, we need to maintain decoder state across members.
-                let decompressed = if is_solid {
-                    self.decompress_solid(index, &compressed, unpacked_size, &fh)?
+                if is_solid {
+                    let expected_crc = if options.verify && !skip_hash_verify {
+                        fh.data_crc32
+                    } else {
+                        None
+                    };
+                    let expected_blake = if options.verify && !skip_hash_verify {
+                        match hash.as_ref() {
+                            Some(FileHash::Blake2sp(expected)) => Some(*expected),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+                    let mut output =
+                        crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
+
+                    let (actual_crc, actual_blake) = {
+                        let mut hash_writer = HashingWriter::new(
+                            &mut output,
+                            expected_crc.is_some(),
+                            expected_blake.is_some(),
+                        );
+                        self.advance_solid_cursor_to(index, &fh)?;
+                        self.run_solid_decoder_to_writer(
+                            compressed.as_ref(),
+                            unpacked_size,
+                            &fh,
+                            &mut hash_writer,
+                        )?;
+                        hash_writer.flush().map_err(RarError::Io)?;
+                        (
+                            expected_crc.map(|_| hash_writer.finalize_crc()),
+                            expected_blake.map(|_| hash_writer.finalize_blake2()),
+                        )
+                    };
+
+                    if let (Some(expected), Some(actual)) = (expected_crc, actual_crc)
+                        && actual != expected
+                    {
+                        return Err(RarError::DataCrcMismatch {
+                            member: fh.name.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+
+                    if let (Some(expected), Some(actual)) = (expected_blake, actual_blake)
+                        && actual != expected
+                    {
+                        return Err(RarError::Blake2Mismatch {
+                            member: fh.name.clone(),
+                        });
+                    }
+
+                    self.solid_next_index = index + 1;
+                    output.into_extracted()?
                 } else {
                     let mut decompressed =
                         Vec::with_capacity(unpacked_size.min(usize::MAX as u64) as usize);
@@ -606,9 +782,10 @@ impl RarArchive {
                         None
                     };
                     let actual_crc = {
-                        let mut crc_writer = CrcWriter::new(&mut decompressed, expected_crc.is_some());
+                        let mut crc_writer =
+                            CrcWriter::new(&mut decompressed, expected_crc.is_some());
                         crate::decompress::decompress_to_writer(
-                            &compressed,
+                            compressed.as_ref(),
                             unpacked_size,
                             &fh.compression,
                             None,
@@ -628,28 +805,8 @@ impl RarArchive {
                         });
                     }
 
-                    decompressed
-                };
-
-                // Verify CRC32 of decompressed data (skip if HASHMAC — CRC is HMAC-transformed).
-                if is_solid
-                    && options.verify
-                    && !skip_hash_verify
-                    && let Some(expected) = fh.data_crc32
-                {
-                    let mut hasher = crc32fast::Hasher::new();
-                    hasher.update(&decompressed);
-                    let actual = hasher.finalize();
-                    if actual != expected {
-                        return Err(RarError::DataCrcMismatch {
-                            member: fh.name.clone(),
-                            expected,
-                            actual,
-                        });
-                    }
+                    crate::extract::ExtractedMember::InMemory(decompressed)
                 }
-
-                crate::extract::ExtractedMember::InMemory(decompressed)
             }
         };
 
@@ -883,12 +1040,8 @@ impl RarArchive {
             };
 
             let segments = self.members[index].segments.clone();
-            let base_reader = ArchiveSegmentReader::new(
-                &mut self.volumes,
-                &self.limits,
-                &segments,
-                &fh.name,
-            );
+            let base_reader =
+                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
 
             let do_crc = expected_crc.is_some();
             let actual_crc = {
@@ -933,7 +1086,15 @@ impl RarArchive {
 
         // Slow path: encrypted or compressed — need compressed data in memory,
         // but stream decompressed output to disk.
-        let mut compressed = self.read_member_data(index)?;
+        let solid_compressed = if is_solid {
+            Some(self.read_member_data_buffered(index)?)
+        } else {
+            None
+        };
+        let mut compressed = match solid_compressed.as_ref() {
+            Some(data) => Cow::Borrowed(data.as_slice()),
+            None => Cow::Owned(self.read_member_data(index)?),
+        };
 
         // Decrypt if needed.
         if let Some(ref pwd) = member_password {
@@ -944,31 +1105,21 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    None,
+                    Some(salt),
+                    pwd,
+                )?);
             } else {
-                let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "member {} is marked encrypted but has no encryption parameters",
-                        fh.name
-                    ),
-                })?;
-                if let Some(ref check_data) = enc_info.check_data
-                    && !self.kdf_cache.verify_password_rar5(
-                        pwd,
-                        &enc_info.salt,
-                        enc_info.kdf_count,
-                        check_data,
-                    )
-                {
-                    return Err(RarError::WrongPassword {
-                        member: fh.name.clone(),
-                    });
-                }
-                let key = self
-                    .kdf_cache
-                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    file_enc.as_ref(),
+                    None,
+                    pwd,
+                )?);
             }
         }
 
@@ -977,53 +1128,79 @@ impl RarArchive {
             && fh.compression.method == CompressionMethod::Store
             && compressed.len() as u64 > unpacked_size
         {
-            compressed.truncate(unpacked_size as usize);
+            let mut owned = compressed.into_owned();
+            owned.truncate(unpacked_size as usize);
+            compressed = Cow::Owned(owned);
         } else if member_password.is_some() {
-            compressed = self.normalize_rar4_encrypted_compressed_data(
-                compressed,
+            compressed = Cow::Owned(self.normalize_rar4_encrypted_compressed_data(
+                compressed.into_owned(),
                 &fh,
                 unpacked_size,
                 options.verify && !skip_hash_verify,
-            )?;
+            )?);
         }
 
         // Use streaming decompression for non-solid, or fall back to buffered for solid.
         if is_solid {
-            // Solid archives need the full Vec path since the decoder state persists.
-            let decompressed = self.decompress_solid(index, &compressed, unpacked_size, &fh)?;
-            if options.verify
-                && !skip_hash_verify
-                && let Some(expected) = fh.data_crc32
-            {
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&decompressed);
-                let actual = hasher.finalize();
-                if actual != expected {
-                    return Err(RarError::DataCrcMismatch {
-                        member: fh.name.clone(),
-                        expected,
-                        actual,
-                    });
+            let expected_crc = if options.verify && !skip_hash_verify {
+                fh.data_crc32
+            } else {
+                None
+            };
+            let expected_blake = if options.verify && !skip_hash_verify {
+                match hash.as_ref() {
+                    Some(FileHash::Blake2sp(expected)) => Some(*expected),
+                    _ => None,
                 }
-            }
-            writer.write_all(&decompressed).map_err(RarError::Io)?;
-            writer.flush().map_err(RarError::Io)?;
+            } else {
+                None
+            };
 
-            if options.verify
-                && !skip_hash_verify
-                && let Some(FileHash::Blake2sp(expected)) = hash.as_ref()
-                && !extract::verify_blake2(&decompressed, expected)
-            {
-                return Err(RarError::Blake2Mismatch {
-                    member: fh.name.clone(),
-                });
-            }
+            let written = {
+                let mut hash_writer = HashingWriter::new(
+                    &mut writer,
+                    expected_crc.is_some(),
+                    expected_blake.is_some(),
+                );
+                self.advance_solid_cursor_to(index, &fh)?;
+                let written = self.run_solid_decoder_to_writer(
+                    compressed.as_ref(),
+                    unpacked_size,
+                    &fh,
+                    &mut hash_writer,
+                )?;
+                hash_writer.flush().map_err(RarError::Io)?;
+
+                if let Some(expected) = expected_crc {
+                    let actual = hash_writer.finalize_crc();
+                    if actual != expected {
+                        return Err(RarError::DataCrcMismatch {
+                            member: fh.name.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+
+                if let Some(expected) = expected_blake {
+                    let actual = hash_writer.finalize_blake2();
+                    if actual != expected {
+                        return Err(RarError::Blake2Mismatch {
+                            member: fh.name.clone(),
+                        });
+                    }
+                }
+
+                written
+            };
+
+            self.solid_next_index = index + 1;
 
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, decompressed.len() as u64);
+                p.on_member_progress(mi, written);
                 p.on_member_complete(mi, &Ok(()));
             }
-            return Ok(decompressed.len() as u64);
+            return Ok(written);
         }
 
         // Non-solid: stream decompressed output to writer.
@@ -1033,7 +1210,7 @@ impl RarArchive {
         let expected_crc = if do_crc { fh.data_crc32 } else { None };
 
         crate::decompress::decompress_to_writer(
-            &compressed,
+            compressed.as_ref(),
             unpacked_size,
             &fh.compression,
             expected_crc,
@@ -1116,7 +1293,8 @@ impl RarArchive {
         }
 
         let segments = self.members[index].segments.clone();
-        let mut compressed = self.read_member_data(index)?;
+        let compressed_buffer = self.read_member_data_buffered(index)?;
+        let mut compressed = Cow::Borrowed(compressed_buffer.as_slice());
 
         if let Some(ref pwd) = member_password {
             if archive_format == ArchiveFormat::Rar4 {
@@ -1126,31 +1304,21 @@ impl RarArchive {
                         fh.name
                     ),
                 })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                compressed = crate::crypto::rar4_decrypt_data(&key, &iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    None,
+                    Some(salt),
+                    pwd,
+                )?);
             } else {
-                let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "member {} is marked encrypted but has no encryption parameters",
-                        fh.name
-                    ),
-                })?;
-                if let Some(ref check_data) = enc_info.check_data
-                    && !self.kdf_cache.verify_password_rar5(
-                        pwd,
-                        &enc_info.salt,
-                        enc_info.kdf_count,
-                        check_data,
-                    )
-                {
-                    return Err(RarError::WrongPassword {
-                        member: fh.name.clone(),
-                    });
-                }
-                let key = self
-                    .kdf_cache
-                    .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                compressed = crate::crypto::decrypt_data(&key, &enc_info.iv, &compressed)?;
+                compressed = Cow::Owned(self.decrypt_member_data(
+                    compressed.as_ref(),
+                    &fh,
+                    file_enc.as_ref(),
+                    None,
+                    pwd,
+                )?);
             }
         }
 
@@ -1158,19 +1326,21 @@ impl RarArchive {
             && fh.compression.method == CompressionMethod::Store
             && compressed.len() as u64 > unpacked_size
         {
-            compressed.truncate(unpacked_size as usize);
+            let mut owned = compressed.into_owned();
+            owned.truncate(unpacked_size as usize);
+            compressed = Cow::Owned(owned);
         } else if member_password.is_some() {
-            compressed = self.normalize_rar4_encrypted_compressed_data(
-                compressed,
+            compressed = Cow::Owned(self.normalize_rar4_encrypted_compressed_data(
+                compressed.into_owned(),
                 &fh,
                 unpacked_size,
                 options.verify && !skip_hash_verify,
-            )?;
+            )?);
         }
 
         self.decompress_solid_chunked(
             index,
-            &compressed,
+            compressed.as_ref(),
             unpacked_size,
             &fh,
             &segments,
@@ -1178,26 +1348,6 @@ impl RarArchive {
             writer_factory,
             skip_hash_verify,
         )
-    }
-
-    /// Decompress a member in a solid archive, maintaining LZ decoder state
-    /// across sequential members.
-    ///
-    /// In a solid archive, the LZ dictionary carries over between files.
-    /// Members MUST be extracted in order — you cannot skip to file N without
-    /// first decoding files 0..N-1.
-    pub(super) fn decompress_solid(
-        &mut self,
-        index: usize,
-        compressed: &[u8],
-        unpacked_size: u64,
-        fh: &FileHeader,
-    ) -> RarResult<Vec<u8>> {
-        self.advance_solid_cursor_to(index, fh)?;
-
-        let result = self.run_solid_decoder(compressed, unpacked_size, fh)?;
-        self.solid_next_index = index + 1;
-        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1245,52 +1395,6 @@ impl RarArchive {
         Ok(result)
     }
 
-    /// Run the solid LZ decoder (creating it on first use).
-    ///
-    /// On subsequent calls, prepares for solid continuation (keeps the
-    /// sliding window / dictionary state but resets the bitstream block flag).
-    /// Dispatches to the correct decoder based on archive format.
-    pub(super) fn run_solid_decoder(
-        &mut self,
-        compressed: &[u8],
-        unpacked_size: u64,
-        fh: &FileHeader,
-    ) -> RarResult<Vec<u8>> {
-        let dict_size = fh.compression.dict_size;
-
-        // Enforce dictionary size limit (same as non-solid path).
-        if dict_size > self.limits.max_dict_size {
-            return Err(RarError::DictionaryTooLarge {
-                size: dict_size,
-                max: self.limits.max_dict_size,
-            });
-        }
-
-        let dict_size = dict_size as usize;
-
-        if fh.compression.format == ArchiveFormat::Rar4 {
-            if let Some(decoder) = &mut self.solid_decoder_rar4 {
-                decoder.prepare_solid_continuation();
-            } else {
-                self.solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
-            }
-            self.solid_decoder_rar4
-                .as_mut()
-                .unwrap()
-                .decompress(compressed, unpacked_size)
-        } else {
-            if let Some(decoder) = &mut self.solid_decoder {
-                decoder.prepare_solid_continuation();
-            } else {
-                self.solid_decoder = Some(LzDecoder::new(dict_size));
-            }
-            self.solid_decoder
-                .as_mut()
-                .unwrap()
-                .decompress(compressed, unpacked_size)
-        }
-    }
-
     pub(super) fn run_solid_decoder_to_writer<W: Write>(
         &mut self,
         compressed: &[u8],
@@ -1325,10 +1429,11 @@ impl RarArchive {
             } else {
                 self.solid_decoder = Some(LzDecoder::new(dict_size));
             }
-            self.solid_decoder
-                .as_mut()
-                .unwrap()
-                .decompress_to_writer(compressed, unpacked_size, writer)
+            self.solid_decoder.as_mut().unwrap().decompress_to_writer(
+                compressed,
+                unpacked_size,
+                writer,
+            )
         }
     }
 
@@ -2263,6 +2368,57 @@ impl RarArchive {
         }
 
         Ok(chunks)
+    }
+}
+
+/// Writer wrapper that updates a shared CRC hasher.
+struct HashingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    crc: Option<crc32fast::Hasher>,
+    blake2: Option<Blake2s256>,
+}
+
+impl<'a, W: Write> HashingWriter<'a, W> {
+    fn new(inner: &'a mut W, compute_crc: bool, compute_blake2: bool) -> Self {
+        Self {
+            inner,
+            crc: compute_crc.then(crc32fast::Hasher::new),
+            blake2: compute_blake2.then(Blake2s256::new),
+        }
+    }
+
+    fn finalize_crc(&self) -> u32 {
+        self.crc
+            .as_ref()
+            .map(|hasher| hasher.clone().finalize())
+            .unwrap_or(0)
+    }
+
+    fn finalize_blake2(&self) -> [u8; 32] {
+        self.blake2
+            .as_ref()
+            .map(|hasher| {
+                let digest: [u8; 32] = hasher.clone().finalize().into();
+                digest
+            })
+            .unwrap_or([0; 32])
+    }
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(ref mut hasher) = self.crc {
+            hasher.update(&buf[..written]);
+        }
+        if let Some(ref mut hasher) = self.blake2 {
+            hasher.update(&buf[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 

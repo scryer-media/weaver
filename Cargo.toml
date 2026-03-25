@@ -64,6 +64,7 @@ socket2 = { version = "0.5", features = ["all"] }
 memchr = "2"
 rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = "3"
+memmap2 = "0.9"
 zstd = "0.13"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 sevenz-rust2 = { version = "0.20", features = ["aes256", "bzip2", "deflate"] }
