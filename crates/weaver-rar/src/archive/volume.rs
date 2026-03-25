@@ -101,7 +101,7 @@ impl RarArchive {
         index: usize,
         mut reader: Box<dyn ReadSeek>,
     ) -> RarResult<()> {
-        let parsed = crate::rar4::parse_rar4_headers(&mut reader)?;
+        let parsed = crate::rar4::parse_rar4_headers(&mut reader, self.password.as_deref())?;
 
         // Use volume number from ENDARC header if available, otherwise fall back to index.
         let vol_num = parsed

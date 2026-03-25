@@ -830,6 +830,7 @@ async fn detect_server_capabilities(config: &mut Config, db: &Database) {
             tls: server.tls,
             username: server.username.clone(),
             password: server.password.clone(),
+            tls_ca_cert: server.tls_ca_cert.clone(),
             ..Default::default()
         };
 
@@ -908,6 +909,7 @@ pub fn build_nntp_client(
                 tls: s.tls,
                 username: s.username.clone(),
                 password: s.password.clone(),
+                tls_ca_cert: s.tls_ca_cert.clone(),
                 buffer_profile,
                 ..Default::default()
             },

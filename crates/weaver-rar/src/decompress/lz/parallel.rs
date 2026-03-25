@@ -13,13 +13,16 @@ use rayon::prelude::*;
 use super::bitstream::BitReader;
 use super::filter::{FilterType, PendingFilter};
 use super::huffman::{self, HuffmanTable};
-use super::window::Window;
 use super::{LzDecoder, NUM_LENGTH_SLOTS};
 use crate::error::{RarError, RarResult};
 
 /// Minimum number of blocks to justify parallel dispatch.
 /// Below this, rayon overhead exceeds the benefit.
 const MIN_PARALLEL_BLOCKS: usize = 4;
+
+/// Number of blocks to queue per worker in the parallel RAR5 path.
+/// Matches unrar's `UNP_BLOCKS_PER_THREAD` batching strategy.
+const BLOCKS_PER_THREAD: usize = 2;
 
 /// Maximum compressed block size (in bits) for parallel decode.
 /// Blocks exceeding this fall back to single-threaded inline decode.
@@ -386,102 +389,10 @@ fn adjust_length_for_distance(length: usize, distance: usize) -> usize {
 
 // ─── Phase 3: Sequential item application ────────────────────────────────────
 
-/// Apply decoded items sequentially to the decoder's window.
-///
-/// Updates dist_cache, last_length, pending_filters — all sequential state.
-fn apply_decoded_items(
-    window: &mut Window,
-    dist_cache: &mut [usize; 4],
-    last_length: &mut usize,
-    pending_filters: &mut Vec<PendingFilter>,
-    all_items: &[Vec<DecodedItem>],
-    unpacked_size: u64,
-    output_size: &mut u64,
-) -> RarResult<()> {
-    for block_items in all_items {
-        for item in block_items {
-            if *output_size >= unpacked_size {
-                return Ok(());
-            }
-
-            match *item {
-                DecodedItem::Literals { bytes, count } => {
-                    let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
-                    for b in &bytes[..n] {
-                        window.put_byte(*b);
-                    }
-                    *output_size += n as u64;
-                }
-                DecodedItem::Match { length, distance } => {
-                    let remaining = (unpacked_size - *output_size) as usize;
-                    let len = (length as usize).min(remaining);
-
-                    dist_cache[3] = dist_cache[2];
-                    dist_cache[2] = dist_cache[1];
-                    dist_cache[1] = dist_cache[0];
-                    dist_cache[0] = distance as usize;
-
-                    *last_length = length as usize;
-                    window.copy(distance as usize, len)?;
-                    *output_size += len as u64;
-                }
-                DecodedItem::RepeatPrev => {
-                    if *last_length != 0 {
-                        let distance = dist_cache[0];
-                        let remaining = (unpacked_size - *output_size) as usize;
-                        let len = (*last_length).min(remaining);
-                        window.copy(distance, len)?;
-                        *output_size += len as u64;
-                    }
-                }
-                DecodedItem::CacheRef { cache_idx, length } => {
-                    let idx = cache_idx as usize;
-                    let distance = dist_cache[idx];
-                    if distance == 0 {
-                        return Err(RarError::CorruptArchive {
-                            detail: "distance cache entry is zero".into(),
-                        });
-                    }
-
-                    if idx > 0 {
-                        let dist = dist_cache[idx];
-                        for i in (1..=idx).rev() {
-                            dist_cache[i] = dist_cache[i - 1];
-                        }
-                        dist_cache[0] = dist;
-                    }
-
-                    let remaining = (unpacked_size - *output_size) as usize;
-                    let len = (length as usize).min(remaining);
-                    *last_length = length as usize;
-                    window.copy(distance, len)?;
-                    *output_size += len as u64;
-                }
-                DecodedItem::Filter {
-                    filter_type,
-                    block_start_delta,
-                    block_length,
-                    channels,
-                } => {
-                    let ft = FilterType::from_code(filter_type)
-                        .ok_or(RarError::UnsupportedFilter { filter_type })?;
-                    pending_filters.push(PendingFilter {
-                        filter_type: ft,
-                        block_start: *output_size + block_start_delta,
-                        block_length: block_length as usize,
-                        channels,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 // ─── Phase 4: Parallel dispatch ──────────────────────────────────────────────
 
-/// Decode all (non-large) blocks in parallel using rayon.
-fn parallel_decode(
+/// Decode a batch of (non-large) blocks in parallel using rayon.
+fn parallel_decode_batch(
     input: &[u8],
     blocks: &[BlockInfo],
     table_sets: &[TableSet],
@@ -500,6 +411,111 @@ fn parallel_decode(
 // ─── Public entry point ──────────────────────────────────────────────────────
 
 impl LzDecoder {
+    fn apply_decoded_items_parallel<W: std::io::Write>(
+        &mut self,
+        all_items: &[Vec<DecodedItem>],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let flush_threshold = (self.window.dict_size() / 2).max(1);
+
+        for block_items in all_items {
+            for item in block_items {
+                if *output_size >= unpacked_size {
+                    return Ok(());
+                }
+
+                match *item {
+                    DecodedItem::Literals { bytes, count } => {
+                        let n =
+                            (count as usize + 1).min((unpacked_size - *output_size) as usize);
+                        for b in &bytes[..n] {
+                            self.window.put_byte(*b);
+                        }
+                        *output_size += n as u64;
+                    }
+                    DecodedItem::Match { length, distance } => {
+                        let remaining = (unpacked_size - *output_size) as usize;
+                        let len = (length as usize).min(remaining);
+
+                        self.dist_cache[3] = self.dist_cache[2];
+                        self.dist_cache[2] = self.dist_cache[1];
+                        self.dist_cache[1] = self.dist_cache[0];
+                        self.dist_cache[0] = distance as usize;
+
+                        self.last_length = length as usize;
+                        self.window.copy(distance as usize, len)?;
+                        *output_size += len as u64;
+                    }
+                    DecodedItem::RepeatPrev => {
+                        if self.last_length != 0 {
+                            let distance = self.dist_cache[0];
+                            let remaining = (unpacked_size - *output_size) as usize;
+                            let len = self.last_length.min(remaining);
+                            self.window.copy(distance, len)?;
+                            *output_size += len as u64;
+                        }
+                    }
+                    DecodedItem::CacheRef { cache_idx, length } => {
+                        let idx = cache_idx as usize;
+                        let distance = self.dist_cache[idx];
+                        if distance == 0 {
+                            return Err(RarError::CorruptArchive {
+                                detail: "distance cache entry is zero".into(),
+                            });
+                        }
+
+                        if idx > 0 {
+                            let dist = self.dist_cache[idx];
+                            for i in (1..=idx).rev() {
+                                self.dist_cache[i] = self.dist_cache[i - 1];
+                            }
+                            self.dist_cache[0] = dist;
+                        }
+
+                        let remaining = (unpacked_size - *output_size) as usize;
+                        let len = (length as usize).min(remaining);
+                        self.last_length = length as usize;
+                        self.window.copy(distance, len)?;
+                        *output_size += len as u64;
+                    }
+                    DecodedItem::Filter {
+                        filter_type,
+                        block_start_delta,
+                        block_length,
+                        channels,
+                    } => {
+                        let ft = FilterType::from_code(filter_type)
+                            .ok_or(RarError::UnsupportedFilter { filter_type })?;
+                        self.pending_filters.push(PendingFilter {
+                            filter_type: ft,
+                            block_start: *output_size + block_start_delta,
+                            block_length: block_length as usize,
+                            channels,
+                        });
+                    }
+                }
+
+                if self.pending_filters.is_empty() {
+                    if self.window.unflushed_bytes() as usize >= flush_threshold {
+                        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                    }
+                } else {
+                    self.flush_filters_and_write(writer)?;
+                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                        return Err(RarError::CorruptArchive {
+                            detail: "RAR5 pending filters exceeded dictionary window before flush"
+                                .into(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Attempt parallel decompression. Returns `None` if the input has too few
     /// blocks to benefit (caller should fall back to single-threaded).
     pub(super) fn try_decompress_parallel<W: std::io::Write>(
@@ -539,21 +555,21 @@ impl LzDecoder {
             return Ok(None);
         }
 
-        // Phase 2: parallel Huffman decode.
-        let all_items = parallel_decode(input, &blocks, &table_sets)?;
+        let batch_size = (rayon::current_num_threads() * BLOCKS_PER_THREAD)
+            .max(MIN_PARALLEL_BLOCKS)
+            .min(blocks.len());
 
-        // Phase 3: sequential application.
+        // Phase 2 + 3: decode a bounded batch in parallel, then apply it
+        // incrementally before moving to the next batch. This keeps peak
+        // memory bounded by a few blocks instead of the entire file.
         let mut output_size = 0u64;
-
-        apply_decoded_items(
-            &mut self.window,
-            &mut self.dist_cache,
-            &mut self.last_length,
-            &mut self.pending_filters,
-            &all_items,
-            unpacked_size,
-            &mut output_size,
-        )?;
+        for block_batch in blocks.chunks(batch_size) {
+            let all_items = parallel_decode_batch(input, block_batch, &table_sets)?;
+            self.apply_decoded_items_parallel(&all_items, unpacked_size, &mut output_size, writer)?;
+            if output_size >= unpacked_size {
+                break;
+            }
+        }
 
         // Update decoder state for solid archive continuity.
         if let Some(last_ts) = table_sets.last() {

@@ -50,10 +50,12 @@ pub fn decompress(
         | CompressionMethod::Fast
         | CompressionMethod::Normal
         | CompressionMethod::Good
-        | CompressionMethod::Best => match info.format {
-            ArchiveFormat::Rar4 => rar4::decompress_rar4_lz(input, unpacked_size, info.dict_size),
-            ArchiveFormat::Rar5 => lz::decompress_lz(input, unpacked_size, info),
-        },
+        | CompressionMethod::Best => {
+            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let mut output = Vec::with_capacity(capacity);
+            decompress_to_writer(input, unpacked_size, info, expected_crc, &mut output)?;
+            Ok(output)
+        }
         CompressionMethod::Unknown(code) => Err(RarError::UnsupportedCompression {
             method: code,
             version: info.version,

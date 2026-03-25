@@ -275,6 +275,7 @@ impl MutationRoot {
             active: input.active,
             supports_pipelining: false,
             priority: input.priority as u32,
+            tls_ca_cert: input.tls_ca_cert.map(std::path::PathBuf::from),
         };
 
         {
@@ -331,6 +332,7 @@ impl MutationRoot {
             s.connections = input.connections;
             s.active = input.active;
             s.priority = input.priority as u32;
+            s.tls_ca_cert = input.tls_ca_cert.map(std::path::PathBuf::from);
 
             let server = s.clone();
             let db = db.clone();
@@ -390,6 +392,7 @@ impl MutationRoot {
             tls: input.tls,
             username: input.username,
             password: input.password,
+            tls_ca_cert: input.tls_ca_cert.map(std::path::PathBuf::from),
             ..Default::default()
         };
 

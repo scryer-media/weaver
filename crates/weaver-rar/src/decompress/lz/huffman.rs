@@ -33,6 +33,12 @@ const MAX_CODE_LENGTH: usize = 15;
 /// Maximum quick decode bits (matches unrar MAX_QUICK_DECODE_BITS = 9).
 const MAX_QUICK_BITS: u8 = 9;
 
+/// Maximum number of symbols across supported Huffman tables.
+const MAX_NUM_SYMBOLS: usize = HUFF_NC;
+
+/// Maximum quick decode table size.
+const MAX_QUICK_ENTRIES: usize = 1 << MAX_QUICK_BITS;
+
 /// A Huffman decoding table using unrar's sorted-threshold scheme.
 #[derive(Clone)]
 ///
@@ -50,13 +56,13 @@ pub struct HuffmanTable {
     decode_pos: [u32; 16],
 
     /// Maps position in code list to alphabet symbol.
-    decode_num: Vec<u16>,
+    decode_num: [u16; MAX_NUM_SYMBOLS],
 
     /// Quick lookup: bit length for each quick-decodable prefix.
-    quick_len: Vec<u8>,
+    quick_len: [u8; MAX_QUICK_ENTRIES],
 
     /// Quick lookup: alphabet symbol for each quick-decodable prefix.
-    quick_num: Vec<u16>,
+    quick_num: [u16; MAX_QUICK_ENTRIES],
 
     /// Number of bits used for quick decode (6 for small tables, 9 for NC).
     quick_bits: u8,
@@ -66,6 +72,9 @@ pub struct HuffmanTable {
 
     /// Number of symbols in this table.
     num_symbols: usize,
+
+    /// Number of populated quick entries.
+    quick_data_size: usize,
 }
 
 impl HuffmanTable {
@@ -77,6 +86,16 @@ impl HuffmanTable {
     /// Matches unrar's `MakeDecodeTables`.
     pub fn build(bit_lengths: &[u8]) -> RarResult<Self> {
         let num_symbols = bit_lengths.len();
+        if num_symbols > MAX_NUM_SYMBOLS {
+            return Err(RarError::InvalidHuffmanTable);
+        }
+
+        let quick_bits = match num_symbols {
+            306 | 299 | 298 => MAX_QUICK_BITS, // NC, NC30, NC20
+            _ if MAX_QUICK_BITS > 3 => MAX_QUICK_BITS - 3,
+            _ => 0,
+        };
+        let quick_data_size = 1usize << quick_bits;
 
         // Count codes of each length.
         let mut length_count = [0u32; 16];
@@ -96,20 +115,16 @@ impl HuffmanTable {
 
         // If no symbols have nonzero length, build an empty table.
         if max_length == 0 {
-            let quick_bits = if num_symbols >= HUFF_NC {
-                MAX_QUICK_BITS
-            } else {
-                MAX_QUICK_BITS.saturating_sub(3)
-            };
             return Ok(Self {
                 decode_len: [0; 16],
                 decode_pos: [0; 16],
-                decode_num: vec![0; num_symbols],
-                quick_len: vec![0; 1 << quick_bits],
-                quick_num: vec![0; 1 << quick_bits],
+                decode_num: [0; MAX_NUM_SYMBOLS],
+                quick_len: [0; MAX_QUICK_ENTRIES],
+                quick_num: [0; MAX_QUICK_ENTRIES],
                 quick_bits,
                 max_length: 0,
                 num_symbols,
+                quick_data_size,
             });
         }
 
@@ -127,7 +142,7 @@ impl HuffmanTable {
         }
 
         // Build decode_num: maps position in code list → alphabet symbol.
-        let mut decode_num = vec![0u16; num_symbols];
+        let mut decode_num = [0u16; MAX_NUM_SYMBOLS];
         let mut copy_pos = decode_pos;
         for (sym, &bl) in bit_lengths.iter().enumerate() {
             let bl = bl & 0xF;
@@ -140,18 +155,8 @@ impl HuffmanTable {
             }
         }
 
-        // Choose quick bits based on table size (matching unrar's MakeDecodeTables).
-        // unrar: NC(306), NC30(299), NC20(298) all get MAX_QUICK_DECODE_BITS (9).
-        // All smaller tables get MAX_QUICK_DECODE_BITS - 3 (6).
-        let quick_bits = match num_symbols {
-            306 | 299 | 298 => MAX_QUICK_BITS, // NC, NC30, NC20
-            _ if MAX_QUICK_BITS > 3 => MAX_QUICK_BITS - 3,
-            _ => 0,
-        };
-
-        let quick_data_size = 1usize << quick_bits;
-        let mut quick_len_table = vec![0u8; quick_data_size];
-        let mut quick_num_table = vec![0u16; quick_data_size];
+        let mut quick_len_table = [0u8; MAX_QUICK_ENTRIES];
+        let mut quick_num_table = [0u16; MAX_QUICK_ENTRIES];
 
         // Build quick decode tables.
         let mut cur_bit_length: usize = 1;
@@ -185,6 +190,7 @@ impl HuffmanTable {
             quick_bits,
             max_length,
             num_symbols,
+            quick_data_size,
         })
     }
 
@@ -205,22 +211,16 @@ impl HuffmanTable {
             });
         }
 
-        // Peek 16 left-aligned bits (or fewer if near end of stream).
-        let peek_count = 16.min(bits_avail) as u8;
-        let raw = reader.peek_bits(peek_count)?;
-        // Left-align to 16 bits and mask off LSB (matching unrar's & 0xfffe).
-        let bit_field = if peek_count < 16 {
-            (raw << (16 - peek_count)) & 0xfffe
-        } else {
-            raw & 0xfffe
-        };
+        // Peek 16 left-aligned bits (or fewer if near end of stream), matching
+        // unrar's `getbits() & 0xfffe` hot path.
+        let bit_field = reader.peek_16_left_aligned()?;
 
         // Quick path: if bit_field is below the threshold for quick_bits length.
         if bit_field < self.decode_len[self.quick_bits as usize] {
             let code = (bit_field >> (16 - self.quick_bits)) as usize;
-            let len = self.quick_len[code];
+            let len = self.quick_len[code.min(self.quick_data_size.saturating_sub(1))];
             if len as usize <= bits_avail {
-                reader.skip_bits(len as u32)?;
+                reader.consume_bits(len)?;
                 return Ok(self.quick_num[code]);
             }
         }
@@ -240,7 +240,7 @@ impl HuffmanTable {
             });
         }
 
-        reader.skip_bits(bits as u32)?;
+        reader.consume_bits(bits as u8)?;
 
         // Calculate position in decode_num.
         let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);

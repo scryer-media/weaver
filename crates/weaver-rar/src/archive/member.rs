@@ -12,6 +12,68 @@ use crate::volume::VolumeProvider;
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 impl RarArchive {
+    fn normalize_rar4_encrypted_compressed_data(
+        &self,
+        mut compressed: Vec<u8>,
+        fh: &FileHeader,
+        unpacked_size: u64,
+        verify_crc: bool,
+    ) -> RarResult<Vec<u8>> {
+        if self.format != ArchiveFormat::Rar4
+            || fh.compression.method == CompressionMethod::Store
+            || !fh.is_encrypted
+            || fh.compression.solid
+            || compressed.is_empty()
+        {
+            return Ok(compressed);
+        }
+
+        let max_trim = compressed.len().min(15);
+        let expected_crc = verify_crc.then_some(fh.data_crc32).flatten();
+
+        for trim in 0..=max_trim {
+            let candidate_len = compressed.len() - trim;
+            let candidate = &compressed[..candidate_len];
+            let mut sink = std::io::sink();
+            let mut crc_writer = CrcWriter::new(&mut sink, expected_crc.is_some());
+
+            if crate::decompress::decompress_to_writer(
+                candidate,
+                unpacked_size,
+                &fh.compression,
+                None,
+                &mut crc_writer,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            crc_writer.flush().map_err(RarError::Io)?;
+
+            if let Some(expected) = expected_crc
+                && crc_writer.finalize_crc() != expected
+            {
+                continue;
+            }
+
+            if trim > 0 {
+                debug!(
+                    member = %fh.name,
+                    trim,
+                    decrypted_len = compressed.len(),
+                    normalized_len = candidate_len,
+                    "trimmed trailing RAR4 encrypted padding before decompression"
+                );
+                compressed.truncate(candidate_len);
+            }
+
+            return Ok(compressed);
+        }
+
+        Ok(compressed)
+    }
+
     fn compressed_capacity_hint(segments: &[DataSegment]) -> usize {
         segments
             .iter()
@@ -289,6 +351,13 @@ impl RarArchive {
             && compressed.len() as u64 > unpacked_size
         {
             compressed.truncate(unpacked_size as usize);
+        } else if member_password.is_some() {
+            compressed = self.normalize_rar4_encrypted_compressed_data(
+                compressed,
+                &fh,
+                unpacked_size,
+                options.verify && !skip_hash_verify,
+            )?;
         }
 
         // Dispatch to decompressor.
@@ -311,16 +380,42 @@ impl RarArchive {
                 let decompressed = if is_solid {
                     self.decompress_solid(index, &compressed, unpacked_size, &fh)?
                 } else {
-                    crate::decompress::decompress(
-                        &compressed,
-                        unpacked_size,
-                        &fh.compression,
-                        None,
-                    )?
+                    let mut decompressed =
+                        Vec::with_capacity(unpacked_size.min(usize::MAX as u64) as usize);
+                    let expected_crc = if options.verify && !skip_hash_verify {
+                        fh.data_crc32
+                    } else {
+                        None
+                    };
+                    let actual_crc = {
+                        let mut crc_writer = CrcWriter::new(&mut decompressed, expected_crc.is_some());
+                        crate::decompress::decompress_to_writer(
+                            &compressed,
+                            unpacked_size,
+                            &fh.compression,
+                            None,
+                            &mut crc_writer,
+                        )?;
+                        crc_writer.flush().map_err(RarError::Io)?;
+                        expected_crc.map(|_| crc_writer.finalize_crc())
+                    };
+
+                    if let (Some(expected), Some(actual)) = (expected_crc, actual_crc)
+                        && actual != expected
+                    {
+                        return Err(RarError::DataCrcMismatch {
+                            member: fh.name.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+
+                    decompressed
                 };
 
                 // Verify CRC32 of decompressed data (skip if HASHMAC — CRC is HMAC-transformed).
-                if options.verify
+                if is_solid
+                    && options.verify
                     && !skip_hash_verify
                     && let Some(expected) = fh.data_crc32
                 {
@@ -578,6 +673,13 @@ impl RarArchive {
             && compressed.len() as u64 > unpacked_size
         {
             compressed.truncate(unpacked_size as usize);
+        } else if member_password.is_some() {
+            compressed = self.normalize_rar4_encrypted_compressed_data(
+                compressed,
+                &fh,
+                unpacked_size,
+                options.verify && !skip_hash_verify,
+            )?;
         }
 
         // Use streaming decompression for non-solid, or fall back to buffered for solid.
@@ -752,6 +854,13 @@ impl RarArchive {
             && compressed.len() as u64 > unpacked_size
         {
             compressed.truncate(unpacked_size as usize);
+        } else if member_password.is_some() {
+            compressed = self.normalize_rar4_encrypted_compressed_data(
+                compressed,
+                &fh,
+                unpacked_size,
+                options.verify && !skip_hash_verify,
+            )?;
         }
 
         self.decompress_solid_chunked(
@@ -1329,6 +1438,15 @@ impl RarArchive {
             RarError::Io(e)
         })?;
 
+        if password.is_some() {
+            compressed = self.normalize_rar4_encrypted_compressed_data(
+                compressed,
+                fh,
+                unpacked_size,
+                options.verify && !skip_hash_verify,
+            )?;
+        }
+
         debug!(
             compressed_bytes = compressed.len(),
             "streaming LZ: all compressed data read"
@@ -1709,6 +1827,15 @@ impl RarArchive {
         let mut compressed = Vec::with_capacity(Self::compressed_capacity_hint(segments));
         std::io::Read::read_to_end(&mut tracking_reader, &mut compressed).map_err(RarError::Io)?;
 
+        if password.is_some() {
+            compressed = self.normalize_rar4_encrypted_compressed_data(
+                compressed,
+                fh,
+                unpacked_size,
+                options.verify && !skip_hash_verify,
+            )?;
+        }
+
         let transitions = tracking_reader.into_transitions();
 
         debug!(
@@ -1924,7 +2051,7 @@ impl<'a> ChainedSegmentReader<'a> {
 
         if format == ArchiveFormat::Rar4 {
             // RAR4: parse headers to find the continuation file entry.
-            let parsed = crate::rar4::parse_rar4_headers(&mut reader)
+            let parsed = crate::rar4::parse_rar4_headers(&mut reader, self.password.as_deref())
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {

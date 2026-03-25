@@ -258,14 +258,14 @@ impl LzDecoder {
             }
 
             let sym = self.nc_table.as_ref().unwrap().decode(reader)? as u32;
+            let mut should_check_yield = false;
 
             if sym < 256 {
                 // Literal byte (most common case — first).
                 self.window.put_byte(sym as u8);
                 output_size += 1;
-                continue;
-            }
-            if sym >= 262 {
+                should_check_yield = true;
+            } else if sym >= 262 {
                 // Inline length-distance pair (second most common).
                 let length_idx = (sym - 262) as usize;
                 let mut length = Self::slot_to_length(reader, length_idx)?;
@@ -285,14 +285,11 @@ impl LzDecoder {
                 self.last_length = length;
                 self.window.copy(distance, length)?;
                 output_size += length as u64;
-                continue;
-            }
-            if sym == 256 {
+                should_check_yield = true;
+            } else if sym == 256 {
                 // Filter marker.
                 output_size = self.handle_filter(reader, output_size)?;
-                continue;
-            }
-            if sym == 257 {
+            } else if sym == 257 {
                 // Repeat previous match.
                 if self.last_length != 0 {
                     let distance = self.dist_cache[0];
@@ -301,11 +298,10 @@ impl LzDecoder {
                     length = length.min(remaining);
                     self.window.copy(distance, length)?;
                     output_size += length as u64;
+                    should_check_yield = true;
                 }
-                continue;
-            }
-            // sym 258..=261: repeat distance from cache.
-            {
+            } else {
+                // sym 258..=261: repeat distance from cache.
                 let cache_idx = (sym - 258) as usize;
                 let distance = self.dist_cache[cache_idx];
                 if distance == 0 {
@@ -331,9 +327,11 @@ impl LzDecoder {
                 self.last_length = length;
                 self.window.copy(distance, length)?;
                 output_size += length as u64;
+                should_check_yield = true;
             }
 
-            if let Some(threshold) = yield_threshold
+            if should_check_yield
+                && let Some(threshold) = yield_threshold
                 && self.pending_filters.is_empty()
                 && self.window.unflushed_bytes() as usize >= threshold
             {
@@ -522,10 +520,14 @@ impl LzDecoder {
             // Flush window periodically — but only up to filter boundaries.
             if self.pending_filters.is_empty() {
                 self.window.flush_to_writer(writer).map_err(RarError::Io)?;
-            } else if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                return Err(RarError::CorruptArchive {
-                    detail: "RAR5 pending filters exceeded dictionary window before flush".into(),
-                });
+            } else {
+                self.flush_filters_and_write(writer)?;
+                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR5 pending filters exceeded dictionary window before flush"
+                            .into(),
+                    });
+                }
             }
         }
 
@@ -609,11 +611,14 @@ impl LzDecoder {
                     self.window
                         .flush_to_writer(&mut *current_writer)
                         .map_err(RarError::Io)?;
-                } else if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR5 pending filters exceeded dictionary window before flush"
-                            .into(),
-                    });
+                } else {
+                    self.flush_filters_and_write(&mut *current_writer)?;
+                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                        return Err(RarError::CorruptArchive {
+                            detail: "RAR5 pending filters exceeded dictionary window before flush"
+                                .into(),
+                        });
+                    }
                 }
             }
         }
@@ -625,6 +630,20 @@ impl LzDecoder {
         }
 
         Ok(chunks)
+    }
+
+    fn write_window_range<W: Write + ?Sized>(
+        &self,
+        writer: &mut W,
+        start_total: u64,
+        len: usize,
+    ) -> RarResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let buf = self.window.copy_output(start_total, len);
+        writer.write_all(&buf).map_err(RarError::Io)
     }
 
     /// Flush pending filters and remaining window data to a writer.
@@ -642,12 +661,40 @@ impl LzDecoder {
         }
 
         let flushed_total = total - unflushed;
-        let mut buf = self.window.copy_output(flushed_total, unflushed as usize);
+        let mut written_up_to = flushed_total;
+        let pending_filters = std::mem::take(&mut self.pending_filters);
+        let mut remaining_filters = Vec::with_capacity(pending_filters.len());
 
-        self.apply_filters(&mut buf, flushed_total);
+        for filter in pending_filters {
+            if filter.block_start > written_up_to {
+                let prefix_len = (filter.block_start - written_up_to) as usize;
+                self.write_window_range(writer, written_up_to, prefix_len)?;
+                written_up_to = filter.block_start;
+            }
 
-        writer.write_all(&buf).map_err(RarError::Io)?;
-        self.window.mark_flushed(total);
+            let block_end = filter.block_start.saturating_add(filter.block_length as u64);
+            if block_end <= total {
+                let mut buf = self.window.copy_output(filter.block_start, filter.block_length);
+                match filter.filter_type {
+                    FilterType::Delta => filter::apply_delta(&mut buf, filter.channels),
+                    FilterType::E8 => filter::apply_e8(&mut buf, filter.block_start),
+                    FilterType::E8E9 => filter::apply_e8e9(&mut buf, filter.block_start),
+                    FilterType::Arm => filter::apply_arm(&mut buf, filter.block_start),
+                }
+                writer.write_all(&buf).map_err(RarError::Io)?;
+                written_up_to = block_end;
+            } else {
+                remaining_filters.push(filter);
+            }
+        }
+
+        if remaining_filters.is_empty() && written_up_to < total {
+            self.write_window_range(writer, written_up_to, (total - written_up_to) as usize)?;
+            written_up_to = total;
+        }
+
+        self.pending_filters = remaining_filters;
+        self.window.mark_flushed(written_up_to);
 
         Ok(())
     }

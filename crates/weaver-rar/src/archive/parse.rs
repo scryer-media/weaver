@@ -104,7 +104,7 @@ impl RarArchive {
         mut reader: Box<dyn ReadSeek>,
         password: Option<&str>,
     ) -> RarResult<Self> {
-        let parsed = crate::rar4::parse_rar4_headers(&mut reader)?;
+        let parsed = crate::rar4::parse_rar4_headers(&mut reader, password)?;
 
         let is_solid = parsed.archive_header.is_solid;
         let is_volume = parsed.archive_header.is_volume;

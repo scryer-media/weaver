@@ -16,6 +16,7 @@ pub(super) enum SimpleArchiveKind {
 fn extract_zip(
     archive_path: &Path,
     output_dir: &Path,
+    password: Option<&str>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
@@ -26,9 +27,15 @@ fn extract_zip(
     let mut extracted = Vec::new();
 
     for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
+        let mut entry = if let Some(pw) = password {
+            archive
+                .by_index_decrypt(i, pw.as_bytes())
+                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+        } else {
+            archive
+                .by_index(i)
+                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+        };
         let name = entry.name().to_string();
 
         if entry.is_dir() {
@@ -1509,6 +1516,26 @@ impl Pipeline {
                     if recovery_now < damaged {
                         let promoted = self.promote_recovery_targeted(job_id, damaged);
                         let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+
+                        // If all available/targeted recovery is still insufficient,
+                        // fail immediately instead of waiting for downloads that
+                        // won't help.
+                        if targeted_total < damaged {
+                            let msg = format!(
+                                "not repairable: {damaged} damaged slices, \
+                                 only {targeted_total} recovery blocks available in NZB"
+                            );
+                            warn!(job_id = job_id.0, %msg);
+                            let state = self.jobs.get_mut(&job_id).unwrap();
+                            state.status = JobStatus::Failed { error: msg.clone() };
+                            let _ = self.event_tx.send(PipelineEvent::JobFailed {
+                                job_id,
+                                error: msg,
+                            });
+                            self.record_job_history(job_id);
+                            return;
+                        }
+
                         info!(
                             job_id = job_id.0,
                             damaged,
@@ -1653,6 +1680,17 @@ impl Pipeline {
                                 }
                             });
 
+                            // Recompute RAR set states so ready_members reflects
+                            // the cleared failures, then retry extraction.
+                            let set_names: Vec<String> = self
+                                .rar_sets
+                                .keys()
+                                .filter(|(jid, _)| *jid == job_id)
+                                .map(|(_, name)| name.clone())
+                                .collect();
+                            for set_name in set_names {
+                                let _ = self.recompute_rar_set_state(job_id, &set_name).await;
+                            }
                             self.try_rar_extraction(job_id).await;
                             return;
                         }
@@ -2315,7 +2353,7 @@ impl Pipeline {
         set_name: &str,
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
-        let file_paths = {
+        let (file_paths, password) = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -2341,7 +2379,7 @@ impl Pipeline {
             }
             parts.sort_by_key(|(n, _)| *n);
             let paths: Vec<std::path::PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
-            paths
+            (paths, state.spec.password.clone())
         };
 
         let output_dir = self.extraction_staging_dir(job_id);
@@ -2362,6 +2400,7 @@ impl Pipeline {
                         SimpleArchiveKind::Zip => extract_zip(
                             &file_paths[0],
                             &output_dir,
+                            password.as_deref(),
                             &event_tx,
                             job_id,
                             &set_name_owned,

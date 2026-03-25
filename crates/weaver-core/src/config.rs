@@ -251,6 +251,10 @@ pub struct ServerConfig {
     /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
     #[serde(default)]
     pub priority: u32,
+    /// Optional path to a PEM-encoded CA certificate to trust for TLS
+    /// connections to this server (e.g. self-signed or internal CAs).
+    #[serde(default)]
+    pub tls_ca_cert: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

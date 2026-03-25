@@ -1,0 +1,30 @@
+FROM rust:1.94-slim-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev curl ca-certificates gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# Copy workspace
+COPY . .
+
+# Build frontend
+RUN cd apps/weaver-web && npm ci && npm run build
+
+# Build backend
+RUN cargo build --release -p weaver
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=chef /app/target/release/weaver /usr/local/bin/weaver
+
+RUN mkdir -p /data
+VOLUME /data
+
+EXPOSE 9090
+
+CMD ["weaver", "serve", "--port", "9090"]

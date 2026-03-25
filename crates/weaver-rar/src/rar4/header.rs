@@ -360,6 +360,88 @@ fn decode_rar4_unicode_name(data: &[u8]) -> String {
     String::from_utf16_lossy(&result)
 }
 
+/// Read one raw RAR4 header from an encrypted stream.
+///
+/// RAR4 header-level encryption (`-hp`) encrypts all headers after the archive
+/// header as a continuous AES-128-CBC stream. This function reads aligned
+/// 16-byte blocks from the stream, decrypts them through the stateful CBC
+/// decryptor, and parses the result as a normal header.
+///
+/// The decryptor's IV state persists across calls — file data areas between
+/// headers are seeked past in the raw stream without feeding through the
+/// decryptor.
+pub fn read_raw_header_encrypted<R: Read>(
+    reader: &mut R,
+    decryptor: &mut crate::crypto::Rar4CbcDecryptor,
+) -> RarResult<Option<RawRar4Header>> {
+    // Read first AES block (16 bytes) — contains the 7-byte common header.
+    let mut block = [0u8; 16];
+    match reader.read_exact(&mut block) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(RarError::Io(e)),
+    }
+    decryptor.decrypt_blocks(&mut block);
+
+    // Parse the 7-byte common header from decrypted data.
+    let header_type = Rar4HeaderType::from(block[2]);
+    let flags = read_u16(&block, 3);
+    let header_size = read_u16(&block, 5);
+
+    if (header_size as usize) < MIN_HEADER_SIZE {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "RAR4 encrypted header size {} < minimum {MIN_HEADER_SIZE}",
+                header_size
+            ),
+        });
+    }
+
+    if header_size as usize > MAX_HEADER_SIZE {
+        return Err(RarError::ResourceLimit {
+            detail: format!("RAR4 encrypted header size {} exceeds maximum", header_size),
+        });
+    }
+
+    // Total encrypted bytes = header_size rounded up to 16-byte boundary.
+    let aligned_size = ((header_size as usize) + 15) & !15;
+
+    // We already decrypted 16 bytes. Read and decrypt any remaining blocks.
+    let mut decrypted = Vec::with_capacity(aligned_size);
+    decrypted.extend_from_slice(&block);
+
+    if aligned_size > 16 {
+        let remaining = aligned_size - 16;
+        let mut more = vec![0u8; remaining];
+        reader.read_exact(&mut more).map_err(RarError::Io)?;
+        decryptor.decrypt_blocks(&mut more);
+        decrypted.extend_from_slice(&more);
+    }
+
+    // Extract the actual header bytes (header_size bytes, ignoring padding).
+    let data = decrypted[..header_size as usize].to_vec();
+
+    // Determine data area size (same logic as plaintext).
+    let data_area_size = if flags & common_flags::HAS_DATA != 0 {
+        if data.len() >= 11 {
+            read_u32(&data, 7) as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    Ok(Some(RawRar4Header {
+        header_type,
+        flags,
+        header_size,
+        data,
+        offset: 0, // Not meaningful for encrypted headers.
+        data_area_size,
+    }))
+}
+
 /// Skip the data area of a RAR4 header.
 pub fn skip_data_area<R: Read + Seek>(reader: &mut R, raw: &RawRar4Header) -> RarResult<()> {
     if raw.data_area_size > 0 {

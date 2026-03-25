@@ -1006,7 +1006,12 @@ impl Pipeline {
                             self.promote_recovery_for_failed_member(job_id, &set_name, member)
                                 .await;
                         }
-                        // Don't mark set as extracted — needs repair + retry.
+                        // Remove from inflight so the job doesn't deadlock waiting
+                        // for this set to complete. check_job_completion will either
+                        // trigger PAR2 repair or fail the job.
+                        if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
+                            sets.remove(&set_name);
+                        }
                     }
                     if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
                         let _ = self.recompute_rar_set_state(job_id, &set_name).await;

@@ -188,20 +188,21 @@ impl Rar4LzDecoder {
 
         let mut output_size: u64 = 0;
         let flush_threshold = self.window.dict_size() / 2;
+        let decode_chunk = flush_threshold.max(1) as u64;
 
         while output_size < unpacked_size {
             if reader.bits_remaining() < 1 {
                 break;
             }
 
+            let target_output = output_size.saturating_add(decode_chunk).min(unpacked_size);
+
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_lz_symbols(&mut reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
                 }
             }
 
@@ -238,6 +239,7 @@ impl Rar4LzDecoder {
 
         let mut output_size: u64 = 0;
         let flush_threshold = self.window.dict_size() / 2;
+    let decode_chunk = flush_threshold.max(1) as u64;
         let mut boundary_idx = 0;
 
         let mut chunks: Vec<(usize, u64)> = Vec::new();
@@ -251,14 +253,13 @@ impl Rar4LzDecoder {
             }
 
             let prev_output = output_size;
+            let target_output = output_size.saturating_add(decode_chunk).min(unpacked_size);
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_lz_symbols(&mut reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
                 }
             }
             let decoded_this_round = output_size - prev_output;

@@ -135,7 +135,7 @@ fn probe_rar5<R: Read + Seek>(reader: &mut R) -> RarResult<VolumeProbe> {
 
 /// Probe a RAR4 volume.
 fn probe_rar4<R: Read + Seek>(reader: &mut R) -> RarResult<VolumeProbe> {
-    let parsed = match crate::rar4::parse_rar4_headers(reader) {
+    let parsed = match crate::rar4::parse_rar4_headers(reader, None) {
         Ok(p) => p,
         Err(RarError::EncryptedArchive) => {
             return Ok(VolumeProbe {

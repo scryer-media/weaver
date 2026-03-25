@@ -1305,6 +1305,14 @@ impl Pipeline {
             .complete_dir
             .join(".weaver-staging")
             .join(job_id.0.to_string());
+        if let Err(e) = std::fs::create_dir_all(&staging) {
+            tracing::warn!(
+                job_id = job_id.0,
+                path = %staging.display(),
+                error = %e,
+                "failed to create staging dir"
+            );
+        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.staging_dir = Some(staging.clone());
         }

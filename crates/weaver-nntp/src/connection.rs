@@ -84,6 +84,9 @@ pub struct ServerConfig {
     pub command_timeout: Duration,
     /// Internal read-buffer sizing profile.
     pub buffer_profile: NntpBufferProfile,
+    /// Optional path to a PEM-encoded CA certificate to trust in addition
+    /// to the system/Mozilla roots (e.g. self-signed or internal CAs).
+    pub tls_ca_cert: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -98,6 +101,7 @@ impl Default for ServerConfig {
             connect_timeout: Duration::from_secs(30),
             command_timeout: Duration::from_mins(1),
             buffer_profile: NntpBufferProfile::default(),
+            tls_ca_cert: None,
         }
     }
 }
@@ -126,6 +130,8 @@ pub struct NntpConnection {
     current_group: Option<String>,
     /// Stored credentials for transparent mid-session re-authentication.
     credentials: Option<(String, String)>,
+    /// Optional custom CA certificate path, kept for STARTTLS upgrades.
+    tls_ca_cert: Option<std::path::PathBuf>,
 }
 
 impl NntpConnection {
@@ -147,7 +153,8 @@ impl NntpConnection {
 
         // 1. Establish transport
         let transport = if config.tls {
-            crate::tls::connect_tls(&config.host, config.port).await?
+            crate::tls::connect_tls(&config.host, config.port, config.tls_ca_cert.as_deref())
+                .await?
         } else {
             crate::tls::connect_plain(&config.host, config.port).await?
         };
@@ -170,6 +177,7 @@ impl NntpConnection {
             poisoned: false,
             current_group: None,
             credentials: None,
+            tls_ca_cert: config.tls_ca_cert.clone(),
         };
 
         // 2. Read greeting
@@ -224,7 +232,9 @@ impl NntpConnection {
 
         // Take ownership of the transport, upgrade it, and put it back.
         let old_transport = self.transport.take().expect("transport must be present");
-        match crate::tls::upgrade_starttls(old_transport, &self.host).await {
+        match crate::tls::upgrade_starttls(old_transport, &self.host, self.tls_ca_cert.as_deref())
+            .await
+        {
             Ok(upgraded) => {
                 self.transport = Some(upgraded);
                 self.codec = NntpCodec::new();

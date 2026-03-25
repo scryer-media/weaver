@@ -484,6 +484,7 @@ impl Database {
             "normalization_retried",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
 
         Ok(())
     }

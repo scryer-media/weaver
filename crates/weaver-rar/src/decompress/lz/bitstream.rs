@@ -194,6 +194,49 @@ impl<'a> BitReader<'a> {
         Ok((self.acc >> (64 - count as u32)) as u32)
     }
 
+    /// Peek up to 16 bits and return them left-aligned in a 16-bit field.
+    ///
+    /// This matches unrar's hot `getbits() & 0xfffe` use in Huffman decode.
+    #[inline]
+    pub fn peek_16_left_aligned(&self) -> RarResult<u32> {
+        if self.acc_bits >= 16 {
+            return Ok(((self.acc >> 48) as u32) & 0xfffe);
+        }
+
+        let bits_avail = self.bits_remaining();
+        if bits_avail == 0 {
+            return Err(RarError::CorruptArchive {
+                detail: "bitstream: unexpected end of data".into(),
+            });
+        }
+
+        let peek_count = 16.min(bits_avail) as u8;
+        let raw = self.peek_bits(peek_count)?;
+        Ok(if peek_count < 16 {
+            (raw << (16 - peek_count)) & 0xfffe
+        } else {
+            raw & 0xfffe
+        })
+    }
+
+    /// Consume a small number of bits using the accumulator fast path when possible.
+    #[inline]
+    pub fn consume_bits(&mut self, count: u8) -> RarResult<()> {
+        debug_assert!(count <= 32);
+        if count == 0 {
+            return Ok(());
+        }
+
+        if self.acc_bits >= count {
+            self.acc <<= count as u32;
+            self.acc_bits -= count;
+            self.refill();
+            return Ok(());
+        }
+
+        self.skip_bits(count as u32)
+    }
+
     /// Skip N bits.
     #[inline]
     pub fn skip_bits(&mut self, count: u32) -> RarResult<()> {

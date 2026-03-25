@@ -44,6 +44,8 @@ pub struct Server {
     pub active: bool,
     pub supports_pipelining: bool,
     pub priority: u32,
+    /// Optional path to a PEM CA certificate trusted for this server's TLS.
+    pub tls_ca_cert: Option<String>,
 }
 
 impl From<&weaver_core::config::ServerConfig> for Server {
@@ -58,6 +60,7 @@ impl From<&weaver_core::config::ServerConfig> for Server {
             active: s.active,
             supports_pipelining: s.supports_pipelining,
             priority: s.priority,
+            tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
         }
     }
 }
@@ -194,6 +197,8 @@ pub struct ServerInput {
     /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
     #[graphql(default = 0)]
     pub priority: u16,
+    /// Optional path to a PEM CA certificate to trust for this server's TLS.
+    pub tls_ca_cert: Option<String>,
 }
 
 /// GraphQL representation of a configured category.

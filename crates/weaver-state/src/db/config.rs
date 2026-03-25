@@ -322,7 +322,7 @@ impl Database {
         let conn = self.conn();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority
+                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert
                  FROM servers ORDER BY priority, id",
             )
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -340,6 +340,9 @@ impl Database {
                     active: row.get::<_, bool>(7)?,
                     supports_pipelining: row.get::<_, bool>(8)?,
                     priority: row.get::<_, u32>(9)?,
+                    tls_ca_cert: row
+                        .get::<_, Option<String>>(10)?
+                        .map(std::path::PathBuf::from),
                 })
             })
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -357,9 +360,10 @@ impl Database {
         use crate::encryption::maybe_encrypt;
         let conn = self.conn();
         let encrypted_password = maybe_encrypt(self.encryption_key(), &server.password);
+        let ca_cert_str = server.tls_ca_cert.as_ref().map(|p| p.display().to_string());
         conn.execute(
-            "INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 server.id,
                 server.host,
@@ -371,6 +375,7 @@ impl Database {
                 server.active,
                 server.supports_pipelining,
                 server.priority,
+                ca_cert_str,
             ],
         )
         .map_err(|e| StateError::Database(e.to_string()))?;
@@ -381,9 +386,10 @@ impl Database {
         use crate::encryption::maybe_encrypt;
         let conn = self.conn();
         let encrypted_password = maybe_encrypt(self.encryption_key(), &server.password);
+        let ca_cert_str = server.tls_ca_cert.as_ref().map(|p| p.display().to_string());
         conn.execute(
             "UPDATE servers SET host=?2, port=?3, tls=?4, username=?5, password=?6,
-             connections=?7, active=?8, supports_pipelining=?9, priority=?10
+             connections=?7, active=?8, supports_pipelining=?9, priority=?10, tls_ca_cert=?11
              WHERE id=?1",
             rusqlite::params![
                 server.id,
@@ -396,6 +402,7 @@ impl Database {
                 server.active,
                 server.supports_pipelining,
                 server.priority,
+                ca_cert_str,
             ],
         )
         .map_err(|e| StateError::Database(e.to_string()))?;

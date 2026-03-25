@@ -32,7 +32,12 @@ pub struct Rar4ParsedVolume {
 /// Parse all headers from a RAR4 archive volume.
 ///
 /// Reader should be positioned right after the 7-byte RAR4 signature.
-pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4ParsedVolume> {
+/// If the archive uses header-level encryption (`-hp`), the password is
+/// required to decrypt headers.
+pub fn parse_rar4_headers<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+) -> RarResult<Rar4ParsedVolume> {
     let mut archive_header = None;
     let mut files = Vec::new();
     let mut end = None;
@@ -49,7 +54,12 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
                     arch.is_solid, arch.is_volume, arch.is_encrypted
                 );
                 if arch.is_encrypted {
-                    return Err(RarError::EncryptedArchive);
+                    let pwd = password.ok_or(RarError::EncryptedArchive)?;
+                    archive_header = Some(arch);
+
+                    // Parse remaining headers — each has its own salt.
+                    parse_rar4_encrypted_headers(reader, pwd, &mut files, &mut end)?;
+                    break;
                 }
                 archive_header = Some(arch);
             }
@@ -104,6 +114,72 @@ pub fn parse_rar4_headers<R: Read + Seek>(reader: &mut R) -> RarResult<Rar4Parse
         files,
         end,
     })
+}
+
+/// Parse remaining RAR4 headers from an encrypted stream.
+///
+/// In RAR4 header encryption (`-hp`), each header is individually encrypted:
+/// a fresh 8-byte salt precedes each header in the stream, and the decryptor
+/// is re-initialized per header (arcread.cpp:157-164 in unrar).
+fn parse_rar4_encrypted_headers<R: Read + Seek>(
+    reader: &mut R,
+    password: &str,
+    files: &mut Vec<Rar4FileHeader>,
+    end: &mut Option<Rar4EndHeader>,
+) -> RarResult<()> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+
+    loop {
+        // Each encrypted header is preceded by its own 8-byte salt.
+        let mut salt = [0u8; 8];
+        match reader.read_exact(&mut salt) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(RarError::Io(e)),
+        }
+
+        let (key, iv) = kdf_cache.derive_key_rar4(password, &salt);
+        let mut decryptor = crate::crypto::Rar4CbcDecryptor::new(&key, &iv);
+
+        let raw = match header::read_raw_header_encrypted(reader, &mut decryptor)? {
+            Some(raw) => raw,
+            None => break,
+        };
+
+        match raw.header_type {
+            Rar4HeaderType::File => {
+                let mut fh = header::parse_file_header(&raw)?;
+                // For encrypted headers, raw.offset is meaningless. The stream
+                // is positioned right after the aligned encrypted header block,
+                // which is where the file data starts.
+                fh.data_offset = reader.stream_position().map_err(RarError::Io)?;
+                debug!(
+                    "RAR4 encrypted file: name={:?} packed={} unpacked={} method={:?}",
+                    fh.name, fh.packed_size, fh.unpacked_size, fh.method
+                );
+                let skip_size = fh.packed_size;
+                files.push(fh);
+                reader
+                    .seek(std::io::SeekFrom::Current(skip_size as i64))
+                    .map_err(RarError::Io)?;
+            }
+            Rar4HeaderType::EndArchive => {
+                let e = header::parse_end_header(&raw);
+                debug!("RAR4 encrypted end: more_volumes={}", e.more_volumes);
+                *end = Some(e);
+                break;
+            }
+            _ => {
+                debug!("RAR4 encrypted: skipping header type {:?}", raw.header_type);
+                if raw.data_area_size > 0 {
+                    reader
+                        .seek(std::io::SeekFrom::Current(raw.data_area_size as i64))
+                        .map_err(RarError::Io)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convert a RAR4 file header to the unified MemberInfo type.
@@ -273,7 +349,7 @@ mod tests {
     fn test_parse_rar4_headers() {
         let data = build_minimal_rar4_archive("hello.txt", b"Hello world");
         let mut cursor = Cursor::new(data);
-        let vol = parse_rar4_headers(&mut cursor).unwrap();
+        let vol = parse_rar4_headers(&mut cursor, None).unwrap();
         assert!(!vol.archive_header.is_solid);
         assert_eq!(vol.files.len(), 1);
         assert_eq!(vol.files[0].name, "hello.txt");
@@ -285,7 +361,7 @@ mod tests {
     fn test_to_member_info() {
         let data = build_minimal_rar4_archive("file.dat", b"data");
         let mut cursor = Cursor::new(data);
-        let vol = parse_rar4_headers(&mut cursor).unwrap();
+        let vol = parse_rar4_headers(&mut cursor, None).unwrap();
         let mi = to_member_info(&vol.files[0], 0);
         assert_eq!(mi.name, "file.dat");
         assert_eq!(mi.unpacked_size, Some(4));
@@ -314,5 +390,43 @@ mod tests {
     fn test_dos_datetime_invalid() {
         // Month=0 is invalid
         assert!(dos_datetime_to_system_time(0).is_none());
+    }
+
+    #[test]
+    fn test_parse_rar4_hp_encrypted_headers() {
+        // Test against a real RAR4 -hp archive from e2e fixtures.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../e2e/testdata/rar4-encrypted/archive.rar");
+        if !path.exists() {
+            eprintln!("skipping test: e2e fixture not found at {}", path.display());
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        // Skip 7-byte signature.
+        let mut cursor = Cursor::new(&data[7..]);
+        let vol = parse_rar4_headers(&mut cursor, Some("e2e-test-password")).unwrap();
+        assert!(vol.archive_header.is_encrypted);
+        assert!(!vol.files.is_empty(), "should have parsed at least one file header");
+        eprintln!("parsed {} files from -hp archive", vol.files.len());
+        for f in &vol.files {
+            eprintln!("  file: {:?} packed={} unpacked={} method={:?} encrypted={} salt={:?} flags={:#06x}",
+                f.name, f.packed_size, f.unpacked_size, f.method, f.is_encrypted, f.salt, f.flags);
+        }
+    }
+
+    #[test]
+    fn test_parse_rar4_hp_no_password_returns_error() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../e2e/testdata/rar4-encrypted/archive.rar");
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let mut cursor = Cursor::new(&data[7..]);
+        let err = parse_rar4_headers(&mut cursor, None).unwrap_err();
+        assert!(
+            matches!(err, RarError::EncryptedArchive),
+            "expected EncryptedArchive, got: {err}"
+        );
     }
 }

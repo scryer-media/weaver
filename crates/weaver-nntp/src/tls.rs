@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,10 +78,33 @@ impl AsyncWrite for NntpTransport {
     }
 }
 
-/// Build a default `rustls` `ClientConfig` using Mozilla root certificates.
-pub fn default_tls_config() -> Arc<ClientConfig> {
+/// Build a `rustls` `ClientConfig` using Mozilla root certificates,
+/// optionally augmented with a custom CA certificate from a PEM file.
+pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>, NntpError> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Load additional CA certificate if provided
+    if let Some(path) = ca_cert_path {
+        let pem_data = std::fs::read(path).map_err(|e| {
+            NntpError::MalformedResponse(format!("failed to read CA cert {}: {e}", path.display()))
+        })?;
+        let mut cursor = std::io::Cursor::new(&pem_data);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+            .filter_map(|r| r.ok())
+            .collect();
+        if certs.is_empty() {
+            return Err(NntpError::MalformedResponse(format!(
+                "no valid certificates found in {}",
+                path.display()
+            )));
+        }
+        for cert in certs {
+            root_store.add(cert).map_err(|e| {
+                NntpError::MalformedResponse(format!("invalid CA cert: {e}"))
+            })?;
+        }
+    }
 
     let provider = tokio_rustls::rustls::crypto::ring::default_provider();
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -89,7 +113,7 @@ pub fn default_tls_config() -> Arc<ClientConfig> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    Arc::new(config)
+    Ok(Arc::new(config))
 }
 
 /// Create a `ServerName` from a hostname string.
@@ -111,12 +135,18 @@ fn set_keepalive(tcp: &TcpStream) {
 /// Connect to a host with implicit TLS (e.g. port 563).
 ///
 /// Performs TCP connect followed by an immediate TLS handshake.
-pub async fn connect_tls(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
+/// If `ca_cert_path` is provided, the certificate is trusted in addition to
+/// the Mozilla root store.
+pub async fn connect_tls(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+) -> Result<NntpTransport, NntpError> {
     let addr = format!("{host}:{port}");
     let tcp = TcpStream::connect(&addr).await?;
     tcp.set_nodelay(true)?;
     set_keepalive(&tcp);
-    let tls_config = default_tls_config();
+    let tls_config = build_tls_config(ca_cert_path)?;
     let connector = TlsConnector::from(tls_config);
     let server_name = make_server_name(host)?;
     let tls_stream = connector.connect(server_name, tcp).await?;
@@ -139,6 +169,7 @@ pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpE
 pub async fn upgrade_starttls(
     transport: NntpTransport,
     host: &str,
+    ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
     let tcp = match transport {
         NntpTransport::Plain { inner } => inner,
@@ -149,7 +180,7 @@ pub async fn upgrade_starttls(
         }
     };
 
-    let tls_config = default_tls_config();
+    let tls_config = build_tls_config(ca_cert_path)?;
     let connector = TlsConnector::from(tls_config);
     let server_name = make_server_name(host)?;
     let tls_stream = connector.connect(server_name, tcp).await?;

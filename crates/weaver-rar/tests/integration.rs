@@ -1261,6 +1261,11 @@ fn open_single(dir: &str, filename: &str) -> weaver_rar::RarArchive {
     weaver_rar::RarArchive::open(Cursor::new(data)).unwrap()
 }
 
+fn open_single_with_password(dir: &str, filename: &str, password: &str) -> weaver_rar::RarArchive {
+    let data = std::fs::read(fixture(dir, filename)).unwrap();
+    weaver_rar::RarArchive::open_with_password(Cursor::new(data), password).unwrap()
+}
+
 fn open_multi(dir: &str, filenames: &[&str]) -> weaver_rar::RarArchive {
     let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = filenames
         .iter()
@@ -1784,6 +1789,82 @@ fn test_rar4_encrypted_no_password_fails_fixture() {
         result.is_err(),
         "no password should fail for encrypted archive"
     );
+}
+
+#[test]
+fn test_rar4_hp_encrypted_store() {
+    let mut archive = open_single_with_password("rar4", "rar4_hp_store.rar", "secretpass");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("secretpass".into()),
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result, b"This is a test file for RAR4 header encryption.\n");
+}
+
+#[test]
+fn test_rar4_hp_encrypted_lz() {
+    let mut archive = open_single_with_password("rar4", "rar4_hp_lz.rar", "secretpass");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("secretpass".into()),
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result, b"This is a test file for RAR4 header encryption.\n");
+}
+
+#[test]
+fn test_rar4_hp_encrypted_large() {
+    let path = fixture("rar4", "rar4_hp_large.rar");
+    if !path.exists() {
+        eprintln!("skipping: rar4_hp_large.rar not present");
+        return;
+    }
+    let mut archive = open_single_with_password("rar4", "rar4_hp_large.rar", "e2e-test-password");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+    archive.extract_member(0, &opts, None).unwrap();
+}
+
+// -- RAR5 header-encrypted (-hp) fixtures ---------------------------------
+
+#[test]
+fn test_rar5_hp_encrypted_store() {
+    let mut archive = open_single_with_password("rar5", "rar5_hp_store.rar", "secretpass");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("secretpass".into()),
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result, b"This is a test file for RAR4 header encryption.\n");
+}
+
+#[test]
+fn test_rar5_hp_encrypted_lz() {
+    let mut archive = open_single_with_password("rar5", "rar5_hp_lz.rar", "secretpass");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("secretpass".into()),
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result, b"This is a test file for RAR4 header encryption.\n");
+}
+
+#[test]
+fn test_rar5_hp_encrypted_large() {
+    let path = fixture("rar5", "rar5_hp_large.rar");
+    if !path.exists() {
+        eprintln!("skipping: rar5_hp_large.rar not present");
+        return;
+    }
+    let mut archive = open_single_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+    archive.extract_member(0, &opts, None).unwrap();
 }
 
 #[test]

@@ -66,7 +66,7 @@ impl RarArchive {
         let format = signature::read_signature(&mut reader)?;
 
         if format == ArchiveFormat::Rar4 {
-            let parsed = crate::rar4::parse_rar4_headers(&mut reader)?;
+            let parsed = crate::rar4::parse_rar4_headers(&mut reader, password)?;
             let volume_number = parsed
                 .end
                 .as_ref()

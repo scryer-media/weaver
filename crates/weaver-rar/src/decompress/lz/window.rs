@@ -5,6 +5,7 @@
 //! when it reaches the dictionary size.
 
 use std::io::Write;
+use std::ptr;
 
 use crate::error::{RarError, RarResult};
 
@@ -51,6 +52,63 @@ impl Window {
     /// additionally bounds by `length`, so a smaller margin is safe. We use
     /// the unrar value anyway for parity.
     const NO_WRAP_MARGIN: usize = 0x1004;
+
+    #[inline]
+    fn copy_no_wrap_fast(&mut self, src: usize, distance: usize, length: usize) {
+        let dst = self.pos;
+
+        unsafe {
+            let buf = self.buf.as_mut_ptr();
+
+            if distance >= length {
+                ptr::copy_nonoverlapping(buf.add(src), buf.add(dst), length);
+            } else {
+                let mut src_ptr = buf.add(src);
+                let mut dst_ptr = buf.add(dst);
+                let mut remaining = length;
+
+                while remaining >= 8 {
+                    *dst_ptr.add(0) = *src_ptr.add(0);
+                    *dst_ptr.add(1) = *src_ptr.add(1);
+                    *dst_ptr.add(2) = *src_ptr.add(2);
+                    *dst_ptr.add(3) = *src_ptr.add(3);
+                    *dst_ptr.add(4) = *src_ptr.add(4);
+                    *dst_ptr.add(5) = *src_ptr.add(5);
+                    *dst_ptr.add(6) = *src_ptr.add(6);
+                    *dst_ptr.add(7) = *src_ptr.add(7);
+
+                    src_ptr = src_ptr.add(8);
+                    dst_ptr = dst_ptr.add(8);
+                    remaining -= 8;
+                }
+
+                if remaining > 0 {
+                    *dst_ptr.add(0) = *src_ptr.add(0);
+                    if remaining > 1 {
+                        *dst_ptr.add(1) = *src_ptr.add(1);
+                        if remaining > 2 {
+                            *dst_ptr.add(2) = *src_ptr.add(2);
+                            if remaining > 3 {
+                                *dst_ptr.add(3) = *src_ptr.add(3);
+                                if remaining > 4 {
+                                    *dst_ptr.add(4) = *src_ptr.add(4);
+                                    if remaining > 5 {
+                                        *dst_ptr.add(5) = *src_ptr.add(5);
+                                        if remaining > 6 {
+                                            *dst_ptr.add(6) = *src_ptr.add(6);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.pos = dst + length;
+        self.total_written += length as u64;
+    }
 
     /// Copy `length` bytes from `distance` bytes back in the output.
     ///
@@ -99,30 +157,11 @@ impl Window {
         //       UnpPtr < MaxWinSize - MAX_INC_LZ_MATCH)
         // Unlike unrar, we don't need the large margin because we bound by
         // `length` explicitly. But we use the same margin for parity.
-        if src < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
+        if length <= Self::NO_WRAP_MARGIN
+            && src < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
             && self.pos < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
         {
-            if distance >= length {
-                // Non-overlapping — single copy_within (memmove).
-                self.buf.copy_within(src..src + length, self.pos);
-            } else {
-                // Overlapping — copy in distance-sized chunks.
-                // Each chunk is non-overlapping so copy_within is safe.
-                // This matches unrar's byte-by-byte approach but uses
-                // larger chunks (distance bytes at a time).
-                let mut s = src;
-                let mut d = self.pos;
-                let mut rem = length;
-                while rem > 0 {
-                    let chunk = rem.min(distance);
-                    self.buf.copy_within(s..s + chunk, d);
-                    s += chunk;
-                    d += chunk;
-                    rem -= chunk;
-                }
-            }
-            self.pos += length;
-            self.total_written += length as u64;
+            self.copy_no_wrap_fast(src, distance, length);
             return Ok(());
         }
 
