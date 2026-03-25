@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3627,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-api"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3664,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-assembly"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "bitvec",
  "serde_json",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-core"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "bytes",
  "chrono",
@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nntp"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "bytes",
  "criterion",
@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aes",
  "blake2",
@@ -3765,7 +3765,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-scheduler"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "chrono",
  "serde",
@@ -3780,7 +3780,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-state"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3802,7 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "crc32fast",
  "memchr",
