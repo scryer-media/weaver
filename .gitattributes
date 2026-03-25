@@ -1,0 +1,1 @@
+crates/weaver-rar/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable

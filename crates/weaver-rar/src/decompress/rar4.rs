@@ -111,6 +111,8 @@ pub struct Rar4LzDecoder {
     ppm_model: Option<Model>,
     /// PPMd escape character (default 2).
     ppm_esc_char: u8,
+        /// Equivalent to unrar's TablesRead3 flag.
+        tables_read: bool,
 }
 
 impl Rar4LzDecoder {
@@ -133,6 +135,7 @@ impl Rar4LzDecoder {
             block_type: BlockType::Lz,
             ppm_model: None,
             ppm_esc_char: 2,
+            tables_read: false,
         }
     }
 
@@ -144,8 +147,9 @@ impl Rar4LzDecoder {
 
         let mut reader = BitReader::new(input);
 
-        // Read initial tables.
-        self.read_tables(&mut reader)?;
+        if !self.tables_read {
+            self.read_tables(&mut reader)?;
+        }
 
         let mut output_size: u64 = 0;
 
@@ -171,6 +175,40 @@ impl Rar4LzDecoder {
         Ok(self.window.copy_output(start, total))
     }
 
+    /// Decode a RAR4 solid member only to advance decoder state.
+    pub fn replay(&mut self, input: &[u8], unpacked_size: u64) -> RarResult<u64> {
+        if unpacked_size == 0 {
+            return Ok(0);
+        }
+
+        let mut reader = BitReader::new(input);
+
+        if !self.tables_read {
+            self.read_tables(&mut reader)?;
+        }
+
+        let mut output_size: u64 = 0;
+
+        while output_size < unpacked_size {
+            if reader.bits_remaining() < 1 {
+                break;
+            }
+
+            match self.block_type {
+                BlockType::Lz => {
+                    output_size =
+                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                }
+                BlockType::Ppm => {
+                    output_size =
+                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                }
+            }
+        }
+
+        Ok(output_size.min(unpacked_size))
+    }
+
     /// Decompress RAR4 LZ data directly to a writer.
     pub fn decompress_to_writer<W: Write>(
         &mut self,
@@ -184,7 +222,9 @@ impl Rar4LzDecoder {
 
         let mut reader = BitReader::new(input);
 
-        self.read_tables(&mut reader)?;
+        if !self.tables_read {
+            self.read_tables(&mut reader)?;
+        }
 
         let mut output_size: u64 = 0;
         let flush_threshold = self.window.dict_size() / 2;
@@ -235,7 +275,9 @@ impl Rar4LzDecoder {
         }
 
         let mut reader = BitReader::new(input);
-        self.read_tables(&mut reader)?;
+        if !self.tables_read {
+            self.read_tables(&mut reader)?;
+        }
 
         let mut output_size: u64 = 0;
         let flush_threshold = self.window.dict_size() / 2;
@@ -434,6 +476,7 @@ impl Rar4LzDecoder {
             &self.code_lengths[offset..offset + RC],
         )?);
 
+        self.tables_read = true;
         Ok(())
     }
 
@@ -647,6 +690,7 @@ impl Rar4LzDecoder {
         let bit = reader.read_bits(1)?;
         if bit != 0 {
             // "1" — no new file, new table immediately.
+            self.tables_read = false;
             self.read_tables(reader)?;
             return Ok(true);
         }
@@ -655,9 +699,8 @@ impl Rar4LzDecoder {
         if reader.bits_remaining() < 1 {
             return Ok(false);
         }
-        let _new_table_bit = reader.read_bits(1)?;
-        // Whether to read new tables at start of next file is irrelevant —
-        // we're done with this member.
+        let new_table_bit = reader.read_bits(1)?;
+        self.tables_read = new_table_bit == 0;
         Ok(false)
     }
 
@@ -958,6 +1001,7 @@ impl Rar4LzDecoder {
         self.block_type = BlockType::Lz;
         self.ppm_model = None;
         self.ppm_esc_char = 2;
+        self.tables_read = false;
         self.window.reset();
     }
 }

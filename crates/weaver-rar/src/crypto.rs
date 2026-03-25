@@ -439,11 +439,11 @@ impl CbcDecryptorAny {
     }
 }
 
-/// Decryption buffer size: 256KB = 16384 AES blocks.
-/// Larger buffers let the `cbc` crate pipeline AES-NI operations.
-/// unrar uses a 32KB I/O buffer but decrypts in bulk after read;
-/// we match that throughput with a single larger decrypt buffer.
-const DECRYPT_BUF_SIZE: usize = 256 * 1024;
+/// Decryption buffer size.
+/// Keep this modest because encrypted extraction already pays for the dictionary
+/// window and output sink; a very large decrypt staging buffer does not buy much
+/// once compressed input is streamed.
+const DECRYPT_BUF_SIZE: usize = 64 * 1024;
 
 /// A `Read` adapter that decrypts AES-CBC on-the-fly.
 ///

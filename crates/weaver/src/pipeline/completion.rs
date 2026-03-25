@@ -3,6 +3,25 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
+
+#[derive(Debug, Clone)]
+struct ScannedExtractionFile {
+    relative_path: String,
+    role: weaver_core::classify::FileRole,
+    size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NestedArchiveFile {
+    relative_path: String,
+    role: weaver_core::classify::FileRole,
+    archive_type: weaver_assembly::ArchiveType,
+    set_name: String,
+    volume_number: u32,
+    size: u64,
+}
+
 /// Simple archive type for non-RAR, non-7z extraction.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SimpleArchiveKind {
@@ -568,6 +587,340 @@ impl Pipeline {
         Ok(dest)
     }
 
+    fn resolve_job_input_path(&self, job_id: JobId, relative_path: &str) -> Option<PathBuf> {
+        let state = self.jobs.get(&job_id)?;
+        let working_path = state.working_dir.join(relative_path);
+        if working_path.exists() {
+            return Some(working_path);
+        }
+
+        if let Some(staging_dir) = state.staging_dir.as_ref() {
+            let staging_path = staging_dir.join(relative_path);
+            if staging_path.exists() {
+                return Some(staging_path);
+            }
+        }
+
+        Some(working_path)
+    }
+
+    fn nested_scan_root(&self, job_id: JobId) -> Result<PathBuf, String> {
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {} not found", job_id.0))?;
+        Ok(state
+            .staging_dir
+            .clone()
+            .unwrap_or_else(|| state.working_dir.clone()))
+    }
+
+    fn archive_type_for_role(
+        role: &weaver_core::classify::FileRole,
+    ) -> Option<weaver_assembly::ArchiveType> {
+        match role {
+            weaver_core::classify::FileRole::RarVolume { .. } => Some(weaver_assembly::ArchiveType::Rar),
+            weaver_core::classify::FileRole::SevenZipArchive
+            | weaver_core::classify::FileRole::SevenZipSplit { .. } => {
+                Some(weaver_assembly::ArchiveType::SevenZip)
+            }
+            weaver_core::classify::FileRole::ZipArchive => Some(weaver_assembly::ArchiveType::Zip),
+            weaver_core::classify::FileRole::TarArchive => Some(weaver_assembly::ArchiveType::Tar),
+            weaver_core::classify::FileRole::TarGzArchive => {
+                Some(weaver_assembly::ArchiveType::TarGz)
+            }
+            weaver_core::classify::FileRole::GzArchive => Some(weaver_assembly::ArchiveType::Gz),
+            weaver_core::classify::FileRole::SplitFile { .. } => Some(weaver_assembly::ArchiveType::Split),
+            _ => None,
+        }
+    }
+
+    fn archive_volume_number(role: &weaver_core::classify::FileRole) -> u32 {
+        match role {
+            weaver_core::classify::FileRole::RarVolume { volume_number } => *volume_number,
+            weaver_core::classify::FileRole::SevenZipSplit { number }
+            | weaver_core::classify::FileRole::SplitFile { number } => *number,
+            _ => 0,
+        }
+    }
+
+    fn synthetic_segment_sizes(size: u64) -> Vec<u32> {
+        if size == 0 {
+            return vec![0];
+        }
+
+        let mut remaining = size;
+        let mut segments = Vec::new();
+        while remaining > 0 {
+            let next = remaining.min(u32::MAX as u64) as u32;
+            segments.push(next);
+            remaining -= u64::from(next);
+        }
+        segments
+    }
+
+    fn scan_extraction_root(root: &Path) -> Result<Vec<ScannedExtractionFile>, String> {
+        fn walk(
+            root: &Path,
+            current: &Path,
+            files: &mut Vec<ScannedExtractionFile>,
+        ) -> Result<(), String> {
+            let entries = std::fs::read_dir(current)
+                .map_err(|error| format!("failed to read {}: {error}", current.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("failed to read entry in {}: {error}", current.display())
+                })?;
+                let path = entry.path();
+                let file_type = entry.file_type().map_err(|error| {
+                    format!("failed to stat {}: {error}", path.display())
+                })?;
+                if file_type.is_dir() {
+                    walk(root, &path, files)?;
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let relative_path = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("failed to relativize {}: {error}", path.display()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let role = weaver_core::classify::FileRole::from_filename(&relative_path);
+                let size = entry
+                    .metadata()
+                    .map_err(|error| format!("failed to stat {}: {error}", path.display()))?
+                    .len();
+
+                files.push(ScannedExtractionFile {
+                    relative_path,
+                    role,
+                    size,
+                });
+            }
+            Ok(())
+        }
+
+        let mut files = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut files)?;
+        }
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(files)
+    }
+
+    fn clear_empty_dirs(root: &Path) -> Result<(), String> {
+        fn prune(root: &Path, current: &Path) -> Result<bool, String> {
+            let mut has_entries = false;
+            let entries = std::fs::read_dir(current)
+                .map_err(|error| format!("failed to read {}: {error}", current.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("failed to read entry in {}: {error}", current.display())
+                })?;
+                let path = entry.path();
+                let file_type = entry.file_type().map_err(|error| {
+                    format!("failed to stat {}: {error}", path.display())
+                })?;
+                if file_type.is_dir() {
+                    if prune(root, &path)? {
+                        has_entries = true;
+                    }
+                } else {
+                    has_entries = true;
+                }
+            }
+
+            if current != root && !has_entries {
+                std::fs::remove_dir(current).map_err(|error| {
+                    format!("failed to remove empty dir {}: {error}", current.display())
+                })?;
+                return Ok(false);
+            }
+
+            Ok(has_entries)
+        }
+
+        if root.exists() {
+            let _ = prune(root, root)?;
+        }
+        Ok(())
+    }
+
+    fn clear_persisted_extracted_members(&self, job_id: JobId) {
+        if let Err(error) = self.db.clear_extracted_members(job_id) {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to clear persisted extracted members before nested extraction"
+            );
+        }
+    }
+
+    fn rebuild_assembly_from_staging(
+        &mut self,
+        job_id: JobId,
+        nested_archives: &[NestedArchiveFile],
+    ) -> Result<Vec<(String, weaver_assembly::ArchiveType)>, String> {
+        let mut assembly = weaver_assembly::JobAssembly::new(job_id);
+        let mut topologies = BTreeMap::<String, weaver_assembly::ArchiveTopology>::new();
+
+        for (index, archive) in nested_archives.iter().enumerate() {
+            let file_index = u32::try_from(index)
+                .map_err(|_| format!("too many nested archive files for job {}", job_id.0))?;
+            let file_id = weaver_core::id::NzbFileId { job_id, file_index };
+            let segment_sizes = Self::synthetic_segment_sizes(archive.size);
+            let mut file_assembly = weaver_assembly::FileAssembly::new(
+                file_id,
+                archive.relative_path.clone(),
+                archive.role.clone(),
+                segment_sizes.clone(),
+            );
+            for (segment_number, segment_size) in segment_sizes.into_iter().enumerate() {
+                file_assembly
+                    .commit_segment(segment_number as u32, segment_size)
+                    .map_err(|error| {
+                        format!(
+                            "failed to mark nested archive {} complete: {error}",
+                            archive.relative_path
+                        )
+                    })?;
+            }
+            assembly.add_file(file_assembly);
+
+            let topology = topologies
+                .entry(archive.set_name.clone())
+                .or_insert_with(|| weaver_assembly::ArchiveTopology {
+                    archive_type: archive.archive_type,
+                    volume_map: HashMap::new(),
+                    complete_volumes: HashSet::new(),
+                    expected_volume_count: Some(0),
+                    members: Vec::new(),
+                    unresolved_spans: Vec::new(),
+                });
+            if topology.archive_type != archive.archive_type {
+                return Err(format!(
+                    "conflicting nested archive types for set '{}'",
+                    archive.set_name
+                ));
+            }
+            topology
+                .volume_map
+                .insert(archive.relative_path.clone(), archive.volume_number);
+            topology.complete_volumes.insert(archive.volume_number);
+            topology.expected_volume_count = Some(
+                topology
+                    .expected_volume_count
+                    .unwrap_or(0)
+                    .max(archive.volume_number.saturating_add(1)),
+            );
+        }
+
+        let mut to_extract = Vec::new();
+        for (set_name, mut topology) in topologies {
+            if topology.expected_volume_count == Some(0) {
+                topology.expected_volume_count = Some(1);
+            }
+            to_extract.push((set_name.clone(), topology.archive_type));
+            assembly.set_archive_topology(set_name, topology);
+        }
+
+        let state = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| format!("job {} not found", job_id.0))?;
+        state.assembly = assembly;
+        Ok(to_extract)
+    }
+
+    async fn maybe_start_nested_extraction(&mut self, job_id: JobId) -> Result<bool, String> {
+        let scan_root = self.nested_scan_root(job_id)?;
+        let scanned_files = Self::scan_extraction_root(&scan_root)?;
+        let nested_archives: Vec<NestedArchiveFile> = scanned_files
+            .iter()
+            .filter_map(|file| {
+                let archive_type = Self::archive_type_for_role(&file.role)?;
+                let set_name = weaver_core::classify::archive_base_name(&file.relative_path, &file.role)?;
+                Some(NestedArchiveFile {
+                    relative_path: file.relative_path.clone(),
+                    role: file.role.clone(),
+                    archive_type,
+                    set_name,
+                    volume_number: Self::archive_volume_number(&file.role),
+                    size: file.size,
+                })
+            })
+            .collect();
+
+        if nested_archives.is_empty() {
+            return Ok(false);
+        }
+
+        let current_depth = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {} not found", job_id.0))?
+            .extraction_depth;
+        if current_depth.saturating_add(1) >= MAX_NESTED_EXTRACTION_DEPTH {
+            warn!(
+                job_id = job_id.0,
+                depth = current_depth,
+                archives = nested_archives.len(),
+                "nested archive extraction depth limit reached; leaving archive output in place"
+            );
+            return Ok(false);
+        }
+
+        for file in &scanned_files {
+            if Self::archive_type_for_role(&file.role).is_some() {
+                continue;
+            }
+            let path = scan_root.join(&file.relative_path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to remove intermediate extracted file {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Self::clear_empty_dirs(&scan_root)?;
+
+        self.clear_job_extraction_runtime(job_id);
+        self.clear_job_rar_runtime(job_id);
+        self.replace_failed_extraction_members(job_id, HashSet::new());
+        self.clear_persisted_extracted_members(job_id);
+
+        let to_extract = self.rebuild_assembly_from_staging(job_id, &nested_archives)?;
+        if to_extract.is_empty() {
+            return Ok(false);
+        }
+
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.extraction_depth = state.extraction_depth.saturating_add(1);
+        }
+
+        info!(
+            job_id = job_id.0,
+            depth = current_depth + 1,
+            archives = to_extract.len(),
+            root = %scan_root.display(),
+            "starting nested archive extraction"
+        );
+
+        let spawned = self.spawn_extractions(job_id, &to_extract).await;
+        if spawned == 0 {
+            return Err("nested archive extraction could not be started".to_string());
+        }
+
+        Ok(true)
+    }
+
     fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
         let mut volume_numbers = HashMap::new();
         let Some(state) = self.jobs.get(&job_id) else {
@@ -998,20 +1351,8 @@ impl Pipeline {
     }
 
     async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
-        if self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|state| state.status == JobStatus::Extracting)
-        {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::ExtractionComplete { job_id });
-
         {
             let state = self.jobs.get(&job_id).unwrap();
-            let cleanup_dir = state.working_dir.clone();
             let cleanup_files: Vec<String> = state
                 .assembly
                 .files()
@@ -1028,7 +1369,9 @@ impl Pipeline {
                 .collect();
             let mut removed = 0u32;
             for filename in &cleanup_files {
-                let path = cleanup_dir.join(filename);
+                let Some(path) = self.resolve_job_input_path(job_id, filename) else {
+                    continue;
+                };
                 match tokio::fs::remove_file(&path).await {
                     Ok(()) => removed += 1,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1048,6 +1391,26 @@ impl Pipeline {
                 "post-extraction cleanup complete"
             );
         }
+
+        match self.maybe_start_nested_extraction(job_id).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                self.fail_job(job_id, error);
+                return;
+            }
+        }
+
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.status == JobStatus::Extracting)
+        {
+            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::ExtractionComplete { job_id });
 
         let was_extracting = self
             .jobs
@@ -1113,13 +1476,18 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+        let extracted_archives = self
+            .extracted_archives
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
         let mut fallback_sets = Vec::new();
         let mut has_incomplete_sets = false;
         let mut has_ready_incremental_work = false;
         for set_name in &set_names {
             let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
-            let set_complete =
-                set_state
+            let set_complete = extracted_archives.contains(set_name)
+                || set_state
                     .and_then(|state| state.plan.as_ref())
                     .is_some_and(|plan| {
                         !plan.member_names.is_empty()
@@ -1146,6 +1514,8 @@ impl Pipeline {
                     } else if !plan.ready_members.is_empty() {
                         has_ready_incremental_work = true;
                     }
+                } else {
+                    fallback_sets.push(set_name.clone());
                 }
             }
         }
@@ -1834,22 +2204,9 @@ impl Pipeline {
                 }
 
                 // All sets extracted — finish the job.
-                if self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|s| s.status == JobStatus::Extracting)
-                {
-                    self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-                }
-                info!(job_id = job_id.0, "extraction complete");
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionComplete { job_id });
-
                 // Clean up archive source files before moving to complete.
                 {
                     let state = self.jobs.get(&job_id).unwrap();
-                    let cleanup_dir = state.working_dir.clone();
                     let cleanup_files: Vec<String> = state
                         .assembly
                         .files()
@@ -1866,7 +2223,9 @@ impl Pipeline {
                         .collect();
                     let mut removed = 0u32;
                     for filename in &cleanup_files {
-                        let path = cleanup_dir.join(filename);
+                        let Some(path) = self.resolve_job_input_path(job_id, filename) else {
+                            continue;
+                        };
                         match tokio::fs::remove_file(&path).await {
                             Ok(()) => removed += 1,
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1886,6 +2245,27 @@ impl Pipeline {
                         "post-extraction cleanup complete"
                     );
                 }
+
+                match self.maybe_start_nested_extraction(job_id).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
+
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|s| s.status == JobStatus::Extracting)
+                {
+                    self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+                }
+                info!(job_id = job_id.0, "extraction complete");
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::ExtractionComplete { job_id });
 
                 // Move extracted files to complete directory.
                 let was_extracting = self
@@ -2009,7 +2389,9 @@ impl Pipeline {
                 if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
                     continue;
                 }
-                let path = state.working_dir.join(file_asm.filename());
+                let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) else {
+                    continue;
+                };
                 if path.exists() {
                     parts.insert(*volume_number, path);
                 }
@@ -2220,7 +2602,9 @@ impl Pipeline {
                         .get(file_asm.filename())
                         .copied()
                         .unwrap_or(0);
-                    parts.push((vol, state.working_dir.join(file_asm.filename())));
+                    if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
+                        parts.push((vol, path));
+                    }
                 }
             }
             parts.sort_by_key(|(n, _)| *n);
@@ -2374,7 +2758,9 @@ impl Pipeline {
                         .get(file_asm.filename())
                         .copied()
                         .unwrap_or(0);
-                    parts.push((vol, state.working_dir.join(file_asm.filename())));
+                    if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
+                        parts.push((vol, path));
+                    }
                 }
             }
             parts.sort_by_key(|(n, _)| *n);
@@ -2512,10 +2898,9 @@ impl Pipeline {
                 && !already_deleted;
 
             if should_delete {
-                let Some(state) = self.jobs.get(&job_id) else {
+                let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
                     return;
                 };
-                let path = state.working_dir.join(&filename);
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         self.eagerly_deleted

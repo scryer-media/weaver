@@ -36,8 +36,9 @@ impl Default for ExtractOptions {
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
 /// Batch extraction keeps small members in memory and spills larger outputs to a temp file.
-/// This prevents the default batch API from always forcing a heap Vec for large members.
-const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+/// Keep the default threshold low so `extract_member()` does not retain large
+/// heap buffers by default on archives that are better served by file-backed output.
+const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1 * 1024 * 1024;
 
 fn spool_threshold_bytes() -> usize {
     std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
@@ -144,13 +145,19 @@ enum ExtractedMemberSinkStorage {
 }
 
 impl ExtractedMemberSink {
-    pub fn with_capacity_hint(capacity_hint: usize) -> Self {
+    pub fn with_capacity_hint(capacity_hint: usize) -> RarResult<Self> {
         let threshold = spool_threshold_bytes();
-        Self {
-            storage: ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint.min(threshold))),
+        let storage = if capacity_hint > threshold {
+            ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::Io)?)
+        } else {
+            ExtractedMemberSinkStorage::Memory(Vec::with_capacity(capacity_hint))
+        };
+
+        Ok(Self {
+            storage,
             threshold,
             len: 0,
-        }
+        })
     }
 
     pub fn len(&self) -> usize {

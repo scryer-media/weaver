@@ -1266,6 +1266,11 @@ fn open_single_with_password(dir: &str, filename: &str, password: &str) -> weave
     weaver_rar::RarArchive::open_with_password(Cursor::new(data), password).unwrap()
 }
 
+fn open_single_file_with_password(dir: &str, filename: &str, password: &str) -> weaver_rar::RarArchive {
+    let file = std::fs::File::open(fixture(dir, filename)).unwrap();
+    weaver_rar::RarArchive::open_with_password(file, password).unwrap()
+}
+
 fn open_multi(dir: &str, filenames: &[&str]) -> weaver_rar::RarArchive {
     let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = filenames
         .iter()
@@ -1868,6 +1873,44 @@ fn test_rar5_hp_encrypted_large() {
 }
 
 #[test]
+fn test_rar5_hp_encrypted_large_to_file() {
+    let path = fixture("rar5", "rar5_hp_large.rar");
+    if !path.exists() {
+        eprintln!("skipping: rar5_hp_large.rar not present");
+        return;
+    }
+    let mut archive = open_single_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_path = temp_dir.path().join("sample.mkv");
+    archive
+        .extract_member_to_file(0, &opts, None, &out_path)
+        .unwrap();
+}
+
+#[test]
+fn test_rar5_hp_encrypted_large_disk_open_to_file() {
+    let path = fixture("rar5", "rar5_hp_large.rar");
+    if !path.exists() {
+        eprintln!("skipping: rar5_hp_large.rar not present");
+        return;
+    }
+    let mut archive = open_single_file_with_password("rar5", "rar5_hp_large.rar", "e2e-test-password");
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+    };
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_path = temp_dir.path().join("sample.mkv");
+    archive
+        .extract_member_to_file(0, &opts, None, &out_path)
+        .unwrap();
+}
+
+#[test]
 #[cfg(feature = "slow-tests")]
 fn test_rar4_encrypted_store_batch() {
     let mut archive = open_single("rar4", "rar4_enc_store.rar");
@@ -2190,11 +2233,168 @@ fn test_rar5_solid_chunked_extraction_preserves_solid_continuation() {
 }
 
 #[test]
+fn test_rar5_solid_reopen_archive_for_later_member() {
+    let fixture = fixture("rar5", "rar5_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_second = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let mut reopened_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
+
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
 fn test_rar4_solid_metadata() {
     let archive = open_single("rar4", "rar4_solid.rar");
     assert!(archive.is_solid(), "archive should be marked solid");
     let names = archive.member_names();
-    assert_eq!(names.len(), 4);
+    assert_eq!(names, vec!["sample.mkv", "file1.txt", "file2.txt"]);
+}
+
+#[test]
+fn test_rar4_solid_reopen_archive_for_later_member() {
+    let fixture = fixture("rar4", "rar4_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_second = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let mut reopened_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
+
+    assert_eq!(actual_second, expected_second);
+}
+
+#[test]
+fn test_rar4_solid_extracts_all_members_sequentially() {
+    let fixture = fixture("rar4", "rar4_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let metadata = archive.metadata().clone();
+
+    for member_index in 0..metadata.members.len() {
+        let extracted = archive.extract_member(member_index, &options, None).unwrap();
+        let expected_size = metadata.members[member_index].unpacked_size.unwrap_or(0);
+        assert_eq!(extracted.len() as u64, expected_size, "member index {member_index}");
+    }
+}
+
+#[test]
+fn test_rar4_solid_chunked_extraction_preserves_solid_continuation() {
+    let fixture = fixture("rar4", "rar4_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let metadata = expected_archive.metadata().clone();
+    let expected_outputs = (0..metadata.members.len())
+        .map(|member_index| {
+            expected_archive
+                .extract_member(member_index, &options, None)
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    let mut archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    for (member_index, expected) in expected_outputs.iter().enumerate() {
+        let member_dir = temp_dir.path().join(format!("member-{member_index}"));
+        let chunks = archive
+            .extract_member_solid_chunked(member_index, &options, |volume_index| {
+                let path = member_dir.join(format!("{volume_index:05}.chunk"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+                }
+                let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+                Ok(Box::new(file))
+            })
+            .unwrap();
+        assert!(!chunks.is_empty(), "member index {member_index}");
+
+        let mut actual = Vec::new();
+        for (volume_index, bytes_written) in &chunks {
+            let data = std::fs::read(member_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+            assert_eq!(data.len() as u64, *bytes_written, "member index {member_index}");
+            actual.extend_from_slice(&data);
+        }
+        assert_eq!(actual, *expected, "member index {member_index}");
+    }
+}
+
+#[test]
+fn test_rar4_solid_chunked_reopen_from_cached_headers_for_later_member() {
+    let fixture = fixture("rar4", "rar4_solid.rar");
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_second = expected_archive
+        .extract_member(1, &options, None)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let headers = archive.serialize_headers();
+    let mut reopened =
+        weaver_rar::RarArchive::deserialize_headers_with_password(&headers, None::<String>)
+            .unwrap();
+    reopened.attach_volume_reader(0, Box::new(std::fs::File::open(&fixture).unwrap()));
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let member_dir = temp_dir.path().join("second");
+    let chunks = reopened
+        .extract_member_solid_chunked(1, &options, |volume_index| {
+            let path = member_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_rar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_rar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+
+    let mut actual_second = Vec::new();
+    for (volume_index, bytes_written) in &chunks {
+        let data = std::fs::read(member_dir.join(format!("{volume_index:05}.chunk"))).unwrap();
+        assert_eq!(data.len() as u64, *bytes_written);
+        actual_second.extend_from_slice(&data);
+    }
+    assert_eq!(actual_second, expected_second);
 }
 
 // -- Recovery record archives -------------------------------------------------

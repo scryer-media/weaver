@@ -117,7 +117,7 @@ impl RarArchive {
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_data = self.read_member_data(skip_idx)?;
                 let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
-                self.run_solid_decoder(&skip_data, skip_unpacked, &skip_fh)?;
+                self.replay_solid_decoder(&skip_data, skip_unpacked, &skip_fh)?;
             }
             self.solid_next_index += 1;
         }
@@ -371,7 +371,7 @@ impl RarArchive {
                 None
             };
             let capacity = unpacked_size.min(usize::MAX as u64) as usize;
-            let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity);
+            let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
             let mut crc = expected_crc.map(|_| crc32fast::Hasher::new());
             self.read_member_data_into(index, &mut output, crc.as_mut())?;
 
@@ -419,7 +419,7 @@ impl RarArchive {
                 None
             };
             let capacity = unpacked_size.min(usize::MAX as u64) as usize;
-            let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity);
+            let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let decrypt_key = if let Some(ref pwd) = member_password {
                 let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -1289,6 +1289,68 @@ impl RarArchive {
                 .unwrap()
                 .decompress(compressed, unpacked_size)
         }
+    }
+
+    pub(super) fn run_solid_decoder_to_writer<W: Write>(
+        &mut self,
+        compressed: &[u8],
+        unpacked_size: u64,
+        fh: &FileHeader,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        let dict_size = fh.compression.dict_size;
+
+        if dict_size > self.limits.max_dict_size {
+            return Err(RarError::DictionaryTooLarge {
+                size: dict_size,
+                max: self.limits.max_dict_size,
+            });
+        }
+
+        let dict_size = dict_size as usize;
+
+        if fh.compression.format == ArchiveFormat::Rar4 {
+            if let Some(decoder) = &mut self.solid_decoder_rar4 {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
+            }
+            self.solid_decoder_rar4
+                .as_mut()
+                .unwrap()
+                .decompress_to_writer(compressed, unpacked_size, writer)
+        } else {
+            if let Some(decoder) = &mut self.solid_decoder {
+                decoder.prepare_solid_continuation();
+            } else {
+                self.solid_decoder = Some(LzDecoder::new(dict_size));
+            }
+            self.solid_decoder
+                .as_mut()
+                .unwrap()
+                .decompress_to_writer(compressed, unpacked_size, writer)
+        }
+    }
+
+    pub(super) fn replay_solid_decoder(
+        &mut self,
+        compressed: &[u8],
+        unpacked_size: u64,
+        fh: &FileHeader,
+    ) -> RarResult<()> {
+        let dict_size = fh.compression.dict_size;
+
+        if dict_size > self.limits.max_dict_size {
+            return Err(RarError::DictionaryTooLarge {
+                size: dict_size,
+                max: self.limits.max_dict_size,
+            });
+        }
+
+        let mut sink = std::io::sink();
+        self.run_solid_decoder_to_writer(compressed, unpacked_size, fh, &mut sink)?;
+
+        Ok(())
     }
 
     pub(super) fn run_solid_decoder_chunked<F>(

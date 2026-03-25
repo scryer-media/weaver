@@ -468,6 +468,16 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_extracted_members(&self, job_id: JobId) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_extracted WHERE job_id = ?1",
+            [job_id.0 as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Load all active jobs with their committed segments and complete files.
     /// Replaces journal replay on startup.
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {

@@ -88,6 +88,8 @@ pub struct JobState {
     pub spec: JobSpec,
     pub status: JobStatus,
     pub assembly: JobAssembly,
+    /// Number of nested archive extraction passes already performed.
+    pub extraction_depth: u32,
     pub created_at: std::time::Instant,
     /// Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,

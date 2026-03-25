@@ -11,7 +11,9 @@ use std::io::Read;
 
 use crate::error::{RarError, RarResult};
 
-const STREAMING_INPUT_BUFFER_SIZE: usize = 0x400000;
+// Keep the streaming reader buffer modest. Large RAR5 members already need the
+// dictionary window; additional multi-megabyte input staging is pure overhead.
+const STREAMING_INPUT_BUFFER_SIZE: usize = 0x80000;
 
 pub trait BitRead {
     fn bits_remaining(&mut self) -> usize;
