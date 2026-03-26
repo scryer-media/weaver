@@ -6,6 +6,8 @@
 //! Reference: 7-zip Ppmd7.c (public domain), Shkarin's original PPMd (public domain).
 
 use super::alloc::{NodeRef, SubAllocator, UNIT_SIZE};
+use super::range::RangeCode;
+#[cfg(test)]
 use super::range::RangeDecoder;
 use super::see::SeeTable;
 // --- Constants ---
@@ -344,7 +346,7 @@ impl Model {
     // =======================================================================
 
     /// Decode one character. Returns 0-255 on success, -1 on error/restart.
-    pub fn decode_char(&mut self, rc: &mut RangeDecoder) -> i32 {
+    pub fn decode_char<R: RangeCode>(&mut self, rc: &mut R) -> i32 {
         if self.min_context == 0 || self.alloc.text_exhausted() {
             return -1;
         }
@@ -412,7 +414,7 @@ impl Model {
     // decode_bin_symbol (NumStats == 1)
     // =======================================================================
 
-    fn decode_bin_symbol(&mut self, rc: &mut RangeDecoder) {
+    fn decode_bin_symbol<R: RangeCode>(&mut self, rc: &mut R) {
         let ctx = self.min_context;
         let symbol = self.one_sym(ctx);
         let freq = self.one_freq(ctx);
@@ -464,7 +466,7 @@ impl Model {
     // decode_symbol1 (NumStats > 1)
     // =======================================================================
 
-    fn decode_symbol1(&mut self, rc: &mut RangeDecoder) -> bool {
+    fn decode_symbol1<R: RangeCode>(&mut self, rc: &mut R) -> bool {
         let ctx = self.min_context;
         let ns = self.ctx_num_stats(ctx) as usize;
         let sum_freq = self.ctx_summ_freq(ctx) as u32;
@@ -587,7 +589,7 @@ impl Model {
     // decode_symbol2 (masked context decode during escape)
     // =======================================================================
 
-    fn decode_symbol2(&mut self, rc: &mut RangeDecoder) -> bool {
+    fn decode_symbol2<R: RangeCode>(&mut self, rc: &mut R) -> bool {
         let ctx = self.min_context;
         let ns = self.ctx_num_stats(ctx) as usize;
         let diff = ns - self.num_masked;

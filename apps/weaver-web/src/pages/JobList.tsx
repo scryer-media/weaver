@@ -428,8 +428,8 @@ export function JobList() {
         <>
           <Card className="hidden lg:block">
             <CardContent className="px-0 pb-0">
-              <Table className="table-fixed">
-                <TableHeader>
+              <Table className="table-fixed" wrapperClassName="max-h-[1700px]">
+                <TableHeader className="sticky top-0 z-10 bg-card">
                   <TableRow className="hover:bg-transparent">
                     <TableHead className="h-7 w-[4%] px-2">
                       <Checkbox

@@ -47,16 +47,60 @@ impl QueryRoot {
     }
 
     /// List jobs, optionally filtered by status, category, or metadata key.
+    /// Supports pagination via `limit` and `offset`.
     async fn jobs(
         &self,
         ctx: &Context<'_>,
         status: Option<Vec<JobStatusGql>>,
         category: Option<String>,
         has_metadata_key: Option<String>,
+        limit: Option<u32>,
+        offset: Option<u32>,
     ) -> Result<Vec<Job>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let infos = handle.list_jobs();
-        let jobs = infos
+        let filtered = infos.iter().filter(|info| {
+            if let Some(ref statuses) = status {
+                let gql_status = JobStatusGql::from(&info.status);
+                if !statuses.contains(&gql_status) {
+                    return false;
+                }
+            }
+            if let Some(ref cat) = category
+                && info.category.as_ref() != Some(cat)
+            {
+                return false;
+            }
+            if let Some(ref key) = has_metadata_key
+                && !info.metadata.iter().any(|(k, _)| k == key)
+            {
+                return false;
+            }
+            true
+        });
+        let jobs = if let Some(lim) = limit {
+            filtered
+                .skip(offset.unwrap_or(0) as usize)
+                .take(lim as usize)
+                .map(Job::from)
+                .collect()
+        } else {
+            filtered.map(Job::from).collect()
+        };
+        Ok(jobs)
+    }
+
+    /// Count jobs matching the given filters (same filters as `jobs`).
+    async fn job_count(
+        &self,
+        ctx: &Context<'_>,
+        status: Option<Vec<JobStatusGql>>,
+        category: Option<String>,
+        has_metadata_key: Option<String>,
+    ) -> Result<u32> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let infos = handle.list_jobs();
+        let count = infos
             .iter()
             .filter(|info| {
                 if let Some(ref statuses) = status {
@@ -77,9 +121,8 @@ impl QueryRoot {
                 }
                 true
             })
-            .map(Job::from)
-            .collect();
-        Ok(jobs)
+            .count();
+        Ok(count as u32)
     }
 
     /// Get a specific job by ID.

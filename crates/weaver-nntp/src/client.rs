@@ -127,13 +127,14 @@ impl NntpClient {
                 | Err(NntpError::AccessDenied) => {
                     warn!(
                         server = idx,
-                        message_id, "authentication/access failure, recording on health tracker"
+                        message_id, "authentication/access failure, trying next server"
                     );
                     {
                         let mut health = self.pool.health().lock().await;
                         health.record_failure(idx, true);
                     }
-                    return Err(NntpError::AuthenticationFailed);
+                    last_error = Some(NntpError::AuthenticationFailed);
+                    continue;
                 }
                 Err(e) if is_transient(&e) => {
                     warn!(
@@ -142,6 +143,58 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_error.unwrap_or(NntpError::PoolExhausted))
+    }
+
+    /// Like [`fetch_body_with_groups`](Self::fetch_body_with_groups) but skips
+    /// the specified servers. Used after decode failures to avoid re-downloading
+    /// from a server that returned corrupt data.
+    pub async fn fetch_body_with_groups_excluding(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> Result<Bytes> {
+        if groups.is_empty() {
+            return self.fetch_body(message_id).await;
+        }
+
+        let server_count = self.pool.server_count();
+        let mut last_error: Option<NntpError> = None;
+
+        let mut order: Vec<usize> = (0..server_count)
+            .filter(|i| !exclude.contains(i))
+            .collect();
+        let server_groups = self.pool.server_groups();
+        order.sort_by_key(|&i| server_groups[i]);
+
+        if order.is_empty() {
+            return Err(NntpError::PoolExhausted);
+        }
+
+        for idx in order {
+            let server = ServerId(idx);
+            match self
+                .fetch_from_server_with_groups(server, message_id, groups)
+                .await
+            {
+                Ok(data) => return Ok(data),
+                Err(NntpError::ArticleNotFound)
+                | Err(NntpError::NoSuchArticle { .. })
+                | Err(NntpError::NoArticleWithNumber) => {
+                    last_error = Some(NntpError::NoSuchArticle {
+                        message_id: message_id.to_string(),
+                    });
+                    continue;
+                }
+                Err(e) if is_transient(&e) => {
                     last_error = Some(e);
                     continue;
                 }
@@ -206,13 +259,14 @@ impl NntpClient {
                 | Err(NntpError::AccessDenied) => {
                     warn!(
                         server = idx,
-                        message_id, "authentication/access failure, recording on health tracker"
+                        message_id, "authentication/access failure, trying next server"
                     );
                     {
                         let mut health = self.pool.health().lock().await;
                         health.record_failure(idx, true);
                     }
-                    return Err(NntpError::AuthenticationFailed);
+                    last_error = Some(NntpError::AuthenticationFailed);
+                    continue;
                 }
                 Err(e) if is_transient(&e) => {
                     warn!(

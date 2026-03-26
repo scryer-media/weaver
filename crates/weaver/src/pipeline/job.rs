@@ -107,7 +107,7 @@ impl Pipeline {
         let state = JobState {
             job_id,
             spec,
-            status: JobStatus::Downloading,
+            status: JobStatus::Queued,
             assembly,
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
@@ -203,6 +203,7 @@ impl Pipeline {
                         byte_estimate: seg.bytes,
                         retry_count: 0,
                         is_recovery,
+                        exclude_servers: vec![],
                     });
                 }
             }

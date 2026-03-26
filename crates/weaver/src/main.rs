@@ -867,6 +867,7 @@ async fn detect_server_capabilities(config: &mut Config, db: &Database) {
 /// Convert a status string (from SQLite) to a scheduler JobStatus.
 fn status_str_to_job_status(status: &str, error: Option<&str>) -> weaver_scheduler::JobStatus {
     match status {
+        "queued" => weaver_scheduler::JobStatus::Queued,
         "downloading" => weaver_scheduler::JobStatus::Downloading,
         "verifying" => weaver_scheduler::JobStatus::Verifying,
         "repairing" => weaver_scheduler::JobStatus::Repairing,

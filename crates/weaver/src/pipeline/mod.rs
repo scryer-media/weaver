@@ -242,6 +242,10 @@ pub struct Pipeline {
     /// Archives whose extraction has completed successfully (by archive name).
     /// For RAR this is the set name; for 7z/zip/tar/gz it's the archive name.
     pub(super) extracted_archives: HashMap<JobId, HashSet<String>>,
+    /// Tracks decode failure retries per segment. When yEnc decode fails (CRC/size
+    /// mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
+    /// failures, the segment is marked permanently failed.
+    pub(super) decode_retries: HashMap<SegmentId, u32>,
     /// Archives with in-flight extraction tasks (spawned but not yet completed).
     /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
@@ -369,6 +373,7 @@ impl Pipeline {
             par2_runtime: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
+            decode_retries: HashMap::new(),
             inflight_extractions: HashMap::new(),
             failed_extractions: HashMap::new(),
             eagerly_deleted: HashMap::new(),
@@ -1481,6 +1486,9 @@ impl Pipeline {
         self.active_downloads_by_job.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
+        // Clean up decode retry tracking for all segments in this job.
+        self.decode_retries
+            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();
     }
 
@@ -2559,7 +2567,7 @@ mod tests {
         .unwrap();
 
         let info = harness.handle.get_job(submitted.job_id).unwrap();
-        assert_eq!(info.status, JobStatus::Downloading);
+        assert_eq!(info.status, JobStatus::Queued);
         assert!(
             info.metadata
                 .contains(&("source".to_string(), "test".to_string()))

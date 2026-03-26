@@ -35,6 +35,7 @@ pub trait BitRead {
 /// Bits are stored left-aligned in the u64: the next bit to read is
 /// always at bit 63 (MSB). `peek_bits(n)` is a single right-shift,
 /// and `skip_bits(n)` is a left-shift + counter decrement.
+#[derive(Clone)]
 pub struct BitReader<'a> {
     /// Source data.
     data: &'a [u8],

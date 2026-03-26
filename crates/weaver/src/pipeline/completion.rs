@@ -1588,7 +1588,7 @@ impl Pipeline {
             // If no data files registered yet but there are still segments queued,
             // downloads haven't really started — don't prematurely leave Downloading.
             if total == 0
-                && state.status == JobStatus::Downloading
+                && matches!(state.status, JobStatus::Queued | JobStatus::Downloading)
                 && (!state.download_queue.is_empty() || !state.recovery_queue.is_empty())
             {
                 return;

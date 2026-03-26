@@ -7,6 +7,17 @@ impl Pipeline {
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
+        // Transition Queued → Downloading when the first segment is dispatched.
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            if state.status == JobStatus::Queued {
+                state.status = JobStatus::Downloading;
+                self.db_fire_and_forget(move |db| {
+                    if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                        tracing::error!(error = %e, "db write failed for queued→downloading");
+                    }
+                });
+            }
+        }
         if self.active_download_passes.insert(job_id) {
             let _ = self
                 .event_tx
@@ -236,7 +247,7 @@ impl Pipeline {
             .iter()
             .filter(|id| {
                 self.jobs.get(id).is_some_and(|s| match s.status {
-                    JobStatus::Downloading => !s.download_queue.is_empty(),
+                    JobStatus::Queued | JobStatus::Downloading => !s.download_queue.is_empty(),
                     // Post-processing jobs may have promoted recovery segments.
                     JobStatus::Extracting | JobStatus::Verifying | JobStatus::Repairing => {
                         !s.download_queue.is_empty()
@@ -363,12 +374,18 @@ impl Pipeline {
         let message_id = work.message_id.to_string();
         let groups = work.groups;
         let retry_count = work.retry_count;
+        let exclude_servers = work.exclude_servers;
 
         tokio::spawn(async move {
-            let data = nntp
-                .fetch_body_with_groups(&message_id, &groups)
-                .await
-                .map_err(|e| e.to_string());
+            let data = if exclude_servers.is_empty() {
+                nntp.fetch_body_with_groups(&message_id, &groups)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                nntp.fetch_body_with_groups_excluding(&message_id, &groups, &exclude_servers)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
 
             let _ = tx
                 .send(DownloadResult {
@@ -513,6 +530,7 @@ impl Pipeline {
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
+                                exclude_servers: vec![],
                             };
                             self.metrics
                                 .segments_retried

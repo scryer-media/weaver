@@ -9,6 +9,9 @@ use std::ptr;
 
 use crate::error::{RarError, RarResult};
 
+/// Matches unrar's PackDef::MAX_INC_LZ_MATCH.
+const MAX_INC_LZ_MATCH: usize = 0x1004;
+
 /// Sliding window ring buffer used during LZ decompression.
 pub struct Window {
     /// The ring buffer.
@@ -46,12 +49,33 @@ impl Window {
         self.total_written += 1;
     }
 
-    /// Safety margin for the no-wrap fast path.
-    ///
-    /// unrar uses MAX_INC_LZ_MATCH = 0x1004 (4100) here. Our fast path
-    /// additionally bounds by `length`, so a smaller margin is safe. We use
-    /// the unrar value anyway for parity.
-    const NO_WRAP_MARGIN: usize = 0x1004;
+    /// Write a contiguous slice of literal bytes to the window.
+    #[inline]
+    pub fn put_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        let dict_size = self.buf.len();
+        let dst = self.pos;
+        let length = bytes.len();
+
+        if dst + length <= dict_size {
+            self.buf[dst..dst + length].copy_from_slice(bytes);
+            self.pos = dst + length;
+            if self.pos == dict_size {
+                self.pos = 0;
+            }
+        } else {
+            let first = dict_size - dst;
+            self.buf[dst..].copy_from_slice(&bytes[..first]);
+            let second = length - first;
+            self.buf[..second].copy_from_slice(&bytes[first..]);
+            self.pos = second;
+        }
+
+        self.total_written += length as u64;
+    }
 
     #[inline]
     fn copy_no_wrap_fast(&mut self, src: usize, distance: usize, length: usize) {
@@ -129,6 +153,10 @@ impl Window {
             dict_size - (distance - self.pos)
         };
 
+        if length == 0 {
+            return Ok(());
+        }
+
         // Fast path: distance=1 is byte-fill (very common RLE pattern).
         if distance == 1 {
             let byte = self.buf[src];
@@ -150,40 +178,32 @@ impl Window {
             return Ok(());
         }
 
-        // Fast path: both src and dst are far enough from the window boundary
-        // that neither will wrap during this copy. Skip all modulo arithmetic.
-        // Matches unrar's CopyString check:
-        //   if (SrcPtr < MaxWinSize - MAX_INC_LZ_MATCH &&
-        //       UnpPtr < MaxWinSize - MAX_INC_LZ_MATCH)
-        // Unlike unrar, we don't need the large margin because we bound by
-        // `length` explicitly. But we use the same margin for parity.
-        if length <= Self::NO_WRAP_MARGIN
-            && src < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
-            && self.pos < dict_size.saturating_sub(Self::NO_WRAP_MARGIN)
-        {
+        // Match unrar's fast-path guard: if both pointers are sufficiently far
+        // from the end of the window, CopyString can avoid wrap handling for
+        // the maximum legal match length, not just for this specific length.
+        let fast_limit = dict_size.saturating_sub(MAX_INC_LZ_MATCH);
+        if src < fast_limit && self.pos < fast_limit {
             self.copy_no_wrap_fast(src, distance, length);
             return Ok(());
         }
 
         // General path with wrap handling and overlap support.
+        // Keep it branch-light and forward-copying like unrar's slow path.
         let mut src = src;
         let mut dst = self.pos;
         let mut remaining = length;
 
         while remaining > 0 {
-            let src_contig = dict_size - src;
-            let dst_contig = dict_size - dst;
-            let gap = if src < dst {
-                dst - src
-            } else {
-                dict_size - src + dst
-            };
-            let chunk = remaining.min(src_contig).min(dst_contig).min(gap);
-
-            self.buf.copy_within(src..src + chunk, dst);
-            src = (src + chunk) % dict_size;
-            dst = (dst + chunk) % dict_size;
-            remaining -= chunk;
+            self.buf[dst] = self.buf[src];
+            src += 1;
+            if src == dict_size {
+                src = 0;
+            }
+            dst += 1;
+            if dst == dict_size {
+                dst = 0;
+            }
+            remaining -= 1;
         }
 
         self.pos = dst;

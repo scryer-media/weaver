@@ -143,6 +143,7 @@ mod tests {
             byte_estimate: 768_000,
             retry_count: 0,
             is_recovery: false,
+            exclude_servers: vec![],
         }
     }
 

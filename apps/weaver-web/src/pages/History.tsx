@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { Link } from "react-router";
-import { useMutation, useQuery, useSubscription } from "urql";
+import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
@@ -24,6 +24,7 @@ import {
   DELETE_HISTORY_BATCH_MUTATION,
   DELETE_HISTORY_MUTATION,
   EVENTS_SUBSCRIPTION,
+  HISTORY_JOBS_COUNT_QUERY,
   HISTORY_JOBS_QUERY,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -47,14 +48,20 @@ type HistoryJob = {
 
 type HistoryFilter = "all" | "success" | "failure";
 
+const PAGE_SIZE = 50;
+
 export function History() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecuteQuery] = useQuery({ query: HISTORY_JOBS_QUERY });
+  const client = useClient();
   const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
   const [deleteBatchState, deleteHistoryBatch] = useMutation(DELETE_HISTORY_BATCH_MUTATION);
   const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
 
   const [jobs, setJobs] = useState<HistoryJob[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [initialFetching, setInitialFetching] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
@@ -63,52 +70,141 @@ export function History() {
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [search, setSearch] = useState("");
 
-  useEffect(() => {
-    if (data?.jobs) {
-      setJobs(data.jobs);
-    }
-  }, [data?.jobs]);
+  const desktopSentinelRef = useRef<HTMLDivElement>(null);
+  const mobileSentinelRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Initial page + count
+  const [{ data: initialData }] = useQuery({
+    query: HISTORY_JOBS_QUERY,
+    variables: { limit: PAGE_SIZE, offset: 0 },
+  });
+  const [{ data: countData }, refetchCount] = useQuery({
+    query: HISTORY_JOBS_COUNT_QUERY,
+  });
+
+  useEffect(() => {
+    if (initialData?.jobs) {
+      setJobs(initialData.jobs);
+      setHasMore(initialData.jobs.length >= PAGE_SIZE);
+      setInitialFetching(false);
+    }
+  }, [initialData?.jobs]);
+
+  useEffect(() => {
+    if (countData?.jobCount != null) {
+      setTotalCount(countData.jobCount);
+    }
+  }, [countData?.jobCount]);
+
+  // Load next page
+  const loadMore = useCallback(async () => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const result = await client
+        .query(HISTORY_JOBS_QUERY, { limit: PAGE_SIZE, offset: jobs.length })
+        .toPromise();
+      const nextJobs: HistoryJob[] = result.data?.jobs ?? [];
+      if (nextJobs.length > 0) {
+        setJobs((prev) => {
+          const existingIds = new Set(prev.map((j) => j.id));
+          const deduped = nextJobs.filter((j) => !existingIds.has(j.id));
+          return [...prev, ...deduped];
+        });
+      }
+      setHasMore(nextJobs.length >= PAGE_SIZE);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [loadingMore, hasMore, jobs.length, client]);
+
+  // Desktop: sentinel is inside the scrollable Table container
+  useEffect(() => {
+    const el = desktopSentinelRef.current;
+    const root = scrollRef.current;
+    if (!el || !root || !hasMore) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry?.isIntersecting) void loadMore(); },
+      { root, rootMargin: "200px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, loadMore]);
+
+  // Mobile: sentinel is in page flow, observed against viewport
+  useEffect(() => {
+    const el = mobileSentinelRef.current;
+    if (!el || !hasMore) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry?.isIntersecting) void loadMore(); },
+      { rootMargin: "200px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, loadMore]);
+
+  // Delete mutations update local state
   useEffect(() => {
     if (deleteState.data?.deleteHistory) {
       setJobs(deleteState.data.deleteHistory);
+      void refetchCount();
     }
-  }, [deleteState.data]);
+  }, [deleteState.data, refetchCount]);
 
   useEffect(() => {
     if (deleteBatchState.data?.deleteHistoryBatch) {
       setJobs(deleteBatchState.data.deleteHistoryBatch);
       setSelectedIds(new Set());
+      void refetchCount();
     }
-  }, [deleteBatchState.data]);
+  }, [deleteBatchState.data, refetchCount]);
 
   useEffect(() => {
     if (deleteAllState.data?.deleteAllHistory) {
       setJobs(deleteAllState.data.deleteAllHistory);
       setSelectedIds(new Set());
+      setTotalCount(0);
+      setHasMore(false);
     }
   }, [deleteAllState.data]);
 
-  // Re-fetch history when jobs complete or fail (queue -> history transition)
+  // Prepend newly completed/failed jobs from event stream
   const handleSubscription = useCallback(
     (_prev: unknown, response: { events: { kind: string; jobId: number | null } }) => {
       const event = response.events;
-      if (event.kind === "JOB_COMPLETED" || event.kind === "JOB_FAILED") {
-        void reexecuteQuery({ requestPolicy: "network-only" });
+      if (
+        (event.kind === "JOB_COMPLETED" || event.kind === "JOB_FAILED") &&
+        event.jobId != null
+      ) {
+        void client
+          .query(HISTORY_JOBS_QUERY, { limit: 1, offset: 0 })
+          .toPromise()
+          .then((result) => {
+            const newJobs: HistoryJob[] = result.data?.jobs ?? [];
+            if (newJobs.length > 0) {
+              setJobs((prev) => {
+                const existingIds = new Set(prev.map((j) => j.id));
+                const fresh = newJobs.filter((j) => !existingIds.has(j.id));
+                return [...fresh, ...prev];
+              });
+              setTotalCount((c) => c + newJobs.length);
+            }
+          });
       }
       return [];
     },
-    [reexecuteQuery],
+    [client],
   );
   useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
 
   const counts = useMemo(
     () => ({
-      all: jobs.length,
+      all: totalCount,
       success: jobs.filter((job) => job.status === "COMPLETE").length,
       failure: jobs.filter((job) => job.status === "FAILED").length,
     }),
-    [jobs],
+    [jobs, totalCount],
   );
   const sortedJobs = useMemo(
     () =>
@@ -259,7 +355,7 @@ export function History() {
         </Card>
       ) : null}
 
-      {fetching && jobs.length === 0 ? (
+      {initialFetching && jobs.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
             {t("label.loading")}
@@ -288,8 +384,8 @@ export function History() {
         <>
           <Card className="hidden lg:block">
             <CardContent className="px-0 pb-0">
-              <Table className="table-fixed">
-                <TableHeader>
+              <Table ref={scrollRef} className="table-fixed" wrapperClassName="max-h-[1700px]">
+                <TableHeader className="sticky top-0 z-10 bg-card">
                   <TableRow className="hover:bg-transparent">
                     <TableHead className="h-7 w-[4%] px-2">
                       <Checkbox
@@ -368,6 +464,15 @@ export function History() {
                       </TableCell>
                     </TableRow>
                   ))}
+                  {hasMore ? (
+                    <tr>
+                      <td colSpan={8}>
+                        <div ref={desktopSentinelRef} className="flex justify-center py-3 text-xs text-muted-foreground">
+                          {loadingMore ? t("label.loading") : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
                 </TableBody>
               </Table>
             </CardContent>
@@ -409,6 +514,11 @@ export function History() {
                 </CardContent>
               </Card>
             ))}
+            {hasMore ? (
+              <div ref={mobileSentinelRef} className="flex justify-center py-3 text-xs text-muted-foreground">
+                {loadingMore ? t("label.loading") : null}
+              </div>
+            ) : null}
           </div>
         </>
       )}

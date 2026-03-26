@@ -78,15 +78,110 @@ impl Pipeline {
         match result {
             DecodeDone::Success(result) => self.handle_decode_success(result).await,
             DecodeDone::Failed { segment_id, error } => {
-                debug!(
-                    segment = %segment_id,
-                    error = %error,
-                    "decode work finished with failure"
-                );
+                self.handle_decode_failure(segment_id, &error);
             }
         }
 
         self.pump_decode_queue();
+    }
+
+    /// Handle a decode failure by re-queuing the segment for re-download.
+    ///
+    /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
+    /// article body was corrupted — either in transit or on the server. Following
+    /// NZBGet's approach, we re-download the segment (which may hit a different
+    /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
+    /// decode failures for the same segment, mark it as permanently failed and
+    /// update health.
+    fn handle_decode_failure(&mut self, segment_id: SegmentId, error: &str) {
+        let job_id = segment_id.file_id.job_id;
+
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| is_terminal_status(&state.status))
+        {
+            debug!(
+                segment = %segment_id,
+                error,
+                "decode failed for inactive job — not retrying"
+            );
+            return;
+        }
+
+        let retries = self
+            .decode_retries
+            .entry(segment_id)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        let retry_count = *retries;
+
+        if retry_count > MAX_SEGMENT_RETRIES {
+            warn!(
+                segment = %segment_id,
+                error,
+                retries = MAX_SEGMENT_RETRIES,
+                "decode failed permanently after max retries"
+            );
+            self.metrics
+                .segments_failed_permanent
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                let file_idx = segment_id.file_id.file_index as usize;
+                if let Some(file_spec) = state.spec.files.get(file_idx)
+                    && let Some(seg_spec) = file_spec
+                        .segments
+                        .iter()
+                        .find(|s| s.number == segment_id.segment_number)
+                {
+                    state.failed_bytes += seg_spec.bytes as u64;
+                }
+            }
+            self.check_health(job_id);
+            return;
+        }
+
+        // Re-queue for download — the NNTP pool may select a different server.
+        if let Some(state) = self.jobs.get(&job_id) {
+            let file_idx = segment_id.file_id.file_index as usize;
+            if let Some(file_spec) = state.spec.files.get(file_idx)
+                && let Some(seg_spec) = file_spec
+                    .segments
+                    .iter()
+                    .find(|s| s.number == segment_id.segment_number)
+            {
+                // Exclude servers that have already returned bad data for this
+                // segment. On decode retry N, exclude the first N servers in
+                // priority order so each retry tries a different server.
+                let exclude: Vec<usize> = (0..retry_count as usize).collect();
+                let work = DownloadWork {
+                    segment_id,
+                    message_id: weaver_core::id::MessageId::new(&seg_spec.message_id),
+                    groups: file_spec.groups.clone(),
+                    priority: file_spec.role.download_priority(),
+                    byte_estimate: seg_spec.bytes,
+                    retry_count: 0,
+                    is_recovery: file_spec.role.is_recovery(),
+                    exclude_servers: exclude,
+                };
+                self.metrics
+                    .segments_retried
+                    .fetch_add(1, Ordering::Relaxed);
+                let delay = std::time::Duration::from_secs(1 << (retry_count - 1));
+                warn!(
+                    segment = %segment_id,
+                    error,
+                    decode_retry = retry_count,
+                    delay_secs = delay.as_secs(),
+                    "decode failed — re-downloading"
+                );
+                let retry_tx = self.retry_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = retry_tx.send(work).await;
+                });
+            }
+        }
     }
 
     async fn handle_decode_success(&mut self, result: DecodeResult) {

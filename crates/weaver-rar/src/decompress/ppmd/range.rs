@@ -6,10 +6,20 @@
 //!
 //! Reference: Dmitry Shkarin's public-domain PPMd code, 7-zip (public domain).
 
+use crate::decompress::lz::bitstream::BitRead;
+
 use crate::error::{RarError, RarResult};
 
 /// Scale factor for frequency counts — range is normalized to [0, SCALE).
 pub const SCALE: u32 = 1 << 15; // 32768
+
+pub trait RangeCode {
+    fn get_current_count(&self, scale: u32) -> u32;
+    fn get_threshold(&self, scale: u32) -> u32;
+    fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32);
+    fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool;
+    fn position(&self) -> usize;
+}
 
 /// Range decoder state.
 pub struct RangeDecoder<'a> {
@@ -18,6 +28,14 @@ pub struct RangeDecoder<'a> {
     low: u32,
     code: u32,
     range: u32,
+}
+
+pub struct BitReadRangeDecoder<'a, R: BitRead> {
+    reader: &'a mut R,
+    low: u32,
+    code: u32,
+    range: u32,
+    pos: usize,
 }
 
 impl<'a> RangeDecoder<'a> {
@@ -127,6 +145,108 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
+impl<R: BitRead> BitReadRangeDecoder<'_, R> {
+    pub fn new(reader: &mut R) -> RarResult<BitReadRangeDecoder<'_, R>> {
+        let b0 = reader.read_bits(8)? as u8;
+        let b1 = reader.read_bits(8)? as u8;
+        let b2 = reader.read_bits(8)? as u8;
+        let b3 = reader.read_bits(8)? as u8;
+        let code = u32::from_be_bytes([b0, b1, b2, b3]);
+
+        Ok(BitReadRangeDecoder {
+            reader,
+            low: 0,
+            code,
+            range: u32::MAX,
+            pos: 4,
+        })
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        match self.reader.read_bits(8) {
+            Ok(byte) => {
+                self.pos += 1;
+                byte as u8
+            }
+            Err(_) => 0,
+        }
+    }
+
+    #[inline]
+    fn normalize(&mut self) {
+        while self.range < (1 << 24) {
+            self.code = (self.code << 8) | self.read_byte() as u32;
+            self.range <<= 8;
+            self.low <<= 8;
+        }
+    }
+}
+
+impl RangeCode for RangeDecoder<'_> {
+    fn get_current_count(&self, scale: u32) -> u32 {
+        RangeDecoder::get_current_count(self, scale)
+    }
+
+    fn get_threshold(&self, scale: u32) -> u32 {
+        RangeDecoder::get_threshold(self, scale)
+    }
+
+    fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
+        RangeDecoder::decode(self, cum_freq, freq, scale)
+    }
+
+    fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool {
+        RangeDecoder::decode_binary(self, freq0, scale)
+    }
+
+    fn position(&self) -> usize {
+        RangeDecoder::position(self)
+    }
+}
+
+impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
+    fn get_current_count(&self, scale: u32) -> u32 {
+        if scale == 0 {
+            return 0;
+        }
+        let r = self.range / scale;
+        if r == 0 {
+            return 0;
+        }
+        (self.code.wrapping_sub(self.low)) / r
+    }
+
+    fn get_threshold(&self, scale: u32) -> u32 {
+        self.get_current_count(scale)
+    }
+
+    fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
+        let r = if scale > 0 {
+            self.range / scale
+        } else {
+            self.range
+        };
+        self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
+        self.range = freq.max(1).wrapping_mul(r);
+        self.normalize();
+    }
+
+    fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool {
+        let threshold = self.get_threshold(scale);
+        if threshold < freq0 {
+            self.decode(0, freq0, scale);
+            true
+        } else {
+            self.decode(freq0, scale - freq0, scale);
+            false
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.pos
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +282,19 @@ mod tests {
         let input = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut rd = RangeDecoder::new(&input).unwrap();
         assert!(rd.decode_binary(128, 256)); // symbol 0 selected
+    }
+
+    #[test]
+    fn test_bitread_range_decoder_matches_slice_decoder() {
+        use crate::decompress::lz::bitstream::BitReader;
+
+        let input = [0x40, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
+        let slice = RangeDecoder::new(&input).unwrap();
+        let mut bit_reader = BitReader::new(&input);
+        let streaming = BitReadRangeDecoder::new(&mut bit_reader).unwrap();
+
+        assert_eq!(slice.get_current_count(256), streaming.get_current_count(256));
+        assert_eq!(slice.get_threshold(256), streaming.get_threshold(256));
+        assert_eq!(slice.position(), streaming.position());
     }
 }

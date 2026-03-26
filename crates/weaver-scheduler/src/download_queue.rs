@@ -13,6 +13,8 @@ pub struct DownloadWork {
     pub retry_count: u32,
     /// Whether this segment belongs to a recovery file (PAR2 repair blocks).
     pub is_recovery: bool,
+    /// Servers to skip for this download (e.g. after decode failure from that server).
+    pub exclude_servers: Vec<usize>,
 }
 
 /// Wrapper that implements ordering for the priority queue.
@@ -153,6 +155,7 @@ mod tests {
             byte_estimate: 768_000,
             retry_count: 0,
             is_recovery: false,
+            exclude_servers: vec![],
         }
     }
 

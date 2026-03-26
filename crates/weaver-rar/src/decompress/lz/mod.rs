@@ -54,6 +54,8 @@ const MAX_FILTER_BLOCK_SIZE: usize = 0x400000;
 /// Maximum number of bytes to accumulate before flushing decoded output.
 /// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
 const UNPACK_MAX_WRITE: usize = 0x400000;
+const STREAMING_PARALLEL_READ_BUFFER_SIZE: usize = 0x400000;
+const STREAMING_PARALLEL_MIN_PROCESS_SIZE: usize = 1024;
 
 /// State for the LZ decompressor.
 pub struct LzDecoder {
@@ -101,6 +103,98 @@ impl LzDecoder {
 
     fn flush_threshold(&self) -> usize {
         self.window.dict_size().clamp(1, UNPACK_MAX_WRITE)
+    }
+
+    #[inline]
+    pub(super) fn insert_old_dist(&mut self, distance: usize) {
+        self.dist_cache[3] = self.dist_cache[2];
+        self.dist_cache[2] = self.dist_cache[1];
+        self.dist_cache[1] = self.dist_cache[0];
+        self.dist_cache[0] = distance;
+    }
+
+    #[inline]
+    pub(super) fn promote_old_dist(&mut self, cache_idx: usize) -> RarResult<usize> {
+        let distance = self.dist_cache[cache_idx];
+        if distance == 0 {
+            return Err(RarError::CorruptArchive {
+                detail: "distance cache entry is zero".into(),
+            });
+        }
+
+        if cache_idx > 0 {
+            for index in (1..=cache_idx).rev() {
+                self.dist_cache[index] = self.dist_cache[index - 1];
+            }
+            self.dist_cache[0] = distance;
+        }
+
+        Ok(distance)
+    }
+
+    fn advance_staged_prefix(staged_start: &mut usize, staged_len: usize, bit_offset: &mut usize) {
+        *staged_start += *bit_offset / 8;
+        *bit_offset %= 8;
+        if *staged_start >= staged_len {
+            *staged_start = 0;
+            *bit_offset = 0;
+        }
+    }
+
+    fn compact_staged_buffer(staged: &mut Vec<u8>, staged_start: &mut usize) {
+        if *staged_start == 0 {
+            return;
+        }
+
+        if *staged_start < staged.len() {
+            staged.copy_within(*staged_start.., 0);
+            staged.truncate(staged.len() - *staged_start);
+        } else {
+            staged.clear();
+        }
+        *staged_start = 0;
+    }
+
+    fn flush_stream_output<W: Write>(&mut self, writer: &mut W) -> RarResult<()> {
+        if self.pending_filters.is_empty() {
+            self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+        } else {
+            self.flush_filters_and_write(writer)?;
+            if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 pending filters exceeded dictionary window before flush".into(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn try_read_block_header_buffered(&mut self, reader: &mut BitReader<'_>) -> RarResult<bool> {
+        let reader_checkpoint = reader.clone();
+        let code_lengths_checkpoint = self.code_lengths.clone();
+        let nc_table_checkpoint = self.nc_table.clone();
+        let dc_table_checkpoint = self.dc_table.clone();
+        let ldc_table_checkpoint = self.ldc_table.clone();
+        let rc_table_checkpoint = self.rc_table.clone();
+        let block_bits_remaining_checkpoint = self.block_bits_remaining;
+        let is_last_block_checkpoint = self.is_last_block;
+
+        match self.read_block_header(reader) {
+            Ok(()) => Ok(true),
+            Err(error) if parallel::is_truncated_input_error(&error) => {
+                *reader = reader_checkpoint;
+                self.code_lengths = code_lengths_checkpoint;
+                self.nc_table = nc_table_checkpoint;
+                self.dc_table = dc_table_checkpoint;
+                self.ldc_table = ldc_table_checkpoint;
+                self.rc_table = rc_table_checkpoint;
+                self.block_bits_remaining = block_bits_remaining_checkpoint;
+                self.is_last_block = is_last_block_checkpoint;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read a RAR5 block header.
@@ -292,11 +386,7 @@ impl LzDecoder {
                 let remaining = (unpacked_size - output_size) as usize;
                 length = length.min(remaining);
 
-                // Update distance cache (unrolled, matching unrar's InsertOldDist).
-                self.dist_cache[3] = self.dist_cache[2];
-                self.dist_cache[2] = self.dist_cache[1];
-                self.dist_cache[1] = self.dist_cache[0];
-                self.dist_cache[0] = distance;
+                self.insert_old_dist(distance);
 
                 self.last_length = length;
                 self.window.copy(distance, length)?;
@@ -319,26 +409,12 @@ impl LzDecoder {
             } else {
                 // sym 258..=261: repeat distance from cache.
                 let cache_idx = (sym - 258) as usize;
-                let distance = self.dist_cache[cache_idx];
-                if distance == 0 {
-                    return Err(RarError::CorruptArchive {
-                        detail: "distance cache entry is zero".into(),
-                    });
-                }
+                let distance = self.promote_old_dist(cache_idx)?;
 
                 let rc = self.rc_table.as_ref().unwrap();
                 let mut length = self.decode_rc_length(reader, rc)?;
                 let remaining = (unpacked_size - output_size) as usize;
                 length = length.min(remaining);
-
-                // Promote cache entry to front.
-                if cache_idx > 0 {
-                    let dist = self.dist_cache[cache_idx];
-                    for i in (1..=cache_idx).rev() {
-                        self.dist_cache[i] = self.dist_cache[i - 1];
-                    }
-                    self.dist_cache[0] = dist;
-                }
 
                 self.last_length = length;
                 self.window.copy(distance, length)?;
@@ -574,7 +650,7 @@ impl LzDecoder {
 
     pub fn decompress_reader_to_writer<Rd: std::io::Read, W: Write>(
         &mut self,
-        input: Rd,
+        mut input: Rd,
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<u64> {
@@ -582,8 +658,125 @@ impl LzDecoder {
             return Ok(0);
         }
 
+        if !parallel::parallel_enabled() {
+            return self.decompress_reader_to_writer_single_thread(input, unpacked_size, writer, 0);
+        }
+
+        let mut output_size = 0u64;
+        let mut staged = Vec::with_capacity(STREAMING_PARALLEL_READ_BUFFER_SIZE);
+        let mut read_buf = vec![0u8; STREAMING_PARALLEL_READ_BUFFER_SIZE];
+        let mut reached_eof = false;
+        let mut staged_start = 0usize;
+        let mut staged_bit_offset = 0usize;
+
+        while output_size < unpacked_size {
+            if staged_start > 0
+                && (staged_start >= STREAMING_PARALLEL_READ_BUFFER_SIZE / 2
+                    || staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE)
+            {
+                Self::compact_staged_buffer(&mut staged, &mut staged_start);
+            }
+
+            while !reached_eof && staged.len() - staged_start < STREAMING_PARALLEL_READ_BUFFER_SIZE {
+                if staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE {
+                    Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                }
+
+                let max_read = STREAMING_PARALLEL_READ_BUFFER_SIZE - (staged.len() - staged_start);
+                let read = input.read(&mut read_buf[..max_read]).map_err(RarError::Io)?;
+                if read == 0 {
+                    reached_eof = true;
+                    break;
+                }
+                staged.extend_from_slice(&read_buf[..read]);
+            }
+
+            let staged_slice = &staged[staged_start..];
+            if staged_slice.is_empty() {
+                break;
+            }
+
+            let have_incomplete_block = self.block_bits_remaining > 0 || staged_bit_offset > 0;
+            if have_incomplete_block {
+                let mut reader = BitReader::new(staged_slice);
+                if staged_bit_offset > 0 {
+                    reader.skip_bits(staged_bit_offset as u32)?;
+                }
+
+                match self.decode_block(
+                    &mut reader,
+                    unpacked_size,
+                    output_size,
+                    Some(self.flush_threshold()),
+                ) {
+                    Ok(new_output_size) => {
+                        output_size = new_output_size;
+                        self.flush_stream_output(writer)?;
+                        staged_bit_offset = reader.position();
+                        Self::advance_staged_prefix(
+                            &mut staged_start,
+                            staged.len(),
+                            &mut staged_bit_offset,
+                        );
+                        continue;
+                    }
+                    Err(error) if parallel::is_truncated_input_error(&error) && !reached_eof => {
+                        staged_bit_offset = reader.position();
+                        Self::advance_staged_prefix(
+                            &mut staged_start,
+                            staged.len(),
+                            &mut staged_bit_offset,
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let consumed = self.process_buffered_blocks(
+                staged_slice,
+                unpacked_size,
+                &mut output_size,
+                writer,
+            )?;
+            if consumed > 0 {
+                staged_start += consumed;
+                if staged_start >= staged.len() {
+                    staged.clear();
+                    staged_start = 0;
+                }
+                staged_bit_offset = 0;
+                continue;
+            }
+
+            if !reached_eof && staged_slice.len() < STREAMING_PARALLEL_MIN_PROCESS_SIZE {
+                continue;
+            }
+
+            let mut reader = BitReader::new(staged_slice);
+            if !self.try_read_block_header_buffered(&mut reader)? {
+                if reached_eof {
+                    break;
+                }
+                continue;
+            }
+
+            staged_bit_offset = reader.position();
+        }
+
+        self.flush_filters_and_write(writer)?;
+        Ok(output_size)
+    }
+
+    fn decompress_reader_to_writer_single_thread<Rd: std::io::Read, W: Write>(
+        &mut self,
+        input: Rd,
+        unpacked_size: u64,
+        writer: &mut W,
+        mut output_size: u64,
+    ) -> RarResult<u64> {
+
         let mut reader = StreamingBitReader::new(input);
-        let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
 
         while output_size < unpacked_size {
@@ -612,6 +805,7 @@ impl LzDecoder {
                     });
                 }
             }
+
         }
 
         self.flush_filters_and_write(writer)?;
@@ -705,6 +899,94 @@ impl LzDecoder {
         }
 
         // Final flush.
+        self.flush_filters_and_write(&mut *current_writer)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        Ok(chunks)
+    }
+
+    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F>(
+        &mut self,
+        input: Rd,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut reader = StreamingBitReader::new(input);
+        let mut output_size: u64 = 0;
+        let mut boundary_idx = 0;
+        let flush_threshold = self.flush_threshold();
+
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_volume_index;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+
+        while output_size < unpacked_size {
+            if self.block_bits_remaining <= 0 {
+                if reader.bits_remaining() < 16 {
+                    break;
+                }
+                self.read_block_header(&mut reader)?;
+            }
+
+            let prev_output = output_size;
+            output_size = self.decode_block(
+                &mut reader,
+                unpacked_size,
+                output_size,
+                Some(flush_threshold),
+            )?;
+            let decoded_this_round = output_size - prev_output;
+
+            let byte_pos = reader.byte_position() as u64;
+            let boundary = {
+                let guard = transitions.lock().map_err(|_| RarError::CorruptArchive {
+                    detail: "RAR5 chunked transition state poisoned".into(),
+                })?;
+                guard.get(boundary_idx).cloned()
+            };
+
+            if let Some(boundary) = boundary
+                && byte_pos >= boundary.compressed_offset
+            {
+                self.flush_filters_and_write(&mut *current_writer)?;
+                chunk_bytes += decoded_this_round;
+                chunks.push((current_vol, chunk_bytes));
+
+                current_vol = boundary.volume_index;
+                boundary_idx += 1;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+            } else {
+                chunk_bytes += decoded_this_round;
+
+                if self.pending_filters.is_empty() {
+                    self.window
+                        .flush_to_writer(&mut *current_writer)
+                        .map_err(RarError::Io)?;
+                } else {
+                    self.flush_filters_and_write(&mut *current_writer)?;
+                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                        return Err(RarError::CorruptArchive {
+                            detail: "RAR5 pending filters exceeded dictionary window before flush"
+                                .into(),
+                        });
+                    }
+                }
+            }
+        }
+
         self.flush_filters_and_write(&mut *current_writer)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -873,6 +1155,35 @@ pub fn decompress_lz_reader_to_writer<Rd: std::io::Read, W: Write>(
     let dict_size = info.dict_size as usize;
     let mut decoder = LzDecoder::new(dict_size);
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
+}
+
+pub fn decompress_lz_reader_to_writer_chunked<Rd: std::io::Read, F>(
+    input: Rd,
+    unpacked_size: u64,
+    info: &CompressionInfo,
+    first_volume_index: usize,
+    transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+    writer_factory: F,
+) -> RarResult<Vec<(usize, u64)>>
+where
+    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+{
+    if info.dict_size > MAX_DICT_SIZE {
+        return Err(RarError::DictionaryTooLarge {
+            size: info.dict_size,
+            max: MAX_DICT_SIZE,
+        });
+    }
+
+    let dict_size = info.dict_size as usize;
+    let mut decoder = LzDecoder::new(dict_size);
+    decoder.decompress_reader_to_writer_chunked(
+        input,
+        unpacked_size,
+        first_volume_index,
+        transitions,
+        writer_factory,
+    )
 }
 
 #[cfg(test)]

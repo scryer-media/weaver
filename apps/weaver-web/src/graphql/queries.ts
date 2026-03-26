@@ -557,14 +557,20 @@ export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
 `;
 
 export const HISTORY_JOBS_QUERY = gql`
-  query HistoryJobs {
-    jobs(status: [COMPLETE, FAILED]) {
+  query HistoryJobs($limit: Int, $offset: Int) {
+    jobs(status: [COMPLETE, FAILED], limit: $limit, offset: $offset) {
       ...HistoryJobFields
     }
   }
   ${PARSED_RELEASE_FIELDS}
   ${JOB_LIST_ITEM_FIELDS}
   ${HISTORY_JOB_FIELDS}
+`;
+
+export const HISTORY_JOBS_COUNT_QUERY = gql`
+  query HistoryJobsCount {
+    jobCount(status: [COMPLETE, FAILED])
+  }
 `;
 
 // --- Server management ---

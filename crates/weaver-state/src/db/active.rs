@@ -83,7 +83,7 @@ impl Database {
         conn.execute(
             "INSERT INTO active_jobs
              (job_id, nzb_hash, nzb_path, output_dir, status, created_at, category, metadata)
-             VALUES (?1, ?2, ?3, ?4, 'downloading', ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7)",
             rusqlite::params![
                 job.job_id.0 as i64,
                 job.nzb_hash.as_slice(),
@@ -1141,7 +1141,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let job = &jobs[&JobId(1)];
         assert_eq!(job.nzb_path, PathBuf::from("/tmp/test_1.nzb"));
-        assert_eq!(job.status, "downloading");
+        assert_eq!(job.status, "queued");
         assert!(job.committed_segments.is_empty());
         assert!(job.complete_files.is_empty());
     }

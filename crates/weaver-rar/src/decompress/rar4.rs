@@ -15,11 +15,11 @@ use std::io::Write;
 
 use tracing::{trace, warn};
 
-use super::lz::bitstream::BitReader;
+use super::lz::bitstream::{BitRead, BitReader, StreamingBitReader};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::Window;
 use super::ppmd::model::Model;
-use super::ppmd::range::RangeDecoder;
+use super::ppmd::range::{BitReadRangeDecoder, RangeCode};
 use crate::error::{RarError, RarResult};
 
 /// RAR4 Huffman table sizes.
@@ -155,8 +155,20 @@ impl Rar4LzDecoder {
 
         let mut reader = BitReader::new(input);
 
+        self.decompress_with_reader(&mut reader, unpacked_size)
+    }
+
+    fn decompress_with_reader<R: BitRead>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+    ) -> RarResult<Vec<u8>> {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
         if !self.tables_read {
-            self.read_tables(&mut reader)?;
+            self.read_tables(reader)?;
         }
 
         let mut output_size: u64 = 0;
@@ -168,12 +180,10 @@ impl Rar4LzDecoder {
 
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_lz_symbols(reader, unpacked_size, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_ppm_symbols(reader, unpacked_size, output_size)?;
                 }
             }
         }
@@ -191,8 +201,16 @@ impl Rar4LzDecoder {
 
         let mut reader = BitReader::new(input);
 
+        self.replay_with_reader(&mut reader, unpacked_size)
+    }
+
+    fn replay_with_reader<R: BitRead>(&mut self, reader: &mut R, unpacked_size: u64) -> RarResult<u64> {
+        if unpacked_size == 0 {
+            return Ok(0);
+        }
+
         if !self.tables_read {
-            self.read_tables(&mut reader)?;
+            self.read_tables(reader)?;
         }
 
         let mut output_size: u64 = 0;
@@ -204,12 +222,10 @@ impl Rar4LzDecoder {
 
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_lz_symbols(reader, unpacked_size, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, unpacked_size, output_size)?;
+                    output_size = self.decode_ppm_symbols(reader, unpacked_size, output_size)?;
                 }
             }
         }
@@ -230,8 +246,35 @@ impl Rar4LzDecoder {
 
         let mut reader = BitReader::new(input);
 
+        self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
+    }
+
+    pub fn decompress_reader_to_writer<Rd: std::io::Read, W: Write>(
+        &mut self,
+        input: Rd,
+        unpacked_size: u64,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        if unpacked_size == 0 {
+            return Ok(0);
+        }
+
+        let mut reader = StreamingBitReader::new(input);
+        self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
+    }
+
+    fn decompress_to_writer_with_reader<R: BitRead, W: Write>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        if unpacked_size == 0 {
+            return Ok(0);
+        }
+
         if !self.tables_read {
-            self.read_tables(&mut reader)?;
+            self.read_tables(reader)?;
         }
 
         let mut output_size: u64 = 0;
@@ -247,12 +290,10 @@ impl Rar4LzDecoder {
 
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, target_output, output_size)?;
+                    output_size = self.decode_lz_symbols(reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
+                    output_size = self.decode_ppm_symbols(reader, target_output, output_size)?;
                 }
             }
 
@@ -275,7 +316,7 @@ impl Rar4LzDecoder {
         unpacked_size: u64,
         first_volume_index: usize,
         boundaries: &[super::VolumeTransition],
-        mut writer_factory: F,
+        writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
@@ -285,8 +326,58 @@ impl Rar4LzDecoder {
         }
 
         let mut reader = BitReader::new(input);
+
+        self.decompress_to_writer_chunked_with_reader(
+            &mut reader,
+            unpacked_size,
+            first_volume_index,
+            boundaries,
+            writer_factory,
+        )
+    }
+
+    pub fn decompress_reader_to_writer_chunked<Rd: std::io::Read, F>(
+        &mut self,
+        input: Rd,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        shared_transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+        writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut reader = StreamingBitReader::new(input);
+        self.decompress_to_writer_chunked_with_shared_transitions(
+            &mut reader,
+            unpacked_size,
+            first_volume_index,
+            shared_transitions,
+            writer_factory,
+        )
+    }
+
+    fn decompress_to_writer_chunked_with_reader<R: BitRead, F>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        boundaries: &[super::VolumeTransition],
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
         if !self.tables_read {
-            self.read_tables(&mut reader)?;
+            self.read_tables(reader)?;
         }
 
         let mut output_size: u64 = 0;
@@ -308,12 +399,10 @@ impl Rar4LzDecoder {
             let target_output = output_size.saturating_add(decode_chunk).min(unpacked_size);
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(&mut reader, target_output, output_size)?;
+                    output_size = self.decode_lz_symbols(reader, target_output, output_size)?;
                 }
                 BlockType::Ppm => {
-                    output_size =
-                        self.decode_ppm_symbols(&mut reader, target_output, output_size)?;
+                    output_size = self.decode_ppm_symbols(reader, target_output, output_size)?;
                 }
             }
             let decoded_this_round = output_size - prev_output;
@@ -352,6 +441,91 @@ impl Rar4LzDecoder {
         Ok(chunks)
     }
 
+    fn decompress_to_writer_chunked_with_shared_transitions<R: BitRead, F>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        shared_transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        if unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        if !self.tables_read {
+            self.read_tables(reader)?;
+        }
+
+        let mut output_size: u64 = 0;
+        let flush_threshold = self.flush_threshold();
+        let decode_chunk = flush_threshold as u64;
+        let mut boundary_idx = 0;
+
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_volume_index;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+
+        while output_size < unpacked_size {
+            if reader.bits_remaining() < 1 {
+                break;
+            }
+
+            let prev_output = output_size;
+            let target_output = output_size.saturating_add(decode_chunk).min(unpacked_size);
+            match self.block_type {
+                BlockType::Lz => {
+                    output_size = self.decode_lz_symbols(reader, target_output, output_size)?;
+                }
+                BlockType::Ppm => {
+                    output_size = self.decode_ppm_symbols(reader, target_output, output_size)?;
+                }
+            }
+            let decoded_this_round = output_size - prev_output;
+
+            let byte_pos = reader.byte_position() as u64;
+            let next_boundary = {
+                let guard = shared_transitions.lock().unwrap();
+                guard.get(boundary_idx).cloned()
+            };
+
+            if let Some(boundary) = next_boundary
+                && byte_pos >= boundary.compressed_offset
+            {
+                self.window
+                    .flush_to_writer(&mut *current_writer)
+                    .map_err(RarError::Io)?;
+                chunk_bytes += decoded_this_round;
+                chunks.push((current_vol, chunk_bytes));
+
+                current_vol = boundary.volume_index;
+                boundary_idx += 1;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+            } else {
+                chunk_bytes += decoded_this_round;
+                if self.window.unflushed_bytes() as usize >= flush_threshold {
+                    self.window
+                        .flush_to_writer(&mut *current_writer)
+                        .map_err(RarError::Io)?;
+                }
+            }
+        }
+
+        self.window
+            .flush_to_writer(&mut *current_writer)
+            .map_err(RarError::Io)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        Ok(chunks)
+    }
+
     /// Read Huffman tables from the bitstream (ReadTables30 equivalent).
     ///
     /// Byte-aligns first, then reads:
@@ -360,9 +534,9 @@ impl Rar4LzDecoder {
     /// 3. BC code lengths (20 x 4-bit, with 15+zero_count special case)
     /// 4. Main code lengths using BC table (delta encoded)
     /// 5. Builds LD, DD, LDD, RD tables
-    fn read_tables(&mut self, reader: &mut BitReader) -> RarResult<()> {
+    fn read_tables<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
         // Align to byte boundary.
-        reader.align_byte();
+        reader.align_byte()?;
 
         if reader.bits_remaining() < 2 {
             return Err(RarError::CorruptArchive {
@@ -494,9 +668,9 @@ impl Rar4LzDecoder {
 
     /// Main decode loop — processes symbols until unpacked_size is reached
     /// or end-of-block.
-    fn decode_lz_symbols(
+    fn decode_lz_symbols<R: BitRead>(
         &mut self,
-        reader: &mut BitReader,
+        reader: &mut R,
         unpacked_size: u64,
         mut output_size: u64,
     ) -> RarResult<u64> {
@@ -640,7 +814,7 @@ impl Rar4LzDecoder {
     }
 
     /// Decode a full distance value from DD and LDD tables.
-    fn decode_distance(&mut self, reader: &mut BitReader) -> RarResult<usize> {
+    fn decode_distance<R: BitRead>(&mut self, reader: &mut R) -> RarResult<usize> {
         let dist_number = self.dd_table.as_ref().unwrap().decode(reader)? as usize;
         if dist_number >= DC {
             return Err(RarError::CorruptArchive {
@@ -694,7 +868,7 @@ impl Rar4LzDecoder {
     ///
     /// Returns true if decompression should continue (new tables read),
     /// false if this is the end of file.
-    fn read_end_of_block(&mut self, reader: &mut BitReader) -> RarResult<bool> {
+    fn read_end_of_block<R: BitRead>(&mut self, reader: &mut R) -> RarResult<bool> {
         if reader.bits_remaining() < 1 {
             return Ok(false);
         }
@@ -720,7 +894,7 @@ impl Rar4LzDecoder {
     ///
     /// We don't implement the RarVM, but we must consume the data from the
     /// bitstream to stay synchronized.
-    fn skip_vm_code(&self, reader: &mut BitReader) -> RarResult<()> {
+    fn skip_vm_code<R: BitRead>(&self, reader: &mut R) -> RarResult<()> {
         let first_byte = reader.read_bits(8)? as u8;
         let mut length = (first_byte & 7) as usize + 1;
         if length == 7 {
@@ -761,7 +935,7 @@ impl Rar4LzDecoder {
     /// - If reset: next byte = allocator size in MB
     /// - If bit 6: next byte = new escape character
     /// - Then the range coder reads its init bytes from the stream
-    fn init_ppm(&mut self, reader: &mut BitReader) -> RarResult<()> {
+    fn init_ppm<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
         // The PPM flag (bit 7) was consumed as 1 bit. Read remaining 7 bits
         // to reconstruct the MaxOrder byte (bit 7 is always 1 but unused).
         if reader.bits_remaining() < 7 {
@@ -811,125 +985,118 @@ impl Rar4LzDecoder {
     ///
     /// Creates a RangeDecoder from the remaining bitstream bytes, decodes
     /// symbols via the PPMd model, and handles escape sequences.
-    fn decode_ppm_symbols(
+    fn decode_ppm_symbols<R: BitRead>(
         &mut self,
-        reader: &mut BitReader,
+        reader: &mut R,
         unpacked_size: u64,
         mut output_size: u64,
     ) -> RarResult<u64> {
-        let remaining = reader.remaining_bytes();
-        if remaining.len() < 4 {
+        if reader.bits_remaining() < 32 {
             return Ok(output_size);
         }
 
-        let mut rc = RangeDecoder::new(remaining)?;
+        let mut switch_to_lz_tables = false;
 
-        while output_size < unpacked_size {
-            let model = match self.ppm_model.as_mut() {
-                Some(m) => m,
-                None => {
-                    self.block_type = BlockType::Lz;
-                    break;
-                }
-            };
+        {
+            let mut rc = BitReadRangeDecoder::new(reader)?;
 
-            let ch = model.decode_char(&mut rc);
-            if ch == -1 {
-                // Corrupt PPM data — switch to LZ mode.
-                self.ppm_model = None;
-                self.block_type = BlockType::Lz;
-                break;
-            }
+            while output_size < unpacked_size {
+                let model = match self.ppm_model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        self.block_type = BlockType::Lz;
+                        break;
+                    }
+                };
 
-            let ch = ch as u8;
-            if ch == self.ppm_esc_char {
-                // Escape sequence — decode the command byte.
-                let model = self.ppm_model.as_mut().unwrap();
-                let next_ch = model.decode_char(&mut rc);
-                if next_ch == -1 {
+                let ch = model.decode_char(&mut rc);
+                if ch == -1 {
+                    // Corrupt PPM data — switch to LZ mode.
                     self.ppm_model = None;
                     self.block_type = BlockType::Lz;
                     break;
                 }
 
-                match next_ch {
-                    0 => {
-                        // End of PPM block — switch via ReadTables.
-                        let consumed = rc.position();
-                        reader.skip_bits((consumed * 8) as u32)?;
-                        self.read_tables(reader)?;
-                        return Ok(output_size);
-                    }
-                    2 => {
-                        // End of file in PPM mode.
+                let ch = ch as u8;
+                if ch == self.ppm_esc_char {
+                    // Escape sequence — decode the command byte.
+                    let model = self.ppm_model.as_mut().unwrap();
+                    let next_ch = model.decode_char(&mut rc);
+                    if next_ch == -1 {
+                        self.ppm_model = None;
+                        self.block_type = BlockType::Lz;
                         break;
                     }
-                    3 => {
-                        // VM filter in PPM mode — read and discard.
-                        self.skip_vm_code_ppm(&mut rc)?;
-                    }
-                    4 => {
-                        // LZ match inside PPM: 3 bytes distance (big-endian) + 1 byte length.
-                        let mut distance: u32 = 0;
-                        let mut length: u32 = 0;
-                        let mut failed = false;
-                        let model = self.ppm_model.as_mut().unwrap();
-                        for i in 0..4 {
-                            let b = model.decode_char(&mut rc);
-                            if b == -1 {
-                                failed = true;
+
+                    match next_ch {
+                        0 => {
+                            switch_to_lz_tables = true;
+                            break;
+                        }
+                        2 => {
+                            break;
+                        }
+                        3 => {
+                            self.skip_vm_code_ppm(&mut rc)?;
+                        }
+                        4 => {
+                            let mut distance: u32 = 0;
+                            let mut length: u32 = 0;
+                            let mut failed = false;
+                            let model = self.ppm_model.as_mut().unwrap();
+                            for i in 0..4 {
+                                let b = model.decode_char(&mut rc);
+                                if b == -1 {
+                                    failed = true;
+                                    break;
+                                }
+                                if i == 3 {
+                                    length = b as u32;
+                                } else {
+                                    distance = (distance << 8) | (b as u32 & 0xFF);
+                                }
+                            }
+                            if failed {
+                                self.ppm_model = None;
+                                self.block_type = BlockType::Lz;
                                 break;
                             }
-                            if i == 3 {
-                                length = b as u32;
-                            } else {
-                                distance = (distance << 8) | (b as u32 & 0xFF);
+                            let copy_len = (length + 32) as usize;
+                            let copy_dist = (distance + 2) as usize;
+                            let remaining_out = (unpacked_size - output_size) as usize;
+                            let actual = copy_len.min(remaining_out);
+                            self.window.copy(copy_dist, actual)?;
+                            output_size += actual as u64;
+                        }
+                        5 => {
+                            let model = self.ppm_model.as_mut().unwrap();
+                            let len_byte = model.decode_char(&mut rc);
+                            if len_byte == -1 {
+                                self.ppm_model = None;
+                                self.block_type = BlockType::Lz;
+                                break;
                             }
+                            let copy_len = (len_byte as usize) + 4;
+                            let remaining_out = (unpacked_size - output_size) as usize;
+                            let actual = copy_len.min(remaining_out);
+                            self.window.copy(1, actual)?;
+                            output_size += actual as u64;
                         }
-                        if failed {
-                            self.ppm_model = None;
-                            self.block_type = BlockType::Lz;
-                            break;
+                        _ => {
+                            self.window.put_byte(ch);
+                            output_size += 1;
                         }
-                        let copy_len = (length + 32) as usize;
-                        let copy_dist = (distance + 2) as usize;
-                        let remaining_out = (unpacked_size - output_size) as usize;
-                        let actual = copy_len.min(remaining_out);
-                        self.window.copy(copy_dist, actual)?;
-                        output_size += actual as u64;
                     }
-                    5 => {
-                        // RLE match inside PPM: 1 byte length, distance=1.
-                        let model = self.ppm_model.as_mut().unwrap();
-                        let len_byte = model.decode_char(&mut rc);
-                        if len_byte == -1 {
-                            self.ppm_model = None;
-                            self.block_type = BlockType::Lz;
-                            break;
-                        }
-                        let copy_len = (len_byte as usize) + 4;
-                        let remaining_out = (unpacked_size - output_size) as usize;
-                        let actual = copy_len.min(remaining_out);
-                        self.window.copy(1, actual)?;
-                        output_size += actual as u64;
-                    }
-                    _ => {
-                        // NextCh == 1 (or any other): literal escape character.
-                        // The original `ch` (== ppm_esc_char) is the output byte.
-                        self.window.put_byte(ch);
-                        output_size += 1;
-                    }
+                } else {
+                    self.window.put_byte(ch);
+                    output_size += 1;
                 }
-            } else {
-                // Regular literal byte.
-                self.window.put_byte(ch);
-                output_size += 1;
             }
         }
 
-        // Advance the bitreader past all bytes consumed by the range decoder.
-        let consumed = rc.position();
-        reader.skip_bits((consumed * 8) as u32)?;
+        if switch_to_lz_tables {
+            self.read_tables(reader)?;
+        }
 
         Ok(output_size)
     }
@@ -938,7 +1105,7 @@ impl Rar4LzDecoder {
     ///
     /// Same structure as skip_vm_code but reads bytes via PPMd model
     /// instead of from the bitstream.
-    fn skip_vm_code_ppm(&mut self, rc: &mut RangeDecoder) -> RarResult<()> {
+    fn skip_vm_code_ppm<R: RangeCode>(&mut self, rc: &mut R) -> RarResult<()> {
         let model = self
             .ppm_model
             .as_mut()
@@ -1047,6 +1214,53 @@ pub fn decompress_rar4_lz_to_writer<W: Write>(
 
     let mut decoder = Rar4LzDecoder::new(dict_size as usize);
     decoder.decompress_to_writer(input, unpacked_size, writer)
+}
+
+pub fn decompress_rar4_lz_reader_to_writer<R: std::io::Read, W: Write>(
+    input: R,
+    unpacked_size: u64,
+    dict_size: u64,
+    writer: &mut W,
+) -> RarResult<u64> {
+    if dict_size > MAX_DICT_SIZE {
+        return Err(RarError::DictionaryTooLarge {
+            size: dict_size,
+            max: MAX_DICT_SIZE,
+        });
+    }
+
+    let mut decoder = Rar4LzDecoder::new(dict_size as usize);
+    let mut reader = StreamingBitReader::new(input);
+    decoder.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
+}
+
+pub fn decompress_rar4_lz_reader_to_writer_chunked<R: std::io::Read, F>(
+    input: R,
+    unpacked_size: u64,
+    dict_size: u64,
+    first_volume_index: usize,
+    shared_transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+    writer_factory: F,
+) -> RarResult<Vec<(usize, u64)>>
+where
+    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+{
+    if dict_size > MAX_DICT_SIZE {
+        return Err(RarError::DictionaryTooLarge {
+            size: dict_size,
+            max: MAX_DICT_SIZE,
+        });
+    }
+
+    let mut decoder = Rar4LzDecoder::new(dict_size as usize);
+    let mut reader = StreamingBitReader::new(input);
+    decoder.decompress_to_writer_chunked_with_shared_transitions(
+        &mut reader,
+        unpacked_size,
+        first_volume_index,
+        shared_transitions,
+        writer_factory,
+    )
 }
 
 #[cfg(test)]

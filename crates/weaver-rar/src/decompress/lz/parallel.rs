@@ -16,6 +16,14 @@ use super::huffman::{self, HuffmanTable};
 use super::{LzDecoder, NUM_LENGTH_SLOTS};
 use crate::error::{RarError, RarResult};
 
+#[derive(Clone)]
+struct PreparsedBlocks {
+    blocks: Vec<BlockInfo>,
+    table_sets: Vec<TableSet>,
+    consumed_bytes: usize,
+    saw_last_block: bool,
+}
+
 /// Minimum number of blocks to justify parallel dispatch.
 /// Below this, rayon overhead exceeds the benefit.
 const MIN_PARALLEL_BLOCKS: usize = 4;
@@ -23,6 +31,10 @@ const MIN_PARALLEL_BLOCKS: usize = 4;
 /// Number of blocks to queue per worker in the parallel RAR5 path.
 /// Matches unrar's `UNP_BLOCKS_PER_THREAD` batching strategy.
 const BLOCKS_PER_THREAD: usize = 2;
+
+/// Maximum worker count to consider when sizing parallel decode batches.
+/// Mirrors unrar's `MaxUserThreads = Min(Threads, 8)` behavior.
+const MAX_PARALLEL_THREADS: usize = 8;
 
 /// Maximum compressed block size (in bits) for parallel decode.
 /// Blocks exceeding this fall back to single-threaded inline decode.
@@ -66,6 +78,7 @@ pub enum DecodedItem {
 }
 
 /// Metadata for one LZ block, parsed during the sequential header scan.
+#[derive(Clone)]
 struct BlockInfo {
     /// Bit offset in the input where this block's compressed data starts
     /// (after header and any table data have been consumed).
@@ -79,11 +92,168 @@ struct BlockInfo {
 }
 
 /// A set of Huffman tables shared by one or more blocks.
+#[derive(Clone)]
 struct TableSet {
     nc: HuffmanTable,
     dc: HuffmanTable,
     ldc: HuffmanTable,
     rc: HuffmanTable,
+}
+
+pub(super) fn parallel_enabled() -> bool {
+    std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_none()
+        && std::env::var_os("WEAVER_RAR_ENABLE_PARALLEL").is_some()
+}
+
+pub(super) fn is_truncated_input_error(error: &RarError) -> bool {
+    match error {
+        RarError::InvalidHuffmanTable => true,
+        RarError::CorruptArchive { detail } => {
+            detail.contains("unexpected end of data")
+                || detail.contains("truncated")
+                || detail.contains("no bits remaining")
+                || detail.contains("need ")
+                || detail.contains("cannot skip")
+        }
+        _ => false,
+    }
+}
+
+fn parse_next_block(
+    reader: &mut BitReader<'_>,
+    code_lengths: &mut [u8],
+    table_sets: &mut Vec<TableSet>,
+) -> RarResult<Option<(BlockInfo, bool)>> {
+    if !reader.has_bits() {
+        return Ok(None);
+    }
+
+    reader.align_byte();
+
+    if reader.bits_remaining() < 16 {
+        return Ok(None);
+    }
+
+    let flags = reader.read_bits(8)? as u8;
+    let checksum = reader.read_bits(8)? as u8;
+
+    let extra_bits = (flags & 0x07) as i64 + 1;
+    let num_size_bytes = ((flags >> 3) & 0x03) + 1;
+    if num_size_bytes > 3 {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 block header: invalid size byte count".into(),
+        });
+    }
+
+    let is_last = (flags & 0x40) != 0;
+    let table_present = (flags & 0x80) != 0;
+
+    let mut block_bytes: i64 = 0;
+    let mut xor_sum = 0x5Au8 ^ flags;
+    for i in 0..num_size_bytes {
+        let b = reader.read_bits(8)? as u8;
+        xor_sum ^= b;
+        block_bytes |= (b as i64) << (i * 8);
+    }
+
+    if xor_sum != checksum {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
+                checksum, xor_sum
+            ),
+        });
+    }
+
+    let mut block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+
+    let table_set_index = if table_present || table_sets.is_empty() {
+        let pos_before = reader.position();
+        let (nc, dc, ldc, rc) = huffman::read_tables(reader, code_lengths)?;
+        let bits_used = (reader.position() - pos_before) as i64;
+        block_bits_remaining -= bits_used;
+        table_sets.push(TableSet { nc, dc, ldc, rc });
+        table_sets.len() - 1
+    } else {
+        table_sets.len() - 1
+    };
+
+    let data_bit_offset = reader.position();
+    let is_large = block_bits_remaining > LARGE_BLOCK_BITS;
+
+    if block_bits_remaining > 0 {
+        reader.skip_bits(block_bits_remaining as u32)?;
+    }
+
+    Ok(Some((
+        BlockInfo {
+            data_bit_offset,
+            data_bits: block_bits_remaining,
+            table_set_index,
+            is_large,
+        },
+        is_last,
+    )))
+}
+
+fn preparse_complete_blocks(
+    input: &[u8],
+    code_lengths: &mut [u8],
+    existing_tables: Option<&TableSet>,
+) -> RarResult<PreparsedBlocks> {
+    let mut reader = BitReader::new(input);
+    let mut blocks = Vec::new();
+    let mut table_sets = Vec::new();
+    let mut working_code_lengths = code_lengths.to_vec();
+    let mut consumed_bytes = 0usize;
+    let mut saw_last_block = false;
+
+    if let Some(ts) = existing_tables {
+        table_sets.push(TableSet {
+            nc: ts.nc.clone(),
+            dc: ts.dc.clone(),
+            ldc: ts.ldc.clone(),
+            rc: ts.rc.clone(),
+        });
+    }
+
+    loop {
+        let checkpoint_code_lengths = working_code_lengths.clone();
+        let checkpoint_table_sets = table_sets.clone();
+
+        match parse_next_block(&mut reader, &mut working_code_lengths, &mut table_sets) {
+            Ok(Some((block, is_last))) => {
+                blocks.push(block);
+                consumed_bytes = (reader.position() + 7) / 8;
+                if is_last {
+                    saw_last_block = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                working_code_lengths = checkpoint_code_lengths;
+                table_sets = checkpoint_table_sets;
+                break;
+            }
+            Err(error) if is_truncated_input_error(&error) => {
+                working_code_lengths = checkpoint_code_lengths;
+                table_sets = checkpoint_table_sets;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if !blocks.is_empty() {
+        code_lengths.copy_from_slice(&working_code_lengths);
+    }
+
+    Ok(PreparsedBlocks {
+        blocks,
+        table_sets,
+        consumed_bytes,
+        saw_last_block,
+    })
 }
 
 // ─── Phase 1: Sequential block header pre-parsing ────────────────────────────
@@ -425,9 +595,160 @@ fn parallel_decode_batch(
         .collect::<RarResult<Vec<_>>>()
 }
 
+    fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
+        thread_count
+        .clamp(1, MAX_PARALLEL_THREADS)
+        .saturating_mul(BLOCKS_PER_THREAD)
+        .max(MIN_PARALLEL_BLOCKS)
+        .min(block_count)
+    }
+
+    fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: usize) -> usize {
+        let max_end = start.saturating_add(batch_size).min(blocks.len());
+        let mut end = start;
+        while end < max_end && !blocks[end].is_large {
+            end += 1;
+        }
+        end
+    }
+
 // ─── Public entry point ──────────────────────────────────────────────────────
 
 impl LzDecoder {
+    pub(super) fn process_buffered_blocks<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<usize> {
+        let existing_tables = if let (Some(nc), Some(dc), Some(ldc), Some(rc)) = (
+            &self.nc_table,
+            &self.dc_table,
+            &self.ldc_table,
+            &self.rc_table,
+        ) {
+            Some(TableSet {
+                nc: nc.clone(),
+                dc: dc.clone(),
+                ldc: ldc.clone(),
+                rc: rc.clone(),
+            })
+        } else {
+            None
+        };
+
+        let preparsed = preparse_complete_blocks(input, &mut self.code_lengths, existing_tables.as_ref())?;
+        if preparsed.blocks.is_empty() {
+            return Ok(0);
+        }
+
+        let batch_size = parallel_batch_size(rayon::current_num_threads(), preparsed.blocks.len());
+        let mut block_index = 0usize;
+        while block_index < preparsed.blocks.len() {
+            if preparsed.blocks[block_index].is_large {
+                let block = &preparsed.blocks[block_index];
+                let tables = &preparsed.table_sets[block.table_set_index];
+                self.decode_preparsed_block_inline(
+                    input,
+                    block,
+                    tables,
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )?;
+                block_index += 1;
+                continue;
+            }
+
+            let batch_end = next_small_block_batch_end(&preparsed.blocks, block_index, batch_size);
+            let block_batch = &preparsed.blocks[block_index..batch_end];
+            if block_batch.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
+                let all_items = parallel_decode_batch(input, block_batch, &preparsed.table_sets)?;
+                self.apply_decoded_items_parallel(&all_items, unpacked_size, output_size, writer)?;
+            } else {
+                for block in block_batch {
+                    let tables = &preparsed.table_sets[block.table_set_index];
+                    self.decode_preparsed_block_inline(
+                        input,
+                        block,
+                        tables,
+                        unpacked_size,
+                        output_size,
+                        writer,
+                    )?;
+                }
+            }
+            block_index = batch_end;
+
+            if *output_size >= unpacked_size {
+                break;
+            }
+        }
+
+        if let Some(last_ts) = preparsed.table_sets.last() {
+            self.nc_table = Some(last_ts.nc.clone());
+            self.dc_table = Some(last_ts.dc.clone());
+            self.ldc_table = Some(last_ts.ldc.clone());
+            self.rc_table = Some(last_ts.rc.clone());
+        }
+        self.block_bits_remaining = 0;
+        self.is_last_block = preparsed.saw_last_block;
+        self.flush_filters_and_write(writer)?;
+
+        Ok(preparsed.consumed_bytes)
+    }
+
+    fn decode_preparsed_block_inline<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        block: &BlockInfo,
+        tables: &TableSet,
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        self.nc_table = Some(tables.nc.clone());
+        self.dc_table = Some(tables.dc.clone());
+        self.ldc_table = Some(tables.ldc.clone());
+        self.rc_table = Some(tables.rc.clone());
+        self.block_bits_remaining = block.data_bits;
+
+        let byte_offset = block.data_bit_offset / 8;
+        let bit_remainder = block.data_bit_offset % 8;
+        let slice = &input[byte_offset..];
+        let mut reader = BitReader::new(slice);
+        if bit_remainder > 0 {
+            reader.skip_bits(bit_remainder as u32)?;
+        }
+
+        let flush_threshold = self.flush_threshold();
+        while *output_size < unpacked_size && self.block_bits_remaining > 0 {
+            *output_size = self.decode_block(
+                &mut reader,
+                unpacked_size,
+                *output_size,
+                Some(flush_threshold),
+            )?;
+
+            if self.pending_filters.is_empty() {
+                if self.window.unflushed_bytes() as usize >= flush_threshold {
+                    self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                }
+            } else {
+                self.flush_filters_and_write(writer)?;
+                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR5 pending filters exceeded dictionary window before flush"
+                            .into(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_decoded_items_parallel<W: std::io::Write>(
         &mut self,
         all_items: &[Vec<DecodedItem>],
@@ -446,19 +767,14 @@ impl LzDecoder {
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
                         let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
-                        for b in &bytes[..n] {
-                            self.window.put_byte(*b);
-                        }
+                        self.window.put_bytes(&bytes[..n]);
                         *output_size += n as u64;
                     }
                     DecodedItem::Match { length, distance } => {
                         let remaining = (unpacked_size - *output_size) as usize;
                         let len = (length as usize).min(remaining);
 
-                        self.dist_cache[3] = self.dist_cache[2];
-                        self.dist_cache[2] = self.dist_cache[1];
-                        self.dist_cache[1] = self.dist_cache[0];
-                        self.dist_cache[0] = distance as usize;
+                        self.insert_old_dist(distance as usize);
 
                         self.last_length = length as usize;
                         self.window.copy(distance as usize, len)?;
@@ -475,20 +791,7 @@ impl LzDecoder {
                     }
                     DecodedItem::CacheRef { cache_idx, length } => {
                         let idx = cache_idx as usize;
-                        let distance = self.dist_cache[idx];
-                        if distance == 0 {
-                            return Err(RarError::CorruptArchive {
-                                detail: "distance cache entry is zero".into(),
-                            });
-                        }
-
-                        if idx > 0 {
-                            let dist = self.dist_cache[idx];
-                            for i in (1..=idx).rev() {
-                                self.dist_cache[i] = self.dist_cache[i - 1];
-                            }
-                            self.dist_cache[0] = dist;
-                        }
+                        let distance = self.promote_old_dist(idx)?;
 
                         let remaining = (unpacked_size - *output_size) as usize;
                         let len = (length as usize).min(remaining);
@@ -550,9 +853,7 @@ impl LzDecoder {
         unpacked_size: u64,
         writer: &mut W,
     ) -> RarResult<Option<u64>> {
-        if std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_some()
-            || std::env::var_os("WEAVER_RAR_ENABLE_PARALLEL").is_none()
-        {
+        if !parallel_enabled() {
             return Ok(None);
         }
 
@@ -580,24 +881,36 @@ impl LzDecoder {
             return Ok(None); // Too few blocks — fall back to single-threaded.
         }
 
-        // Check for large blocks — if any exist, fall back entirely.
-        // (A more sophisticated approach could mix parallel + inline, but
-        // large blocks are rare in practice.)
-        if blocks.iter().any(|b| b.is_large) {
-            return Ok(None);
-        }
+        let batch_size = parallel_batch_size(rayon::current_num_threads(), blocks.len());
 
-        let batch_size = (rayon::current_num_threads() * BLOCKS_PER_THREAD)
-            .max(MIN_PARALLEL_BLOCKS)
-            .min(blocks.len());
-
-        // Phase 2 + 3: decode a bounded batch in parallel, then apply it
-        // incrementally before moving to the next batch. This keeps peak
-        // memory bounded by a few blocks instead of the entire file.
         let mut output_size = 0u64;
-        for block_batch in blocks.chunks(batch_size) {
-            let all_items = parallel_decode_batch(input, block_batch, &table_sets)?;
-            self.apply_decoded_items_parallel(&all_items, unpacked_size, &mut output_size, writer)?;
+        let mut block_index = 0usize;
+        while block_index < blocks.len() {
+            if blocks[block_index].is_large {
+                let block = &blocks[block_index];
+                let tables = &table_sets[block.table_set_index];
+                self.decode_preparsed_block_inline(
+                    input,
+                    block,
+                    tables,
+                    unpacked_size,
+                    &mut output_size,
+                    writer,
+                )?;
+                block_index += 1;
+            } else {
+                let batch_end = next_small_block_batch_end(&blocks, block_index, batch_size);
+                let block_batch = &blocks[block_index..batch_end];
+                let all_items = parallel_decode_batch(input, block_batch, &table_sets)?;
+                self.apply_decoded_items_parallel(
+                    &all_items,
+                    unpacked_size,
+                    &mut output_size,
+                    writer,
+                )?;
+                block_index = batch_end;
+            }
+
             if output_size >= unpacked_size {
                 break;
             }
@@ -619,5 +932,61 @@ impl LzDecoder {
         self.flush_filters_and_write(writer)?;
 
         Ok(Some(output_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_batch_size_respects_unrar_thread_cap() {
+        assert_eq!(parallel_batch_size(32, 128), 16);
+        assert_eq!(parallel_batch_size(64, 128), 16);
+    }
+
+    #[test]
+    fn parallel_batch_size_preserves_minimum_batch_floor() {
+        assert_eq!(parallel_batch_size(1, 8), 4);
+        assert_eq!(parallel_batch_size(0, 8), 4);
+    }
+
+    #[test]
+    fn parallel_batch_size_never_exceeds_available_blocks() {
+        assert_eq!(parallel_batch_size(8, 3), 3);
+        assert_eq!(parallel_batch_size(2, 2), 2);
+    }
+
+    #[test]
+    fn next_small_block_batch_end_stops_before_large_block() {
+        let blocks = vec![
+            BlockInfo {
+                data_bit_offset: 0,
+                data_bits: 1,
+                table_set_index: 0,
+                is_large: false,
+            },
+            BlockInfo {
+                data_bit_offset: 1,
+                data_bits: 1,
+                table_set_index: 0,
+                is_large: false,
+            },
+            BlockInfo {
+                data_bit_offset: 2,
+                data_bits: 1,
+                table_set_index: 0,
+                is_large: true,
+            },
+            BlockInfo {
+                data_bit_offset: 3,
+                data_bits: 1,
+                table_set_index: 0,
+                is_large: false,
+            },
+        ];
+
+        assert_eq!(next_small_block_batch_end(&blocks, 0, 4), 2);
+        assert_eq!(next_small_block_batch_end(&blocks, 3, 4), 4);
     }
 }
