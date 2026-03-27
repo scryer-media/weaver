@@ -181,7 +181,7 @@ impl LzDecoder {
         let block_bits_remaining_checkpoint = self.block_bits_remaining;
         let is_last_block_checkpoint = self.is_last_block;
 
-        match self.read_block_header(reader) {
+        match self.read_block_header_bitreader(reader) {
             Ok(()) => Ok(true),
             Err(error) if parallel::is_truncated_input_error(&error) => {
                 *reader = reader_checkpoint;
@@ -196,6 +196,57 @@ impl LzDecoder {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn read_block_header_bitreader(&mut self, reader: &mut BitReader<'_>) -> RarResult<()> {
+        reader.align_byte();
+
+        let flags = reader.read_bits(8)? as u8;
+        let checksum = reader.read_bits(8)? as u8;
+
+        let extra_bits = (flags & 0x07) as i64 + 1;
+        let num_size_bytes = ((flags >> 3) & 0x03) + 1;
+        if num_size_bytes > 3 {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 block header: invalid size byte count".into(),
+            });
+        }
+
+        self.is_last_block = (flags & 0x40) != 0;
+        let table_present = (flags & 0x80) != 0;
+
+        let mut block_bytes: i64 = 0;
+        let mut xor_sum = 0x5Au8 ^ flags;
+        for i in 0..num_size_bytes {
+            let b = reader.read_bits(8)? as u8;
+            xor_sum ^= b;
+            block_bytes |= (b as i64) << (i * 8);
+        }
+
+        if xor_sum != checksum {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR5 block header checksum mismatch: expected {:#04x}, got {:#04x}",
+                    checksum, xor_sum
+                ),
+            });
+        }
+
+        self.block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+
+        if table_present || self.nc_table.is_none() {
+            let pos_before = reader.position();
+            let (nc, dc, ldc, rc) =
+                huffman::read_tables_bitreader(reader, &mut self.code_lengths)?;
+            let bits_used = (reader.position() - pos_before) as i64;
+            self.block_bits_remaining -= bits_used;
+            self.nc_table = Some(Arc::new(nc));
+            self.dc_table = Some(Arc::new(dc));
+            self.ldc_table = Some(Arc::new(ldc));
+            self.rc_table = Some(Arc::new(rc));
+        }
+
+        Ok(())
     }
 
     /// Read a RAR5 block header.
@@ -465,7 +516,11 @@ impl LzDecoder {
     }
 
     /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).
-    fn decode_rc_length<R: BitRead>(&self, reader: &mut R, rc: &HuffmanTable) -> RarResult<usize> {
+    fn decode_rc_length<R: BitRead>(
+        &self,
+        reader: &mut R,
+        rc: &HuffmanTable,
+    ) -> RarResult<usize> {
         let slot = rc.decode(reader)? as usize;
         Self::slot_to_length(reader, slot)
     }

@@ -119,6 +119,7 @@ impl NntpClient {
                 Ok(data) => {
                     let elapsed = start.elapsed();
                     let mut health = self.pool.health().lock().await;
+                    health.record_success(idx);
                     health.record_latency(idx, elapsed);
                     return Ok(data);
                 }
@@ -201,6 +202,7 @@ impl NntpClient {
                 Ok(data) => {
                     let elapsed = start.elapsed();
                     let mut health = self.pool.health().lock().await;
+                    health.record_success(idx);
                     health.record_latency(idx, elapsed);
                     return Ok(data);
                 }
@@ -251,19 +253,26 @@ impl NntpClient {
     /// Build the server try-order, grouping by priority and ranking within each
     /// group using latency-weighted random selection.
     ///
-    /// Servers in `exclude` are skipped entirely.
+    /// Servers in `exclude` are skipped entirely. Disabled servers (circuit-
+    /// breaker tripped) are also excluded so we don't waste time on servers
+    /// that are known to be failing.
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
+
+        // Check health to skip disabled servers.
+        let mut health = self.pool.health().lock().await;
+        health.check_reenable_all();
 
         // Collect available servers, grouped by priority.
         let mut groups: std::collections::BTreeMap<u32, Vec<usize>> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
-            if !exclude.contains(&idx) {
+            if !exclude.contains(&idx) && health.is_available(idx) {
                 groups.entry(server_groups[idx]).or_default().push(idx);
             }
         }
+        drop(health);
 
         let mut result = Vec::with_capacity(server_count);
         for (_priority, servers) in groups {
@@ -284,7 +293,7 @@ impl NntpClient {
             return servers.to_vec();
         }
 
-        // Compute scores: latency_ms * (1.0 + 2.0 * load_ratio).
+        // Compute scores: latency_ms * (1.0 + 2.0 * load_ratio) * premature_death_penalty.
         let scores: Vec<(usize, f64)> = {
             let health = self.pool.health().lock().await;
             servers
@@ -297,7 +306,10 @@ impl NntpClient {
                     } else {
                         1.0 - (available as f64 / max as f64)
                     };
-                    let score = latency * (1.0 + 2.0 * load_ratio);
+                    // Penalize servers whose connections keep dying prematurely.
+                    let deaths = health.recent_premature_deaths(idx) as f64;
+                    let death_penalty = 1.0 + 0.5 * deaths;
+                    let score = latency * (1.0 + 2.0 * load_ratio) * death_penalty;
                     (idx, score.max(0.001)) // floor to avoid division by zero
                 })
                 .collect()
@@ -342,6 +354,7 @@ impl NntpClient {
                 Ok(data) => {
                     let elapsed = start.elapsed();
                     let mut health = self.pool.health().lock().await;
+                    health.record_success(idx);
                     health.record_latency(idx, elapsed);
                     return Ok(data);
                 }

@@ -862,6 +862,7 @@ struct ServerHealthInfo {
     latency_ms: f64,
     connections_available: usize,
     connections_max: usize,
+    premature_deaths: usize,
 }
 
 async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
@@ -895,6 +896,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
                 latency_ms: health.latency_ms(idx),
                 connections_available: avail,
                 connections_max: max,
+                premature_deaths: health.recent_premature_deaths(idx),
             }
         })
         .collect()
@@ -1289,6 +1291,8 @@ fn render_prometheus_metrics(
         out.push_str("# TYPE weaver_server_connections_available gauge\n");
         out.push_str("# HELP weaver_server_connections_max Maximum connections per server.\n");
         out.push_str("# TYPE weaver_server_connections_max gauge\n");
+        out.push_str("# HELP weaver_server_premature_deaths Recent connections that died before 60s age.\n");
+        out.push_str("# TYPE weaver_server_premature_deaths gauge\n");
 
         for srv in server_health {
             let labels: &[(&str, &str)] = &[("server", &srv.label)];
@@ -1318,6 +1322,12 @@ fn render_prometheus_metrics(
                 "weaver_server_connections_max",
                 labels,
                 srv.connections_max,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_premature_deaths",
+                labels,
+                srv.premature_deaths,
             );
         }
     }

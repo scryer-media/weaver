@@ -174,7 +174,7 @@ fn parse_next_block(
 
     let table_set_index = if table_present || table_sets.is_empty() {
         let pos_before = reader.position();
-        let (nc, dc, ldc, rc) = huffman::read_tables(reader, code_lengths)?;
+            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths)?;
         let bits_used = (reader.position() - pos_before) as i64;
         block_bits_remaining -= bits_used;
         table_sets.push(TableSet {
@@ -338,7 +338,7 @@ fn preparse_blocks(
         // Read tables if present — this advances the reader and consumes bits.
         let table_set_index = if table_present || table_sets.is_empty() {
             let pos_before = reader.position();
-            let (nc, dc, ldc, rc) = huffman::read_tables(&mut reader, code_lengths)?;
+            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(&mut reader, code_lengths)?;
             let bits_used = (reader.position() - pos_before) as i64;
             block_bits_remaining -= bits_used;
             table_sets.push(TableSet {
@@ -403,7 +403,7 @@ fn decode_block_symbols(
             break;
         }
 
-        let sym = tables.nc.decode(&mut reader)? as u32;
+        let sym = tables.nc.decode_bitreader(&mut reader)? as u32;
 
         if sym < 256 {
             // Literal — try to batch with previous item.
@@ -458,7 +458,7 @@ fn decode_block_symbols(
 
         // sym 258..=261: cache reference.
         let cache_idx = (sym - 258) as u8;
-        let slot = tables.rc.decode(&mut reader)? as usize;
+        let slot = tables.rc.decode_bitreader(&mut reader)? as usize;
         let length = slot_to_length(&mut reader, slot)?;
         items.push(DecodedItem::CacheRef {
             cache_idx,
@@ -542,7 +542,7 @@ fn decode_distance(
     dc: &HuffmanTable,
     ldc: &HuffmanTable,
 ) -> RarResult<usize> {
-    let dist_code = dc.decode(reader)? as usize;
+    let dist_code = dc.decode_bitreader(reader)? as usize;
     if dist_code > 63 {
         return Err(RarError::CorruptArchive {
             detail: format!("distance code out of range: {dist_code}"),
@@ -561,7 +561,7 @@ fn decode_distance(
             } else {
                 0
             };
-            let low = ldc.decode(reader)? as usize;
+            let low = ldc.decode_bitreader(reader)? as usize;
             base + high + low
         } else {
             base + reader.read_bits(num_bits as u8)? as usize

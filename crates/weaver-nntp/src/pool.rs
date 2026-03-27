@@ -397,10 +397,15 @@ impl Drop for PooledConnection {
                     trace!("returned connection to pool");
                 }));
             } else {
+                let age = conn.created_at().elapsed();
                 drop(tokio::spawn(async move {
                     {
                         let mut h = health.lock().await;
                         h.record_failure(server_idx, false);
+                        // Connection that died before MIN_CONNECTION_LIFETIME indicates infrastructure issues.
+                        if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
+                            h.record_premature_death(server_idx);
+                        }
                     }
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);

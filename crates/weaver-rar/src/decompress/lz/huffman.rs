@@ -14,10 +14,7 @@
 
 use crate::error::{RarError, RarResult};
 
-use super::bitstream::BitRead;
-
-#[cfg(test)]
-use super::bitstream::BitReader;
+use super::bitstream::{BitRead, BitReader};
 
 /// Number of bit-length bootstrap codes.
 pub const HUFF_BC: usize = 20;
@@ -90,13 +87,8 @@ impl HuffmanTable {
             return Err(RarError::InvalidHuffmanTable);
         }
 
-        let quick_bits = match num_symbols {
-            306 | 299 | 298 => MAX_QUICK_BITS, // NC, NC30, NC20
-            _ if MAX_QUICK_BITS > 3 => MAX_QUICK_BITS - 3,
-            _ => 0,
-        };
-        let quick_data_size = 1usize << quick_bits;
-        // Count codes of each length.
+        let quick_bits = quick_bits_for_size(num_symbols);
+
         let mut length_count = [0u32; 16];
         let mut max_length: u8 = 0;
         for &bl in bit_lengths {
@@ -112,7 +104,6 @@ impl HuffmanTable {
         }
         length_count[0] = 0;
 
-        // If no symbols have nonzero length, build an empty table.
         if max_length == 0 {
             return Ok(Self {
                 decode_len: [0; 16],
@@ -126,10 +117,8 @@ impl HuffmanTable {
             });
         }
 
-        // Build decode_len (left-aligned upper limits) and decode_pos.
         let mut decode_len = [0u32; 16];
         let mut decode_pos = [0u32; 16];
-
         let mut upper_limit: u32 = 0;
         for i in 1..16 {
             upper_limit += length_count[i];
@@ -139,7 +128,6 @@ impl HuffmanTable {
             decode_pos[i] = decode_pos[i - 1] + length_count[i - 1];
         }
 
-        // Build decode_num: maps position in code list → alphabet symbol.
         let mut decode_num = [0u16; MAX_NUM_SYMBOLS];
         let mut copy_pos = decode_pos;
         for (sym, &bl) in bit_lengths.iter().enumerate() {
@@ -155,27 +143,21 @@ impl HuffmanTable {
 
         let mut quick_len_table = [0u8; MAX_QUICK_ENTRIES];
         let mut quick_num_table = [0u16; MAX_QUICK_ENTRIES];
-
-        // Build quick decode tables.
+        let quick_data_size = 1usize << quick_bits;
         let mut cur_bit_length: usize = 1;
         for code in 0..quick_data_size {
             let bit_field = (code as u32) << (16 - quick_bits);
-
-            // Find the bit length for this left-aligned bit field.
             while cur_bit_length < decode_len.len() && bit_field >= decode_len[cur_bit_length] {
                 cur_bit_length += 1;
             }
 
             quick_len_table[code] = cur_bit_length as u8;
 
-            // Calculate position in decode_num.
-            if cur_bit_length > 0 && cur_bit_length < decode_pos.len() {
-                let dist = bit_field.wrapping_sub(decode_len[cur_bit_length - 1]);
-                let dist = dist >> (16 - cur_bit_length);
-                let pos = (decode_pos[cur_bit_length] + dist) as usize;
-                if pos < num_symbols {
-                    quick_num_table[code] = decode_num[pos];
-                }
+            let dist = bit_field.wrapping_sub(decode_len[cur_bit_length - 1]);
+            let dist = dist >> (16 - cur_bit_length);
+            let pos = (decode_pos[cur_bit_length] + dist) as usize;
+            if cur_bit_length < decode_pos.len() && pos < num_symbols {
+                quick_num_table[code] = decode_num[pos];
             }
         }
 
@@ -238,6 +220,44 @@ impl HuffmanTable {
         Ok(self.decode_num[pos])
     }
 
+    /// Slice-reader specialization of `DecodeNumber`, organized to follow
+    /// unrar's `getbits()` / `addbits()` control flow as directly as possible.
+    #[inline(always)]
+    pub fn decode_bitreader(&self, reader: &mut BitReader<'_>) -> RarResult<u16> {
+        if self.max_length == 0 {
+            return Err(RarError::InvalidHuffmanTable);
+        }
+
+        let bit_field = reader.getbits()?;
+        let quick_bits = self.quick_bits as usize;
+
+        if bit_field < self.decode_len[quick_bits] {
+            let code = (bit_field >> (16 - self.quick_bits)) as usize;
+            let bits = self.quick_len[code];
+            if bits != 0 {
+                reader.addbits(bits)?;
+                return Ok(self.quick_num[code]);
+            }
+        }
+
+        let mut bits = 15usize;
+        for i in (quick_bits + 1)..15 {
+            if bit_field < self.decode_len[i] {
+                bits = i;
+                break;
+            }
+        }
+
+        reader.addbits(bits as u8)?;
+
+        let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
+        let dist = dist >> (16 - bits);
+        let pos = (self.decode_pos[bits] + dist) as usize;
+        let pos = if pos >= self.num_symbols { 0 } else { pos };
+
+        Ok(self.decode_num[pos])
+    }
+
     /// Returns the number of symbols this table can decode.
     pub fn num_symbols(&self) -> usize {
         self.num_symbols
@@ -247,6 +267,30 @@ impl HuffmanTable {
     pub fn max_length(&self) -> u8 {
         self.max_length
     }
+}
+
+#[inline(always)]
+fn quick_bits_for_size(num_symbols: usize) -> u8 {
+    match num_symbols {
+        306 | 299 | 298 => MAX_QUICK_BITS,
+        _ if MAX_QUICK_BITS > 3 => MAX_QUICK_BITS - 3,
+        _ => 0,
+    }
+}
+
+fn build_tables_from_combined_lengths(
+    all_lengths: &[u8],
+) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
+    let mut offset = 0;
+    let nc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_NC])?;
+    offset += HUFF_NC;
+    let dc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_DC])?;
+    offset += HUFF_DC;
+    let ldc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_LDC])?;
+    offset += HUFF_LDC;
+    let rc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_RC])?;
+
+    Ok((nc_table, dc_table, ldc_table, rc_table))
 }
 
 /// Read the 5 Huffman tables from the bitstream (called at the start of an LZ block
@@ -260,36 +304,30 @@ pub fn read_tables<R: BitRead>(
     reader: &mut R,
     prev_lengths: &mut [u8],
 ) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
-    // Step 1: Read 20 x 4-bit lengths for the BC (bit-length code) table.
-    // Special encoding: if a 4-bit value is 0xF, read 4 more bits as skip count.
-    // If count > 0, skip (count+1) entries (all zeros). If count == 0, value is 15.
     let mut bc_lengths = [0u8; HUFF_BC];
     let mut i = 0;
     while i < HUFF_BC {
-        let n = reader.read_bits(4)? as u8;
-        if n == 0x0F {
-            let cnt = reader.read_bits(4)? as usize;
-            if cnt > 0 {
-                // Skip cnt+2 entries (zero-fill), matching 7-zip's zeroCount += 2.
-                i += cnt + 2;
+        let length = reader.read_bits(4)? as u8;
+        if length == 15 {
+            let mut zero_count = reader.read_bits(4)? as usize;
+            if zero_count == 0 {
+                bc_lengths[i] = 15;
+            } else {
+                zero_count += 2;
+                while zero_count > 0 && i < HUFF_BC {
+                    bc_lengths[i] = 0;
+                    i += 1;
+                    zero_count -= 1;
+                }
                 continue;
             }
-            // cnt == 0: value is literally 15.
-        }
-        if i < HUFF_BC {
-            bc_lengths[i] = n;
+        } else {
+            bc_lengths[i] = length;
         }
         i += 1;
     }
     let bc_table = HuffmanTable::build(&bc_lengths)?;
 
-    // Step 2: Use BC table to decode lengths for NC, DC, LDC, RC tables.
-    // Symbols 0-15: direct bit length values.
-    // Symbols 16-19 are RLE codes:
-    //   16: repeat previous, count = readBits(3) + 3  (3-10)
-    //   17: repeat previous, count = readBits(7) + 11 (11-138)
-    //   18: zero fill,       count = readBits(3) + 3  (3-10)
-    //   19: zero fill,       count = readBits(7) + 11 (11-138)
     let total_symbols = HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC;
     let all_lengths = prev_lengths;
     let mut i = 0;
@@ -302,27 +340,15 @@ pub fn read_tables<R: BitRead>(
         let sym = bc_table.decode(reader)? as usize;
 
         if sym < 16 {
-            // Direct bit length value.
             all_lengths[i] = sym as u8;
             i += 1;
-        } else {
-            // RLE code: determine count and fill value.
-            let count = match sym {
-                16 | 18 => 3 + reader.read_bits(3)? as usize, // short: 3-10
-                _ => 11 + reader.read_bits(7)? as usize,      // long: 11-138 (17, 19)
-            };
-            let value = if sym < 18 {
-                // Symbols 16-17: repeat previous value.
-                if i == 0 {
-                    return Err(RarError::CorruptArchive {
-                        detail: "huffman: repeat code at start of table".into(),
-                    });
-                }
-                all_lengths[i - 1]
+        } else if sym < 18 {
+            let count = if sym == 16 {
+                reader.read_bits(3)? as usize + 3
             } else {
-                // Symbols 18-19: fill with zeros.
-                0
+                reader.read_bits(7)? as usize + 11
             };
+            let value = if i == 0 { 0 } else { all_lengths[i - 1] };
             for _ in 0..count {
                 if i >= total_symbols {
                     break;
@@ -330,25 +356,132 @@ pub fn read_tables<R: BitRead>(
                 all_lengths[i] = value;
                 i += 1;
             }
+        } else {
+            let count = if sym == 18 {
+                reader.read_bits(3)? as usize + 3
+            } else {
+                reader.read_bits(7)? as usize + 11
+            };
+            for _ in 0..count {
+                if i >= total_symbols {
+                    break;
+                }
+                all_lengths[i] = 0;
+                i += 1;
+            }
         }
     }
 
-    // Split the combined lengths into individual tables.
-    let mut offset = 0;
-    let nc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_NC])?;
-    offset += HUFF_NC;
-    let dc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_DC])?;
-    offset += HUFF_DC;
-    let ldc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_LDC])?;
-    offset += HUFF_LDC;
-    let rc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_RC])?;
+    build_tables_from_combined_lengths(all_lengths)
+}
 
-    Ok((nc_table, dc_table, ldc_table, rc_table))
+pub fn read_tables_bitreader(
+    reader: &mut BitReader<'_>,
+    prev_lengths: &mut [u8],
+) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
+    let mut bc_lengths = [0u8; HUFF_BC];
+    let mut i = 0usize;
+    while i < HUFF_BC {
+        let length = (reader.getbits()? >> 12) as u8;
+        reader.addbits(4)?;
+        if length == 15 {
+            let mut zero_count = (reader.getbits()? >> 12) as usize;
+            reader.addbits(4)?;
+            if zero_count == 0 {
+                bc_lengths[i] = 15;
+            } else {
+                zero_count += 2;
+                while zero_count > 0 && i < HUFF_BC {
+                    bc_lengths[i] = 0;
+                    i += 1;
+                    zero_count -= 1;
+                }
+                continue;
+            }
+        } else {
+            bc_lengths[i] = length;
+        }
+        i += 1;
+    }
+
+    let bc_table = HuffmanTable::build(&bc_lengths)?;
+    let total_symbols = HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC;
+    let all_lengths = prev_lengths;
+    let mut i = 0usize;
+
+    while i < total_symbols {
+        if !reader.has_bits() {
+            break;
+        }
+
+        let number = bc_table.decode_bitreader(reader)? as usize;
+        if number < 16 {
+            all_lengths[i] = number as u8;
+            i += 1;
+        } else if number < 18 {
+            let count = if number == 16 {
+                ((reader.getbits()? >> 13) as usize) + 3
+            } else {
+                ((reader.getbits()? >> 9) as usize) + 11
+            };
+            reader.addbits(if number == 16 { 3 } else { 7 })?;
+            let value = if i == 0 { 0 } else { all_lengths[i - 1] };
+            for _ in 0..count {
+                if i >= total_symbols {
+                    break;
+                }
+                all_lengths[i] = value;
+                i += 1;
+            }
+        } else {
+            let count = if number == 18 {
+                ((reader.getbits()? >> 13) as usize) + 3
+            } else {
+                ((reader.getbits()? >> 9) as usize) + 11
+            };
+            reader.addbits(if number == 18 { 3 } else { 7 })?;
+            for _ in 0..count {
+                if i >= total_symbols {
+                    break;
+                }
+                all_lengths[i] = 0;
+                i += 1;
+            }
+        }
+    }
+
+    build_tables_from_combined_lengths(all_lengths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_bits(bit_string: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut current = 0u8;
+        let mut count = 0u8;
+
+        for bit in bit_string.bytes() {
+            current <<= 1;
+            if bit == b'1' {
+                current |= 1;
+            }
+            count += 1;
+            if count == 8 {
+                bytes.push(current);
+                current = 0;
+                count = 0;
+            }
+        }
+
+        if count > 0 {
+            current <<= 8 - count;
+            bytes.push(current);
+        }
+
+        bytes
+    }
 
     #[test]
     fn test_build_empty_table() {
@@ -543,5 +676,63 @@ mod tests {
         let sym = table.decode(&mut r).unwrap();
         assert_eq!(sym, 14, "code 1100 should be sym 14, got {}", sym);
         assert_eq!(r.position(), 4);
+    }
+
+    #[test]
+    fn test_decode_bitreader_matches_generic_decode() {
+        let mut lengths = [0u8; 5];
+        lengths[0] = 1;
+        lengths[1] = 3;
+        lengths[2] = 3;
+        lengths[3] = 3;
+        lengths[4] = 3;
+
+        let table = HuffmanTable::build(&lengths).unwrap();
+        let data = [0b01111010, 0b00000000];
+        let mut generic = BitReader::new(&data);
+        let mut ported = BitReader::new(&data);
+
+        for _ in 0..3 {
+            assert_eq!(table.decode(&mut generic).unwrap(), table.decode_bitreader(&mut ported).unwrap());
+            assert_eq!(generic.position(), ported.position());
+        }
+    }
+
+    #[test]
+    fn test_read_tables_bitreader_matches_generic() {
+        let mut bits = String::new();
+
+        for _ in 0..18 {
+            bits.push_str("0000");
+        }
+        bits.push_str("0001");
+        bits.push_str("0001");
+
+        for _ in 0..3 {
+            bits.push('1');
+            bits.push_str("1111111");
+        }
+        for _ in 0..2 {
+            bits.push('0');
+            bits.push_str("101");
+        }
+
+        let data = pack_bits(&bits);
+        let mut prev_generic = vec![0u8; HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC];
+        let mut prev_ported = prev_generic.clone();
+        let mut generic = BitReader::new(&data);
+        let mut ported = BitReader::new(&data);
+
+        let (generic_nc, generic_dc, generic_ldc, generic_rc) =
+            read_tables(&mut generic, &mut prev_generic).unwrap();
+        let (ported_nc, ported_dc, ported_ldc, ported_rc) =
+            read_tables_bitreader(&mut ported, &mut prev_ported).unwrap();
+
+        assert_eq!(generic.position(), ported.position());
+        assert_eq!(prev_generic, prev_ported);
+        assert_eq!(generic_nc.max_length(), ported_nc.max_length());
+        assert_eq!(generic_dc.max_length(), ported_dc.max_length());
+        assert_eq!(generic_ldc.max_length(), ported_ldc.max_length());
+        assert_eq!(generic_rc.max_length(), ported_rc.max_length());
     }
 }

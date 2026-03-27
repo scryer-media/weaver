@@ -240,6 +240,12 @@ impl<'a> BitReader<'a> {
         })
     }
 
+    /// unrar-style `getbits()`: return the next bits as a left-aligned 16-bit field.
+    #[inline(always)]
+    pub fn getbits(&self) -> RarResult<u32> {
+        self.peek_16_left_aligned()
+    }
+
     /// Consume a small number of bits using the accumulator fast path when possible.
     #[inline]
     pub fn consume_bits(&mut self, count: u8) -> RarResult<()> {
@@ -256,6 +262,12 @@ impl<'a> BitReader<'a> {
         }
 
         self.skip_bits(count as u32)
+    }
+
+    /// unrar-style `addbits()`: advance by `count` bits.
+    #[inline(always)]
+    pub fn addbits(&mut self, count: u8) -> RarResult<()> {
+        self.consume_bits(count)
     }
 
     /// Skip N bits.
@@ -413,6 +425,7 @@ impl<R: Read> StreamingBitReader<R> {
         }
     }
 
+    #[inline]
     fn fill_buffer(&mut self) -> RarResult<()> {
         if self.buf_pos < self.buf_len || self.eof {
             return Ok(());
@@ -427,6 +440,7 @@ impl<R: Read> StreamingBitReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn refill(&mut self) -> RarResult<()> {
         while self.acc_bits <= 56 {
             self.fill_buffer()?;
@@ -440,13 +454,22 @@ impl<R: Read> StreamingBitReader<R> {
         Ok(())
     }
 
+    #[inline]
     fn peek_bits(&mut self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
         if count == 0 {
             return Ok(0);
         }
 
+        if self.acc_bits >= count {
+            return Ok((self.acc >> (64 - count as u32)) as u32);
+        }
+
         self.refill()?;
+
+        if self.acc_bits >= count {
+            return Ok((self.acc >> (64 - count as u32)) as u32);
+        }
 
         let available = self.acc_bits as usize + (self.buf_len - self.buf_pos) * 8;
         if available < count as usize && self.eof {
@@ -506,8 +529,15 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
     }
 
     fn has_bits(&mut self) -> bool {
-        let _ = self.refill();
-        self.acc_bits > 0 || self.buf_pos < self.buf_len
+        if self.acc_bits > 0 || self.buf_pos < self.buf_len {
+            return true;
+        }
+
+        if self.eof {
+            return false;
+        }
+
+        self.fill_buffer().is_ok() && self.buf_pos < self.buf_len
     }
 
     fn position(&self) -> usize {
@@ -520,7 +550,26 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             return Ok(0);
         }
 
+        if self.acc_bits >= count {
+            let result = (self.acc >> (64 - count as u32)) as u32;
+            self.acc <<= count as u32;
+            self.acc_bits -= count;
+            self.bit_pos += count as usize;
+            self.refill()?;
+            return Ok(result);
+        }
+
         self.refill()?;
+
+        if self.acc_bits >= count {
+            let result = (self.acc >> (64 - count as u32)) as u32;
+            self.acc <<= count as u32;
+            self.acc_bits -= count;
+            self.bit_pos += count as usize;
+            self.refill()?;
+            return Ok(result);
+        }
+
         let available = self.acc_bits as usize + (self.buf_len - self.buf_pos) * 8;
         if available < count as usize && self.eof {
             return Err(RarError::CorruptArchive {
@@ -531,26 +580,22 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             });
         }
 
-        if self.acc_bits < count {
-            self.refill()?;
-            let available = self.acc_bits as usize + (self.buf_len - self.buf_pos) * 8;
-            if available < count as usize && self.eof {
-                return Err(RarError::CorruptArchive {
-                    detail: format!(
-                        "bitstream: need {} bits but only {} remaining",
-                        count, available
-                    ),
-                });
-            }
-        }
-
         let result = self.peek_bits(count)?;
         self.consume_bits(count)?;
         Ok(result)
     }
 
     fn peek_16_left_aligned(&mut self) -> RarResult<u32> {
+        if self.acc_bits >= 16 {
+            return Ok(((self.acc >> 48) as u32) & 0xfffe);
+        }
+
         self.refill()?;
+
+        if self.acc_bits >= 16 {
+            return Ok(((self.acc >> 48) as u32) & 0xfffe);
+        }
+
         let bits_avail = self.acc_bits as usize + (self.buf_len - self.buf_pos) * 8;
         if bits_avail == 0 {
             return Err(RarError::CorruptArchive {
@@ -572,7 +617,24 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             return Ok(());
         }
 
+        if self.acc_bits >= count {
+            self.acc <<= count as u32;
+            self.acc_bits -= count;
+            self.bit_pos += count as usize;
+            self.refill()?;
+            return Ok(());
+        }
+
         self.refill()?;
+
+        if self.acc_bits >= count {
+            self.acc <<= count as u32;
+            self.acc_bits -= count;
+            self.bit_pos += count as usize;
+            self.refill()?;
+            return Ok(());
+        }
+
         let available = self.acc_bits as usize + (self.buf_len - self.buf_pos) * 8;
         if available < count as usize && self.eof {
             return Err(RarError::CorruptArchive {
@@ -583,9 +645,6 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             });
         }
 
-        if self.acc_bits < count {
-            self.refill()?;
-        }
         if self.acc_bits < count {
             return Err(RarError::CorruptArchive {
                 detail: "bitstream: truncated code".into(),

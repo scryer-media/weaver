@@ -75,10 +75,18 @@ pub struct ServerHealth {
     latency_ewma_us: f64,
     /// Number of latency samples recorded.
     latency_samples: u32,
+    /// Recent premature connection deaths (connections that died before
+    /// `MIN_CONNECTION_LIFETIME`). Stored as timestamps for time-windowed counting.
+    premature_deaths: Vec<Instant>,
 }
 
 impl ServerHealth {
     /// Create a new `ServerHealth` starting in the `Healthy` state.
+    /// Connections younger than this when they die are counted as premature deaths.
+    pub const MIN_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
+    /// Window for counting recent premature deaths.
+    const PREMATURE_DEATH_WINDOW: Duration = Duration::from_secs(120);
+
     pub fn new(config: HealthConfig) -> Self {
         Self {
             state: ServerState::Healthy,
@@ -89,6 +97,7 @@ impl ServerHealth {
             config,
             latency_ewma_us: 0.0,
             latency_samples: 0,
+            premature_deaths: Vec::new(),
         }
     }
 
@@ -142,13 +151,21 @@ impl ServerHealth {
     }
 
     /// If the server is disabled and the backoff period has elapsed, transition
-    /// back to Healthy. Otherwise this is a no-op.
+    /// back to Degraded for a probationary period. The consecutive failure count
+    /// is set to one below the disable threshold so that a single additional
+    /// failure immediately re-disables the server (with increased backoff),
+    /// while a success resets the server to Healthy.
     pub fn check_reenable(&mut self) {
         if let ServerState::Disabled { until, .. } = self.state
             && Instant::now() >= until
         {
-            self.consecutive_failures = 0;
-            self.state = ServerState::Healthy;
+            // Re-enter as Degraded just below the disable threshold so one
+            // more failure trips the circuit breaker again immediately.
+            let probe_failures = self.config.disable_threshold.saturating_sub(1);
+            self.consecutive_failures = probe_failures;
+            self.state = ServerState::Degraded {
+                consecutive_failures: probe_failures,
+            };
         }
     }
 
@@ -175,6 +192,23 @@ impl ServerHealth {
         } else {
             self.latency_ewma_us / 1_000.0
         }
+    }
+
+    /// Record a premature connection death — a connection that died before
+    /// reaching `MIN_CONNECTION_LIFETIME`. Indicates infrastructure problems
+    /// (firewalls, proxies, ISP throttling) rather than article-level issues.
+    pub fn record_premature_death(&mut self) {
+        let now = Instant::now();
+        self.premature_deaths.push(now);
+        // Prune entries outside the window.
+        let cutoff = now - Self::PREMATURE_DEATH_WINDOW;
+        self.premature_deaths.retain(|&t| t > cutoff);
+    }
+
+    /// Count of premature connection deaths within the recent time window.
+    pub fn recent_premature_deaths(&self) -> usize {
+        let cutoff = Instant::now() - Self::PREMATURE_DEATH_WINDOW;
+        self.premature_deaths.iter().filter(|&&t| t > cutoff).count()
     }
 
     /// Compute the exponential backoff duration capped at `max_backoff`.
@@ -241,6 +275,16 @@ impl HealthTracker {
 
         healthy.extend(degraded);
         healthy
+    }
+
+    /// Record a premature connection death for the given server.
+    pub fn record_premature_death(&mut self, server_idx: usize) {
+        self.servers[server_idx].record_premature_death();
+    }
+
+    /// Recent premature deaths for the given server.
+    pub fn recent_premature_deaths(&self, server_idx: usize) -> usize {
+        self.servers[server_idx].recent_premature_deaths()
     }
 
     /// Record a latency sample for the given server.
@@ -376,8 +420,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         health.check_reenable();
-        assert_eq!(*health.state(), ServerState::Healthy);
+        // Re-enables as Degraded (probationary), not Healthy.
+        assert!(matches!(health.state(), ServerState::Degraded { .. }));
         assert!(health.is_available());
+        // consecutive_failures is set to disable_threshold - 1 so one more
+        // failure immediately re-disables.
+        assert_eq!(
+            health.consecutive_failures,
+            test_config().disable_threshold - 1
+        );
+
+        // A success should fully reset to Healthy.
+        health.record_success();
+        assert_eq!(*health.state(), ServerState::Healthy);
         assert_eq!(health.consecutive_failures, 0);
     }
 
