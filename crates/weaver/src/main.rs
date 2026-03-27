@@ -762,6 +762,8 @@ async fn run_server_command(
     )
     .await?;
 
+    let nntp_pool = pipeline.nntp.pool().clone();
+
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
@@ -794,6 +796,7 @@ async fn run_server_command(
         handle.clone(),
         db.clone(),
         backup,
+        nntp_pool,
         addr,
         base_url.to_owned(),
     ));
@@ -923,6 +926,7 @@ pub fn build_nntp_client(
         servers,
         max_idle_age: std::time::Duration::from_secs(300),
         max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(15),
     };
 
     NntpClient::new(client_config)

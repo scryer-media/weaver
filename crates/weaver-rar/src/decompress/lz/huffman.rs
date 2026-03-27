@@ -75,9 +75,6 @@ pub struct HuffmanTable {
 
     /// Number of symbols in this table.
     num_symbols: usize,
-
-    /// Number of populated quick entries.
-    quick_data_size: usize,
 }
 
 impl HuffmanTable {
@@ -99,7 +96,6 @@ impl HuffmanTable {
             _ => 0,
         };
         let quick_data_size = 1usize << quick_bits;
-
         // Count codes of each length.
         let mut length_count = [0u32; 16];
         let mut max_length: u8 = 0;
@@ -127,7 +123,6 @@ impl HuffmanTable {
                 quick_bits,
                 max_length: 0,
                 num_symbols,
-                quick_data_size,
             });
         }
 
@@ -193,7 +188,6 @@ impl HuffmanTable {
             quick_bits,
             max_length,
             num_symbols,
-            quick_data_size,
         })
     }
 
@@ -201,17 +195,10 @@ impl HuffmanTable {
     ///
     /// Matches unrar's `DecodeNumber`: peek 16 left-aligned bits, try quick
     /// table, fall back to linear threshold scan.
-    #[inline]
+    #[inline(always)]
     pub fn decode<R: BitRead>(&self, reader: &mut R) -> RarResult<u16> {
         if self.max_length == 0 {
             return Err(RarError::InvalidHuffmanTable);
-        }
-
-        let bits_avail = reader.bits_remaining();
-        if bits_avail == 0 {
-            return Err(RarError::CorruptArchive {
-                detail: "huffman: no bits remaining".into(),
-            });
         }
 
         // Peek 16 left-aligned bits (or fewer if near end of stream), matching
@@ -219,28 +206,23 @@ impl HuffmanTable {
         let bit_field = reader.peek_16_left_aligned()?;
 
         // Quick path: if bit_field is below the threshold for quick_bits length.
-        if bit_field < self.decode_len[self.quick_bits as usize] {
+        let quick_bits = self.quick_bits as usize;
+        if bit_field < self.decode_len[quick_bits] {
             let code = (bit_field >> (16 - self.quick_bits)) as usize;
-            let len = self.quick_len[code.min(self.quick_data_size.saturating_sub(1))];
-            if len as usize <= bits_avail {
+            let len = self.quick_len[code];
+            if len != 0 {
                 reader.consume_bits(len)?;
                 return Ok(self.quick_num[code]);
             }
         }
 
         // Slow path: linear scan of thresholds to find bit length.
-        let mut bits: usize = MAX_CODE_LENGTH;
-        for i in (self.quick_bits as usize + 1)..MAX_CODE_LENGTH {
+        let mut bits = self.max_length as usize;
+        for i in (quick_bits + 1)..bits {
             if bit_field < self.decode_len[i] {
                 bits = i;
                 break;
             }
-        }
-
-        if bits > bits_avail {
-            return Err(RarError::CorruptArchive {
-                detail: "huffman: truncated code".into(),
-            });
         }
 
         reader.consume_bits(bits as u8)?;

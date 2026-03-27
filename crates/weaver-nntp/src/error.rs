@@ -98,6 +98,10 @@ pub enum NntpError {
     /// The connection pool has been shut down.
     #[error("pool is shut down")]
     PoolShutdown,
+
+    /// An article fetch exceeded the soft timeout, triggering failover to the next server.
+    #[error("article fetch soft timeout ({0}s)")]
+    SoftTimeout(u64),
 }
 
 /// Convenience type alias.

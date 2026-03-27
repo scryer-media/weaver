@@ -83,49 +83,21 @@ impl Window {
 
         unsafe {
             let buf = self.buf.as_mut_ptr();
+            let src_ptr = buf.add(src);
+            let dst_ptr = buf.add(dst);
 
             if distance >= length {
-                ptr::copy_nonoverlapping(buf.add(src), buf.add(dst), length);
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
             } else {
-                let mut src_ptr = buf.add(src);
-                let mut dst_ptr = buf.add(dst);
-                let mut remaining = length;
+                // Seed from the look-back source once, then expand from the
+                // just-written destination prefix like unrar's CopyString.
+                let mut copied = distance;
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, copied);
 
-                while remaining >= 8 {
-                    *dst_ptr.add(0) = *src_ptr.add(0);
-                    *dst_ptr.add(1) = *src_ptr.add(1);
-                    *dst_ptr.add(2) = *src_ptr.add(2);
-                    *dst_ptr.add(3) = *src_ptr.add(3);
-                    *dst_ptr.add(4) = *src_ptr.add(4);
-                    *dst_ptr.add(5) = *src_ptr.add(5);
-                    *dst_ptr.add(6) = *src_ptr.add(6);
-                    *dst_ptr.add(7) = *src_ptr.add(7);
-
-                    src_ptr = src_ptr.add(8);
-                    dst_ptr = dst_ptr.add(8);
-                    remaining -= 8;
-                }
-
-                if remaining > 0 {
-                    *dst_ptr.add(0) = *src_ptr.add(0);
-                    if remaining > 1 {
-                        *dst_ptr.add(1) = *src_ptr.add(1);
-                        if remaining > 2 {
-                            *dst_ptr.add(2) = *src_ptr.add(2);
-                            if remaining > 3 {
-                                *dst_ptr.add(3) = *src_ptr.add(3);
-                                if remaining > 4 {
-                                    *dst_ptr.add(4) = *src_ptr.add(4);
-                                    if remaining > 5 {
-                                        *dst_ptr.add(5) = *src_ptr.add(5);
-                                        if remaining > 6 {
-                                            *dst_ptr.add(6) = *src_ptr.add(6);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                while copied < length {
+                    let chunk = copied.min(length - copied);
+                    ptr::copy_nonoverlapping(dst_ptr, dst_ptr.add(copied), chunk);
+                    copied += chunk;
                 }
             }
         }

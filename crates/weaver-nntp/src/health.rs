@@ -71,6 +71,10 @@ pub struct ServerHealth {
     /// Number of times this server has been disabled (used for exponential backoff).
     disable_count: u32,
     config: HealthConfig,
+    /// Exponentially weighted moving average of latency in microseconds.
+    latency_ewma_us: f64,
+    /// Number of latency samples recorded.
+    latency_samples: u32,
 }
 
 impl ServerHealth {
@@ -83,6 +87,8 @@ impl ServerHealth {
             consecutive_failures: 0,
             disable_count: 0,
             config,
+            latency_ewma_us: 0.0,
+            latency_samples: 0,
         }
     }
 
@@ -143,6 +149,31 @@ impl ServerHealth {
         {
             self.consecutive_failures = 0;
             self.state = ServerState::Healthy;
+        }
+    }
+
+    /// Record a latency sample, updating the EWMA with α=0.2.
+    ///
+    /// The first sample seeds the EWMA directly; subsequent samples are
+    /// blended using `new = α * sample + (1 - α) * old`.
+    pub fn record_latency(&mut self, duration: Duration) {
+        let sample_us = duration.as_secs_f64() * 1_000_000.0;
+        if self.latency_samples == 0 {
+            self.latency_ewma_us = sample_us;
+        } else {
+            const ALPHA: f64 = 0.2;
+            self.latency_ewma_us = ALPHA * sample_us + (1.0 - ALPHA) * self.latency_ewma_us;
+        }
+        self.latency_samples += 1;
+    }
+
+    /// Returns the EWMA latency in milliseconds, or 50.0 if no samples have
+    /// been recorded yet (cold start default).
+    pub fn latency_ms(&self) -> f64 {
+        if self.latency_samples == 0 {
+            50.0
+        } else {
+            self.latency_ewma_us / 1_000.0
         }
     }
 
@@ -210,6 +241,16 @@ impl HealthTracker {
 
         healthy.extend(degraded);
         healthy
+    }
+
+    /// Record a latency sample for the given server.
+    pub fn record_latency(&mut self, server_idx: usize, duration: Duration) {
+        self.servers[server_idx].record_latency(duration);
+    }
+
+    /// Returns the EWMA latency in milliseconds for the given server.
+    pub fn latency_ms(&self, server_idx: usize) -> f64 {
+        self.servers[server_idx].latency_ms()
     }
 
     /// Get a reference to the health state for a specific server.
@@ -367,5 +408,119 @@ mod tests {
         // Server 1 should be excluded entirely.
         assert_eq!(order, vec![0, 2]);
         assert!(!tracker.is_available(1));
+    }
+
+    #[test]
+    fn latency_cold_start_returns_default() {
+        let health = ServerHealth::new(test_config());
+        // No samples recorded — should return the 50ms cold start default.
+        assert!((health.latency_ms() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn latency_first_sample_seeds_ewma() {
+        let mut health = ServerHealth::new(test_config());
+        health.record_latency(Duration::from_millis(100));
+        // First sample seeds directly: 100ms.
+        assert!((health.latency_ms() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn latency_ewma_converges() {
+        let mut health = ServerHealth::new(test_config());
+
+        // Seed with 100ms.
+        health.record_latency(Duration::from_millis(100));
+        assert!((health.latency_ms() - 100.0).abs() < 0.01);
+
+        // Feed 10 samples of 200ms — EWMA should converge toward 200ms.
+        for _ in 0..10 {
+            health.record_latency(Duration::from_millis(200));
+        }
+
+        // After 10 samples with alpha=0.2: should be very close to 200ms.
+        // Exact: 100 * 0.8^10 + 200 * (1 - 0.8^10) = 100*0.107 + 200*0.893 ≈ 189.3
+        let latency = health.latency_ms();
+        assert!(
+            latency > 180.0 && latency < 200.0,
+            "expected EWMA to converge near 200ms, got {latency}ms"
+        );
+    }
+
+    #[test]
+    fn latency_ewma_update_formula() {
+        let mut health = ServerHealth::new(test_config());
+
+        // Seed: 100ms
+        health.record_latency(Duration::from_millis(100));
+
+        // Second sample: 200ms
+        // EWMA = 0.2 * 200 + 0.8 * 100 = 40 + 80 = 120ms
+        health.record_latency(Duration::from_millis(200));
+        assert!((health.latency_ms() - 120.0).abs() < 0.01);
+
+        // Third sample: 200ms
+        // EWMA = 0.2 * 200 + 0.8 * 120 = 40 + 96 = 136ms
+        health.record_latency(Duration::from_millis(200));
+        assert!((health.latency_ms() - 136.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn tracker_record_latency() {
+        let config = test_config();
+        let mut tracker = HealthTracker::new(2, config);
+
+        // Cold start for both servers.
+        assert!((tracker.latency_ms(0) - 50.0).abs() < f64::EPSILON);
+        assert!((tracker.latency_ms(1) - 50.0).abs() < f64::EPSILON);
+
+        // Record latency for server 0 only.
+        tracker.record_latency(0, Duration::from_millis(80));
+        assert!((tracker.latency_ms(0) - 80.0).abs() < 0.01);
+        // Server 1 should still be at cold start.
+        assert!((tracker.latency_ms(1) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn circuit_breaker_disables_after_consecutive_failures() {
+        let config = test_config(); // disable_threshold = 5
+        let mut tracker = HealthTracker::new(1, config);
+
+        // Record 5 consecutive transient failures.
+        for _ in 0..5 {
+            tracker.record_failure(0, false);
+        }
+
+        // Server should be disabled.
+        assert!(!tracker.is_available(0));
+        assert!(matches!(
+            tracker.server(0).state(),
+            ServerState::Disabled {
+                reason: DisableReason::ConsecutiveFailures,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn circuit_breaker_ten_failures_disables_with_default_config() {
+        // Use default config (disable_threshold = 10).
+        let config = HealthConfig::default();
+        let mut tracker = HealthTracker::new(1, config);
+
+        // 10 consecutive failures should disable the server.
+        for i in 0..10 {
+            tracker.record_failure(0, false);
+            if i < 9 {
+                // Should still be available (healthy or degraded).
+                assert!(
+                    tracker.server(0).is_available(),
+                    "server should be available after {} failures",
+                    i + 1
+                );
+            }
+        }
+
+        assert!(!tracker.server(0).is_available());
     }
 }

@@ -23,9 +23,14 @@ use weaver_api::auth::{
 };
 use weaver_api::jwt::{self, JWT_TTL_SECS};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
+use weaver_nntp::pool::NntpPool;
 use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_scheduler::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
 use weaver_state::Database;
+
+/// Shared handle to the NNTP connection pool for per-server metrics.
+#[derive(Clone)]
+struct NntpPoolHandle(Arc<NntpPool>);
 
 #[derive(Embed)]
 #[folder = "../../apps/weaver-web/dist/"]
@@ -416,15 +421,20 @@ async fn ws_handler(
         })
 }
 
-async fn metrics_handler(Extension(handle): Extension<SchedulerHandle>) -> impl IntoResponse {
+async fn metrics_handler(
+    Extension(handle): Extension<SchedulerHandle>,
+    Extension(NntpPoolHandle(pool)): Extension<NntpPoolHandle>,
+) -> impl IntoResponse {
     let snapshot = handle.get_metrics();
     let jobs = handle.list_jobs();
     let download_block = handle.get_download_block();
+    let server_health = collect_server_health(&pool).await;
     let body = render_prometheus_metrics(
         &snapshot,
         &jobs,
         handle.is_globally_paused(),
         &download_block,
+        &server_health,
     );
     (
         StatusCode::OK,
@@ -782,6 +792,7 @@ pub async fn run_server(
     handle: SchedulerHandle,
     db: Database,
     backup: BackupService,
+    nntp_pool: Arc<NntpPool>,
     addr: SocketAddr,
     base_url: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -805,6 +816,7 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
+        .layer(Extension(NntpPoolHandle(nntp_pool)))
         .layer(Extension(base_url_ext))
         .layer(Extension(session_token));
 
@@ -841,11 +853,59 @@ pub async fn run_server(
     Ok(())
 }
 
+struct ServerHealthInfo {
+    label: String,
+    state: &'static str,
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u32,
+    latency_ms: f64,
+    connections_available: usize,
+    connections_max: usize,
+}
+
+async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
+    let configs = pool.server_configs();
+    // Build labels and read load outside the health lock.
+    let pre: Vec<(String, usize, usize)> = configs
+        .iter()
+        .enumerate()
+        .map(|(idx, cfg)| {
+            let (avail, max) = pool.server_load(idx);
+            (format!("{}:{}", cfg.host, cfg.port), avail, max)
+        })
+        .collect();
+
+    // Hold the health lock only for field reads — no allocations inside.
+    let health = pool.health().lock().await;
+    pre.into_iter()
+        .enumerate()
+        .map(|(idx, (label, avail, max))| {
+            let srv = health.server(idx);
+            ServerHealthInfo {
+                label,
+                state: match srv.state() {
+                    weaver_nntp::ServerState::Healthy => "healthy",
+                    weaver_nntp::ServerState::Degraded { .. } => "degraded",
+                    weaver_nntp::ServerState::Disabled { .. } => "disabled",
+                },
+                success_count: srv.success_count,
+                failure_count: srv.failure_count,
+                consecutive_failures: srv.consecutive_failures,
+                latency_ms: health.latency_ms(idx),
+                connections_available: avail,
+                connections_max: max,
+            }
+        })
+        .collect()
+}
+
 fn render_prometheus_metrics(
     snapshot: &MetricsSnapshot,
     jobs: &[JobInfo],
     pipeline_paused: bool,
     download_block: &DownloadBlockState,
+    server_health: &[ServerHealthInfo],
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("# HELP weaver_build_info Static build information.\n");
@@ -1211,6 +1271,57 @@ fn render_prometheus_metrics(
         );
     }
 
+    // Per-server NNTP health metrics.
+    if !server_health.is_empty() {
+        out.push_str("# HELP weaver_server_state Server health state (1=healthy, 0=disabled).\n");
+        out.push_str("# TYPE weaver_server_state gauge\n");
+        out.push_str("# HELP weaver_server_success_total Total successful operations per server.\n");
+        out.push_str("# TYPE weaver_server_success_total counter\n");
+        out.push_str("# HELP weaver_server_failure_total Total failed operations per server.\n");
+        out.push_str("# TYPE weaver_server_failure_total counter\n");
+        out.push_str("# HELP weaver_server_consecutive_failures Current run of consecutive failures per server.\n");
+        out.push_str("# TYPE weaver_server_consecutive_failures gauge\n");
+        out.push_str("# HELP weaver_server_latency_ms EWMA latency in milliseconds per server.\n");
+        out.push_str("# TYPE weaver_server_latency_ms gauge\n");
+        out.push_str(
+            "# HELP weaver_server_connections_available Available connection permits per server.\n",
+        );
+        out.push_str("# TYPE weaver_server_connections_available gauge\n");
+        out.push_str("# HELP weaver_server_connections_max Maximum connections per server.\n");
+        out.push_str("# TYPE weaver_server_connections_max gauge\n");
+
+        for srv in server_health {
+            let labels: &[(&str, &str)] = &[("server", &srv.label)];
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_state",
+                labels,
+                if srv.state == "healthy" { 1 } else { 0 },
+            );
+            append_labeled_metric(&mut out, "weaver_server_success_total", labels, srv.success_count);
+            append_labeled_metric(&mut out, "weaver_server_failure_total", labels, srv.failure_count);
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_consecutive_failures",
+                labels,
+                srv.consecutive_failures,
+            );
+            append_labeled_metric_f64(&mut out, "weaver_server_latency_ms", labels, srv.latency_ms);
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_connections_available",
+                labels,
+                srv.connections_available,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_connections_max",
+                labels,
+                srv.connections_max,
+            );
+        }
+    }
+
     out
 }
 
@@ -1238,6 +1349,19 @@ fn append_labeled_metric<T: std::fmt::Display>(
     append_labels(out, labels);
     out.push(' ');
     out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn append_labeled_metric_f64(
+    out: &mut String,
+    name: &str,
+    labels: &[(&str, &str)],
+    value: f64,
+) {
+    out.push_str(name);
+    append_labels(out, labels);
+    out.push(' ');
+    out.push_str(&format_prometheus_f64(value));
     out.push('\n');
 }
 
@@ -1418,6 +1542,7 @@ mod tests {
                 timezone_name: "MDT".into(),
                 scheduled_speed_limit: 0,
             },
+            &[],
         );
 
         assert!(rendered.contains("weaver_pipeline_paused 1"));

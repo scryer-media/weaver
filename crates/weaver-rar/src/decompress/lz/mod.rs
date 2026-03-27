@@ -24,6 +24,7 @@ mod parallel;
 pub mod window;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use tracing::trace;
 
@@ -66,10 +67,10 @@ pub struct LzDecoder {
     /// Length of the last match (for symbol 257 repeat).
     last_length: usize,
     /// Current Huffman tables (kept across blocks when table_present is false).
-    nc_table: Option<HuffmanTable>,
-    dc_table: Option<HuffmanTable>,
-    ldc_table: Option<HuffmanTable>,
-    rc_table: Option<HuffmanTable>,
+    nc_table: Option<Arc<HuffmanTable>>,
+    dc_table: Option<Arc<HuffmanTable>>,
+    ldc_table: Option<Arc<HuffmanTable>>,
+    rc_table: Option<Arc<HuffmanTable>>,
     /// Persistent code lengths for delta encoding across blocks.
     code_lengths: Vec<u8>,
     /// Number of compressed bits remaining in the current block.
@@ -253,10 +254,10 @@ impl LzDecoder {
             let (nc, dc, ldc, rc) = huffman::read_tables(reader, &mut self.code_lengths)?;
             let bits_used = (reader.position() - pos_before) as i64;
             self.block_bits_remaining -= bits_used;
-            self.nc_table = Some(nc);
-            self.dc_table = Some(dc);
-            self.ldc_table = Some(ldc);
-            self.rc_table = Some(rc);
+            self.nc_table = Some(Arc::new(nc));
+            self.dc_table = Some(Arc::new(dc));
+            self.ldc_table = Some(Arc::new(ldc));
+            self.rc_table = Some(Arc::new(rc));
         }
 
         Ok(())

@@ -9,6 +9,7 @@
 //! they depend on running output state.
 
 use rayon::prelude::*;
+use std::sync::Arc;
 
 use super::bitstream::BitReader;
 use super::filter::{FilterType, PendingFilter};
@@ -31,6 +32,10 @@ const MIN_PARALLEL_BLOCKS: usize = 4;
 /// Number of blocks to queue per worker in the parallel RAR5 path.
 /// Matches unrar's `UNP_BLOCKS_PER_THREAD` batching strategy.
 const BLOCKS_PER_THREAD: usize = 2;
+
+/// Per-block decoded item buffer size.
+/// Matches unrar's `DecodedAllocated = 0x4100`.
+const DECODED_ITEMS_CAPACITY: usize = 0x4100;
 
 /// Maximum worker count to consider when sizing parallel decode batches.
 /// Mirrors unrar's `MaxUserThreads = Min(Threads, 8)` behavior.
@@ -94,10 +99,10 @@ struct BlockInfo {
 /// A set of Huffman tables shared by one or more blocks.
 #[derive(Clone)]
 struct TableSet {
-    nc: HuffmanTable,
-    dc: HuffmanTable,
-    ldc: HuffmanTable,
-    rc: HuffmanTable,
+    nc: Arc<HuffmanTable>,
+    dc: Arc<HuffmanTable>,
+    ldc: Arc<HuffmanTable>,
+    rc: Arc<HuffmanTable>,
 }
 
 pub(super) fn parallel_enabled() -> bool {
@@ -172,7 +177,12 @@ fn parse_next_block(
         let (nc, dc, ldc, rc) = huffman::read_tables(reader, code_lengths)?;
         let bits_used = (reader.position() - pos_before) as i64;
         block_bits_remaining -= bits_used;
-        table_sets.push(TableSet { nc, dc, ldc, rc });
+        table_sets.push(TableSet {
+            nc: Arc::new(nc),
+            dc: Arc::new(dc),
+            ldc: Arc::new(ldc),
+            rc: Arc::new(rc),
+        });
         table_sets.len() - 1
     } else {
         table_sets.len() - 1
@@ -202,24 +212,20 @@ fn preparse_complete_blocks(
     existing_tables: Option<&TableSet>,
 ) -> RarResult<PreparsedBlocks> {
     let mut reader = BitReader::new(input);
-    let mut blocks = Vec::new();
-    let mut table_sets = Vec::new();
+    let estimated_blocks = (input.len() / 0x4000).clamp(8, 512);
+    let mut blocks = Vec::with_capacity(estimated_blocks);
+    let mut table_sets = Vec::with_capacity(estimated_blocks.min(64));
     let mut working_code_lengths = code_lengths.to_vec();
     let mut consumed_bytes = 0usize;
     let mut saw_last_block = false;
 
     if let Some(ts) = existing_tables {
-        table_sets.push(TableSet {
-            nc: ts.nc.clone(),
-            dc: ts.dc.clone(),
-            ldc: ts.ldc.clone(),
-            rc: ts.rc.clone(),
-        });
+        table_sets.push(ts.clone());
     }
 
     loop {
         let checkpoint_code_lengths = working_code_lengths.clone();
-        let checkpoint_table_sets = table_sets.clone();
+        let checkpoint_table_set_len = table_sets.len();
 
         match parse_next_block(&mut reader, &mut working_code_lengths, &mut table_sets) {
             Ok(Some((block, is_last))) => {
@@ -232,12 +238,12 @@ fn preparse_complete_blocks(
             }
             Ok(None) => {
                 working_code_lengths = checkpoint_code_lengths;
-                table_sets = checkpoint_table_sets;
+                table_sets.truncate(checkpoint_table_set_len);
                 break;
             }
             Err(error) if is_truncated_input_error(&error) => {
                 working_code_lengths = checkpoint_code_lengths;
-                table_sets = checkpoint_table_sets;
+                table_sets.truncate(checkpoint_table_set_len);
                 break;
             }
             Err(error) => return Err(error),
@@ -335,7 +341,12 @@ fn preparse_blocks(
             let (nc, dc, ldc, rc) = huffman::read_tables(&mut reader, code_lengths)?;
             let bits_used = (reader.position() - pos_before) as i64;
             block_bits_remaining -= bits_used;
-            table_sets.push(TableSet { nc, dc, ldc, rc });
+            table_sets.push(TableSet {
+                nc: Arc::new(nc),
+                dc: Arc::new(dc),
+                ldc: Arc::new(ldc),
+                rc: Arc::new(rc),
+            });
             table_sets.len() - 1
         } else {
             table_sets.len() - 1
@@ -588,7 +599,7 @@ fn parallel_decode_batch(
         .par_iter()
         .map(|block| {
             let tables = &table_sets[block.table_set_index];
-            let mut items = Vec::with_capacity(16384);
+            let mut items = Vec::with_capacity(DECODED_ITEMS_CAPACITY);
             decode_block_symbols(input, block, tables, &mut items)?;
             Ok(items)
         })
@@ -629,10 +640,10 @@ impl LzDecoder {
             &self.rc_table,
         ) {
             Some(TableSet {
-                nc: nc.clone(),
-                dc: dc.clone(),
-                ldc: ldc.clone(),
-                rc: rc.clone(),
+                nc: Arc::clone(nc),
+                dc: Arc::clone(dc),
+                ldc: Arc::clone(ldc),
+                rc: Arc::clone(rc),
             })
         } else {
             None
@@ -687,10 +698,10 @@ impl LzDecoder {
         }
 
         if let Some(last_ts) = preparsed.table_sets.last() {
-            self.nc_table = Some(last_ts.nc.clone());
-            self.dc_table = Some(last_ts.dc.clone());
-            self.ldc_table = Some(last_ts.ldc.clone());
-            self.rc_table = Some(last_ts.rc.clone());
+            self.nc_table = Some(Arc::clone(&last_ts.nc));
+            self.dc_table = Some(Arc::clone(&last_ts.dc));
+            self.ldc_table = Some(Arc::clone(&last_ts.ldc));
+            self.rc_table = Some(Arc::clone(&last_ts.rc));
         }
         self.block_bits_remaining = 0;
         self.is_last_block = preparsed.saw_last_block;
@@ -708,10 +719,10 @@ impl LzDecoder {
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
-        self.nc_table = Some(tables.nc.clone());
-        self.dc_table = Some(tables.dc.clone());
-        self.ldc_table = Some(tables.ldc.clone());
-        self.rc_table = Some(tables.rc.clone());
+        self.nc_table = Some(Arc::clone(&tables.nc));
+        self.dc_table = Some(Arc::clone(&tables.dc));
+        self.ldc_table = Some(Arc::clone(&tables.ldc));
+        self.rc_table = Some(Arc::clone(&tables.rc));
         self.block_bits_remaining = block.data_bits;
 
         let byte_offset = block.data_bit_offset / 8;
@@ -757,6 +768,7 @@ impl LzDecoder {
         writer: &mut W,
     ) -> RarResult<()> {
         let flush_threshold = self.flush_threshold();
+        let mut bytes_since_flush = 0usize;
 
         for block_items in all_items {
             for item in block_items {
@@ -764,11 +776,15 @@ impl LzDecoder {
                     return Ok(());
                 }
 
+                let mut produced = 0usize;
+                let mut force_sync = false;
+
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
                         let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
                         self.window.put_bytes(&bytes[..n]);
                         *output_size += n as u64;
+                        produced = n;
                     }
                     DecodedItem::Match { length, distance } => {
                         let remaining = (unpacked_size - *output_size) as usize;
@@ -779,6 +795,7 @@ impl LzDecoder {
                         self.last_length = length as usize;
                         self.window.copy(distance as usize, len)?;
                         *output_size += len as u64;
+                        produced = len;
                     }
                     DecodedItem::RepeatPrev => {
                         if self.last_length != 0 {
@@ -787,6 +804,7 @@ impl LzDecoder {
                             let len = self.last_length.min(remaining);
                             self.window.copy(distance, len)?;
                             *output_size += len as u64;
+                            produced = len;
                         }
                     }
                     DecodedItem::CacheRef { cache_idx, length } => {
@@ -798,6 +816,7 @@ impl LzDecoder {
                         self.last_length = length as usize;
                         self.window.copy(distance, len)?;
                         *output_size += len as u64;
+                        produced = len;
                     }
                     DecodedItem::Filter {
                         filter_type,
@@ -823,22 +842,26 @@ impl LzDecoder {
                                 ),
                             });
                         }
+
+                        force_sync = true;
                     }
                 }
 
-                if self.pending_filters.is_empty() {
-                    if self.window.unflushed_bytes() as usize >= flush_threshold {
+                if force_sync || !self.pending_filters.is_empty() {
+                    self.flush_stream_output(writer)?;
+                    bytes_since_flush = 0;
+                } else if produced != 0 {
+                    bytes_since_flush += produced;
+                    if bytes_since_flush >= flush_threshold {
                         self.window.flush_to_writer(writer).map_err(RarError::Io)?;
-                    }
-                } else {
-                    self.flush_filters_and_write(writer)?;
-                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                        return Err(RarError::CorruptArchive {
-                            detail: "RAR5 pending filters exceeded dictionary window before flush"
-                                .into(),
-                        });
+                        bytes_since_flush = 0;
                     }
                 }
+            }
+
+            if !self.pending_filters.is_empty() {
+                self.flush_stream_output(writer)?;
+                bytes_since_flush = 0;
             }
         }
 
@@ -865,10 +888,10 @@ impl LzDecoder {
             &self.rc_table,
         ) {
             Some(TableSet {
-                nc: nc.clone(),
-                dc: dc.clone(),
-                ldc: ldc.clone(),
-                rc: rc.clone(),
+                nc: Arc::clone(nc),
+                dc: Arc::clone(dc),
+                ldc: Arc::clone(ldc),
+                rc: Arc::clone(rc),
             })
         } else {
             None
@@ -918,10 +941,10 @@ impl LzDecoder {
 
         // Update decoder state for solid archive continuity.
         if let Some(last_ts) = table_sets.last() {
-            self.nc_table = Some(last_ts.nc.clone());
-            self.dc_table = Some(last_ts.dc.clone());
-            self.ldc_table = Some(last_ts.ldc.clone());
-            self.rc_table = Some(last_ts.rc.clone());
+            self.nc_table = Some(Arc::clone(&last_ts.nc));
+            self.dc_table = Some(Arc::clone(&last_ts.dc));
+            self.ldc_table = Some(Arc::clone(&last_ts.ldc));
+            self.rc_table = Some(Arc::clone(&last_ts.rc));
         }
         self.block_bits_remaining = 0;
         // preparse_blocks stops on is_last, so if we consumed all blocks

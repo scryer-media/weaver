@@ -38,6 +38,8 @@ pub struct NntpPool {
     stale_check_age: Duration,
     /// Priority group for each server (parallel to pools/configs).
     groups: Vec<u32>,
+    /// Maximum connections per server (parallel to pools/configs).
+    max_connections: Vec<usize>,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -78,9 +80,11 @@ impl NntpPool {
         let mut semaphores = Vec::with_capacity(server_count);
         let mut last_connect_failure = Vec::with_capacity(server_count);
         let mut groups = Vec::with_capacity(server_count);
+        let mut max_connections = Vec::with_capacity(server_count);
 
         for spc in &config.servers {
             groups.push(spc.group);
+            max_connections.push(spc.max_connections);
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(Mutex::new(ServerPool {
@@ -108,6 +112,7 @@ impl NntpPool {
             reconnect_delay: config.reconnect_delay,
             stale_check_age: config.stale_check_age,
             groups,
+            max_connections,
         }
     }
 
@@ -305,6 +310,21 @@ impl NntpPool {
     /// Access the health tracker for observability.
     pub fn health(&self) -> &Arc<Mutex<HealthTracker>> {
         &self.health
+    }
+
+    /// Server configurations (parallel to health tracker indices).
+    pub fn server_configs(&self) -> &[ServerConfig] {
+        &self.configs
+    }
+
+    /// Returns `(available_permits, max_connections)` for the given server.
+    ///
+    /// This is lock-free — it reads semaphore permits and the pre-stored
+    /// max_connections value, so it can be called from synchronous contexts.
+    pub fn server_load(&self, idx: usize) -> (usize, usize) {
+        let available = self.semaphores[idx].available_permits();
+        let max = self.max_connections[idx];
+        (available, max)
     }
 
     /// Take a healthy idle connection, evicting stale/poisoned ones.
@@ -605,5 +625,51 @@ mod tests {
             h2.ordered_servers()
         };
         assert_eq!(ordered, vec![0]);
+    }
+
+    #[test]
+    fn server_load_initial() {
+        let pool = NntpPool::new(test_pool_config(10));
+        let (available, max) = pool.server_load(0);
+        // No connections acquired yet, so all permits should be available.
+        assert_eq!(available, 10);
+        assert_eq!(max, 10);
+    }
+
+    #[test]
+    fn server_load_multi_server() {
+        let config = PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "a.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 10,
+                    group: 0,
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "b.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 5,
+                    group: 1,
+                },
+            ],
+            max_idle_age: Duration::from_mins(5),
+            health_config: HealthConfig::default(),
+            reconnect_delay: Duration::from_secs(1),
+            stale_check_age: Duration::from_secs(30),
+        };
+        let pool = NntpPool::new(config);
+
+        let (avail0, max0) = pool.server_load(0);
+        assert_eq!(avail0, 10);
+        assert_eq!(max0, 10);
+
+        let (avail1, max1) = pool.server_load(1);
+        assert_eq!(avail1, 5);
+        assert_eq!(max1, 5);
     }
 }

@@ -19,6 +19,7 @@ bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 socket2 = { workspace = true }
 memchr = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

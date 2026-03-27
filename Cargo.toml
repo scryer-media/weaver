@@ -70,6 +70,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 sevenz-rust2 = { version = "0.20", features = ["aes256", "bzip2", "deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "zstd"] }
 feed-rs = "2.3"
+rand = "0.9"
 regex = "1.11"
 tar = "0.4"
 zip = "2"

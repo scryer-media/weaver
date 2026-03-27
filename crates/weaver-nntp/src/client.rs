@@ -1,7 +1,9 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rand::distr::weighted::WeightedIndex;
+use rand::prelude::*;
 use tracing::{debug, warn};
 
 use crate::connection::ServerConfig;
@@ -18,6 +20,10 @@ pub struct NntpClientConfig {
     /// before failing over to the next server. A value of 1 means try once,
     /// then retry once (2 total attempts per server).
     pub max_retries_per_server: u32,
+    /// Per-article soft timeout. If a fetch from a single server exceeds this
+    /// duration, the client fails over to the next server. This is separate
+    /// from the connection-level `command_timeout` (hard ceiling per connection).
+    pub soft_timeout: Duration,
 }
 
 impl NntpClientConfig {
@@ -31,6 +37,7 @@ impl NntpClientConfig {
             }],
             max_idle_age: Duration::from_secs(300),
             max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -43,12 +50,15 @@ impl NntpClientConfig {
 pub struct NntpClient {
     pool: Arc<NntpPool>,
     max_retries_per_server: u32,
+    /// Per-article soft timeout — triggers failover to the next server.
+    soft_timeout: Duration,
 }
 
 impl NntpClient {
     /// Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
         let max_retries_per_server = config.max_retries_per_server;
+        let soft_timeout = config.soft_timeout;
         let pool = NntpPool::new(PoolConfig {
             servers: config.servers,
             max_idle_age: config.max_idle_age,
@@ -58,6 +68,7 @@ impl NntpClient {
         NntpClient {
             pool: Arc::new(pool),
             max_retries_per_server,
+            soft_timeout,
         }
     }
 
@@ -66,6 +77,7 @@ impl NntpClient {
         NntpClient {
             pool,
             max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
         }
     }
 
@@ -93,23 +105,23 @@ impl NntpClient {
             return self.fetch_body(message_id).await;
         }
 
-        let server_count = self.pool.server_count();
+        let order = self.build_server_order(&[]).await;
         let mut last_error: Option<NntpError> = None;
-
-        // Sort servers by priority group so all primary servers are tried
-        // before any backfill server.
-        let mut order: Vec<usize> = (0..server_count).collect();
-        let server_groups = self.pool.server_groups();
-        order.sort_by_key(|&i| server_groups[i]);
 
         for idx in order {
             let server = ServerId(idx);
+            let start = Instant::now();
 
             match self
                 .fetch_from_server_with_groups(server, message_id, groups)
                 .await
             {
-                Ok(data) => return Ok(data),
+                Ok(data) => {
+                    let elapsed = start.elapsed();
+                    let mut health = self.pool.health().lock().await;
+                    health.record_latency(idx, elapsed);
+                    return Ok(data);
+                }
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
@@ -143,6 +155,10 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
+                    {
+                        let mut health = self.pool.health().lock().await;
+                        health.record_failure(idx, false);
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -166,26 +182,28 @@ impl NntpClient {
             return self.fetch_body(message_id).await;
         }
 
-        let server_count = self.pool.server_count();
-        let mut last_error: Option<NntpError> = None;
-
-        let mut order: Vec<usize> = (0..server_count)
-            .filter(|i| !exclude.contains(i))
-            .collect();
-        let server_groups = self.pool.server_groups();
-        order.sort_by_key(|&i| server_groups[i]);
+        let order = self.build_server_order(exclude).await;
 
         if order.is_empty() {
             return Err(NntpError::PoolExhausted);
         }
 
+        let mut last_error: Option<NntpError> = None;
+
         for idx in order {
             let server = ServerId(idx);
+            let start = Instant::now();
+
             match self
                 .fetch_from_server_with_groups(server, message_id, groups)
                 .await
             {
-                Ok(data) => return Ok(data),
+                Ok(data) => {
+                    let elapsed = start.elapsed();
+                    let mut health = self.pool.health().lock().await;
+                    health.record_latency(idx, elapsed);
+                    return Ok(data);
+                }
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
@@ -195,6 +213,10 @@ impl NntpClient {
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
+                    {
+                        let mut health = self.pool.health().lock().await;
+                        health.record_failure(idx, false);
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -226,22 +248,103 @@ impl NntpClient {
         &self.pool
     }
 
+    /// Build the server try-order, grouping by priority and ranking within each
+    /// group using latency-weighted random selection.
+    ///
+    /// Servers in `exclude` are skipped entirely.
+    async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
+        let server_count = self.pool.server_count();
+        let server_groups = self.pool.server_groups();
+
+        // Collect available servers, grouped by priority.
+        let mut groups: std::collections::BTreeMap<u32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for idx in 0..server_count {
+            if !exclude.contains(&idx) {
+                groups.entry(server_groups[idx]).or_default().push(idx);
+            }
+        }
+
+        let mut result = Vec::with_capacity(server_count);
+        for (_priority, servers) in groups {
+            let ranked = self.rank_servers_in_group(&servers).await;
+            result.extend(ranked);
+        }
+        result
+    }
+
+    /// Rank servers within a single priority group using weighted random selection
+    /// based on latency EWMA and current load.
+    ///
+    /// The first server is chosen probabilistically (weight = 1/score), and the
+    /// rest are appended in ascending score order. This ensures that faster,
+    /// less-loaded servers are tried first while still providing load distribution.
+    async fn rank_servers_in_group(&self, servers: &[usize]) -> Vec<usize> {
+        if servers.len() <= 1 {
+            return servers.to_vec();
+        }
+
+        // Compute scores: latency_ms * (1.0 + 2.0 * load_ratio).
+        let scores: Vec<(usize, f64)> = {
+            let health = self.pool.health().lock().await;
+            servers
+                .iter()
+                .map(|&idx| {
+                    let latency = health.latency_ms(idx);
+                    let (available, max) = self.pool.server_load(idx);
+                    let load_ratio = if max == 0 {
+                        1.0
+                    } else {
+                        1.0 - (available as f64 / max as f64)
+                    };
+                    let score = latency * (1.0 + 2.0 * load_ratio);
+                    (idx, score.max(0.001)) // floor to avoid division by zero
+                })
+                .collect()
+        };
+
+        // Weighted random pick for the first server (weight = 1/score).
+        let weights: Vec<f64> = scores.iter().map(|(_, s)| 1.0 / s).collect();
+        let first_idx = match WeightedIndex::new(&weights) {
+            Ok(dist) => {
+                let mut rng = rand::rng();
+                dist.sample(&mut rng)
+            }
+            Err(_) => 0, // fallback if all weights are zero/invalid
+        };
+
+        let mut result = Vec::with_capacity(scores.len());
+        result.push(scores[first_idx].0);
+
+        // Remaining servers sorted by ascending score.
+        let mut rest: Vec<(usize, f64)> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != first_idx)
+            .map(|(_, pair)| pair)
+            .collect();
+        rest.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        result.extend(rest.iter().map(|(idx, _)| *idx));
+
+        result
+    }
+
     /// Internal: fetch with multi-server failover logic.
     async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
-        let server_count = self.pool.server_count();
+        let order = self.build_server_order(&[]).await;
         let mut last_error: Option<NntpError> = None;
-
-        // Sort servers by priority group so all primary servers are tried
-        // before any backfill server.
-        let mut order: Vec<usize> = (0..server_count).collect();
-        let groups = self.pool.server_groups();
-        order.sort_by_key(|&i| groups[i]);
 
         for idx in order {
             let server = ServerId(idx);
+            let start = Instant::now();
 
             match self.fetch_from_server(server, message_id, kind).await {
-                Ok(data) => return Ok(data),
+                Ok(data) => {
+                    let elapsed = start.elapsed();
+                    let mut health = self.pool.health().lock().await;
+                    health.record_latency(idx, elapsed);
+                    return Ok(data);
+                }
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
@@ -275,6 +378,10 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
+                    {
+                        let mut health = self.pool.health().lock().await;
+                        health.record_failure(idx, false);
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -309,7 +416,29 @@ impl NntpClient {
     /// Tries each group in order. If selecting a group fails, tries the next.
     /// Once a group is selected, issues the BODY command. Retries on transient
     /// errors up to `max_retries_per_server` times.
+    ///
+    /// The entire operation is bounded by the soft timeout — if it fires, the
+    /// caller should fail over to the next server.
     async fn fetch_from_server_with_groups(
+        &self,
+        server: ServerId,
+        message_id: &str,
+        groups: &[String],
+    ) -> Result<Bytes> {
+        let soft_timeout = self.soft_timeout;
+        match tokio::time::timeout(
+            soft_timeout,
+            self.fetch_from_server_with_groups_inner(server, message_id, groups),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(NntpError::SoftTimeout(soft_timeout.as_secs())),
+        }
+    }
+
+    /// Inner implementation of fetch_from_server_with_groups without the soft timeout wrapper.
+    async fn fetch_from_server_with_groups_inner(
         &self,
         server: ServerId,
         message_id: &str,
@@ -395,7 +524,29 @@ impl NntpClient {
     }
 
     /// Fetch from a specific server, retrying on transient errors.
+    ///
+    /// Bounded by the soft timeout — if exceeded, returns `SoftTimeout` to
+    /// trigger failover at the caller.
     async fn fetch_from_server(
+        &self,
+        server: ServerId,
+        message_id: &str,
+        kind: FetchKind,
+    ) -> Result<Bytes> {
+        let soft_timeout = self.soft_timeout;
+        match tokio::time::timeout(
+            soft_timeout,
+            self.fetch_from_server_inner(server, message_id, kind),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(NntpError::SoftTimeout(soft_timeout.as_secs())),
+        }
+    }
+
+    /// Inner implementation of fetch_from_server without the soft timeout wrapper.
+    async fn fetch_from_server_inner(
         &self,
         server: ServerId,
         message_id: &str,
@@ -467,6 +618,7 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
+            | NntpError::SoftTimeout(_)
     )
 }
 
@@ -480,6 +632,7 @@ fn is_connection_error(err: &NntpError) -> bool {
             | NntpError::ConnectionClosed
             | NntpError::TooManyConnections
             | NntpError::AccessDenied
+            | NntpError::SoftTimeout(_)
     )
 }
 
@@ -631,5 +784,169 @@ mod tests {
         // After shutdown, fetches should fail
         let result = client.fetch_body("<test@example.com>").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn soft_timeout_is_transient() {
+        assert!(is_transient(&NntpError::SoftTimeout(15)));
+    }
+
+    #[test]
+    fn soft_timeout_is_connection_error() {
+        assert!(is_connection_error(&NntpError::SoftTimeout(15)));
+    }
+
+    #[test]
+    fn soft_timeout_display() {
+        let err = NntpError::SoftTimeout(15);
+        assert_eq!(err.to_string(), "article fetch soft timeout (15s)");
+    }
+
+    #[test]
+    fn client_config_default_soft_timeout() {
+        let config = NntpClientConfig::single(
+            ServerConfig {
+                host: "news.example.com".into(),
+                ..Default::default()
+            },
+            5,
+        );
+        assert_eq!(config.soft_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn client_soft_timeout_propagated() {
+        let mut config = NntpClientConfig::single(
+            ServerConfig {
+                host: "news.example.com".into(),
+                ..Default::default()
+            },
+            5,
+        );
+        config.soft_timeout = Duration::from_secs(30);
+        let client = NntpClient::new(config);
+        assert_eq!(client.soft_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn from_pool_default_soft_timeout() {
+        let config = NntpClientConfig::single(
+            ServerConfig {
+                host: "news.example.com".into(),
+                ..Default::default()
+            },
+            5,
+        );
+        let pool = Arc::new(NntpPool::new(PoolConfig {
+            servers: config.servers,
+            max_idle_age: config.max_idle_age,
+            ..PoolConfig::default()
+        }));
+        let client = NntpClient::from_pool(pool);
+        assert_eq!(client.soft_timeout, Duration::from_secs(15));
+    }
+
+    /// Build a multi-server client for testing server ordering.
+    fn multi_server_client(server_count: usize) -> NntpClient {
+        let servers: Vec<ServerPoolConfig> = (0..server_count)
+            .map(|i| ServerPoolConfig {
+                server: ServerConfig {
+                    host: format!("server{i}.example.com"),
+                    ..Default::default()
+                },
+                max_connections: 10,
+                group: if i < 2 { 0 } else { 1 }, // first 2 in group 0, rest in group 1
+            })
+            .collect();
+
+        let pool = NntpPool::new(PoolConfig {
+            servers,
+            max_idle_age: Duration::from_secs(300),
+            ..PoolConfig::default()
+        });
+
+        NntpClient {
+            pool: Arc::new(pool),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_server_order_respects_priority_groups() {
+        let client = multi_server_client(4);
+
+        let order = client.build_server_order(&[]).await;
+        // All 4 servers should be present.
+        assert_eq!(order.len(), 4);
+        // Group 0 servers (0, 1) should come before group 1 servers (2, 3).
+        let group0_positions: Vec<usize> = order.iter().position(|&x| x == 0).into_iter()
+            .chain(order.iter().position(|&x| x == 1))
+            .collect();
+        let group1_positions: Vec<usize> = order.iter().position(|&x| x == 2).into_iter()
+            .chain(order.iter().position(|&x| x == 3))
+            .collect();
+
+        let max_group0 = *group0_positions.iter().max().unwrap();
+        let min_group1 = *group1_positions.iter().min().unwrap();
+        assert!(
+            max_group0 < min_group1,
+            "group 0 servers should all come before group 1 servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_server_order_excludes_servers() {
+        let client = multi_server_client(4);
+
+        let order = client.build_server_order(&[1, 3]).await;
+        assert_eq!(order.len(), 2);
+        assert!(!order.contains(&1));
+        assert!(!order.contains(&3));
+        assert!(order.contains(&0));
+        assert!(order.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn weighted_selection_favours_faster_server() {
+        let client = multi_server_client(2);
+
+        // Seed server 0 with 50ms latency and server 1 with 500ms latency.
+        {
+            let mut health = client.pool.health().lock().await;
+            health.record_latency(0, Duration::from_millis(50));
+            health.record_latency(1, Duration::from_millis(500));
+        }
+
+        // Run 1000 iterations and count how often server 0 is picked first.
+        let mut server0_first = 0u32;
+        for _ in 0..1000 {
+            let ranked = client.rank_servers_in_group(&[0, 1]).await;
+            if ranked[0] == 0 {
+                server0_first += 1;
+            }
+        }
+
+        // Server 0 is 10x faster, so it should be picked first significantly
+        // more often. With weight=1/score, server 0 weight ≈ 10x server 1 weight,
+        // so server 0 should be picked ~90% of the time. Allow some variance.
+        assert!(
+            server0_first > 700,
+            "faster server should be picked first most of the time, but was only first {server0_first}/1000 times"
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_single_server_returns_it() {
+        let client = multi_server_client(2);
+        let ranked = client.rank_servers_in_group(&[1]).await;
+        assert_eq!(ranked, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn rank_empty_returns_empty() {
+        let client = multi_server_client(2);
+        let ranked = client.rank_servers_in_group(&[]).await;
+        assert!(ranked.is_empty());
     }
 }

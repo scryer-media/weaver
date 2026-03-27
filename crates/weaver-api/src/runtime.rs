@@ -86,6 +86,7 @@ pub async fn rebuild_nntp_from_config(
             servers,
             max_idle_age: std::time::Duration::from_mins(5),
             max_retries_per_server: 1,
+            soft_timeout: std::time::Duration::from_secs(15),
         });
         (client, total)
     };

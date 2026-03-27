@@ -3703,6 +3703,7 @@ dependencies = [
  "criterion",
  "memchr",
  "pin-project-lite",
+ "rand",
  "rustls-pemfile",
  "socket2 0.5.10",
  "thiserror",
