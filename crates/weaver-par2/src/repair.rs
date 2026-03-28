@@ -770,16 +770,7 @@ pub fn execute_repair_with_options(
         RepairExecutionMode::Streaming {
             chunk_words,
             budget,
-        } => {
-            execute_repair_streaming(
-                plan,
-                par2_set,
-                file_access,
-                options,
-                chunk_words,
-                budget,
-            )
-        }
+        } => execute_repair_streaming(plan, par2_set, file_access, options, chunk_words, budget),
         RepairExecutionMode::InMemory { chunk_words } => {
             let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
             let mut input_data = vec![0u8; slice_size];

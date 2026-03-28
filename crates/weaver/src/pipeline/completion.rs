@@ -32,9 +32,10 @@ impl Pipeline {
             .pending_decode
             .iter()
             .any(|work| work.segment_id.file_id.job_id == job_id);
-        let has_buffered_segments = self.write_buffers.iter().any(|(file_id, write_buf)| {
-            file_id.job_id == job_id && write_buf.buffered_len() > 0
-        });
+        let has_buffered_segments = self
+            .write_buffers
+            .iter()
+            .any(|(file_id, write_buf)| file_id.job_id == job_id && write_buf.buffered_len() > 0);
 
         has_queued_work
             || has_inflight_downloads
@@ -1852,11 +1853,7 @@ impl Pipeline {
     }
 
     async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {
-        self.transition_postprocessing_status(
-            job_id,
-            JobStatus::Downloading,
-            Some("downloading"),
-        );
+        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
         if self.job_has_only_rar_archives(job_id) {
             let set_names: Vec<String> = self
@@ -2029,7 +2026,12 @@ impl Pipeline {
                 })
                 .collect::<Vec<_>>();
 
-            (retry_files, retry_sets, retry_members, state.working_dir.clone())
+            (
+                retry_files,
+                retry_sets,
+                retry_members,
+                state.working_dir.clone(),
+            )
         };
 
         if retry_files.is_empty() {
@@ -2087,7 +2089,9 @@ impl Pipeline {
                     ));
                 }
             }
-            if let Err(error) = self.db.mark_file_incomplete(job_id, retry_file.file_id.file_index)
+            if let Err(error) = self
+                .db
+                .mark_file_incomplete(job_id, retry_file.file_id.file_index)
             {
                 warn!(
                     job_id = job_id.0,

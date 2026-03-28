@@ -534,13 +534,15 @@ fn build_repair_access(
 ) -> Box<dyn weaver_par2::FileAccess> {
     if resolved.search_dirs.is_empty() {
         if let Some(plan) = placement_plan
-            && plan.swaps.is_empty() && plan.renames.is_empty() {
-                return Box::new(weaver_par2::PlacementFileAccess::from_plan(
-                    resolved.primary_dir.clone(),
-                    par2_set,
-                    plan,
-                ));
-            }
+            && plan.swaps.is_empty()
+            && plan.renames.is_empty()
+        {
+            return Box::new(weaver_par2::PlacementFileAccess::from_plan(
+                resolved.primary_dir.clone(),
+                par2_set,
+                plan,
+            ));
+        }
         Box::new(weaver_par2::DiskFileAccess::new(
             resolved.primary_dir.clone(),
             par2_set,

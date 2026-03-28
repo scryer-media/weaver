@@ -3071,7 +3071,12 @@ mod tests {
         drain_decode_results(&mut pipeline, 1).await;
 
         assert_eq!(
-            pipeline.jobs.get(&job_id).unwrap().assembly.complete_data_file_count(),
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .assembly
+                .complete_data_file_count(),
             0
         );
 
@@ -3107,7 +3112,10 @@ mod tests {
         }
 
         let status = job_status_for_assert(&pipeline, job_id).expect("job should be archived");
-        assert!(matches!(status, JobStatus::Failed { .. }), "status: {status:?}");
+        assert!(
+            matches!(status, JobStatus::Failed { .. }),
+            "status: {status:?}"
+        );
     }
 
     #[tokio::test]
@@ -5183,7 +5191,10 @@ mod tests {
             let state = pipeline.jobs.get_mut(&job_id).unwrap();
             state
                 .assembly
-                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
                 .unwrap()
                 .commit_segment(0, 14)
                 .unwrap();
@@ -5246,12 +5257,13 @@ mod tests {
             .rar_sets
             .get_mut(&(job_id, "show".to_string()))
             .unwrap()
-            .volume_files = std::collections::BTreeMap::from([(
-            0u32,
-            "show.part01.rar".to_string(),
-        )]);
+            .volume_files =
+            std::collections::BTreeMap::from([(0u32, "show.part01.rar".to_string())]);
 
-        pipeline.recompute_rar_set_state(job_id, "show").await.unwrap();
+        pipeline
+            .recompute_rar_set_state(job_id, "show")
+            .await
+            .unwrap();
 
         let volume_paths = pipeline.volume_paths_for_rar_set(job_id, "show");
         assert_eq!(volume_paths.len(), 4);
@@ -5301,7 +5313,10 @@ mod tests {
             state.download_queue = DownloadQueue::new();
             state
                 .assembly
-                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
                 .unwrap()
                 .commit_segment(0, 128)
                 .unwrap();
@@ -5365,7 +5380,10 @@ mod tests {
             state.download_queue = DownloadQueue::new();
             state
                 .assembly
-                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
                 .unwrap()
                 .commit_segment(0, 128)
                 .unwrap();
@@ -5398,7 +5416,10 @@ mod tests {
             assert!(topo.complete_volumes.is_empty());
         }
 
-        let file_id = NzbFileId { job_id, file_index: 0 };
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
         {
             let state = pipeline.jobs.get_mut(&job_id).unwrap();
             state
@@ -5449,7 +5470,10 @@ mod tests {
             state.download_queue = DownloadQueue::new();
             state
                 .assembly
-                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
                 .unwrap()
                 .commit_segment(0, 128)
                 .unwrap();
@@ -5482,7 +5506,10 @@ mod tests {
             assert!(topo.complete_volumes.is_empty());
         }
 
-        let file_id = NzbFileId { job_id, file_index: 0 };
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
         {
             let state = pipeline.jobs.get_mut(&job_id).unwrap();
             state
@@ -5518,7 +5545,10 @@ mod tests {
             state.download_queue = DownloadQueue::new();
             state
                 .assembly
-                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
                 .unwrap()
                 .commit_segment(0, 64)
                 .unwrap();

@@ -23,14 +23,15 @@ impl Pipeline {
     fn mark_download_pass_started(&mut self, job_id: JobId) {
         // Transition Queued → Downloading when the first segment is dispatched.
         if let Some(state) = self.jobs.get_mut(&job_id)
-            && state.status == JobStatus::Queued {
-                state.status = JobStatus::Downloading;
-                self.db_fire_and_forget(move |db| {
-                    if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
-                        tracing::error!(error = %e, "db write failed for queued→downloading");
-                    }
-                });
-            }
+            && state.status == JobStatus::Queued
+        {
+            state.status = JobStatus::Downloading;
+            self.db_fire_and_forget(move |db| {
+                if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
+                    tracing::error!(error = %e, "db write failed for queued→downloading");
+                }
+            });
+        }
         if self.active_download_passes.insert(job_id) {
             let _ = self
                 .event_tx
