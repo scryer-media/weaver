@@ -230,7 +230,7 @@ fn preparse_complete_blocks(
         match parse_next_block(&mut reader, &mut working_code_lengths, &mut table_sets) {
             Ok(Some((block, is_last))) => {
                 blocks.push(block);
-                consumed_bytes = (reader.position() + 7) / 8;
+                consumed_bytes = reader.position().div_ceil(8);
                 if is_last {
                     saw_last_block = true;
                     break;

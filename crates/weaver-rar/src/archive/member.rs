@@ -1575,6 +1575,7 @@ impl RarArchive {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn solid_decode_reader_to_writer_chunked<R: Read, F>(
         solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
         solid_decoder: &mut Option<LzDecoder>,

@@ -394,6 +394,7 @@ impl NntpClient {
     /// permit are preferred over fully saturated peers so we do not burn the
     /// soft-timeout budget queued behind a busy server while another server is
     /// ready right now.
+    #[allow(clippy::needless_range_loop)]
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();

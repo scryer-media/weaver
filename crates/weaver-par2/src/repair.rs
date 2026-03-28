@@ -771,14 +771,14 @@ pub fn execute_repair_with_options(
             chunk_words,
             budget,
         } => {
-            return execute_repair_streaming(
+            execute_repair_streaming(
                 plan,
                 par2_set,
                 file_access,
                 options,
                 chunk_words,
                 budget,
-            );
+            )
         }
         RepairExecutionMode::InMemory { chunk_words } => {
             let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
