@@ -266,6 +266,7 @@ fn derive_single_file_output_name<'a>(archive_name: &'a str, suffixes: &[&str]) 
         .unwrap_or(archive_name)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_single_stream_to_file<R: std::io::Read>(
     mut reader: R,
     archive_path: &Path,
