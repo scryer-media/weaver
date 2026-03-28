@@ -2470,6 +2470,7 @@ mod tests {
                 .unwrap();
         }
 
+        pipeline.try_update_archive_topology(job_id, file_id).await;
         pipeline.try_update_7z_topology(job_id, file_id);
     }
 
