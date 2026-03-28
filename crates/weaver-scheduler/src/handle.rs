@@ -656,6 +656,7 @@ mod tests {
                             download_queue: DownloadQueue::new(),
                             recovery_queue: DownloadQueue::new(),
                             staging_dir: None,
+                            paused_resume_status: None,
                         };
                         let _ = event_tx.send(PipelineEvent::JobCreated {
                             job_id,
@@ -752,6 +753,7 @@ mod tests {
                             download_queue: DownloadQueue::new(),
                             recovery_queue: DownloadQueue::new(),
                             staging_dir: None,
+                            paused_resume_status: None,
                         };
                         jobs.insert(job_id, state);
                         let _ = reply.send(Ok(()));

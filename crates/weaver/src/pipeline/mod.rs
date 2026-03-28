@@ -4858,6 +4858,12 @@ mod tests {
             plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
         }
 
+        // Set status to Extracting to match what the real pipeline would have
+        // done when extraction workers were spawned.  The bounded workload
+        // queue may gate through QueuedExtract first, but by the time workers
+        // are active the status is always Extracting.
+        pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Extracting;
+
         pipeline.check_job_completion(job_id).await;
 
         assert_eq!(

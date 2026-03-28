@@ -151,12 +151,18 @@ impl HuffmanTable {
                 cur_bit_length += 1;
             }
 
+            // Prefixes that run off the end do not correspond to a valid quick-table
+            // decode. Leave the entry empty so decode falls back to the slow path.
+            if cur_bit_length >= decode_pos.len() {
+                continue;
+            }
+
             quick_len_table[code] = cur_bit_length as u8;
 
             let dist = bit_field.wrapping_sub(decode_len[cur_bit_length - 1]);
             let dist = dist >> (16 - cur_bit_length);
             let pos = (decode_pos[cur_bit_length] + dist) as usize;
-            if cur_bit_length < decode_pos.len() && pos < num_symbols {
+            if pos < num_symbols {
                 quick_num_table[code] = decode_num[pos];
             }
         }
@@ -504,6 +510,22 @@ mod tests {
         let mut reader = BitReader::new(&data);
         let sym = table.decode(&mut reader).unwrap();
         assert_eq!(sym, 0);
+    }
+
+    #[test]
+    fn test_single_symbol_invalid_quick_prefixes_remain_empty() {
+        let mut lengths = [0u8; 4];
+        lengths[0] = 1;
+        let table = HuffmanTable::build(&lengths).unwrap();
+
+        let quick_bits = table.quick_bits as usize;
+        let quick_limit = table.decode_len[quick_bits];
+        for code in 0..(1usize << quick_bits) {
+            let bit_field = (code as u32) << (16 - quick_bits);
+            if bit_field >= quick_limit {
+                assert_eq!(table.quick_len[code], 0);
+            }
+        }
     }
 
     #[test]
