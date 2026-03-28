@@ -194,6 +194,21 @@ impl Database {
         Ok(())
     }
 
+    pub fn mark_file_incomplete(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_segments WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM active_files WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Store PAR2 metadata for a job.
     pub fn set_par2_metadata(
         &self,

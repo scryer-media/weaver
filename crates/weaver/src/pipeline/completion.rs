@@ -1851,6 +1851,286 @@ impl Pipeline {
         self.record_job_history(job_id);
     }
 
+    async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {
+        self.transition_postprocessing_status(
+            job_id,
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+
+        if self.job_has_only_rar_archives(job_id) {
+            let set_names: Vec<String> = self
+                .rar_sets
+                .keys()
+                .filter(|(jid, _)| *jid == job_id)
+                .map(|(_, name)| name.clone())
+                .collect();
+            for set_name in set_names {
+                let _ = self.recompute_rar_set_state(job_id, &set_name).await;
+            }
+            self.try_rar_extraction(job_id).await;
+            return;
+        }
+
+        let already_extracted = self
+            .extracted_archives
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        let already_spawned = self
+            .inflight_extractions
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        let sets_to_extract: Vec<(String, weaver_assembly::ArchiveType)> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            state
+                .assembly
+                .archive_topologies()
+                .iter()
+                .filter(|(name, _)| {
+                    !already_extracted.contains(*name) && !already_spawned.contains(*name)
+                })
+                .map(|(name, topo)| (name.clone(), topo.archive_type))
+                .collect()
+        };
+
+        if !already_spawned.is_empty() && sets_to_extract.is_empty() {
+            return;
+        }
+
+        if !sets_to_extract.is_empty() {
+            if !self.maybe_start_extraction(job_id).await {
+                return;
+            }
+            self.spawn_extractions(job_id, &sets_to_extract).await;
+            return;
+        }
+
+        self.finalize_completed_archive_job(job_id).await;
+    }
+
+    async fn retry_failed_archive_sources_without_par2(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<bool, String> {
+        if self.normalization_retried.contains(&job_id) {
+            return Ok(false);
+        }
+
+        let failed_entries = self
+            .failed_extractions
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        if failed_entries.is_empty() {
+            return Ok(false);
+        }
+
+        struct SourceRetryFile {
+            file_id: NzbFileId,
+            filename: String,
+            work: Vec<DownloadWork>,
+        }
+
+        let (retry_files, retry_sets, retry_members, working_dir) = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return Ok(false);
+            };
+
+            let mut file_indices = HashSet::new();
+            let mut retry_sets: HashSet<String> = HashSet::new();
+            let mut retry_members: HashSet<String> = HashSet::new();
+
+            for failed in &failed_entries {
+                if let Some(topo) = state.assembly.archive_topology_for(failed) {
+                    retry_sets.insert(failed.clone());
+                    retry_members.extend(topo.members.iter().map(|member| member.name.clone()));
+                    for filename in topo.volume_map.keys() {
+                        if let Some((index, _)) = state
+                            .spec
+                            .files
+                            .iter()
+                            .enumerate()
+                            .find(|(_, file)| file.filename == *filename)
+                        {
+                            file_indices.insert(index as u32);
+                        }
+                    }
+                    continue;
+                }
+
+                let mut matched_member = false;
+                for (set_name, topo) in state.assembly.archive_topologies() {
+                    if !topo.members.iter().any(|member| member.name == *failed) {
+                        continue;
+                    }
+                    matched_member = true;
+                    retry_sets.insert(set_name.clone());
+                    retry_members.extend(topo.members.iter().map(|member| member.name.clone()));
+                    for filename in topo.volume_map.keys() {
+                        if let Some((index, _)) = state
+                            .spec
+                            .files
+                            .iter()
+                            .enumerate()
+                            .find(|(_, file)| file.filename == *filename)
+                        {
+                            file_indices.insert(index as u32);
+                        }
+                    }
+                    break;
+                }
+
+                if matched_member {
+                    continue;
+                }
+
+                if let Some((index, _)) = state
+                    .spec
+                    .files
+                    .iter()
+                    .enumerate()
+                    .find(|(_, file)| file.filename == *failed)
+                {
+                    file_indices.insert(index as u32);
+                }
+            }
+
+            let retry_files = file_indices
+                .into_iter()
+                .filter_map(|file_index| {
+                    let file = state.spec.files.get(file_index as usize)?;
+                    let file_id = NzbFileId { job_id, file_index };
+                    let work = file
+                        .segments
+                        .iter()
+                        .map(|segment| DownloadWork {
+                            segment_id: SegmentId {
+                                file_id,
+                                segment_number: segment.number,
+                            },
+                            message_id: weaver_core::id::MessageId::new(&segment.message_id),
+                            groups: file.groups.clone(),
+                            priority: file.role.download_priority(),
+                            byte_estimate: segment.bytes,
+                            retry_count: 0,
+                            is_recovery: false,
+                            exclude_servers: vec![0],
+                        })
+                        .collect();
+                    Some(SourceRetryFile {
+                        file_id,
+                        filename: file.filename.clone(),
+                        work,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            (retry_files, retry_sets, retry_members, state.working_dir.clone())
+        };
+
+        if retry_files.is_empty() {
+            return Ok(false);
+        }
+
+        self.set_normalization_retried_state(job_id, true);
+        self.replace_failed_extraction_members(job_id, HashSet::new());
+
+        let mut clear_extracted_archives = false;
+        if let Some(extracted_archives) = self.extracted_archives.get_mut(&job_id) {
+            for set_name in &retry_sets {
+                extracted_archives.remove(set_name);
+            }
+            clear_extracted_archives = extracted_archives.is_empty();
+        }
+        if clear_extracted_archives {
+            self.extracted_archives.remove(&job_id);
+        }
+
+        let mut clear_inflight_extractions = false;
+        if let Some(inflight_extractions) = self.inflight_extractions.get_mut(&job_id) {
+            for set_name in &retry_sets {
+                inflight_extractions.remove(set_name);
+            }
+            clear_inflight_extractions = inflight_extractions.is_empty();
+        }
+        if clear_inflight_extractions {
+            self.inflight_extractions.remove(&job_id);
+        }
+
+        let mut clear_extracted_members = false;
+        if let Some(extracted_members) = self.extracted_members.get_mut(&job_id) {
+            for member_name in &retry_members {
+                extracted_members.remove(member_name);
+            }
+            clear_extracted_members = extracted_members.is_empty();
+        }
+        if clear_extracted_members {
+            self.extracted_members.remove(&job_id);
+        }
+        if !retry_members.is_empty() {
+            self.clear_persisted_extracted_members(job_id);
+        }
+
+        for retry_file in &retry_files {
+            let path = working_dir.join(&retry_file.filename);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to remove corrupt archive {} before source retry: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            if let Err(error) = self.db.mark_file_incomplete(job_id, retry_file.file_id.file_index)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    file_index = retry_file.file_id.file_index,
+                    error = %error,
+                    "failed to persist file invalidation before source retry"
+                );
+            }
+        }
+
+        {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return Ok(false);
+            };
+
+            for mut retry_file in retry_files {
+                if let Some(file_asm) = state.assembly.file_mut(retry_file.file_id) {
+                    file_asm.reset();
+                }
+
+                for topo in state.assembly.archive_topologies_mut().values_mut() {
+                    if let Some(&volume_number) = topo.volume_map.get(&retry_file.filename) {
+                        topo.complete_volumes.remove(&volume_number);
+                    }
+                }
+
+                for work in retry_file.work.drain(..) {
+                    state.download_queue.push(work);
+                }
+            }
+        }
+
+        info!(
+            job_id = job_id.0,
+            files = retry_sets.len().max(1),
+            failed = ?failed_entries,
+            "re-queueing archive source files after extraction failure without PAR2"
+        );
+
+        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
+        Ok(true)
+    }
+
     async fn check_rar_job_completion(&mut self, job_id: JobId) {
         let set_names = self.rar_set_names_for_job(job_id);
         if set_names.is_empty() {
@@ -2219,12 +2499,8 @@ impl Pipeline {
                             "cleared failed extractions after authoritative verify — retrying"
                         );
 
-                        self.transition_postprocessing_status(
-                            job_id,
-                            JobStatus::Downloading,
-                            Some("downloading"),
-                        );
-                        self.try_rar_extraction(job_id).await;
+                        self.retry_archive_extraction_after_verify_or_repair(job_id)
+                            .await;
                         return;
                     }
                 } else {
@@ -2397,24 +2673,8 @@ impl Pipeline {
                                 );
                             }
 
-                            self.transition_postprocessing_status(
-                                job_id,
-                                JobStatus::Downloading,
-                                Some("downloading"),
-                            );
-
-                            // Recompute RAR set states so ready_members reflects
-                            // the cleared failures, then retry extraction.
-                            let set_names: Vec<String> = self
-                                .rar_sets
-                                .keys()
-                                .filter(|(jid, _)| *jid == job_id)
-                                .map(|(_, name)| name.clone())
-                                .collect();
-                            for set_name in set_names {
-                                let _ = self.recompute_rar_set_state(job_id, &set_name).await;
-                            }
-                            self.try_rar_extraction(job_id).await;
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
                             return;
                         }
                         Err(error_msg) => {
@@ -2429,7 +2689,15 @@ impl Pipeline {
                     }
                 }
             } else {
-                // CRC failures but no PAR2 set — fail the job.
+                match self.retry_failed_archive_sources_without_par2(job_id).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
+
                 let failed_members: Vec<String> = self
                     .failed_extractions
                     .get(&job_id)

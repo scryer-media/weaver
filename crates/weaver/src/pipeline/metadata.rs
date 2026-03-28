@@ -96,21 +96,19 @@ impl Pipeline {
             }
         }
 
-        if volume_paths.is_empty() {
-            for file_asm in state.assembly.files() {
-                let weaver_core::classify::FileRole::RarVolume { volume_number } = file_asm.role()
-                else {
-                    continue;
-                };
-                let base_name =
-                    weaver_core::classify::archive_base_name(file_asm.filename(), file_asm.role());
-                if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
-                    continue;
-                }
-                let path = state.working_dir.join(file_asm.filename());
-                if path.exists() {
-                    volume_paths.insert(*volume_number, path);
-                }
+        for file_asm in state.assembly.files() {
+            let weaver_core::classify::FileRole::RarVolume { volume_number } = file_asm.role()
+            else {
+                continue;
+            };
+            let base_name =
+                weaver_core::classify::archive_base_name(file_asm.filename(), file_asm.role());
+            if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
+                continue;
+            }
+            let path = state.working_dir.join(file_asm.filename());
+            if path.exists() {
+                volume_paths.entry(*volume_number).or_insert(path);
             }
         }
 
@@ -784,34 +782,26 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return HashMap::new();
         };
+        let mut volume_map = HashMap::new();
         if let Some(rar_state) = self.rar_sets.get(&(job_id, set_name.to_string())) {
-            let volume_map = rar_state
-                .volume_files
-                .iter()
-                .map(|(logical_volume, filename)| (filename.clone(), *logical_volume))
-                .collect::<HashMap<_, _>>();
-            if !volume_map.is_empty() {
-                return volume_map;
+            for (logical_volume, filename) in &rar_state.volume_files {
+                volume_map.insert(filename.clone(), *logical_volume);
             }
         }
-        state
-            .assembly
-            .files()
-            .filter_map(|file_asm| match file_asm.role() {
-                weaver_core::classify::FileRole::RarVolume { volume_number } => {
-                    let base_name = weaver_core::classify::archive_base_name(
-                        file_asm.filename(),
-                        file_asm.role(),
-                    );
-                    if base_name.as_deref() == Some(set_name) && file_asm.is_complete() {
-                        Some((file_asm.filename().to_string(), *volume_number))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>()
+        for file_asm in state.assembly.files() {
+            let weaver_core::classify::FileRole::RarVolume { volume_number } = file_asm.role()
+            else {
+                continue;
+            };
+            let base_name =
+                weaver_core::classify::archive_base_name(file_asm.filename(), file_asm.role());
+            if base_name.as_deref() == Some(set_name) && file_asm.is_complete() {
+                volume_map
+                    .entry(file_asm.filename().to_string())
+                    .or_insert(*volume_number);
+            }
+        }
+        volume_map
     }
 
     pub(super) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
@@ -1131,7 +1121,14 @@ impl Pipeline {
             weaver_core::classify::FileRole::SevenZipArchive => {
                 // Single .7z file — topology has exactly one volume.
                 if state.assembly.archive_topology_for(&set_name).is_some() {
-                    return; // Already set.
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.assembly.mark_volume_complete(&set_name, 0);
+                    debug!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        "7z single-file volume complete"
+                    );
+                    return;
                 }
 
                 let mut volume_map = std::collections::HashMap::new();
@@ -1251,6 +1248,14 @@ impl Pipeline {
             | weaver_core::classify::FileRole::TarGzArchive
             | weaver_core::classify::FileRole::GzArchive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.assembly.mark_volume_complete(&set_name, 0);
+                    debug!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        archive_type = ?role,
+                        "single-file archive volume complete"
+                    );
                     return;
                 }
 

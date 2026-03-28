@@ -85,6 +85,11 @@ impl<'a> RarExtractionContext<'a> {
 }
 
 impl Pipeline {
+    fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        lower.contains("checksum") || lower.contains("crc mismatch")
+    }
+
     fn rar_set_worker_limit(plan: &crate::pipeline::rar_state::RarDerivedPlan) -> usize {
         if plan.is_solid { 1 } else { 2 }
     }
@@ -1048,6 +1053,11 @@ impl Pipeline {
                     // Remove from spawned tracking so it doesn't block retries.
                     if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                         sets.remove(&set_name);
+                    }
+                    if Self::is_recoverable_full_set_extraction_error(&e) {
+                        self.set_failed_extraction_member(job_id, &set_name);
+                        self.check_job_completion(job_id).await;
+                        return;
                     }
                     let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
                         job_id,

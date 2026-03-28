@@ -2470,7 +2470,7 @@ mod tests {
                 .unwrap();
         }
 
-        pipeline.try_update_archive_topology(job_id, file_id).await;
+        pipeline.try_update_7z_topology(job_id, file_id);
     }
 
     fn member_span(
@@ -5093,6 +5093,464 @@ mod tests {
             .unwrap_or_default();
         assert!(verified_suspect.contains(&1));
         assert!(!verified_suspect.contains(&3));
+    }
+
+    #[tokio::test]
+    async fn recoverable_full_set_extraction_error_defers_to_repair_flow() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30022);
+        let spec = standalone_job_spec(
+            "Recoverable Full Set Extraction Error",
+            &[("sample.bin".to_string(), 100)],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline
+            .inflight_extractions
+            .entry(job_id)
+            .or_default()
+            .insert("archive.zip".to_string());
+
+        pipeline
+            .handle_extraction_done(ExtractionDone::FullSet {
+                job_id,
+                set_name: "archive.zip".to_string(),
+                result: Err("failed to extract sample.mkv: Invalid checksum".to_string()),
+            })
+            .await;
+
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Downloading)
+        );
+        assert_eq!(
+            pipeline.failed_extractions.get(&job_id),
+            Some(&HashSet::from(["archive.zip".to_string()]))
+        );
+        assert!(
+            pipeline
+                .inflight_extractions
+                .get(&job_id)
+                .is_none_or(HashSet::is_empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn nonrecoverable_full_set_extraction_error_fails_job() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30023);
+        let spec = standalone_job_spec(
+            "Nonrecoverable Full Set Extraction Error",
+            &[("sample.bin".to_string(), 100)],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline
+            .inflight_extractions
+            .entry(job_id)
+            .or_default()
+            .insert("archive.zip".to_string());
+
+        pipeline
+            .handle_extraction_done(ExtractionDone::FullSet {
+                job_id,
+                set_name: "archive.zip".to_string(),
+                result: Err("failed to parse zip central directory".to_string()),
+            })
+            .await;
+
+        assert!(matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn clean_verify_retries_non_rar_full_set_extraction() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30024);
+        let spec = standalone_job_spec(
+            "Non-RAR Extraction Retry After Verify",
+            &[("archive.zip".to_string(), 16)],
+        );
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+        tokio::fs::write(working_dir.join("archive.zip"), b"not-a-real-zip")
+            .await
+            .unwrap();
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .unwrap()
+                .commit_segment(0, 14)
+                .unwrap();
+            state.assembly.set_archive_topology(
+                "archive.zip".to_string(),
+                weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::Zip,
+                    volume_map: HashMap::from([("archive.zip".to_string(), 0)]),
+                    complete_volumes: [0u32].into_iter().collect(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: "sample.mkv".to_string(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: Vec::new(),
+                },
+            );
+        }
+
+        install_test_par2_runtime(&mut pipeline, job_id, minimal_par2_file_set(), &[]);
+        pipeline
+            .failed_extractions
+            .insert(job_id, ["archive.zip".to_string()].into_iter().collect());
+
+        pipeline.check_job_completion(job_id).await;
+
+        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        let done = next_extraction_done(&mut pipeline).await;
+        match done {
+            ExtractionDone::FullSet { set_name, .. } => {
+                assert_eq!(set_name, "archive.zip");
+            }
+            _ => panic!("expected full-set extraction retry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rar_state_recompute_supplements_stale_volume_registry_from_assembly() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30025);
+        let files = build_multifile_multivolume_rar_set();
+        let spec = rar_job_spec("RAR Registry Merge", &files);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        for (file_index, (filename, bytes)) in files.iter().enumerate() {
+            write_and_complete_rar_volume(
+                &mut pipeline,
+                job_id,
+                file_index as u32,
+                filename,
+                bytes,
+            )
+            .await;
+        }
+
+        pipeline
+            .rar_sets
+            .get_mut(&(job_id, "show".to_string()))
+            .unwrap()
+            .volume_files = std::collections::BTreeMap::from([(
+            0u32,
+            "show.part01.rar".to_string(),
+        )]);
+
+        pipeline.recompute_rar_set_state(job_id, "show").await.unwrap();
+
+        let volume_paths = pipeline.volume_paths_for_rar_set(job_id, "show");
+        assert_eq!(volume_paths.len(), 4);
+        assert!(volume_paths.contains_key(&0));
+        assert!(volume_paths.contains_key(&1));
+        assert!(volume_paths.contains_key(&2));
+        assert!(volume_paths.contains_key(&3));
+
+        let plan = pipeline
+            .rar_sets
+            .get(&(job_id, "show".to_string()))
+            .and_then(|state| state.plan.as_ref())
+            .cloned()
+            .expect("RAR plan should exist");
+        assert_eq!(plan.topology.complete_volumes.len(), 4);
+        assert!(plan.topology.volume_map.values().any(|volume| *volume == 1));
+        assert!(plan.topology.volume_map.values().any(|volume| *volume == 2));
+        assert!(plan.topology.volume_map.values().any(|volume| *volume == 3));
+    }
+
+    #[tokio::test]
+    async fn no_par2_full_set_failure_requeues_archive_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30026);
+        let spec = JobSpec {
+            name: "No PAR2 ZIP Retry".to_string(),
+            password: None,
+            total_bytes: 128,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: "archive.zip".to_string(),
+                role: FileRole::from_filename("archive.zip"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "zip-0@example.com".to_string(),
+                }],
+            }],
+        };
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .unwrap()
+                .commit_segment(0, 128)
+                .unwrap();
+            state.assembly.set_archive_topology(
+                "archive.zip".to_string(),
+                weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::Zip,
+                    volume_map: HashMap::from([("archive.zip".to_string(), 0)]),
+                    complete_volumes: [0u32].into_iter().collect(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: "sample.mkv".to_string(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: Vec::new(),
+                },
+            );
+        }
+        pipeline
+            .failed_extractions
+            .insert(job_id, HashSet::from(["archive.zip".to_string()]));
+
+        pipeline.check_job_completion(job_id).await;
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.assembly.complete_data_file_count(), 0);
+        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        assert!(pipeline.normalization_retried.contains(&job_id));
+    }
+
+    #[tokio::test]
+    async fn no_par2_single_file_retry_marks_zip_volume_complete_after_redownload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30028);
+        let spec = JobSpec {
+            name: "No PAR2 ZIP Retry Refresh".to_string(),
+            password: None,
+            total_bytes: 128,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: "archive.zip".to_string(),
+                role: FileRole::from_filename("archive.zip"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "zip-refresh-0@example.com".to_string(),
+                }],
+            }],
+        };
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .unwrap()
+                .commit_segment(0, 128)
+                .unwrap();
+            state.assembly.set_archive_topology(
+                "archive.zip".to_string(),
+                weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::Zip,
+                    volume_map: HashMap::from([("archive.zip".to_string(), 0)]),
+                    complete_volumes: [0u32].into_iter().collect(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: "sample.mkv".to_string(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: Vec::new(),
+                },
+            );
+        }
+        pipeline
+            .failed_extractions
+            .insert(job_id, HashSet::from(["archive.zip".to_string()]));
+
+        pipeline.check_job_completion(job_id).await;
+
+        {
+            let state = pipeline.jobs.get(&job_id).unwrap();
+            let topo = state.assembly.archive_topology_for("archive.zip").unwrap();
+            assert!(topo.complete_volumes.is_empty());
+        }
+
+        let file_id = NzbFileId { job_id, file_index: 0 };
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state
+                .assembly
+                .file_mut(file_id)
+                .unwrap()
+                .commit_segment(0, 128)
+                .unwrap();
+        }
+
+        pipeline.try_update_7z_topology(job_id, file_id);
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let topo = state.assembly.archive_topology_for("archive.zip").unwrap();
+        assert!(topo.complete_volumes.contains(&0));
+        assert!(matches!(
+            state.assembly.set_extraction_readiness("archive.zip"),
+            weaver_assembly::ExtractionReadiness::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30029);
+        let spec = JobSpec {
+            name: "No PAR2 7z Retry Refresh".to_string(),
+            password: None,
+            total_bytes: 128,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: "archive.7z".to_string(),
+                role: FileRole::from_filename("archive.7z"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "7z-refresh-0@example.com".to_string(),
+                }],
+            }],
+        };
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .unwrap()
+                .commit_segment(0, 128)
+                .unwrap();
+            state.assembly.set_archive_topology(
+                "archive.7z".to_string(),
+                weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::SevenZip,
+                    volume_map: HashMap::from([("archive.7z".to_string(), 0)]),
+                    complete_volumes: [0u32].into_iter().collect(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: "sample.mkv".to_string(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: Vec::new(),
+                },
+            );
+        }
+        pipeline
+            .failed_extractions
+            .insert(job_id, HashSet::from(["archive.7z".to_string()]));
+
+        pipeline.check_job_completion(job_id).await;
+
+        {
+            let state = pipeline.jobs.get(&job_id).unwrap();
+            let topo = state.assembly.archive_topology_for("archive.7z").unwrap();
+            assert!(topo.complete_volumes.is_empty());
+        }
+
+        let file_id = NzbFileId { job_id, file_index: 0 };
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state
+                .assembly
+                .file_mut(file_id)
+                .unwrap()
+                .commit_segment(0, 128)
+                .unwrap();
+        }
+
+        pipeline.try_update_7z_topology(job_id, file_id);
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let topo = state.assembly.archive_topology_for("archive.7z").unwrap();
+        assert!(topo.complete_volumes.contains(&0));
+        assert!(matches!(
+            state.assembly.set_extraction_readiness("archive.7z"),
+            weaver_assembly::ExtractionReadiness::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_par2_rar_failure_requeues_member_owner_volumes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30027);
+        let files = vec![("archive.rar".to_string(), vec![1u8; 64])];
+        let spec = rar_job_spec("No PAR2 RAR Retry", &files);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state
+                .assembly
+                .file_mut(NzbFileId { job_id, file_index: 0 })
+                .unwrap()
+                .commit_segment(0, 64)
+                .unwrap();
+            state.assembly.set_archive_topology(
+                "archive".to_string(),
+                weaver_assembly::ArchiveTopology {
+                    archive_type: weaver_assembly::ArchiveType::Rar,
+                    volume_map: HashMap::from([("archive.rar".to_string(), 0)]),
+                    complete_volumes: [0u32].into_iter().collect(),
+                    expected_volume_count: Some(1),
+                    members: vec![weaver_assembly::ArchiveMember {
+                        name: "work/sample.mkv".to_string(),
+                        first_volume: 0,
+                        last_volume: 0,
+                        unpacked_size: 0,
+                    }],
+                    unresolved_spans: Vec::new(),
+                },
+            );
+        }
+        pipeline
+            .failed_extractions
+            .insert(job_id, HashSet::from(["work/sample.mkv".to_string()]));
+
+        pipeline.check_job_completion(job_id).await;
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.assembly.complete_data_file_count(), 0);
+        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        assert!(pipeline.normalization_retried.contains(&job_id));
     }
 
     #[tokio::test]

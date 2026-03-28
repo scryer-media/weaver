@@ -7,9 +7,10 @@
 //! - `HUFF_LDC = 16` — lower distance bits codes
 //! - `HUFF_RC = 44` — repeating/cached distance codes
 //!
-//! Decoding uses the same sorted-threshold scheme as unrar:
+//! Decoding uses the same canonical ordering as unrar, but with two
+//! precomputed lookup layers:
 //! - Quick table (9-bit lookup) for the most common short codes
-//! - Linear scan of 15 left-aligned thresholds for longer codes
+//! - Full 15-bit direct lookup for longer codes
 //! - No tree pointers — just flat arrays (cache-friendly)
 
 use crate::error::{RarError, RarResult};
@@ -38,6 +39,23 @@ const MAX_NUM_SYMBOLS: usize = HUFF_NC;
 
 /// Maximum quick decode table size.
 const MAX_QUICK_ENTRIES: usize = 1 << MAX_QUICK_BITS;
+/// Full canonical decode table size for 15-bit codes.
+const FULL_DECODE_ENTRIES: usize = 1 << MAX_CODE_LENGTH;
+
+#[inline(always)]
+const fn pack_decode_entry(len: u8, sym: u16) -> u32 {
+    ((sym as u32) << 8) | len as u32
+}
+
+#[inline(always)]
+const fn decode_entry_len(entry: u32) -> u8 {
+    (entry & 0xff) as u8
+}
+
+#[inline(always)]
+const fn decode_entry_sym(entry: u32) -> u16 {
+    (entry >> 8) as u16
+}
 
 /// A Huffman decoding table using unrar's sorted-threshold scheme.
 #[derive(Clone)]
@@ -63,6 +81,9 @@ pub struct HuffmanTable {
 
     /// Quick lookup: alphabet symbol for each quick-decodable prefix.
     quick_num: [u16; MAX_QUICK_ENTRIES],
+
+    /// Full 15-bit direct lookup table. Entry 0 means "fall back".
+    decode_lookup: Box<[u32]>,
 
     /// Number of bits used for quick decode (6 for small tables, 9 for NC).
     quick_bits: u8,
@@ -111,6 +132,7 @@ impl HuffmanTable {
                 decode_num: [0; MAX_NUM_SYMBOLS],
                 quick_len: [0; MAX_QUICK_ENTRIES],
                 quick_num: [0; MAX_QUICK_ENTRIES],
+                decode_lookup: vec![0u32; FULL_DECODE_ENTRIES].into_boxed_slice(),
                 quick_bits,
                 max_length: 0,
                 num_symbols,
@@ -143,6 +165,7 @@ impl HuffmanTable {
 
         let mut quick_len_table = [0u8; MAX_QUICK_ENTRIES];
         let mut quick_num_table = [0u16; MAX_QUICK_ENTRIES];
+        let mut decode_lookup = vec![0u32; FULL_DECODE_ENTRIES].into_boxed_slice();
         let quick_data_size = 1usize << quick_bits;
         let mut cur_bit_length: usize = 1;
         for code in 0..quick_data_size {
@@ -167,16 +190,63 @@ impl HuffmanTable {
             }
         }
 
+        for bit_length in 1..=MAX_CODE_LENGTH {
+            let count = length_count[bit_length] as usize;
+            if count == 0 {
+                continue;
+            }
+
+            let start_pos = decode_pos[bit_length] as usize;
+            let mut code = decode_len[bit_length - 1];
+            let fill = 1usize << (MAX_CODE_LENGTH - bit_length);
+            for offset in 0..count {
+                let pos = start_pos + offset;
+                if pos >= num_symbols {
+                    break;
+                }
+
+                let table_index = (code >> 1) as usize;
+                let entry = pack_decode_entry(bit_length as u8, decode_num[pos]);
+                for slot in &mut decode_lookup[table_index..table_index + fill] {
+                    *slot = entry;
+                }
+
+                code += 1u32 << (16 - bit_length);
+            }
+        }
+
         Ok(Self {
             decode_len,
             decode_pos,
             decode_num,
             quick_len: quick_len_table,
             quick_num: quick_num_table,
+            decode_lookup,
             quick_bits,
             max_length,
             num_symbols,
         })
+    }
+
+    #[inline(always)]
+    fn slow_path_bits(&self, bit_field: u32) -> usize {
+        let mut bits = self.max_length as usize;
+        for i in (self.quick_bits as usize + 1)..bits {
+            if bit_field < self.decode_len[i] {
+                bits = i;
+                break;
+            }
+        }
+        bits
+    }
+
+    #[inline(always)]
+    fn symbol_for_bits(&self, bit_field: u32, bits: usize) -> u16 {
+        let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
+        let dist = dist >> (16 - bits);
+        let pos = (self.decode_pos[bits] + dist) as usize;
+        let pos = if pos >= self.num_symbols { 0 } else { pos };
+        self.decode_num[pos]
     }
 
     /// Decode the next symbol from the bitstream.
@@ -204,26 +274,16 @@ impl HuffmanTable {
             }
         }
 
-        // Slow path: linear scan of thresholds to find bit length.
-        let mut bits = self.max_length as usize;
-        for i in (quick_bits + 1)..bits {
-            if bit_field < self.decode_len[i] {
-                bits = i;
-                break;
-            }
+        let entry = self.decode_lookup[(bit_field >> 1) as usize];
+        let bits = decode_entry_len(entry);
+        if bits != 0 {
+            reader.consume_bits(bits)?;
+            return Ok(decode_entry_sym(entry));
         }
 
+        let bits = self.slow_path_bits(bit_field);
         reader.consume_bits(bits as u8)?;
-
-        // Calculate position in decode_num.
-        let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
-        let dist = dist >> (16 - bits);
-        let pos = (self.decode_pos[bits] + dist) as usize;
-
-        // Safety check for corrupt data (matching unrar: Pos=0 if out of bounds).
-        let pos = if pos >= self.num_symbols { 0 } else { pos };
-
-        Ok(self.decode_num[pos])
+        Ok(self.symbol_for_bits(bit_field, bits))
     }
 
     /// Slice-reader specialization of `DecodeNumber`, organized to follow
@@ -246,22 +306,16 @@ impl HuffmanTable {
             }
         }
 
-        let mut bits = 15usize;
-        for i in (quick_bits + 1)..15 {
-            if bit_field < self.decode_len[i] {
-                bits = i;
-                break;
-            }
+        let entry = self.decode_lookup[(bit_field >> 1) as usize];
+        let bits = decode_entry_len(entry);
+        if bits != 0 {
+            reader.addbits(bits)?;
+            return Ok(decode_entry_sym(entry));
         }
 
+        let bits = self.slow_path_bits(bit_field);
         reader.addbits(bits as u8)?;
-
-        let dist = bit_field.wrapping_sub(self.decode_len[bits - 1]);
-        let dist = dist >> (16 - bits);
-        let pos = (self.decode_pos[bits] + dist) as usize;
-        let pos = if pos >= self.num_symbols { 0 } else { pos };
-
-        Ok(self.decode_num[pos])
+        Ok(self.symbol_for_bits(bit_field, bits))
     }
 
     /// Returns the number of symbols this table can decode.
@@ -659,6 +713,25 @@ mod tests {
         let data = [0x00]; // 00000000
         let mut reader = BitReader::new(&data);
         assert_eq!(table.decode(&mut reader).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_long_symbol_uses_full_lookup() {
+        let mut lengths = [0u8; 4];
+        lengths[0] = 1;
+        lengths[1] = 3;
+        lengths[2] = 3;
+        lengths[3] = 11;
+
+        let table = HuffmanTable::build(&lengths).unwrap();
+
+        // Canonical code for the lone 11-bit symbol after 0, 100, 101 is 11000000000.
+        let data = [0b11000000, 0b00000000];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(table.decode(&mut reader).unwrap(), 3);
+
+        let mut reader = BitReader::new(&data);
+        assert_eq!(table.decode_bitreader(&mut reader).unwrap(), 3);
     }
 
     #[test]

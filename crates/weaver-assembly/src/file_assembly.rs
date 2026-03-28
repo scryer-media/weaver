@@ -92,6 +92,11 @@ impl FileAssembly {
         })
     }
 
+    pub fn reset(&mut self) {
+        self.received.fill(false);
+        self.received_bytes = 0;
+    }
+
     /// How many segments are still missing.
     pub fn missing_count(&self) -> u32 {
         self.total_segments - self.received.count_ones() as u32
