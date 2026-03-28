@@ -36,7 +36,7 @@ fn corrupted_copy(damage_count: usize) -> (TempDir, Par2FileSet) {
 
     let rar_path = temp.path().join("fixture_rar5_heavy_damage.rar");
     let rar_size = fs::metadata(&rar_path).unwrap().len();
-    let total_slices = ((rar_size + SLICE_SIZE - 1) / SLICE_SIZE) as usize;
+    let total_slices = rar_size.div_ceil(SLICE_SIZE) as usize;
     let stride = total_slices / (damage_count + 1);
 
     let mut f = OpenOptions::new().write(true).open(&rar_path).unwrap();
