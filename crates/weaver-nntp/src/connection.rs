@@ -116,7 +116,6 @@ pub struct NntpConnection {
     transport: Option<NntpTransport>,
     codec: NntpCodec,
     read_buf: BytesMut,
-    io_buf: Vec<u8>,
     buffer_profile: NntpBufferProfile,
     state: ConnectionState,
     capabilities: Capabilities,
@@ -161,12 +160,10 @@ impl NntpConnection {
 
         let now = Instant::now();
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
-        let socket_read_size = config.buffer_profile.socket_read_size.max(64 * 1024);
         let mut conn = NntpConnection {
             transport: Some(transport),
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
-            io_buf: vec![0u8; socket_read_size],
             buffer_profile: config.buffer_profile,
             state: ConnectionState::Greeting,
             capabilities: Capabilities::default(),
@@ -371,8 +368,7 @@ impl NntpConnection {
                 }
 
                 // Need more data from the transport.
-                let n = self.read_into_buffer().await?;
-                self.read_buf.extend_from_slice(&self.io_buf[..n]);
+                self.read_into_buffer().await?;
             }
         })
         .await;
@@ -703,8 +699,7 @@ impl NntpConnection {
                     }
                 }
 
-                let n = self.read_into_buffer().await?;
-                self.read_buf.extend_from_slice(&self.io_buf[..n]);
+                self.read_into_buffer().await?;
             }
         })
         .await;
@@ -744,8 +739,13 @@ impl NntpConnection {
     }
 
     async fn read_into_buffer(&mut self) -> Result<usize> {
+        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
+        let spare = self.read_buf.capacity().saturating_sub(self.read_buf.len());
+        if spare < socket_read_size {
+            self.read_buf.reserve(socket_read_size - spare);
+        }
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
-        let n = transport.read(&mut self.io_buf).await.map_err(|e| {
+        let n = transport.read_buf(&mut self.read_buf).await.map_err(|e| {
             self.poisoned = true;
             self.current_group = None;
             NntpError::Io(e)

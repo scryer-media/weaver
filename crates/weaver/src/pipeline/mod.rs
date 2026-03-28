@@ -673,18 +673,25 @@ impl Pipeline {
                             serde_json::to_string(&state.spec.metadata).ok()
                         },
                     };
-                    let db = self.db.clone();
-                    let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = db.archive_job(job_id, &row) {
-                            tracing::error!(job_id = job_id.0, error = %e, "failed to archive cancelled job");
-                        }
-                        if let Err(e) = std::fs::remove_file(&nzb_path)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
-                        }
-                    });
+                    let archive_result = self
+                        .db_blocking({
+                            let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
+                            move |db| {
+                                db.archive_job(job_id, &row).map_err(|e| {
+                                    format!("failed to archive cancelled job: {e}")
+                                })?;
+                                if let Err(e) = std::fs::remove_file(&nzb_path)
+                                    && e.kind() != std::io::ErrorKind::NotFound
+                                {
+                                    tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
+                                }
+                                Ok::<(), String>(())
+                            }
+                        })
+                        .await;
+                    if let Err(error) = archive_result {
+                        tracing::error!(job_id = job_id.0, error = %error, "failed to durably archive cancelled job");
+                    }
 
                     // Clean up per-job caches.
                     self.clear_par2_runtime_state(job_id);
@@ -1504,6 +1511,9 @@ impl Pipeline {
     }
 
     /// Write a terminal job to SQLite history and add it to the finished_jobs list.
+    ///
+    /// This must complete before we purge runtime state; otherwise a fast shutdown
+    /// can leave the job stranded in `active_jobs` and resurrect it on restart.
     pub(super) fn record_job_history(&mut self, job_id: JobId) {
         let state = match self.jobs.get(&job_id) {
             Some(s) => s,
@@ -1578,19 +1588,17 @@ impl Pipeline {
             created_at_epoch_ms: state.created_at_epoch_ms,
         });
 
-        let db = self.db.clone();
         let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db.archive_job(job_id, &row) {
-                tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
-            }
-            // Clean up the stored NZB file — no longer needed after archival.
-            if let Err(e) = std::fs::remove_file(&nzb_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
-            }
-        });
+        if let Err(e) = self.db.archive_job(job_id, &row) {
+            tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
+            return;
+        }
+        // Clean up the stored NZB file — no longer needed after archival.
+        if let Err(e) = std::fs::remove_file(&nzb_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
+        }
         self.purge_terminal_job_runtime(job_id);
     }
 }
@@ -3920,6 +3928,10 @@ mod tests {
         pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
         pipeline.record_job_history(job_id);
 
+        assert!(pipeline.db.load_active_jobs().unwrap().is_empty());
+        let history = pipeline.db.get_job_history(job_id.0).unwrap();
+        assert!(history.is_some());
+        assert_eq!(history.unwrap().status, "complete");
         assert!(!pipeline.jobs.contains_key(&job_id));
         assert_eq!(
             pipeline

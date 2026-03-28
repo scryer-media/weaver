@@ -41,6 +41,13 @@ pub struct NntpCodec {
     /// When true, multiline data is returned without dot-unstuffing.
     /// The caller is responsible for handling dot-stuffed lines.
     raw_multiline: bool,
+    /// Scan progress for raw multiline bodies.
+    ///
+    /// BODY fetches append to the same buffer across many socket reads. In raw
+    /// mode we don't mutate the accumulated bytes until the terminator arrives,
+    /// so rescanning from byte 0 on every read turns terminator detection into
+    /// repeated full-buffer work. Remember the next line start instead.
+    raw_multiline_scan_offset: usize,
 }
 
 #[derive(Debug)]
@@ -57,12 +64,16 @@ impl NntpCodec {
             multiline: false,
             streaming_multiline: false,
             raw_multiline: false,
+            raw_multiline_scan_offset: 0,
         }
     }
 
     /// Switch to multi-line mode for reading the next data block.
     pub fn set_multiline(&mut self, multiline: bool) {
         self.multiline = multiline;
+        if !multiline {
+            self.raw_multiline_scan_offset = 0;
+        }
     }
 
     /// Enable raw multiline mode: data is returned without dot-unstuffing.
@@ -71,6 +82,9 @@ impl NntpCodec {
     /// dot-unstuffing inline (e.g., during yEnc decode).
     pub fn set_raw_multiline(&mut self, raw: bool) {
         self.raw_multiline = raw;
+        if !raw {
+            self.raw_multiline_scan_offset = 0;
+        }
     }
 
     /// Whether the codec is currently in multi-line mode.
@@ -145,10 +159,11 @@ impl NntpCodec {
     }
 
     /// Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
-    fn decode_multiline(&self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
+    fn decode_multiline(&mut self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
         let scan_result = if self.raw_multiline {
-            scan_multiline_raw(src)
+            scan_multiline_raw(src, &mut self.raw_multiline_scan_offset)
         } else {
+            self.raw_multiline_scan_offset = 0;
             scan_multiline_chunk(src, false)
         };
         match scan_result {
@@ -159,6 +174,7 @@ impl NntpCodec {
                     ));
                 }
                 let chunk = take_multiline_output(src, scan);
+                self.raw_multiline_scan_offset = 0;
                 Ok(Some(NntpFrame::MultiLineData(chunk.data)))
             }
             None => {
@@ -292,19 +308,20 @@ fn scan_multiline_chunk(buf: &[u8], allow_partial: bool) -> Option<MultilineScan
 /// Scan for the dot-terminator without dot-unstuffing.
 /// Returns the byte offset of the terminator line start and its length,
 /// or None if not found yet.
-fn scan_multiline_raw(buf: &[u8]) -> Option<MultilineScan> {
+fn scan_multiline_raw(buf: &[u8], cursor: &mut usize) -> Option<MultilineScan> {
     if buf.is_empty() {
+        *cursor = 0;
         return None;
     }
 
-    let mut cursor = 0usize;
+    let mut scan_cursor = (*cursor).min(buf.len());
 
-    while cursor < buf.len() {
-        let Some(line_rel_end) = memchr::memchr(b'\n', &buf[cursor..]) else {
+    while scan_cursor < buf.len() {
+        let Some(line_rel_end) = memchr::memchr(b'\n', &buf[scan_cursor..]) else {
             break;
         };
-        let line_end = cursor + line_rel_end;
-        let content_end = if line_end > cursor && buf[line_end - 1] == b'\r' {
+        let line_end = scan_cursor + line_rel_end;
+        let content_end = if line_end > scan_cursor && buf[line_end - 1] == b'\r' {
             line_end - 1
         } else {
             line_end
@@ -312,17 +329,21 @@ fn scan_multiline_raw(buf: &[u8]) -> Option<MultilineScan> {
         let line_total_end = line_end + 1;
 
         // Check for single-dot terminator line.
-        if cursor < content_end && buf[cursor] == b'.' && content_end == cursor + 1 {
+        if scan_cursor < content_end
+            && buf[scan_cursor] == b'.'
+            && content_end == scan_cursor + 1
+        {
             return Some(MultilineScan {
-                data_end: cursor,
-                terminator_len: line_total_end - cursor,
+                data_end: scan_cursor,
+                terminator_len: line_total_end - scan_cursor,
                 copied: None, // raw mode: no copies
             });
         }
 
-        cursor = line_total_end;
+        scan_cursor = line_total_end;
     }
 
+    *cursor = scan_cursor;
     None
 }
 
