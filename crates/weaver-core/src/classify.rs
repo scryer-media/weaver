@@ -21,8 +21,10 @@ pub enum FileRole {
     ZipArchive,
     /// tar archive (`.tar`).
     TarArchive,
-    /// Gzipped tar archive (`.tar.gz`, `.tgz`).
+    /// Gzipped tar archive (`.tar.gz`, `.tgz`, `.tar.gzip`).
     TarGzArchive,
+    /// Bzip2-compressed tar archive (`.tar.bz2`, `.tbz`, `.tbz2`, `.tar.bzip2`).
+    TarBz2Archive,
     /// Gzipped single file (`.gz`, but not `.tar.gz`).
     GzArchive,
     /// DEFLATE-compressed single file (`.deflate`).
@@ -78,8 +80,17 @@ impl FileRole {
         }
 
         // tar.gz / tgz detection (must be before .gz and .tar checks)
-        if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar.gzip") {
             return FileRole::TarGzArchive;
+        }
+
+        // tar.bz2 / tbz detection (must be before .bz2 and .tar checks)
+        if lower.ends_with(".tar.bz2")
+            || lower.ends_with(".tbz")
+            || lower.ends_with(".tbz2")
+            || lower.ends_with(".tar.bzip2")
+        {
+            return FileRole::TarBz2Archive;
         }
 
         // tar detection
@@ -137,6 +148,7 @@ impl FileRole {
             FileRole::ZipArchive => 3,
             FileRole::TarArchive => 3,
             FileRole::TarGzArchive => 3,
+            FileRole::TarBz2Archive => 3,
             FileRole::GzArchive => 3,
             FileRole::DeflateArchive => 3,
             FileRole::BrotliArchive => 3,
@@ -298,6 +310,7 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
         FileRole::ZipArchive
         | FileRole::TarArchive
         | FileRole::TarGzArchive
+        | FileRole::TarBz2Archive
         | FileRole::GzArchive
         | FileRole::DeflateArchive
         | FileRole::BrotliArchive
@@ -537,8 +550,33 @@ mod tests {
         );
         assert_eq!(FileRole::from_filename("data.tgz"), FileRole::TarGzArchive);
         assert_eq!(
+            FileRole::from_filename("backup.tar.gzip"),
+            FileRole::TarGzArchive
+        );
+        assert_eq!(
             FileRole::from_filename("Archive.TAR.GZ"),
             FileRole::TarGzArchive
+        );
+    }
+
+    #[test]
+    fn tar_bz2_archive() {
+        assert_eq!(
+            FileRole::from_filename("backup.tar.bz2"),
+            FileRole::TarBz2Archive
+        );
+        assert_eq!(FileRole::from_filename("data.tbz"), FileRole::TarBz2Archive);
+        assert_eq!(
+            FileRole::from_filename("movie.tbz2"),
+            FileRole::TarBz2Archive
+        );
+        assert_eq!(
+            FileRole::from_filename("archive.tar.bzip2"),
+            FileRole::TarBz2Archive
+        );
+        assert_eq!(
+            FileRole::from_filename("Archive.TAR.BZ2"),
+            FileRole::TarBz2Archive
         );
     }
 
@@ -582,6 +620,10 @@ mod tests {
     fn bzip2_archive() {
         assert_eq!(FileRole::from_filename("file.bz2"), FileRole::Bzip2Archive);
         assert_eq!(FileRole::from_filename("data.BZ2"), FileRole::Bzip2Archive);
+        assert_ne!(
+            FileRole::from_filename("backup.tar.bz2"),
+            FileRole::Bzip2Archive
+        );
     }
 
     #[test]

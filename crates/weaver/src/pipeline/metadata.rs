@@ -1242,10 +1242,11 @@ impl Pipeline {
                     "7z topology set (split archive)"
                 );
             }
-            // Single-file archives: zip, tar, tar.gz, gz, deflate, br, zst, bz2
+            // Single-file archives: zip, tar, tar.gz, tar.bz2, gz, deflate, br, zst, bz2
             weaver_core::classify::FileRole::ZipArchive
             | weaver_core::classify::FileRole::TarArchive
             | weaver_core::classify::FileRole::TarGzArchive
+            | weaver_core::classify::FileRole::TarBz2Archive
             | weaver_core::classify::FileRole::GzArchive
             | weaver_core::classify::FileRole::DeflateArchive
             | weaver_core::classify::FileRole::BrotliArchive
@@ -1272,6 +1273,9 @@ impl Pipeline {
                     }
                     weaver_core::classify::FileRole::TarGzArchive => {
                         weaver_assembly::ArchiveType::TarGz
+                    }
+                    weaver_core::classify::FileRole::TarBz2Archive => {
+                        weaver_assembly::ArchiveType::TarBz2
                     }
                     weaver_core::classify::FileRole::GzArchive => weaver_assembly::ArchiveType::Gz,
                     weaver_core::classify::FileRole::DeflateArchive => {

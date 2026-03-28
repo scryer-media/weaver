@@ -73,6 +73,7 @@ pub(super) enum SimpleArchiveKind {
     Zip,
     Tar,
     TarGz,
+    TarBz2,
     Gz,
     Deflate,
     Brotli,
@@ -163,6 +164,19 @@ fn extract_tar_gz(
         std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.gz: {e}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     extract_tar_from_reader(gz, output_dir, event_tx, job_id, set_name)
+}
+
+fn extract_tar_bz2(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.bz2: {e}"))?;
+    let bz2 = bzip2::read::BzDecoder::new(file);
+    extract_tar_from_reader(bz2, output_dir, event_tx, job_id, set_name)
 }
 
 fn extract_tar_from_reader<R: std::io::Read>(
@@ -1194,6 +1208,9 @@ impl Pipeline {
             weaver_core::classify::FileRole::TarArchive => Some(weaver_assembly::ArchiveType::Tar),
             weaver_core::classify::FileRole::TarGzArchive => {
                 Some(weaver_assembly::ArchiveType::TarGz)
+            }
+            weaver_core::classify::FileRole::TarBz2Archive => {
+                Some(weaver_assembly::ArchiveType::TarBz2)
             }
             weaver_core::classify::FileRole::GzArchive => Some(weaver_assembly::ArchiveType::Gz),
             weaver_core::classify::FileRole::DeflateArchive => {
@@ -3273,6 +3290,10 @@ impl Pipeline {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarGz)
                         .await
                 }
+                weaver_assembly::ArchiveType::TarBz2 => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarBz2)
+                        .await
+                }
                 weaver_assembly::ArchiveType::Gz => {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz)
                         .await
@@ -3467,7 +3488,8 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, gz, deflate, br, zstd, bz2, or split.
+    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, gz, deflate, br,
+    /// zstd, bz2, or split.
     pub(super) async fn extract_simple_archive(
         &mut self,
         job_id: JobId,
@@ -3536,6 +3558,13 @@ impl Pipeline {
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::TarGz => extract_tar_gz(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::TarBz2 => extract_tar_bz2(
                             &file_paths[0],
                             &output_dir,
                             &event_tx,

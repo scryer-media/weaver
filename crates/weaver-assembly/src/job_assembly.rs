@@ -23,6 +23,7 @@ pub enum ArchiveType {
     Zip,
     Tar,
     TarGz,
+    TarBz2,
     Gz,
     Deflate,
     Brotli,

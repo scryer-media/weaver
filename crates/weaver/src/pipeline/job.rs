@@ -485,6 +485,7 @@ impl Pipeline {
                     | weaver_core::classify::FileRole::ZipArchive
                     | weaver_core::classify::FileRole::TarArchive
                     | weaver_core::classify::FileRole::TarGzArchive
+                    | weaver_core::classify::FileRole::TarBz2Archive
                     | weaver_core::classify::FileRole::GzArchive
                     | weaver_core::classify::FileRole::DeflateArchive
                     | weaver_core::classify::FileRole::BrotliArchive
