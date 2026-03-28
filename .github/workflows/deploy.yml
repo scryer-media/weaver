@@ -161,6 +161,8 @@ jobs:
             sde_arch: "-spr"
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
