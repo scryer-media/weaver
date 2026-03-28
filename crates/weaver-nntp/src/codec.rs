@@ -329,10 +329,7 @@ fn scan_multiline_raw(buf: &[u8], cursor: &mut usize) -> Option<MultilineScan> {
         let line_total_end = line_end + 1;
 
         // Check for single-dot terminator line.
-        if scan_cursor < content_end
-            && buf[scan_cursor] == b'.'
-            && content_end == scan_cursor + 1
-        {
+        if scan_cursor < content_end && buf[scan_cursor] == b'.' && content_end == scan_cursor + 1 {
             return Some(MultilineScan {
                 data_end: scan_cursor,
                 terminator_len: line_total_end - scan_cursor,
