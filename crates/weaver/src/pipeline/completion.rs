@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 impl Pipeline {
     pub(super) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
-        let has_queued_work = self.jobs.get(&job_id).is_some_and(|state| {
-            state.health_probing
-                || !state.download_queue.is_empty()
-        });
+        let has_queued_work = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.health_probing || !state.download_queue.is_empty());
         let has_inflight_downloads = self
             .active_downloads_by_job
             .get(&job_id)
