@@ -5224,7 +5224,7 @@ mod tests {
 
         pipeline.check_job_completion(job_id).await;
 
-        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        assert!(!pipeline.failed_extractions.contains_key(&job_id));
         let done = next_extraction_done(&mut pipeline).await;
         match done {
             ExtractionDone::FullSet { set_name, .. } => {
@@ -5348,7 +5348,7 @@ mod tests {
         assert!(matches!(state.status, JobStatus::Downloading));
         assert_eq!(state.download_queue.len(), 1);
         assert_eq!(state.assembly.complete_data_file_count(), 0);
-        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        assert!(!pipeline.failed_extractions.contains_key(&job_id));
         assert!(pipeline.normalization_retried.contains(&job_id));
     }
 
@@ -5580,7 +5580,7 @@ mod tests {
         assert!(matches!(state.status, JobStatus::Downloading));
         assert_eq!(state.download_queue.len(), 1);
         assert_eq!(state.assembly.complete_data_file_count(), 0);
-        assert!(pipeline.failed_extractions.get(&job_id).is_none());
+        assert!(!pipeline.failed_extractions.contains_key(&job_id));
         assert!(pipeline.normalization_retried.contains(&job_id));
     }
 
@@ -6290,12 +6290,10 @@ mod tests {
             Some(JobStatus::Paused)
         );
         assert_eq!(
-            pipeline.jobs.get(&job_b).and_then(|state| {
-                state
-                    .paused_resume_status
-                    .as_ref()
-                    .map(std::clone::Clone::clone)
-            }),
+            pipeline
+                .jobs
+                .get(&job_b)
+                .and_then(|state| state.paused_resume_status.clone()),
             Some(JobStatus::QueuedRepair)
         );
         assert_eq!(

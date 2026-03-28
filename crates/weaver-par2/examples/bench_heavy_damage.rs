@@ -102,7 +102,7 @@ fn load_fixture_info(dir: PathBuf) -> FixtureInfo {
     let rar_path = dir.join(&rar_name);
     let rar_size = fs::metadata(&rar_path).unwrap().len();
     let slice_size = par2_set.slice_size;
-    let total_slices = ((rar_size + slice_size - 1) / slice_size) as usize;
+    let total_slices = rar_size.div_ceil(slice_size) as usize;
 
     FixtureInfo {
         dir,
@@ -221,7 +221,7 @@ fn run_once(dir: &Path, par2_set: &Par2FileSet, repair_options: &RepairOptions) 
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = values.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (values[n / 2 - 1] + values[n / 2]) / 2.0
     } else {
         values[n / 2]
