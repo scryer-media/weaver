@@ -1242,11 +1242,15 @@ impl Pipeline {
                     "7z topology set (split archive)"
                 );
             }
-            // Single-file archives: zip, tar, tar.gz, gz
+            // Single-file archives: zip, tar, tar.gz, gz, deflate, br, zst, bz2
             weaver_core::classify::FileRole::ZipArchive
             | weaver_core::classify::FileRole::TarArchive
             | weaver_core::classify::FileRole::TarGzArchive
-            | weaver_core::classify::FileRole::GzArchive => {
+            | weaver_core::classify::FileRole::GzArchive
+            | weaver_core::classify::FileRole::DeflateArchive
+            | weaver_core::classify::FileRole::BrotliArchive
+            | weaver_core::classify::FileRole::ZstdArchive
+            | weaver_core::classify::FileRole::Bzip2Archive => {
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
                     state.assembly.mark_volume_complete(&set_name, 0);
@@ -1270,6 +1274,18 @@ impl Pipeline {
                         weaver_assembly::ArchiveType::TarGz
                     }
                     weaver_core::classify::FileRole::GzArchive => weaver_assembly::ArchiveType::Gz,
+                    weaver_core::classify::FileRole::DeflateArchive => {
+                        weaver_assembly::ArchiveType::Deflate
+                    }
+                    weaver_core::classify::FileRole::BrotliArchive => {
+                        weaver_assembly::ArchiveType::Brotli
+                    }
+                    weaver_core::classify::FileRole::ZstdArchive => {
+                        weaver_assembly::ArchiveType::Zstd
+                    }
+                    weaver_core::classify::FileRole::Bzip2Archive => {
+                        weaver_assembly::ArchiveType::Bzip2
+                    }
                     _ => unreachable!(),
                 };
 

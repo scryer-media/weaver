@@ -486,6 +486,10 @@ impl Pipeline {
                     | weaver_core::classify::FileRole::TarArchive
                     | weaver_core::classify::FileRole::TarGzArchive
                     | weaver_core::classify::FileRole::GzArchive
+                    | weaver_core::classify::FileRole::DeflateArchive
+                    | weaver_core::classify::FileRole::BrotliArchive
+                    | weaver_core::classify::FileRole::ZstdArchive
+                    | weaver_core::classify::FileRole::Bzip2Archive
                     | weaver_core::classify::FileRole::SplitFile { .. }
             ) {
                 self.try_update_7z_topology(job_id, *file_id);

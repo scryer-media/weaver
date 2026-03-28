@@ -74,6 +74,10 @@ pub(super) enum SimpleArchiveKind {
     Tar,
     TarGz,
     Gz,
+    Deflate,
+    Brotli,
+    Zstd,
+    Bzip2,
     Split,
 }
 
@@ -244,6 +248,147 @@ fn extract_gz(
     tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, "gz decompressed");
 
     Ok(vec![output_name.to_string()])
+}
+
+fn strip_ascii_case_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(suffix) {
+        Some(&name[..name.len() - suffix.len()])
+    } else {
+        None
+    }
+}
+
+fn derive_single_file_output_name<'a>(archive_name: &'a str, suffixes: &[&str]) -> &'a str {
+    suffixes
+        .iter()
+        .find_map(|suffix| strip_ascii_case_suffix(archive_name, suffix))
+        .unwrap_or(archive_name)
+}
+
+fn extract_single_stream_to_file<R: std::io::Read>(
+    mut reader: R,
+    archive_path: &Path,
+    output_dir: &Path,
+    suffixes: &[&str],
+    format_name: &str,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let archive_name = archive_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let output_name = derive_single_file_output_name(&archive_name, suffixes);
+    let out_path = output_dir.join(output_name);
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+
+    let mut outfile = std::fs::File::create(&out_path)
+        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let bytes_written = std::io::copy(&mut reader, &mut outfile)
+        .map_err(|e| format!("failed to decompress {format_name}: {e}"))?;
+
+    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
+        job_id,
+        set_name: set_name.to_string(),
+        member: output_name.to_string(),
+    });
+    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, format = format_name, "compressed file decompressed");
+
+    Ok(vec![output_name.to_string()])
+}
+
+fn extract_brotli(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open br: {e}"))?;
+    let reader = brotli::Decompressor::new(file, 4096);
+    extract_single_stream_to_file(
+        reader,
+        archive_path,
+        output_dir,
+        &[".br"],
+        "br",
+        event_tx,
+        job_id,
+        set_name,
+    )
+}
+
+fn extract_deflate(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open deflate: {e}"))?;
+    let reader = flate2::read::DeflateDecoder::new(file);
+    extract_single_stream_to_file(
+        reader,
+        archive_path,
+        output_dir,
+        &[".deflate"],
+        "deflate",
+        event_tx,
+        job_id,
+        set_name,
+    )
+}
+
+fn extract_zstd(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file =
+        std::fs::File::open(archive_path).map_err(|e| format!("failed to open zstd: {e}"))?;
+    let reader =
+        zstd::stream::read::Decoder::new(file).map_err(|e| format!("failed to open zstd: {e}"))?;
+    extract_single_stream_to_file(
+        reader,
+        archive_path,
+        output_dir,
+        &[".zstd", ".zst"],
+        "zstd",
+        event_tx,
+        job_id,
+        set_name,
+    )
+}
+
+fn extract_bzip2(
+    archive_path: &Path,
+    output_dir: &Path,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open bz2: {e}"))?;
+    let reader = bzip2::read::BzDecoder::new(file);
+    extract_single_stream_to_file(
+        reader,
+        archive_path,
+        output_dir,
+        &[".bz2"],
+        "bz2",
+        event_tx,
+        job_id,
+        set_name,
+    )
 }
 
 fn extract_split(
@@ -1050,6 +1195,18 @@ impl Pipeline {
                 Some(weaver_assembly::ArchiveType::TarGz)
             }
             weaver_core::classify::FileRole::GzArchive => Some(weaver_assembly::ArchiveType::Gz),
+            weaver_core::classify::FileRole::DeflateArchive => {
+                Some(weaver_assembly::ArchiveType::Deflate)
+            }
+            weaver_core::classify::FileRole::BrotliArchive => {
+                Some(weaver_assembly::ArchiveType::Brotli)
+            }
+            weaver_core::classify::FileRole::ZstdArchive => {
+                Some(weaver_assembly::ArchiveType::Zstd)
+            }
+            weaver_core::classify::FileRole::Bzip2Archive => {
+                Some(weaver_assembly::ArchiveType::Bzip2)
+            }
             weaver_core::classify::FileRole::SplitFile { .. } => {
                 Some(weaver_assembly::ArchiveType::Split)
             }
@@ -3119,6 +3276,22 @@ impl Pipeline {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz)
                         .await
                 }
+                weaver_assembly::ArchiveType::Deflate => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Deflate)
+                        .await
+                }
+                weaver_assembly::ArchiveType::Brotli => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Brotli)
+                        .await
+                }
+                weaver_assembly::ArchiveType::Zstd => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zstd)
+                        .await
+                }
+                weaver_assembly::ArchiveType::Bzip2 => {
+                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Bzip2)
+                        .await
+                }
                 weaver_assembly::ArchiveType::Split => {
                     self.extract_simple_archive(job_id, name, SimpleArchiveKind::Split)
                         .await
@@ -3293,7 +3466,7 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, gz, or split.
+    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, gz, deflate, br, zstd, bz2, or split.
     pub(super) async fn extract_simple_archive(
         &mut self,
         job_id: JobId,
@@ -3369,6 +3542,34 @@ impl Pipeline {
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Gz => extract_gz(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Deflate => extract_deflate(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Brotli => extract_brotli(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Zstd => extract_zstd(
+                            &file_paths[0],
+                            &output_dir,
+                            &event_tx,
+                            job_id,
+                            &set_name_owned,
+                        )?,
+                        SimpleArchiveKind::Bzip2 => extract_bzip2(
                             &file_paths[0],
                             &output_dir,
                             &event_tx,

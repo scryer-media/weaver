@@ -35,6 +35,7 @@ import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
+import { getDisplayedJobProgress } from "@/lib/job-progress";
 
 interface EventEntry {
   kind: string;
@@ -223,7 +224,13 @@ export function JobDetail() {
     optionalRecoveryBytes - optionalRecoveryDownloadedBytes,
     0,
   );
-  const displayProgress = job.status === "COMPLETE" ? 1 : job.progress;
+  const displayProgress = getDisplayedJobProgress({
+    progress: job.progress,
+    status: job.status,
+    totalBytes: job.totalBytes,
+    downloadedBytes: job.downloadedBytes,
+    failedBytes: job.failedBytes,
+  });
   const showSavedBandwidthTile = job.status === "COMPLETE" && optionalRecoveryBytes > 0;
   const showLegacySavedBandwidthNote =
     job.status === "COMPLETE"
@@ -286,7 +293,13 @@ export function JobDetail() {
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
-          <JobProgress progress={displayProgress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} />
+          <JobProgress
+            progress={job.progress}
+            status={job.status}
+            totalBytes={job.totalBytes}
+            downloadedBytes={job.downloadedBytes}
+            failedBytes={job.failedBytes}
+          />
           <div
             className={`grid grid-cols-2 gap-4 ${showSavedBandwidthTile ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}
           >
@@ -574,4 +587,3 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     </Card>
   );
 }
-

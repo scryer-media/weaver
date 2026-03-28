@@ -1,3 +1,5 @@
+import { Progress } from "@/components/ui/progress";
+import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { cn } from "@/lib/utils";
 
 function statusColor(status?: string): string {
@@ -22,45 +24,30 @@ function statusColor(status?: string): string {
 export function JobProgress({
   progress,
   status,
-  health: _health,
-  failedPct,
+  totalBytes,
+  downloadedBytes,
+  failedBytes,
   showLabel = true,
   compact = false,
 }: {
   progress: number;
   status?: string;
-  health?: number;
-  /** Failed bytes as a fraction of total (0..1) */
-  failedPct?: number;
+  totalBytes?: number;
+  downloadedBytes?: number;
+  failedBytes?: number;
   showLabel?: boolean;
   compact?: boolean;
 }) {
-  const goodPct = Math.min(100, Math.max(0, progress * 100));
-  const badPct = Math.min(100, Math.max(0, (failedPct ?? 0) * 100));
-  const isDownloading = status === "DOWNLOADING" || status === "QUEUED";
-  const hasFailed = badPct > 0 && isDownloading;
+  const displayedProgress =
+    getDisplayedJobProgress({ progress, status, totalBytes, downloadedBytes, failedBytes }) * 100;
 
   return (
     <div className={cn("flex items-center gap-3", compact && "gap-2")}>
-      <div
-        className={cn(
-          "relative h-2.5 w-full overflow-hidden rounded-full bg-muted",
-          compact && "h-1.5",
-        )}
-      >
-        {/* Good progress (downloaded) */}
-        <div
-          className={cn("absolute inset-y-0 left-0", statusColor(status))}
-          style={{ width: `${goodPct}%` }}
-        />
-        {/* Failed segments (stacked after good) */}
-        {hasFailed ? (
-          <div
-            className="absolute inset-y-0 bg-red-500"
-            style={{ left: `${goodPct}%`, width: `${Math.min(badPct, 100 - goodPct)}%` }}
-          />
-        ) : null}
-      </div>
+      <Progress
+        value={displayedProgress}
+        className={cn(compact && "h-1.5")}
+        indicatorClassName={statusColor(status)}
+      />
       {showLabel ? (
         <span
           className={cn(
@@ -68,7 +55,7 @@ export function JobProgress({
             compact && "w-10 text-[10px]",
           )}
         >
-          {goodPct.toFixed(1)}%
+          {displayedProgress.toFixed(1)}%
         </span>
       ) : null}
     </div>

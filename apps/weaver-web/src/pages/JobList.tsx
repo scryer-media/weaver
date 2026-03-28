@@ -23,6 +23,7 @@ import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -449,10 +450,17 @@ export function JobList() {
                 </TableHeader>
                 <TableBody>
                   {jobs.map((job) => {
-                    const priority = getJobPriority(job);
-                    const displayName = job.displayTitle;
-                    const expanded = expandedJobIds.has(job.id);
-                    return (
+                      const priority = getJobPriority(job);
+                      const displayName = job.displayTitle;
+                      const expanded = expandedJobIds.has(job.id);
+                      const displayProgress = getDisplayedJobProgress({
+                        progress: job.progress,
+                        status: job.status,
+                        totalBytes: job.totalBytes,
+                        downloadedBytes: job.downloadedBytes,
+                        failedBytes: job.failedBytes,
+                      });
+                      return (
                       <Fragment key={job.id}>
                         <TableRow key={job.id} className="text-xs">
                           <TableCell className="px-2 py-1.5">
@@ -509,8 +517,16 @@ export function JobList() {
                           <TableCell className="truncate px-2 py-1.5 text-[11px]" title={job.category ?? "\u2014"}>
                             {job.category ?? "\u2014"}
                           </TableCell>
-                          <TableCell className="min-w-0 px-2 py-1.5" title={`${(job.progress * 100).toFixed(1)}%`}>
-                            <JobProgress progress={job.progress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} compact showLabel={false} />
+                          <TableCell className="min-w-0 px-2 py-1.5" title={`${(displayProgress * 100).toFixed(1)}%`}>
+                            <JobProgress
+                              progress={job.progress}
+                              status={job.status}
+                              totalBytes={job.totalBytes}
+                              downloadedBytes={job.downloadedBytes}
+                              failedBytes={job.failedBytes}
+                              compact
+                              showLabel={false}
+                            />
                           </TableCell>
                           <TableCell className="px-2 py-1.5 text-right text-[11px] text-muted-foreground">
                             {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
@@ -640,7 +656,14 @@ export function JobList() {
                         ) : null}
                       </div>
                     </div>
-                    <JobProgress progress={job.progress} status={job.status} health={job.health} failedPct={job.totalBytes > 0 ? job.failedBytes / job.totalBytes : 0} compact />
+                    <JobProgress
+                      progress={job.progress}
+                      status={job.status}
+                      totalBytes={job.totalBytes}
+                      downloadedBytes={job.downloadedBytes}
+                      failedBytes={job.failedBytes}
+                      compact
+                    />
                     {expanded ? (
                       <ParsedReleaseDetails
                         originalTitle={job.originalTitle}

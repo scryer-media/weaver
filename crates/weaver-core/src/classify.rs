@@ -25,6 +25,14 @@ pub enum FileRole {
     TarGzArchive,
     /// Gzipped single file (`.gz`, but not `.tar.gz`).
     GzArchive,
+    /// DEFLATE-compressed single file (`.deflate`).
+    DeflateArchive,
+    /// Brotli-compressed single file (`.br`).
+    BrotliArchive,
+    /// Zstandard-compressed single file (`.zst`, `.zstd`).
+    ZstdArchive,
+    /// Bzip2-compressed single file (`.bz2`).
+    Bzip2Archive,
     /// Plain split file (`.001`, `.002`, etc.). 0-indexed: `.001` = number 0.
     SplitFile { number: u32 },
     /// Standalone file (not part of an archive).
@@ -84,6 +92,22 @@ impl FileRole {
             return FileRole::GzArchive;
         }
 
+        if lower.ends_with(".deflate") {
+            return FileRole::DeflateArchive;
+        }
+
+        if lower.ends_with(".br") {
+            return FileRole::BrotliArchive;
+        }
+
+        if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+            return FileRole::ZstdArchive;
+        }
+
+        if lower.ends_with(".bz2") {
+            return FileRole::Bzip2Archive;
+        }
+
         // Plain split files: .001, .002, ... .999
         // Must not match .7z.001 (already caught by parse_7z_file above)
         if let Some(role) = parse_split_file(&lower) {
@@ -114,6 +138,10 @@ impl FileRole {
             FileRole::TarArchive => 3,
             FileRole::TarGzArchive => 3,
             FileRole::GzArchive => 3,
+            FileRole::DeflateArchive => 3,
+            FileRole::BrotliArchive => 3,
+            FileRole::ZstdArchive => 3,
+            FileRole::Bzip2Archive => 3,
             FileRole::Standalone => 5,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
             FileRole::SevenZipSplit { number } => 10 + *number,
@@ -270,7 +298,11 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
         FileRole::ZipArchive
         | FileRole::TarArchive
         | FileRole::TarGzArchive
-        | FileRole::GzArchive => Some(filename.to_string()),
+        | FileRole::GzArchive
+        | FileRole::DeflateArchive
+        | FileRole::BrotliArchive
+        | FileRole::ZstdArchive
+        | FileRole::Bzip2Archive => Some(filename.to_string()),
         // Split files: strip the .NNN extension.
         FileRole::SplitFile { .. } => {
             if let Some(dot_pos) = filename.rfind('.') {
@@ -519,6 +551,37 @@ mod tests {
             FileRole::from_filename("backup.tar.gz"),
             FileRole::GzArchive
         );
+    }
+
+    #[test]
+    fn deflate_archive() {
+        assert_eq!(
+            FileRole::from_filename("file.deflate"),
+            FileRole::DeflateArchive
+        );
+        assert_eq!(
+            FileRole::from_filename("data.DEFLATE"),
+            FileRole::DeflateArchive
+        );
+    }
+
+    #[test]
+    fn brotli_archive() {
+        assert_eq!(FileRole::from_filename("file.br"), FileRole::BrotliArchive);
+        assert_eq!(FileRole::from_filename("data.BR"), FileRole::BrotliArchive);
+    }
+
+    #[test]
+    fn zstd_archive() {
+        assert_eq!(FileRole::from_filename("file.zst"), FileRole::ZstdArchive);
+        assert_eq!(FileRole::from_filename("file.zstd"), FileRole::ZstdArchive);
+        assert_eq!(FileRole::from_filename("data.ZST"), FileRole::ZstdArchive);
+    }
+
+    #[test]
+    fn bzip2_archive() {
+        assert_eq!(FileRole::from_filename("file.bz2"), FileRole::Bzip2Archive);
+        assert_eq!(FileRole::from_filename("data.BZ2"), FileRole::Bzip2Archive);
     }
 
     #[test]
