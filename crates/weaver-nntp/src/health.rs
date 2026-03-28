@@ -1,9 +1,10 @@
 //! Per-server health tracking with automatic degradation and disabling.
 //!
-//! Servers transition through three states based on connection outcomes:
+//! Servers transition through four states based on connection outcomes:
 //!
 //! - **Healthy** — all good, use normally
 //! - **Degraded** — experiencing transient failures, still usable but deprioritised
+//! - **CoolingDown** — short-lived quarantine after transport/capacity problems
 //! - **Disabled** — temporarily taken out of rotation (auth failure or too many consecutive errors)
 
 use std::time::{Duration, Instant};
@@ -15,11 +16,27 @@ pub enum ServerState {
     Healthy,
     /// Server is experiencing transient failures but is still usable.
     Degraded { consecutive_failures: u32 },
+    /// Server hit a short-lived transport/capacity issue and should be skipped
+    /// briefly without affecting the longer-lived health state machine.
+    CoolingDown {
+        until: Instant,
+        reason: CooldownReason,
+        resume_degraded: Option<u32>,
+    },
     /// Server is temporarily disabled and should not be used.
     Disabled {
         until: Instant,
         reason: DisableReason,
     },
+}
+
+/// Why a server entered a short-lived cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownReason {
+    /// Transport-level problems such as timeouts, disconnects, or 400 errors.
+    Transport,
+    /// Capacity-related problems such as too many connections or pool exhaustion.
+    Capacity,
 }
 
 /// Why a server was disabled.
@@ -44,6 +61,10 @@ pub struct HealthConfig {
     pub max_backoff: Duration,
     /// How long to disable a server after an authentication failure.
     pub auth_disable_duration: Duration,
+    /// How long to cool down a server after a transport-level failure.
+    pub transient_cooldown: Duration,
+    /// How long to cool down a server after a capacity-related failure.
+    pub capacity_cooldown: Duration,
 }
 
 impl Default for HealthConfig {
@@ -54,6 +75,8 @@ impl Default for HealthConfig {
             base_backoff: Duration::from_secs(30),
             max_backoff: Duration::from_hours(1),
             auth_disable_duration: Duration::from_mins(5),
+            transient_cooldown: Duration::from_secs(10),
+            capacity_cooldown: Duration::from_secs(5),
         }
     }
 }
@@ -140,9 +163,39 @@ impl ServerHealth {
         }
     }
 
+    /// Record a short-lived transport or capacity failure without advancing
+    /// the longer-lived degraded/disabled thresholds.
+    pub fn record_cooldown(&mut self, reason: CooldownReason) {
+        self.failure_count += 1;
+
+        let resume_degraded = match self.state {
+            ServerState::Degraded {
+                consecutive_failures,
+            } => Some(consecutive_failures),
+            ServerState::CoolingDown {
+                resume_degraded, ..
+            } => resume_degraded,
+            _ => None,
+        };
+
+        let duration = match reason {
+            CooldownReason::Transport => self.config.transient_cooldown,
+            CooldownReason::Capacity => self.config.capacity_cooldown,
+        };
+
+        self.state = ServerState::CoolingDown {
+            until: Instant::now() + duration,
+            reason,
+            resume_degraded,
+        };
+    }
+
     /// Whether this server can currently accept work.
     pub fn is_available(&self) -> bool {
-        !matches!(self.state, ServerState::Disabled { .. })
+        !matches!(
+            self.state,
+            ServerState::Disabled { .. } | ServerState::CoolingDown { .. }
+        )
     }
 
     /// The current state of this server.
@@ -156,16 +209,29 @@ impl ServerHealth {
     /// failure immediately re-disables the server (with increased backoff),
     /// while a success resets the server to Healthy.
     pub fn check_reenable(&mut self) {
-        if let ServerState::Disabled { until, .. } = self.state
-            && Instant::now() >= until
-        {
-            // Re-enter as Degraded just below the disable threshold so one
-            // more failure trips the circuit breaker again immediately.
-            let probe_failures = self.config.disable_threshold.saturating_sub(1);
-            self.consecutive_failures = probe_failures;
-            self.state = ServerState::Degraded {
-                consecutive_failures: probe_failures,
-            };
+        match self.state {
+            ServerState::Disabled { until, .. } if Instant::now() >= until => {
+                // Re-enter as Degraded just below the disable threshold so one
+                // more failure trips the circuit breaker again immediately.
+                let probe_failures = self.config.disable_threshold.saturating_sub(1);
+                self.consecutive_failures = probe_failures;
+                self.state = ServerState::Degraded {
+                    consecutive_failures: probe_failures,
+                };
+            }
+            ServerState::CoolingDown {
+                until,
+                resume_degraded,
+                ..
+            } if Instant::now() >= until => {
+                self.state = match resume_degraded {
+                    Some(consecutive_failures) => ServerState::Degraded {
+                        consecutive_failures,
+                    },
+                    None => ServerState::Healthy,
+                };
+            }
+            _ => {}
         }
     }
 
@@ -247,6 +313,11 @@ impl HealthTracker {
         self.servers[server_idx].record_failure(is_auth);
     }
 
+    /// Record a short-lived cooldown-worthy failure for the given server.
+    pub fn record_cooldown(&mut self, server_idx: usize, reason: CooldownReason) {
+        self.servers[server_idx].record_cooldown(reason);
+    }
+
     /// Whether the given server is available for work.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
         self.servers[server_idx].check_reenable();
@@ -272,7 +343,7 @@ impl HealthTracker {
             match server.state() {
                 ServerState::Healthy => healthy.push(idx),
                 ServerState::Degraded { .. } => degraded.push(idx),
-                ServerState::Disabled { .. } => {}
+                ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => {}
             }
         }
 
@@ -317,6 +388,8 @@ mod tests {
             base_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(10),
             auth_disable_duration: Duration::from_millis(100),
+            transient_cooldown: Duration::from_millis(50),
+            capacity_cooldown: Duration::from_millis(25),
         }
     }
 
@@ -466,6 +539,56 @@ mod tests {
         // Server 1 should be excluded entirely.
         assert_eq!(order, vec![0, 2]);
         assert!(!tracker.is_available(1));
+    }
+
+    #[test]
+    fn cooldown_excludes_server_until_expiry() {
+        let mut health = ServerHealth::new(test_config());
+        health.record_cooldown(CooldownReason::Transport);
+
+        assert!(matches!(
+            health.state(),
+            ServerState::CoolingDown {
+                reason: CooldownReason::Transport,
+                ..
+            }
+        ));
+        assert!(!health.is_available());
+
+        std::thread::sleep(Duration::from_millis(60));
+        health.check_reenable();
+
+        assert_eq!(*health.state(), ServerState::Healthy);
+        assert!(health.is_available());
+        assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn cooldown_from_degraded_restores_degraded_state() {
+        let mut health = ServerHealth::new(test_config());
+        for _ in 0..3 {
+            health.record_failure(false);
+        }
+        assert!(matches!(
+            health.state(),
+            ServerState::Degraded {
+                consecutive_failures: 3
+            }
+        ));
+
+        health.record_cooldown(CooldownReason::Capacity);
+        assert!(!health.is_available());
+
+        std::thread::sleep(Duration::from_millis(30));
+        health.check_reenable();
+
+        assert!(matches!(
+            health.state(),
+            ServerState::Degraded {
+                consecutive_failures: 3
+            }
+        ));
+        assert_eq!(health.consecutive_failures, 3);
     }
 
     #[test]

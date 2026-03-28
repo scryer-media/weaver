@@ -78,6 +78,16 @@ impl NntpCodec {
         self.multiline
     }
 
+    /// Whether the codec is currently in streaming multiline mode.
+    pub fn is_streaming_multiline(&self) -> bool {
+        self.streaming_multiline
+    }
+
+    /// Whether the codec is currently expecting multiline data in either mode.
+    pub fn is_reading_multiline(&self) -> bool {
+        self.multiline || self.streaming_multiline
+    }
+
     /// Set the codec into streaming multiline mode.
     pub fn set_streaming_multiline(&mut self, streaming: bool) {
         self.streaming_multiline = streaming;
@@ -406,6 +416,15 @@ mod tests {
     }
 
     #[test]
+    fn decode_line_rejects_oversized_status_line() {
+        let mut codec = NntpCodec::new();
+        let long = format!("200 {}\r\n", "x".repeat(MAX_LINE_LENGTH + 1));
+        let mut buf = BytesMut::from(long.as_bytes());
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert!(matches!(err, NntpError::MalformedResponse(_)));
+    }
+
+    #[test]
     fn decode_multiple_lines() {
         let mut codec = NntpCodec::new();
         let mut buf = BytesMut::from("200 OK\r\n281 Auth OK\r\n");
@@ -485,6 +504,24 @@ mod tests {
         match frame {
             NntpFrame::MultiLineData(data) => {
                 assert_eq!(&data[..], b"data here\r\nmore data\r\n");
+            }
+            _ => panic!("expected MultiLineData"),
+        }
+    }
+
+    #[test]
+    fn decode_multiline_handles_split_terminator() {
+        let mut codec = NntpCodec::new();
+        codec.set_multiline(true);
+
+        let mut buf = BytesMut::from("body line\r\n.");
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+
+        buf.extend_from_slice(b"\r\n");
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        match frame {
+            NntpFrame::MultiLineData(data) => {
+                assert_eq!(&data[..], b"body line\r\n");
             }
             _ => panic!("expected MultiLineData"),
         }

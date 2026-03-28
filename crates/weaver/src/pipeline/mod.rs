@@ -1608,6 +1608,7 @@ mod tests {
     use weaver_core::buffer::{BufferPool, BufferPoolConfig};
     use weaver_core::classify::FileRole;
     use weaver_core::config::{Config, SharedConfig};
+    use weaver_core::id::MessageId;
     use weaver_core::system::{
         CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
         SystemProfile,
@@ -3116,6 +3117,60 @@ mod tests {
         assert!(
             matches!(status, JobStatus::Failed { .. }),
             "status: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(20010);
+        let spec = segmented_job_spec("Optional Recovery Only", "payload.bin", &[128]);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.status = JobStatus::Downloading;
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue.push(DownloadWork {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 1,
+                    },
+                    segment_number: 0,
+                },
+                message_id: MessageId::new("recovery-0@example.com"),
+                groups: vec!["alt.binaries.test".to_string()],
+                priority: 1000,
+                byte_estimate: 128,
+                retry_count: 0,
+                is_recovery: true,
+                exclude_servers: Vec::new(),
+            });
+        }
+
+        pipeline.active_download_passes.insert(job_id);
+        pipeline.active_downloads_by_job.insert(job_id, 0);
+
+        assert!(!pipeline.pending_completion_checks.contains(&job_id));
+        assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
+
+        pipeline.maybe_finish_download_pass(job_id);
+
+        assert!(!pipeline.active_download_passes.contains(&job_id));
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_id]
+        );
+        assert_eq!(
+            pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(),
+            1,
+            "optional recovery files should stay parked until promoted"
         );
     }
 

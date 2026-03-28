@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
-use crate::health::ServerState;
+use crate::health::{CooldownReason, ServerState};
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 
 /// Configuration for the high-level NNTP client.
@@ -137,8 +137,8 @@ impl NntpClient {
                     last_error = Some(NntpError::AuthenticationFailed);
                 }
                 Err(e) if is_transient(&e) => {
-                    if should_record_transient_failure(&e) {
-                        self.record_server_failure(idx, false).await;
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
                     }
                     had_transient = true;
                     last_error = Some(e);
@@ -234,8 +234,8 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
-                    if should_record_transient_failure(&e) {
-                        self.record_server_failure(idx, false).await;
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -303,8 +303,8 @@ impl NntpClient {
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
-                    if should_record_transient_failure(&e) {
-                        self.record_server_failure(idx, false).await;
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -348,6 +348,11 @@ impl NntpClient {
         health.record_failure(server_idx, is_auth);
     }
 
+    async fn record_server_cooldown(&self, server_idx: usize, reason: CooldownReason) {
+        let mut health = self.pool.health().lock().await;
+        health.record_cooldown(server_idx, reason);
+    }
+
     async fn record_premature_death_if_needed(&self, server_idx: usize, age: Duration) {
         if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
             let mut health = self.pool.health().lock().await;
@@ -384,16 +389,14 @@ impl NntpClient {
         NntpError::SoftTimeout(self.soft_timeout.as_secs())
     }
 
-    /// Build the server try-order, grouping by immediate capacity, then
-    /// priority, and ranking within each group using latency-weighted random
-    /// selection.
+    /// Build the server try-order, exhausting lower-priority groups before
+    /// considering higher-priority backfill groups.
     ///
-    /// Servers in `exclude` are skipped entirely. Disabled servers (circuit-
-    /// breaker tripped) are also excluded so we don't waste time on servers
-    /// that are known to be failing. Servers with an immediately acquirable
-    /// permit are preferred over fully saturated peers so we do not burn the
-    /// soft-timeout budget queued behind a busy server while another server is
-    /// ready right now.
+    /// Servers in `exclude` are skipped entirely. Disabled servers and
+    /// short-lived cooldown servers are excluded so we don't waste time on
+    /// servers that are known to be failing right now. Within a priority
+    /// group, immediately acquirable servers are preferred over fully
+    /// saturated peers.
     #[allow(clippy::needless_range_loop)]
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
@@ -403,45 +406,60 @@ impl NntpClient {
         let mut health = self.pool.health().lock().await;
         health.check_reenable_all();
 
-        // Collect available servers into two tiers: immediately available
-        // servers first, then fully saturated servers. Within each tier we
-        // still prefer lower-priority groups and healthy servers.
-        let mut ready_groups: std::collections::BTreeMap<u32, (Vec<usize>, Vec<usize>)> =
-            std::collections::BTreeMap::new();
-        let mut waiting_groups: std::collections::BTreeMap<u32, (Vec<usize>, Vec<usize>)> =
+        #[derive(Default)]
+        struct GroupCandidates {
+            ready_healthy: Vec<usize>,
+            ready_degraded: Vec<usize>,
+            waiting_healthy: Vec<usize>,
+            waiting_degraded: Vec<usize>,
+        }
+
+        let mut groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
             if !exclude.contains(&idx) && health.is_available(idx) {
-                let groups = if self.pool.server_load(idx).0 > 0 {
-                    &mut ready_groups
-                } else {
-                    &mut waiting_groups
-                };
                 let entry = groups.entry(server_groups[idx]).or_default();
+                let ready = self.pool.server_load(idx).0 > 0;
                 match health.server(idx).state() {
-                    ServerState::Healthy => entry.0.push(idx),
-                    ServerState::Degraded { .. } => entry.1.push(idx),
-                    ServerState::Disabled { .. } => {}
+                    ServerState::Healthy => {
+                        if ready {
+                            entry.ready_healthy.push(idx);
+                        } else {
+                            entry.waiting_healthy.push(idx);
+                        }
+                    }
+                    ServerState::Degraded { .. } => {
+                        if ready {
+                            entry.ready_degraded.push(idx);
+                        } else {
+                            entry.waiting_degraded.push(idx);
+                        }
+                    }
+                    ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => {}
                 }
             }
         }
         drop(health);
 
         let mut result = Vec::with_capacity(server_count);
-        for (_priority, (healthy, degraded)) in ready_groups {
-            if !healthy.is_empty() {
-                result.extend(self.rank_servers_in_group(&healthy).await);
+        for (_priority, candidates) in groups {
+            if !candidates.ready_healthy.is_empty() {
+                result.extend(self.rank_servers_in_group(&candidates.ready_healthy).await);
             }
-            if !degraded.is_empty() {
-                result.extend(self.rank_servers_in_group(&degraded).await);
+            if !candidates.ready_degraded.is_empty() {
+                result.extend(self.rank_servers_in_group(&candidates.ready_degraded).await);
             }
-        }
-        for (_priority, (healthy, degraded)) in waiting_groups {
-            if !healthy.is_empty() {
-                result.extend(self.rank_servers_in_group(&healthy).await);
+            if !candidates.waiting_healthy.is_empty() {
+                result.extend(
+                    self.rank_servers_in_group(&candidates.waiting_healthy)
+                        .await,
+                );
             }
-            if !degraded.is_empty() {
-                result.extend(self.rank_servers_in_group(&degraded).await);
+            if !candidates.waiting_degraded.is_empty() {
+                result.extend(
+                    self.rank_servers_in_group(&candidates.waiting_degraded)
+                        .await,
+                );
             }
         }
         result
@@ -571,8 +589,8 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
-                    if should_record_transient_failure(&e) {
-                        self.record_server_failure(idx, false).await;
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -876,6 +894,9 @@ fn is_transient(err: &NntpError) -> bool {
         NntpError::Io(_)
             | NntpError::Timeout
             | NntpError::ConnectionClosed
+            | NntpError::TruncatedMultilineBody
+            | NntpError::ServerDisconnectedMidBody
+            | NntpError::MalformedMultilineTerminator
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
@@ -883,11 +904,20 @@ fn is_transient(err: &NntpError) -> bool {
     )
 }
 
-fn should_record_transient_failure(err: &NntpError) -> bool {
-    !matches!(
-        err,
-        NntpError::TooManyConnections | NntpError::PoolExhausted
-    )
+fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
+    match err {
+        NntpError::Io(_)
+        | NntpError::Timeout
+        | NntpError::ConnectionClosed
+        | NntpError::TruncatedMultilineBody
+        | NntpError::ServerDisconnectedMidBody
+        | NntpError::MalformedMultilineTerminator
+        | NntpError::ServiceUnavailable
+        | NntpError::SoftTimeout(_) => Some(CooldownReason::Transport),
+        NntpError::TooManyConnections => Some(CooldownReason::Capacity),
+        NntpError::PoolExhausted => None,
+        _ => None,
+    }
 }
 
 /// Returns true if the error indicates the connection itself is bad
@@ -898,6 +928,9 @@ fn is_connection_error(err: &NntpError) -> bool {
         NntpError::Io(_)
             | NntpError::Timeout
             | NntpError::ConnectionClosed
+            | NntpError::TruncatedMultilineBody
+            | NntpError::ServerDisconnectedMidBody
+            | NntpError::MalformedMultilineTerminator
             | NntpError::TooManyConnections
             | NntpError::AccessDenied
             | NntpError::SoftTimeout(_)
@@ -919,6 +952,9 @@ mod tests {
     fn transient_errors() {
         assert!(is_transient(&NntpError::Timeout));
         assert!(is_transient(&NntpError::ConnectionClosed));
+        assert!(is_transient(&NntpError::TruncatedMultilineBody));
+        assert!(is_transient(&NntpError::ServerDisconnectedMidBody));
+        assert!(is_transient(&NntpError::MalformedMultilineTerminator));
         assert!(is_transient(&NntpError::ServiceUnavailable));
         assert!(is_transient(&NntpError::TooManyConnections));
         assert!(is_transient(&NntpError::PoolExhausted));
@@ -938,6 +974,11 @@ mod tests {
     fn connection_errors() {
         assert!(is_connection_error(&NntpError::Timeout));
         assert!(is_connection_error(&NntpError::ConnectionClosed));
+        assert!(is_connection_error(&NntpError::TruncatedMultilineBody));
+        assert!(is_connection_error(&NntpError::ServerDisconnectedMidBody));
+        assert!(is_connection_error(
+            &NntpError::MalformedMultilineTerminator
+        ));
         assert!(is_connection_error(&NntpError::TooManyConnections));
         assert!(is_connection_error(&NntpError::AccessDenied));
         assert!(!is_connection_error(&NntpError::ArticleNotFound));
@@ -1066,12 +1107,19 @@ mod tests {
 
     #[test]
     fn transient_failure_recording_counts_soft_timeouts() {
-        assert!(should_record_transient_failure(&NntpError::SoftTimeout(15)));
-        assert!(!should_record_transient_failure(
-            &NntpError::TooManyConnections
-        ));
-        assert!(!should_record_transient_failure(&NntpError::PoolExhausted));
-        assert!(should_record_transient_failure(&NntpError::Timeout));
+        assert_eq!(
+            cooldown_reason(&NntpError::SoftTimeout(15)),
+            Some(CooldownReason::Transport)
+        );
+        assert_eq!(
+            cooldown_reason(&NntpError::TooManyConnections),
+            Some(CooldownReason::Capacity)
+        );
+        assert_eq!(cooldown_reason(&NntpError::PoolExhausted), None);
+        assert_eq!(
+            cooldown_reason(&NntpError::Timeout),
+            Some(CooldownReason::Transport)
+        );
     }
 
     #[test]
@@ -1250,7 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_server_order_prefers_immediately_available_servers() {
+    async fn build_server_order_keeps_backfill_after_primary_group() {
         let pool = NntpPool::new(PoolConfig {
             servers: vec![
                 ServerPoolConfig {
@@ -1268,6 +1316,41 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 1,
+                },
+            ],
+            max_idle_age: Duration::from_secs(300),
+            ..PoolConfig::default()
+        });
+
+        let client = NntpClient {
+            pool: Arc::new(pool),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        };
+
+        let order = client.build_server_order(&[]).await;
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn build_server_order_prefers_ready_servers_within_same_group() {
+        let pool = NntpPool::new(PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "waiting-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 0,
+                    group: 0,
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "ready-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 1,
+                    group: 0,
                 },
             ],
             max_idle_age: Duration::from_secs(300),

@@ -888,6 +888,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
                 state: match srv.state() {
                     weaver_nntp::ServerState::Healthy => "healthy",
                     weaver_nntp::ServerState::Degraded { .. } => "degraded",
+                    weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
                     weaver_nntp::ServerState::Disabled { .. } => "disabled",
                 },
                 success_count: srv.success_count,

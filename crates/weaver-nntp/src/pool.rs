@@ -222,21 +222,17 @@ impl NntpPool {
     }
 
     /// Acquire a connection from any server that has capacity.
-    /// Tries servers in health-priority order (healthy first, degraded second,
-    /// disabled servers are skipped).
+    ///
+    /// Lower-numbered priority groups are exhausted before higher-numbered
+    /// backfill groups are considered. Within a group, healthy servers are
+    /// preferred over degraded ones, and immediately available servers are
+    /// preferred over saturated ones.
     pub async fn acquire_any(&self) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
 
-        let ordered = {
-            let mut health = self.health.lock().await;
-            let mut servers = health.ordered_servers();
-            // Stable-sort by group so lower-group (primary) servers are tried first,
-            // while preserving health ordering within each group.
-            servers.sort_by_key(|&idx| self.groups[idx]);
-            servers
-        };
+        let ordered = self.acquire_any_order().await;
 
         // Try non-blocking acquire on each server in group+health order.
         for idx in &ordered {
@@ -260,6 +256,56 @@ impl NntpPool {
             // All servers disabled — fall back to server 0.
             self.acquire(ServerId(0)).await
         }
+    }
+
+    async fn acquire_any_order(&self) -> Vec<usize> {
+        #[derive(Default)]
+        struct GroupCandidates {
+            ready_healthy: Vec<usize>,
+            ready_degraded: Vec<usize>,
+            waiting_healthy: Vec<usize>,
+            waiting_degraded: Vec<usize>,
+        }
+
+        let mut health = self.health.lock().await;
+        health.check_reenable_all();
+
+        let mut groups: std::collections::BTreeMap<u32, GroupCandidates> =
+            std::collections::BTreeMap::new();
+        for idx in 0..self.server_count() {
+            if !health.is_available(idx) {
+                continue;
+            }
+            let entry = groups.entry(self.groups[idx]).or_default();
+            let ready = self.semaphores[idx].available_permits() > 0;
+            match health.server(idx).state() {
+                crate::health::ServerState::Healthy => {
+                    if ready {
+                        entry.ready_healthy.push(idx);
+                    } else {
+                        entry.waiting_healthy.push(idx);
+                    }
+                }
+                crate::health::ServerState::Degraded { .. } => {
+                    if ready {
+                        entry.ready_degraded.push(idx);
+                    } else {
+                        entry.waiting_degraded.push(idx);
+                    }
+                }
+                crate::health::ServerState::CoolingDown { .. }
+                | crate::health::ServerState::Disabled { .. } => {}
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(self.server_count());
+        for (_group, candidates) in groups {
+            ordered.extend(candidates.ready_healthy);
+            ordered.extend(candidates.ready_degraded);
+            ordered.extend(candidates.waiting_healthy);
+            ordered.extend(candidates.waiting_degraded);
+        }
+        ordered
     }
 
     /// Drain all idle connections across all servers.
@@ -622,6 +668,70 @@ mod tests {
             h2.ordered_servers()
         };
         assert_eq!(ordered, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_order_keeps_backfill_after_primary_group() {
+        let config = PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "waiting-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 0,
+                    group: 0,
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "ready-backfill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 1,
+                    group: 1,
+                },
+            ],
+            max_idle_age: Duration::from_mins(5),
+            health_config: HealthConfig::default(),
+            reconnect_delay: Duration::from_secs(1),
+            stale_check_age: Duration::from_secs(30),
+        };
+        let pool = NntpPool::new(config);
+
+        let ordered = pool.acquire_any_order().await;
+        assert_eq!(ordered, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_order_prefers_ready_servers_within_primary_group() {
+        let config = PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "waiting-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 0,
+                    group: 0,
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "ready-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 1,
+                    group: 0,
+                },
+            ],
+            max_idle_age: Duration::from_mins(5),
+            health_config: HealthConfig::default(),
+            reconnect_delay: Duration::from_secs(1),
+            stale_check_age: Duration::from_secs(30),
+        };
+        let pool = NntpPool::new(config);
+
+        let ordered = pool.acquire_any_order().await;
+        assert_eq!(ordered, vec![1, 0]);
     }
 
     #[test]

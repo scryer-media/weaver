@@ -335,6 +335,30 @@ impl NntpConnection {
         }
     }
 
+    fn reset_multiline_decode_state(&mut self) {
+        self.codec.set_multiline(false);
+        self.codec.set_streaming_multiline(false);
+        self.codec.set_raw_multiline(false);
+    }
+
+    fn classify_multiline_error(&self, err: NntpError) -> NntpError {
+        if !self.codec.is_reading_multiline() {
+            return err;
+        }
+
+        match err {
+            NntpError::ConnectionClosed => {
+                if pending_multiline_terminator(&self.read_buf) {
+                    NntpError::MalformedMultilineTerminator
+                } else {
+                    NntpError::ServerDisconnectedMidBody
+                }
+            }
+            NntpError::Timeout => NntpError::TruncatedMultilineBody,
+            other => other,
+        }
+    }
+
     /// Read a raw frame from the codec, with timeout.
     async fn read_frame(&mut self) -> Result<NntpFrame> {
         let timeout = self.command_timeout;
@@ -382,15 +406,24 @@ impl NntpConnection {
     async fn read_multiline_data_inner(&mut self, raw: bool) -> Result<Bytes> {
         self.codec.set_multiline(true);
         self.codec.set_raw_multiline(raw);
-
-        let frame = self.read_frame().await?;
+        let frame = self.read_frame().await;
         self.codec.set_raw_multiline(false);
-        self.trim_read_buffer();
         match frame {
-            NntpFrame::MultiLineData(data) => Ok(data.freeze()),
-            NntpFrame::Line(line) => Err(NntpError::MalformedResponse(format!(
-                "expected multi-line data, got line: {line:?}"
-            ))),
+            Ok(NntpFrame::MultiLineData(data)) => {
+                self.trim_read_buffer();
+                Ok(data.freeze())
+            }
+            Ok(NntpFrame::Line(line)) => {
+                self.reset_multiline_decode_state();
+                Err(NntpError::MalformedResponse(format!(
+                    "expected multi-line data, got line: {line:?}"
+                )))
+            }
+            Err(err) => {
+                let err = self.classify_multiline_error(err);
+                self.reset_multiline_decode_state();
+                Err(err)
+            }
         }
     }
 
@@ -679,12 +712,20 @@ impl NntpConnection {
         match result {
             Ok(inner) => {
                 self.trim_read_buffer();
-                inner
+                match inner {
+                    Ok(bytes) => Ok(bytes),
+                    Err(err) => {
+                        let err = self.classify_multiline_error(err);
+                        self.reset_multiline_decode_state();
+                        Err(err)
+                    }
+                }
             }
             Err(_) => {
                 self.poisoned = true;
                 self.current_group = None;
-                Err(NntpError::Timeout)
+                self.reset_multiline_decode_state();
+                Err(NntpError::TruncatedMultilineBody)
             }
         }
     }
@@ -757,9 +798,79 @@ impl NntpConnection {
     }
 }
 
+fn pending_multiline_terminator(buf: &[u8]) -> bool {
+    buf.ends_with(b"\r.")
+        || buf.ends_with(b"\n.")
+        || buf.ends_with(b"\r.\r")
+        || buf.ends_with(b"\n.\r")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct ScriptStep {
+        expect_prefix: Option<&'static str>,
+        response: &'static [u8],
+        delay: Duration,
+    }
+
+    async fn read_command_line(socket: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = socket.read(&mut byte).await.unwrap();
+            assert!(n > 0, "client closed connection before command completed");
+            buf.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for step in steps {
+                if let Some(prefix) = step.expect_prefix {
+                    let line = read_command_line(&mut socket).await;
+                    assert!(
+                        line.starts_with(prefix),
+                        "expected command starting with {prefix:?}, got {line:?}"
+                    );
+                }
+                if step.delay > Duration::ZERO {
+                    tokio::time::sleep(step.delay).await;
+                }
+                if !step.response.is_empty() {
+                    socket.write_all(step.response).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+            }
+            if hold_open_after_last > Duration::ZERO {
+                tokio::time::sleep(hold_open_after_last).await;
+            }
+        });
+
+        port
+    }
+
+    fn scripted_plain_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            connect_timeout: Duration::from_secs(1),
+            command_timeout: Duration::from_millis(100),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn group_tracking_initial_state() {
@@ -811,6 +922,244 @@ mod tests {
         assert!(!cfg.starttls);
         assert!(cfg.username.is_none());
         assert!(cfg.password.is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_accepts_201_greeting() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"201 no posting\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let conn = NntpConnection::connect(&scripted_plain_config(port)).await;
+        assert!(conn.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_maps_400_greeting_to_service_unavailable() {
+        let port = spawn_scripted_server(
+            vec![ScriptStep {
+                expect_prefix: None,
+                response: b"400 service unavailable\r\n",
+                delay: Duration::ZERO,
+            }],
+            Duration::ZERO,
+        )
+        .await;
+
+        let err = match NntpConnection::connect(&scripted_plain_config(port)).await {
+            Ok(_) => panic!("expected connect to fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, NntpError::ServiceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn body_by_id_reauthenticates_on_mid_session_480() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"480 authentication required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\nhello\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.username = Some("user".into());
+        config.password = Some("pass".into());
+
+        let mut conn = NntpConnection::connect(&config).await.unwrap();
+        let response = conn.body_by_id("<test@example.com>").await.unwrap();
+        assert_eq!(&response.data[..], b"hello\r\n");
+    }
+
+    #[tokio::test]
+    async fn body_by_id_handles_split_terminator() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\nhello\r\n.",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"\r\n",
+                    delay: Duration::from_millis(5),
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let response = conn.body_by_id("<test@example.com>").await.unwrap();
+        assert_eq!(&response.data[..], b"hello\r\n");
+    }
+
+    #[tokio::test]
+    async fn body_by_id_reports_disconnect_mid_body() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\npartial\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let err = conn.body_by_id("<test@example.com>").await.unwrap_err();
+        assert!(matches!(err, NntpError::ServerDisconnectedMidBody));
+    }
+
+    #[tokio::test]
+    async fn body_by_id_reports_malformed_terminator() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\npartial\r\n.\r",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let err = conn.body_by_id("<test@example.com>").await.unwrap_err();
+        assert!(matches!(err, NntpError::MalformedMultilineTerminator));
+    }
+
+    #[tokio::test]
+    async fn body_by_id_reports_truncated_multiline_body_on_timeout() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\npartial\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::from_millis(1500),
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.command_timeout = Duration::from_secs(1);
+
+        let mut conn = NntpConnection::connect(&config).await.unwrap();
+        let err = conn.body_by_id("<test@example.com>").await.unwrap_err();
+        assert!(
+            matches!(err, NntpError::TruncatedMultilineBody),
+            "expected TruncatedMultilineBody, got {err:?}"
+        );
     }
 
     #[tokio::test]

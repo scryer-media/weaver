@@ -54,6 +54,6 @@ pub use client::NntpClient;
 pub use codec::StreamChunk;
 pub use connection::{NntpConnection, ServerConfig};
 pub use error::{NntpError, Result};
-pub use health::{HealthConfig, HealthTracker, ServerHealth, ServerState};
+pub use health::{CooldownReason, HealthConfig, HealthTracker, ServerHealth, ServerState};
 pub use pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 pub use types::{ArticleId, Capabilities, MultiLineResponse, Response, StatusCode};

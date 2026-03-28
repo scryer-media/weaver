@@ -33,6 +33,18 @@ pub enum NntpError {
     #[error("malformed response: {0}")]
     MalformedResponse(String),
 
+    /// The server disconnected while a multi-line article body was still in flight.
+    #[error("server disconnected mid-body")]
+    ServerDisconnectedMidBody,
+
+    /// The server stalled before completing a multi-line article body.
+    #[error("truncated multi-line body")]
+    TruncatedMultilineBody,
+
+    /// The server started a multiline terminator but never completed it.
+    #[error("malformed multiline terminator")]
+    MalformedMultilineTerminator,
+
     // --- Authentication errors ---
     /// The server requires authentication (480).
     #[error("authentication required (480)")]

@@ -39,14 +39,17 @@ impl Pipeline {
         }
     }
 
-    fn maybe_finish_download_pass(&mut self, job_id: JobId) {
+    pub(super) fn maybe_finish_download_pass(&mut self, job_id: JobId) {
         let in_flight = self
             .active_downloads_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);
         let has_remaining_work = self.jobs.get(&job_id).is_some_and(|state| {
-            !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
+            // Optional recovery files remain parked in `recovery_queue` until
+            // explicitly promoted, so they must not keep a download pass open
+            // once all dispatchable work has drained.
+            !state.download_queue.is_empty()
         }) || self
             .pending_retries_by_job
             .get(&job_id)

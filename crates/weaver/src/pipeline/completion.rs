@@ -8,7 +8,6 @@ impl Pipeline {
         let has_queued_work = self.jobs.get(&job_id).is_some_and(|state| {
             state.health_probing
                 || !state.download_queue.is_empty()
-                || !state.recovery_queue.is_empty()
         });
         let has_inflight_downloads = self
             .active_downloads_by_job
@@ -2470,7 +2469,7 @@ impl Pipeline {
             // downloads haven't really started — don't prematurely leave Downloading.
             if total == 0
                 && matches!(state.status, JobStatus::Queued | JobStatus::Downloading)
-                && (!state.download_queue.is_empty() || !state.recovery_queue.is_empty())
+                && !state.download_queue.is_empty()
             {
                 return;
             }
