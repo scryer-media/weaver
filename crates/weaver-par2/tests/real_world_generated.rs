@@ -12,6 +12,7 @@ use weaver_par2::{
 };
 
 const TEST_PASSWORD: &str = "testpass123";
+const HEAVY_DAMAGE_SLICE_SIZE: u64 = 65536;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -228,4 +229,80 @@ fn repairs_missing_volume_with_swapped_valid_names() {
     let repaired = verify_all(&par2_set, &access);
     assert_not_needed(&repaired, "swapped-plus-missing set repaired");
     extract_and_assert(temp.path(), prefix, &expected, None);
+}
+
+/// Heavy damage: 28 corrupted regions spread across a ~73MB RAR archive.
+/// With 30 recovery blocks at 64KB slices, this is 2 blocks from the repair
+/// ceiling. Tests multi-slice repair at scale with varied corruption patterns.
+#[test]
+fn repairs_heavy_damage_28_regions_rar5() {
+    let temp = copy_fixture_dir("rar5_heavy_damage");
+    let prefix = "fixture_rar5_heavy_damage";
+    let rar_path = temp.path().join("fixture_rar5_heavy_damage.rar");
+    let rar_size = fs::metadata(&rar_path).unwrap().len();
+    let total_slices =
+        ((rar_size + HEAVY_DAMAGE_SLICE_SIZE - 1) / HEAVY_DAMAGE_SLICE_SIZE) as usize;
+    let par2_paths = collect_paths(temp.path(), "fixture_rar5_heavy_damage_repair", "par2");
+    let par2_set = load_par2_set(&par2_paths);
+
+    // Spread 28 corruption sites across the file. Use a deterministic stride
+    // so each hit lands in a different 64KB slice. Vary corruption sizes from
+    // 1 byte up to 4KB to exercise different damage patterns.
+    let stride = total_slices / 29; // 28 sites, skip first and last slice
+    let corruption_sizes: &[usize] = &[
+        1, 16, 64, 256, 512, 1024, 2048, 4096, // 8 sizes
+        1, 16, 64, 256, 512, 1024, 2048, 4096, // repeat
+        1, 16, 64, 256, 512, 1024, 2048, 4096, // repeat
+        1, 16, 64, 256, // remaining 4
+    ];
+
+    for (i, &corrupt_len) in corruption_sizes.iter().enumerate() {
+        let slice_idx = stride * (i + 1); // skip slice 0 (RAR header)
+        let offset = (slice_idx as u64) * HEAVY_DAMAGE_SLICE_SIZE + 100; // +100 to avoid slice boundary
+        corrupt_file(&rar_path, offset, corrupt_len);
+    }
+
+    // Verify — should detect exactly 28 damaged slices.
+    let mut access = DiskFileAccess::new(temp.path().to_path_buf(), &par2_set);
+    let verification = verify_all(&par2_set, &access);
+    assert_repairable(&verification, "heavy damage 28 regions");
+    eprintln!(
+        "heavy damage: {} missing blocks (30 available)",
+        verification.total_missing_blocks
+    );
+    assert!(
+        verification.total_missing_blocks <= 30,
+        "expected at most 30 missing blocks, got {}",
+        verification.total_missing_blocks
+    );
+
+    // Repair.
+    let plan = plan_repair(&par2_set, &verification).unwrap();
+    eprintln!(
+        "repair plan: {} missing slices, {} recovery exponents",
+        plan.missing_slices.len(),
+        plan.recovery_exponents.len()
+    );
+    execute_repair(&plan, &par2_set, &mut access).unwrap();
+
+    // Verify repaired — should be clean.
+    let repaired = verify_all(&par2_set, &access);
+    assert_not_needed(&repaired, "heavy damage 28 regions repaired");
+
+    // Extract and verify the file is byte-identical to the original.
+    let volume_paths = collect_paths(temp.path(), prefix, "rar");
+    let mut archive = weaver_rar::RarArchive::open_volumes(
+        volume_paths
+            .iter()
+            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn weaver_rar::ReadSeek>)
+            .collect(),
+    )
+    .unwrap();
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+    let _extracted = archive.extract_member(0, &opts, None).unwrap();
+    // If extract_member didn't panic/error, the CRC matched.
+    eprintln!("heavy damage: extract verified OK");
 }

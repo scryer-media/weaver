@@ -55,6 +55,20 @@ impl FileAccess for DiskFileAccess {
         Ok(buf)
     }
 
+    fn read_file_range_into(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(dst)
+    }
+
     fn file_exists(&self, file_id: &FileId) -> bool {
         self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
@@ -149,6 +163,20 @@ impl FileAccess for PlacementFileAccess {
         Ok(buf)
     }
 
+    fn read_file_range_into(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(dst)
+    }
+
     fn file_exists(&self, file_id: &FileId) -> bool {
         self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
@@ -221,6 +249,21 @@ impl FileAccess for MultiDirectoryFileAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         match self.find_reader(file_id) {
             Some(accessor) => accessor.read_file_range(file_id, offset, len),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found in any directory",
+            )),
+        }
+    }
+
+    fn read_file_range_into(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        match self.find_reader(file_id) {
+            Some(accessor) => accessor.read_file_range_into(file_id, offset, dst),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "file not found in any directory",

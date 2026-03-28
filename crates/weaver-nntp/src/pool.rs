@@ -217,7 +217,6 @@ impl NntpPool {
             conn: Some(conn),
             pool: self.pools[idx].clone(),
             server_idx: idx,
-            health: self.health.clone(),
             _permit: permit,
         })
     }
@@ -349,7 +348,6 @@ pub struct PooledConnection {
     conn: Option<NntpConnection>,
     pool: Arc<Mutex<ServerPool>>,
     server_idx: usize,
-    health: Arc<Mutex<HealthTracker>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -357,7 +355,15 @@ impl PooledConnection {
     /// Explicitly discard this connection instead of returning it to the pool.
     /// Use when the connection is in a bad state.
     pub fn discard(mut self) {
-        self.conn = None;
+        if self.conn.take().is_some() {
+            let pool = self.pool.clone();
+            let server_idx = self.server_idx;
+            drop(tokio::spawn(async move {
+                let mut pool = pool.lock().await;
+                pool.active_count = pool.active_count.saturating_sub(1);
+                trace!(server = server_idx, "discarded connection");
+            }));
+        }
     }
 }
 
@@ -379,7 +385,6 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let pool = self.pool.clone();
-            let health = self.health.clone();
             let server_idx = self.server_idx;
             let poisoned = conn.is_poisoned();
 
@@ -387,32 +392,19 @@ impl Drop for PooledConnection {
                 // tokio::spawn can fail during runtime shutdown; if so, the
                 // connection is simply dropped (permit released by _permit).
                 drop(tokio::spawn(async move {
-                    {
-                        let mut h = health.lock().await;
-                        h.record_success(server_idx);
-                    }
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
                     pool.idle.push_back(conn);
-                    trace!("returned connection to pool");
+                    trace!(server = server_idx, "returned connection to pool");
                 }));
             } else {
-                let age = conn.created_at().elapsed();
                 drop(tokio::spawn(async move {
-                    {
-                        let mut h = health.lock().await;
-                        h.record_failure(server_idx, false);
-                        // Connection that died before MIN_CONNECTION_LIFETIME indicates infrastructure issues.
-                        if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
-                            h.record_premature_death(server_idx);
-                        }
-                    }
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
                     if poisoned {
-                        trace!("dropped poisoned connection, recorded failure");
+                        trace!(server = server_idx, "dropped poisoned connection");
                     } else {
-                        trace!("dropped unhealthy connection, recorded failure");
+                        trace!(server = server_idx, "dropped unhealthy connection");
                     }
                 }));
             }

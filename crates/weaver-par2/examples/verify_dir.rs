@@ -31,14 +31,8 @@ fn main() {
         rar_files.len()
     );
 
-    // Read and parse all PAR2 files.
-    let par2_data: Vec<Vec<u8>> = par2_paths
-        .iter()
-        .map(|p| std::fs::read(p).unwrap())
-        .collect();
-    let par2_refs: Vec<&[u8]> = par2_data.iter().map(|d| d.as_slice()).collect();
-
-    let mut par2_set = Par2FileSet::from_files(&par2_refs).unwrap();
+    // Parse all PAR2 files directly from disk so recovery slices stay file-backed.
+    let mut par2_set = Par2FileSet::from_paths(&par2_paths).unwrap();
 
     println!(
         "\nPAR2 set: {} files, slice_size={}, recovery_blocks={}",

@@ -112,11 +112,15 @@ impl Pipeline {
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             failed_bytes: 0,
             par2_bytes,
             health_probing: false,
+            last_health_probe_failed_bytes: 0,
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -304,11 +308,15 @@ impl Pipeline {
                 extraction_depth: 0,
                 created_at: std::time::Instant::now(),
                 created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
                 downloaded_bytes: info.downloaded_bytes,
                 failed_bytes: 0,
                 par2_bytes,
                 health_probing: false,
+                last_health_probe_failed_bytes: 0,
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
@@ -564,11 +572,17 @@ impl Pipeline {
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+            queued_repair_at_epoch_ms: matches!(status, JobStatus::QueuedRepair)
+                .then(weaver_scheduler::job::epoch_ms_now),
+            queued_extract_at_epoch_ms: matches!(status, JobStatus::QueuedExtract)
+                .then(weaver_scheduler::job::epoch_ms_now),
+            paused_resume_status: None,
             working_dir,
             downloaded_bytes,
             failed_bytes: 0,
             par2_bytes,
             health_probing: false,
+            last_health_probe_failed_bytes: 0,
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -616,6 +630,15 @@ impl Pipeline {
             queue_depth,
             "job restored from journal"
         );
+        if matches!(
+            status,
+            JobStatus::Downloading
+                | JobStatus::Verifying
+                | JobStatus::QueuedRepair
+                | JobStatus::QueuedExtract
+        ) {
+            self.schedule_job_completion_check(job_id);
+        }
         Ok(())
     }
 }

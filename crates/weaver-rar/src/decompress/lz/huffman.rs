@@ -693,7 +693,10 @@ mod tests {
         let mut ported = BitReader::new(&data);
 
         for _ in 0..3 {
-            assert_eq!(table.decode(&mut generic).unwrap(), table.decode_bitreader(&mut ported).unwrap());
+            assert_eq!(
+                table.decode(&mut generic).unwrap(),
+                table.decode_bitreader(&mut ported).unwrap()
+            );
             assert_eq!(generic.position(), ported.position());
         }
     }

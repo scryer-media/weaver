@@ -510,20 +510,20 @@ impl Pipeline {
             return;
         }
 
-        // Read the PAR2 file from disk.
-        let par2_bytes = match tokio::fs::read(&file_path).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                warn!(filename = %filename, error = %e, "failed to read PAR2 index file");
+        // Parse PAR2 packets directly from disk so recovery slices stay file-backed.
+        let parse_path = file_path.clone();
+        let mut par2_set = match tokio::task::spawn_blocking(move || {
+            weaver_par2::Par2FileSet::from_paths(&[parse_path])
+        })
+        .await
+        {
+            Ok(Ok(set)) => set,
+            Ok(Err(e)) => {
+                warn!(filename = %filename, error = %e, "failed to parse PAR2 index");
                 return;
             }
-        };
-
-        // Parse PAR2 packets.
-        let mut par2_set = match weaver_par2::Par2FileSet::from_files(&[&par2_bytes]) {
-            Ok(set) => set,
             Err(e) => {
-                warn!(filename = %filename, error = %e, "failed to parse PAR2 index");
+                warn!(filename = %filename, error = %e, "failed to join PAR2 index parse task");
                 return;
             }
         };
@@ -662,17 +662,28 @@ impl Pipeline {
             return;
         }
 
-        let par2_bytes = match tokio::fs::read(&file_path).await {
-            Ok(bytes) => bytes,
+        // Parse packets from this volume file directly from disk so recovery slices stay file-backed.
+        let parse_path = file_path.clone();
+        let packet_list = match tokio::task::spawn_blocking(move || {
+            weaver_par2::scan_packets_from_path(&parse_path).map(|packets| {
+                packets
+                    .into_iter()
+                    .map(|(packet, _)| packet)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        {
+            Ok(Ok(packet_list)) => packet_list,
+            Ok(Err(e)) => {
+                warn!(filename = %filename, error = %e, "failed to parse PAR2 recovery volume");
+                return;
+            }
             Err(e) => {
-                warn!(filename = %filename, error = %e, "failed to read PAR2 recovery volume");
+                warn!(filename = %filename, error = %e, "failed to join PAR2 recovery parse task");
                 return;
             }
         };
-
-        // Parse packets from this volume file.
-        let packets = weaver_par2::packet::scan_packets(&par2_bytes, 0);
-        let packet_list: Vec<_> = packets.into_iter().map(|(p, _)| p).collect();
 
         // Merge into the retained set (Arc::make_mut clones only if shared).
         let merge_result = {

@@ -1,6 +1,20 @@
 use super::*;
 
 impl Pipeline {
+    pub(crate) fn note_retry_scheduled(&mut self, job_id: JobId) {
+        *self.pending_retries_by_job.entry(job_id).or_default() += 1;
+    }
+
+    pub(crate) fn note_retry_requeued(&mut self, job_id: JobId) {
+        let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) else {
+            return;
+        };
+        *pending = pending.saturating_sub(1);
+        if *pending == 0 {
+            self.pending_retries_by_job.remove(&job_id);
+        }
+    }
+
     fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
         let decoded = decoded_bytes as u64;
         decoded.saturating_add(decoded / 16).saturating_add(1024)
@@ -31,14 +45,20 @@ impl Pipeline {
             .get(&job_id)
             .copied()
             .unwrap_or(0);
-        let has_queued_work = self.jobs.get(&job_id).is_some_and(|state| {
+        let has_remaining_work = self.jobs.get(&job_id).is_some_and(|state| {
             !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
-        });
+        }) || self
+            .pending_retries_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
 
-        if in_flight == 0 && !has_queued_work && self.active_download_passes.remove(&job_id) {
+        if in_flight == 0 && !has_remaining_work && self.active_download_passes.remove(&job_id) {
             let _ = self
                 .event_tx
                 .send(PipelineEvent::DownloadFinished { job_id });
+            self.schedule_job_completion_check(job_id);
         }
     }
 
@@ -153,6 +173,7 @@ impl Pipeline {
             }
 
             if work.raw.len() > weaver_core::buffer::BufferTier::Large.size_bytes() {
+                self.note_decode_started(job_id);
                 self.spawn_decode_task(work, None);
                 continue;
             }
@@ -163,6 +184,7 @@ impl Pipeline {
                 continue;
             };
 
+            self.note_decode_started(job_id);
             self.spawn_decode_task(work, Some(output));
         }
 
@@ -174,8 +196,9 @@ impl Pipeline {
     /// Iterates `job_order` and fills connections greedily: the first eligible
     /// job gets first pick of connections, the next job fills the remainder, etc.
     /// A job is eligible if it is `Downloading` with queued segments, or in a
-    /// post-processing state (`Extracting`/`Verifying`/`Repairing`) with
-    /// promoted recovery segments in its download queue.
+    /// post-processing state (`QueuedExtract`/`Extracting`/`Verifying`/
+    /// `QueuedRepair`/`Repairing`) with promoted recovery segments in its
+    /// download queue.
     ///
     /// This enables two key behaviors:
     /// - **Prefetch**: when the primary job enters extraction, the next job
@@ -249,9 +272,11 @@ impl Pipeline {
                 self.jobs.get(id).is_some_and(|s| match s.status {
                     JobStatus::Queued | JobStatus::Downloading => !s.download_queue.is_empty(),
                     // Post-processing jobs may have promoted recovery segments.
-                    JobStatus::Extracting | JobStatus::Verifying | JobStatus::Repairing => {
-                        !s.download_queue.is_empty()
-                    }
+                    JobStatus::QueuedExtract
+                    | JobStatus::Extracting
+                    | JobStatus::Verifying
+                    | JobStatus::QueuedRepair
+                    | JobStatus::Repairing => !s.download_queue.is_empty(),
                     _ => false,
                 })
             })
@@ -536,6 +561,7 @@ impl Pipeline {
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
                             let delay = std::time::Duration::from_secs(1 << (next_retry - 1));
+                            self.note_retry_scheduled(job_id);
                             debug!(
                                 segment = %seg_id,
                                 error = %e,

@@ -58,6 +58,18 @@ pub fn md5_multi(inputs: &[&[u8]], pad_to: Option<u64>) -> Vec<[u8; 16]> {
         return unsafe { md5_multi_neon(inputs, pad_to) };
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { md5_multi_x86(inputs, pad_to) };
+    }
+
+    #[cfg(target_arch = "x86")]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            return unsafe { md5_multi_x86(inputs, pad_to) };
+        }
+    }
+
     #[allow(unreachable_code)]
     md5_multi_scalar(inputs, pad_to)
 }
@@ -150,6 +162,176 @@ fn md5_pad(data: &[u8], effective_len: u64) -> Vec<u8> {
     padded.extend_from_slice(&bit_len.to_le_bytes());
 
     padded
+}
+
+// ---------------------------------------------------------------------------
+// x86/x86_64 kernel: 4 independent MD5 hashes in __m128i registers
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn md5_multi_x86(inputs: &[&[u8]], pad_to: Option<u64>) -> Vec<[u8; 16]> {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n = inputs.len();
+
+    let effective_lens: Vec<u64> = inputs
+        .iter()
+        .map(|inp| {
+            let raw = inp.len() as u64;
+            match pad_to {
+                Some(p) if p > raw => p,
+                _ => raw,
+            }
+        })
+        .collect();
+
+    let padded: Vec<Vec<u8>> = (0..n)
+        .map(|i| md5_pad(inputs[i], effective_lens[i]))
+        .collect();
+
+    let block_counts: Vec<usize> = padded.iter().map(|p| p.len() / 64).collect();
+    let uniform_blocks = block_counts.iter().all(|&c| c == block_counts[0]);
+    if !uniform_blocks {
+        return md5_multi_scalar(inputs, pad_to);
+    }
+
+    let num_blocks = block_counts[0];
+    let lane_ptrs: [&[u8]; 4] = [
+        &padded[0],
+        if n > 1 { &padded[1] } else { &padded[0] },
+        if n > 2 { &padded[2] } else { &padded[0] },
+        if n > 3 { &padded[3] } else { &padded[0] },
+    ];
+
+    #[inline(always)]
+    unsafe fn sse2_rotl(v: __m128i, amount: u32) -> __m128i {
+        #[cfg(target_arch = "x86")]
+        use std::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::*;
+
+        unsafe {
+            let left = _mm_sll_epi32(v, _mm_cvtsi32_si128(amount as i32));
+            let right = _mm_srl_epi32(v, _mm_cvtsi32_si128((32 - amount) as i32));
+            _mm_or_si128(left, right)
+        }
+    }
+
+    unsafe {
+        let mut a = _mm_set1_epi32(MD5_A0 as i32);
+        let mut b = _mm_set1_epi32(MD5_B0 as i32);
+        let mut c = _mm_set1_epi32(MD5_C0 as i32);
+        let mut d = _mm_set1_epi32(MD5_D0 as i32);
+        let all_ones = _mm_set1_epi32(-1);
+
+        for block_idx in 0..num_blocks {
+            let mut m = [_mm_setzero_si128(); 16];
+            let off = block_idx * 64;
+
+            for w in 0..4 {
+                let idx = w * 4;
+                let w_off = idx * 4;
+
+                let in0 = _mm_loadu_si128(lane_ptrs[0].as_ptr().add(off + w_off) as *const __m128i);
+                let in1 = _mm_loadu_si128(lane_ptrs[1].as_ptr().add(off + w_off) as *const __m128i);
+                let in2 = _mm_loadu_si128(lane_ptrs[2].as_ptr().add(off + w_off) as *const __m128i);
+                let in3 = _mm_loadu_si128(lane_ptrs[3].as_ptr().add(off + w_off) as *const __m128i);
+
+                let z01_lo = _mm_unpacklo_epi32(in0, in1);
+                let z01_hi = _mm_unpackhi_epi32(in0, in1);
+                let z23_lo = _mm_unpacklo_epi32(in2, in3);
+                let z23_hi = _mm_unpackhi_epi32(in2, in3);
+
+                m[idx] = _mm_unpacklo_epi64(z01_lo, z23_lo);
+                m[idx + 1] = _mm_unpackhi_epi64(z01_lo, z23_lo);
+                m[idx + 2] = _mm_unpacklo_epi64(z01_hi, z23_hi);
+                m[idx + 3] = _mm_unpackhi_epi64(z01_hi, z23_hi);
+            }
+
+            let oa = a;
+            let ob = b;
+            let oc = c;
+            let od = d;
+
+            for r in 0..16 {
+                let f = _mm_or_si128(_mm_and_si128(b, c), _mm_andnot_si128(b, d));
+                let tmp = _mm_add_epi32(
+                    _mm_add_epi32(a, f),
+                    _mm_add_epi32(_mm_set1_epi32(K[r] as i32), m[G[r]]),
+                );
+                a = d;
+                d = c;
+                c = b;
+                b = _mm_add_epi32(b, sse2_rotl(tmp, S[r]));
+            }
+
+            for r in 16..32 {
+                let f = _mm_or_si128(_mm_and_si128(d, b), _mm_andnot_si128(d, c));
+                let tmp = _mm_add_epi32(
+                    _mm_add_epi32(a, f),
+                    _mm_add_epi32(_mm_set1_epi32(K[r] as i32), m[G[r]]),
+                );
+                a = d;
+                d = c;
+                c = b;
+                b = _mm_add_epi32(b, sse2_rotl(tmp, S[r]));
+            }
+
+            for r in 32..48 {
+                let f = _mm_xor_si128(_mm_xor_si128(b, c), d);
+                let tmp = _mm_add_epi32(
+                    _mm_add_epi32(a, f),
+                    _mm_add_epi32(_mm_set1_epi32(K[r] as i32), m[G[r]]),
+                );
+                a = d;
+                d = c;
+                c = b;
+                b = _mm_add_epi32(b, sse2_rotl(tmp, S[r]));
+            }
+
+            for r in 48..64 {
+                let f = _mm_xor_si128(c, _mm_or_si128(b, _mm_andnot_si128(d, all_ones)));
+                let tmp = _mm_add_epi32(
+                    _mm_add_epi32(a, f),
+                    _mm_add_epi32(_mm_set1_epi32(K[r] as i32), m[G[r]]),
+                );
+                a = d;
+                d = c;
+                c = b;
+                b = _mm_add_epi32(b, sse2_rotl(tmp, S[r]));
+            }
+
+            a = _mm_add_epi32(a, oa);
+            b = _mm_add_epi32(b, ob);
+            c = _mm_add_epi32(c, oc);
+            d = _mm_add_epi32(d, od);
+        }
+
+        let mut a_words = [0u32; 4];
+        let mut b_words = [0u32; 4];
+        let mut c_words = [0u32; 4];
+        let mut d_words = [0u32; 4];
+        _mm_storeu_si128(a_words.as_mut_ptr() as *mut __m128i, a);
+        _mm_storeu_si128(b_words.as_mut_ptr() as *mut __m128i, b);
+        _mm_storeu_si128(c_words.as_mut_ptr() as *mut __m128i, c);
+        _mm_storeu_si128(d_words.as_mut_ptr() as *mut __m128i, d);
+
+        let mut results = Vec::with_capacity(n);
+        for lane in 0..n {
+            let mut digest = [0u8; 16];
+            digest[0..4].copy_from_slice(&a_words[lane].to_le_bytes());
+            digest[4..8].copy_from_slice(&b_words[lane].to_le_bytes());
+            digest[8..12].copy_from_slice(&c_words[lane].to_le_bytes());
+            digest[12..16].copy_from_slice(&d_words[lane].to_le_bytes());
+            results.push(digest);
+        }
+
+        results
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +672,26 @@ mod tests {
                 scalar[i], dispatched[i],
                 "scalar vs dispatched mismatch for input {i}"
             );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn scalar_matches_x86_backend() {
+        let inputs: Vec<Vec<u8>> = (0..4)
+            .map(|i| {
+                (0..500u32)
+                    .map(|j| ((j * 17 + i * 101) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|v| v.as_slice()).collect();
+
+        let scalar = md5_multi_scalar(&refs, None);
+        let x86 = unsafe { md5_multi_x86(&refs, None) };
+
+        for i in 0..4 {
+            assert_eq!(scalar[i], x86[i], "scalar vs x86 mismatch for input {i}");
         }
     }
 }

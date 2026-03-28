@@ -208,7 +208,10 @@ impl ServerHealth {
     /// Count of premature connection deaths within the recent time window.
     pub fn recent_premature_deaths(&self) -> usize {
         let cutoff = Instant::now() - Self::PREMATURE_DEATH_WINDOW;
-        self.premature_deaths.iter().filter(|&&t| t > cutoff).count()
+        self.premature_deaths
+            .iter()
+            .filter(|&&t| t > cutoff)
+            .count()
     }
 
     /// Compute the exponential backoff duration capped at `max_backoff`.

@@ -86,7 +86,9 @@ enum JournalEntry {
 enum PersistedJobStatus {
     Downloading,
     Verifying,
+    QueuedRepair,
     Repairing,
+    QueuedExtract,
     Extracting,
     Complete,
     Failed { error: String },
@@ -248,7 +250,9 @@ impl Database {
             let (status_str, error_str) = match &job.status {
                 PersistedJobStatus::Downloading => ("downloading", None),
                 PersistedJobStatus::Verifying => ("verifying", None),
+                PersistedJobStatus::QueuedRepair => ("queued_repair", None),
                 PersistedJobStatus::Repairing => ("repairing", None),
+                PersistedJobStatus::QueuedExtract => ("queued_extract", None),
                 PersistedJobStatus::Extracting => ("extracting", None),
                 PersistedJobStatus::Complete => ("complete", None),
                 PersistedJobStatus::Failed { error } => ("failed", Some(error.as_str())),

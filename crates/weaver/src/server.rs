@@ -1277,7 +1277,9 @@ fn render_prometheus_metrics(
     if !server_health.is_empty() {
         out.push_str("# HELP weaver_server_state Server health state (1=healthy, 0=disabled).\n");
         out.push_str("# TYPE weaver_server_state gauge\n");
-        out.push_str("# HELP weaver_server_success_total Total successful operations per server.\n");
+        out.push_str(
+            "# HELP weaver_server_success_total Total successful operations per server.\n",
+        );
         out.push_str("# TYPE weaver_server_success_total counter\n");
         out.push_str("# HELP weaver_server_failure_total Total failed operations per server.\n");
         out.push_str("# TYPE weaver_server_failure_total counter\n");
@@ -1291,7 +1293,9 @@ fn render_prometheus_metrics(
         out.push_str("# TYPE weaver_server_connections_available gauge\n");
         out.push_str("# HELP weaver_server_connections_max Maximum connections per server.\n");
         out.push_str("# TYPE weaver_server_connections_max gauge\n");
-        out.push_str("# HELP weaver_server_premature_deaths Recent connections that died before 60s age.\n");
+        out.push_str(
+            "# HELP weaver_server_premature_deaths Recent connections that died before 60s age.\n",
+        );
         out.push_str("# TYPE weaver_server_premature_deaths gauge\n");
 
         for srv in server_health {
@@ -1302,8 +1306,18 @@ fn render_prometheus_metrics(
                 labels,
                 if srv.state == "healthy" { 1 } else { 0 },
             );
-            append_labeled_metric(&mut out, "weaver_server_success_total", labels, srv.success_count);
-            append_labeled_metric(&mut out, "weaver_server_failure_total", labels, srv.failure_count);
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_success_total",
+                labels,
+                srv.success_count,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_failure_total",
+                labels,
+                srv.failure_count,
+            );
             append_labeled_metric(
                 &mut out,
                 "weaver_server_consecutive_failures",
@@ -1362,12 +1376,7 @@ fn append_labeled_metric<T: std::fmt::Display>(
     out.push('\n');
 }
 
-fn append_labeled_metric_f64(
-    out: &mut String,
-    name: &str,
-    labels: &[(&str, &str)],
-    value: f64,
-) {
+fn append_labeled_metric_f64(out: &mut String, name: &str, labels: &[(&str, &str)], value: f64) {
     out.push_str(name);
     append_labels(out, labels);
     out.push(' ');
@@ -1453,13 +1462,15 @@ fn format_prometheus_f64(value: f64) -> String {
     }
 }
 
-fn all_job_statuses() -> [&'static str; 9] {
+fn all_job_statuses() -> [&'static str; 11] {
     [
         "queued",
         "downloading",
         "checking",
         "verifying",
+        "queued_repair",
         "repairing",
+        "queued_extract",
         "extracting",
         "complete",
         "failed",
@@ -1473,7 +1484,9 @@ fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::Downloading => "downloading",
         JobStatus::Checking => "checking",
         JobStatus::Verifying => "verifying",
+        JobStatus::QueuedRepair => "queued_repair",
         JobStatus::Repairing => "repairing",
+        JobStatus::QueuedExtract => "queued_extract",
         JobStatus::Extracting => "extracting",
         JobStatus::Moving => "moving",
         JobStatus::Complete => "complete",

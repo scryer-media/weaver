@@ -4,6 +4,8 @@
 //! of the decompressed output. Filters reverse transformations that were applied
 //! during compression to improve redundancy for specific data patterns.
 
+use memchr::{memchr, memchr2};
+
 /// The four RAR5 filter types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
@@ -79,41 +81,48 @@ fn apply_e8e9_inner(data: &mut [u8], file_offset: u64, include_e9: bool) {
         return;
     }
 
+    let last_start = data.len() - 4;
     let mut i = 0usize;
-    while i < data.len() - 4 {
-        let b = data[i];
-        if b == 0xE8 || (include_e9 && b == 0xE9) {
-            let addr = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
-            let cur_pos = (file_offset as i64) + (i as i64) + 5;
-
-            // RAR5 range check: after subtracting current position, the result
-            // must be >= 0 and < file_size to be considered a valid conversion.
-            if addr >= 0 && i64::from(addr) < file_size {
-                // Stored as absolute, convert back to relative.
-                let relative = addr - cur_pos as i32;
-                let bytes = relative.to_le_bytes();
-                data[i + 1] = bytes[0];
-                data[i + 2] = bytes[1];
-                data[i + 3] = bytes[2];
-                data[i + 4] = bytes[3];
-            } else if addr < 0 && addr.wrapping_add(cur_pos as i32) >= 0 {
-                // Negative address that wraps into valid range.
-                let relative = addr.wrapping_add(cur_pos as i32);
-                // Convert: this was stored as `addr = relative + cur_pos`, so
-                // the original relative value is actually just `relative` here
-                // which equals `addr + cur_pos`. We need to store it as-is since
-                // it represents the absolute form.
-                let bytes = relative.to_le_bytes();
-                data[i + 1] = bytes[0];
-                data[i + 2] = bytes[1];
-                data[i + 3] = bytes[2];
-                data[i + 4] = bytes[3];
-            }
-
-            i += 5;
+    while i < last_start {
+        let rel = if include_e9 {
+            memchr2(0xE8, 0xE9, &data[i..last_start])
         } else {
-            i += 1;
+            memchr(0xE8, &data[i..last_start])
+        };
+        let Some(found) = rel else {
+            break;
+        };
+
+        i += found;
+
+        let addr = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+        let cur_pos = (file_offset as i64) + (i as i64) + 5;
+
+        // RAR5 range check: after subtracting current position, the result
+        // must be >= 0 and < file_size to be considered a valid conversion.
+        if addr >= 0 && i64::from(addr) < file_size {
+            // Stored as absolute, convert back to relative.
+            let relative = addr - cur_pos as i32;
+            let bytes = relative.to_le_bytes();
+            data[i + 1] = bytes[0];
+            data[i + 2] = bytes[1];
+            data[i + 3] = bytes[2];
+            data[i + 4] = bytes[3];
+        } else if addr < 0 && addr.wrapping_add(cur_pos as i32) >= 0 {
+            // Negative address that wraps into valid range.
+            let relative = addr.wrapping_add(cur_pos as i32);
+            // Convert: this was stored as `addr = relative + cur_pos`, so
+            // the original relative value is actually just `relative` here
+            // which equals `addr + cur_pos`. We need to store it as-is since
+            // it represents the absolute form.
+            let bytes = relative.to_le_bytes();
+            data[i + 1] = bytes[0];
+            data[i + 2] = bytes[1];
+            data[i + 3] = bytes[2];
+            data[i + 4] = bytes[3];
         }
+
+        i += 5;
     }
 }
 

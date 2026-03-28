@@ -454,7 +454,15 @@ impl<R: Read> StreamingBitReader<R> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
+    fn refill_if_needed(&mut self) -> RarResult<()> {
+        if self.acc_bits <= 56 {
+            self.refill()?;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
     fn peek_bits(&mut self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
         if count == 0 {
@@ -518,6 +526,7 @@ impl<R: Read> StreamingBitReader<R> {
 }
 
 impl<R: Read> BitRead for StreamingBitReader<R> {
+    #[inline]
     fn bits_remaining(&mut self) -> usize {
         let _ = self.refill();
         let buffered = self.acc_bits as usize + (self.buf_len.saturating_sub(self.buf_pos)) * 8;
@@ -528,6 +537,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         }
     }
 
+    #[inline(always)]
     fn has_bits(&mut self) -> bool {
         if self.acc_bits > 0 || self.buf_pos < self.buf_len {
             return true;
@@ -544,6 +554,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         self.bit_pos
     }
 
+    #[inline(always)]
     fn read_bits(&mut self, count: u8) -> RarResult<u32> {
         debug_assert!(count <= 32);
         if count == 0 {
@@ -555,7 +566,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             self.acc <<= count as u32;
             self.acc_bits -= count;
             self.bit_pos += count as usize;
-            self.refill()?;
+            self.refill_if_needed()?;
             return Ok(result);
         }
 
@@ -566,7 +577,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             self.acc <<= count as u32;
             self.acc_bits -= count;
             self.bit_pos += count as usize;
-            self.refill()?;
+            self.refill_if_needed()?;
             return Ok(result);
         }
 
@@ -585,6 +596,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         Ok(result)
     }
 
+    #[inline(always)]
     fn peek_16_left_aligned(&mut self) -> RarResult<u32> {
         if self.acc_bits >= 16 {
             return Ok(((self.acc >> 48) as u32) & 0xfffe);
@@ -611,6 +623,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         })
     }
 
+    #[inline(always)]
     fn consume_bits(&mut self, count: u8) -> RarResult<()> {
         debug_assert!(count <= 32);
         if count == 0 {
@@ -621,7 +634,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             self.acc <<= count as u32;
             self.acc_bits -= count;
             self.bit_pos += count as usize;
-            self.refill()?;
+            self.refill_if_needed()?;
             return Ok(());
         }
 
@@ -631,7 +644,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
             self.acc <<= count as u32;
             self.acc_bits -= count;
             self.bit_pos += count as usize;
-            self.refill()?;
+            self.refill_if_needed()?;
             return Ok(());
         }
 
@@ -654,7 +667,7 @@ impl<R: Read> BitRead for StreamingBitReader<R> {
         self.acc <<= count as u32;
         self.acc_bits -= count;
         self.bit_pos += count as usize;
-        self.refill()?;
+        self.refill_if_needed()?;
         Ok(())
     }
 

@@ -5,6 +5,11 @@ pub mod header;
 pub mod main;
 pub mod recovery;
 
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use md5::{Digest, Md5};
 use tracing::{debug, trace, warn};
 
 use crate::error::{Par2Error, Result};
@@ -15,7 +20,7 @@ pub use file_desc::FileDescriptionPacket;
 pub use file_verify::IfscPacket;
 pub use header::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 pub use main::MainPacket;
-pub use recovery::RecoverySlicePacket;
+pub use recovery::{RecoverySliceData, RecoverySlicePacket};
 
 /// A parsed PAR2 packet (any type).
 #[derive(Debug, Clone)]
@@ -35,7 +40,11 @@ pub enum Packet {
 ///
 /// Returns the parsed packet and the number of bytes consumed.
 /// `offset` is used for error reporting (position in the file/stream).
-pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
+fn parse_packet_internal(
+    data: &[u8],
+    offset: u64,
+    recovery_path: Option<&Path>,
+) -> Result<(Packet, usize)> {
     let header = PacketHeader::parse(data, offset)?;
     let total_len = header.length as usize;
 
@@ -66,7 +75,24 @@ pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
         }
         PacketType::RecoverySlice => {
             debug!("parsed RecoverySlice packet at offset {offset}");
-            Packet::RecoverySlice(RecoverySlicePacket::parse(body)?)
+            if let Some(path) = recovery_path {
+                if body.len() < 4 {
+                    return Err(Par2Error::InvalidRecoveryPacket {
+                        reason: format!("body too short: {} bytes, need at least 4", body.len()),
+                    });
+                }
+                let exponent = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                Packet::RecoverySlice(RecoverySlicePacket {
+                    exponent,
+                    data: RecoverySliceData::file_backed(
+                        path.to_path_buf(),
+                        offset + HEADER_SIZE as u64 + 4,
+                        body.len() - 4,
+                    ),
+                })
+            } else {
+                Packet::RecoverySlice(RecoverySlicePacket::parse(body)?)
+            }
         }
         PacketType::Creator => {
             debug!("parsed Creator packet at offset {offset}");
@@ -84,6 +110,28 @@ pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
     Ok((packet, total_len))
 }
 
+pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
+    parse_packet_internal(data, offset, None)
+}
+
+fn parse_packet_body(header: &PacketHeader, body: Vec<u8>) -> Result<Packet> {
+    Ok(match header.packet_type {
+        PacketType::Main => Packet::Main(MainPacket::parse(&body, header.recovery_set_id)?),
+        PacketType::FileDescription => {
+            Packet::FileDescription(FileDescriptionPacket::parse(&body)?)
+        }
+        PacketType::InputFileSliceChecksum => {
+            Packet::InputFileSliceChecksum(IfscPacket::parse(&body)?)
+        }
+        PacketType::RecoverySlice => Packet::RecoverySlice(RecoverySlicePacket::parse(&body)?),
+        PacketType::Creator => Packet::Creator(CreatorPacket::parse(&body)),
+        PacketType::Unknown(sig) => Packet::Unknown {
+            packet_type: sig,
+            body,
+        },
+    })
+}
+
 /// Scan a byte stream for PAR2 packets.
 ///
 /// Scans through `data` looking for valid PAR2 packets. When a valid packet is
@@ -92,6 +140,14 @@ pub fn parse_packet(data: &[u8], offset: u64) -> Result<(Packet, usize)> {
 ///
 /// `base_offset` is the offset of `data[0]` in the original file (for error reporting).
 pub fn scan_packets(data: &[u8], base_offset: u64) -> Vec<(Packet, u64)> {
+    scan_packets_internal(data, base_offset, None)
+}
+
+fn scan_packets_internal(
+    data: &[u8],
+    base_offset: u64,
+    recovery_path: Option<&Path>,
+) -> Vec<(Packet, u64)> {
     let mut packets = Vec::new();
     let mut pos = 0;
 
@@ -99,7 +155,7 @@ pub fn scan_packets(data: &[u8], base_offset: u64) -> Vec<(Packet, u64)> {
         // Try to parse a packet at the current position
         let offset = base_offset + pos as u64;
 
-        match parse_packet(&data[pos..], offset) {
+        match parse_packet_internal(&data[pos..], offset, recovery_path) {
             Ok((packet, consumed)) => {
                 trace!("packet at offset {offset}, size {consumed}");
                 packets.push((packet, offset));
@@ -123,6 +179,184 @@ pub fn scan_packets(data: &[u8], base_offset: u64) -> Vec<(Packet, u64)> {
     }
 
     packets
+}
+
+fn find_next_magic_in_reader(
+    reader: &mut BufReader<File>,
+    offset: &mut u64,
+) -> io::Result<Option<u64>> {
+    let mut matched = 0usize;
+
+    loop {
+        let mut found = None;
+        let mut consumed = 0usize;
+
+        {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(None);
+            }
+
+            while consumed < buf.len() {
+                let byte = buf[consumed];
+                if byte == MAGIC[matched] {
+                    matched += 1;
+                    if matched == MAGIC.len() {
+                        found = Some(*offset + consumed as u64 + 1 - MAGIC.len() as u64);
+                        consumed += 1;
+                        break;
+                    }
+                } else {
+                    matched = if byte == MAGIC[0] { 1 } else { 0 };
+                }
+                consumed += 1;
+            }
+        }
+
+        reader.consume(consumed);
+        *offset += consumed as u64;
+
+        if let Some(found) = found {
+            return Ok(Some(found));
+        }
+    }
+}
+
+fn validate_streamed_hash(
+    header: &PacketHeader,
+    header_bytes: &[u8; HEADER_SIZE],
+    body: &[u8],
+    offset: u64,
+) -> Result<()> {
+    let mut hasher = Md5::new();
+    hasher.update(&header_bytes[32..HEADER_SIZE]);
+    hasher.update(body);
+    let computed: [u8; 16] = hasher.finalize().into();
+    if computed != header.packet_hash {
+        return Err(Par2Error::PacketHashMismatch { offset });
+    }
+    Ok(())
+}
+
+fn parse_non_recovery_packet_from_reader(
+    reader: &mut BufReader<File>,
+    header: &PacketHeader,
+    header_bytes: &[u8; HEADER_SIZE],
+    offset: u64,
+) -> Result<Packet> {
+    let body_len = header.body_length() as usize;
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body).map_err(Par2Error::Io)?;
+    validate_streamed_hash(header, header_bytes, &body, offset)?;
+    parse_packet_body(header, body)
+}
+
+fn parse_recovery_packet_from_reader(
+    reader: &mut BufReader<File>,
+    header: &PacketHeader,
+    header_bytes: &[u8; HEADER_SIZE],
+    offset: u64,
+    path: &Path,
+) -> Result<Packet> {
+    let body_len = header.body_length() as usize;
+    if body_len < 4 {
+        return Err(Par2Error::InvalidRecoveryPacket {
+            reason: format!("body too short: {body_len} bytes, need at least 4"),
+        });
+    }
+
+    let mut exponent_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut exponent_bytes)
+        .map_err(Par2Error::Io)?;
+    let exponent = u32::from_le_bytes(exponent_bytes);
+    let payload_len = body_len - 4;
+    let payload_offset = offset + HEADER_SIZE as u64 + 4;
+
+    let mut hasher = Md5::new();
+    hasher.update(&header_bytes[32..HEADER_SIZE]);
+    hasher.update(exponent_bytes);
+
+    let mut remaining = payload_len;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        reader.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
+        hasher.update(&buf[..take]);
+        remaining -= take;
+    }
+
+    let computed: [u8; 16] = hasher.finalize().into();
+    if computed != header.packet_hash {
+        return Err(Par2Error::PacketHashMismatch { offset });
+    }
+
+    Ok(Packet::RecoverySlice(RecoverySlicePacket {
+        exponent,
+        data: RecoverySliceData::file_backed(path.to_path_buf(), payload_offset, payload_len),
+    }))
+}
+
+pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(Packet, u64)>> {
+    let file = File::open(path).map_err(Par2Error::Io)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut packets = Vec::new();
+    let mut offset = 0u64;
+
+    while let Some(packet_offset) =
+        find_next_magic_in_reader(&mut reader, &mut offset).map_err(Par2Error::Io)?
+    {
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        header_bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+
+        match reader.read_exact(&mut header_bytes[MAGIC.len()..]) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(Par2Error::Io(e)),
+        }
+
+        let header = match PacketHeader::parse(&header_bytes, packet_offset) {
+            Ok(header) => header,
+            Err(_) => {
+                reader
+                    .seek(SeekFrom::Start(packet_offset + 1))
+                    .map_err(Par2Error::Io)?;
+                offset = packet_offset + 1;
+                continue;
+            }
+        };
+
+        let packet = match header.packet_type {
+            PacketType::RecoverySlice => parse_recovery_packet_from_reader(
+                &mut reader,
+                &header,
+                &header_bytes,
+                packet_offset,
+                path,
+            ),
+            _ => parse_non_recovery_packet_from_reader(
+                &mut reader,
+                &header,
+                &header_bytes,
+                packet_offset,
+            ),
+        };
+
+        match packet {
+            Ok(packet) => {
+                packets.push((packet, packet_offset));
+                offset = packet_offset + header.length;
+            }
+            Err(_) => {
+                reader
+                    .seek(SeekFrom::Start(packet_offset + 1))
+                    .map_err(Par2Error::Io)?;
+                offset = packet_offset + 1;
+            }
+        }
+    }
+
+    Ok(packets)
 }
 
 /// Find the byte offset of the next PAR2 magic sequence in `data`.

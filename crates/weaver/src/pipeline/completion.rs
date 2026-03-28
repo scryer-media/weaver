@@ -3,7 +3,51 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+impl Pipeline {
+    pub(super) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
+        let has_queued_work = self.jobs.get(&job_id).is_some_and(|state| {
+            state.health_probing
+                || !state.download_queue.is_empty()
+                || !state.recovery_queue.is_empty()
+        });
+        let has_inflight_downloads = self
+            .active_downloads_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        let has_inflight_decodes = self
+            .active_decodes_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        let has_delayed_retries = self
+            .pending_retries_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        let has_pending_decode = self
+            .pending_decode
+            .iter()
+            .any(|work| work.segment_id.file_id.job_id == job_id);
+        let has_buffered_segments = self.write_buffers.iter().any(|(file_id, write_buf)| {
+            file_id.job_id == job_id && write_buf.buffered_len() > 0
+        });
+
+        has_queued_work
+            || has_inflight_downloads
+            || has_inflight_decodes
+            || has_delayed_retries
+            || has_pending_decode
+            || has_buffered_segments
+    }
+}
+
 const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
+const MAX_CONCURRENT_REPAIRS: usize = 1;
+const MAX_CONCURRENT_EXTRACTIONS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct ScannedExtractionFile {
@@ -275,6 +319,379 @@ fn move_path_with_copy_fallback(
 }
 
 impl Pipeline {
+    pub(super) fn persist_active_status(&self, job_id: JobId, status: &'static str) {
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.set_active_job_status(job_id, status, None) {
+                tracing::error!(error = %error, status, "db write failed for active job status");
+            }
+        });
+    }
+
+    pub(super) fn active_repair_jobs(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|state| matches!(state.status, JobStatus::Repairing))
+            .count()
+    }
+
+    pub(super) fn active_extract_jobs(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|state| matches!(state.status, JobStatus::Extracting))
+            .count()
+    }
+
+    pub(super) fn job_has_active_extraction_tasks(&self, job_id: JobId) -> bool {
+        self.has_active_rar_workers(job_id)
+            || self
+                .inflight_extractions
+                .get(&job_id)
+                .is_some_and(|sets| !sets.is_empty())
+    }
+
+    fn next_queued_repair_job(&self) -> Option<JobId> {
+        self.jobs
+            .iter()
+            .filter(|(_, state)| matches!(state.status, JobStatus::QueuedRepair))
+            .min_by(|(job_id_a, state_a), (job_id_b, state_b)| {
+                state_a
+                    .queued_repair_at_epoch_ms
+                    .unwrap_or(state_a.created_at_epoch_ms)
+                    .total_cmp(
+                        &state_b
+                            .queued_repair_at_epoch_ms
+                            .unwrap_or(state_b.created_at_epoch_ms),
+                    )
+                    .then_with(|| job_id_a.0.cmp(&job_id_b.0))
+            })
+            .map(|(job_id, _)| *job_id)
+    }
+
+    pub(super) fn schedule_job_completion_check(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if matches!(
+            state.status,
+            JobStatus::Paused
+                | JobStatus::Checking
+                | JobStatus::Moving
+                | JobStatus::Complete
+                | JobStatus::Failed { .. }
+        ) {
+            return;
+        }
+        if !self.pending_completion_checks.contains(&job_id) {
+            self.pending_completion_checks.push_back(job_id);
+        }
+    }
+
+    pub(super) fn remove_pending_completion_check(&mut self, job_id: JobId) {
+        self.pending_completion_checks
+            .retain(|queued| *queued != job_id);
+    }
+
+    fn paused_resume_target(previous_status: &JobStatus) -> JobStatus {
+        match previous_status {
+            JobStatus::Queued => JobStatus::Queued,
+            JobStatus::Downloading | JobStatus::Checking | JobStatus::Verifying => {
+                JobStatus::Downloading
+            }
+            JobStatus::QueuedRepair | JobStatus::Repairing => JobStatus::QueuedRepair,
+            JobStatus::QueuedExtract | JobStatus::Extracting => JobStatus::QueuedExtract,
+            JobStatus::Paused => JobStatus::Downloading,
+            JobStatus::Moving | JobStatus::Complete | JobStatus::Failed { .. } => {
+                previous_status.clone()
+            }
+        }
+    }
+
+    fn persist_active_status_for(status: &JobStatus) -> Option<&'static str> {
+        match status {
+            JobStatus::Queued => Some("queued"),
+            JobStatus::Downloading => Some("downloading"),
+            JobStatus::Checking => Some("checking"),
+            JobStatus::Verifying => Some("verifying"),
+            JobStatus::QueuedRepair => Some("queued_repair"),
+            JobStatus::Repairing => Some("repairing"),
+            JobStatus::QueuedExtract => Some("queued_extract"),
+            JobStatus::Extracting => Some("extracting"),
+            JobStatus::Paused => Some("paused"),
+            JobStatus::Moving | JobStatus::Complete | JobStatus::Failed { .. } => None,
+        }
+    }
+
+    pub(super) fn pause_job_runtime(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), weaver_scheduler::SchedulerError> {
+        let previous_status = match self.jobs.get(&job_id) {
+            Some(state) => state.status.clone(),
+            None => return Err(weaver_scheduler::SchedulerError::JobNotFound(job_id)),
+        };
+        if matches!(previous_status, JobStatus::Paused) {
+            return Ok(());
+        }
+        if matches!(
+            previous_status,
+            JobStatus::Complete | JobStatus::Failed { .. }
+        ) {
+            return Err(weaver_scheduler::SchedulerError::Other(format!(
+                "cannot pause job in {:?} state",
+                previous_status
+            )));
+        }
+        if matches!(previous_status, JobStatus::Repairing) {
+            return Err(weaver_scheduler::SchedulerError::Other(
+                "cannot pause while PAR2 repair is running".to_string(),
+            ));
+        }
+        if matches!(previous_status, JobStatus::Extracting)
+            && self.job_has_active_extraction_tasks(job_id)
+        {
+            return Err(weaver_scheduler::SchedulerError::Other(
+                "cannot pause while extraction tasks are running".to_string(),
+            ));
+        }
+
+        let resume_status = Self::paused_resume_target(&previous_status);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.paused_resume_status = Some(resume_status);
+        }
+        self.remove_pending_completion_check(job_id);
+        self.transition_postprocessing_status(job_id, JobStatus::Paused, Some("paused"));
+        Ok(())
+    }
+
+    pub(super) fn resume_job_runtime(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), weaver_scheduler::SchedulerError> {
+        let resume_status = match self.jobs.get_mut(&job_id) {
+            Some(state) => {
+                if !matches!(state.status, JobStatus::Paused) {
+                    return Ok(());
+                }
+                state
+                    .paused_resume_status
+                    .take()
+                    .unwrap_or(JobStatus::Downloading)
+            }
+            None => return Err(weaver_scheduler::SchedulerError::JobNotFound(job_id)),
+        };
+
+        if matches!(
+            resume_status,
+            JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Moving | JobStatus::Paused
+        ) {
+            return Ok(());
+        }
+
+        self.transition_postprocessing_status(
+            job_id,
+            resume_status.clone(),
+            Self::persist_active_status_for(&resume_status),
+        );
+        if matches!(
+            resume_status,
+            JobStatus::Downloading
+                | JobStatus::Verifying
+                | JobStatus::QueuedRepair
+                | JobStatus::QueuedExtract
+                | JobStatus::Extracting
+        ) {
+            self.schedule_job_completion_check(job_id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn transition_postprocessing_status(
+        &mut self,
+        job_id: JobId,
+        new_status: JobStatus,
+        persist_status: Option<&'static str>,
+    ) {
+        let (released_repair, released_extract, entered_repair, entered_extract) = {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return;
+            };
+            let old_status = state.status.clone();
+            let queued_repair_at = state.queued_repair_at_epoch_ms;
+            let queued_extract_at = state.queued_extract_at_epoch_ms;
+            let released_repair = matches!(old_status, JobStatus::Repairing)
+                && !matches!(new_status, JobStatus::Repairing);
+            let released_extract = matches!(old_status, JobStatus::Extracting)
+                && !matches!(new_status, JobStatus::Extracting);
+            let entered_repair = !matches!(old_status, JobStatus::Repairing)
+                && matches!(new_status, JobStatus::Repairing);
+            let entered_extract = !matches!(old_status, JobStatus::Extracting)
+                && matches!(new_status, JobStatus::Extracting);
+            let now = weaver_scheduler::job::epoch_ms_now();
+            state.status = new_status;
+            state.queued_repair_at_epoch_ms = if matches!(state.status, JobStatus::QueuedRepair) {
+                queued_repair_at.or(Some(now))
+            } else if matches!(state.status, JobStatus::Paused)
+                && matches!(state.paused_resume_status, Some(JobStatus::QueuedRepair))
+            {
+                queued_repair_at
+            } else {
+                None
+            };
+            state.queued_extract_at_epoch_ms = if matches!(state.status, JobStatus::QueuedExtract) {
+                queued_extract_at.or(Some(now))
+            } else if matches!(state.status, JobStatus::Paused)
+                && matches!(state.paused_resume_status, Some(JobStatus::QueuedExtract))
+            {
+                queued_extract_at
+            } else {
+                None
+            };
+            if !matches!(state.status, JobStatus::Paused) {
+                state.paused_resume_status = None;
+            }
+            (
+                released_repair,
+                released_extract,
+                entered_repair,
+                entered_extract,
+            )
+        };
+
+        if released_repair {
+            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        if released_extract {
+            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        if entered_repair {
+            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if entered_extract {
+            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(status) = persist_status {
+            self.persist_active_status(job_id, status);
+        }
+        if released_repair {
+            self.promote_queued_repairs();
+        }
+        if released_extract {
+            self.promote_queued_extractions();
+        }
+    }
+
+    pub(super) async fn maybe_start_repair(&mut self, job_id: JobId) -> bool {
+        let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
+            return false;
+        };
+        if matches!(
+            status,
+            JobStatus::Paused
+                | JobStatus::Checking
+                | JobStatus::Moving
+                | JobStatus::Complete
+                | JobStatus::Failed { .. }
+        ) {
+            return false;
+        }
+        if matches!(status, JobStatus::Repairing) {
+            return true;
+        }
+        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::QueuedRepair,
+                Some("queued_repair"),
+            );
+            return false;
+        }
+
+        self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
+        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        true
+    }
+
+    pub(super) async fn maybe_start_extraction(&mut self, job_id: JobId) -> bool {
+        let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
+            return false;
+        };
+        if matches!(
+            status,
+            JobStatus::Paused
+                | JobStatus::Checking
+                | JobStatus::Moving
+                | JobStatus::Complete
+                | JobStatus::Failed { .. }
+        ) {
+            return false;
+        }
+        if matches!(status, JobStatus::Extracting) {
+            return true;
+        }
+        if self.active_extract_jobs() >= MAX_CONCURRENT_EXTRACTIONS {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::QueuedExtract,
+                Some("queued_extract"),
+            );
+            return false;
+        }
+
+        self.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::ExtractionReady { job_id });
+        info!(job_id = job_id.0, "extraction ready");
+        true
+    }
+
+    pub(super) fn promote_queued_repairs(&mut self) {
+        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
+            return;
+        }
+        let Some(job_id) = self.next_queued_repair_job() else {
+            return;
+        };
+        self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
+        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.schedule_job_completion_check(job_id);
+    }
+
+    pub(super) fn promote_queued_extractions(&mut self) {
+        let available = MAX_CONCURRENT_EXTRACTIONS.saturating_sub(self.active_extract_jobs());
+        if available == 0 {
+            return;
+        }
+        let mut candidates: Vec<(JobId, f64)> = self
+            .jobs
+            .iter()
+            .filter_map(|(job_id, state)| {
+                matches!(state.status, JobStatus::QueuedExtract).then_some((
+                    *job_id,
+                    state
+                        .queued_extract_at_epoch_ms
+                        .unwrap_or(state.created_at_epoch_ms),
+                ))
+            })
+            .collect();
+        candidates.sort_by(|(job_id_a, queued_at_a), (job_id_b, queued_at_b)| {
+            queued_at_a
+                .total_cmp(queued_at_b)
+                .then_with(|| job_id_a.0.cmp(&job_id_b.0))
+        });
+        for (job_id, _) in candidates.into_iter().take(available) {
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Extracting,
+                Some("extracting"),
+            );
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::ExtractionReady { job_id });
+            self.schedule_job_completion_check(job_id);
+        }
+    }
+
     async fn cleanup_par2_files(&self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -1153,7 +1570,7 @@ impl Pipeline {
         }
     }
 
-    fn has_active_rar_workers(&self, job_id: JobId) -> bool {
+    pub(super) fn has_active_rar_workers(&self, job_id: JobId) -> bool {
         self.rar_set_names_for_job(job_id).iter().any(|set_name| {
             self.rar_sets
                 .get(&(job_id, set_name.clone()))
@@ -1406,25 +1823,12 @@ impl Pipeline {
             }
         }
 
-        if self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|state| state.status == JobStatus::Extracting)
-        {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
         let _ = self
             .event_tx
             .send(PipelineEvent::ExtractionComplete { job_id });
 
-        let was_extracting = self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|state| state.status == JobStatus::Extracting);
         if let Err(error) = self.move_to_complete(job_id).await {
-            if was_extracting {
-                self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-            }
             self.fail_job(job_id, error);
             return;
         }
@@ -1459,16 +1863,16 @@ impl Pipeline {
                 .is_some_and(|state| state.active_workers > 0)
         });
         if has_active_worker {
-            if let Some(state) = self.jobs.get_mut(&job_id)
-                && state.status != JobStatus::Extracting
+            if self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !matches!(state.status, JobStatus::Extracting))
             {
-                state.status = JobStatus::Extracting;
-                self.db_fire_and_forget(move |db| {
-                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
-                        tracing::error!(error = %e, "db write failed for extracting status");
-                    }
-                });
-                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Extracting,
+                    Some("extracting"),
+                );
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::ExtractionReady { job_id });
@@ -1526,19 +1930,10 @@ impl Pipeline {
         }
 
         if has_incomplete_sets {
-            if let Some(state) = self.jobs.get_mut(&job_id)
-                && state.status != JobStatus::Extracting
+            if (has_ready_incremental_work || !fallback_sets.is_empty())
+                && !self.maybe_start_extraction(job_id).await
             {
-                state.status = JobStatus::Extracting;
-                self.db_fire_and_forget(move |db| {
-                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
-                        tracing::error!(error = %e, "db write failed for extracting status");
-                    }
-                });
-                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionReady { job_id });
+                return;
             }
 
             if has_ready_incremental_work {
@@ -1580,9 +1975,36 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
+            if matches!(
+                state.status,
+                JobStatus::Paused
+                    | JobStatus::Checking
+                    | JobStatus::Moving
+                    | JobStatus::Complete
+                    | JobStatus::Failed { .. }
+            ) {
+                return;
+            }
             let total = state.assembly.data_file_count();
             let complete = state.assembly.complete_data_file_count();
             if complete < total {
+                if matches!(state.status, JobStatus::Queued | JobStatus::Downloading)
+                    && state.failed_bytes > 0
+                    && !self.job_has_pending_download_pipeline_work(job_id)
+                {
+                    let failed_bytes = state.failed_bytes;
+                    let error = format!(
+                        "download incomplete after exhausting retries: {complete}/{total} data files complete, {failed_bytes} bytes unavailable"
+                    );
+                    warn!(
+                        job_id = job_id.0,
+                        complete,
+                        total,
+                        failed_bytes,
+                        "failing incomplete job after download pipeline exhaustion"
+                    );
+                    self.fail_job(job_id, error);
+                }
                 return;
             }
             // If no data files registered yet but there are still segments queued,
@@ -1608,21 +2030,6 @@ impl Pipeline {
             return;
         }
 
-        // All data files downloaded — transition out of Downloading so the UI
-        // reflects post-processing (verify/extract/cleanup).
-        {
-            let state = self.jobs.get_mut(&job_id).unwrap();
-            if state.status == JobStatus::Downloading {
-                state.status = JobStatus::Extracting;
-                self.db_fire_and_forget(move |db| {
-                    if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
-                        tracing::error!(error = %e, "db write failed for extracting status");
-                    }
-                });
-                self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
 
         // Step 2: Check for CRC failures that need PAR2 repair.
@@ -1642,18 +2049,11 @@ impl Pipeline {
 
             let par2_set = self.par2_set(job_id).cloned();
             if let Some(par2_set) = par2_set {
-                {
-                    let state = self.jobs.get_mut(&job_id).unwrap();
-                    if state.status == JobStatus::Extracting {
-                        self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    state.status = JobStatus::Verifying;
-                }
-                self.db_fire_and_forget(move |db| {
-                    if let Err(e) = db.set_active_job_status(job_id, "verifying", None) {
-                        tracing::error!(error = %e, "db write failed for verifying status");
-                    }
-                });
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Verifying,
+                    Some("verifying"),
+                );
                 self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
                 info!(job_id = job_id.0, "par2 verification started");
                 let _ = self
@@ -1701,23 +2101,13 @@ impl Pipeline {
                     Ok(Ok(v)) => v,
                     Ok(Err(msg)) => {
                         warn!(job_id = job_id.0, error = %msg);
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        state.status = JobStatus::Failed { error: msg.clone() };
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::JobFailed { job_id, error: msg });
-                        self.record_job_history(job_id);
+                        self.fail_job(job_id, msg);
                         return;
                     }
                     Err(e) => {
                         let msg = format!("verification task panicked: {e}");
                         warn!(job_id = job_id.0, error = %msg);
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        state.status = JobStatus::Failed { error: msg.clone() };
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::JobFailed { job_id, error: msg });
-                        self.record_job_history(job_id);
+                        self.fail_job(job_id, msg);
                         return;
                     }
                 };
@@ -1787,12 +2177,7 @@ impl Pipeline {
                                 "clean PAR2 verification but extraction still failing after retry"
                                     .to_string();
                             warn!(job_id = job_id.0, error = %msg);
-                            let state = self.jobs.get_mut(&job_id).unwrap();
-                            state.status = JobStatus::Failed { error: msg.clone() };
-                            let _ = self
-                                .event_tx
-                                .send(PipelineEvent::JobFailed { job_id, error: msg });
-                            self.record_job_history(job_id);
+                            self.fail_job(job_id, msg);
                             return;
                         }
 
@@ -1825,12 +2210,7 @@ impl Pipeline {
                                 "invalid RAR retry frontier after placement correction: {reason}"
                             );
                             warn!(job_id = job_id.0, error = %msg);
-                            let state = self.jobs.get_mut(&job_id).unwrap();
-                            state.status = JobStatus::Failed { error: msg.clone() };
-                            let _ = self
-                                .event_tx
-                                .send(PipelineEvent::JobFailed { job_id, error: msg });
-                            self.record_job_history(job_id);
+                            self.fail_job(job_id, msg);
                             return;
                         }
                         info!(
@@ -1839,14 +2219,11 @@ impl Pipeline {
                             "cleared failed extractions after authoritative verify — retrying"
                         );
 
-                        if let Some(state) = self.jobs.get_mut(&job_id) {
-                            state.status = JobStatus::Downloading;
-                        }
-                        self.db_fire_and_forget(move |db| {
-                            if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
-                                tracing::error!(error = %e, "db write failed for downloading status");
-                            }
-                        });
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
                         self.try_rar_extraction(job_id).await;
                         return;
                     }
@@ -1872,19 +2249,12 @@ impl Pipeline {
                     }
 
                     if total_recovery_capacity < damaged {
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        state.status = JobStatus::Failed {
-                            error: format!(
+                        self.fail_job(
+                            job_id,
+                            format!(
                                 "not repairable: {damaged} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
                             ),
-                        };
-                        let _ = self.event_tx.send(PipelineEvent::JobFailed {
-                            job_id,
-                            error: format!(
-                                "not repairable: {damaged} damaged, {total_recovery_capacity} recovery"
-                            ),
-                        });
-                        self.record_job_history(job_id);
+                        );
                         return;
                     }
 
@@ -1901,12 +2271,7 @@ impl Pipeline {
                                  only {targeted_total} recovery blocks available in NZB"
                             );
                             warn!(job_id = job_id.0, %msg);
-                            let state = self.jobs.get_mut(&job_id).unwrap();
-                            state.status = JobStatus::Failed { error: msg.clone() };
-                            let _ = self
-                                .event_tx
-                                .send(PipelineEvent::JobFailed { job_id, error: msg });
-                            self.record_job_history(job_id);
+                            self.fail_job(job_id, msg);
                             return;
                         }
 
@@ -1918,28 +2283,17 @@ impl Pipeline {
                             promoted_blocks = promoted,
                             "waiting for targeted recovery downloads before repair"
                         );
-                        if let Some(state) = self.jobs.get_mut(&job_id) {
-                            state.status = JobStatus::Downloading;
-                        }
-                        self.db_fire_and_forget(move |db| {
-                            if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
-                                tracing::error!(error = %e, "db write failed for downloading status");
-                            }
-                        });
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
                         return;
                     }
 
-                    {
-                        let state = self.jobs.get_mut(&job_id).unwrap();
-                        state.status = JobStatus::Repairing;
+                    if !self.maybe_start_repair(job_id).await {
+                        return;
                     }
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.set_active_job_status(job_id, "repairing", None) {
-                            tracing::error!(error = %e, "db write failed for repairing status");
-                        }
-                    });
-                    self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
-                    let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
 
                     let par2_for_repair = Arc::clone(&par2_set);
                     let repair_dir = working_dir.clone();
@@ -1958,8 +2312,6 @@ impl Pipeline {
                         })
                     })
                     .await;
-
-                    self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
 
                     let repair_outcome = match repair_result {
                         Ok(Ok(slices)) => Ok(slices),
@@ -2045,14 +2397,11 @@ impl Pipeline {
                                 );
                             }
 
-                            if let Some(state) = self.jobs.get_mut(&job_id) {
-                                state.status = JobStatus::Downloading;
-                            }
-                            self.db_fire_and_forget(move |db| {
-                                if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
-                                    tracing::error!(error = %e, "db write failed for downloading status");
-                                }
-                            });
+                            self.transition_postprocessing_status(
+                                job_id,
+                                JobStatus::Downloading,
+                                Some("downloading"),
+                            );
 
                             // Recompute RAR set states so ready_members reflects
                             // the cleared failures, then retry extraction.
@@ -2070,17 +2419,11 @@ impl Pipeline {
                         }
                         Err(error_msg) => {
                             warn!(job_id = job_id.0, error = %error_msg, "PAR2 repair failed");
-                            let Some(state) = self.jobs.get_mut(&job_id) else {
-                                return;
-                            };
-                            state.status = JobStatus::Failed {
-                                error: error_msg.clone(),
-                            };
                             let _ = self.event_tx.send(PipelineEvent::RepairFailed {
                                 job_id,
                                 error: error_msg.clone(),
                             });
-                            self.record_job_history(job_id);
+                            self.fail_job(job_id, error_msg);
                             return;
                         }
                     }
@@ -2097,12 +2440,7 @@ impl Pipeline {
                     failed_members
                 );
                 warn!(job_id = job_id.0, error = %msg);
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state.status = JobStatus::Failed { error: msg.clone() };
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::JobFailed { job_id, error: msg });
-                self.record_job_history(job_id);
+                self.fail_job(job_id, msg);
                 return;
             }
         }
@@ -2123,19 +2461,10 @@ impl Pipeline {
                     self.cleanup_par2_files(job_id).await;
                 }
                 // No archives — move to complete and finish.
-                let was_extracting = self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| state.status == JobStatus::Extracting);
+                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
                 if let Err(error) = self.move_to_complete(job_id).await {
-                    if was_extracting {
-                        self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-                    }
                     self.fail_job(job_id, error);
                     return;
-                }
-                if was_extracting {
-                    self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
                 }
                 let state = self.jobs.get_mut(&job_id).unwrap();
                 state.status = JobStatus::Complete;
@@ -2186,19 +2515,8 @@ impl Pipeline {
                     // Spawn extraction tasks in the background.
                     // handle_extraction_done will re-enter check_job_completion
                     // when each set finishes, and we'll reach the empty branch below.
-                    let state = self.jobs.get_mut(&job_id).unwrap();
-                    if state.status != JobStatus::Extracting {
-                        state.status = JobStatus::Extracting;
-                        self.db_fire_and_forget(move |db| {
-                            if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
-                                tracing::error!(error = %e, "db write failed for extracting status");
-                            }
-                        });
-                        self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::ExtractionReady { job_id });
-                        info!(job_id = job_id.0, "extraction ready");
+                    if !self.maybe_start_extraction(job_id).await {
+                        return;
                     }
 
                     self.spawn_extractions(job_id, &sets_to_extract).await;
@@ -2259,27 +2577,14 @@ impl Pipeline {
                     }
                 }
 
-                if self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|s| s.status == JobStatus::Extracting)
-                {
-                    self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-                }
+                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
                 info!(job_id = job_id.0, "extraction complete");
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::ExtractionComplete { job_id });
 
                 // Move extracted files to complete directory.
-                let was_extracting = self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| state.status == JobStatus::Extracting);
                 if let Err(error) = self.move_to_complete(job_id).await {
-                    if was_extracting {
-                        self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-                    }
                     self.fail_job(job_id, error);
                     return;
                 }
@@ -2300,15 +2605,7 @@ impl Pipeline {
                 self.record_job_history(job_id);
             }
             ExtractionReadiness::Blocked { reason } => {
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state.status = JobStatus::Failed {
-                    error: reason.clone(),
-                };
-                let _ = self.event_tx.send(PipelineEvent::JobFailed {
-                    job_id,
-                    error: reason.clone(),
-                });
-                self.record_job_history(job_id);
+                self.fail_job(job_id, reason);
             }
             ExtractionReadiness::Partial {
                 extractable,
@@ -2346,18 +2643,8 @@ impl Pipeline {
                     return;
                 }
 
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                if state.status != JobStatus::Extracting {
-                    state.status = JobStatus::Extracting;
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.set_active_job_status(job_id, "extracting", None) {
-                            tracing::error!(error = %e, "db write failed for extracting status");
-                        }
-                    });
-                    self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::ExtractionReady { job_id });
+                if !self.maybe_start_extraction(job_id).await {
+                    return;
                 }
 
                 let spawned = self.spawn_extractions(job_id, &to_spawn).await;

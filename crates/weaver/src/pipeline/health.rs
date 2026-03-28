@@ -42,7 +42,9 @@ impl Pipeline {
                 }
             };
 
-            let needs_probes = health < 980 && !state.health_probing;
+            let needs_probes = health < 980
+                && !state.health_probing
+                && state.failed_bytes > state.last_health_probe_failed_bytes;
             (health, critical, state.failed_bytes, total, needs_probes)
         };
 
@@ -126,6 +128,8 @@ impl Pipeline {
         if done {
             // Restore to Downloading and re-enqueue held segments into job's queues.
             if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.last_health_probe_failed_bytes = state.failed_bytes;
+                state.health_probing = false;
                 if matches!(state.status, JobStatus::Checking) {
                     state.status = JobStatus::Downloading;
                 }
@@ -153,18 +157,30 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
-        let staging_dir = if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.status = JobStatus::Failed {
-                error: error.clone(),
+        let (staging_dir, released_repair, released_extract) =
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                let released_repair = matches!(state.status, JobStatus::Repairing);
+                let released_extract = matches!(state.status, JobStatus::Extracting);
+                state.queued_repair_at_epoch_ms = None;
+                state.queued_extract_at_epoch_ms = None;
+                state.paused_resume_status = None;
+                state.status = JobStatus::Failed {
+                    error: error.clone(),
+                };
+                state.held_segments.clear();
+                // Clear per-job queues to free memory.
+                state.download_queue = DownloadQueue::new();
+                state.recovery_queue = DownloadQueue::new();
+                (state.staging_dir.take(), released_repair, released_extract)
+            } else {
+                (None, false, false)
             };
-            state.held_segments.clear();
-            // Clear per-job queues to free memory.
-            state.download_queue = DownloadQueue::new();
-            state.recovery_queue = DownloadQueue::new();
-            state.staging_dir.take()
-        } else {
-            None
-        };
+        if released_repair {
+            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        if released_extract {
+            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+        }
         // Clean up staging directory if it was created.
         if let Some(staging) = staging_dir {
             tokio::spawn(async move {
@@ -181,6 +197,11 @@ impl Pipeline {
         }
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);
+        self.active_download_passes.remove(&job_id);
+        self.active_downloads_by_job.remove(&job_id);
+        self.active_decodes_by_job.remove(&job_id);
+        self.pending_retries_by_job.remove(&job_id);
+        self.remove_pending_completion_check(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
@@ -189,18 +210,25 @@ impl Pipeline {
         let _ = self
             .event_tx
             .send(PipelineEvent::JobFailed { job_id, error });
+        if released_repair {
+            self.promote_queued_repairs();
+        }
+        if released_extract {
+            self.promote_queued_extractions();
+        }
         self.publish_snapshot();
     }
 
     /// Spawn a dedicated STAT probe task to quickly estimate job health.
     ///
     /// Instead of pushing probes into the download queue (where they compete
-    /// with 150k+ regular segments), this acquires a single NNTP connection
-    /// and pipelines STAT commands in batches. STAT doesn't need GROUP, returns
-    /// only a status line, and pipelining amortizes RTT across the batch.
+    /// with 150k+ regular segments), this issues batched STAT checks through
+    /// the high-level NNTP client so probes inherit the normal server ordering,
+    /// failover, and soft-timeout semantics used by real downloads.
     ///
-    /// e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 RTTs ≈ ~12 seconds.
-    /// If every single probe returns 430, the job is failed immediately.
+    /// e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 batched checks.
+    /// If every single probe returns 430 across the usable server set, the job
+    /// is failed immediately.
     pub(super) fn activate_health_probes(&mut self, job_id: JobId) {
         // Set the flag and status, then collect probes separately to avoid borrow conflicts.
         match self.jobs.get_mut(&job_id) {
@@ -236,6 +264,13 @@ impl Pipeline {
 
         let total_segs = all_segments.len();
         if total_segs == 0 {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.last_health_probe_failed_bytes = state.failed_bytes;
+                state.health_probing = false;
+                if matches!(state.status, JobStatus::Checking) {
+                    state.status = JobStatus::Downloading;
+                }
+            }
             return;
         }
 
@@ -266,100 +301,62 @@ impl Pipeline {
             job_id = job_id.0,
             probes = probe_count,
             total_segments = total_segs,
-            "health probe activated — pipelined STAT sampling"
+            "health probe activated — batched STAT sampling"
         );
 
-        // Spawn a dedicated task that checks articles via STAT on a single connection.
-        // Uses pipelining if the server supports it, otherwise falls back to sequential.
-        // Tracks total misses and reports back to the pipeline loop.
+        // Spawn a dedicated task that checks articles in batches via the NNTP
+        // client. The client handles batching per server, load-aware ordering,
+        // failover, and soft timeouts so probes match the real downloader path.
         tokio::spawn(async move {
-            let mut conn = match nntp.pool().acquire(weaver_nntp::ServerId(0)).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "health probe: failed to acquire connection");
-                    return;
-                }
-            };
-
-            let pipelining = conn.capabilities().supports_pipelining();
             info!(
                 job_id = job_id.0,
-                pipelining,
                 probes = probe_count,
                 "health probe starting"
             );
 
             let mut missed: usize = 0;
             let mut checked: usize = 0;
+            const BATCH_SIZE: usize = 50;
+            const UPDATE_INTERVAL: usize = 10;
+            let mut batches_since_update: usize = 0;
 
-            if pipelining {
-                // Pipeline STAT in batches of 50 — N articles per RTT.
-                // Send partial updates every 10 batches (500 STATs).
-                const BATCH_SIZE: usize = 50;
-                const UPDATE_INTERVAL: usize = 10;
-                let mut batches_since_update: usize = 0;
+            for batch in probes.chunks(BATCH_SIZE) {
+                let msg_ids: Vec<&str> = batch.iter().map(|(_, mid, _)| mid.as_str()).collect();
 
-                for batch in probes.chunks(BATCH_SIZE) {
-                    let msg_ids: Vec<&str> = batch.iter().map(|(_, mid, _)| mid.as_str()).collect();
-
-                    let results = match conn.stat_pipeline(&msg_ids).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(error = %e, "health probe: pipeline batch failed");
-                            missed += batch.len();
-                            checked += batch.len();
-                            batches_since_update += 1;
-                            continue;
-                        }
-                    };
-
-                    for (exists, (_seg_id, _mid, _bytes)) in results.iter().zip(batch) {
-                        checked += 1;
-                        if !exists {
-                            missed += 1;
-                        }
-                    }
-
-                    batches_since_update += 1;
-                    if batches_since_update >= UPDATE_INTERVAL {
-                        batches_since_update = 0;
+                let results = match nntp.stat_many(&msg_ids).await {
+                    Ok(results) => results,
+                    Err(e) => {
+                        warn!(error = %e, "health probe: STAT batch failed, aborting probe");
                         let _ = probe_tx
                             .send(ProbeUpdate {
                                 job_id,
                                 total: checked,
                                 missed,
-                                done: false,
+                                done: true,
                             })
                             .await;
+                        return;
+                    }
+                };
+
+                for (exists, (_seg_id, _mid, _bytes)) in results.iter().zip(batch) {
+                    checked += 1;
+                    if !exists {
+                        missed += 1;
                     }
                 }
-            } else {
-                // Sequential STAT — 1 article per RTT.
-                // Send partial updates every 100 STATs.
-                const UPDATE_INTERVAL: usize = 100;
 
-                for (_seg_id, mid, _bytes) in &probes {
-                    match conn.stat_by_id(mid).await {
-                        Ok(false) => {
-                            missed += 1;
-                        }
-                        Ok(true) => {}
-                        Err(e) => {
-                            warn!(error = %e, "health probe: STAT failed, aborting probe");
-                            return;
-                        }
-                    }
-                    checked += 1;
-                    if checked.is_multiple_of(UPDATE_INTERVAL) {
-                        let _ = probe_tx
-                            .send(ProbeUpdate {
-                                job_id,
-                                total: checked,
-                                missed,
-                                done: false,
-                            })
-                            .await;
-                    }
+                batches_since_update += 1;
+                if batches_since_update >= UPDATE_INTERVAL {
+                    batches_since_update = 0;
+                    let _ = probe_tx
+                        .send(ProbeUpdate {
+                            job_id,
+                            total: checked,
+                            missed,
+                            done: false,
+                        })
+                        .await;
                 }
             }
 

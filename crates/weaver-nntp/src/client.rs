@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
+use crate::health::ServerState;
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 
 /// Configuration for the high-level NNTP client.
@@ -81,6 +83,77 @@ impl NntpClient {
         }
     }
 
+    /// Check whether articles exist anywhere in the configured server set.
+    ///
+    /// Returns one boolean per message-id: true if any usable server reports
+    /// the article exists, false if every usable server definitively reports it
+    /// missing. If a transient server failure leaves the batch inconclusive,
+    /// this returns an error so callers do not treat missing samples as
+    /// authoritative.
+    pub async fn stat_many(&self, message_ids: &[&str]) -> Result<Vec<bool>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let order = self.build_server_order(&[]).await;
+        if order.is_empty() {
+            return Err(NntpError::ServiceUnavailable);
+        }
+
+        let mut found = vec![false; message_ids.len()];
+        let mut remaining: Vec<usize> = (0..message_ids.len()).collect();
+        let mut had_success = false;
+        let mut had_transient = false;
+        let mut last_error: Option<NntpError> = None;
+
+        for idx in order {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let batch: Vec<&str> = remaining.iter().map(|&i| message_ids[i]).collect();
+            let start = Instant::now();
+
+            match self.stat_many_from_server(ServerId(idx), &batch).await {
+                Ok(results) => {
+                    had_success = true;
+                    self.record_server_success(idx, start.elapsed()).await;
+
+                    let mut next_remaining = Vec::with_capacity(remaining.len());
+                    for (original_idx, exists) in remaining.iter().copied().zip(results.into_iter())
+                    {
+                        if exists {
+                            found[original_idx] = true;
+                        } else {
+                            next_remaining.push(original_idx);
+                        }
+                    }
+                    remaining = next_remaining;
+                }
+                Err(NntpError::AuthenticationFailed)
+                | Err(NntpError::AuthenticationRejected)
+                | Err(NntpError::AccessDenied) => {
+                    self.record_server_failure(idx, true).await;
+                    last_error = Some(NntpError::AuthenticationFailed);
+                }
+                Err(e) if is_transient(&e) => {
+                    if should_record_transient_failure(&e) {
+                        self.record_server_failure(idx, false).await;
+                    }
+                    had_transient = true;
+                    last_error = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if remaining.is_empty() || (had_success && !had_transient) {
+            Ok(found)
+        } else {
+            Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
+        }
+    }
+
     /// Fetch the body of an article by message-id, with multi-server failover.
     ///
     /// Tries each server in priority order. Falls back to the next server
@@ -118,9 +191,7 @@ impl NntpClient {
             {
                 Ok(data) => {
                     let elapsed = start.elapsed();
-                    let mut health = self.pool.health().lock().await;
-                    health.record_success(idx);
-                    health.record_latency(idx, elapsed);
+                    self.record_server_success(idx, elapsed).await;
                     return Ok(data);
                 }
                 Err(NntpError::ArticleNotFound)
@@ -135,6 +206,16 @@ impl NntpClient {
                     });
                     continue;
                 }
+                Err(e @ NntpError::SoftTimeout(_)) => {
+                    warn!(
+                        server = idx,
+                        error = %e,
+                        message_id,
+                        "soft timeout, trying next server"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
@@ -142,10 +223,7 @@ impl NntpClient {
                         server = idx,
                         message_id, "authentication/access failure, trying next server"
                     );
-                    {
-                        let mut health = self.pool.health().lock().await;
-                        health.record_failure(idx, true);
-                    }
+                    self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                     continue;
                 }
@@ -156,9 +234,8 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
-                    {
-                        let mut health = self.pool.health().lock().await;
-                        health.record_failure(idx, false);
+                    if should_record_transient_failure(&e) {
+                        self.record_server_failure(idx, false).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -180,7 +257,9 @@ impl NntpClient {
         exclude: &[usize],
     ) -> Result<Bytes> {
         if groups.is_empty() {
-            return self.fetch_body(message_id).await;
+            return self
+                .fetch_with_failover_excluding(message_id, FetchKind::Body, exclude)
+                .await;
         }
 
         let order = self.build_server_order(exclude).await;
@@ -201,9 +280,7 @@ impl NntpClient {
             {
                 Ok(data) => {
                     let elapsed = start.elapsed();
-                    let mut health = self.pool.health().lock().await;
-                    health.record_success(idx);
-                    health.record_latency(idx, elapsed);
+                    self.record_server_success(idx, elapsed).await;
                     return Ok(data);
                 }
                 Err(NntpError::ArticleNotFound)
@@ -214,10 +291,20 @@ impl NntpClient {
                     });
                     continue;
                 }
+                Err(e @ NntpError::SoftTimeout(_)) => {
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(NntpError::AuthenticationFailed)
+                | Err(NntpError::AuthenticationRejected)
+                | Err(NntpError::AccessDenied) => {
+                    self.record_server_failure(idx, true).await;
+                    last_error = Some(NntpError::AuthenticationFailed);
+                    continue;
+                }
                 Err(e) if is_transient(&e) => {
-                    {
-                        let mut health = self.pool.health().lock().await;
-                        health.record_failure(idx, false);
+                    if should_record_transient_failure(&e) {
+                        self.record_server_failure(idx, false).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -250,12 +337,63 @@ impl NntpClient {
         &self.pool
     }
 
-    /// Build the server try-order, grouping by priority and ranking within each
-    /// group using latency-weighted random selection.
+    async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
+        let mut health = self.pool.health().lock().await;
+        health.record_success(server_idx);
+        health.record_latency(server_idx, elapsed);
+    }
+
+    async fn record_server_failure(&self, server_idx: usize, is_auth: bool) {
+        let mut health = self.pool.health().lock().await;
+        health.record_failure(server_idx, is_auth);
+    }
+
+    async fn record_premature_death_if_needed(&self, server_idx: usize, age: Duration) {
+        if age < crate::health::ServerHealth::MIN_CONNECTION_LIFETIME {
+            let mut health = self.pool.health().lock().await;
+            health.record_premature_death(server_idx);
+        }
+    }
+
+    async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
+        let age = conn.created_at().elapsed();
+        conn.discard();
+        self.pool.drain_all_idle().await;
+        self.record_premature_death_if_needed(server_idx, age).await;
+    }
+
+    async fn acquire_before_deadline(
+        &self,
+        server: ServerId,
+        deadline: TokioInstant,
+    ) -> Result<PooledConnection> {
+        match tokio::time::timeout_at(deadline, self.pool.acquire(server)).await {
+            Ok(result) => result,
+            Err(_) => Err(self.soft_timeout_error()),
+        }
+    }
+
+    async fn sleep_before_deadline(&self, delay: Duration, deadline: TokioInstant) -> Result<()> {
+        match tokio::time::timeout_at(deadline, tokio::time::sleep(delay)).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.soft_timeout_error()),
+        }
+    }
+
+    fn soft_timeout_error(&self) -> NntpError {
+        NntpError::SoftTimeout(self.soft_timeout.as_secs())
+    }
+
+    /// Build the server try-order, grouping by immediate capacity, then
+    /// priority, and ranking within each group using latency-weighted random
+    /// selection.
     ///
     /// Servers in `exclude` are skipped entirely. Disabled servers (circuit-
     /// breaker tripped) are also excluded so we don't waste time on servers
-    /// that are known to be failing.
+    /// that are known to be failing. Servers with an immediately acquirable
+    /// permit are preferred over fully saturated peers so we do not burn the
+    /// soft-timeout budget queued behind a busy server while another server is
+    /// ready right now.
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
@@ -264,20 +402,46 @@ impl NntpClient {
         let mut health = self.pool.health().lock().await;
         health.check_reenable_all();
 
-        // Collect available servers, grouped by priority.
-        let mut groups: std::collections::BTreeMap<u32, Vec<usize>> =
+        // Collect available servers into two tiers: immediately available
+        // servers first, then fully saturated servers. Within each tier we
+        // still prefer lower-priority groups and healthy servers.
+        let mut ready_groups: std::collections::BTreeMap<u32, (Vec<usize>, Vec<usize>)> =
+            std::collections::BTreeMap::new();
+        let mut waiting_groups: std::collections::BTreeMap<u32, (Vec<usize>, Vec<usize>)> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
             if !exclude.contains(&idx) && health.is_available(idx) {
-                groups.entry(server_groups[idx]).or_default().push(idx);
+                let groups = if self.pool.server_load(idx).0 > 0 {
+                    &mut ready_groups
+                } else {
+                    &mut waiting_groups
+                };
+                let entry = groups.entry(server_groups[idx]).or_default();
+                match health.server(idx).state() {
+                    ServerState::Healthy => entry.0.push(idx),
+                    ServerState::Degraded { .. } => entry.1.push(idx),
+                    ServerState::Disabled { .. } => {}
+                }
             }
         }
         drop(health);
 
         let mut result = Vec::with_capacity(server_count);
-        for (_priority, servers) in groups {
-            let ranked = self.rank_servers_in_group(&servers).await;
-            result.extend(ranked);
+        for (_priority, (healthy, degraded)) in ready_groups {
+            if !healthy.is_empty() {
+                result.extend(self.rank_servers_in_group(&healthy).await);
+            }
+            if !degraded.is_empty() {
+                result.extend(self.rank_servers_in_group(&degraded).await);
+            }
+        }
+        for (_priority, (healthy, degraded)) in waiting_groups {
+            if !healthy.is_empty() {
+                result.extend(self.rank_servers_in_group(&healthy).await);
+            }
+            if !degraded.is_empty() {
+                result.extend(self.rank_servers_in_group(&degraded).await);
+            }
         }
         result
     }
@@ -343,7 +507,17 @@ impl NntpClient {
 
     /// Internal: fetch with multi-server failover logic.
     async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
-        let order = self.build_server_order(&[]).await;
+        self.fetch_with_failover_excluding(message_id, kind, &[])
+            .await
+    }
+
+    async fn fetch_with_failover_excluding(
+        &self,
+        message_id: &str,
+        kind: FetchKind,
+        exclude: &[usize],
+    ) -> Result<Bytes> {
+        let order = self.build_server_order(exclude).await;
         let mut last_error: Option<NntpError> = None;
 
         for idx in order {
@@ -353,9 +527,7 @@ impl NntpClient {
             match self.fetch_from_server(server, message_id, kind).await {
                 Ok(data) => {
                     let elapsed = start.elapsed();
-                    let mut health = self.pool.health().lock().await;
-                    health.record_success(idx);
-                    health.record_latency(idx, elapsed);
+                    self.record_server_success(idx, elapsed).await;
                     return Ok(data);
                 }
                 Err(NntpError::ArticleNotFound)
@@ -370,6 +542,16 @@ impl NntpClient {
                     });
                     continue;
                 }
+                Err(e @ NntpError::SoftTimeout(_)) => {
+                    warn!(
+                        server = idx,
+                        error = %e,
+                        message_id,
+                        "soft timeout, trying next server"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
@@ -377,10 +559,7 @@ impl NntpClient {
                         server = idx,
                         message_id, "authentication/access failure, trying next server"
                     );
-                    {
-                        let mut health = self.pool.health().lock().await;
-                        health.record_failure(idx, true);
-                    }
+                    self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                     continue;
                 }
@@ -391,9 +570,8 @@ impl NntpClient {
                         message_id,
                         "transient error, trying next server"
                     );
-                    {
-                        let mut health = self.pool.health().lock().await;
-                        health.record_failure(idx, false);
+                    if should_record_transient_failure(&e) {
+                        self.record_server_failure(idx, false).await;
                     }
                     last_error = Some(e);
                     continue;
@@ -431,50 +609,45 @@ impl NntpClient {
     /// errors up to `max_retries_per_server` times.
     ///
     /// The entire operation is bounded by the soft timeout — if it fires, the
-    /// caller should fail over to the next server.
+    /// current connection is discarded and the caller should fail over to the
+    /// next server.
     async fn fetch_from_server_with_groups(
         &self,
         server: ServerId,
         message_id: &str,
         groups: &[String],
     ) -> Result<Bytes> {
-        let soft_timeout = self.soft_timeout;
-        match tokio::time::timeout(
-            soft_timeout,
-            self.fetch_from_server_with_groups_inner(server, message_id, groups),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(NntpError::SoftTimeout(soft_timeout.as_secs())),
-        }
-    }
-
-    /// Inner implementation of fetch_from_server_with_groups without the soft timeout wrapper.
-    async fn fetch_from_server_with_groups_inner(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        groups: &[String],
-    ) -> Result<Bytes> {
+        let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.pool.acquire(server).await?;
+            let mut conn = self.acquire_before_deadline(server, deadline).await?;
 
             // Try to select a group — iterate through the list on failure.
-            let group_result = Self::try_select_group(&mut conn, groups).await;
+            let group_result =
+                match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.discard_connection_error(server.0, conn).await;
+                        return Err(self.soft_timeout_error());
+                    }
+                };
 
             match group_result {
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
-                        conn.discard();
-                        self.pool.drain_all_idle().await;
+                        self.discard_connection_error(server.0, conn).await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
                         // Delay before retry to avoid hammering during reconnect throttle.
-                        tokio::time::sleep(Duration::from_millis(200 * attempts as u64)).await;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await?;
                         debug!(
                             server = server.0,
                             attempt = attempts,
@@ -498,7 +671,14 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            let result = conn.body_by_id_raw(message_id).await;
+            let result =
+                match tokio::time::timeout_at(deadline, conn.body_by_id_raw(message_id)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.discard_connection_error(server.0, conn).await;
+                        return Err(self.soft_timeout_error());
+                    }
+                };
             match result {
                 Ok(response) => return Ok(response.data),
                 Err(NntpError::ArticleNotFound)
@@ -508,12 +688,15 @@ impl NntpClient {
                 }
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
-                        conn.discard();
-                        self.pool.drain_all_idle().await;
+                        self.discard_connection_error(server.0, conn).await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(200 * attempts as u64)).await;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await?;
                         debug!(
                             server = server.0,
                             attempt = attempts,
@@ -527,8 +710,78 @@ impl NntpClient {
                 }
                 Err(e) => {
                     if is_connection_error(&e) {
-                        conn.discard();
-                        self.pool.drain_all_idle().await;
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Check a batch of articles on a specific server, retrying on transient
+    /// errors and using pipelining when the server supports it.
+    async fn stat_many_from_server(
+        &self,
+        server: ServerId,
+        message_ids: &[&str],
+    ) -> Result<Vec<bool>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut attempts = 0u32;
+
+        loop {
+            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+
+            let result = match tokio::time::timeout_at(deadline, async {
+                if conn.capabilities().supports_pipelining() {
+                    conn.stat_pipeline(message_ids).await
+                } else {
+                    let mut results = Vec::with_capacity(message_ids.len());
+                    for message_id in message_ids {
+                        results.push(conn.stat_by_id(message_id).await?);
+                    }
+                    Ok(results)
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.discard_connection_error(server.0, conn).await;
+                    return Err(self.soft_timeout_error());
+                }
+            };
+
+            match result {
+                Ok(results) => return Ok(results),
+                Err(e) if is_transient(&e) => {
+                    if is_connection_error(&e) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    if attempts < self.max_retries_per_server {
+                        attempts += 1;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await?;
+                        debug!(
+                            server = server.0,
+                            attempt = attempts,
+                            error = %e,
+                            batch_size = message_ids.len(),
+                            "transient error during STAT batch, retrying on same server"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => {
+                    if is_connection_error(&e) {
+                        self.discard_connection_error(server.0, conn).await;
                     }
                     return Err(e);
                 }
@@ -538,42 +791,34 @@ impl NntpClient {
 
     /// Fetch from a specific server, retrying on transient errors.
     ///
-    /// Bounded by the soft timeout — if exceeded, returns `SoftTimeout` to
-    /// trigger failover at the caller.
+    /// Bounded by the soft timeout — if exceeded, the current connection is
+    /// discarded and `SoftTimeout` is returned to trigger failover at the caller.
     async fn fetch_from_server(
         &self,
         server: ServerId,
         message_id: &str,
         kind: FetchKind,
     ) -> Result<Bytes> {
-        let soft_timeout = self.soft_timeout;
-        match tokio::time::timeout(
-            soft_timeout,
-            self.fetch_from_server_inner(server, message_id, kind),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(NntpError::SoftTimeout(soft_timeout.as_secs())),
-        }
-    }
-
-    /// Inner implementation of fetch_from_server without the soft timeout wrapper.
-    async fn fetch_from_server_inner(
-        &self,
-        server: ServerId,
-        message_id: &str,
-        kind: FetchKind,
-    ) -> Result<Bytes> {
+        let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.pool.acquire(server).await?;
+            let mut conn = self.acquire_before_deadline(server, deadline).await?;
 
-            let result = match kind {
-                FetchKind::Body => conn.body_by_id_raw(message_id).await,
-                FetchKind::Head => conn.head_by_id(message_id).await,
-                FetchKind::Article => conn.article_by_id(message_id).await,
+            let result = match tokio::time::timeout_at(deadline, async {
+                match kind {
+                    FetchKind::Body => conn.body_by_id_raw(message_id).await,
+                    FetchKind::Head => conn.head_by_id(message_id).await,
+                    FetchKind::Article => conn.article_by_id(message_id).await,
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.discard_connection_error(server.0, conn).await;
+                    return Err(self.soft_timeout_error());
+                }
             };
 
             match result {
@@ -584,12 +829,15 @@ impl NntpClient {
                 }
                 Err(e) if is_transient(&e) => {
                     if is_connection_error(&e) {
-                        conn.discard();
-                        self.pool.drain_all_idle().await;
+                        self.discard_connection_error(server.0, conn).await;
                     }
                     if attempts < self.max_retries_per_server {
                         attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(200 * attempts as u64)).await;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await?;
                         debug!(
                             server = server.0,
                             attempt = attempts,
@@ -603,8 +851,7 @@ impl NntpClient {
                 }
                 Err(e) => {
                     if is_connection_error(&e) {
-                        conn.discard();
-                        self.pool.drain_all_idle().await;
+                        self.discard_connection_error(server.0, conn).await;
                     }
                     return Err(e);
                 }
@@ -632,6 +879,13 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
             | NntpError::SoftTimeout(_)
+    )
+}
+
+fn should_record_transient_failure(err: &NntpError) -> bool {
+    !matches!(
+        err,
+        NntpError::TooManyConnections | NntpError::PoolExhausted
     )
 }
 
@@ -810,6 +1064,16 @@ mod tests {
     }
 
     #[test]
+    fn transient_failure_recording_counts_soft_timeouts() {
+        assert!(should_record_transient_failure(&NntpError::SoftTimeout(15)));
+        assert!(!should_record_transient_failure(
+            &NntpError::TooManyConnections
+        ));
+        assert!(!should_record_transient_failure(&NntpError::PoolExhausted));
+        assert!(should_record_transient_failure(&NntpError::Timeout));
+    }
+
+    #[test]
     fn soft_timeout_display() {
         let err = NntpError::SoftTimeout(15);
         assert_eq!(err.to_string(), "article fetch soft timeout (15s)");
@@ -893,10 +1157,16 @@ mod tests {
         // All 4 servers should be present.
         assert_eq!(order.len(), 4);
         // Group 0 servers (0, 1) should come before group 1 servers (2, 3).
-        let group0_positions: Vec<usize> = order.iter().position(|&x| x == 0).into_iter()
+        let group0_positions: Vec<usize> = order
+            .iter()
+            .position(|&x| x == 0)
+            .into_iter()
             .chain(order.iter().position(|&x| x == 1))
             .collect();
-        let group1_positions: Vec<usize> = order.iter().position(|&x| x == 2).into_iter()
+        let group1_positions: Vec<usize> = order
+            .iter()
+            .position(|&x| x == 2)
+            .into_iter()
             .chain(order.iter().position(|&x| x == 3))
             .collect();
 
@@ -961,5 +1231,55 @@ mod tests {
         let client = multi_server_client(2);
         let ranked = client.rank_servers_in_group(&[]).await;
         assert!(ranked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_server_order_prefers_healthy_over_degraded() {
+        let client = multi_server_client(2);
+
+        {
+            let mut health = client.pool.health().lock().await;
+            for _ in 0..5 {
+                health.record_failure(1, false);
+            }
+        }
+
+        let order = client.build_server_order(&[]).await;
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn build_server_order_prefers_immediately_available_servers() {
+        let pool = NntpPool::new(PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "saturated-primary.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 0,
+                    group: 0,
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "available-backfill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 1,
+                    group: 1,
+                },
+            ],
+            max_idle_age: Duration::from_secs(300),
+            ..PoolConfig::default()
+        });
+
+        let client = NntpClient {
+            pool: Arc::new(pool),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        };
+
+        let order = client.build_server_order(&[]).await;
+        assert_eq!(order, vec![1, 0]);
     }
 }

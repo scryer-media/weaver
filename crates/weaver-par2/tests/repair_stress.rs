@@ -200,7 +200,7 @@ fn build_synthetic_par2(
             exp,
             RecoverySlice {
                 exponent: exp,
-                data: Bytes::from(recovery),
+                data: Bytes::from(recovery).into(),
             },
         );
     }

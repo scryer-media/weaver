@@ -304,21 +304,6 @@ impl Pipeline {
         file_indices
     }
 
-    /// Set a job's status.
-    pub(super) fn set_job_status(
-        &mut self,
-        job_id: JobId,
-        status: JobStatus,
-    ) -> Result<(), weaver_scheduler::SchedulerError> {
-        match self.jobs.get_mut(&job_id) {
-            Some(state) => {
-                state.status = status;
-                Ok(())
-            }
-            None => Err(weaver_scheduler::SchedulerError::JobNotFound(job_id)),
-        }
-    }
-
     pub(super) fn total_recovery_block_capacity(&self, job_id: JobId) -> u32 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;

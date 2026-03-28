@@ -414,15 +414,21 @@ pub fn decode_chunk(
             }
             _ => {
                 state.at_line_start = false;
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
+                let (consumed, written) = crate::simd::decode_normal_run(input, src, output, dst);
+                if written == 0 {
+                    if dst >= output.len() {
+                        return Err(YencError::BufferTooSmall {
+                            needed: dst + 1,
+                            available: output.len(),
+                        });
+                    }
+                    output[dst] = byte.wrapping_sub(42);
+                    dst += 1;
+                    src += 1;
+                } else {
+                    src += consumed;
+                    dst += written;
                 }
-                output[dst] = byte.wrapping_sub(42);
-                dst += 1;
-                src += 1;
             }
         }
     }

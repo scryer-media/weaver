@@ -4,6 +4,9 @@
 //! at line start). For runs of normal bytes, we can batch-subtract 42 using
 //! SIMD or an unrolled loop.
 
+#[cfg(target_arch = "x86_64")]
+type DecodeRunFn = fn(&[u8], usize, &mut [u8], usize) -> (usize, usize);
+
 /// Decode a run of "normal" yEnc bytes (no special characters) by subtracting 42.
 ///
 /// Scans `input` from position `start`, decoding bytes into `output` at position
@@ -20,12 +23,7 @@ pub fn decode_normal_run(
     // Use platform-specific SIMD when available, fall back to scalar.
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { decode_normal_run_avx2(input, start, output, dst_start) };
-        }
-        if is_x86_feature_detected!("sse2") {
-            return unsafe { decode_normal_run_sse2(input, start, output, dst_start) };
-        }
+        return dispatch_x86_decode_normal_run()(input, start, output, dst_start);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -47,21 +45,71 @@ fn decode_normal_run_scalar(
     output: &mut [u8],
     dst_start: usize,
 ) -> (usize, usize) {
-    let mut src = start;
-    let mut dst = dst_start;
+    let max_len = input
+        .len()
+        .saturating_sub(start)
+        .min(output.len().saturating_sub(dst_start));
+    let input = &input[start..start + max_len];
+    let run_len = memchr::memchr3(b'=', b'\r', b'\n', input).unwrap_or(input.len());
+    let output = &mut output[dst_start..dst_start + run_len];
 
-    while src < input.len() && dst < output.len() {
-        let byte = input[src];
-        // Stop at special characters.
-        if byte == b'=' || byte == b'\r' || byte == b'\n' {
-            break;
-        }
-        output[dst] = byte.wrapping_sub(42);
-        src += 1;
-        dst += 1;
+    let mut i = 0usize;
+    while i + 8 <= run_len {
+        output[i] = input[i].wrapping_sub(42);
+        output[i + 1] = input[i + 1].wrapping_sub(42);
+        output[i + 2] = input[i + 2].wrapping_sub(42);
+        output[i + 3] = input[i + 3].wrapping_sub(42);
+        output[i + 4] = input[i + 4].wrapping_sub(42);
+        output[i + 5] = input[i + 5].wrapping_sub(42);
+        output[i + 6] = input[i + 6].wrapping_sub(42);
+        output[i + 7] = input[i + 7].wrapping_sub(42);
+        i += 8;
+    }
+    while i < run_len {
+        output[i] = input[i].wrapping_sub(42);
+        i += 1;
     }
 
-    (src - start, dst - dst_start)
+    (run_len, run_len)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dispatch_x86_decode_normal_run() -> DecodeRunFn {
+    use std::sync::OnceLock;
+
+    static DISPATCH: OnceLock<DecodeRunFn> = OnceLock::new();
+    *DISPATCH.get_or_init(|| {
+        if is_x86_feature_detected!("avx2") {
+            decode_normal_run_avx2_dispatch
+        } else if is_x86_feature_detected!("sse2") {
+            decode_normal_run_sse2_dispatch
+        } else {
+            decode_normal_run_scalar
+        }
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn decode_normal_run_sse2_dispatch(
+    input: &[u8],
+    start: usize,
+    output: &mut [u8],
+    dst_start: usize,
+) -> (usize, usize) {
+    unsafe { decode_normal_run_sse2(input, start, output, dst_start) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn decode_normal_run_avx2_dispatch(
+    input: &[u8],
+    start: usize,
+    output: &mut [u8],
+    dst_start: usize,
+) -> (usize, usize) {
+    unsafe { decode_normal_run_avx2(input, start, output, dst_start) }
 }
 
 /// SSE2 implementation: process 16 bytes at a time.
@@ -100,9 +148,7 @@ unsafe fn decode_normal_run_sse2(
                 let count = mask.trailing_zeros() as usize;
                 if count > 0 {
                     let decoded = _mm_add_epi8(chunk, sub42);
-                    let mut tmp = [0u8; 16];
-                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, decoded);
-                    output[dst..dst + count].copy_from_slice(&tmp[..count]);
+                    _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, decoded);
                     src += count;
                     dst += count;
                 }
@@ -155,9 +201,7 @@ unsafe fn decode_normal_run_avx2(
                 let count = mask.trailing_zeros() as usize;
                 if count > 0 {
                     let decoded = _mm256_add_epi8(chunk, sub42);
-                    let mut tmp = [0u8; 32];
-                    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, decoded);
-                    output[dst..dst + count].copy_from_slice(&tmp[..count]);
+                    _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, decoded);
                     src += count;
                     dst += count;
                 }
@@ -206,16 +250,19 @@ unsafe fn decode_normal_run_neon(
             // Check if any lane is set.
             let max_val = vmaxvq_u8(any_special);
             if max_val != 0 {
-                // Found a special character -- find the first one.
-                let mut mask_bytes = [0u8; 16];
-                vst1q_u8(mask_bytes.as_mut_ptr(), any_special);
-                let count = mask_bytes.iter().position(|&b| b != 0).unwrap_or(16);
+                // Found a special character -- find the first one via the mask lanes.
+                let mask64 = vreinterpretq_u64_u8(any_special);
+                let low = vgetq_lane_u64(mask64, 0);
+                let high = vgetq_lane_u64(mask64, 1);
+                let count = if low != 0 {
+                    (low.trailing_zeros() / 8) as usize
+                } else {
+                    8 + (high.trailing_zeros() / 8) as usize
+                };
 
                 if count > 0 {
                     let decoded = vaddq_u8(chunk, sub42);
-                    let mut tmp = [0u8; 16];
-                    vst1q_u8(tmp.as_mut_ptr(), decoded);
-                    output[dst..dst + count].copy_from_slice(&tmp[..count]);
+                    vst1q_u8(output.as_mut_ptr().add(dst), decoded);
                     src += count;
                     dst += count;
                 }

@@ -45,14 +45,18 @@ impl RarArchive {
                         .to_owned();
 
                     if self.format == ArchiveFormat::Rar4 {
-                        let salt = skip_entry.rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                skip_fh.name,
-                            ),
-                        })?;
+                        let salt =
+                            skip_entry
+                                .rar4_salt
+                                .ok_or_else(|| RarError::CorruptArchive {
+                                    detail: format!(
+                                        "RAR4 member {} is marked encrypted but has no salt",
+                                        skip_fh.name,
+                                    ),
+                                })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(&password, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -87,7 +91,11 @@ impl RarArchive {
                             &enc_info.salt,
                             enc_info.kdf_count,
                         );
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
+                        );
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -118,7 +126,9 @@ impl RarArchive {
     fn normalized_provider_segments(segments: &[DataSegment]) -> (Vec<DataSegment>, usize) {
         let mut sorted_segments = segments.to_vec();
         sorted_segments.sort_by_key(|segment| segment.volume_index);
-        let volume_base = sorted_segments.first().map_or(0, |segment| segment.volume_index);
+        let volume_base = sorted_segments
+            .first()
+            .map_or(0, |segment| segment.volume_index);
         for segment in &mut sorted_segments {
             segment.volume_index -= volume_base;
         }
@@ -162,14 +172,18 @@ impl RarArchive {
                         .to_owned();
 
                     if self.format == ArchiveFormat::Rar4 {
-                        let salt = skip_entry.rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                skip_fh.name,
-                            ),
-                        })?;
+                        let salt =
+                            skip_entry
+                                .rar4_salt
+                                .ok_or_else(|| RarError::CorruptArchive {
+                                    detail: format!(
+                                        "RAR4 member {} is marked encrypted but has no salt",
+                                        skip_fh.name,
+                                    ),
+                                })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(&password, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -204,7 +218,11 @@ impl RarArchive {
                             &enc_info.salt,
                             enc_info.kdf_count,
                         );
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
+                        );
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -397,12 +415,8 @@ impl RarArchive {
 
             let (written, actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
-                let base_reader = ArchiveSegmentReader::new(
-                    &mut self.volumes,
-                    &self.limits,
-                    &segments,
-                    &fh.name,
-                );
+                let base_reader =
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let mut hash_writer = HashingWriter::new(
                     &mut output,
                     expected_crc.is_some(),
@@ -418,7 +432,8 @@ impl RarArchive {
                             ),
                         })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
                     } else {
                         let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -439,10 +454,14 @@ impl RarArchive {
                                 member: fh.name.clone(),
                             });
                         }
-                        let key = self
-                            .kdf_cache
-                            .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
+                        let key =
+                            self.kdf_cache
+                                .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
+                        );
                         Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
                     }
                 } else {
@@ -691,12 +710,8 @@ impl RarArchive {
                 );
                 self.advance_solid_cursor_to(index, &fh)?;
                 let segments = self.members[index].segments.clone();
-                let base_reader = ArchiveSegmentReader::new(
-                    &mut self.volumes,
-                    &self.limits,
-                    &segments,
-                    &fh.name,
-                );
+                let base_reader =
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
                         let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
@@ -706,7 +721,8 @@ impl RarArchive {
                             ),
                         })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -723,12 +739,14 @@ impl RarArchive {
                                 fh.name,
                             ),
                         })?;
-                        let key = self.kdf_cache.derive_key_rar5(
-                            pwd,
-                            &enc_info.salt,
-                            enc_info.kdf_count,
+                        let key =
+                            self.kdf_cache
+                                .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
                         );
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -793,8 +811,7 @@ impl RarArchive {
         Err(RarError::CorruptArchive {
             detail: format!(
                 "unsupported extraction path for member {} (method {:?}, solid={is_solid}, format={archive_format:?})",
-                fh.name,
-                fh.compression.method,
+                fh.name, fh.compression.method,
             ),
         })
     }
@@ -870,12 +887,8 @@ impl RarArchive {
 
             let (written, actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
-                let base_reader = ArchiveSegmentReader::new(
-                    &mut self.volumes,
-                    &self.limits,
-                    &segments,
-                    &fh.name,
-                );
+                let base_reader =
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let mut hash_writer = HashingWriter::new(
                     &mut writer,
                     expected_crc.is_some(),
@@ -891,7 +904,8 @@ impl RarArchive {
                             ),
                         })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
                     } else {
                         let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -912,10 +926,14 @@ impl RarArchive {
                                 member: fh.name.clone(),
                             });
                         }
-                        let key = self
-                            .kdf_cache
-                            .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
+                        let key =
+                            self.kdf_cache
+                                .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
+                        );
                         Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
                     }
                 } else {
@@ -1123,12 +1141,8 @@ impl RarArchive {
                 );
                 self.advance_solid_cursor_to(index, &fh)?;
                 let segments = self.members[index].segments.clone();
-                let base_reader = ArchiveSegmentReader::new(
-                    &mut self.volumes,
-                    &self.limits,
-                    &segments,
-                    &fh.name,
-                );
+                let base_reader =
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
                         let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
@@ -1138,7 +1152,8 @@ impl RarArchive {
                             ),
                         })?;
                         let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader =
+                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -1155,12 +1170,14 @@ impl RarArchive {
                                 fh.name,
                             ),
                         })?;
-                        let key = self.kdf_cache.derive_key_rar5(
-                            pwd,
-                            &enc_info.salt,
-                            enc_info.kdf_count,
+                        let key =
+                            self.kdf_cache
+                                .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                        let reader = crate::crypto::DecryptingReader::new_rar5(
+                            base_reader,
+                            &key,
+                            &enc_info.iv,
                         );
-                        let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -1219,8 +1236,7 @@ impl RarArchive {
         Err(RarError::CorruptArchive {
             detail: format!(
                 "unsupported file extraction path for member {} (method {:?}, solid={is_solid}, format={archive_format:?})",
-                fh.name,
-                fh.compression.method,
+                fh.name, fh.compression.method,
             ),
         })
     }
@@ -1282,13 +1298,9 @@ impl RarArchive {
                 segments.first().map_or(0, |segment| segment.volume_index),
             ));
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let base_reader = ArchiveSegmentReader::new(
-                &mut self.volumes,
-                &self.limits,
-                &segments,
-                &fh.name,
-            )
-            .with_volume_tracker(Arc::clone(&volume_tracker));
+            let base_reader =
+                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                    .with_volume_tracker(Arc::clone(&volume_tracker));
             let tracking_reader = VolumeTrackingReader::new(base_reader, volume_tracker)
                 .with_shared_transitions(Arc::clone(&shared_transitions));
 
@@ -1301,7 +1313,8 @@ impl RarArchive {
                         ),
                     })?;
                     let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                    let reader = crate::crypto::DecryptingReader::new_rar4(tracking_reader, &key, &iv);
+                    let reader =
+                        crate::crypto::DecryptingReader::new_rar4(tracking_reader, &key, &iv);
                     Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
@@ -1321,12 +1334,14 @@ impl RarArchive {
                             fh.name,
                         ),
                     })?;
-                    let key = self.kdf_cache.derive_key_rar5(
-                        pwd,
-                        &enc_info.salt,
-                        enc_info.kdf_count,
+                    let key =
+                        self.kdf_cache
+                            .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                    let reader = crate::crypto::DecryptingReader::new_rar5(
+                        tracking_reader,
+                        &key,
+                        &enc_info.iv,
                     );
-                    let reader = crate::crypto::DecryptingReader::new_rar5(tracking_reader, &key, &enc_info.iv);
                     Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
@@ -1376,15 +1391,12 @@ impl RarArchive {
         let volume_tracker = Arc::new(AtomicUsize::new(
             segments.first().map_or(0, |segment| segment.volume_index),
         ));
-        let base_reader = ArchiveSegmentReader::new(
-            &mut self.volumes,
-            &self.limits,
-            &segments,
-            &fh.name,
-        )
-        .with_volume_tracker(Arc::clone(&volume_tracker));
+        let base_reader =
+            ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                .with_volume_tracker(Arc::clone(&volume_tracker));
 
-        let shared_crc = expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
+        let shared_crc =
+            expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
         let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
             expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
         let mut writer_factory = writer_factory;
@@ -1435,7 +1447,8 @@ impl RarArchive {
                 let key = self
                     .kdf_cache
                     .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                let reader = crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
+                let reader =
+                    crate::crypto::DecryptingReader::new_rar5(base_reader, &key, &enc_info.iv);
                 Self::copy_reader_to_writer_chunked(
                     reader,
                     Arc::clone(&volume_tracker),
@@ -1469,7 +1482,11 @@ impl RarArchive {
         };
 
         if let (Some(expected), Some(shared)) = (expected_crc, shared_crc) {
-            let actual = Arc::try_unwrap(shared).unwrap().into_inner().unwrap().finalize();
+            let actual = Arc::try_unwrap(shared)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+                .finalize();
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
                     member: fh.name.clone(),
@@ -1495,169 +1512,170 @@ impl RarArchive {
 
         Ok(chunks)
     }
-fn solid_decode_reader_to_sink<R: Read>(
-    solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
-    solid_decoder: &mut Option<LzDecoder>,
-    max_dict_size: u64,
-    compressed: R,
-    unpacked_size: u64,
-    fh: &FileHeader,
-) -> RarResult<()> {
-    let mut sink = std::io::sink();
-    Self::solid_decode_reader_to_writer(
-        solid_decoder_rar4,
-        solid_decoder,
-        max_dict_size,
-        compressed,
-        unpacked_size,
-        fh,
-        &mut sink,
-    )?;
-    Ok(())
-}
-
-fn solid_decode_reader_to_writer<R: Read, W: Write>(
-    solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
-    solid_decoder: &mut Option<LzDecoder>,
-    max_dict_size: u64,
-    compressed: R,
-    unpacked_size: u64,
-    fh: &FileHeader,
-    writer: &mut W,
-) -> RarResult<u64> {
-    let dict_size = fh.compression.dict_size;
-    if dict_size > max_dict_size {
-        return Err(RarError::DictionaryTooLarge {
-            size: dict_size,
-            max: max_dict_size,
-        });
-    }
-
-    let dict_size = dict_size as usize;
-    if fh.compression.format == ArchiveFormat::Rar4 {
-        if let Some(decoder) = solid_decoder_rar4 {
-            decoder.prepare_solid_continuation();
-        } else {
-            *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
-        }
-        solid_decoder_rar4
-            .as_mut()
-            .unwrap()
-            .decompress_reader_to_writer(compressed, unpacked_size, writer)
-    } else {
-        if let Some(decoder) = solid_decoder {
-            decoder.prepare_solid_continuation();
-        } else {
-            *solid_decoder = Some(LzDecoder::new(dict_size));
-        }
-        solid_decoder
-            .as_mut()
-            .unwrap()
-            .decompress_reader_to_writer(compressed, unpacked_size, writer)
-    }
-}
-
-fn solid_decode_reader_to_writer_chunked<R: Read, F>(
-    solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
-    solid_decoder: &mut Option<LzDecoder>,
-    max_dict_size: u64,
-    compressed: R,
-    fh: &FileHeader,
-    unpacked_size: u64,
-    first_volume_index: usize,
-    shared_transitions: Arc<std::sync::Mutex<Vec<crate::decompress::VolumeTransition>>>,
-    writer_factory: F,
-    verify_crc: bool,
-) -> RarResult<Vec<(usize, u64)>>
-where
-    F: FnMut(usize) -> RarResult<Box<dyn Write>>,
-{
-    let dict_size = fh.compression.dict_size;
-    if dict_size > max_dict_size {
-        return Err(RarError::DictionaryTooLarge {
-            size: dict_size,
-            max: max_dict_size,
-        });
-    }
-
-    let dict_size = dict_size as usize;
-    let shared_hasher = if verify_crc {
-        Some(Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())))
-    } else {
-        None
-    };
-    let mut writer_factory = writer_factory;
-
-    let chunks = if fh.compression.format == ArchiveFormat::Rar4 {
-        if let Some(decoder) = solid_decoder_rar4 {
-            decoder.prepare_solid_continuation();
-        } else {
-            *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
-        }
-        let decoder = solid_decoder_rar4.as_mut().unwrap();
-        let hasher_clone = shared_hasher.clone();
-        decoder.decompress_reader_to_writer_chunked(
+    fn solid_decode_reader_to_sink<R: Read>(
+        solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
+        solid_decoder: &mut Option<LzDecoder>,
+        max_dict_size: u64,
+        compressed: R,
+        unpacked_size: u64,
+        fh: &FileHeader,
+    ) -> RarResult<()> {
+        let mut sink = std::io::sink();
+        Self::solid_decode_reader_to_writer(
+            solid_decoder_rar4,
+            solid_decoder,
+            max_dict_size,
             compressed,
             unpacked_size,
-            first_volume_index,
-            Arc::clone(&shared_transitions),
-            |volume_index| {
-                let writer = writer_factory(volume_index)?;
-                if let Some(ref hasher) = hasher_clone {
-                    Ok(Box::new(HashTrackingWriter {
-                        inner: writer,
-                        crc: Some(Arc::clone(hasher)),
-                        blake2: None,
-                    }))
-                } else {
-                    Ok(writer)
-                }
-            },
-        )?
-    } else {
-        if let Some(decoder) = solid_decoder {
-            decoder.prepare_solid_continuation();
-        } else {
-            *solid_decoder = Some(LzDecoder::new(dict_size));
-        }
-        let decoder = solid_decoder.as_mut().unwrap();
-        let hasher_clone = shared_hasher.clone();
-        decoder.decompress_reader_to_writer_chunked(
-            compressed,
-            unpacked_size,
-            first_volume_index,
-            Arc::clone(&shared_transitions),
-            |volume_index| {
-                let writer = writer_factory(volume_index)?;
-                if let Some(ref hasher) = hasher_clone {
-                    Ok(Box::new(HashTrackingWriter {
-                        inner: writer,
-                        crc: Some(Arc::clone(hasher)),
-                        blake2: None,
-                    }))
-                } else {
-                    Ok(writer)
-                }
-            },
-        )?
-    };
+            fh,
+            &mut sink,
+        )?;
+        Ok(())
+    }
 
-    if let Some(hasher_arc) = shared_hasher
-        && let Some(expected) = fh.data_crc32
-    {
-        let hasher = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
-        let actual = hasher.finalize();
-        if actual != expected {
-            return Err(RarError::DataCrcMismatch {
-                member: fh.name.clone(),
-                expected,
-                actual,
+    fn solid_decode_reader_to_writer<R: Read, W: Write>(
+        solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
+        solid_decoder: &mut Option<LzDecoder>,
+        max_dict_size: u64,
+        compressed: R,
+        unpacked_size: u64,
+        fh: &FileHeader,
+        writer: &mut W,
+    ) -> RarResult<u64> {
+        let dict_size = fh.compression.dict_size;
+        if dict_size > max_dict_size {
+            return Err(RarError::DictionaryTooLarge {
+                size: dict_size,
+                max: max_dict_size,
             });
         }
+
+        let dict_size = dict_size as usize;
+        if fh.compression.format == ArchiveFormat::Rar4 {
+            if let Some(decoder) = solid_decoder_rar4 {
+                decoder.prepare_solid_continuation();
+            } else {
+                *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
+            }
+            solid_decoder_rar4
+                .as_mut()
+                .unwrap()
+                .decompress_reader_to_writer(compressed, unpacked_size, writer)
+        } else {
+            if let Some(decoder) = solid_decoder {
+                decoder.prepare_solid_continuation();
+            } else {
+                *solid_decoder = Some(LzDecoder::new(dict_size));
+            }
+            solid_decoder.as_mut().unwrap().decompress_reader_to_writer(
+                compressed,
+                unpacked_size,
+                writer,
+            )
+        }
     }
 
-    Ok(chunks)
-}
+    fn solid_decode_reader_to_writer_chunked<R: Read, F>(
+        solid_decoder_rar4: &mut Option<Rar4LzDecoder>,
+        solid_decoder: &mut Option<LzDecoder>,
+        max_dict_size: u64,
+        compressed: R,
+        fh: &FileHeader,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        shared_transitions: Arc<std::sync::Mutex<Vec<crate::decompress::VolumeTransition>>>,
+        writer_factory: F,
+        verify_crc: bool,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        let dict_size = fh.compression.dict_size;
+        if dict_size > max_dict_size {
+            return Err(RarError::DictionaryTooLarge {
+                size: dict_size,
+                max: max_dict_size,
+            });
+        }
+
+        let dict_size = dict_size as usize;
+        let shared_hasher = if verify_crc {
+            Some(Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())))
+        } else {
+            None
+        };
+        let mut writer_factory = writer_factory;
+
+        let chunks = if fh.compression.format == ArchiveFormat::Rar4 {
+            if let Some(decoder) = solid_decoder_rar4 {
+                decoder.prepare_solid_continuation();
+            } else {
+                *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
+            }
+            let decoder = solid_decoder_rar4.as_mut().unwrap();
+            let hasher_clone = shared_hasher.clone();
+            decoder.decompress_reader_to_writer_chunked(
+                compressed,
+                unpacked_size,
+                first_volume_index,
+                Arc::clone(&shared_transitions),
+                |volume_index| {
+                    let writer = writer_factory(volume_index)?;
+                    if let Some(ref hasher) = hasher_clone {
+                        Ok(Box::new(HashTrackingWriter {
+                            inner: writer,
+                            crc: Some(Arc::clone(hasher)),
+                            blake2: None,
+                        }))
+                    } else {
+                        Ok(writer)
+                    }
+                },
+            )?
+        } else {
+            if let Some(decoder) = solid_decoder {
+                decoder.prepare_solid_continuation();
+            } else {
+                *solid_decoder = Some(LzDecoder::new(dict_size));
+            }
+            let decoder = solid_decoder.as_mut().unwrap();
+            let hasher_clone = shared_hasher.clone();
+            decoder.decompress_reader_to_writer_chunked(
+                compressed,
+                unpacked_size,
+                first_volume_index,
+                Arc::clone(&shared_transitions),
+                |volume_index| {
+                    let writer = writer_factory(volume_index)?;
+                    if let Some(ref hasher) = hasher_clone {
+                        Ok(Box::new(HashTrackingWriter {
+                            inner: writer,
+                            crc: Some(Arc::clone(hasher)),
+                            blake2: None,
+                        }))
+                    } else {
+                        Ok(writer)
+                    }
+                },
+            )?
+        };
+
+        if let Some(hasher_arc) = shared_hasher
+            && let Some(expected) = fh.data_crc32
+        {
+            let hasher = Arc::try_unwrap(hasher_arc).unwrap().into_inner().unwrap();
+            let actual = hasher.finalize();
+            if actual != expected {
+                return Err(RarError::DataCrcMismatch {
+                    member: fh.name.clone(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+
+        Ok(chunks)
+    }
     /// Extract a member by name, handling any supported compression method.
     ///
     /// Returns the decompressed data as a `Vec<u8>`.
@@ -1915,10 +1933,11 @@ where
                             member: fh.name.clone(),
                         });
                     }
-                    let key = self
-                        .kdf_cache
-                        .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                    let reader = crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv);
+                    let key =
+                        self.kdf_cache
+                            .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
+                    let reader =
+                        crate::crypto::DecryptingReader::new_rar5(chained, &key, &enc_info.iv);
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
@@ -2248,9 +2267,7 @@ where
             }
         }
 
-        if !final_skip_hash
-            && let Some(expected) = expected_blake
-        {
+        if !final_skip_hash && let Some(expected) = expected_blake {
             let actual = hash_writer.finalize_blake2();
             if actual != expected {
                 return Err(RarError::Blake2Mismatch {
@@ -2548,7 +2565,8 @@ where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
     {
         let skip_hash_verify = file_encryption.is_some_and(|fe| fe.use_hash_mac);
-        let (segments, first_vol) = Self::normalized_provider_segments(&self.members[index].segments);
+        let (segments, first_vol) =
+            Self::normalized_provider_segments(&self.members[index].segments);
 
         if fh.compression.method == CompressionMethod::Store {
             return self.extract_member_streaming_store_chunked(
@@ -2623,7 +2641,8 @@ where
                 let key = self
                     .kdf_cache
                     .derive_key_rar5(pwd, &enc_info.salt, enc_info.kdf_count);
-                let reader = crate::crypto::DecryptingReader::new_rar5(tracking_reader, &key, &enc_info.iv);
+                let reader =
+                    crate::crypto::DecryptingReader::new_rar5(tracking_reader, &key, &enc_info.iv);
                 Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
@@ -3245,7 +3264,6 @@ impl<R: Read> VolumeTrackingReader<R> {
         self.shared_transitions = Some(transitions);
         self
     }
-
 }
 
 impl<R: Read> Read for VolumeTrackingReader<R> {
@@ -3271,4 +3289,3 @@ impl<R: Read> Read for VolumeTrackingReader<R> {
         Ok(n)
     }
 }
-

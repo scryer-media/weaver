@@ -8,6 +8,11 @@
 //! 4. Write repaired data back to files
 
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::error::{Par2Error, Result};
@@ -16,6 +21,8 @@ use crate::matrix;
 use crate::par2_set::Par2FileSet;
 use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
 use crate::verify::{FileAccess, Repairability, VerificationResult};
+
+const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 50 * 1024 * 1024;
 
 /// A plan for repairing missing/damaged slices.
 #[derive(Debug, Clone)]
@@ -185,17 +192,182 @@ pub fn plan_repair(
 }
 
 /// Options controlling repair execution.
-#[derive(Default)]
 pub struct RepairOptions {
     /// If set, repair will check this token and stop early if cancelled.
     pub cancel: Option<CancellationToken>,
     /// If set, called with progress updates during repair.
     pub progress: Option<ProgressCallback>,
-    /// Maximum memory (bytes) to use for repair buffers.
+    /// Maximum transient repair workspace size in bytes.
     ///
-    /// If `None`, all recovery data is loaded into memory at once.
-    /// If `Some(limit)`, recovery data is processed in word-range chunks.
+    /// If `Some(limit)`, repair chooses the in-memory fast path only when its
+    /// estimated working set fits within `limit`; otherwise it switches to the
+    /// streamed chunk path and sizes chunk buffers from this budget.
+    ///
+    /// If `None`, repair always uses the in-memory fast path.
     pub memory_limit: Option<usize>,
+}
+
+impl Default for RepairOptions {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            progress: None,
+            memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RepairExecutionMode {
+    InMemory { chunk_words: usize },
+    Streaming { chunk_words: usize, budget: usize },
+}
+
+#[derive(Debug, Clone)]
+struct RepairWriteTarget {
+    file_id: FileId,
+    filename: String,
+    offset: u64,
+    file_end: u64,
+}
+
+fn check_cancel(options: &RepairOptions) -> Result<()> {
+    if let Some(ref cancel) = options.cancel
+        && cancel.is_cancelled()
+    {
+        return Err(Par2Error::Cancelled);
+    }
+    Ok(())
+}
+
+fn estimated_in_memory_repair_bytes(plan: &RepairPlan) -> usize {
+    plan.missing_slices
+        .len()
+        .saturating_mul(plan.slice_size as usize)
+        .saturating_mul(2)
+}
+
+fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize) -> usize {
+    if outputs == 0 {
+        return word_count.max(1);
+    }
+
+    let chunk_bytes = (limit_bytes / outputs.saturating_mul(2))
+        .max(2)
+        .min(word_count.saturating_mul(2));
+    (chunk_bytes / 2).max(1).min(word_count.max(1))
+}
+
+fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> RepairExecutionMode {
+    let slice_size = plan.slice_size as usize;
+    let word_count = (slice_size / 2).max(1);
+
+    match options.memory_limit {
+        None => RepairExecutionMode::InMemory {
+            chunk_words: word_count,
+        },
+        Some(limit) => {
+            let chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
+            if estimated_in_memory_repair_bytes(plan) <= limit {
+                RepairExecutionMode::InMemory { chunk_words }
+            } else {
+                RepairExecutionMode::Streaming {
+                    chunk_words,
+                    budget: limit,
+                }
+            }
+        }
+    }
+}
+
+fn build_write_targets(
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+) -> Result<Vec<RepairWriteTarget>> {
+    plan.missing_slices
+        .iter()
+        .map(|(file_id, local_slice)| {
+            let desc =
+                par2_set
+                    .file_description(file_id)
+                    .ok_or_else(|| Par2Error::ReedSolomonError {
+                        reason: format!("file description not found for {file_id}"),
+                    })?;
+            Ok(RepairWriteTarget {
+                file_id: *file_id,
+                filename: desc.filename.clone(),
+                offset: *local_slice as u64 * plan.slice_size,
+                file_end: desc.length,
+            })
+        })
+        .collect()
+}
+
+fn xor_out_known_data(
+    recovery_buffers: &mut [Vec<u8>],
+    recovery_exponents: &[u32],
+    constant: u16,
+    data: &[u8],
+) {
+    recovery_buffers
+        .par_iter_mut()
+        .zip(recovery_exponents.par_iter())
+        .for_each(|(recovery, &exp)| {
+            let factor = gf::pow(constant, exp);
+            if factor != 0 {
+                crate::gf_simd::mul_acc_region(factor, data, recovery);
+            }
+        });
+}
+
+fn read_exact_at_cached(
+    files: &mut HashMap<PathBuf, File>,
+    path: &Path,
+    offset: u64,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    let file = if let Some(file) = files.get_mut(path) {
+        file
+    } else {
+        files.insert(path.to_path_buf(), File::open(path)?);
+        files.get_mut(path).expect("cached file should exist")
+    };
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(dst)
+}
+
+fn fill_recovery_chunk(
+    data: &crate::packet::RecoverySliceData,
+    start: usize,
+    dst: &mut [u8],
+    file_cache: &mut HashMap<PathBuf, File>,
+) -> io::Result<()> {
+    dst.fill(0);
+
+    if let Some(bytes) = data.as_bytes() {
+        if start >= bytes.len() {
+            return Ok(());
+        }
+        let end = (start + dst.len()).min(bytes.len());
+        let copy_len = end - start;
+        dst[..copy_len].copy_from_slice(&bytes[start..end]);
+        return Ok(());
+    }
+
+    let Some((path, base_offset, len)) = data.file_span() else {
+        return Ok(());
+    };
+    if start >= len {
+        return Ok(());
+    }
+
+    let read_len = dst.len().min(len - start);
+    read_exact_at_cached(
+        file_cache,
+        path,
+        base_offset + start as u64,
+        &mut dst[..read_len],
+    )
 }
 
 /// Execute a repair plan, reading recovery data and writing repaired slices.
@@ -236,7 +408,7 @@ pub fn prepare_recovery_buffers(
             .ok_or_else(|| Par2Error::ReedSolomonError {
                 reason: format!("recovery block with exponent {exp} not found"),
             })?;
-        let mut data = rs.data.to_vec();
+        let mut data = rs.data.to_vec().map_err(Par2Error::Io)?;
         data.resize(slice_size, 0);
         recovery_data.push(data);
 
@@ -282,18 +454,12 @@ pub fn xor_out_slice(
         &input_data[..slice_size]
     };
 
-    let constant = plan.constants[global_idx];
-
-    // Parallelize across recovery buffers — each (factor, buffer) pair is independent.
-    recovery_buffers
-        .par_iter_mut()
-        .zip(plan.recovery_exponents.par_iter())
-        .for_each(|(recovery, &exp)| {
-            let factor = gf::pow(constant, exp);
-            if factor != 0 {
-                crate::gf_simd::mul_acc_region(factor, data, &mut recovery[..slice_size]);
-            }
-        });
+    xor_out_known_data(
+        recovery_buffers,
+        &plan.recovery_exponents,
+        plan.constants[global_idx],
+        &data[..slice_size],
+    );
 }
 
 /// Multiply adjusted recovery data by the decode matrix and write repaired slices.
@@ -302,17 +468,9 @@ pub fn reconstruct_and_write(
     par2_set: &Par2FileSet,
     recovery_buffers: Vec<Vec<u8>>,
     file_access: &mut dyn FileAccess,
+    chunk_words: usize,
     options: &RepairOptions,
 ) -> Result<()> {
-    let check_cancel = |options: &RepairOptions| -> Result<()> {
-        if let Some(ref cancel) = options.cancel
-            && cancel.is_cancelled()
-        {
-            return Err(Par2Error::Cancelled);
-        }
-        Ok(())
-    };
-
     let n = plan.missing_slices.len();
     if n == 0 {
         return Ok(());
@@ -328,35 +486,28 @@ pub fn reconstruct_and_write(
     // Step 2: Multiply adjusted recovery data by decode matrix.
     info!("reconstructing {} missing slices", n);
 
-    // Determine chunk size (for memory budget support).
-    let base_chunk_size = 4096usize;
-    let chunk_size = if let Some(limit) = options.memory_limit {
-        let max_chunk_words = if n > 0 {
-            limit / (n * 2)
-        } else {
-            base_chunk_size
-        };
-        max_chunk_words.max(1).min(word_count)
-    } else {
-        base_chunk_size
-    };
-
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
 
-    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_size).collect();
+    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_words).collect();
     let total_chunks = word_chunks.len() as u32;
 
     check_cancel(options)?;
 
-    let chunk_results: Vec<Vec<Vec<u8>>> = word_chunks
+    let completed_chunks = AtomicU32::new(0);
+    let repaired_ptrs: Vec<usize> = repaired_slices
+        .iter_mut()
+        .map(|slice| slice.as_mut_ptr() as usize)
+        .collect();
+
+    word_chunks
         .par_iter()
-        .map(|&chunk_start| {
-            let chunk_end = (chunk_start + chunk_size).min(word_count);
+        .try_for_each(|&chunk_start| -> Result<()> {
+            check_cancel(options)?;
+
+            let chunk_end = (chunk_start + chunk_words).min(word_count);
             let chunk_len = chunk_end - chunk_start;
             let byte_start = chunk_start * 2;
             let byte_len = chunk_len * 2;
-
-            let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; byte_len]; n];
 
             // Transposed loop: iterate recovery buffers in the outer loop so each
             // buffer is loaded into cache once and reused for all N output slices.
@@ -365,16 +516,18 @@ pub fn reconstruct_and_write(
             // matter.
             for (r, recovery) in recovery_buffers.iter().enumerate() {
                 let src = &recovery[byte_start..byte_start + byte_len];
-                let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> = chunk_output
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(j, chunk_out)| {
+                let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> = (0..n)
+                    .filter_map(|j| {
                         let factor = plan.decode_matrix[j][r];
                         if factor != 0 {
-                            Some(crate::gf_simd::FactorDst {
-                                factor,
-                                dst: chunk_out.as_mut_slice(),
-                            })
+                            // Safe because each chunk task writes a disjoint byte
+                            // range within every repaired slice, and the slices
+                            // themselves live in distinct Vec allocations.
+                            let dst = unsafe {
+                                let ptr = repaired_ptrs[j] as *mut u8;
+                                std::slice::from_raw_parts_mut(ptr.add(byte_start), byte_len)
+                            };
+                            Some(crate::gf_simd::FactorDst { factor, dst })
                         } else {
                             None
                         }
@@ -385,66 +538,50 @@ pub fn reconstruct_and_write(
                 }
             }
 
-            chunk_output
-        })
-        .collect();
+            if let Some(ref progress) = options.progress {
+                let current = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+                progress(ProgressUpdate {
+                    stage: ProgressStage::Repairing,
+                    current,
+                    total: total_chunks,
+                    bytes_processed: current as u64 * chunk_words as u64 * 2,
+                });
+            }
+
+            Ok(())
+        })?;
 
     check_cancel(options)?;
 
-    // Reassemble chunks into repaired slices.
-    for (ci, &chunk_start) in word_chunks.iter().enumerate() {
-        let chunk_end = (chunk_start + chunk_size).min(word_count);
-        let chunk_len = chunk_end - chunk_start;
-        let byte_start = chunk_start * 2;
-
-        for j in 0..n {
-            repaired_slices[j][byte_start..byte_start + chunk_len * 2]
-                .copy_from_slice(&chunk_results[ci][j]);
-        }
-
-        if let Some(ref progress) = options.progress {
-            progress(ProgressUpdate {
-                stage: ProgressStage::Repairing,
-                current: ci as u32 + 1,
-                total: total_chunks,
-                bytes_processed: (ci + 1) as u64 * chunk_size as u64 * 2,
-            });
-        }
-    }
-
     // Step 3: Write repaired slices back to files.
     info!("writing repaired slices to files");
+    let write_targets = build_write_targets(plan, par2_set)?;
 
-    for (j, (file_id, local_slice)) in plan.missing_slices.iter().enumerate() {
+    for (j, target) in write_targets.iter().enumerate() {
         check_cancel(options)?;
 
-        let offset = *local_slice as u64 * plan.slice_size;
-
-        let desc =
-            par2_set
-                .file_description(file_id)
-                .ok_or_else(|| Par2Error::ReedSolomonError {
-                    reason: format!("file description not found for {file_id}"),
-                })?;
-        let file_end = desc.length;
-        let slice_end = offset + plan.slice_size;
-        let write_len = if slice_end > file_end {
-            (file_end - offset) as usize
+        let slice_end = target.offset + plan.slice_size;
+        let write_len = if slice_end > target.file_end {
+            (target.file_end - target.offset) as usize
         } else {
             slice_size
         };
 
         file_access
-            .write_file_range(file_id, offset, &repaired_slices[j][..write_len])
+            .write_file_range(
+                &target.file_id,
+                target.offset,
+                &repaired_slices[j][..write_len],
+            )
             .map_err(|e| Par2Error::RepairWriteFailed {
-                filename: desc.filename.clone(),
-                offset,
+                filename: target.filename.clone(),
+                offset: target.offset,
                 source: e,
             })?;
 
         debug!(
-            "repaired slice {local_slice} of file {} ({write_len} bytes at offset {offset})",
-            desc.filename
+            "repaired slice {} of file {} ({write_len} bytes at offset {})",
+            plan.missing_slices[j].1, target.filename, target.offset
         );
 
         if let Some(ref progress) = options.progress {
@@ -458,6 +595,156 @@ pub fn reconstruct_and_write(
     }
 
     info!("repair complete: {} slices restored", n);
+    Ok(())
+}
+
+fn execute_repair_streaming(
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    options: &RepairOptions,
+    chunk_words: usize,
+    budget: usize,
+) -> Result<()> {
+    let n = plan.missing_slices.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let slice_size = plan.slice_size as usize;
+    assert!(
+        slice_size.is_multiple_of(2),
+        "PAR2 slice_size must be a multiple of 2"
+    );
+    let word_count = slice_size / 2;
+    let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
+    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_words).collect();
+    let total_chunks = word_chunks.len() as u32;
+    let write_targets = build_write_targets(plan, par2_set)?;
+    let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
+    let max_byte_len = chunk_words * 2;
+    let mut recovery_chunks: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
+    let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
+    let mut input_chunk = vec![0u8; max_byte_len];
+
+    info!(
+        missing_slices = n,
+        chunk_bytes = chunk_words * 2,
+        budget_bytes = budget,
+        "repairing with streamed chunk path"
+    );
+
+    for (chunk_idx, &chunk_start) in word_chunks.iter().enumerate() {
+        check_cancel(options)?;
+
+        let chunk_end = (chunk_start + chunk_words).min(word_count);
+        let chunk_len = chunk_end - chunk_start;
+        let byte_start = chunk_start * 2;
+        let byte_len = chunk_len * 2;
+
+        for (chunk, &exp) in recovery_chunks
+            .iter_mut()
+            .zip(plan.recovery_exponents.iter())
+        {
+            let rs =
+                par2_set
+                    .recovery_slices
+                    .get(&exp)
+                    .ok_or_else(|| Par2Error::ReedSolomonError {
+                        reason: format!("recovery block with exponent {exp} not found"),
+                    })?;
+            fill_recovery_chunk(
+                &rs.data,
+                byte_start,
+                &mut chunk[..byte_len],
+                &mut recovery_files,
+            )
+            .map_err(Par2Error::Io)?;
+        }
+
+        for global_idx in 0..plan.total_input_slices {
+            if missing_set.contains(&global_idx) {
+                continue;
+            }
+
+            if global_idx % 64 == 0 {
+                check_cancel(options)?;
+            }
+
+            let (file_id, local_slice) = plan.global_to_file[global_idx];
+            let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
+            let read_len = file_access
+                .read_file_range_into(&file_id, offset, &mut input_chunk[..byte_len])
+                .map_err(Par2Error::Io)?;
+            input_chunk[read_len..byte_len].fill(0);
+
+            recovery_chunks
+                .par_iter_mut()
+                .zip(plan.recovery_exponents.par_iter())
+                .for_each(|(recovery, &exp)| {
+                    let factor = gf::pow(plan.constants[global_idx], exp);
+                    if factor != 0 {
+                        crate::gf_simd::mul_acc_region(
+                            factor,
+                            &input_chunk[..byte_len],
+                            &mut recovery[..byte_len],
+                        );
+                    }
+                });
+        }
+
+        for chunk in &mut chunk_output {
+            chunk[..byte_len].fill(0);
+        }
+        for (r, recovery) in recovery_chunks.iter().enumerate() {
+            let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> = chunk_output
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(j, chunk_out)| {
+                    let factor = plan.decode_matrix[j][r];
+                    if factor != 0 {
+                        Some(crate::gf_simd::FactorDst {
+                            factor,
+                            dst: &mut chunk_out[..byte_len],
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !pairs.is_empty() {
+                crate::gf_simd::mul_acc_multi_region(&mut pairs, &recovery[..byte_len]);
+            }
+        }
+
+        for (j, target) in write_targets.iter().enumerate() {
+            let write_offset = target.offset + byte_start as u64;
+            let remaining = target.file_end.saturating_sub(write_offset);
+            let write_len = remaining.min(byte_len as u64) as usize;
+            if write_len == 0 {
+                continue;
+            }
+
+            file_access
+                .write_file_range(&target.file_id, write_offset, &chunk_output[j][..write_len])
+                .map_err(|e| Par2Error::RepairWriteFailed {
+                    filename: target.filename.clone(),
+                    offset: write_offset,
+                    source: e,
+                })?;
+        }
+
+        if let Some(ref progress) = options.progress {
+            progress(ProgressUpdate {
+                stage: ProgressStage::Repairing,
+                current: chunk_idx as u32 + 1,
+                total: total_chunks,
+                bytes_processed: (chunk_idx + 1) as u64 * chunk_words as u64 * 2,
+            });
+        }
+    }
+
+    info!("streaming repair complete: {} slices restored", n);
     Ok(())
 }
 
@@ -479,39 +766,60 @@ pub fn execute_repair_with_options(
         "PAR2 slice_size must be a multiple of 2"
     );
 
-    let missing_set: std::collections::HashSet<usize> =
-        plan.missing_global_indices.iter().copied().collect();
-
-    // Step 1: Read recovery slice data.
-    info!("reading recovery blocks and computing adjusted syndromes");
-    let mut recovery_buffers = prepare_recovery_buffers(plan, par2_set, options)?;
-
-    // XOR out known input slice contributions from each recovery block.
-    for global_idx in 0..plan.total_input_slices {
-        if missing_set.contains(&global_idx) {
-            continue;
+    match select_repair_execution_mode(plan, options) {
+        RepairExecutionMode::Streaming {
+            chunk_words,
+            budget,
+        } => {
+            return execute_repair_streaming(
+                plan,
+                par2_set,
+                file_access,
+                options,
+                chunk_words,
+                budget,
+            );
         }
+        RepairExecutionMode::InMemory { chunk_words } => {
+            let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
+            let mut input_data = vec![0u8; slice_size];
 
-        // Check cancellation every 64 input slices.
-        if global_idx % 64 == 0
-            && let Some(ref cancel) = options.cancel
-            && cancel.is_cancelled()
-        {
-            return Err(Par2Error::Cancelled);
+            // Step 1: Read recovery slice data.
+            info!("reading recovery blocks and computing adjusted syndromes");
+            let mut recovery_buffers = prepare_recovery_buffers(plan, par2_set, options)?;
+
+            // XOR out known input slice contributions from each recovery block.
+            for global_idx in 0..plan.total_input_slices {
+                if missing_set.contains(&global_idx) {
+                    continue;
+                }
+
+                // Check cancellation every 64 input slices.
+                if global_idx % 64 == 0 {
+                    check_cancel(options)?;
+                }
+
+                let (file_id, local_slice) = plan.global_to_file[global_idx];
+                let offset = local_slice as u64 * plan.slice_size;
+                let read_len = file_access
+                    .read_file_range_into(&file_id, offset, &mut input_data)
+                    .map_err(Par2Error::Io)?;
+                input_data[read_len..].fill(0);
+
+                xor_out_slice(&mut recovery_buffers, plan, global_idx, &input_data);
+            }
+
+            // Step 2 + 3: Multiply and write.
+            reconstruct_and_write(
+                plan,
+                par2_set,
+                recovery_buffers,
+                file_access,
+                chunk_words,
+                options,
+            )
         }
-
-        let (file_id, local_slice) = plan.global_to_file[global_idx];
-        let offset = local_slice as u64 * plan.slice_size;
-        let mut input_data = file_access
-            .read_file_range(&file_id, offset, plan.slice_size)
-            .map_err(Par2Error::Io)?;
-        input_data.resize(slice_size, 0);
-
-        xor_out_slice(&mut recovery_buffers, plan, global_idx, &input_data);
     }
-
-    // Step 2 + 3: Multiply and write.
-    reconstruct_and_write(plan, par2_set, recovery_buffers, file_access, options)
 }
 
 #[cfg(test)]
@@ -524,6 +832,7 @@ mod tests {
     use crate::verify::{self, MemoryFileAccess};
     use bytes::Bytes;
     use md5::{Digest, Md5};
+    use tempfile::tempdir;
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -649,12 +958,23 @@ mod tests {
                 exp,
                 RecoverySlice {
                     exponent: exp,
-                    data: Bytes::from(recovery),
+                    data: Bytes::from(recovery).into(),
                 },
             );
         }
 
         (set, file_id)
+    }
+
+    fn spill_recovery_slices_to_disk(set: &mut Par2FileSet) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        for (exp, slice) in &mut set.recovery_slices {
+            let path = dir.path().join(format!("recovery_{exp}.bin"));
+            let bytes = slice.data.to_vec().unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            slice.data = crate::packet::RecoverySliceData::file_backed(path, 0, bytes.len());
+        }
+        dir
     }
 
     #[test]
@@ -809,5 +1129,113 @@ mod tests {
 
         let repaired = access.read_file(&file_id).unwrap();
         assert_eq!(repaired, file_data);
+    }
+
+    #[test]
+    fn repair_with_tiny_memory_limit_still_succeeds() {
+        let slice_size = 128u64;
+        let file_data: Vec<u8> = (0..384u32).map(|i| ((i * 9 + 17) % 256) as u8).collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 3);
+
+        let mut damaged = file_data.clone();
+        for item in damaged.iter_mut().take(128) {
+            *item = 0;
+        }
+        for item in damaged.iter_mut().take(384).skip(256) {
+            *item = 0;
+        }
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        let plan = plan_repair(&par2_set, &result).unwrap();
+
+        execute_repair_with_options(
+            &plan,
+            &par2_set,
+            &mut access,
+            &RepairOptions {
+                memory_limit: Some(1),
+                ..RepairOptions::default()
+            },
+        )
+        .unwrap();
+
+        let repaired = access.read_file(&file_id).unwrap();
+        assert_eq!(repaired, file_data);
+    }
+
+    #[test]
+    fn repair_with_file_backed_recovery_streaming_succeeds() {
+        let slice_size = 128u64;
+        let file_data: Vec<u8> = (0..384u32).map(|i| ((i * 9 + 17) % 256) as u8).collect();
+        let (mut par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 3);
+        let _spill_dir = spill_recovery_slices_to_disk(&mut par2_set);
+
+        let mut damaged = file_data.clone();
+        for item in damaged.iter_mut().take(128) {
+            *item = 0;
+        }
+        for item in damaged.iter_mut().take(384).skip(256) {
+            *item = 0;
+        }
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        let plan = plan_repair(&par2_set, &result).unwrap();
+
+        execute_repair_with_options(
+            &plan,
+            &par2_set,
+            &mut access,
+            &RepairOptions {
+                memory_limit: Some(1),
+                ..RepairOptions::default()
+            },
+        )
+        .unwrap();
+
+        let repaired = access.read_file(&file_id).unwrap();
+        assert_eq!(repaired, file_data);
+    }
+
+    fn synthetic_plan(missing_slices: usize, slice_size: u64) -> RepairPlan {
+        RepairPlan {
+            missing_slices: (0..missing_slices)
+                .map(|i| (FileId::from_bytes([i as u8; 16]), i as u32))
+                .collect(),
+            missing_global_indices: (0..missing_slices).collect(),
+            recovery_exponents: (0..missing_slices as u32).collect(),
+            decode_matrix: vec![vec![1; missing_slices]; missing_slices],
+            slice_size,
+            constants: vec![1; missing_slices],
+            total_input_slices: missing_slices,
+            global_to_file: (0..missing_slices)
+                .map(|i| (FileId::from_bytes([i as u8; 16]), i as u32))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn repair_selector_prefers_streaming_when_budget_is_tight() {
+        let plan = synthetic_plan(450, 64 * 1024);
+        let mode = select_repair_execution_mode(&plan, &RepairOptions::default());
+        assert!(matches!(mode, RepairExecutionMode::Streaming { .. }));
+    }
+
+    #[test]
+    fn repair_selector_keeps_fast_path_when_budget_allows() {
+        let plan = synthetic_plan(8, 64 * 1024);
+        let mode = select_repair_execution_mode(
+            &plan,
+            &RepairOptions {
+                memory_limit: Some(16 * 1024 * 1024),
+                ..RepairOptions::default()
+            },
+        );
+        assert!(matches!(mode, RepairExecutionMode::InMemory { .. }));
     }
 }

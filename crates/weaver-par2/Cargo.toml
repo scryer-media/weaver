@@ -17,7 +17,15 @@ bytes = { workspace = true }
 crc32fast = { workspace = true }
 md-5 = { workspace = true }
 rayon = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+libc = { workspace = true }
 weaver-rar = { path = "../weaver-rar" }
+criterion = "0.5"
+
+[[bench]]
+name = "par2_repair"
+path = "benches/par2_repair.rs"
+harness = false

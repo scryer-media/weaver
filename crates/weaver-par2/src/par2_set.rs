@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
-use bytes::Bytes;
 use tracing::{debug, warn};
 
 use crate::error::{Par2Error, Result};
-use crate::packet::{Packet, scan_packets};
+use crate::packet::{Packet, RecoverySliceData, scan_packets, scan_packets_from_path};
 use crate::types::{FileId, RecoveryExponent, RecoverySetId, SliceChecksum};
 
 /// Description of a single file in the PAR2 set.
@@ -21,7 +21,7 @@ pub struct FileDescription {
 #[derive(Debug, Clone)]
 pub struct RecoverySlice {
     pub exponent: RecoveryExponent,
-    pub data: Bytes,
+    pub data: RecoverySliceData,
 }
 
 /// Aggregated state from one or more .par2 files.
@@ -58,6 +58,22 @@ impl Par2FileSet {
         for (i, data) in par2_files.iter().enumerate() {
             debug!("scanning par2 file {} ({} bytes)", i, data.len());
             let packets = scan_packets(data, 0);
+            for (packet, offset) in packets {
+                builder.add_packet(packet, offset)?;
+            }
+        }
+
+        builder.build()
+    }
+
+    /// Create a new Par2FileSet by parsing packets directly from one or more
+    /// on-disk .par2 files. Recovery slice payloads are kept file-backed.
+    pub fn from_paths<P: AsRef<Path>>(par2_files: &[P]) -> Result<Self> {
+        let mut builder = Par2FileSetBuilder::new();
+
+        for (i, path) in par2_files.iter().enumerate() {
+            debug!("scanning par2 file {} ({})", i, path.as_ref().display());
+            let packets = scan_packets_from_path(path.as_ref())?;
             for (packet, offset) in packets {
                 builder.add_packet(packet, offset)?;
             }
@@ -357,6 +373,7 @@ mod tests {
     use super::*;
     use crate::packet::header;
     use md5::{Digest, Md5};
+    use tempfile::tempdir;
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -489,6 +506,37 @@ mod tests {
         assert_eq!(set.files.len(), 1);
         assert_eq!(set.recovery_block_count(), 1);
         assert!(set.recovery_slices.contains_key(&0));
+    }
+
+    #[test]
+    fn build_par2_set_from_paths_keeps_recovery_file_backed() {
+        let file_id_a = [0x01; 16];
+        let main_body = make_main_body(1024, &[file_id_a]);
+        let rsid = compute_rsid(&main_body);
+
+        let mut recovery_body = Vec::new();
+        recovery_body.extend_from_slice(&0u32.to_le_bytes());
+        recovery_body.extend_from_slice(&[0xAB; 1024]);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
+        stream.extend_from_slice(&make_full_packet(
+            header::TYPE_RECOVERY,
+            &recovery_body,
+            rsid,
+        ));
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.par2");
+        std::fs::write(&path, &stream).unwrap();
+
+        let set = Par2FileSet::from_paths(&[path]).unwrap();
+        let recovery = set.recovery_slices.get(&0).unwrap();
+        assert!(recovery.data.as_bytes().is_none());
+
+        let mut head = vec![0u8; 16];
+        recovery.data.read_range_padded(0, &mut head).unwrap();
+        assert_eq!(head, vec![0xAB; 16]);
     }
 
     #[test]

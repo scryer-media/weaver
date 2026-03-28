@@ -174,7 +174,7 @@ fn parse_next_block(
 
     let table_set_index = if table_present || table_sets.is_empty() {
         let pos_before = reader.position();
-            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths)?;
+        let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths)?;
         let bits_used = (reader.position() - pos_before) as i64;
         block_bits_remaining -= bits_used;
         table_sets.push(TableSet {
@@ -606,22 +606,22 @@ fn parallel_decode_batch(
         .collect::<RarResult<Vec<_>>>()
 }
 
-    fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
-        thread_count
+fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
+    thread_count
         .clamp(1, MAX_PARALLEL_THREADS)
         .saturating_mul(BLOCKS_PER_THREAD)
         .max(MIN_PARALLEL_BLOCKS)
         .min(block_count)
-    }
+}
 
-    fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: usize) -> usize {
-        let max_end = start.saturating_add(batch_size).min(blocks.len());
-        let mut end = start;
-        while end < max_end && !blocks[end].is_large {
-            end += 1;
-        }
-        end
+fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: usize) -> usize {
+    let max_end = start.saturating_add(batch_size).min(blocks.len());
+    let mut end = start;
+    while end < max_end && !blocks[end].is_large {
+        end += 1;
     }
+    end
+}
 
 // ─── Public entry point ──────────────────────────────────────────────────────
 
@@ -649,7 +649,8 @@ impl LzDecoder {
             None
         };
 
-        let preparsed = preparse_complete_blocks(input, &mut self.code_lengths, existing_tables.as_ref())?;
+        let preparsed =
+            preparse_complete_blocks(input, &mut self.code_lengths, existing_tables.as_ref())?;
         if preparsed.blocks.is_empty() {
             return Ok(0);
         }

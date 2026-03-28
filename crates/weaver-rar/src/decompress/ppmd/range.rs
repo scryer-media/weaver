@@ -293,7 +293,10 @@ mod tests {
         let mut bit_reader = BitReader::new(&input);
         let streaming = BitReadRangeDecoder::new(&mut bit_reader).unwrap();
 
-        assert_eq!(slice.get_current_count(256), streaming.get_current_count(256));
+        assert_eq!(
+            slice.get_current_count(256),
+            streaming.get_current_count(256)
+        );
         assert_eq!(slice.get_threshold(256), streaming.get_threshold(256));
         assert_eq!(slice.position(), streaming.position());
     }

@@ -1858,6 +1858,16 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest",
+ "md5-asm",
+]
+
+[[package]]
+name = "md5-asm"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d19b8ee7fc7d812058d3b708c7f719efd0713d53854648e4223c6fcae709e2df"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -3732,7 +3742,10 @@ version = "0.1.45"
 dependencies = [
  "bytes",
  "crc32fast",
+ "criterion",
+ "libc",
  "md-5",
+ "memmap2",
  "rayon",
  "tempfile",
  "thiserror",
@@ -3751,6 +3764,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "hmac",
+ "memchr",
  "memmap2",
  "pbkdf2",
  "rayon",

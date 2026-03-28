@@ -74,3 +74,5 @@ make_set "rar:latest" "" "-m5" "" "fixture_rar5_lz_plain" "$FIXTURE_DIR/rar5_lz_
 make_set "rar:4" "-ma4" "-m0" "-ptestpass123" "fixture_rar4_store_enc" "$FIXTURE_DIR/rar4_store_enc"
 
 echo "Generated PAR2 real-world fixtures."
+echo ""
+echo "NOTE: rar5_heavy_damage is generated separately via generate_heavy_damage.sh"

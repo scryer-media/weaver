@@ -2280,7 +2280,8 @@ fn test_rar5_solid_streaming_extracts_all_members_sequentially() {
         password: None,
     };
 
-    let mut expected_archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
@@ -2307,7 +2308,8 @@ fn test_rar5_solid_streaming_chunked_preserves_solid_continuation() {
         password: None,
     };
 
-    let mut expected_archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let expected_first = expected_archive.extract_member(0, &options, None).unwrap();
     let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
 
@@ -2589,7 +2591,8 @@ fn test_rar4_solid_streaming_extracts_all_members_sequentially() {
         password: None,
     };
 
-    let mut expected_archive = weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let mut expected_archive =
+        weaver_rar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let metadata = expected_archive.metadata().clone();
     let expected_outputs = (0..metadata.members.len())
         .map(|member_index| {

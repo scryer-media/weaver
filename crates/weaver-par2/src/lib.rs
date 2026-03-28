@@ -37,7 +37,7 @@ pub use gf_simd::{FactorDst, mul_acc_multi_region, mul_acc_region};
 pub use matrix::{Matrix, build_decode_matrix};
 pub use packet::{
     CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, Packet, PacketHeader, PacketType,
-    RecoverySlicePacket, parse_packet, scan_packets,
+    RecoverySliceData, RecoverySlicePacket, parse_packet, scan_packets, scan_packets_from_path,
 };
 pub use par2_set::{
     FileDescription, MergeResult, Par2Diagnostic, Par2FileSet, Par2ParseResult, RecoverySlice,

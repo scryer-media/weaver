@@ -779,7 +779,7 @@ mod tests {
                     r,
                     RecoverySlice {
                         exponent: r,
-                        data: Bytes::from(recovery),
+                        data: Bytes::from(recovery).into(),
                     },
                 );
             }

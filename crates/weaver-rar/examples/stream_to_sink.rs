@@ -11,9 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(arg) = args.next() {
         if arg == "--password" {
-            let value = args
-                .next()
-                .ok_or("missing value after --password")?;
+            let value = args.next().ok_or("missing value after --password")?;
             password = Some(value);
             continue;
         }
@@ -22,7 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if paths.is_empty() {
-        return Err("usage: stream_to_sink [--password PASSWORD] <archive> [more-volumes...]".into());
+        return Err(
+            "usage: stream_to_sink [--password PASSWORD] <archive> [more-volumes...]".into(),
+        );
     }
 
     let first = File::open(&paths[0])?;

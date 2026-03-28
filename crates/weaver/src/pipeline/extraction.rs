@@ -507,10 +507,7 @@ impl Pipeline {
             return;
         };
         match &state.status {
-            JobStatus::Downloading
-            | JobStatus::Verifying
-            | JobStatus::Paused
-            | JobStatus::Extracting => {}
+            JobStatus::Downloading | JobStatus::Verifying | JobStatus::Extracting => {}
             _ => return,
         }
 
@@ -556,6 +553,12 @@ impl Pipeline {
             })
             .collect();
         ready_sets.sort_by(|a, b| a.0.cmp(&b.0));
+        if ready_sets.is_empty() {
+            return;
+        }
+        if !self.maybe_start_extraction(job_id).await {
+            return;
+        }
 
         let mut scheduled_slots = 0usize;
         for (set_name, ready_members) in ready_sets {
@@ -950,6 +953,18 @@ impl Pipeline {
                     self.check_job_completion(job_id).await;
                 } else {
                     self.try_rar_extraction(job_id).await;
+                    if !self.has_active_rar_workers(job_id)
+                        && self
+                            .jobs
+                            .get(&job_id)
+                            .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
+                    {
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
+                    }
                 }
             }
             ExtractionDone::FullSet {
@@ -1034,14 +1049,11 @@ impl Pipeline {
                     if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                         sets.remove(&set_name);
                     }
-                    // Fail the job.
-                    if let Some(state) = self.jobs.get_mut(&job_id) {
-                        state.status = JobStatus::Failed { error: e.clone() };
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::ExtractionFailed { job_id, error: e });
-                        self.record_job_history(job_id);
-                    }
+                    let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
+                        job_id,
+                        error: e.clone(),
+                    });
+                    self.fail_job(job_id, e);
                 }
             },
         }

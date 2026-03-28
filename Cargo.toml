@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
 async-graphql = "7.0"
 crc32fast = "1.4"
-md-5 = "0.10"
+md-5 = { version = "0.10", features = ["asm"] }
 blake2 = "0.10"
 aes = "0.8"
 aes-gcm = "0.10"

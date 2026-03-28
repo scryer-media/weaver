@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
-use rayon::prelude::*;
-
 use crate::checksum;
 use crate::par2_set::Par2FileSet;
 use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
@@ -12,6 +10,19 @@ use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, P
 pub trait FileAccess {
     /// Read a range of bytes from a file identified by its FileId.
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>>;
+
+    /// Read bytes into a caller-provided buffer, returning the number of bytes read.
+    fn read_file_range_into(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        let data = self.read_file_range(file_id, offset, dst.len() as u64)?;
+        let read_len = data.len().min(dst.len());
+        dst[..read_len].copy_from_slice(&data[..read_len]);
+        Ok(read_len)
+    }
 
     /// Check if a file exists on disk.
     fn file_exists(&self, file_id: &FileId) -> bool;
@@ -61,6 +72,26 @@ impl FileAccess for MemoryFileAccess {
             return Ok(Vec::new());
         }
         Ok(data[offset..end].to_vec())
+    }
+
+    fn read_file_range_into(
+        &self,
+        file_id: &FileId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        let data = self
+            .files
+            .get(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+        let offset = offset as usize;
+        if offset >= data.len() {
+            return Ok(0);
+        }
+        let end = (offset + dst.len()).min(data.len());
+        let read_len = end - offset;
+        dst[..read_len].copy_from_slice(&data[offset..end]);
+        Ok(read_len)
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -200,14 +231,27 @@ pub fn verify_full_hash(
     access: &dyn FileAccess,
 ) -> Option<bool> {
     let desc = par2.file_description(file_id)?;
-
-    let data = access.read_file(file_id).ok()?;
-    if data.len() as u64 != desc.length {
+    let actual_len = access.file_length(file_id)?;
+    if actual_len != desc.length {
         return Some(false);
     }
+    let mut state = checksum::FileHashState::new();
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
 
-    let hash = checksum::md5(&data);
-    Some(hash == desc.hash_full)
+    while offset < actual_len {
+        let chunk_len = ((actual_len - offset) as usize).min(buf.len());
+        let read_len = access
+            .read_file_range_into(file_id, offset, &mut buf[..chunk_len])
+            .ok()?;
+        if read_len == 0 {
+            return Some(false);
+        }
+        state.update(&buf[..read_len]);
+        offset += read_len as u64;
+    }
+
+    Some(state.finalize() == desc.hash_full)
 }
 
 /// Perform slice-level verification of a single file.
@@ -221,67 +265,69 @@ pub fn verify_slices(
     let _desc = par2.file_description(file_id)?;
     let checksums = par2.file_checksums(file_id)?;
     let slice_size = par2.slice_size;
+    let slice_size_usize = slice_size as usize;
 
     if !access.file_exists(file_id) {
         return Some(vec![false; checksums.len()]);
     }
 
-    let file_data = access.read_file(file_id).ok()?;
+    let file_len = access.file_length(file_id).unwrap_or(0);
 
-    // Process slices in batches of 4 for multi-buffer MD5.
     let mut results = vec![false; checksums.len()];
+    let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; slice_size_usize]).collect();
 
-    results
-        .par_chunks_mut(4)
-        .enumerate()
-        .for_each(|(chunk_idx, result_chunk)| {
-            let base = chunk_idx * 4;
-            let batch_size = result_chunk.len();
+    for (chunk_idx, result_chunk) in results.chunks_mut(4).enumerate() {
+        let base = chunk_idx * 4;
+        let batch_size = result_chunk.len();
 
-            // Gather slice data and compute CRC32 per-slice.
-            let mut slice_refs: Vec<&[u8]> = Vec::with_capacity(batch_size);
-            let mut crcs: Vec<u32> = Vec::with_capacity(batch_size);
-            let mut any_needs_pad = false;
+        let mut read_lens = vec![0usize; batch_size];
+        let mut crcs: Vec<u32> = Vec::with_capacity(batch_size);
+        let mut any_needs_pad = false;
 
-            for j in 0..batch_size {
-                let i = base + j;
-                let offset = i as u64 * slice_size;
-                let end = ((offset + slice_size) as usize).min(file_data.len());
-                if offset as usize >= file_data.len() {
-                    slice_refs.push(&[]);
-                    crcs.push(0);
-                    continue;
-                }
-                let data = &file_data[offset as usize..end];
-                slice_refs.push(data);
-
-                // CRC32 with zero-padding for partial last slice.
-                let pad_len = slice_size.saturating_sub(data.len() as u64);
-                if pad_len > 0 {
-                    let mut hasher = crc32fast::Hasher::new();
-                    hasher.update(data);
-                    hasher.update(&vec![0u8; pad_len as usize]);
-                    crcs.push(hasher.finalize());
-                    any_needs_pad = true;
-                } else {
-                    crcs.push(checksum::crc32(data));
-                }
+        for j in 0..batch_size {
+            let i = base + j;
+            let offset = i as u64 * slice_size;
+            if offset >= file_len {
+                crcs.push(0);
+                read_lens[j] = 0;
+                any_needs_pad = true;
+                continue;
             }
 
-            // Multi-buffer MD5 for the batch.
-            let pad_to = if any_needs_pad {
-                Some(slice_size)
+            let expected_len = (file_len - offset).min(slice_size) as usize;
+            buffers[j].fill(0);
+            let read_len = access
+                .read_file_range_into(file_id, offset, &mut buffers[j][..expected_len])
+                .ok()?;
+            read_lens[j] = read_len;
+
+            let pad_len = slice_size_usize.saturating_sub(read_len);
+            if pad_len > 0 {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&buffers[j][..read_len]);
+                hasher.update(&vec![0u8; pad_len]);
+                crcs.push(hasher.finalize());
+                any_needs_pad = true;
             } else {
-                None
-            };
-            let md5s = crate::md5_simd::md5_multi(&slice_refs, pad_to);
-
-            // Compare.
-            for j in 0..batch_size {
-                let i = base + j;
-                result_chunk[j] = crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
+                crcs.push(checksum::crc32(&buffers[j][..read_len]));
             }
-        });
+        }
+
+        let slice_refs: Vec<&[u8]> = (0..batch_size)
+            .map(|j| &buffers[j][..read_lens[j]])
+            .collect();
+        let pad_to = if any_needs_pad {
+            Some(slice_size)
+        } else {
+            None
+        };
+        let md5s = crate::md5_simd::md5_multi(&slice_refs, pad_to);
+
+        for j in 0..batch_size {
+            let i = base + j;
+            result_chunk[j] = crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
+        }
+    }
 
     Some(results)
 }
@@ -872,14 +918,14 @@ mod tests {
             0,
             RecoverySlice {
                 exponent: 0,
-                data: Bytes::from(vec![0u8; 1024]),
+                data: Bytes::from(vec![0u8; 1024]).into(),
             },
         );
         set.recovery_slices.insert(
             1,
             RecoverySlice {
                 exponent: 1,
-                data: Bytes::from(vec![0u8; 1024]),
+                data: Bytes::from(vec![0u8; 1024]).into(),
             },
         );
 

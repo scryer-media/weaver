@@ -190,6 +190,10 @@ pub struct Pipeline {
     pub(super) active_download_passes: HashSet<JobId>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
+    /// In-flight decode task count per job.
+    pub(super) active_decodes_by_job: HashMap<JobId, usize>,
+    /// Delayed retry tasks that have been scheduled but not yet re-queued.
+    pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).
@@ -200,6 +204,8 @@ pub struct Pipeline {
     pub(super) segment_batch: Vec<CommittedSegment>,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
+    /// Jobs that should re-enter completion/post-processing on the next loop pass.
+    pub(super) pending_completion_checks: VecDeque<JobId>,
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
@@ -345,11 +351,14 @@ impl Pipeline {
             active_recovery: 0,
             active_download_passes: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
+            active_decodes_by_job: HashMap::new(),
+            pending_retries_by_job: HashMap::new(),
             intermediate_dir,
             complete_dir,
             nzb_dir,
             segment_batch: Vec::new(),
             pending_decode: VecDeque::new(),
+            pending_completion_checks: VecDeque::new(),
             download_done_tx,
             download_done_rx,
             decode_done_tx,
@@ -426,6 +435,11 @@ impl Pipeline {
             // before dispatching more downloads.
             self.pump_decode_queue();
 
+            while let Some(job_id) = self.pending_completion_checks.pop_front() {
+                self.check_job_completion(job_id).await;
+                self.pump_decode_queue();
+            }
+
             // Dispatch pending downloads up to concurrency limit.
             self.dispatch_downloads();
 
@@ -480,6 +494,7 @@ impl Pipeline {
                 // Delayed retries arriving after backoff sleep.
                 Some(work) = self.retry_rx.recv() => {
                     let job_id = work.segment_id.file_id.job_id;
+                    self.note_retry_requeued(job_id);
                     if let Some(state) = self.jobs.get_mut(&job_id) {
                         if work.is_recovery {
                             state.recovery_queue.push(work);
@@ -594,7 +609,7 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::PauseJob { job_id, reply } => {
-                let result = self.set_job_status(job_id, JobStatus::Paused);
+                let result = self.pause_job_runtime(job_id);
                 if result.is_ok() {
                     if self.active_download_passes.remove(&job_id) {
                         let _ = self
@@ -611,14 +626,9 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::ResumeJob { job_id, reply } => {
-                let result = self.set_job_status(job_id, JobStatus::Downloading);
+                let result = self.resume_job_runtime(job_id);
                 if result.is_ok() {
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.set_active_job_status(job_id, "downloading", None) {
-                            error!(error = %e, "db write failed for ResumeJob");
-                        }
-                    });
                 }
                 let _ = reply.send(result);
             }
@@ -626,6 +636,7 @@ impl Pipeline {
                 let result = if let Some(state) = self.jobs.remove(&job_id) {
                     // Per-job queues are dropped with the JobState.
                     self.job_order.retain(|id| *id != job_id);
+                    self.remove_pending_completion_check(job_id);
                     self.update_queue_metrics();
 
                     // Archive cancelled job: move to history + delete active state.
@@ -1647,6 +1658,7 @@ mod tests {
                 servers: vec![],
                 max_idle_age: Duration::from_secs(1),
                 max_retries_per_server: 1,
+                soft_timeout: Duration::from_secs(15),
             });
             let profile = SystemProfile {
                 cpu: CpuProfile {
@@ -1740,11 +1752,15 @@ mod tests {
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
             working_dir,
             downloaded_bytes: 0,
             failed_bytes: 0,
             par2_bytes: 0,
             health_probing: false,
+            last_health_probe_failed_bytes: 0,
             held_segments: Vec::new(),
             download_queue: DownloadQueue::new(),
             recovery_queue: DownloadQueue::new(),
@@ -1809,6 +1825,7 @@ mod tests {
             servers: vec![],
             max_idle_age: Duration::from_secs(1),
             max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
         });
         let profile = SystemProfile {
             cpu: CpuProfile {
@@ -2378,11 +2395,15 @@ mod tests {
                 extraction_depth: 0,
                 created_at: std::time::Instant::now(),
                 created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir: working_dir.clone(),
                 downloaded_bytes: 0,
                 failed_bytes: 0,
                 par2_bytes,
                 health_probing: false,
+                last_health_probe_failed_bytes: 0,
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
@@ -2955,6 +2976,138 @@ mod tests {
             job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
         ));
+    }
+
+    #[tokio::test]
+    async fn transient_retry_backoff_does_not_fail_job_early() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(20008);
+        let spec = segmented_job_spec("Retry Backoff Guard", "retry.bin", &[128, 128]);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        pipeline.active_downloads = 1;
+        pipeline.active_download_passes.insert(job_id);
+        pipeline.active_downloads_by_job.insert(job_id, 1);
+
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                    segment_number: 0,
+                },
+                data: Err("connection reset by peer".to_string()),
+                is_recovery: false,
+                retry_count: 0,
+            })
+            .await;
+
+        assert_eq!(
+            pipeline.pending_retries_by_job.get(&job_id).copied(),
+            Some(1)
+        );
+        assert!(pipeline.pending_completion_checks.is_empty());
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Downloading)
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_incomplete_download_fails_instead_of_hanging() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(20009);
+        let filename = "stalled.bin";
+        let first_segment_size = 6400u32;
+        let second_segment_size = 128u32;
+        let total_size = (first_segment_size + second_segment_size) as u64;
+        let spec = segmented_job_spec(
+            "Incomplete Exhausted",
+            filename,
+            &[first_segment_size, second_segment_size],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+        }
+
+        pipeline.active_downloads = 1;
+        pipeline.active_download_passes.insert(job_id);
+        pipeline.active_downloads_by_job.insert(job_id, 1);
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                    segment_number: 0,
+                },
+                data: Ok(encode_article_part(
+                    filename,
+                    &vec![1u8; first_segment_size as usize],
+                    1,
+                    2,
+                    1,
+                    total_size,
+                )),
+                is_recovery: false,
+                retry_count: 0,
+            })
+            .await;
+        drain_decode_results(&mut pipeline, 1).await;
+
+        assert_eq!(
+            pipeline.jobs.get(&job_id).unwrap().assembly.complete_data_file_count(),
+            0
+        );
+
+        pipeline.active_downloads = 1;
+        pipeline.active_download_passes.insert(job_id);
+        pipeline.active_downloads_by_job.insert(job_id, 1);
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                    segment_number: 1,
+                },
+                data: Err("connection reset by peer".to_string()),
+                is_recovery: false,
+                retry_count: MAX_SEGMENT_RETRIES,
+            })
+            .await;
+
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_id]
+        );
+
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+        }
+
+        let status = job_status_for_assert(&pipeline, job_id).expect("job should be archived");
+        assert!(matches!(status, JobStatus::Failed { .. }), "status: {status:?}");
     }
 
     #[tokio::test]
@@ -5325,6 +5478,413 @@ mod tests {
                 .eagerly_deleted
                 .get(&job_id)
                 .is_some_and(|deleted| deleted.contains("show.part02.rar"))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_completion_clears_health_probing_and_restores_queues() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30020);
+        let spec = standalone_job_spec(
+            "Probe Reset",
+            &[
+                ("probe-a.bin".to_string(), 100),
+                ("probe-b.bin".to_string(), 100),
+                ("probe-c.bin".to_string(), 100),
+            ],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        pipeline.activate_health_probes(job_id);
+
+        {
+            let state = pipeline.jobs.get(&job_id).unwrap();
+            assert!(state.health_probing);
+            assert!(matches!(state.status, JobStatus::Checking));
+            assert_eq!(state.download_queue.len(), 0);
+            assert_eq!(state.recovery_queue.len(), 0);
+            assert_eq!(state.held_segments.len(), 3);
+        }
+
+        pipeline.handle_probe_update(ProbeUpdate {
+            job_id,
+            total: 1,
+            missed: 0,
+            done: true,
+        });
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(!state.health_probing);
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert!(state.held_segments.is_empty());
+        assert_eq!(state.download_queue.len(), 3);
+        assert_eq!(state.recovery_queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_completion_does_not_immediately_reenter_checking() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30021);
+        let spec = standalone_job_spec(
+            "Probe Reentry Guard",
+            &[
+                ("probe-a.bin".to_string(), 100),
+                ("probe-b.bin".to_string(), 100),
+                ("probe-c.bin".to_string(), 100),
+            ],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.failed_bytes = 10;
+        }
+
+        pipeline.activate_health_probes(job_id);
+        pipeline.handle_probe_update(ProbeUpdate {
+            job_id,
+            total: 1,
+            missed: 0,
+            done: true,
+        });
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(!state.health_probing);
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert_eq!(state.last_health_probe_failed_bytes, 10);
+    }
+
+    #[tokio::test]
+    async fn repair_queue_limits_to_one_job() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_a = JobId(31001);
+        let job_b = JobId(31002);
+
+        pipeline.jobs.insert(
+            job_a,
+            minimal_job_state(job_a, "repair-a", temp_dir.path().join("repair-a")),
+        );
+        pipeline.jobs.insert(
+            job_b,
+            minimal_job_state(job_b, "repair-b", temp_dir.path().join("repair-b")),
+        );
+
+        assert!(pipeline.maybe_start_repair(job_a).await);
+        assert_eq!(
+            pipeline.jobs.get(&job_a).map(|state| state.status.clone()),
+            Some(JobStatus::Repairing)
+        );
+        assert_eq!(pipeline.metrics.repair_active.load(Ordering::Relaxed), 1);
+
+        assert!(!pipeline.maybe_start_repair(job_b).await);
+        assert_eq!(
+            pipeline.jobs.get(&job_b).map(|state| state.status.clone()),
+            Some(JobStatus::QueuedRepair)
+        );
+        assert_eq!(pipeline.metrics.repair_active.load(Ordering::Relaxed), 1);
+
+        pipeline.transition_postprocessing_status(
+            job_a,
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+
+        assert_eq!(pipeline.metrics.repair_active.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pipeline.jobs.get(&job_b).map(|state| state.status.clone()),
+            Some(JobStatus::Repairing)
+        );
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_b]
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_queue_limits_to_three_jobs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let jobs = [JobId(31101), JobId(31102), JobId(31103), JobId(31104)];
+
+        for (idx, job_id) in jobs.iter().enumerate() {
+            pipeline.jobs.insert(
+                *job_id,
+                minimal_job_state(
+                    *job_id,
+                    &format!("extract-{idx}"),
+                    temp_dir.path().join(format!("extract-{idx}")),
+                ),
+            );
+        }
+
+        for job_id in jobs.iter().take(3) {
+            assert!(pipeline.maybe_start_extraction(*job_id).await);
+            assert_eq!(
+                pipeline.jobs.get(job_id).map(|state| state.status.clone()),
+                Some(JobStatus::Extracting)
+            );
+        }
+        assert_eq!(pipeline.metrics.extract_active.load(Ordering::Relaxed), 3);
+
+        assert!(!pipeline.maybe_start_extraction(jobs[3]).await);
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&jobs[3])
+                .map(|state| state.status.clone()),
+            Some(JobStatus::QueuedExtract)
+        );
+
+        pipeline.transition_postprocessing_status(
+            jobs[0],
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+
+        assert_eq!(pipeline.metrics.extract_active.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&jobs[3])
+                .map(|state| state.status.clone()),
+            Some(JobStatus::Extracting)
+        );
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![jobs[3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_queued_postprocessing_schedules_completion_check() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(31201);
+        let spec = standalone_job_spec("Restore queued repair", &[("sample.bin".to_string(), 100)]);
+        let working_dir = temp_dir.path().join("restore-queued-repair");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+        pipeline
+            .restore_job(
+                job_id,
+                spec,
+                HashSet::new(),
+                HashSet::new(),
+                JobStatus::QueuedRepair,
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_id]
+        );
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::QueuedRepair)
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_queue_promotion_reserves_slot_and_keeps_queue_age() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_a = JobId(31211);
+        let job_b = JobId(31212);
+        let job_c = JobId(31213);
+
+        pipeline.jobs.insert(
+            job_a,
+            minimal_job_state(job_a, "repair-a", temp_dir.path().join("repair-a")),
+        );
+        pipeline.jobs.insert(
+            job_b,
+            minimal_job_state(job_b, "repair-b", temp_dir.path().join("repair-b")),
+        );
+        pipeline.jobs.insert(
+            job_c,
+            minimal_job_state(job_c, "repair-c", temp_dir.path().join("repair-c")),
+        );
+
+        assert!(pipeline.maybe_start_repair(job_a).await);
+        assert!(!pipeline.maybe_start_repair(job_b).await);
+        let queued_at = pipeline
+            .jobs
+            .get(&job_b)
+            .and_then(|state| state.queued_repair_at_epoch_ms)
+            .unwrap();
+
+        assert!(!pipeline.maybe_start_repair(job_b).await);
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_b)
+                .and_then(|state| state.queued_repair_at_epoch_ms),
+            Some(queued_at)
+        );
+
+        pipeline.transition_postprocessing_status(
+            job_a,
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+
+        assert_eq!(
+            pipeline.jobs.get(&job_b).map(|state| state.status.clone()),
+            Some(JobStatus::Repairing)
+        );
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_b]
+        );
+
+        assert!(!pipeline.maybe_start_repair(job_c).await);
+        assert_eq!(
+            pipeline.jobs.get(&job_c).map(|state| state.status.clone()),
+            Some(JobStatus::QueuedRepair)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_resume_preserves_queued_repair_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_a = JobId(31221);
+        let job_b = JobId(31222);
+
+        pipeline.jobs.insert(
+            job_a,
+            minimal_job_state(job_a, "repair-a", temp_dir.path().join("repair-a")),
+        );
+        pipeline.jobs.insert(
+            job_b,
+            minimal_job_state(job_b, "repair-b", temp_dir.path().join("repair-b")),
+        );
+
+        assert!(pipeline.maybe_start_repair(job_a).await);
+        assert!(!pipeline.maybe_start_repair(job_b).await);
+        let queued_at = pipeline
+            .jobs
+            .get(&job_b)
+            .and_then(|state| state.queued_repair_at_epoch_ms)
+            .unwrap();
+
+        pipeline.pause_job_runtime(job_b).unwrap();
+        assert_eq!(
+            pipeline.jobs.get(&job_b).map(|state| state.status.clone()),
+            Some(JobStatus::Paused)
+        );
+        assert_eq!(
+            pipeline.jobs.get(&job_b).and_then(|state| {
+                state
+                    .paused_resume_status
+                    .as_ref()
+                    .map(std::clone::Clone::clone)
+            }),
+            Some(JobStatus::QueuedRepair)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_b)
+                .and_then(|state| state.queued_repair_at_epoch_ms),
+            Some(queued_at)
+        );
+
+        pipeline.resume_job_runtime(job_b).unwrap();
+        assert_eq!(
+            pipeline.jobs.get(&job_b).map(|state| state.status.clone()),
+            Some(JobStatus::QueuedRepair)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_b)
+                .and_then(|state| state.queued_repair_at_epoch_ms),
+            Some(queued_at)
+        );
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_b]
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_clears_stale_completion_rechecks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(31231);
+
+        pipeline.jobs.insert(
+            job_id,
+            minimal_job_state(job_id, "paused-job", temp_dir.path().join("paused-job")),
+        );
+        pipeline.schedule_job_completion_check(job_id);
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_id]
+        );
+
+        pipeline.pause_job_runtime(job_id).unwrap();
+        assert!(pipeline.pending_completion_checks.is_empty());
+
+        pipeline.check_job_completion(job_id).await;
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Paused)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_rejects_active_extraction_tasks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(31241);
+
+        let mut state = minimal_job_state(
+            job_id,
+            "extracting-job",
+            temp_dir.path().join("extracting-job"),
+        );
+        state.status = JobStatus::Extracting;
+        pipeline.jobs.insert(job_id, state);
+        pipeline
+            .inflight_extractions
+            .insert(job_id, HashSet::from([String::from("archive")]));
+
+        let error = pipeline.pause_job_runtime(job_id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot pause while extraction tasks are running")
         );
     }
 }

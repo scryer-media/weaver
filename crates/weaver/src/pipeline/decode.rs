@@ -3,6 +3,20 @@ use std::time::Instant;
 use super::*;
 
 impl Pipeline {
+    pub(super) fn note_decode_started(&mut self, job_id: JobId) {
+        *self.active_decodes_by_job.entry(job_id).or_default() += 1;
+    }
+
+    fn note_decode_finished(&mut self, job_id: JobId) {
+        let Some(active) = self.active_decodes_by_job.get_mut(&job_id) else {
+            return;
+        };
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.active_decodes_by_job.remove(&job_id);
+        }
+    }
+
     pub(super) async fn flush_quiescent_write_backlog(&mut self) {
         if self.active_downloads > 0
             || !self.pending_decode.is_empty()
@@ -74,6 +88,12 @@ impl Pipeline {
     /// Handle a completed decode — persist the segment, update assembly, journal.
     pub(super) async fn handle_decode_done(&mut self, result: DecodeDone) {
         self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
+
+        let job_id = match &result {
+            DecodeDone::Success(result) => result.segment_id.file_id.job_id,
+            DecodeDone::Failed { segment_id, .. } => segment_id.file_id.job_id,
+        };
+        self.note_decode_finished(job_id);
 
         match result {
             DecodeDone::Success(result) => self.handle_decode_success(result).await,
@@ -168,6 +188,7 @@ impl Pipeline {
                     .segments_retried
                     .fetch_add(1, Ordering::Relaxed);
                 let delay = std::time::Duration::from_secs(1 << (retry_count - 1));
+                self.note_retry_scheduled(job_id);
                 warn!(
                     segment = %segment_id,
                     error,

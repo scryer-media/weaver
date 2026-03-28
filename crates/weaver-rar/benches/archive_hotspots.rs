@@ -132,6 +132,37 @@ fn bench_archive_planner_view(c: &mut Criterion) {
     });
 }
 
+fn bench_filter_e8e9(c: &mut Criterion) {
+    let mut seed = vec![0u8; 1024 * 1024];
+    for i in (0..seed.len().saturating_sub(5)).step_by(64) {
+        seed[i] = if (i / 64) % 2 == 0 { 0xE8 } else { 0xE9 };
+        let addr = ((i as i32) + 0x1234).to_le_bytes();
+        seed[i + 1..i + 5].copy_from_slice(&addr);
+    }
+
+    c.bench_function("rar_filter_e8e9", |b| {
+        b.iter(|| {
+            let mut data = seed.clone();
+            weaver_rar::decompress::lz::filter::apply_e8e9(&mut data, 0);
+            black_box(data);
+        });
+    });
+}
+
+fn bench_crc_hasher(c: &mut Criterion) {
+    let data: Vec<u8> = (0..(8 * 1024 * 1024))
+        .map(|i| (i as u8).wrapping_mul(31))
+        .collect();
+
+    c.bench_function("rar_crc32fast_baseline", |b| {
+        b.iter(|| {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(black_box(&data));
+            black_box(hasher.finalize());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_non_solid_lz_chunked,
@@ -140,6 +171,8 @@ criterion_group!(
     bench_rar5_solid_extract_all_members,
     bench_rar4_solid_reopen_later_member,
     bench_rar5_solid_reopen_later_member,
-    bench_archive_planner_view
+    bench_archive_planner_view,
+    bench_filter_e8e9,
+    bench_crc_hasher
 );
 criterion_main!(benches);

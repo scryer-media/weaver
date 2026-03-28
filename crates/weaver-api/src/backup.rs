@@ -712,8 +712,8 @@ fn job_info_from_history(row: weaver_state::JobHistoryRow) -> JobInfo {
     let status = match row.status.as_str() {
         "downloading" => JobStatus::Downloading,
         "verifying" => JobStatus::Verifying,
-        "repairing" => JobStatus::Repairing,
-        "extracting" => JobStatus::Extracting,
+        "queued_repair" | "repairing" => JobStatus::QueuedRepair,
+        "queued_extract" | "extracting" => JobStatus::QueuedExtract,
         "complete" => JobStatus::Complete,
         "failed" => JobStatus::Failed {
             error: row

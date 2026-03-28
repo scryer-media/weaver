@@ -236,8 +236,7 @@ impl LzDecoder {
 
         if table_present || self.nc_table.is_none() {
             let pos_before = reader.position();
-            let (nc, dc, ldc, rc) =
-                huffman::read_tables_bitreader(reader, &mut self.code_lengths)?;
+            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, &mut self.code_lengths)?;
             let bits_used = (reader.position() - pos_before) as i64;
             self.block_bits_remaining -= bits_used;
             self.nc_table = Some(Arc::new(nc));
@@ -516,11 +515,7 @@ impl LzDecoder {
     }
 
     /// Decode a length from the RC/LenDecoder table (used for symbols 256 and 258-261).
-    fn decode_rc_length<R: BitRead>(
-        &self,
-        reader: &mut R,
-        rc: &HuffmanTable,
-    ) -> RarResult<usize> {
+    fn decode_rc_length<R: BitRead>(&self, reader: &mut R, rc: &HuffmanTable) -> RarResult<usize> {
         let slot = rc.decode(reader)? as usize;
         Self::slot_to_length(reader, slot)
     }
@@ -733,13 +728,16 @@ impl LzDecoder {
                 Self::compact_staged_buffer(&mut staged, &mut staged_start);
             }
 
-            while !reached_eof && staged.len() - staged_start < STREAMING_PARALLEL_READ_BUFFER_SIZE {
+            while !reached_eof && staged.len() - staged_start < STREAMING_PARALLEL_READ_BUFFER_SIZE
+            {
                 if staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE {
                     Self::compact_staged_buffer(&mut staged, &mut staged_start);
                 }
 
                 let max_read = STREAMING_PARALLEL_READ_BUFFER_SIZE - (staged.len() - staged_start);
-                let read = input.read(&mut read_buf[..max_read]).map_err(RarError::Io)?;
+                let read = input
+                    .read(&mut read_buf[..max_read])
+                    .map_err(RarError::Io)?;
                 if read == 0 {
                     reached_eof = true;
                     break;
@@ -831,7 +829,6 @@ impl LzDecoder {
         writer: &mut W,
         mut output_size: u64,
     ) -> RarResult<u64> {
-
         let mut reader = StreamingBitReader::new(input);
         let flush_threshold = self.flush_threshold();
 
@@ -861,7 +858,6 @@ impl LzDecoder {
                     });
                 }
             }
-
         }
 
         self.flush_filters_and_write(writer)?;

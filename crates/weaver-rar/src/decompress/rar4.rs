@@ -204,7 +204,11 @@ impl Rar4LzDecoder {
         self.replay_with_reader(&mut reader, unpacked_size)
     }
 
-    fn replay_with_reader<R: BitRead>(&mut self, reader: &mut R, unpacked_size: u64) -> RarResult<u64> {
+    fn replay_with_reader<R: BitRead>(
+        &mut self,
+        reader: &mut R,
+        unpacked_size: u64,
+    ) -> RarResult<u64> {
         if unpacked_size == 0 {
             return Ok(0);
         }

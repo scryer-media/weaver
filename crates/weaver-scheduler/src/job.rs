@@ -17,7 +17,9 @@ pub enum JobStatus {
     /// Health probe in progress — checking article availability.
     Checking,
     Verifying,
+    QueuedRepair,
     Repairing,
+    QueuedExtract,
     Extracting,
     /// Moving extracted files to the final destination directory.
     Moving,
@@ -93,6 +95,12 @@ pub struct JobState {
     pub created_at: std::time::Instant,
     /// Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
+    /// When this job most recently entered the bounded repair queue.
+    pub queued_repair_at_epoch_ms: Option<f64>,
+    /// When this job most recently entered the bounded extraction queue.
+    pub queued_extract_at_epoch_ms: Option<f64>,
+    /// Safe status to restore when a paused job is resumed.
+    pub paused_resume_status: Option<JobStatus>,
     /// Per-job working directory (subdirectory under intermediate_dir).
     /// All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,
@@ -104,6 +112,8 @@ pub struct JobState {
     pub par2_bytes: u64,
     /// Whether health probes have been dispatched for this job.
     pub health_probing: bool,
+    /// Highest failed-byte watermark that has already been health-probed.
+    pub last_health_probe_failed_bytes: u64,
     /// Segments pulled from queues while health probe runs. Restored on
     /// probe pass, dropped on probe fail.
     pub held_segments: Vec<DownloadWork>,
