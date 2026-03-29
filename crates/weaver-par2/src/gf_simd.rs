@@ -893,12 +893,9 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
             let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
 
             for matrices in &all_matrices {
-                let d = _mm256_loadu_si256(
-                    factors_and_dsts[matrices.dst_idx]
-                        .dst
-                        .as_ptr()
-                        .add(offset) as *const __m256i
-                );
+                let d =
+                    _mm256_loadu_si256(factors_and_dsts[matrices.dst_idx].dst.as_ptr().add(offset)
+                        as *const __m256i);
 
                 let result_lo = _mm256_xor_si256(
                     _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_ll),
@@ -991,8 +988,7 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
 
         macro_rules! process_chunk {
             ($chunk_offset:expr) => {{
-                let mut acc =
-                    _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+                let mut acc = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
 
                 for src in &xor_inputs {
                     let s = _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
@@ -1000,9 +996,8 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
                 }
 
                 for input in &prepared {
-                    let s = _mm256_loadu_si256(
-                        input.src.as_ptr().add($chunk_offset) as *const __m256i
-                    );
+                    let s =
+                        _mm256_loadu_si256(input.src.as_ptr().add($chunk_offset) as *const __m256i);
                     let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
                     let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
 

@@ -748,8 +748,12 @@ mod tests {
 
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
-        decoder.feed_chunk(&article[..split_at], &mut output).unwrap();
-        decoder.feed_chunk(&article[split_at..], &mut output).unwrap();
+        decoder
+            .feed_chunk(&article[..split_at], &mut output)
+            .unwrap();
+        decoder
+            .feed_chunk(&article[split_at..], &mut output)
+            .unwrap();
         let decoded = decoder.finish(output).unwrap();
 
         assert_eq!(decoded.data, original);

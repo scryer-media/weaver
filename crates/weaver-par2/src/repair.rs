@@ -280,7 +280,8 @@ fn method_tuned_chunk_words(slice_size: usize) -> usize {
             let ideal_chunk_bytes = 4 * 1024usize;
             let stride_bytes = 64usize;
             let threads = rayon::current_num_threads().max(1);
-            let aligned_slice_bytes = slice_size.div_ceil(stride_bytes) * stride_bytes + stride_bytes;
+            let aligned_slice_bytes =
+                slice_size.div_ceil(stride_bytes) * stride_bytes + stride_bytes;
             let target_thread_chunk = aligned_slice_bytes.div_ceil(threads);
 
             let mut num_chunks = if target_thread_chunk <= ideal_chunk_bytes / 2 {
@@ -314,7 +315,8 @@ fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> R
             chunk_words: method_chunk_words,
         },
         Some(limit) => {
-            let budget_chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
+            let budget_chunk_words =
+                chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
             let chunk_words = budget_chunk_words.min(method_chunk_words);
             if estimated_in_memory_repair_bytes(plan) <= limit {
                 RepairExecutionMode::InMemory { chunk_words }
@@ -800,10 +802,8 @@ fn reconstruct_and_write_grouped_inputs(
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
     let completed_outputs = AtomicU32::new(0);
 
-    repaired_slices
-        .par_iter_mut()
-        .enumerate()
-        .try_for_each(|(output_idx, repaired)| -> Result<()> {
+    repaired_slices.par_iter_mut().enumerate().try_for_each(
+        |(output_idx, repaired)| -> Result<()> {
             check_cancel(options)?;
 
             let decode_inputs = &output_inputs[output_idx];
@@ -840,7 +840,8 @@ fn reconstruct_and_write_grouped_inputs(
             }
 
             Ok(())
-        })?;
+        },
+    )?;
 
     check_cancel(options)?;
 

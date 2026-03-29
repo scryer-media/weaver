@@ -3389,7 +3389,9 @@ mod tests {
         pipeline
             .handle_download_done(DownloadResult {
                 segment_id,
-                data: Ok(DownloadPayload::Raw(Bytes::from_static(b"not a yenc article"))),
+                data: Ok(DownloadPayload::Raw(Bytes::from_static(
+                    b"not a yenc article",
+                ))),
                 is_recovery: false,
                 retry_count: 0,
             })

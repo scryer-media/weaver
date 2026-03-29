@@ -6,7 +6,9 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
-use weaver_yenc::{DecodeResult as YencDecodeResult, DecodedArticle, StreamingArticleDecoder, YencError};
+use weaver_yenc::{
+    DecodeResult as YencDecodeResult, DecodedArticle, StreamingArticleDecoder, YencError,
+};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
@@ -890,7 +892,9 @@ impl NntpClient {
                     raw_size = raw_size.saturating_add(chunk.len() as u32);
                     if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
                         decode_error = Some(err);
-                        return Err(NntpError::MalformedResponse("streamed yEnc decode failed".into()));
+                        return Err(NntpError::MalformedResponse(
+                            "streamed yEnc decode failed".into(),
+                        ));
                     }
                     Ok(())
                 })
