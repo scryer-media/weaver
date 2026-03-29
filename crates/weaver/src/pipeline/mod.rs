@@ -1227,6 +1227,8 @@ pub(super) async fn write_segment_to_disk(
     let path = path.to_owned();
     let data = data.to_vec();
     tokio::task::spawn_blocking(move || {
+        crate::runtime_affinity::pin_current_thread_for_hot_download_path();
+
         use std::io::{Seek, Write};
         let mut file = std::fs::OpenOptions::new()
             .create(true)

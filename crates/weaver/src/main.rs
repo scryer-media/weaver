@@ -1,5 +1,6 @@
 mod import;
 mod pipeline;
+mod runtime_affinity;
 mod server;
 mod system;
 
@@ -112,11 +113,11 @@ struct ResolvedPar2Input {
 }
 
 fn main() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(8 * 1024 * 1024) // 8 MB — pipeline futures are large
-        .build()
-        .expect("failed to build tokio runtime");
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB — pipeline futures are large
+    runtime_affinity::install_tokio_worker_affinity(&mut builder);
+
+    let runtime = builder.build().expect("failed to build tokio runtime");
 
     runtime.block_on(async_main());
 }

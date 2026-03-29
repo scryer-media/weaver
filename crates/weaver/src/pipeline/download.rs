@@ -71,6 +71,8 @@ impl Pipeline {
         let metrics = Arc::clone(&self.metrics);
 
         tokio::task::spawn_blocking(move || {
+            crate::runtime_affinity::pin_current_thread_for_hot_download_path();
+
             if let Some(mut output) = output {
                 let Some(output_buf) = output.as_mut_slice() else {
                     let error = "failed to get unique pooled decode buffer".to_string();
