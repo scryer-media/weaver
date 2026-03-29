@@ -113,7 +113,7 @@ impl Pipeline {
     /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
     /// decode failures for the same segment, mark it as permanently failed and
     /// update health.
-    fn handle_decode_failure(&mut self, segment_id: SegmentId, error: &str) {
+    pub(super) fn handle_decode_failure(&mut self, segment_id: SegmentId, error: &str) {
         let job_id = segment_id.file_id.job_id;
 
         if self
@@ -205,7 +205,7 @@ impl Pipeline {
         }
     }
 
-    async fn handle_decode_success(&mut self, result: DecodeResult) {
+    pub(super) async fn handle_decode_success(&mut self, result: DecodeResult) {
         let DecodeResult {
             segment_id,
             file_offset,

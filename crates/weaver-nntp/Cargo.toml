@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 weaver-core = { path = "../weaver-core" }
+weaver-yenc = { path = "../weaver-yenc" }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }

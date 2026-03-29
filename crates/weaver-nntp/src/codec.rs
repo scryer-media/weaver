@@ -48,6 +48,9 @@ pub struct NntpCodec {
     /// so rescanning from byte 0 on every read turns terminator detection into
     /// repeated full-buffer work. Remember the next line start instead.
     raw_multiline_scan_offset: usize,
+    /// When a streaming decode sees data and the final terminator in the same
+    /// chunk, emit `Data` first and then a synthetic `End` on the next call.
+    streaming_end_pending: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,7 @@ impl NntpCodec {
             streaming_multiline: false,
             raw_multiline: false,
             raw_multiline_scan_offset: 0,
+            streaming_end_pending: false,
         }
     }
 
@@ -73,6 +77,7 @@ impl NntpCodec {
         self.multiline = multiline;
         if !multiline {
             self.raw_multiline_scan_offset = 0;
+            self.streaming_end_pending = false;
         }
     }
 
@@ -105,6 +110,9 @@ impl NntpCodec {
     /// Set the codec into streaming multiline mode.
     pub fn set_streaming_multiline(&mut self, streaming: bool) {
         self.streaming_multiline = streaming;
+        if !streaming {
+            self.streaming_end_pending = false;
+        }
     }
 
     /// Decode the next chunk in streaming multiline mode.
@@ -115,6 +123,11 @@ impl NntpCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<StreamChunk>, NntpError> {
+        if self.streaming_end_pending {
+            self.streaming_end_pending = false;
+            return Ok(Some(StreamChunk::End));
+        }
+
         let Some(scan) = scan_multiline_chunk(src, true) else {
             return Ok(None);
         };
@@ -122,9 +135,47 @@ impl NntpCodec {
         let chunk = take_multiline_output(src, scan);
         if chunk.terminator_len > 0 {
             self.streaming_multiline = false;
+            if chunk.data.is_empty() {
+                return Ok(Some(StreamChunk::End));
+            }
+            self.streaming_end_pending = true;
         }
-        if chunk.data.is_empty() && chunk.terminator_len > 0 {
+        Ok(Some(StreamChunk::Data(chunk.data)))
+    }
+
+    /// Decode the next raw chunk in streaming multiline mode.
+    ///
+    /// Yields data ending on a complete line boundary without dot-unstuffing.
+    /// This is used by the download hot path so yEnc decoding can happen while
+    /// the BODY is still streaming in.
+    pub fn decode_streaming_raw_chunk(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> Result<Option<StreamChunk>, NntpError> {
+        if self.streaming_end_pending {
+            self.streaming_end_pending = false;
             return Ok(Some(StreamChunk::End));
+        }
+
+        let Some(scan) = scan_multiline_raw_stream(src, &mut self.raw_multiline_scan_offset) else {
+            return Ok(None);
+        };
+
+        if scan.data_end > MAX_MULTILINE_LENGTH {
+            return Err(NntpError::MalformedResponse(
+                "multi-line response too large".into(),
+            ));
+        }
+
+        let chunk = take_multiline_output(src, scan);
+        self.raw_multiline_scan_offset = 0;
+        if chunk.terminator_len > 0 {
+            self.streaming_multiline = false;
+            self.raw_multiline = false;
+            if chunk.data.is_empty() {
+                return Ok(Some(StreamChunk::End));
+            }
+            self.streaming_end_pending = true;
         }
         Ok(Some(StreamChunk::Data(chunk.data)))
     }
@@ -341,6 +392,52 @@ fn scan_multiline_raw(buf: &[u8], cursor: &mut usize) -> Option<MultilineScan> {
     }
 
     *cursor = scan_cursor;
+    None
+}
+
+fn scan_multiline_raw_stream(buf: &[u8], cursor: &mut usize) -> Option<MultilineScan> {
+    if buf.is_empty() {
+        *cursor = 0;
+        return None;
+    }
+
+    let mut scan_cursor = (*cursor).min(buf.len());
+    let mut last_complete_end = 0usize;
+
+    while scan_cursor < buf.len() {
+        let Some(line_rel_end) = memchr::memchr(b'\n', &buf[scan_cursor..]) else {
+            break;
+        };
+        let line_end = scan_cursor + line_rel_end;
+        let content_end = if line_end > scan_cursor && buf[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line_total_end = line_end + 1;
+
+        if scan_cursor < content_end && buf[scan_cursor] == b'.' && content_end == scan_cursor + 1 {
+            return Some(MultilineScan {
+                data_end: scan_cursor,
+                terminator_len: line_total_end - scan_cursor,
+                copied: None,
+            });
+        }
+
+        scan_cursor = line_total_end;
+        last_complete_end = scan_cursor;
+    }
+
+    *cursor = scan_cursor;
+
+    if last_complete_end > 0 {
+        return Some(MultilineScan {
+            data_end: last_complete_end,
+            terminator_len: 0,
+            copied: None,
+        });
+    }
+
     None
 }
 
@@ -582,15 +679,15 @@ mod tests {
         codec.set_streaming_multiline(true);
 
         let mut buf = BytesMut::from("line one\r\nline two\r\n.\r\n");
-        let chunk = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
-        match chunk {
+        let first = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
+        match first {
             StreamChunk::Data(data) => {
                 assert_eq!(&data[..], b"line one\r\nline two\r\n");
             }
             StreamChunk::End => panic!("expected Data, got End"),
         }
-        // Next call should yield End — but actually End was returned inline
-        // because \r\n.\r\n was found, so streaming mode should be off.
+        let second = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
+        assert_eq!(second, StreamChunk::End);
         assert!(!codec.streaming_multiline);
         assert!(buf.is_empty());
     }
@@ -614,13 +711,15 @@ mod tests {
 
         // "..hello" is dot-stuffed, should become ".hello"
         let mut buf = BytesMut::from("..hello\r\nnormal\r\n.\r\n");
-        let chunk = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
-        match chunk {
+        let first = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
+        match first {
             StreamChunk::Data(data) => {
                 assert_eq!(&data[..], b".hello\r\nnormal\r\n");
             }
             StreamChunk::End => panic!("expected Data"),
         }
+        let second = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
+        assert_eq!(second, StreamChunk::End);
         assert!(buf.is_empty());
     }
 
@@ -657,7 +756,48 @@ mod tests {
             }
             StreamChunk::End => panic!("expected Data"),
         }
+        let end = codec.decode_streaming_chunk(&mut buf).unwrap().unwrap();
+        assert_eq!(end, StreamChunk::End);
         assert!(!codec.streaming_multiline);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn streaming_raw_decode_emits_end_after_final_data_chunk() {
+        let mut codec = NntpCodec::new();
+        codec.set_streaming_multiline(true);
+        codec.set_raw_multiline(true);
+
+        let mut buf = BytesMut::from("line one\r\nline two\r\n.\r\n");
+        let first = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap();
+        match first {
+            StreamChunk::Data(data) => {
+                assert_eq!(&data[..], b"line one\r\nline two\r\n");
+            }
+            StreamChunk::End => panic!("expected Data"),
+        }
+        let second = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap();
+        assert_eq!(second, StreamChunk::End);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn streaming_raw_decode_handles_split_terminator() {
+        let mut codec = NntpCodec::new();
+        codec.set_streaming_multiline(true);
+        codec.set_raw_multiline(true);
+
+        let mut buf = BytesMut::from("line one\r\n.");
+        let first = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap();
+        match first {
+            StreamChunk::Data(data) => assert_eq!(&data[..], b"line one\r\n"),
+            StreamChunk::End => panic!("expected Data"),
+        }
+        assert_eq!(&buf[..], b".");
+
+        buf.extend_from_slice(b"\r\n");
+        let second = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap();
+        assert_eq!(second, StreamChunk::End);
         assert!(buf.is_empty());
     }
 

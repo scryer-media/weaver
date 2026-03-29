@@ -20,7 +20,6 @@ Usage:
     [--seed-par2 /path/to/main.par2] \
     [--turbo /path/to/par2] \
     [--output-dir /path/to/out] \
-    [--memory-limit-mb 50] \
     [--threads 16] \
     [--taskset 0-15] \
     [--label skylake-repair] \
@@ -40,7 +39,6 @@ Examples:
   scripts/run-par2-x86-hotpaths.sh \
     --weaver ./weaver \
     --fixture ./large-fixture \
-    --memory-limit-mb 0 \
     --no-verify-perf
 EOF
 }
@@ -215,7 +213,7 @@ build_weaver_cmd() {
   cmd+=("$WEAVER_BIN" par2 "$subcommand")
 
   if [ "$subcommand" = "repair" ]; then
-    cmd+=(--working-dir "$(dirname "$seed_path")" --memory-limit-mb "$MEMORY_LIMIT_MB")
+    cmd+=(--working-dir "$(dirname "$seed_path")")
   fi
 
   cmd+=("$seed_path")
@@ -251,7 +249,6 @@ write_metadata() {
     echo "turbo_bin=${TURBO_BIN:-}"
     echo "threads=${THREADS}"
     echo "taskset=${TASKSET_CPUSET:-}"
-    echo "memory_limit_mb=${MEMORY_LIMIT_MB}"
     echo "perf_freq=${PERF_FREQ}"
     echo
     echo "uname:"
@@ -291,7 +288,6 @@ TURBO_BIN=""
 FIXTURE_DIR=""
 SEED_PAR2=""
 OUT_DIR=""
-MEMORY_LIMIT_MB="50"
 THREADS="$(cpu_count)"
 TASKSET_CPUSET=""
 LABEL="x86-par2"
@@ -321,10 +317,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --output-dir)
       OUT_DIR="$2"
-      shift 2
-      ;;
-    --memory-limit-mb)
-      MEMORY_LIMIT_MB="$2"
       shift 2
       ;;
     --threads)

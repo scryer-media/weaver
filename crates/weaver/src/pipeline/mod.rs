@@ -45,11 +45,19 @@ const MAX_SEGMENT_RETRIES: u32 = 3;
 /// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
-    pub(super) data: Result<Bytes, String>,
+    pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
     /// Whether this was a speculative recovery download.
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
     pub(super) retry_count: u32,
+}
+
+pub(super) enum DownloadPayload {
+    Raw(Bytes),
+}
+
+pub(super) enum DownloadError {
+    Fetch(String),
 }
 
 /// Successful download payload waiting for decode scheduling.
@@ -2833,7 +2841,7 @@ mod tests {
                 Duration::from_secs(1),
                 pipeline.handle_download_done(DownloadResult {
                     segment_id,
-                    data: Ok(raw),
+                    data: Ok(DownloadPayload::Raw(raw)),
                     is_recovery: false,
                     retry_count: 0,
                 }),
@@ -2879,7 +2887,7 @@ mod tests {
                     },
                     segment_number: 0,
                 },
-                data: Ok(raw),
+                data: Ok(DownloadPayload::Raw(raw)),
                 is_recovery: false,
                 retry_count: 0,
             })
@@ -2963,7 +2971,7 @@ mod tests {
             pipeline
                 .handle_download_done(DownloadResult {
                     segment_id,
-                    data: Ok(raw),
+                    data: Ok(DownloadPayload::Raw(raw)),
                     is_recovery: false,
                     retry_count: 0,
                 })
@@ -3015,7 +3023,7 @@ mod tests {
                     },
                     segment_number: 0,
                 },
-                data: Err("connection reset by peer".to_string()),
+                data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
                 is_recovery: false,
                 retry_count: 0,
             })
@@ -3066,14 +3074,14 @@ mod tests {
                     },
                     segment_number: 0,
                 },
-                data: Ok(encode_article_part(
+                data: Ok(DownloadPayload::Raw(encode_article_part(
                     filename,
                     &vec![1u8; first_segment_size as usize],
                     1,
                     2,
                     1,
                     total_size,
-                )),
+                ))),
                 is_recovery: false,
                 retry_count: 0,
             })
@@ -3102,7 +3110,7 @@ mod tests {
                     },
                     segment_number: 1,
                 },
-                data: Err("connection reset by peer".to_string()),
+                data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
                 is_recovery: false,
                 retry_count: MAX_SEGMENT_RETRIES,
             })
@@ -3381,7 +3389,7 @@ mod tests {
         pipeline
             .handle_download_done(DownloadResult {
                 segment_id,
-                data: Ok(Bytes::from_static(b"not a yenc article")),
+                data: Ok(DownloadPayload::Raw(Bytes::from_static(b"not a yenc article"))),
                 is_recovery: false,
                 retry_count: 0,
             })

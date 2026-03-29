@@ -406,14 +406,13 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let data = if exclude_servers.is_empty() {
-                nntp.fetch_body_with_groups(&message_id, &groups)
-                    .await
-                    .map_err(|e| e.to_string())
+                nntp.fetch_body_with_groups(&message_id, &groups).await
             } else {
                 nntp.fetch_body_with_groups_excluding(&message_id, &groups, &exclude_servers)
                     .await
-                    .map_err(|e| e.to_string())
-            };
+            }
+            .map(DownloadPayload::Raw)
+            .map_err(|e| DownloadError::Fetch(e.to_string()));
 
             let _ = tx
                 .send(DownloadResult {
@@ -443,14 +442,17 @@ impl Pipeline {
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
             error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
         }
-        if let Ok(raw) = &result.data
-            && let Err(error) = self.record_download_bandwidth_usage(raw.len() as u64)
-        {
-            error!(
-                error = %error,
-                segment = %result.segment_id,
-                "failed to record ISP bandwidth usage"
-            );
+        match &result.data {
+            Ok(DownloadPayload::Raw(raw)) => {
+                if let Err(error) = self.record_download_bandwidth_usage(raw.len() as u64) {
+                    error!(
+                        error = %error,
+                        segment = %result.segment_id,
+                        "failed to record ISP bandwidth usage"
+                    );
+                }
+            }
+            Err(DownloadError::Fetch(_)) => {}
         }
         if self
             .jobs
@@ -467,7 +469,7 @@ impl Pipeline {
         }
 
         match result.data {
-            Ok(raw) => {
+            Ok(DownloadPayload::Raw(raw)) => {
                 let raw_size = raw.len() as u32;
                 self.metrics
                     .bytes_downloaded
@@ -490,7 +492,7 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Err(e) => {
+            Err(DownloadError::Fetch(e)) => {
                 if e.contains("no such article") || e.contains("article not found") {
                     self.metrics
                         .articles_not_found

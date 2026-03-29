@@ -725,6 +725,78 @@ impl NntpConnection {
         }
     }
 
+    /// Stream the raw body of an article, yielding chunks on line boundaries.
+    ///
+    /// Chunks retain NNTP dot-stuffing and exclude the final multiline
+    /// terminator. This is the download hot path used by the streaming yEnc
+    /// decoder.
+    pub async fn stream_body_chunked_raw<F>(
+        &mut self,
+        message_id: &str,
+        mut on_chunk: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        let initial = self.send_command(&cmd).await?;
+
+        if initial.code.is_error() {
+            return Err(NntpError::from_status(initial.code, &initial.message));
+        }
+
+        if initial.code.raw() != 222 {
+            return Err(NntpError::unexpected(initial.code, &initial.message));
+        }
+
+        self.codec.set_streaming_multiline(true);
+        self.codec.set_raw_multiline(true);
+        let mut total_bytes = 0u64;
+        let timeout = self.command_timeout;
+
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                match self.codec.decode_streaming_raw_chunk(&mut self.read_buf)? {
+                    Some(StreamChunk::Data(data)) => {
+                        total_bytes += data.len() as u64;
+                        if let Err(err) = on_chunk(&data) {
+                            self.poisoned = true;
+                            self.current_group = None;
+                            self.reset_multiline_decode_state();
+                            return Err(err);
+                        }
+                        continue;
+                    }
+                    Some(StreamChunk::End) => return Ok::<u64, NntpError>(total_bytes),
+                    None => {}
+                }
+
+                self.read_into_buffer().await?;
+            }
+        })
+        .await;
+
+        match result {
+            Ok(inner) => {
+                self.trim_read_buffer();
+                match inner {
+                    Ok(bytes) => Ok(bytes),
+                    Err(err) => {
+                        let err = self.classify_multiline_error(err);
+                        self.reset_multiline_decode_state();
+                        Err(err)
+                    }
+                }
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.current_group = None;
+                self.reset_multiline_decode_state();
+                Err(NntpError::TruncatedMultilineBody)
+            }
+        }
+    }
+
     fn trim_read_buffer(&mut self) {
         let target = self
             .buffer_profile
@@ -1160,6 +1232,46 @@ mod tests {
             matches!(err, NntpError::TruncatedMultilineBody),
             "expected TruncatedMultilineBody, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_body_chunked_raw_finishes_when_data_and_terminator_arrive_together() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\nline one\r\nline two\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        let total = conn
+            .stream_body_chunked_raw("<test@example.com>", |chunk| {
+                chunks.push(chunk.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(total, b"line one\r\nline two\r\n".len() as u64);
+        assert_eq!(chunks, vec![b"line one\r\nline two\r\n".to_vec()]);
     }
 
     #[tokio::test]

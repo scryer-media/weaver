@@ -296,6 +296,46 @@ pub struct FactorDst<'a> {
     pub dst: &'a mut [u8],
 }
 
+/// A (factor, source) pair for grouped-input multiply-accumulate into one destination.
+pub struct FactorSrc<'a> {
+    pub factor: u16,
+    pub src: &'a [u8],
+}
+
+/// Multiply multiple input regions by their corresponding factors and XOR-accumulate
+/// the results into a single destination buffer.
+///
+/// For each factor/src pair, computes `dst[i] ^= gf_mul(src[i], factor)`.
+/// Reads and writes `dst` once per SIMD chunk, which is a better fit for
+/// grouped-input execution than repeatedly calling `mul_acc_region`.
+pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    let len = dst.len();
+    assert!(len.is_multiple_of(2), "region length must be even");
+
+    if dst.is_empty() {
+        return;
+    }
+
+    for fs in factors_and_srcs.iter() {
+        assert_eq!(fs.src.len(), len, "all src slices must match dst length");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            unsafe { mul_acc_input_batch_gfni_avx2(dst, factors_and_srcs) };
+            return;
+        }
+    }
+
+    #[allow(unreachable_code)]
+    for fs in factors_and_srcs {
+        if fs.factor != 0 {
+            mul_acc_region(fs.factor, fs.src, dst);
+        }
+    }
+}
+
 /// Scalar fallback: one word at a time using gf::mul + gf::add.
 fn mul_acc_region_scalar(factor: u16, src: &[u8], dst: &mut [u8]) {
     let word_count = src.len() / 2;
@@ -343,31 +383,37 @@ unsafe fn mul_acc_region_gfni_avx2(matrices: &AffineMulMatrices, src: &[u8], dst
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 
+        macro_rules! process_chunk {
+            ($chunk_offset:expr) => {{
+                let s = _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
+                let d = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+
+                let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
+                let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+
+                let result_lo = _mm256_xor_si256(
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+                );
+                let result_hi = _mm256_xor_si256(
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+                );
+
+                let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+                let result = _mm256_xor_si256(d, product);
+                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, result);
+            }};
+        }
+
+        while offset + 64 <= len {
+            process_chunk!(offset);
+            process_chunk!(offset + 32);
+            offset += 64;
+        }
+
         while offset + 32 <= len {
-            let s = _mm256_loadu_si256(src.as_ptr().add(offset) as *const __m256i);
-            let d = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
-
-            // Deinterleave within each 128-bit lane: separate lo and hi bytes.
-            let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
-            let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
-
-            // Apply four 8×8 affine transforms.
-            let result_lo = _mm256_xor_si256(
-                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
-                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
-            );
-            let result_hi = _mm256_xor_si256(
-                _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
-                _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
-            );
-
-            // Reinterleave within each lane.
-            let product = _mm256_unpacklo_epi8(result_lo, result_hi);
-
-            // XOR-accumulate.
-            let result = _mm256_xor_si256(d, product);
-            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, result);
-
+            process_chunk!(offset);
             offset += 32;
         }
     }
@@ -794,12 +840,31 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
 
     let len = src.len();
 
+    struct BroadcastAffine {
+        m_ll: __m256i,
+        m_lh: __m256i,
+        m_hl: __m256i,
+        m_hh: __m256i,
+        factor: u16,
+        dst_idx: usize,
+    }
+
     // Precompute affine matrices for all non-zero factors.
-    let all_matrices: Vec<(AffineMulMatrices, usize)> = factors_and_dsts
+    let all_matrices: Vec<BroadcastAffine> = factors_and_dsts
         .iter()
         .enumerate()
         .filter(|(_, fd)| fd.factor != 0 && fd.factor != 1)
-        .map(|(idx, fd)| (precompute_affine_matrices(fd.factor), idx))
+        .map(|(idx, fd)| {
+            let matrices = precompute_affine_matrices(fd.factor);
+            BroadcastAffine {
+                m_ll: _mm256_set1_epi64x(matrices.m_ll as i64),
+                m_lh: _mm256_set1_epi64x(matrices.m_lh as i64),
+                m_hl: _mm256_set1_epi64x(matrices.m_hl as i64),
+                m_hh: _mm256_set1_epi64x(matrices.m_hh as i64),
+                factor: matrices.factor,
+                dst_idx: idx,
+            }
+        })
         .collect();
 
     // Handle factor=1 (XOR-only) destinations.
@@ -827,29 +892,30 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
             let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
             let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
 
-            for &(ref matrices, dst_idx) in &all_matrices {
+            for matrices in &all_matrices {
                 let d = _mm256_loadu_si256(
-                    factors_and_dsts[dst_idx].dst.as_ptr().add(offset) as *const __m256i
+                    factors_and_dsts[matrices.dst_idx]
+                        .dst
+                        .as_ptr()
+                        .add(offset) as *const __m256i
                 );
-
-                let m_ll = _mm256_set1_epi64x(matrices.m_ll as i64);
-                let m_lh = _mm256_set1_epi64x(matrices.m_lh as i64);
-                let m_hl = _mm256_set1_epi64x(matrices.m_hl as i64);
-                let m_hh = _mm256_set1_epi64x(matrices.m_hh as i64);
 
                 let result_lo = _mm256_xor_si256(
-                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_ll),
-                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_lh),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_ll),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, matrices.m_lh),
                 );
                 let result_hi = _mm256_xor_si256(
-                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, m_hl),
-                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, m_hh),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, matrices.m_hl),
+                    _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, matrices.m_hh),
                 );
 
                 let product = _mm256_unpacklo_epi8(result_lo, result_hi);
                 let result = _mm256_xor_si256(d, product);
                 _mm256_storeu_si256(
-                    factors_and_dsts[dst_idx].dst.as_mut_ptr().add(offset) as *mut __m256i,
+                    factors_and_dsts[matrices.dst_idx]
+                        .dst
+                        .as_mut_ptr()
+                        .add(offset) as *mut __m256i,
                     result,
                 );
             }
@@ -859,12 +925,125 @@ unsafe fn mul_acc_multi_region_gfni_avx2(factors_and_dsts: &mut [FactorDst<'_>],
 
         // Tail: scalar for remaining bytes.
         if offset < len {
-            for &(ref matrices, dst_idx) in &all_matrices {
+            for matrices in &all_matrices {
                 mul_acc_region_scalar(
                     matrices.factor,
                     &src[offset..],
-                    &mut factors_and_dsts[dst_idx].dst[offset..],
+                    &mut factors_and_dsts[matrices.dst_idx].dst[offset..],
                 );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped-input GFNI + AVX2 kernel
+//
+// Keeps one destination chunk hot in registers while accumulating multiple
+// source regions into it. This mirrors ParPar's grouped-input execution shape
+// more closely than repeatedly issuing single-input updates against the same
+// destination buffer.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx2")]
+unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+
+    struct PreparedInput<'a> {
+        m_ll: __m256i,
+        m_lh: __m256i,
+        m_hl: __m256i,
+        m_hh: __m256i,
+        factor: u16,
+        src: &'a [u8],
+    }
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor != 0 && fs.factor != 1)
+        .map(|fs| {
+            let matrices = precompute_affine_matrices(fs.factor);
+            PreparedInput {
+                m_ll: _mm256_set1_epi64x(matrices.m_ll as i64),
+                m_lh: _mm256_set1_epi64x(matrices.m_lh as i64),
+                m_hl: _mm256_set1_epi64x(matrices.m_hl as i64),
+                m_hh: _mm256_set1_epi64x(matrices.m_hh as i64),
+                factor: matrices.factor,
+                src: fs.src,
+            }
+        })
+        .collect();
+
+    unsafe {
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
+        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+
+        macro_rules! process_chunk {
+            ($chunk_offset:expr) => {{
+                let mut acc =
+                    _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+
+                for src in &xor_inputs {
+                    let s = _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
+                    acc = _mm256_xor_si256(acc, s);
+                }
+
+                for input in &prepared {
+                    let s = _mm256_loadu_si256(
+                        input.src.as_ptr().add($chunk_offset) as *const __m256i
+                    );
+                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
+                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+
+                    let result_lo = _mm256_xor_si256(
+                        _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_ll),
+                        _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_lh),
+                    );
+                    let result_hi = _mm256_xor_si256(
+                        _mm256_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_hl),
+                        _mm256_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
+                    );
+
+                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+                    acc = _mm256_xor_si256(acc, product);
+                }
+
+                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, acc);
+            }};
+        }
+
+        let mut offset = 0usize;
+        while offset + 64 <= len {
+            process_chunk!(offset);
+            process_chunk!(offset + 32);
+            offset += 64;
+        }
+
+        while offset + 32 <= len {
+            process_chunk!(offset);
+            offset += 32;
+        }
+
+        if offset < len {
+            let tail = &mut dst[offset..];
+            for src in &xor_inputs {
+                for (d, s) in tail.iter_mut().zip(src[offset..].iter()) {
+                    *d ^= *s;
+                }
+            }
+            for input in &prepared {
+                mul_acc_region_scalar(input.factor, &input.src[offset..], tail);
             }
         }
     }

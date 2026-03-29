@@ -6,6 +6,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
+use weaver_yenc::{DecodeResult as YencDecodeResult, DecodedArticle, StreamingArticleDecoder, YencError};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
@@ -54,6 +55,21 @@ pub struct NntpClient {
     max_retries_per_server: u32,
     /// Per-article soft timeout — triggers failover to the next server.
     soft_timeout: Duration,
+}
+
+/// A BODY fetch that was streamed and decoded inline.
+#[derive(Debug)]
+pub struct DecodedBody {
+    pub raw_size: u32,
+    pub decoded: Vec<u8>,
+    pub result: YencDecodeResult,
+}
+
+/// Errors from the streamed BODY decode path.
+#[derive(Debug)]
+pub enum DecodedBodyError {
+    Nntp(NntpError),
+    Decode { raw_size: u32, error: YencError },
 }
 
 impl NntpClient {
@@ -314,6 +330,85 @@ impl NntpClient {
         }
 
         Err(last_error.unwrap_or(NntpError::PoolExhausted))
+    }
+
+    /// Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
+    pub async fn fetch_body_decoded_with_groups(
+        &self,
+        message_id: &str,
+        groups: &[String],
+    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        self.fetch_body_decoded_with_groups_excluding(message_id, groups, &[])
+            .await
+    }
+
+    /// Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
+    /// but skips the specified servers.
+    pub async fn fetch_body_decoded_with_groups_excluding(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        let order = self.build_server_order(exclude).await;
+
+        if order.is_empty() {
+            return Err(DecodedBodyError::Nntp(NntpError::PoolExhausted));
+        }
+
+        let mut last_error: Option<DecodedBodyError> = None;
+
+        for idx in order {
+            let server = ServerId(idx);
+            let start = Instant::now();
+
+            match self
+                .fetch_decoded_from_server_with_groups(server, message_id, groups)
+                .await
+            {
+                Ok(decoded) => {
+                    let elapsed = start.elapsed();
+                    self.record_server_success(idx, elapsed).await;
+                    return Ok(decoded);
+                }
+                Err(DecodedBodyError::Decode { raw_size, error }) => {
+                    return Err(DecodedBodyError::Decode { raw_size, error });
+                }
+                Err(DecodedBodyError::Nntp(
+                    NntpError::ArticleNotFound
+                    | NntpError::NoSuchArticle { .. }
+                    | NntpError::NoArticleWithNumber,
+                )) => {
+                    last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
+                        message_id: message_id.to_string(),
+                    }));
+                    continue;
+                }
+                Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
+                    last_error = Some(DecodedBodyError::Nntp(e));
+                    continue;
+                }
+                Err(DecodedBodyError::Nntp(
+                    NntpError::AuthenticationFailed
+                    | NntpError::AuthenticationRejected
+                    | NntpError::AccessDenied,
+                )) => {
+                    self.record_server_failure(idx, true).await;
+                    last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
+                    continue;
+                }
+                Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
+                    }
+                    last_error = Some(DecodedBodyError::Nntp(e));
+                    continue;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        Err(last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted)))
     }
 
     /// Fetch the headers of an article by message-id, with multi-server failover.
@@ -732,6 +827,141 @@ impl NntpClient {
                         self.discard_connection_error(server.0, conn).await;
                     }
                     return Err(e);
+                }
+            }
+        }
+    }
+
+    async fn fetch_decoded_from_server_with_groups(
+        &self,
+        server: ServerId,
+        message_id: &str,
+        groups: &[String],
+    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut attempts = 0u32;
+
+        loop {
+            let mut conn = self
+                .acquire_before_deadline(server, deadline)
+                .await
+                .map_err(DecodedBodyError::Nntp)?;
+
+            let group_result =
+                match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.discard_connection_error(server.0, conn).await;
+                        return Err(DecodedBodyError::Nntp(self.soft_timeout_error()));
+                    }
+                };
+
+            match group_result {
+                Err(e) if is_transient(&e) => {
+                    if is_connection_error(&e) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    if attempts < self.max_retries_per_server {
+                        attempts += 1;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await
+                        .map_err(DecodedBodyError::Nntp)?;
+                        continue;
+                    }
+                    return Err(DecodedBodyError::Nntp(e));
+                }
+                Err(e) => return Err(DecodedBodyError::Nntp(e)),
+                Ok(false) => {}
+                Ok(true) => {}
+            }
+
+            let mut decoder = StreamingArticleDecoder::new();
+            let mut output = Vec::new();
+            let mut raw_size = 0u32;
+            let mut decode_error: Option<YencError> = None;
+
+            let stream_result = match tokio::time::timeout_at(deadline, async {
+                conn.stream_body_chunked_raw(message_id, |chunk| {
+                    raw_size = raw_size.saturating_add(chunk.len() as u32);
+                    if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                        decode_error = Some(err);
+                        return Err(NntpError::MalformedResponse("streamed yEnc decode failed".into()));
+                    }
+                    Ok(())
+                })
+                .await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.discard_connection_error(server.0, conn).await;
+                    return Err(DecodedBodyError::Nntp(self.soft_timeout_error()));
+                }
+            };
+
+            match stream_result {
+                Ok(_) => {
+                    if let Some(err) = decode_error.take() {
+                        return Err(DecodedBodyError::Decode {
+                            raw_size,
+                            error: err,
+                        });
+                    }
+
+                    match decoder.finish(output) {
+                        Ok(DecodedArticle { data, result }) => {
+                            return Ok(DecodedBody {
+                                raw_size,
+                                decoded: data,
+                                result,
+                            });
+                        }
+                        Err(err) => {
+                            return Err(DecodedBodyError::Decode {
+                                raw_size,
+                                error: err,
+                            });
+                        }
+                    }
+                }
+                Err(_e) if decode_error.is_some() => {
+                    return Err(DecodedBodyError::Decode {
+                        raw_size,
+                        error: decode_error.take().expect("decode error present"),
+                    });
+                }
+                Err(e @ NntpError::ArticleNotFound)
+                | Err(e @ NntpError::NoSuchArticle { .. })
+                | Err(e @ NntpError::NoArticleWithNumber) => {
+                    return Err(DecodedBodyError::Nntp(e));
+                }
+                Err(e) if is_transient(&e) => {
+                    if is_connection_error(&e) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    if attempts < self.max_retries_per_server {
+                        attempts += 1;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await
+                        .map_err(DecodedBodyError::Nntp)?;
+                        continue;
+                    }
+                    return Err(DecodedBodyError::Nntp(e));
+                }
+                Err(e) => {
+                    if is_connection_error(&e) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    return Err(DecodedBodyError::Nntp(e));
                 }
             }
         }

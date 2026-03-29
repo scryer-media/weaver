@@ -50,7 +50,7 @@ pub mod tls;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use client::NntpClient;
+pub use client::{DecodedBody, DecodedBodyError, NntpClient};
 pub use codec::StreamChunk;
 pub use connection::{NntpConnection, ServerConfig};
 pub use error::{NntpError, Result};

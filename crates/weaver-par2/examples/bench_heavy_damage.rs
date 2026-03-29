@@ -5,8 +5,6 @@
 //! Usage:
 //!   DAMAGE=450 cargo run -p weaver-par2 --release --example bench_heavy_damage
 //!   DAMAGE=450 WARMUP=2 ITERS=5 cargo run -p weaver-par2 --release --example bench_heavy_damage
-//!   DAMAGE=450 MEMORY_LIMIT_MB=50 cargo run -p weaver-par2 --release --example bench_heavy_damage
-//!   DAMAGE=450 MEMORY_LIMIT_MB=0 cargo run -p weaver-par2 --release --example bench_heavy_damage
 //!   FIXTURE_DIR=/path/to/fixture DAMAGE=450 cargo run -p weaver-par2 --release --example bench_heavy_damage
 
 use std::ffi::OsStr;
@@ -27,20 +25,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
-}
-
-fn env_memory_limit_bytes() -> Option<usize> {
-    match std::env::var("MEMORY_LIMIT_MB") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed == "0" || trimmed.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(trimmed.parse::<usize>().unwrap() * 1024 * 1024)
-            }
-        }
-        Err(_) => RepairOptions::default().memory_limit,
-    }
 }
 
 fn peak_rss_bytes() -> u64 {
@@ -232,10 +216,7 @@ fn main() {
     let damage_count = env_usize("DAMAGE", 450);
     let warmup_iters = env_usize("WARMUP", 2);
     let bench_iters = env_usize("ITERS", 5);
-    let repair_options = RepairOptions {
-        memory_limit: env_memory_limit_bytes(),
-        ..RepairOptions::default()
-    };
+    let repair_options = RepairOptions::default();
 
     let fixture = load_fixture_info(env_fixture_dir());
 
@@ -247,10 +228,6 @@ fn main() {
         fixture.slice_size / 1024
     );
     eprintln!("  damage:   {damage_count} slices");
-    match repair_options.memory_limit {
-        Some(limit) => eprintln!("  memory:   {}MB repair budget", limit / 1024 / 1024),
-        None => eprintln!("  memory:   unlimited fast path"),
-    }
     eprintln!("  warmup:   {warmup_iters} iterations");
     eprintln!("  measured: {bench_iters} iterations");
     eprintln!();

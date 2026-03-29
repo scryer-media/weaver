@@ -1,7 +1,7 @@
 use crate::crc::Crc32;
 use crate::error::YencError;
 use crate::header;
-use crate::types::DecodeResult;
+use crate::types::{DecodeResult, YencMetadata};
 
 /// Options for decoding.
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,6 +104,255 @@ pub fn decode_with_options(
         crc_valid,
         has_trailer: parsed.yend.is_some(),
     })
+}
+
+/// Result of incrementally decoding a full NNTP yEnc article.
+#[derive(Debug)]
+pub struct DecodedArticle {
+    pub data: Vec<u8>,
+    pub result: DecodeResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingStage {
+    Header,
+    Body,
+    Trailer,
+    Finished,
+}
+
+/// Incremental yEnc article decoder for raw NNTP BODY data.
+///
+/// This keeps only the small yEnc header/trailer lines buffered while decoding
+/// body bytes as chunks arrive from the socket.
+#[derive(Debug, Clone)]
+pub struct StreamingArticleDecoder {
+    stage: StreamingStage,
+    header_bytes: Vec<u8>,
+    pending: Vec<u8>,
+    metadata: Option<YencMetadata>,
+    yend_line: Option<Vec<u8>>,
+    decode_state: DecodeState,
+    decode_buf: Vec<u8>,
+}
+
+impl StreamingArticleDecoder {
+    pub fn new() -> Self {
+        Self {
+            stage: StreamingStage::Header,
+            header_bytes: Vec::with_capacity(256),
+            pending: Vec::with_capacity(4096),
+            metadata: None,
+            yend_line: None,
+            decode_state: DecodeState::new(),
+            decode_buf: Vec::new(),
+        }
+    }
+
+    /// Feed the next raw NNTP BODY chunk into the decoder.
+    ///
+    /// `output` is appended with decoded bytes. Chunks are expected to end on a
+    /// line boundary, which matches the NNTP raw streaming fetch path.
+    pub fn feed_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), YencError> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        if self.stage == StreamingStage::Finished {
+            return Err(YencError::InvalidHeader {
+                field: "stream".to_string(),
+                reason: "received data after =yend trailer".to_string(),
+            });
+        }
+
+        self.pending.extend_from_slice(input);
+
+        loop {
+            let progressed = match self.stage {
+                StreamingStage::Header => self.process_header()?,
+                StreamingStage::Body => self.process_body(output)?,
+                StreamingStage::Trailer => self.process_trailer()?,
+                StreamingStage::Finished => false,
+            };
+
+            if !progressed {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn finish(mut self, output: Vec<u8>) -> Result<DecodedArticle, YencError> {
+        let metadata = self.metadata.take().ok_or(YencError::MissingHeader)?;
+        let bytes_written = self.decode_state.bytes_decoded as usize;
+        let part_crc = self.decode_state.finalize_crc();
+
+        let (expected_part_crc, expected_file_crc, yend_size, has_trailer) =
+            if let Some(yend_line) = self.yend_line.take() {
+                let mut scratch = self.header_bytes;
+                scratch.extend_from_slice(b"x\r\n");
+                scratch.extend_from_slice(&yend_line);
+                let parsed = header::parse_headers(&scratch)?;
+                let yend = parsed.yend.ok_or(YencError::MissingTrailer)?;
+                (yend.pcrc32, yend.crc32, yend.size, true)
+            } else {
+                (None, None, None, false)
+            };
+
+        if let Some(expected_size) = yend_size
+            && bytes_written as u64 != expected_size
+        {
+            return Err(YencError::SizeMismatch {
+                expected: expected_size,
+                actual: bytes_written as u64,
+            });
+        }
+
+        if metadata.part.is_none()
+            && let Some(expected_size) = yend_size
+            && metadata.size != expected_size
+        {
+            return Err(YencError::SizeMismatch {
+                expected: metadata.size,
+                actual: expected_size,
+            });
+        }
+
+        let expected_crc_to_check = if metadata.part.is_some() {
+            expected_part_crc
+        } else {
+            expected_file_crc
+        };
+        let crc_valid = match expected_crc_to_check {
+            Some(expected) => part_crc == expected,
+            None => true,
+        };
+
+        Ok(DecodedArticle {
+            data: output,
+            result: DecodeResult {
+                metadata,
+                bytes_written,
+                part_crc,
+                expected_part_crc,
+                expected_file_crc,
+                crc_valid,
+                has_trailer,
+            },
+        })
+    }
+
+    fn process_header(&mut self) -> Result<bool, YencError> {
+        let Some(line_len) = next_line_len(&self.pending) else {
+            return Ok(false);
+        };
+
+        let line = self.pending.drain(..line_len).collect::<Vec<_>>();
+        self.header_bytes.extend_from_slice(&line);
+
+        match header::parse_headers(&self.header_bytes) {
+            Ok(parsed) => {
+                self.metadata = Some(parsed.metadata);
+                self.stage = StreamingStage::Body;
+            }
+            Err(YencError::MissingField(field)) if field == "=ypart" => {}
+            Err(err) => return Err(err),
+        }
+
+        Ok(true)
+    }
+
+    fn process_body(&mut self, output: &mut Vec<u8>) -> Result<bool, YencError> {
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
+
+        if let Some(marker_start) = find_line_start(&self.pending, b"=yend ") {
+            if marker_start > 0 {
+                let body_len = marker_start;
+                let body = self.pending[..body_len].to_vec();
+                self.decode_body_chunk(&body, output)?;
+            }
+            let rest = self.pending.split_off(marker_start);
+            self.pending = rest;
+            self.stage = StreamingStage::Trailer;
+            return Ok(true);
+        }
+
+        let body = std::mem::take(&mut self.pending);
+        self.decode_body_chunk(&body, output)?;
+        Ok(false)
+    }
+
+    fn process_trailer(&mut self) -> Result<bool, YencError> {
+        let Some(line_len) = next_line_len(&self.pending) else {
+            return Ok(false);
+        };
+
+        let line = self.pending.drain(..line_len).collect::<Vec<_>>();
+        if line.starts_with(b"=yend ") {
+            self.yend_line = Some(line);
+            self.stage = StreamingStage::Finished;
+        } else if !line.iter().all(|b| matches!(b, b'\r' | b'\n')) {
+            return Err(YencError::InvalidHeader {
+                field: "=yend".to_string(),
+                reason: "unexpected trailing line after yEnc body".to_string(),
+            });
+        }
+
+        Ok(true)
+    }
+
+    fn decode_body_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), YencError> {
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        if self.decode_buf.len() < input.len() {
+            self.decode_buf.resize(input.len(), 0);
+        }
+
+        let written = decode_chunk(
+            input,
+            &mut self.decode_buf[..input.len()],
+            &mut self.decode_state,
+            DecodeOptions {
+                dot_unstuffing: true,
+            },
+        )?;
+        output.extend_from_slice(&self.decode_buf[..written]);
+        Ok(())
+    }
+}
+
+impl Default for StreamingArticleDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn next_line_len(buf: &[u8]) -> Option<usize> {
+    memchr::memchr(b'\n', buf).map(|idx| idx + 1)
+}
+
+fn find_line_start(buf: &[u8], prefix: &[u8]) -> Option<usize> {
+    if buf.starts_with(prefix) {
+        return Some(0);
+    }
+
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let Some(rel) = memchr::memchr(b'\n', &buf[pos..]) else {
+            break;
+        };
+        let abs = pos + rel + 1;
+        if abs < buf.len() && buf[abs..].starts_with(prefix) {
+            return Some(abs);
+        }
+        pos = abs;
+    }
+
+    None
 }
 
 /// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
@@ -464,6 +713,47 @@ mod tests {
             out.extend(yenc_encode_byte(b));
         }
         out
+    }
+
+    #[test]
+    fn streaming_article_decoder_single_chunk() {
+        let original = b"Hello streamed yEnc";
+        let mut article =
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).into_bytes();
+        article.extend_from_slice(&encode_raw(original));
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
+
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article, &mut output).unwrap();
+        let decoded = decoder.finish(output).unwrap();
+
+        assert_eq!(decoded.data, original);
+        assert_eq!(decoded.result.bytes_written, original.len());
+    }
+
+    #[test]
+    fn streaming_article_decoder_split_chunks() {
+        let original = b"Hello streamed yEnc split";
+        let mut article =
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).into_bytes();
+        article.extend_from_slice(&encode_raw(original));
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
+
+        let split_at = article
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|idx| idx + 2)
+            .unwrap();
+
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article[..split_at], &mut output).unwrap();
+        decoder.feed_chunk(&article[split_at..], &mut output).unwrap();
+        let decoded = decoder.finish(output).unwrap();
+
+        assert_eq!(decoded.data, original);
+        assert_eq!(decoded.result.bytes_written, original.len());
     }
 
     #[test]

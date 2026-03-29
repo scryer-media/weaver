@@ -31,7 +31,8 @@ pub mod types;
 
 // Convenience re-exports.
 pub use decode::{
-    DecodeOptions, DecodeState, decode, decode_body, decode_chunk, decode_nntp, decode_with_options,
+    DecodeOptions, DecodeState, DecodedArticle, StreamingArticleDecoder, decode, decode_body,
+    decode_chunk, decode_nntp, decode_with_options,
 };
 pub use encode::{encode, encode_part};
 pub use error::YencError;

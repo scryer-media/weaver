@@ -3745,6 +3745,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "weaver-core",
+ "weaver-yenc",
  "webpki-roots",
 ]
 

@@ -102,10 +102,6 @@ enum Par2Command {
     Repair {
         #[command(flatten)]
         args: Par2Args,
-
-        /// Maximum transient repair workspace in MiB. Use 0 for unlimited.
-        #[arg(long, value_name = "MB")]
-        memory_limit_mb: Option<usize>,
     },
 }
 
@@ -286,10 +282,7 @@ async fn async_main() {
 fn run_par2_command(command: Par2Command) -> Result<i32, Box<dyn std::error::Error>> {
     match command {
         Par2Command::Verify(args) => run_par2_verify(args),
-        Par2Command::Repair {
-            args,
-            memory_limit_mb,
-        } => run_par2_repair(args, memory_limit_mb),
+        Par2Command::Repair { args } => run_par2_repair(args),
     }
 }
 
@@ -311,10 +304,7 @@ fn run_par2_verify(args: Par2Args) -> Result<i32, Box<dyn std::error::Error>> {
     })
 }
 
-fn run_par2_repair(
-    args: Par2Args,
-    memory_limit_mb: Option<usize>,
-) -> Result<i32, Box<dyn std::error::Error>> {
+fn run_par2_repair(args: Par2Args) -> Result<i32, Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let resolved = resolve_par2_input(&args)?;
     std::fs::create_dir_all(&resolved.primary_dir)?;
@@ -360,14 +350,7 @@ fn run_par2_repair(
         repair_plan.recovery_exponents.len()
     );
 
-    let mut options = weaver_par2::RepairOptions::default();
-    if let Some(limit_mb) = memory_limit_mb {
-        options.memory_limit = if limit_mb == 0 {
-            None
-        } else {
-            Some(limit_mb.saturating_mul(1024 * 1024))
-        };
-    }
+    let options = weaver_par2::RepairOptions::default();
 
     let repair_started = std::time::Instant::now();
     let mut repair_access: Box<dyn weaver_par2::FileAccess> =
