@@ -58,8 +58,9 @@ impl RuntimeTuner {
     /// Create with an explicit connection limit (from config).
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
         let cores = profile.cpu.physical_cores.max(1);
-        let max_concurrent_extractions_override =
-            parse_max_concurrent_extractions_override(env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref());
+        let max_concurrent_extractions_override = parse_max_concurrent_extractions_override(
+            env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref(),
+        );
 
         // Start with all configured connections — the adaptive tuner will
         // reduce if decode pressure builds or disk can't keep up. Never cap
@@ -450,8 +451,14 @@ mod tests {
 
     #[test]
     fn parse_max_concurrent_extractions_override_accepts_positive_values() {
-        assert_eq!(parse_max_concurrent_extractions_override(Some("1")), Some(1));
-        assert_eq!(parse_max_concurrent_extractions_override(Some("6")), Some(6));
+        assert_eq!(
+            parse_max_concurrent_extractions_override(Some("1")),
+            Some(1)
+        );
+        assert_eq!(
+            parse_max_concurrent_extractions_override(Some("6")),
+            Some(6)
+        );
     }
 
     #[test]
@@ -460,7 +467,10 @@ mod tests {
         assert_eq!(parse_max_concurrent_extractions_override(Some("")), None);
         assert_eq!(parse_max_concurrent_extractions_override(Some("0")), None);
         assert_eq!(parse_max_concurrent_extractions_override(Some("-1")), None);
-        assert_eq!(parse_max_concurrent_extractions_override(Some("nope")), None);
+        assert_eq!(
+            parse_max_concurrent_extractions_override(Some("nope")),
+            None
+        );
     }
 
     #[test]
