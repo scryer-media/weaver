@@ -24,7 +24,7 @@ use weaver_core::event::PipelineEvent;
 use weaver_core::system::*;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_nntp::pool::ServerPoolConfig;
-use weaver_scheduler::{SchedulerCommand, SchedulerHandle};
+use weaver_scheduler::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 use weaver_state::Database;
 
 /// Decompress a stored NZB file. Handles both zstd-compressed and legacy
@@ -1331,10 +1331,10 @@ async fn run_server_command(
     {
         let committed_count = committed.len();
         match handle
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                committed,
+                committed_segments: committed,
                 file_progress,
                 extracted_members,
                 status,
@@ -1342,7 +1342,7 @@ async fn run_server_command(
                 queued_extract_at_epoch_ms,
                 paused_resume_status,
                 working_dir,
-            )
+            })
             .await
         {
             Ok(()) => info!(job_id = job_id.0, committed_count, "job restored"),

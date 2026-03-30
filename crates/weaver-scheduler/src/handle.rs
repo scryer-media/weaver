@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -126,6 +126,19 @@ impl Default for DownloadBlockState {
 }
 
 /// Commands sent to the scheduler's main loop.
+pub struct RestoreJobRequest {
+    pub job_id: JobId,
+    pub spec: JobSpec,
+    pub committed_segments: HashSet<SegmentId>,
+    pub file_progress: HashMap<u32, u64>,
+    pub extracted_members: HashSet<String>,
+    pub status: JobStatus,
+    pub queued_repair_at_epoch_ms: Option<f64>,
+    pub queued_extract_at_epoch_ms: Option<f64>,
+    pub paused_resume_status: Option<JobStatus>,
+    pub working_dir: PathBuf,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -136,16 +149,7 @@ pub enum SchedulerCommand {
     },
     /// Restore a job from the journal (crash recovery).
     RestoreJob {
-        job_id: JobId,
-        spec: JobSpec,
-        committed_segments: HashSet<SegmentId>,
-        file_progress: std::collections::HashMap<u32, u64>,
-        extracted_members: HashSet<String>,
-        status: JobStatus,
-        queued_repair_at_epoch_ms: Option<f64>,
-        queued_extract_at_epoch_ms: Option<f64>,
-        paused_resume_status: Option<JobStatus>,
-        working_dir: PathBuf,
+        request: Box<RestoreJobRequest>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Pause a job.
@@ -299,32 +303,11 @@ impl SchedulerHandle {
     }
 
     /// Restore a job from crash-recovery journal.
-    pub async fn restore_job(
-        &self,
-        job_id: JobId,
-        spec: JobSpec,
-        committed_segments: HashSet<SegmentId>,
-        file_progress: std::collections::HashMap<u32, u64>,
-        extracted_members: HashSet<String>,
-        status: JobStatus,
-        queued_repair_at_epoch_ms: Option<f64>,
-        queued_extract_at_epoch_ms: Option<f64>,
-        paused_resume_status: Option<JobStatus>,
-        working_dir: PathBuf,
-    ) -> Result<(), SchedulerError> {
+    pub async fn restore_job(&self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::RestoreJob {
-                job_id,
-                spec,
-                committed_segments,
-                file_progress,
-                extracted_members,
-                status,
-                queued_repair_at_epoch_ms,
-                queued_extract_at_epoch_ms,
-                paused_resume_status,
-                working_dir,
+                request: Box::new(request),
                 reply: tx,
             })
             .await
@@ -736,14 +719,14 @@ mod tests {
                     SchedulerCommand::ClearScheduleAction { reply } => {
                         let _ = reply.send(());
                     }
-                    SchedulerCommand::RestoreJob {
-                        job_id,
-                        spec,
-                        status,
-                        working_dir,
-                        reply,
-                        ..
-                    } => {
+                    SchedulerCommand::RestoreJob { request, reply } => {
+                        let RestoreJobRequest {
+                            job_id,
+                            spec,
+                            status,
+                            working_dir,
+                            ..
+                        } = *request;
                         let assembly = JobAssembly::new(job_id);
                         let par2_bytes = spec.par2_bytes();
                         let state = JobState {

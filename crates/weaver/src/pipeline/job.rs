@@ -521,17 +521,20 @@ impl Pipeline {
     /// Restore a job from crash-recovery journal.
     pub(super) async fn restore_job(
         &mut self,
-        job_id: JobId,
-        spec: JobSpec,
-        committed_segments: HashSet<SegmentId>,
-        file_progress: HashMap<u32, u64>,
-        extracted_members: HashSet<String>,
-        status: JobStatus,
-        queued_repair_at_epoch_ms: Option<f64>,
-        queued_extract_at_epoch_ms: Option<f64>,
-        paused_resume_status: Option<JobStatus>,
-        working_dir: PathBuf,
+        request: RestoreJobRequest,
     ) -> Result<(), weaver_scheduler::SchedulerError> {
+        let RestoreJobRequest {
+            job_id,
+            spec,
+            committed_segments,
+            file_progress,
+            extracted_members,
+            status,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            working_dir,
+        } = request;
         if self.jobs.contains_key(&job_id) {
             return Err(weaver_scheduler::SchedulerError::JobExists(job_id));
         }

@@ -19,7 +19,7 @@ use weaver_scheduler::download_queue::DownloadQueue;
 use weaver_scheduler::handle::{JobInfo, SharedPipelineState};
 use weaver_scheduler::job::{JobState, JobStatus, epoch_ms_now};
 use weaver_scheduler::metrics::PipelineMetrics;
-use weaver_scheduler::{SchedulerCommand, SchedulerHandle};
+use weaver_scheduler::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 use weaver_state::Database;
 
 use weaver_assembly::JobAssembly;
@@ -340,14 +340,14 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::ClearScheduleAction { reply } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::RestoreJob {
-                    job_id,
-                    spec,
-                    status,
-                    working_dir,
-                    reply,
-                    ..
-                } => {
+                SchedulerCommand::RestoreJob { request, reply } => {
+                    let RestoreJobRequest {
+                        job_id,
+                        spec,
+                        status,
+                        working_dir,
+                        ..
+                    } = *request;
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
                     let state = JobState {

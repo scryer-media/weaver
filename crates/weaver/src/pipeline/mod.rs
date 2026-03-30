@@ -32,7 +32,8 @@ use weaver_nntp::NntpClient;
 use weaver_par2::par2_set::Par2FileSet;
 use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
-    RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState, TokenBucket,
+    RestoreJobRequest, RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState,
+    TokenBucket,
 };
 use weaver_state::{ActiveFileProgress, CommittedSegment};
 
@@ -669,33 +670,8 @@ impl Pipeline {
                 }
                 let _ = reply.send(result);
             }
-            SchedulerCommand::RestoreJob {
-                job_id,
-                spec,
-                committed_segments,
-                file_progress,
-                extracted_members,
-                status,
-                queued_repair_at_epoch_ms,
-                queued_extract_at_epoch_ms,
-                paused_resume_status,
-                working_dir,
-                reply,
-            } => {
-                let result = self
-                    .restore_job(
-                        job_id,
-                        spec,
-                        committed_segments,
-                        file_progress,
-                        extracted_members,
-                        status,
-                        queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms,
-                        paused_resume_status,
-                        working_dir,
-                    )
-                    .await;
+            SchedulerCommand::RestoreJob { request, reply } => {
+                let result = self.restore_job(*request).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
@@ -3983,18 +3959,18 @@ mod tests {
         let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
         let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
         restored
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
                 committed_segments,
-                HashMap::new(),
-                ["E01.mkv".to_string()].into_iter().collect(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
-                working_dir.clone(),
-            )
+                file_progress: HashMap::new(),
+                extracted_members: ["E01.mkv".to_string()].into_iter().collect(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
+                working_dir: working_dir.clone(),
+            })
             .await
             .unwrap();
 
@@ -4146,10 +4122,10 @@ mod tests {
 
         let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
         restored
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                Pipeline::all_segment_ids(
+                committed_segments: Pipeline::all_segment_ids(
                     job_id,
                     &JobSpec {
                         name: "PAR2 Restore".to_string(),
@@ -4169,14 +4145,14 @@ mod tests {
                         }],
                     },
                 ),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -4208,18 +4184,18 @@ mod tests {
         let file_progress = HashMap::from([(0u32, 40u64), (1u32, 80u64)]);
 
         pipeline
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
                 committed_segments,
                 file_progress,
-                HashSet::new(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -4291,18 +4267,18 @@ mod tests {
 
         let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
         restored
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
                 committed_segments,
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -4369,21 +4345,21 @@ mod tests {
 
         let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
         restored
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                Pipeline::all_segment_ids(
+                committed_segments: Pipeline::all_segment_ids(
                     job_id,
                     &rar_job_spec("RAR Restart Runtime Restore", &files),
                 ),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -4420,18 +4396,21 @@ mod tests {
 
         let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
         restored
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                Pipeline::all_segment_ids(job_id, &rar_job_spec("RAR Ownerless Restore", &files)),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Downloading,
-                None,
-                None,
-                None,
-                working_dir.clone(),
-            )
+                committed_segments: Pipeline::all_segment_ids(
+                    job_id,
+                    &rar_job_spec("RAR Ownerless Restore", &files),
+                ),
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
+                working_dir: working_dir.clone(),
+            })
             .await
             .unwrap();
 
@@ -6344,10 +6323,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extraction_queue_limits_to_three_jobs() {
+    async fn extraction_queue_limits_to_tuner_capacity() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let jobs = [JobId(31101), JobId(31102), JobId(31103), JobId(31104)];
+        let extraction_limit = pipeline.tuner.max_concurrent_extractions();
+        let jobs: Vec<JobId> = (0..=extraction_limit)
+            .map(|idx| JobId(31101 + idx as u64))
+            .collect();
+        let queued_job = jobs[extraction_limit];
 
         for (idx, job_id) in jobs.iter().enumerate() {
             pipeline.jobs.insert(
@@ -6360,20 +6343,23 @@ mod tests {
             );
         }
 
-        for job_id in jobs.iter().take(3) {
+        for job_id in jobs.iter().take(extraction_limit) {
             assert!(pipeline.maybe_start_extraction(*job_id).await);
             assert_eq!(
                 pipeline.jobs.get(job_id).map(|state| state.status.clone()),
                 Some(JobStatus::Extracting)
             );
         }
-        assert_eq!(pipeline.metrics.extract_active.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            pipeline.metrics.extract_active.load(Ordering::Relaxed),
+            extraction_limit
+        );
 
-        assert!(!pipeline.maybe_start_extraction(jobs[3]).await);
+        assert!(!pipeline.maybe_start_extraction(queued_job).await);
         assert_eq!(
             pipeline
                 .jobs
-                .get(&jobs[3])
+                .get(&queued_job)
                 .map(|state| state.status.clone()),
             Some(JobStatus::QueuedExtract)
         );
@@ -6384,11 +6370,14 @@ mod tests {
             Some("downloading"),
         );
 
-        assert_eq!(pipeline.metrics.extract_active.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            pipeline.metrics.extract_active.load(Ordering::Relaxed),
+            extraction_limit
+        );
         assert_eq!(
             pipeline
                 .jobs
-                .get(&jobs[3])
+                .get(&queued_job)
                 .map(|state| state.status.clone()),
             Some(JobStatus::Extracting)
         );
@@ -6398,7 +6387,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![jobs[3]]
+            vec![queued_job]
         );
     }
 
@@ -6412,18 +6401,18 @@ mod tests {
         tokio::fs::create_dir_all(&working_dir).await.unwrap();
 
         pipeline
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                HashSet::new(),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::QueuedRepair,
-                None,
-                None,
-                None,
+                committed_segments: HashSet::new(),
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::QueuedRepair,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -6451,18 +6440,18 @@ mod tests {
         tokio::fs::create_dir_all(&working_dir).await.unwrap();
 
         pipeline
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                HashSet::new(),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Repairing,
-                Some(42_000.0),
-                None,
-                None,
+                committed_segments: HashSet::new(),
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Repairing,
+                queued_repair_at_epoch_ms: Some(42_000.0),
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 
@@ -6498,18 +6487,18 @@ mod tests {
         tokio::fs::create_dir_all(&working_dir).await.unwrap();
 
         pipeline
-            .restore_job(
+            .restore_job(RestoreJobRequest {
                 job_id,
                 spec,
-                HashSet::new(),
-                HashMap::new(),
-                HashSet::new(),
-                JobStatus::Paused,
-                None,
-                Some(84_000.0),
-                Some(JobStatus::QueuedExtract),
+                committed_segments: HashSet::new(),
+                file_progress: HashMap::new(),
+                extracted_members: HashSet::new(),
+                status: JobStatus::Paused,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: Some(84_000.0),
+                paused_resume_status: Some(JobStatus::QueuedExtract),
                 working_dir,
-            )
+            })
             .await
             .unwrap();
 

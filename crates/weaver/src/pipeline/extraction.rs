@@ -56,10 +56,10 @@ impl Drop for DirectOutputWriter {
         if let Some(shared) = &self.shared {
             let _ = shared.borrow_mut().inner.flush();
         }
-        if let Some(checkpoint) = &self.checkpoint {
-            if let Err(error) = checkpoint.persist_volume(self.volume_index, self.bytes_written) {
-                checkpoint.record_error(error);
-            }
+        if let Some(checkpoint) = &self.checkpoint
+            && let Err(error) = checkpoint.persist_volume(self.volume_index, self.bytes_written)
+        {
+            checkpoint.record_error(error);
         }
     }
 }
@@ -106,10 +106,10 @@ impl ExtractionCheckpointState {
     }
 
     fn record_error(&self, error: String) {
-        if let Ok(mut slot) = self.error.lock() {
-            if slot.is_none() {
-                *slot = Some(error);
-            }
+        if let Ok(mut slot) = self.error.lock()
+            && slot.is_none()
+        {
+            *slot = Some(error);
         }
     }
 

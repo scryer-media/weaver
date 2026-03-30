@@ -10,7 +10,9 @@ pub mod tuner;
 
 pub use download_queue::{DownloadQueue, DownloadWork};
 pub use error::SchedulerError;
-pub use handle::{JobInfo, SchedulerCommand, SchedulerHandle, SharedPipelineState};
+pub use handle::{
+    JobInfo, RestoreJobRequest, SchedulerCommand, SchedulerHandle, SharedPipelineState,
+};
 pub use job::{FileSpec, JobSpec, JobState, JobStatus, SegmentSpec};
 pub use metrics::{MetricsSnapshot, PipelineMetrics};
 pub use rate_limiter::TokenBucket;

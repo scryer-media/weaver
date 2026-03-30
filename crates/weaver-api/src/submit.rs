@@ -182,9 +182,7 @@ async fn resolve_submission_category(
     config: &SharedConfig,
     category: Option<&str>,
 ) -> Option<String> {
-    let Some(cat) = category else {
-        return None;
-    };
+    let cat = category?;
     let cfg = config.read().await;
     if cfg.categories.is_empty() {
         return Some(cat.to_string());
