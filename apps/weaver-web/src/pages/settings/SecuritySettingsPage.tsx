@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Lock, LockOpen, LogOut } from "lucide-react";
-import { useMutation } from "urql";
+import { useMutation, useQuery } from "urql";
 import { ApiKeysSection, SettingsPageHeader } from "@/pages/settings/shared";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,7 +16,7 @@ import {
   CHANGE_PASSWORD_MUTATION,
   DISABLE_LOGIN_MUTATION,
   ENABLE_LOGIN_MUTATION,
-  LOGIN_STATUS_MUTATION,
+  LOGIN_STATUS_QUERY,
 } from "@/graphql/queries";
 
 interface LoginStatus {
@@ -26,7 +26,6 @@ interface LoginStatus {
 
 function LoginProtectionSection() {
   const [status, setStatus] = useState<LoginStatus | null>(null);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -43,20 +42,28 @@ function LoginProtectionSection() {
   const [, enableLogin] = useMutation(ENABLE_LOGIN_MUTATION);
   const [, disableLogin] = useMutation(DISABLE_LOGIN_MUTATION);
   const [, changePassword] = useMutation(CHANGE_PASSWORD_MUTATION);
-  const [, fetchLoginStatus] = useMutation(LOGIN_STATUS_MUTATION);
+  const [{ data, fetching, error: loginStatusError }, reexecuteLoginStatus] = useQuery<{
+    adminLoginStatus: LoginStatus;
+  }>({
+    query: LOGIN_STATUS_QUERY,
+    requestPolicy: "network-only",
+  });
 
-  const refreshStatus = useCallback(async () => {
-    setLoading(true);
-    const result = await fetchLoginStatus({});
-    if (result.data?.loginStatus) {
-      setStatus(result.data.loginStatus);
-    }
-    setLoading(false);
-  }, [fetchLoginStatus]);
+  const refreshStatus = useCallback(() => {
+    reexecuteLoginStatus({ requestPolicy: "network-only" });
+  }, [reexecuteLoginStatus]);
 
   useEffect(() => {
-    refreshStatus();
-  }, [refreshStatus]);
+    if (data?.adminLoginStatus) {
+      setStatus(data.adminLoginStatus);
+    }
+  }, [data?.adminLoginStatus]);
+
+  useEffect(() => {
+    if (loginStatusError) {
+      setError(loginStatusError.message);
+    }
+  }, [loginStatusError]);
 
   const handleEnable = async () => {
     setError(null);
@@ -127,7 +134,7 @@ function LoginProtectionSection() {
     });
   };
 
-  if (loading) {
+  if (fetching && !status) {
     return null;
   }
 

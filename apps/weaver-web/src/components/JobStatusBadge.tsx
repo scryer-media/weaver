@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 const STATUS_VARIANTS: Record<string, ComponentProps<typeof Badge>["variant"]> = {
   QUEUED: "muted",
   DOWNLOADING: "info",
+  CHECKING: "info",
   VERIFYING: "warning",
   QUEUED_REPAIR: "muted",
   REPAIRING: "warning",
@@ -12,14 +13,17 @@ const STATUS_VARIANTS: Record<string, ComponentProps<typeof Badge>["variant"]> =
   EXTRACTING: "secondary",
   MOVING: "secondary",
   COMPLETE: "success",
+  COMPLETED: "success",
   FAILED: "destructive",
   PAUSED: "outline",
   CANCELLED: "outline",
+  FINALIZING: "secondary",
 };
 
 const STATUS_LABELS: Record<string, string> = {
   QUEUED: "Queued",
   DOWNLOADING: "Downloading",
+  CHECKING: "Checking",
   VERIFYING: "Verifying",
   QUEUED_REPAIR: "Queued",
   REPAIRING: "Repairing",
@@ -27,9 +31,11 @@ const STATUS_LABELS: Record<string, string> = {
   EXTRACTING: "Extracting",
   MOVING: "Moving",
   COMPLETE: "Complete",
+  COMPLETED: "Complete",
   FAILED: "Failed",
   PAUSED: "Paused",
   CANCELLED: "Cancelled",
+  FINALIZING: "Finalizing",
 };
 
 export function JobStatusBadge({

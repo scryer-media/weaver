@@ -153,6 +153,46 @@ async fn settings_persist_across_queries() {
 }
 
 #[tokio::test]
+async fn clear_complete_dir_with_null() {
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(
+            r#"mutation {
+                updateSettings(input: { completeDir: "/tmp/explicit-complete" }) {
+                    completeDir
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        h.db.get_setting("complete_dir").unwrap().as_deref(),
+        Some("/tmp/explicit-complete")
+    );
+
+    let resp = h
+        .execute(
+            r#"mutation {
+                updateSettings(input: { completeDir: null }) {
+                    dataDir
+                    completeDir
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let data_dir = data["updateSettings"]["dataDir"].as_str().unwrap();
+    let expected = format!("{data_dir}/complete");
+    assert_eq!(
+        data["updateSettings"]["completeDir"].as_str().unwrap(),
+        expected
+    );
+    assert!(h.db.get_setting("complete_dir").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn partial_settings_update() {
     let h = TestHarness::new().await;
 

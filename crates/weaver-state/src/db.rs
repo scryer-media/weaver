@@ -13,18 +13,24 @@ mod bandwidth;
 mod config;
 mod events;
 mod history;
+mod integration_events;
+mod metrics_scrapes;
 mod migration;
 mod rss;
 
-pub use active::{ActiveJob, ActivePar2File, CommittedSegment, ExtractionChunk, RecoveredJob};
+pub use active::{
+    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, ExtractionChunk, RecoveredJob,
+};
 pub use api_keys::ApiKeyRow;
 pub use auth::AuthCredentials;
 pub use backup::StableStateExport;
 pub use events::JobEvent;
 pub use history::{HistoryFilter, JobHistoryRow};
+pub use integration_events::IntegrationEventRow;
+pub use metrics_scrapes::MetricsScrapeRow;
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 17;
 
 fn ensure_column(
     conn: &Connection,
@@ -167,6 +173,9 @@ impl Database {
                 error        TEXT,
                 created_at   INTEGER NOT NULL,
                 normalization_retried INTEGER NOT NULL DEFAULT 0,
+                queued_repair_at_epoch_ms REAL,
+                queued_extract_at_epoch_ms REAL,
+                paused_resume_status TEXT,
                 category     TEXT,
                 metadata     TEXT
             );
@@ -179,6 +188,13 @@ impl Database {
                 decoded_size    INTEGER NOT NULL,
                 crc32           INTEGER NOT NULL,
                 PRIMARY KEY (job_id, file_index, segment_number)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS active_file_progress (
+                job_id                  INTEGER NOT NULL,
+                file_index              INTEGER NOT NULL,
+                contiguous_bytes_written INTEGER NOT NULL,
+                PRIMARY KEY (job_id, file_index)
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS active_files (
@@ -228,6 +244,22 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_job_events_job_id
                 ON job_events(job_id);
+
+            CREATE TABLE IF NOT EXISTS integration_events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp    INTEGER NOT NULL,
+                kind         TEXT NOT NULL,
+                item_id      INTEGER,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_integration_events_item_id
+                ON integration_events(item_id);
+
+            CREATE TABLE IF NOT EXISTS metrics_scrapes (
+                scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
+                body_zstd            BLOB NOT NULL
+            ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS active_extraction_chunks (
                 job_id        INTEGER NOT NULL,
@@ -446,6 +478,26 @@ impl Database {
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
+            Some(13) => {
+                // v13→v14: public integration event log is created above via IF NOT EXISTS.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(14) => {
+                // v14→v15: compressed metrics scrape storage is created above via IF NOT EXISTS.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(15) => {
+                // v15→v16: active file progress floors are created above via IF NOT EXISTS.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(16) => {
+                // v16→v17: active runtime restore columns are added below via ensure_column.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -484,6 +536,9 @@ impl Database {
             "normalization_retried",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "active_jobs", "queued_repair_at_epoch_ms", "REAL")?;
+        ensure_column(&conn, "active_jobs", "queued_extract_at_epoch_ms", "REAL")?;
+        ensure_column(&conn, "active_jobs", "paused_resume_status", "TEXT")?;
         ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
 
         Ok(())
@@ -829,6 +884,116 @@ mod tests {
             )
             .unwrap();
         assert!(bucket_cols > 0);
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v14_adds_metrics_scrapes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (14);",
+        )
+        .unwrap();
+
+        let db = Database {
+            conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
+        };
+        db.create_schema().unwrap();
+
+        let conn = db.conn();
+        let metrics_scrape_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('metrics_scrapes')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(metrics_scrape_cols, 2);
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v15_adds_active_file_progress() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (15);",
+        )
+        .unwrap();
+
+        let db = Database {
+            conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
+        };
+        db.create_schema().unwrap();
+
+        let conn = db.conn();
+        let progress_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('active_file_progress')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(progress_cols, 3);
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v16_adds_active_runtime_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (16);
+             CREATE TABLE active_jobs (
+                 job_id       INTEGER PRIMARY KEY NOT NULL,
+                 nzb_hash     BLOB NOT NULL,
+                 nzb_path     TEXT NOT NULL,
+                 output_dir   TEXT NOT NULL,
+                 status       TEXT NOT NULL DEFAULT 'downloading',
+                 error        TEXT,
+                 created_at   INTEGER NOT NULL,
+                 normalization_retried INTEGER NOT NULL DEFAULT 0,
+                 category     TEXT,
+                 metadata     TEXT
+             );",
+        )
+        .unwrap();
+
+        let db = Database {
+            conn: Arc::new(Mutex::new(conn)),
+            encryption_key: None,
+        };
+        db.create_schema().unwrap();
+
+        let conn = db.conn();
+        let runtime_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('active_jobs')
+                 WHERE name IN (
+                    'queued_repair_at_epoch_ms',
+                    'queued_extract_at_epoch_ms',
+                    'paused_resume_status'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runtime_cols, 3);
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))

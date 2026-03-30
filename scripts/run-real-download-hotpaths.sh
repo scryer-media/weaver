@@ -248,27 +248,32 @@ output_path = pathlib.Path(sys.argv[4])
 
 payload = {
     "query": """
-mutation($source: NzbSourceInput!, $filename: String, $password: String, $category: String) {
-  submitNzb(source: $source, filename: $filename, password: $password, category: $category) {
-    id
-    status
-    name
+mutation($input: SubmitNzbInput!) {
+  submitNzb(input: $input) {
+    accepted
+    item {
+      id
+      state
+      name
+    }
   }
 }
 """,
     "variables": {
-        "source": {"nzbBase64": base64.b64encode(nzb_path.read_bytes()).decode()},
-        "filename": nzb_path.name,
-        "category": category,
+        "input": {
+            "nzbBase64": base64.b64encode(nzb_path.read_bytes()).decode(),
+            "filename": nzb_path.name,
+            "category": category,
+        },
     },
 }
 if job_password:
-    payload["variables"]["password"] = job_password
+    payload["variables"]["input"]["password"] = job_password
 output_path.write_text(json.dumps(payload), encoding="utf-8")
 PY
 
 SUBMIT_RESPONSE="$(curl -fsS -H 'Content-Type: application/json' --data-binary @"${SUBMIT_PAYLOAD_PATH}" "${GRAPHQL_URL}")"
-JOB_ID="$(jq -r '.data.submitNzb.id // empty' <<<"${SUBMIT_RESPONSE}")"
+JOB_ID="$(jq -r '.data.submitNzb.item.id // empty' <<<"${SUBMIT_RESPONSE}")"
 
 if [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]]; then
   echo "submit failed: ${SUBMIT_RESPONSE}" >&2

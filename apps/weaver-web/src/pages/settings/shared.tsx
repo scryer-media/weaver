@@ -498,13 +498,13 @@ export function ApiKeysSection() {
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
 
   const [newKeyName, setNewKeyName] = useState("");
-  const [newKeyScope, setNewKeyScope] = useState<"INTEGRATION" | "ADMIN">(
-    "INTEGRATION",
+  const [newKeyScope, setNewKeyScope] = useState<"CONTROL" | "READ" | "ADMIN">(
+    "CONTROL",
   );
   const [createdKey, setCreatedKey] = useState<{
     rawKey: string;
     name: string;
-    scope: "INTEGRATION" | "ADMIN";
+    scope: "CONTROL" | "READ" | "ADMIN";
   } | null>(null);
   const [createdKeyOpen, setCreatedKeyOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
@@ -539,7 +539,7 @@ export function ApiKeysSection() {
 
   const createKey = async (
     name: string,
-    scope: "INTEGRATION" | "ADMIN",
+    scope: "CONTROL" | "READ" | "ADMIN",
   ) => {
     if (!name.trim()) return;
     setCreateBusy(true);
@@ -587,6 +587,10 @@ export function ApiKeysSection() {
 
   const handleDelete = (id: number) => {
     void deleteApiKey({ id }).then((result) => {
+      if (result.error) {
+        setCreateError(result.error.message);
+        return;
+      }
       if (result.data?.deleteApiKey) {
         setKeys(result.data.deleteApiKey);
       }
@@ -634,7 +638,9 @@ export function ApiKeysSection() {
                     <span className="rounded bg-muted px-1.5 py-0.5">
                       {key.scope === "ADMIN"
                         ? t("settings.scopeAdmin")
-                        : t("settings.scopeIntegration")}
+                        : key.scope === "READ"
+                          ? t("settings.scopeRead")
+                          : t("settings.scopeIntegration")}
                     </span>
                     <span>
                       {t("settings.apiKeyLastUsed")}:{" "}
@@ -669,14 +675,15 @@ export function ApiKeysSection() {
             <Select
               value={newKeyScope}
               onValueChange={(value) =>
-                setNewKeyScope(value as "INTEGRATION" | "ADMIN")
+                setNewKeyScope(value as "CONTROL" | "READ" | "ADMIN")
               }
             >
               <SelectTrigger className="min-w-44">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="INTEGRATION">{t("settings.scopeIntegration")}</SelectItem>
+                <SelectItem value="CONTROL">{t("settings.scopeIntegration")}</SelectItem>
+                <SelectItem value="READ">Read</SelectItem>
                 <SelectItem value="ADMIN">{t("settings.scopeAdmin")}</SelectItem>
               </SelectContent>
             </Select>
@@ -720,6 +727,8 @@ export function ApiKeysSection() {
                 <span className="font-medium text-foreground">{t("settings.apiKeyScope")}:</span>{" "}
                 {createdKey?.scope === "ADMIN"
                   ? t("settings.scopeAdmin")
+                  : createdKey?.scope === "READ"
+                    ? t("settings.scopeRead")
                   : t("settings.scopeIntegration")}
               </div>
             </div>

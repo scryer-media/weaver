@@ -28,9 +28,31 @@ use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_scheduler::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
 use weaver_state::Database;
 
-/// Shared handle to the NNTP connection pool for per-server metrics.
 #[derive(Clone)]
-struct NntpPoolHandle(Arc<NntpPool>);
+pub(crate) struct PrometheusMetricsExporter {
+    handle: SchedulerHandle,
+    nntp_pool: Arc<NntpPool>,
+}
+
+impl PrometheusMetricsExporter {
+    pub(crate) fn new(handle: SchedulerHandle, nntp_pool: Arc<NntpPool>) -> Self {
+        Self { handle, nntp_pool }
+    }
+
+    pub(crate) async fn render(&self) -> String {
+        let snapshot = self.handle.get_metrics();
+        let jobs = self.handle.list_jobs();
+        let download_block = self.handle.get_download_block();
+        let server_health = collect_server_health(&self.nntp_pool).await;
+        render_prometheus_metrics(
+            &snapshot,
+            &jobs,
+            self.handle.is_globally_paused(),
+            &download_block,
+            &server_health,
+        )
+    }
+}
 
 #[derive(Embed)]
 #[folder = "../../apps/weaver-web/dist/"]
@@ -51,6 +73,15 @@ fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
         .flat_map(|s| s.split(';'))
         .map(str::trim)
         .find_map(|cookie| cookie.strip_prefix("weaver_jwt=").map(|v| v.to_string()))
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Check if login auth is enabled and return the JWT secret if so.
@@ -74,10 +105,13 @@ async fn resolve_scope(
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
     let api_key_header = headers.get("x-api-key");
+    let bearer_token = extract_bearer_token(headers);
+    let presented_token = bearer_token
+        .as_deref()
+        .or_else(|| api_key_header.and_then(|value| value.to_str().ok()));
 
-    // 1. API key header (session token or stored key).
-    if let Some(hdr) = api_key_header {
-        let raw_key = hdr.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // 1. Bearer token or API key header (session token or stored key).
+    if let Some(raw_key) = presented_token {
         if raw_key == session_token {
             return Ok(CallerScope::Local);
         }
@@ -99,7 +133,9 @@ async fn resolve_scope(
             });
             return match row.scope.as_str() {
                 "admin" => Ok(CallerScope::Admin),
-                _ => Ok(CallerScope::Integration),
+                "read" => Ok(CallerScope::Read),
+                "control" | "integration" => Ok(CallerScope::Control),
+                _ => Ok(CallerScope::Control),
             };
         }
     }
@@ -112,14 +148,9 @@ async fn resolve_scope(
         return Ok(CallerScope::Admin);
     }
 
-    // 3. No auth enabled → open access (backward compat).
+    // 3. No login auth enabled: require an explicit session token or API key.
     if jwt_secret_if_auth_enabled(db).await.is_none() {
-        // Auth is not configured — allow open access with session token.
-        if api_key_header.is_some() {
-            // They sent a key but it didn't match anything.
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        return Ok(CallerScope::Local);
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     Err(StatusCode::UNAUTHORIZED)
@@ -388,10 +419,15 @@ async fn ws_handler(
                         return Ok(data);
                     }
 
-                    // Fall back to connection_init payload (api_key field).
-                    let Some(key) = payload.get("api_key").and_then(|v| v.as_str()) else {
+                    // Fall back to connection_init payload.
+                    let presented = payload
+                        .get("authorization")
+                        .and_then(|v| v.as_str())
+                        .and_then(|value| value.strip_prefix("Bearer ").map(str::trim))
+                        .or_else(|| payload.get("api_key").and_then(|v| v.as_str()));
+                    let Some(key) = presented else {
                         return Err(async_graphql::Error::new(
-                            "Missing api_key in connection_init",
+                            "Missing authorization or api_key in connection_init",
                         ));
                     };
                     if key == session_token.as_str() {
@@ -407,7 +443,9 @@ async fn ws_handler(
                         Some(row) => {
                             let scope = match row.scope.as_str() {
                                 "admin" => CallerScope::Admin,
-                                _ => CallerScope::Integration,
+                                "read" => CallerScope::Read,
+                                "control" | "integration" => CallerScope::Control,
+                                _ => CallerScope::Control,
                             };
                             let mut data = Data::default();
                             data.insert(scope);
@@ -422,20 +460,9 @@ async fn ws_handler(
 }
 
 async fn metrics_handler(
-    Extension(handle): Extension<SchedulerHandle>,
-    Extension(NntpPoolHandle(pool)): Extension<NntpPoolHandle>,
+    Extension(exporter): Extension<PrometheusMetricsExporter>,
 ) -> impl IntoResponse {
-    let snapshot = handle.get_metrics();
-    let jobs = handle.list_jobs();
-    let download_block = handle.get_download_block();
-    let server_health = collect_server_health(&pool).await;
-    let body = render_prometheus_metrics(
-        &snapshot,
-        &jobs,
-        handle.is_globally_paused(),
-        &download_block,
-        &server_health,
-    );
+    let body = exporter.render().await;
     (
         StatusCode::OK,
         [(
@@ -792,7 +819,7 @@ pub async fn run_server(
     handle: SchedulerHandle,
     db: Database,
     backup: BackupService,
-    nntp_pool: Arc<NntpPool>,
+    metrics_exporter: PrometheusMetricsExporter,
     addr: SocketAddr,
     base_url: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -816,7 +843,7 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
-        .layer(Extension(NntpPoolHandle(nntp_pool)))
+        .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
         .layer(Extension(session_token));
 
@@ -836,10 +863,17 @@ pub async fn run_server(
     };
 
     let app = app
-        .layer(CompressionLayer::new().gzip(true).br(true).zstd(true))
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .deflate(true)
+                .br(true)
+                .zstd(true),
+        )
         .layer(
             RequestDecompressionLayer::new()
                 .gzip(true)
+                .deflate(true)
                 .br(true)
                 .zstd(true),
         )
@@ -1463,7 +1497,7 @@ fn format_prometheus_f64(value: f64) -> String {
     }
 }
 
-fn all_job_statuses() -> [&'static str; 11] {
+fn all_job_statuses() -> [&'static str; 12] {
     [
         "queued",
         "downloading",
@@ -1473,6 +1507,7 @@ fn all_job_statuses() -> [&'static str; 11] {
         "repairing",
         "queued_extract",
         "extracting",
+        "moving",
         "complete",
         "failed",
         "paused",
@@ -1499,7 +1534,35 @@ fn job_status_label(status: &JobStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{Body, Bytes, to_bytes};
+    use axum::http::{HeaderMap, HeaderValue, header};
+    use axum::routing::post;
+    use flate2::Compression;
+    use flate2::write::{GzEncoder, ZlibEncoder};
+    use std::io::Write;
+    use tower::ServiceExt;
     use weaver_core::id::JobId;
+    use weaver_state::Database;
+
+    #[tokio::test]
+    async fn resolve_scope_requires_explicit_auth_when_login_is_disabled() {
+        let db = Database::open_in_memory().unwrap();
+        let headers = HeaderMap::new();
+        let result = resolve_scope(&db, "session-token", &headers).await;
+        assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn resolve_scope_accepts_session_bearer_without_login() {
+        let db = Database::open_in_memory().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer session-token"),
+        );
+        let result = resolve_scope(&db, "session-token", &headers).await;
+        assert_eq!(result, Ok(CallerScope::Local));
+    }
 
     #[test]
     fn renders_prometheus_metrics_for_pipeline_and_jobs() {
@@ -1583,6 +1646,106 @@ mod tests {
         assert_eq!(
             escape_prometheus_label_value("a\"b\\c\nd"),
             "a\\\"b\\\\c\\nd"
+        );
+    }
+
+    fn compress_request_body(encoding: &str, payload: &[u8]) -> Vec<u8> {
+        match encoding {
+            "gzip" => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(payload).unwrap();
+                encoder.finish().unwrap()
+            }
+            "deflate" => {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(payload).unwrap();
+                encoder.finish().unwrap()
+            }
+            "br" => {
+                let mut compressed = Vec::new();
+                {
+                    let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 3, 22);
+                    encoder.write_all(payload).unwrap();
+                }
+                compressed
+            }
+            "zstd" => zstd::bulk::compress(payload, 1).unwrap(),
+            other => panic!("unsupported encoding {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_decompression_accepts_all_supported_encodings() {
+        let app = Router::new()
+            .route("/", post(|body: Bytes| async move { body }))
+            .layer(
+                RequestDecompressionLayer::new()
+                    .gzip(true)
+                    .deflate(true)
+                    .br(true)
+                    .zstd(true),
+            );
+        let payload = br#"{"query":"query { __typename }"}"#;
+
+        for encoding in ["gzip", "deflate", "br", "zstd"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CONTENT_ENCODING, encoding)
+                        .body(Body::from(compress_request_body(encoding, payload)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "encoding {encoding}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], payload, "encoding {encoding}");
+        }
+    }
+
+    #[tokio::test]
+    async fn response_compression_supports_deflate() {
+        let payload = "deflate-me-please ".repeat(256);
+        let app = Router::new()
+            .route(
+                "/",
+                post(move || {
+                    let payload = payload.clone();
+                    async move { payload }
+                }),
+            )
+            .layer(
+                CompressionLayer::new()
+                    .gzip(true)
+                    .deflate(true)
+                    .br(true)
+                    .zstd(true),
+            );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(header::ACCEPT_ENCODING, "deflate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("deflate")
         );
     }
 }

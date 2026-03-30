@@ -1,18 +1,78 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
-import { useMutation, useQuery } from "urql";
-import { CATEGORIES_QUERY, SUBMIT_NZB_MUTATION } from "@/graphql/queries";
+import { useQuery } from "urql";
+import { authHeaders } from "@/graphql/client";
+import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 
 const NO_CATEGORY_VALUE = "__none__";
 
-async function toBase64(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += 1) {
-    binary += String.fromCharCode(bytes[index]);
+const SUBMIT_NZB_UPLOAD_OPERATION = `
+  mutation SubmitNzb($input: SubmitNzbInput!) {
+    submitNzb(input: $input) {
+      accepted
+      clientRequestId
+      item {
+        id
+        error
+      }
+    }
   }
-  return btoa(binary);
+`;
+
+type SubmitNzbUploadResponse = {
+  data?: {
+    submitNzb?: {
+      accepted: boolean;
+      clientRequestId?: string | null;
+      item?: {
+        id: number;
+        error?: string | null;
+      } | null;
+    } | null;
+  };
+  errors?: Array<{ message: string }>;
+};
+
+async function submitUploadedNzb(input: {
+  file: File;
+  password: string;
+  category: string;
+  priority: string;
+}): Promise<SubmitNzbUploadResponse> {
+  const form = new FormData();
+  form.append(
+    "operations",
+    JSON.stringify({
+      query: SUBMIT_NZB_UPLOAD_OPERATION,
+      variables: {
+        input: {
+          nzbUpload: null,
+          filename: input.file.name,
+          password: input.password.trim() || null,
+          category:
+            input.category.trim() && input.category !== NO_CATEGORY_VALUE
+              ? input.category
+              : null,
+          attributes: [{ key: "priority", value: input.priority }],
+        },
+      },
+    }),
+  );
+  form.append("map", JSON.stringify({ "0": ["variables.input.nzbUpload"] }));
+  form.append("0", input.file, input.file.name);
+
+  const response = await fetch(new URL("graphql", document.baseURI).href, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+    credentials: "same-origin",
+  });
+
+  const payload = (await response.json()) as SubmitNzbUploadResponse;
+  if (!response.ok && (!payload.errors || payload.errors.length === 0)) {
+    throw new Error(`Upload failed with status ${response.status}`);
+  }
+  return payload;
 }
 
 export function useUploadNzb(options?: {
@@ -29,7 +89,6 @@ export function useUploadNzb(options?: {
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [{ fetching }, submitNzb] = useMutation(SUBMIT_NZB_MUTATION);
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
 
   useEffect(() => {
@@ -94,15 +153,14 @@ export function useUploadNzb(options?: {
     try {
       let submittedCount = 0;
       for (const file of files) {
-        const result = await submitNzb({
-          source: { nzbBase64: await toBase64(file) },
-          filename: file.name,
-          password: password.trim() || null,
-          category: category.trim() && category !== NO_CATEGORY_VALUE ? category : null,
-          metadata: [{ key: "priority", value: priority }],
+        const result = await submitUploadedNzb({
+          file,
+          password,
+          category,
+          priority,
         });
 
-        if (result.error) {
+        if (result.errors?.length) {
           const prefix =
             submittedCount > 0
               ? t("upload.partialFailure", {
@@ -111,7 +169,22 @@ export function useUploadNzb(options?: {
                   name: file.name,
                 })
               : t("upload.batchFailure", { name: file.name });
-          setError(`${prefix} ${result.error.message}`);
+          setError(`${prefix} ${result.errors[0]?.message ?? t("upload.rejected")}`);
+          return false;
+        }
+
+        if (!result.data?.submitNzb?.accepted) {
+          const prefix =
+            submittedCount > 0
+              ? t("upload.partialFailure", {
+                  submitted: submittedCount,
+                  total: files.length,
+                  name: file.name,
+                })
+              : t("upload.batchFailure", { name: file.name });
+          const rejectionMessage =
+            result.data?.submitNzb?.item?.error ?? t("upload.rejected");
+          setError(`${prefix} ${rejectionMessage}`);
           return false;
         }
 
@@ -134,7 +207,7 @@ export function useUploadNzb(options?: {
     } finally {
       setSubmitting(false);
     }
-  }, [category, files, options, password, priority, submitNzb, t]);
+  }, [category, files, options, password, priority, t]);
 
   return {
     categories: categoryData?.categories ?? [],
@@ -142,7 +215,7 @@ export function useUploadNzb(options?: {
     error,
     files,
     fileInputRef,
-    fetching: submitting || fetching,
+    fetching: submitting,
     password,
     priority,
     category,

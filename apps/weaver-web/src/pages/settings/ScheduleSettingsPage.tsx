@@ -57,6 +57,7 @@ export function ScheduleSettingsPage() {
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [formEnabled, setFormEnabled] = useState(true);
   const [formTime, setFormTime] = useState("08:00");
   const [formAction, setFormAction] = useState("pause");
   const [formDays, setFormDays] = useState<string[]>([]);
@@ -69,6 +70,7 @@ export function ScheduleSettingsPage() {
   const resetForm = () => {
     setShowForm(false);
     setEditingId(null);
+    setFormEnabled(true);
     setFormTime("08:00");
     setFormAction("pause");
     setFormLabel("");
@@ -84,6 +86,7 @@ export function ScheduleSettingsPage() {
 
   const openEdit = (entry: Schedule) => {
     setEditingId(entry.id);
+    setFormEnabled(entry.enabled);
     setFormTime(entry.time);
     setFormAction(entry.actionType);
     setFormDays(entry.days);
@@ -109,7 +112,7 @@ export function ScheduleSettingsPage() {
       actionType: formAction,
       days: formDays.length > 0 ? formDays : null,
       label: formLabel || null,
-      enabled: true,
+      enabled: formEnabled,
     };
     if (formAction === "speed_limit") {
       input.speedLimitBytes = formSpeedUnlimited ? 0 : parseFloat(formSpeed) * 1024 * 1024;

@@ -86,6 +86,7 @@ const de: LocaleDictionary = {
   "upload.sharedSettingsHint": "Passwort, Kategorie und Priorität werden auf jede ausgewählte NZB angewendet.",
   "upload.batchFailure": "Upload bei {{name}} fehlgeschlagen.",
   "upload.partialFailure": "{{submitted}} von {{total}} Dateien übermittelt, bevor der Upload bei {{name}} fehlschlug.",
+  "upload.rejected": "Der Upload wurde vom Server abgelehnt.",
 
   // Jobs page
   "jobs.title": "Warteschlange",
@@ -387,6 +388,7 @@ const de: LocaleDictionary = {
   "settings.apiKeyNamePlaceholder": "z. B. Scryer",
   "settings.apiKeyScope": "Berechtigungsbereich",
   "settings.scopeIntegration": "Integration",
+  "settings.scopeRead": "Lesen",
   "settings.scopeAdmin": "Administrator",
   "settings.apiKeyCreated": "API-Schlüssel erstellt",
   "settings.apiKeyCopyWarning": "Kopieren Sie diesen Schlüssel jetzt. Er wird nicht erneut angezeigt.",

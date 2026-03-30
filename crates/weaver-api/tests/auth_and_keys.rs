@@ -1,14 +1,16 @@
 mod common;
 
+use async_graphql::Value;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use weaver_api::auth::CallerScope;
 
 #[tokio::test]
-async fn create_integration_api_key() {
+async fn create_control_api_key() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
             r#"mutation {
-                createApiKey(name: "test", scope: INTEGRATION) {
+                createApiKey(name: "test", scope: CONTROL) {
                     rawKey
                     key { id name scope }
                 }
@@ -21,7 +23,7 @@ async fn create_integration_api_key() {
     assert!(!result["rawKey"].as_str().unwrap().is_empty());
     assert!(result["key"]["id"].as_i64().is_some());
     assert_eq!(result["key"]["name"].as_str().unwrap(), "test");
-    assert_eq!(result["key"]["scope"].as_str().unwrap(), "INTEGRATION");
+    assert_eq!(result["key"]["scope"].as_str().unwrap(), "CONTROL");
 }
 
 #[tokio::test]
@@ -53,7 +55,7 @@ async fn list_api_keys_hides_raw_key() {
     let resp = h
         .execute(
             r#"mutation {
-                createApiKey(name: "listed", scope: INTEGRATION) {
+                createApiKey(name: "listed", scope: CONTROL) {
                     rawKey
                     key { id }
                 }
@@ -71,7 +73,7 @@ async fn list_api_keys_hides_raw_key() {
     let key = &keys[0];
     assert!(key["id"].as_i64().is_some());
     assert_eq!(key["name"].as_str().unwrap(), "listed");
-    assert_eq!(key["scope"].as_str().unwrap(), "INTEGRATION");
+    assert_eq!(key["scope"].as_str().unwrap(), "CONTROL");
 }
 
 #[tokio::test]
@@ -82,7 +84,7 @@ async fn delete_api_key() {
     let resp = h
         .execute(
             r#"mutation {
-                createApiKey(name: "doomed", scope: INTEGRATION) {
+                createApiKey(name: "doomed", scope: CONTROL) {
                     key { id }
                 }
             }"#,
@@ -163,11 +165,11 @@ async fn login_status_when_enabled() {
 
     // Check status.
     let resp = h
-        .execute(r#"mutation { loginStatus { enabled username } }"#)
+        .execute(r#"{ adminLoginStatus { enabled username } }"#)
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    let status = &data["loginStatus"];
+    let status = &data["adminLoginStatus"];
     assert!(status["enabled"].as_bool().unwrap());
     assert_eq!(status["username"].as_str().unwrap(), "admin");
 }
@@ -176,11 +178,11 @@ async fn login_status_when_enabled() {
 async fn login_status_when_disabled() {
     let h = TestHarness::new().await;
     let resp = h
-        .execute(r#"mutation { loginStatus { enabled username } }"#)
+        .execute(r#"{ adminLoginStatus { enabled username } }"#)
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    let status = &data["loginStatus"];
+    let status = &data["adminLoginStatus"];
     assert!(!status["enabled"].as_bool().unwrap());
 }
 
@@ -199,10 +201,10 @@ async fn disable_login() {
     assert_no_errors(&resp);
 
     // Verify disabled.
-    let resp = h.execute(r#"mutation { loginStatus { enabled } }"#).await;
+    let resp = h.execute(r#"{ adminLoginStatus { enabled } }"#).await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert!(!data["loginStatus"]["enabled"].as_bool().unwrap());
+    assert!(!data["adminLoginStatus"]["enabled"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -281,5 +283,88 @@ async fn change_password_when_not_enabled() {
     assert!(
         err_msg.contains("login is not enabled"),
         "expected 'login is not enabled' in error: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn read_scope_can_query_public_facade() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute_as(
+            r#"{ queueSummary { totalItems } systemStatus { version } globalQueueState { isPaused } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&resp);
+}
+
+#[tokio::test]
+async fn read_scope_cannot_submit() {
+    let h = TestHarness::new().await;
+    let nzb_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        common::make_test_nzb("read-scope-submit").as_bytes(),
+    );
+
+    let resp = h
+        .execute_as(
+            &format!(
+                r#"mutation {{
+                    submitNzb(input: {{ nzbBase64: "{nzb_b64}" }}) {{
+                        accepted
+                    }}
+                }}"#
+            ),
+            CallerScope::Read,
+        )
+        .await;
+
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("FORBIDDEN")
+    );
+}
+
+#[tokio::test]
+async fn control_scope_can_submit() {
+    let h = TestHarness::new().await;
+    let nzb_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        common::make_test_nzb("control-scope-submit").as_bytes(),
+    );
+
+    let resp = h
+        .execute_as(
+            &format!(
+                r#"mutation {{
+                    submitNzb(input: {{ nzbBase64: "{nzb_b64}", clientRequestId: "scope-1" }}) {{
+                        accepted
+                        clientRequestId
+                        item {{ id state }}
+                    }}
+                }}"#
+            ),
+            CallerScope::Control,
+        )
+        .await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert_eq!(
+        data["submitNzb"]["clientRequestId"].as_str().unwrap(),
+        "scope-1"
+    );
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
     );
 }

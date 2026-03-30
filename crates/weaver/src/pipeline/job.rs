@@ -42,12 +42,9 @@ impl Pipeline {
 
         // Create per-job working directory.
         let working_dir = self.compute_working_dir(job_id, &spec.name);
-        tokio::fs::create_dir_all(&working_dir).await.map_err(|e| {
-            weaver_scheduler::SchedulerError::Other(format!(
-                "failed to create working dir {}: {e}",
-                working_dir.display()
-            ))
-        })?;
+        tokio::fs::create_dir_all(&working_dir)
+            .await
+            .map_err(weaver_scheduler::SchedulerError::Io)?;
         info!(
             job_id = job_id.0,
             working_dir = %working_dir.display(),
@@ -117,6 +114,7 @@ impl Pipeline {
             paused_resume_status: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
+            restored_download_floor_bytes: 0,
             failed_bytes: 0,
             par2_bytes,
             health_probing: false,
@@ -250,7 +248,7 @@ impl Pipeline {
             // Case A: job still in self.jobs — must be Failed.
             let state = self.jobs.get(&job_id).unwrap();
             if !matches!(state.status, JobStatus::Failed { .. }) {
-                return Err(weaver_scheduler::SchedulerError::Other(format!(
+                return Err(weaver_scheduler::SchedulerError::Conflict(format!(
                     "job {} is not failed",
                     job_id.0
                 )));
@@ -262,7 +260,7 @@ impl Pipeline {
                 return Err(weaver_scheduler::SchedulerError::JobNotFound(job_id));
             };
             if !matches!(info.status, JobStatus::Failed { .. }) {
-                return Err(weaver_scheduler::SchedulerError::Other(format!(
+                return Err(weaver_scheduler::SchedulerError::Conflict(format!(
                     "job {} is not failed",
                     job_id.0
                 )));
@@ -270,14 +268,17 @@ impl Pipeline {
 
             let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
             let raw = tokio::fs::read(&nzb_path).await.map_err(|e| {
-                weaver_scheduler::SchedulerError::Other(format!(
-                    "failed to read NZB for job {}: {e}",
-                    job_id.0
+                weaver_scheduler::SchedulerError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to read NZB for job {}: {e}", job_id.0),
                 ))
             })?;
             let nzb_bytes = crate::decompress_nzb(&raw);
             let nzb = weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| {
-                weaver_scheduler::SchedulerError::Other(format!("failed to parse NZB: {e}"))
+                weaver_scheduler::SchedulerError::Internal(format!(
+                    "failed to parse NZB for job {}: {e}",
+                    job_id.0
+                ))
             })?;
 
             let spec = crate::import::nzb_to_spec(
@@ -313,6 +314,7 @@ impl Pipeline {
                 paused_resume_status: None,
                 working_dir,
                 downloaded_bytes: info.downloaded_bytes,
+                restored_download_floor_bytes: 0,
                 failed_bytes: 0,
                 par2_bytes,
                 health_probing: false,
@@ -522,8 +524,12 @@ impl Pipeline {
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        file_progress: HashMap<u32, u64>,
         extracted_members: HashSet<String>,
         status: JobStatus,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<JobStatus>,
         working_dir: PathBuf,
     ) -> Result<(), weaver_scheduler::SchedulerError> {
         if self.jobs.contains_key(&job_id) {
@@ -536,28 +542,35 @@ impl Pipeline {
 
         // Compute downloaded bytes from committed segments.
         let committed_ref = &committed_segments;
-        let downloaded_bytes: u64 = spec
-            .files
-            .iter()
-            .enumerate()
-            .flat_map(|(fi, file_spec)| {
-                let file_id = NzbFileId {
-                    job_id,
-                    file_index: fi as u32,
-                };
-                file_spec.segments.iter().filter_map(move |seg| {
+        let mut downloaded_bytes = 0u64;
+        let mut restored_download_floor_bytes = 0u64;
+        for (fi, file_spec) in spec.files.iter().enumerate() {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: fi as u32,
+            };
+            let committed_bytes_for_file: u64 = file_spec
+                .segments
+                .iter()
+                .filter_map(|seg| {
                     let sid = SegmentId {
                         file_id,
                         segment_number: seg.number,
                     };
-                    if committed_ref.contains(&sid) {
-                        Some(seg.bytes as u64)
-                    } else {
-                        None
-                    }
+                    committed_ref.contains(&sid).then_some(seg.bytes as u64)
                 })
-            })
-            .sum();
+                .sum();
+            downloaded_bytes += committed_bytes_for_file;
+            let file_total_bytes: u64 = file_spec.segments.iter().map(|seg| seg.bytes as u64).sum();
+            let file_progress_floor = file_progress
+                .get(&(fi as u32))
+                .copied()
+                .unwrap_or(0)
+                .min(file_total_bytes);
+            restored_download_floor_bytes += committed_bytes_for_file.max(file_progress_floor);
+            self.persisted_file_progress
+                .insert(file_id, file_progress_floor);
+        }
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 
@@ -577,13 +590,12 @@ impl Pipeline {
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
-            queued_repair_at_epoch_ms: matches!(status, JobStatus::QueuedRepair)
-                .then(weaver_scheduler::job::epoch_ms_now),
-            queued_extract_at_epoch_ms: matches!(status, JobStatus::QueuedExtract)
-                .then(weaver_scheduler::job::epoch_ms_now),
-            paused_resume_status: None,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
             working_dir,
             downloaded_bytes,
+            restored_download_floor_bytes,
             failed_bytes: 0,
             par2_bytes,
             health_probing: false,
@@ -627,10 +639,18 @@ impl Pipeline {
         self.restore_par2_state_from_disk(job_id).await;
         self.restore_rar_state_for_job(job_id).await;
 
+        if matches!(status, JobStatus::Repairing) {
+            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(status, JobStatus::Extracting) {
+            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+        }
+
         info!(
             job_id = job_id.0,
             committed_count,
             downloaded_bytes,
+            restored_download_floor_bytes,
             status = ?status,
             queue_depth,
             "job restored from journal"
@@ -638,9 +658,12 @@ impl Pipeline {
         if matches!(
             status,
             JobStatus::Downloading
+                | JobStatus::Checking
                 | JobStatus::Verifying
                 | JobStatus::QueuedRepair
+                | JobStatus::Repairing
                 | JobStatus::QueuedExtract
+                | JobStatus::Extracting
         ) {
             self.schedule_job_completion_check(job_id);
         }

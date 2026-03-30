@@ -3,17 +3,25 @@ use std::path::{Path, PathBuf};
 use async_graphql::{Context, Object, Result};
 
 use weaver_core::config::SharedConfig;
-use weaver_scheduler::SchedulerHandle;
-use weaver_state::Database;
+use weaver_core::id::JobId;
+use weaver_scheduler::{JobInfo, JobStatus, SchedulerHandle};
+use weaver_state::{Database, JobHistoryRow};
 
-use crate::auth::AdminGuard;
+use crate::auth::{AdminGuard, ReadGuard, graphql_error};
+use crate::facade::{
+    GlobalQueueState, HistoryItem, QueueEvent, QueueFilterInput, QueueItem, QueueSummary,
+    SystemStatus, decode_event_cursor, decode_offset_cursor, global_queue_state,
+    history_item_from_row, matches_history_filter, matches_queue_filter, metrics_from_snapshot,
+    queue_event_from_record, queue_item_from_job, queue_summary,
+};
+use crate::metrics_history::build_metrics_history;
 use crate::timeline::build_job_timeline;
 use weaver_core::log_buffer::LogRingBuffer;
 
 use crate::types::{
     ApiKey, ApiKeyScope, Category, DirectoryBrowseEntry, DirectoryBrowseResult, DownloadBlock,
     EventKind, GeneralSettings, Job, JobEvent, JobOutputFile, JobOutputResult, JobStatusGql,
-    JobTimeline, Metrics, RssFeed, RssSeenItem, Server, ServiceLogsPayload,
+    JobTimeline, Metrics, MetricsHistoryResult, RssFeed, RssSeenItem, Server, ServiceLogsPayload,
 };
 
 pub struct QueryRoot;
@@ -23,6 +31,248 @@ impl QueryRoot {
     /// The running weaver binary version.
     async fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
+    }
+
+    /// Public queue facade for active or in-flight items.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_items(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<QueueFilterInput>,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<Vec<QueueItem>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let offset = decode_offset_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let limit = first.unwrap_or(u32::MAX) as usize;
+
+        let items = handle
+            .list_jobs()
+            .into_iter()
+            .filter(|info| {
+                !matches!(
+                    info.status,
+                    weaver_scheduler::JobStatus::Complete
+                        | weaver_scheduler::JobStatus::Failed { .. }
+                )
+            })
+            .map(|info| queue_item_from_job(&info))
+            .filter(|item| matches_queue_filter(item, filter.as_ref()))
+            .skip(offset)
+            .take(limit)
+            .collect();
+        Ok(items)
+    }
+
+    /// Public queue facade for one active item.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<Option<QueueItem>> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let Some(info) = handle.list_jobs().into_iter().find(|info| {
+            info.job_id.0 == id
+                && !matches!(
+                    info.status,
+                    weaver_scheduler::JobStatus::Complete
+                        | weaver_scheduler::JobStatus::Failed { .. }
+                )
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(queue_item_from_job(&info)))
+    }
+
+    /// Summary of the active queue and live throughput.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_summary(&self, ctx: &Context<'_>) -> Result<QueueSummary> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let items: Vec<QueueItem> = handle
+            .list_jobs()
+            .into_iter()
+            .filter(|info| {
+                !matches!(
+                    info.status,
+                    weaver_scheduler::JobStatus::Complete
+                        | weaver_scheduler::JobStatus::Failed { .. }
+                )
+            })
+            .map(|info| queue_item_from_job(&info))
+            .collect();
+        Ok(queue_summary(&items, &handle.get_metrics()))
+    }
+
+    /// Public history facade.
+    #[graphql(guard = "ReadGuard")]
+    async fn history_items(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<QueueFilterInput>,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<Vec<HistoryItem>> {
+        let offset = decode_offset_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let limit = first.unwrap_or(u32::MAX) as usize;
+        let db = ctx.data::<Database>()?.clone();
+        let items = tokio::task::spawn_blocking(move || {
+            let rows = db.list_job_history(&weaver_state::HistoryFilter::default())?;
+            Ok::<_, weaver_state::StateError>(
+                rows.into_iter()
+                    .map(|row| history_item_from_row(&row))
+                    .filter(|item| matches_history_filter(item, filter.as_ref()))
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        Ok(items)
+    }
+
+    /// Public history facade for one completed or failed item.
+    #[graphql(guard = "ReadGuard")]
+    async fn history_item(&self, ctx: &Context<'_>, id: u64) -> Result<Option<HistoryItem>> {
+        let db = ctx.data::<Database>()?.clone();
+        let row = tokio::task::spawn_blocking(move || db.get_job_history(id))
+            .await
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        Ok(row.as_ref().map(history_item_from_row))
+    }
+
+    /// Count history items exposed by the public history facade.
+    #[graphql(guard = "ReadGuard")]
+    async fn history_items_count(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<QueueFilterInput>,
+    ) -> Result<u32> {
+        let db = ctx.data::<Database>()?.clone();
+        let count = tokio::task::spawn_blocking(move || {
+            let rows = db.list_job_history(&weaver_state::HistoryFilter::default())?;
+            Ok::<_, weaver_state::StateError>(
+                rows.into_iter()
+                    .map(|row| history_item_from_row(&row))
+                    .filter(|item| matches_history_filter(item, filter.as_ref()))
+                    .count() as u32,
+            )
+        })
+        .await
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        Ok(count)
+    }
+
+    /// Semantic lifecycle history for a queue/history item.
+    #[graphql(guard = "ReadGuard")]
+    async fn history_events(
+        &self,
+        ctx: &Context<'_>,
+        item_id: u64,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<Vec<QueueEvent>> {
+        let cursor = decode_event_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let db = ctx.data::<Database>()?.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            db.list_integration_events_after(cursor, Some(item_id), first)
+        })
+        .await
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let record = serde_json::from_str(&row.payload_json).map_err(|e| {
+                    graphql_error(
+                        "INTERNAL",
+                        format!("invalid integration event payload: {e}"),
+                    )
+                })?;
+                Ok(queue_event_from_record(row.id, record))
+            })
+            .collect()
+    }
+
+    /// System status facade for integrations.
+    #[graphql(guard = "ReadGuard")]
+    async fn system_status(&self, ctx: &Context<'_>) -> Result<SystemStatus> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        let cfg = config.read().await;
+        let items: Vec<QueueItem> = handle
+            .list_jobs()
+            .into_iter()
+            .filter(|info| {
+                !matches!(
+                    info.status,
+                    weaver_scheduler::JobStatus::Complete
+                        | weaver_scheduler::JobStatus::Failed { .. }
+                )
+            })
+            .map(|info| queue_item_from_job(&info))
+            .collect();
+        let metrics = handle.get_metrics();
+        let global_state = global_queue_state(
+            handle.is_globally_paused(),
+            &handle.get_download_block(),
+            cfg.max_download_speed.unwrap_or(0),
+        );
+        Ok(SystemStatus {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            global_state,
+            summary: queue_summary(&items, &metrics),
+        })
+    }
+
+    /// System metrics facade for integrations.
+    #[graphql(guard = "ReadGuard")]
+    async fn system_metrics(&self, ctx: &Context<'_>) -> Result<Metrics> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        Ok(metrics_from_snapshot(&handle.get_metrics()))
+    }
+
+    /// Historical Prometheus metrics, parsed on demand from compressed SQLite scrapes.
+    #[graphql(guard = "ReadGuard")]
+    async fn metrics_history(
+        &self,
+        ctx: &Context<'_>,
+        minutes: i32,
+        metrics: Vec<String>,
+    ) -> Result<MetricsHistoryResult> {
+        let clamped_minutes = minutes.clamp(1, 1440) as i64;
+        let db = ctx.data::<Database>()?.clone();
+        let since_epoch_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - clamped_minutes * 60;
+
+        tokio::task::spawn_blocking(move || {
+            let rows = db
+                .list_metrics_scrapes_since(since_epoch_sec)
+                .map_err(|error| error.to_string())?;
+            build_metrics_history(rows, &metrics)
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error))
+    }
+
+    /// Current global queue state facade.
+    #[graphql(guard = "ReadGuard")]
+    async fn global_queue_state(&self, ctx: &Context<'_>) -> Result<GlobalQueueState> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        let cfg = config.read().await;
+        Ok(global_queue_state(
+            handle.is_globally_paused(),
+            &handle.get_download_block(),
+            cfg.max_download_speed.unwrap_or(0),
+        ))
     }
 
     #[graphql(guard = "AdminGuard")]
@@ -142,15 +392,20 @@ impl QueryRoot {
         job_id: u64,
     ) -> Result<Option<JobOutputResult>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let job = match handle.get_job(weaver_core::id::JobId(job_id)) {
-            Ok(info) => info,
-            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => return Ok(None),
+        let output_dir = match handle.get_job(weaver_core::id::JobId(job_id)) {
+            Ok(info) => info.output_dir.clone(),
+            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => {
+                let db = ctx.data::<Database>()?.clone();
+                tokio::task::spawn_blocking(move || db.get_job_history(job_id))
+                    .await
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                    .and_then(|row| row.output_dir)
+            }
             Err(e) => return Err(e.into()),
         };
-
-        let output_dir = match job.output_dir {
-            Some(ref dir) => dir.clone(),
-            None => return Ok(None),
+        let Some(output_dir) = output_dir else {
+            return Ok(None);
         };
 
         let dir_path = PathBuf::from(&output_dir);
@@ -179,9 +434,9 @@ impl QueryRoot {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_state::Database>()?.clone();
 
-        let job = match handle.get_job(weaver_core::id::JobId(job_id)) {
-            Ok(info) => info,
-            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => return Ok(None),
+        let live_job = match handle.get_job(JobId(job_id)) {
+            Ok(info) => Some(info),
+            Err(weaver_scheduler::SchedulerError::JobNotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
 
@@ -193,6 +448,10 @@ impl QueryRoot {
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        let Some(job) = live_job.or_else(|| history.as_ref().map(job_info_from_history_row)) else {
+            return Ok(None);
+        };
 
         Ok(Some(build_job_timeline(&job, history.as_ref(), &events)))
     }
@@ -252,6 +511,29 @@ impl QueryRoot {
             .collect())
     }
 
+    /// Admin-facing auth status moved to query semantics.
+    #[graphql(guard = "AdminGuard")]
+    async fn admin_login_status(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::mutation::LoginStatusResult> {
+        let db = ctx.data::<Database>()?.clone();
+        let credentials = tokio::task::spawn_blocking(move || db.get_auth_credentials())
+            .await
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        Ok(match credentials {
+            Some(creds) => crate::mutation::LoginStatusResult {
+                enabled: true,
+                username: Some(creds.username),
+            },
+            None => crate::mutation::LoginStatusResult {
+                enabled: false,
+                username: None,
+            },
+        })
+    }
+
     /// List all API keys (without raw key values).
     #[graphql(guard = "AdminGuard")]
     async fn api_keys(&self, ctx: &Context<'_>) -> Result<Vec<ApiKey>> {
@@ -267,8 +549,10 @@ impl QueryRoot {
                 id: r.id,
                 name: r.name,
                 scope: match r.scope.as_str() {
+                    "read" => ApiKeyScope::Read,
+                    "control" | "integration" => ApiKeyScope::Control,
                     "admin" => ApiKeyScope::Admin,
-                    _ => ApiKeyScope::Integration,
+                    _ => ApiKeyScope::Control,
                 },
                 created_at: r.created_at as f64,
                 last_used_at: r.last_used_at.map(|t| t as f64),
@@ -413,6 +697,51 @@ fn browse_directories(path: &Path) -> Result<DirectoryBrowseResult> {
         parent_path,
         entries,
     })
+}
+
+fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
+    let metadata = row
+        .metadata
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
+        .unwrap_or_default();
+    let error = row.error_message.clone();
+    let status = match row.status.to_ascii_lowercase().as_str() {
+        "complete" => JobStatus::Complete,
+        "paused" => JobStatus::Paused,
+        "cancelled" => JobStatus::Failed {
+            error: error
+                .clone()
+                .unwrap_or_else(|| "item was cancelled".to_string()),
+        },
+        _ => JobStatus::Failed {
+            error: error.clone().unwrap_or_else(|| "job failed".to_string()),
+        },
+    };
+    let progress = if row.total_bytes == 0 {
+        0.0
+    } else {
+        (row.downloaded_bytes as f64 / row.total_bytes as f64).clamp(0.0, 1.0)
+    };
+
+    JobInfo {
+        job_id: JobId(row.job_id),
+        name: row.name.clone(),
+        status,
+        progress,
+        total_bytes: row.total_bytes,
+        downloaded_bytes: row.downloaded_bytes,
+        optional_recovery_bytes: row.optional_recovery_bytes,
+        optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
+        failed_bytes: row.failed_bytes,
+        health: row.health,
+        password: None,
+        category: row.category.clone(),
+        metadata,
+        output_dir: row.output_dir.clone(),
+        error,
+        created_at_epoch_ms: row.created_at as f64,
+    }
 }
 
 fn list_output_files(dir: &Path) -> Result<JobOutputResult> {

@@ -139,8 +139,12 @@ pub enum SchedulerCommand {
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        file_progress: std::collections::HashMap<u32, u64>,
         extracted_members: HashSet<String>,
         status: JobStatus,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<JobStatus>,
         working_dir: PathBuf,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
@@ -300,8 +304,12 @@ impl SchedulerHandle {
         job_id: JobId,
         spec: JobSpec,
         committed_segments: HashSet<SegmentId>,
+        file_progress: std::collections::HashMap<u32, u64>,
         extracted_members: HashSet<String>,
         status: JobStatus,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<JobStatus>,
         working_dir: PathBuf,
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -310,8 +318,12 @@ impl SchedulerHandle {
                 job_id,
                 spec,
                 committed_segments,
+                file_progress,
                 extracted_members,
                 status,
+                queued_repair_at_epoch_ms,
+                queued_extract_at_epoch_ms,
+                paused_resume_status,
                 working_dir,
                 reply: tx,
             })
@@ -648,6 +660,7 @@ mod tests {
                             queued_extract_at_epoch_ms: None,
                             working_dir: PathBuf::from("/tmp/test"),
                             downloaded_bytes: 0,
+                            restored_download_floor_bytes: 0,
                             failed_bytes: 0,
                             par2_bytes,
                             health_probing: false,
@@ -745,6 +758,7 @@ mod tests {
                             queued_extract_at_epoch_ms: None,
                             working_dir,
                             downloaded_bytes: 0,
+                            restored_download_floor_bytes: 0,
                             failed_bytes: 0,
                             par2_bytes,
                             health_probing: false,
@@ -770,7 +784,7 @@ mod tests {
                                 state.status = JobStatus::Downloading;
                                 Ok(())
                             }
-                            Some(_) => Err(SchedulerError::Other(format!(
+                            Some(_) => Err(SchedulerError::Conflict(format!(
                                 "job {} is not failed",
                                 job_id.0
                             ))),

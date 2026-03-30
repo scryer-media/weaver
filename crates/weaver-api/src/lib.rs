@@ -1,6 +1,8 @@
 pub mod auth;
 mod backup;
+mod facade;
 pub mod jwt;
+mod metrics_history;
 mod mutation;
 mod query;
 pub mod rss;
@@ -20,6 +22,7 @@ pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
     BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
 };
+pub use facade::*;
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;
 pub use rss::RssService;

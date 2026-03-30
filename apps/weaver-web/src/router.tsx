@@ -1,12 +1,12 @@
 import { createBrowserRouter, Navigate } from "react-router";
 import { Layout } from "@/components/Layout";
+import { RouteErrorPage } from "@/components/RouteErrorPage";
 import { JobList } from "@/pages/JobList";
 import { JobDetail } from "@/pages/JobDetail";
 import { Upload } from "@/pages/Upload";
 import { Servers } from "@/pages/Servers";
 import { Categories } from "@/pages/Categories";
 import { History } from "@/pages/History";
-import { MetricsPage } from "@/pages/MetricsPage";
 import { SettingsLayout } from "@/pages/settings/SettingsLayout";
 import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
 import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
@@ -14,24 +14,32 @@ import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
 import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
 import { ScheduleSettingsPage } from "@/pages/settings/ScheduleSettingsPage";
 import { BandwidthCapSettingsPage } from "@/pages/settings/BandwidthCapSettingsPage";
-import { lazy } from "react";
-
-const LogViewerPage = lazy(() =>
-  import("@/pages/LogViewerPage").then((m) => ({ default: m.LogViewerPage })),
-);
 
 const basename = window.__WEAVER_BASE__ || "/";
 
 export const router = createBrowserRouter([
   {
     element: <Layout />,
+    errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <JobList /> },
       { path: "jobs/:id", element: <JobDetail /> },
       { path: "upload", element: <Upload /> },
-      { path: "metrics", element: <MetricsPage /> },
+      {
+        path: "metrics",
+        lazy: async () => {
+          const page = await import("@/pages/MetricsPage");
+          return { Component: page.MetricsPage };
+        },
+      },
       { path: "history", element: <History /> },
-      { path: "logs", element: <LogViewerPage /> },
+      {
+        path: "logs",
+        lazy: async () => {
+          const page = await import("@/pages/LogViewerPage");
+          return { Component: page.LogViewerPage };
+        },
+      },
       { path: "servers", element: <Navigate to="/settings/servers" replace /> },
       { path: "categories", element: <Navigate to="/settings/categories" replace /> },
       {

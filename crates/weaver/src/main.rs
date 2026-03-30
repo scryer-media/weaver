@@ -1,9 +1,11 @@
+mod e2e_failpoint;
 mod import;
 mod pipeline;
 mod runtime_affinity;
 mod server;
 mod system;
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -454,6 +456,31 @@ fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, Box<dyn st
     Ok(par2_paths)
 }
 
+fn cleanup_orphaned_persisted_nzbs(
+    nzb_dir: &Path,
+    referenced_paths: &HashSet<PathBuf>,
+) -> Result<usize, std::io::Error> {
+    if !nzb_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(nzb_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if referenced_paths.contains(&path) {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
 fn load_par2_set(
     par2_paths: &[PathBuf],
 ) -> Result<weaver_par2::Par2FileSet, Box<dyn std::error::Error>> {
@@ -891,6 +918,44 @@ fn pipeline_exit_error(result: Result<(), tokio::task::JoinError>) -> std::io::E
     }
 }
 
+fn epoch_sec_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn spawn_metrics_history_task(
+    exporter: server::PrometheusMetricsExporter,
+    db: Database,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            let rendered = exporter.render().await;
+            let db = db.clone();
+            let recorded_at_epoch_sec = epoch_sec_now();
+            match tokio::task::spawn_blocking(move || {
+                db.record_metrics_scrape(recorded_at_epoch_sec, &rendered)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "failed to persist metrics scrape");
+                }
+                Err(join_error) => {
+                    tracing::warn!(error = %join_error, "metrics scrape persistence task failed");
+                }
+            }
+        }
+    })
+}
+
 /// Run the HTTP server with the GraphQL API.
 async fn run_server_command(
     mut config: Config,
@@ -967,6 +1032,10 @@ async fn run_server_command(
     weaver_api::init_job_counter(max_id + 1);
 
     let active_jobs = db.load_active_jobs().unwrap_or_default();
+    let mut referenced_nzb_paths: HashSet<PathBuf> = active_jobs
+        .values()
+        .map(|recovered| recovered.nzb_path.clone())
+        .collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -1059,12 +1128,20 @@ async fn run_server_command(
                                 &recovered.status,
                                 recovered.error.as_deref(),
                             );
+                            let paused_resume_status = recovered
+                                .paused_resume_status
+                                .as_deref()
+                                .map(|status| status_str_to_job_status(status, None));
                             to_restore.push((
                                 job_id,
                                 spec,
                                 recovered.committed_segments,
+                                recovered.file_progress,
                                 recovered.extracted_members,
                                 status,
+                                recovered.queued_repair_at_epoch_ms,
+                                recovered.queued_extract_at_epoch_ms,
+                                paused_resume_status,
                                 recovered.output_dir,
                             ));
                         }
@@ -1092,6 +1169,9 @@ async fn run_server_command(
     match db.list_job_history(&weaver_state::HistoryFilter::default()) {
         Ok(history_rows) => {
             for row in history_rows {
+                if let Some(nzb_path) = row.nzb_path.as_ref() {
+                    referenced_nzb_paths.insert(PathBuf::from(nzb_path));
+                }
                 let job_id = weaver_core::id::JobId(row.job_id);
                 // Skip if we already have this job from active_jobs recovery.
                 if initial_history.iter().any(|j| j.job_id == job_id) {
@@ -1127,6 +1207,21 @@ async fn run_server_command(
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to load job history from database");
+        }
+    }
+
+    let nzb_dir = data_dir.join(".weaver-nzbs");
+    match cleanup_orphaned_persisted_nzbs(&nzb_dir, &referenced_nzb_paths) {
+        Ok(removed) if removed > 0 => {
+            info!(removed, nzb_dir = %nzb_dir.display(), "removed orphaned persisted nzbs");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                error = %error,
+                nzb_dir = %nzb_dir.display(),
+                "failed to cleanup orphaned persisted nzbs"
+            );
         }
     }
 
@@ -1174,8 +1269,17 @@ async fn run_server_command(
     {
         let event_rx = event_tx.subscribe();
         let db_for_events = db.clone();
+        let handle_for_events = handle.clone();
+        let config_for_events = pipeline_config.clone();
         tokio::spawn(async move {
-            if let Err(panic) = tokio::spawn(persist_events(event_rx, db_for_events)).await {
+            if let Err(panic) = tokio::spawn(persist_events(
+                event_rx,
+                db_for_events,
+                handle_for_events,
+                config_for_events,
+            ))
+            .await
+            {
                 tracing::error!(
                     error = %panic,
                     "CRITICAL: event persistence task panicked — events will not be recorded"
@@ -1205,21 +1309,38 @@ async fn run_server_command(
     .await?;
 
     let nntp_pool = pipeline.nntp.pool().clone();
+    let metrics_exporter = server::PrometheusMetricsExporter::new(handle.clone(), nntp_pool);
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
 
     // Restore in-progress jobs from SQLite.
-    for (job_id, spec, committed, extracted_members, status, working_dir) in to_restore {
+    for (
+        job_id,
+        spec,
+        committed,
+        file_progress,
+        extracted_members,
+        status,
+        queued_repair_at_epoch_ms,
+        queued_extract_at_epoch_ms,
+        paused_resume_status,
+        working_dir,
+    ) in to_restore
+    {
         let committed_count = committed.len();
         match handle
             .restore_job(
                 job_id,
                 spec,
                 committed,
+                file_progress,
                 extracted_members,
                 status,
+                queued_repair_at_epoch_ms,
+                queued_extract_at_epoch_ms,
+                paused_resume_status,
                 working_dir,
             )
             .await
@@ -1230,6 +1351,7 @@ async fn run_server_command(
     }
 
     let rss_task = rss.start_background_loop();
+    let metrics_history_task = spawn_metrics_history_task(metrics_exporter.clone(), db.clone());
 
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -1238,7 +1360,7 @@ async fn run_server_command(
         handle.clone(),
         db.clone(),
         backup,
-        nntp_pool,
+        metrics_exporter,
         addr,
         base_url.to_owned(),
     ));
@@ -1252,12 +1374,14 @@ async fn run_server_command(
             }
             server_task.abort();
             rss_task.abort();
+            metrics_history_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
             let error = pipeline_exit_error(result);
             server_task.abort();
             rss_task.abort();
+            metrics_history_task.abort();
             Err(error.into())
         }
     }
@@ -1314,9 +1438,12 @@ fn status_str_to_job_status(status: &str, error: Option<&str>) -> weaver_schedul
     match status {
         "queued" => weaver_scheduler::JobStatus::Queued,
         "downloading" => weaver_scheduler::JobStatus::Downloading,
+        "checking" => weaver_scheduler::JobStatus::Checking,
         "verifying" => weaver_scheduler::JobStatus::Verifying,
-        "queued_repair" | "repairing" => weaver_scheduler::JobStatus::QueuedRepair,
-        "queued_extract" | "extracting" => weaver_scheduler::JobStatus::QueuedExtract,
+        "queued_repair" => weaver_scheduler::JobStatus::QueuedRepair,
+        "repairing" => weaver_scheduler::JobStatus::Repairing,
+        "queued_extract" => weaver_scheduler::JobStatus::QueuedExtract,
+        "extracting" => weaver_scheduler::JobStatus::Extracting,
         "complete" => weaver_scheduler::JobStatus::Complete,
         "failed" => weaver_scheduler::JobStatus::Failed {
             error: error.unwrap_or("unknown error").to_string(),
@@ -1374,10 +1501,65 @@ pub fn build_nntp_client(
     NntpClient::new(client_config)
 }
 
+fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
+    match event {
+        PipelineEvent::JobCreated { job_id, .. }
+        | PipelineEvent::JobPaused { job_id }
+        | PipelineEvent::JobResumed { job_id }
+        | PipelineEvent::JobCompleted { job_id }
+        | PipelineEvent::JobFailed { job_id, .. }
+        | PipelineEvent::DownloadStarted { job_id }
+        | PipelineEvent::DownloadFinished { job_id }
+        | PipelineEvent::Par2MetadataLoaded { job_id }
+        | PipelineEvent::JobVerificationStarted { job_id }
+        | PipelineEvent::JobVerificationComplete { job_id, .. }
+        | PipelineEvent::RepairConfidenceUpdated { job_id, .. }
+        | PipelineEvent::RepairStarted { job_id }
+        | PipelineEvent::RepairComplete { job_id, .. }
+        | PipelineEvent::RepairFailed { job_id, .. }
+        | PipelineEvent::ExtractionReady { job_id }
+        | PipelineEvent::ExtractionMemberStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberWaitingStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberWaitingFinished { job_id, .. }
+        | PipelineEvent::ExtractionMemberAppendStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberAppendFinished { job_id, .. }
+        | PipelineEvent::ExtractionProgress { job_id, .. }
+        | PipelineEvent::ExtractionMemberFinished { job_id, .. }
+        | PipelineEvent::ExtractionMemberFailed { job_id, .. }
+        | PipelineEvent::ExtractionComplete { job_id }
+        | PipelineEvent::ExtractionFailed { job_id, .. }
+        | PipelineEvent::MoveToCompleteStarted { job_id }
+        | PipelineEvent::MoveToCompleteFinished { job_id } => Some(job_id.0),
+        PipelineEvent::FileClassified { file_id, .. }
+        | PipelineEvent::VerificationStarted { file_id }
+        | PipelineEvent::VerificationComplete { file_id, .. }
+        | PipelineEvent::FileComplete { file_id, .. }
+        | PipelineEvent::FileMissing { file_id, .. } => Some(file_id.job_id.0),
+        PipelineEvent::SegmentQueued { segment_id, .. }
+        | PipelineEvent::ArticleDownloaded { segment_id, .. }
+        | PipelineEvent::ArticleNotFound { segment_id }
+        | PipelineEvent::SegmentRetryScheduled { segment_id, .. }
+        | PipelineEvent::SegmentFailedPermanent { segment_id, .. }
+        | PipelineEvent::SegmentDecoded { segment_id, .. }
+        | PipelineEvent::SegmentDecodeFailed { segment_id, .. }
+        | PipelineEvent::SegmentCommitted { segment_id } => Some(segment_id.file_id.job_id.0),
+        PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed => None,
+    }
+}
+
 /// Background task that subscribes to pipeline events and persists meaningful
-/// ones to SQLite for the job event log.
-async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database) {
-    use weaver_api::PipelineEventGql;
+/// ones to SQLite for both the legacy job-event log and the public integration
+/// event stream.
+async fn persist_events(
+    mut rx: broadcast::Receiver<PipelineEvent>,
+    db: Database,
+    handle: SchedulerHandle,
+    config: SharedConfig,
+) {
+    use weaver_api::{
+        PersistedQueueEvent, PipelineEventGql, QueueEventKind, QueueItemState, global_queue_state,
+        queue_item_from_job,
+    };
 
     // Only persist job-level milestones. Per-segment and per-file events go to
     // system logs (tracing) only — they're too numerous for SQLite on large NZBs.
@@ -1404,10 +1586,14 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
     }
 
     let mut batch: Vec<weaver_state::JobEvent> = Vec::new();
+    let mut integration_batch: Vec<weaver_state::IntegrationEventRow> = Vec::new();
+    let mut last_states: HashMap<u64, QueueItemState> = HashMap::new();
+    let mut last_progress_buckets: HashMap<u64, u8> = HashMap::new();
+    let mut last_attention: HashMap<u64, Option<(String, String)>> = HashMap::new();
     let flush_interval = tokio::time::Duration::from_secs(1);
 
     loop {
-        let recv = if batch.is_empty() {
+        let recv = if batch.is_empty() && integration_batch.is_empty() {
             // No pending events — wait indefinitely for the next one.
             tokio::select! {
                 result = rx.recv() => result,
@@ -1418,10 +1604,14 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
                 result = rx.recv() => result,
                 _ = tokio::time::sleep(flush_interval) => {
                     let events = std::mem::take(&mut batch);
+                    let integration_events = std::mem::take(&mut integration_batch);
                     let db = db.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.insert_job_events(&events) {
                             tracing::warn!(error = %e, "failed to persist job events");
+                        }
+                        if let Err(e) = db.insert_integration_events(&integration_events) {
+                            tracing::warn!(error = %e, "failed to persist integration events");
                         }
                     });
                     continue;
@@ -1448,12 +1638,154 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
                     }
                 }
 
-                if batch.len() >= 50 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+
+                if matches!(
+                    event,
+                    PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed
+                ) {
+                    let cfg = config.read().await;
+                    let global_state = global_queue_state(
+                        handle.is_globally_paused(),
+                        &handle.get_download_block(),
+                        cfg.max_download_speed.unwrap_or(0),
+                    );
+                    let record = PersistedQueueEvent {
+                        occurred_at_ms: now,
+                        kind: QueueEventKind::GlobalStateChanged,
+                        item_id: None,
+                        item: None,
+                        state: None,
+                        previous_state: None,
+                        attention: None,
+                        global_state: Some(global_state),
+                    };
+                    if let Ok(payload_json) = serde_json::to_string(&record) {
+                        integration_batch.push(weaver_state::IntegrationEventRow {
+                            id: 0,
+                            timestamp: now,
+                            kind: "GLOBAL_STATE_CHANGED".to_string(),
+                            item_id: None,
+                            payload_json,
+                        });
+                    }
+                }
+
+                if let Some(job_id) = pipeline_job_id(&event)
+                    && let Ok(info) = handle.get_job(weaver_core::id::JobId(job_id))
+                {
+                    let item = queue_item_from_job(&info);
+                    let should_evict = matches!(
+                        item.state,
+                        QueueItemState::Completed | QueueItemState::Failed
+                    );
+                    let previous_state = last_states.insert(job_id, item.state);
+                    let progress_bucket = item.progress_percent.floor() as u8;
+                    let previous_progress = last_progress_buckets.insert(job_id, progress_bucket);
+                    let attention_signature = item
+                        .attention
+                        .as_ref()
+                        .map(|value| (value.code.clone(), value.message.clone()));
+                    let previous_attention =
+                        last_attention.insert(job_id, attention_signature.clone());
+
+                    let mut records: Vec<PersistedQueueEvent> = Vec::new();
+                    if matches!(event, PipelineEvent::JobCreated { .. }) {
+                        records.push(PersistedQueueEvent {
+                            occurred_at_ms: now,
+                            kind: QueueEventKind::ItemCreated,
+                            item_id: Some(job_id),
+                            item: Some(item.clone()),
+                            state: Some(item.state),
+                            previous_state,
+                            attention: item.attention.clone(),
+                            global_state: None,
+                        });
+                    }
+
+                    if let Some(previous_state) = previous_state
+                        && previous_state != item.state
+                    {
+                        records.push(PersistedQueueEvent {
+                            occurred_at_ms: now,
+                            kind: if item.state == QueueItemState::Completed {
+                                QueueEventKind::ItemCompleted
+                            } else {
+                                QueueEventKind::ItemStateChanged
+                            },
+                            item_id: Some(job_id),
+                            item: Some(item.clone()),
+                            state: Some(item.state),
+                            previous_state: Some(previous_state),
+                            attention: item.attention.clone(),
+                            global_state: None,
+                        });
+                    }
+
+                    if item.state != QueueItemState::Completed
+                        && item.state != QueueItemState::Failed
+                        && progress_bucket > 0
+                        && previous_progress.is_none_or(|value| progress_bucket > value)
+                    {
+                        records.push(PersistedQueueEvent {
+                            occurred_at_ms: now,
+                            kind: QueueEventKind::ItemProgress,
+                            item_id: Some(job_id),
+                            item: Some(item.clone()),
+                            state: Some(item.state),
+                            previous_state: None,
+                            attention: None,
+                            global_state: None,
+                        });
+                    }
+
+                    if attention_signature.is_some()
+                        && attention_signature != previous_attention.flatten()
+                    {
+                        records.push(PersistedQueueEvent {
+                            occurred_at_ms: now,
+                            kind: QueueEventKind::ItemAttention,
+                            item_id: Some(job_id),
+                            item: Some(item.clone()),
+                            state: Some(item.state),
+                            previous_state: None,
+                            attention: item.attention.clone(),
+                            global_state: None,
+                        });
+                    }
+
+                    for record in records {
+                        if let Ok(payload_json) = serde_json::to_string(&record) {
+                            integration_batch.push(weaver_state::IntegrationEventRow {
+                                id: 0,
+                                timestamp: now,
+                                kind: format!("{:?}", record.kind),
+                                item_id: record.item_id,
+                                payload_json,
+                            });
+                        }
+                    }
+
+                    if should_evict {
+                        last_states.remove(&job_id);
+                        last_progress_buckets.remove(&job_id);
+                        last_attention.remove(&job_id);
+                    }
+                }
+
+                if batch.len() >= 50 || integration_batch.len() >= 50 {
                     let events = std::mem::take(&mut batch);
+                    let integration_events = std::mem::take(&mut integration_batch);
                     let db = db.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.insert_job_events(&events) {
                             tracing::warn!(error = %e, "failed to persist job events");
+                        }
+                        if let Err(e) = db.insert_integration_events(&integration_events) {
+                            tracing::warn!(error = %e, "failed to persist integration events");
                         }
                     });
                 }
@@ -1469,6 +1801,9 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
     if !batch.is_empty() {
         let _ = db.insert_job_events(&batch);
     }
+    if !integration_batch.is_empty() {
+        let _ = db.insert_integration_events(&integration_batch);
+    }
 }
 
 /// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
@@ -1480,5 +1815,31 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_orphaned_persisted_nzbs;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cleanup_orphaned_persisted_nzbs_removes_only_unreferenced_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let nzb_dir = tempdir.path().join(".weaver-nzbs");
+        std::fs::create_dir_all(&nzb_dir).unwrap();
+
+        let kept = nzb_dir.join("kept.nzb");
+        let removed = nzb_dir.join("removed.nzb");
+        std::fs::write(&kept, b"kept").unwrap();
+        std::fs::write(&removed, b"removed").unwrap();
+
+        let referenced = HashSet::from([PathBuf::from(&kept)]);
+        let removed_count = cleanup_orphaned_persisted_nzbs(&nzb_dir, &referenced).unwrap();
+
+        assert_eq!(removed_count, 1);
+        assert!(kept.exists());
+        assert!(!removed.exists());
     }
 }

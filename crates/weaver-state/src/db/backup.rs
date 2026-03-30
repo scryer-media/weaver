@@ -14,6 +14,7 @@ const STABLE_TABLES: &[&str] = &[
     "api_keys",
     "job_history",
     "job_events",
+    "integration_events",
     "bandwidth_usage_minute_buckets",
     "rss_feeds",
     "rss_rules",
@@ -21,10 +22,12 @@ const STABLE_TABLES: &[&str] = &[
 ];
 
 const RESTORE_PRISTINE_TABLES: &[&str] = &[
+    "metrics_scrapes",
     "job_history",
     "job_events",
     "active_jobs",
     "active_segments",
+    "active_file_progress",
     "active_files",
     "active_par2",
     "active_par2_files",
@@ -38,9 +41,11 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
 ];
 
 const CLEAR_IMPORT_TABLES: &[&str] = &[
+    "metrics_scrapes",
     "rss_seen_items",
     "rss_rules",
     "rss_feeds",
+    "integration_events",
     "job_events",
     "job_history",
     "api_keys",
@@ -186,6 +191,8 @@ impl Database {
                  FROM src.job_history;
              INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                  SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
+             INSERT INTO integration_events (id, timestamp, kind, item_id, payload_json)
+                 SELECT id, timestamp, kind, item_id, payload_json FROM src.integration_events;
              INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
                  SELECT bucket_epoch_minute, payload_bytes FROM src.bandwidth_usage_minute_buckets;
              INSERT INTO rss_feeds
@@ -200,11 +207,13 @@ impl Database {
                  (feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at, job_id, item_url, error)
                  SELECT feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at, job_id, item_url, error
                  FROM src.rss_seen_items;
-             DELETE FROM sqlite_sequence WHERE name IN ('api_keys', 'job_events');
+             DELETE FROM sqlite_sequence WHERE name IN ('api_keys', 'job_events', 'integration_events');
              INSERT INTO sqlite_sequence (name, seq)
                  SELECT 'api_keys', COALESCE(MAX(id), 0) FROM api_keys;
              INSERT INTO sqlite_sequence (name, seq)
                  SELECT 'job_events', COALESCE(MAX(id), 0) FROM job_events;
+             INSERT INTO sqlite_sequence (name, seq)
+                 SELECT 'integration_events', COALESCE(MAX(id), 0) FROM integration_events;
              ",
         ))
         .map_err(db_err)?;

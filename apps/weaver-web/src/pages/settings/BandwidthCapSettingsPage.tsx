@@ -48,6 +48,13 @@ type DownloadBlock = {
   timezoneName: string;
 };
 
+type SettingsQueryData = {
+  settings: GeneralSettings;
+  globalState?: {
+    downloadBlock: DownloadBlock;
+  } | null;
+};
+
 const BANDWIDTH_UNITS = [
   { label: "GB", value: 1024 ** 3 },
   { label: "TB", value: 1024 ** 4 },
@@ -82,7 +89,7 @@ function timeInputToMinutes(raw: string) {
 
 export function BandwidthCapSettingsPage() {
   const t = useTranslate();
-  const [{ data }, reexecuteQuery] = useQuery<{ settings: GeneralSettings; downloadBlock: DownloadBlock }>({
+  const [{ data }, reexecuteQuery] = useQuery<SettingsQueryData>({
     query: SETTINGS_QUERY,
   });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
@@ -131,14 +138,8 @@ export function BandwidthCapSettingsPage() {
   }, [updateState.data, reexecuteQuery]);
 
   const persistSettings = async () => {
-    if (!settings) return;
     await updateSettings({
       input: {
-        intermediateDir: settings.intermediateDir || null,
-        completeDir: settings.completeDir || null,
-        cleanupAfterExtract: settings.cleanupAfterExtract,
-        maxDownloadSpeed: settings.maxDownloadSpeed,
-        maxRetries: settings.maxRetries,
         ispBandwidthCap: {
           enabled: capEnabled,
           period: capPeriod,
@@ -151,7 +152,7 @@ export function BandwidthCapSettingsPage() {
     });
   };
 
-  const downloadBlock = data?.downloadBlock;
+  const downloadBlock = data?.globalState?.downloadBlock;
   const capResetAt = downloadBlock?.windowEndsAtEpochMs
     ? new Date(downloadBlock.windowEndsAtEpochMs).toLocaleString([], {
         month: "short",

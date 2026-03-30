@@ -550,9 +550,9 @@ impl Pipeline {
                     None
                 },
                 status: state.status.clone(),
-                progress: state.assembly.progress(),
+                progress: Self::effective_progress(state),
                 total_bytes: total,
-                downloaded_bytes: state.downloaded_bytes,
+                downloaded_bytes: Self::effective_downloaded_bytes(state),
                 optional_recovery_bytes,
                 optional_recovery_downloaded_bytes,
                 failed_bytes: state.failed_bytes,

@@ -265,11 +265,11 @@ impl Pipeline {
                 .entry(file_id)
                 .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
             write_buf.insert(file_offset, buffered_segment);
-            write_buf.drain_ready()
+            write_buf.drain_ready_with_contiguous_end()
         };
         self.note_write_buffered(buffered_len, 1);
 
-        if let Err(e) = self.persist_ready_segments(file_id, ready).await {
+        if let Err(e) = self.persist_ready_segments(file_id, ready.0, ready.1).await {
             warn!(
                 file_id = %file_id,
                 error = %e,
@@ -296,6 +296,7 @@ impl Pipeline {
         &mut self,
         file_id: NzbFileId,
         ready: Vec<(u64, BufferedDecodedSegment)>,
+        contiguous_end_after_ready: u64,
     ) -> Result<(), std::io::Error> {
         if ready.is_empty() {
             self.remove_empty_write_buffer(file_id);
@@ -317,9 +318,11 @@ impl Pipeline {
                 write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
             self.release_write_buffered(segment_bytes, 1);
             write_result?;
+            crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
             self.commit_persisted_segment(offset, segment, &filename, &working_dir)
                 .await;
         }
+        self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
         let write_us = write_start.elapsed().as_micros() as u64;
         self.metrics
             .disk_write_latency_us
@@ -404,6 +407,7 @@ impl Pipeline {
             .store(write_us, Ordering::Relaxed);
         self.release_write_buffered(segment_bytes, 1);
         write_result?;
+        crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
 
         if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
             write_buf.mark_persisted(offset, segment_bytes);
@@ -493,11 +497,16 @@ impl Pipeline {
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.commit_segments(&batch) {
                             tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+                        } else {
+                            crate::e2e_failpoint::maybe_trip(
+                                "download.after_batch_commit_before_ack",
+                            );
                         }
                     });
                 }
 
                 if file_complete {
+                    self.note_file_progress_floor(file_id, total_bytes, true);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let leftovers = write_buf.flush_all();
                         if !leftovers.is_empty() {
@@ -550,6 +559,10 @@ impl Pipeline {
                         tokio::task::spawn_blocking(move || {
                             if let Err(e) = db.commit_segments(&batch) {
                                 tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+                            } else {
+                                crate::e2e_failpoint::maybe_trip(
+                                    "download.after_batch_commit_before_ack",
+                                );
                             }
                         });
                     }
@@ -566,6 +579,8 @@ impl Pipeline {
                             error!(error = %e, "db write failed for complete_file");
                         }
                     }
+                    self.pending_file_progress.remove(&file_id);
+                    self.persisted_file_progress.remove(&file_id);
 
                     self.try_load_par2_metadata(job_id, file_id).await;
                     self.try_merge_par2_recovery(job_id, file_id).await;

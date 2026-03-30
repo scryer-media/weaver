@@ -1,4 +1,4 @@
-use async_graphql::{Enum, InputObject, OneofObject, SimpleObject};
+use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_core::config::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use weaver_core::release_name::{derive_release_name, original_release_title, parse_job_release};
@@ -9,7 +9,8 @@ use weaver_scheduler::handle::{DownloadBlockKind, DownloadBlockState};
 /// Scope level for API keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum ApiKeyScope {
-    Integration,
+    Read,
+    Control,
     Admin,
 }
 
@@ -287,15 +288,15 @@ pub struct GeneralSettings {
 /// Input for updating general settings.
 #[derive(Debug, InputObject)]
 pub struct GeneralSettingsInput {
-    pub intermediate_dir: Option<String>,
-    pub complete_dir: Option<String>,
+    pub intermediate_dir: MaybeUndefined<String>,
+    pub complete_dir: MaybeUndefined<String>,
     pub cleanup_after_extract: Option<bool>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettingsInput>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum IspBandwidthCapPeriodGql {
     Daily,
     Weekly,
@@ -322,7 +323,7 @@ impl From<IspBandwidthCapPeriodGql> for IspBandwidthCapPeriod {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum IspBandwidthCapWeekdayGql {
     Mon,
     Tue,
@@ -361,7 +362,7 @@ impl From<IspBandwidthCapWeekdayGql> for IspBandwidthCapWeekday {
     }
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SimpleObject)]
 pub struct IspBandwidthCapSettings {
     pub enabled: bool,
     pub period: IspBandwidthCapPeriodGql,
@@ -407,7 +408,7 @@ impl From<IspBandwidthCapSettingsInput> for IspBandwidthCapConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DownloadBlockKindGql {
     None,
     ManualPause,
@@ -426,7 +427,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
     }
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SimpleObject)]
 pub struct DownloadBlock {
     pub kind: DownloadBlockKindGql,
     pub cap_enabled: bool,
@@ -573,7 +574,7 @@ pub struct MetadataEntry {
     pub value: String,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct ParsedEpisode {
     pub season: Option<u32>,
     pub episode_numbers: Vec<u32>,
@@ -581,7 +582,7 @@ pub struct ParsedEpisode {
     pub raw: Option<String>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct ParsedRelease {
     pub normalized_title: String,
     pub release_group: Option<String>,
@@ -620,15 +621,6 @@ pub struct ParsedRelease {
 pub struct MetadataInput {
     pub key: String,
     pub value: String,
-}
-
-/// NZB source — either inline base64 content or a URL to fetch from.
-#[derive(Debug, OneofObject)]
-pub enum NzbSourceInput {
-    /// Base64-encoded NZB file content.
-    NzbBase64(String),
-    /// URL to fetch the NZB from.
-    Url(String),
 }
 
 /// GraphQL representation of a job.
@@ -677,7 +669,7 @@ pub enum JobStatusGql {
 }
 
 /// GraphQL representation of pipeline metrics.
-#[derive(Debug, Clone, Default, SimpleObject)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
@@ -704,6 +696,25 @@ pub struct Metrics {
     pub recovery_queue_depth: u32,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct MetricLabel {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct MetricSeries {
+    pub metric: String,
+    pub labels: Vec<MetricLabel>,
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct MetricsHistoryResult {
+    pub timestamps: Vec<f64>,
+    pub series: Vec<MetricSeries>,
 }
 
 /// GraphQL representation of a pipeline event (real-time subscription).

@@ -231,6 +231,9 @@ impl NntpClient {
                         message_id,
                         "soft timeout, trying next server"
                     );
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -310,6 +313,9 @@ impl NntpClient {
                     continue;
                 }
                 Err(e @ NntpError::SoftTimeout(_)) => {
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -387,6 +393,9 @@ impl NntpClient {
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
+                    }
                     last_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
@@ -665,6 +674,9 @@ impl NntpClient {
                         message_id,
                         "soft timeout, trying next server"
                     );
+                    if let Some(reason) = cooldown_reason(&e) {
+                        self.record_server_cooldown(idx, reason).await;
+                    }
                     last_error = Some(e);
                     continue;
                 }

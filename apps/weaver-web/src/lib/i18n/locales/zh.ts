@@ -86,6 +86,7 @@ const zh: LocaleDictionary = {
   "upload.sharedSettingsHint": "密码、分类和优先级将应用于所有选中的 NZB。",
   "upload.batchFailure": "上传 {{name}} 时失败。",
   "upload.partialFailure": "在 {{name}} 失败前已提交 {{submitted}}/{{total}} 个文件。",
+  "upload.rejected": "上传被服务器拒绝。",
 
   // Jobs page
   "jobs.title": "队列",
@@ -387,6 +388,7 @@ const zh: LocaleDictionary = {
   "settings.apiKeyNamePlaceholder": "例如 Scryer",
   "settings.apiKeyScope": "权限范围",
   "settings.scopeIntegration": "集成",
+  "settings.scopeRead": "只读",
   "settings.scopeAdmin": "管理员",
   "settings.apiKeyCreated": "API 密钥已创建",
   "settings.apiKeyCopyWarning": "请立即复制此密钥。关闭后将无法再次查看。",

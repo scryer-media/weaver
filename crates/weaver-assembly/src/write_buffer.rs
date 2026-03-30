@@ -66,6 +66,12 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
 
     /// Drain any contiguous segments that are now ready for sequential writing.
     pub fn drain_ready(&mut self) -> Vec<(u64, T)> {
+        self.drain_ready_with_contiguous_end().0
+    }
+
+    /// Drain ready segments and return the contiguous end represented by the
+    /// drain, including already-persisted gaps that were bridged.
+    pub fn drain_ready_with_contiguous_end(&mut self) -> (Vec<(u64, T)>, u64) {
         // Drain contiguous segments starting from write_cursor.
         let mut ready = Vec::new();
         while let Some((&offset, _)) = self.pending.first_key_value() {
@@ -88,7 +94,7 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
             }
         }
 
-        ready
+        (ready, self.write_cursor)
     }
 
     /// Whether the buffer exceeds its per-file in-memory segment limit.

@@ -2,6 +2,9 @@ use super::*;
 use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Shared output file that multiple `DirectOutputWriter` instances write to.
 /// Each writer tracks per-volume bytes but the underlying file is the same.
@@ -13,23 +16,36 @@ struct SharedOutputFile {
 /// Wraps a shared output file via `Rc<RefCell<...>>` and tracks bytes
 /// written during this volume's contribution.
 struct DirectOutputWriter {
-    shared: Rc<RefCell<SharedOutputFile>>,
+    shared: Option<Rc<RefCell<SharedOutputFile>>>,
     bytes_written: u64,
+    volume_index: u32,
+    checkpoint: Option<Arc<ExtractionCheckpointState>>,
 }
 
 impl std::io::Write for DirectOutputWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let written = self.shared.borrow_mut().inner.write(buf)?;
-        self.bytes_written += written as u64;
-        Ok(written)
+        if let Some(shared) = &self.shared {
+            let written = shared.borrow_mut().inner.write(buf)?;
+            self.bytes_written += written as u64;
+            Ok(written)
+        } else {
+            self.bytes_written += buf.len() as u64;
+            Ok(buf.len())
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.shared.borrow_mut().inner.flush()
+        if let Some(shared) = &self.shared {
+            shared.borrow_mut().inner.flush()
+        } else {
+            Ok(())
+        }
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.shared.borrow_mut().inner.write_all(buf)?;
+        if let Some(shared) = &self.shared {
+            shared.borrow_mut().inner.write_all(buf)?;
+        }
         self.bytes_written += buf.len() as u64;
         Ok(())
     }
@@ -37,7 +53,68 @@ impl std::io::Write for DirectOutputWriter {
 
 impl Drop for DirectOutputWriter {
     fn drop(&mut self) {
-        let _ = self.shared.borrow_mut().inner.flush();
+        if let Some(shared) = &self.shared {
+            let _ = shared.borrow_mut().inner.flush();
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            if let Err(error) = checkpoint.persist_volume(self.volume_index, self.bytes_written) {
+                checkpoint.record_error(error);
+            }
+        }
+    }
+}
+
+struct ExtractionCheckpointState {
+    db: weaver_state::Database,
+    job_id: JobId,
+    set_name: String,
+    member_name: String,
+    temp_path: String,
+    manifest: Mutex<Vec<weaver_state::ExtractionChunk>>,
+    next_offset: AtomicU64,
+    error: Mutex<Option<String>>,
+}
+
+impl ExtractionCheckpointState {
+    fn persist_volume(&self, volume_index: u32, bytes_written: u64) -> Result<(), String> {
+        if bytes_written == 0 {
+            return Ok(());
+        }
+
+        let start_offset = self.next_offset.fetch_add(bytes_written, Ordering::SeqCst);
+        let end_offset = start_offset + bytes_written;
+        let mut manifest = self
+            .manifest
+            .lock()
+            .map_err(|_| "checkpoint manifest poisoned".to_string())?;
+        manifest.push(weaver_state::ExtractionChunk {
+            member_name: self.member_name.clone(),
+            volume_index,
+            bytes_written,
+            temp_path: self.temp_path.clone(),
+            start_offset,
+            end_offset,
+            verified: true,
+            appended: false,
+        });
+        manifest.sort_by_key(|chunk| (chunk.start_offset, chunk.volume_index));
+        self.db
+            .replace_member_chunks(self.job_id, &self.set_name, &self.member_name, &manifest)
+            .map_err(|error| format!("failed to persist extraction chunks: {error}"))?;
+        crate::e2e_failpoint::maybe_trip("extract.after_volume_checkpoint");
+        Ok(())
+    }
+
+    fn record_error(&self, error: String) {
+        if let Ok(mut slot) = self.error.lock() {
+            if slot.is_none() {
+                *slot = Some(error);
+            }
+        }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -50,6 +127,20 @@ struct FinalizeMemberContext<'a> {
     partial_path: &'a std::path::Path,
     out_path: &'a std::path::Path,
     chunk_dir: &'a std::path::Path,
+}
+
+#[derive(Debug)]
+struct ValidatedExtractionCheckpoint {
+    manifest: Vec<weaver_state::ExtractionChunk>,
+    completed_volumes: HashSet<u32>,
+    next_offset: u64,
+}
+
+#[derive(Debug)]
+struct ValidatedExtractionManifest {
+    manifest: Vec<weaver_state::ExtractionChunk>,
+    completed_volumes: HashSet<u32>,
+    next_offset: u64,
 }
 
 pub(super) struct RarExtractionContext<'a> {
@@ -169,6 +260,116 @@ impl Pipeline {
         Ok(())
     }
 
+    fn validate_member_extraction_manifest(
+        chunks: &[weaver_state::ExtractionChunk],
+        first_volume: u32,
+        last_volume_index: u32,
+    ) -> Result<Option<ValidatedExtractionManifest>, String> {
+        if chunks.is_empty() {
+            return Ok(None);
+        }
+
+        let mut manifest = chunks.to_vec();
+        manifest.sort_by_key(|chunk| (chunk.start_offset, chunk.volume_index));
+
+        let temp_path = &manifest[0].temp_path;
+        if manifest.iter().any(|chunk| chunk.temp_path != *temp_path) {
+            return Err("checkpoint manifest references multiple temp paths".to_string());
+        }
+
+        let mut expected_start = 0u64;
+        let mut previous_volume = None;
+        let mut completed_volumes = HashSet::new();
+        for chunk in &manifest {
+            if chunk.bytes_written == 0 {
+                return Err(format!(
+                    "checkpoint chunk for volume {} recorded zero bytes",
+                    chunk.volume_index
+                ));
+            }
+            if chunk.start_offset != expected_start {
+                return Err(format!(
+                    "checkpoint chunk for volume {} starts at {} but expected {}",
+                    chunk.volume_index, chunk.start_offset, expected_start
+                ));
+            }
+            if chunk.end_offset != chunk.start_offset + chunk.bytes_written {
+                return Err(format!(
+                    "checkpoint chunk for volume {} has inconsistent end offset",
+                    chunk.volume_index
+                ));
+            }
+            if chunk.volume_index < first_volume || chunk.volume_index > last_volume_index {
+                return Err(format!(
+                    "checkpoint chunk volume {} outside member range {}..={}",
+                    chunk.volume_index, first_volume, last_volume_index
+                ));
+            }
+            if let Some(previous) = previous_volume
+                && chunk.volume_index <= previous
+            {
+                return Err(format!(
+                    "checkpoint chunk volumes are not strictly increasing ({} then {})",
+                    previous, chunk.volume_index
+                ));
+            }
+            expected_start = chunk.end_offset;
+            previous_volume = Some(chunk.volume_index);
+            completed_volumes.insert(chunk.volume_index);
+        }
+
+        Ok(Some(ValidatedExtractionManifest {
+            manifest,
+            completed_volumes,
+            next_offset: expected_start,
+        }))
+    }
+
+    fn validate_member_extraction_checkpoint(
+        chunks: &[weaver_state::ExtractionChunk],
+        partial_path: &std::path::Path,
+        first_volume: u32,
+        last_volume_index: u32,
+    ) -> Result<Option<ValidatedExtractionCheckpoint>, String> {
+        let Some(validated) =
+            Self::validate_member_extraction_manifest(chunks, first_volume, last_volume_index)?
+        else {
+            return Ok(None);
+        };
+
+        let temp_path = std::path::PathBuf::from(&validated.manifest[0].temp_path);
+        if temp_path != partial_path {
+            return Err(format!(
+                "checkpoint temp path {} does not match expected {}",
+                temp_path.display(),
+                partial_path.display()
+            ));
+        }
+
+        let partial_size = std::fs::metadata(partial_path)
+            .map_err(|error| {
+                format!(
+                    "failed to stat checkpoint partial output {}: {error}",
+                    partial_path.display()
+                )
+            })?
+            .len();
+        if partial_size != validated.next_offset {
+            return Err(format!(
+                "checkpoint partial output {} has size {} but manifest ends at {}",
+                partial_path.display(),
+                partial_size,
+                validated.next_offset
+            ));
+        }
+
+        Ok(Some(ValidatedExtractionCheckpoint {
+            manifest: validated.manifest,
+            completed_volumes: validated.completed_volumes,
+            next_offset: validated.next_offset,
+        }))
+    }
+
     fn finalize_member_output(ctx: FinalizeMemberContext<'_>) -> Result<u64, String> {
         let FinalizeMemberContext {
             db,
@@ -210,6 +411,7 @@ impl Pipeline {
             .len();
         std::fs::rename(partial_path, out_path)
             .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
+        crate::e2e_failpoint::maybe_trip("extract.after_finalize_rename_before_record");
 
         // Clean up legacy chunk directory if it exists (backward compat
         // for interrupted upgrades from chunk-file extraction).
@@ -288,35 +490,147 @@ impl Pipeline {
             member: member_name.clone(),
         });
 
-        // Clean up any stale artifacts from previous extraction attempts.
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
-        Self::clear_member_extraction_artifacts(
-            db,
-            job_id,
-            set_name,
-            &member_name,
+        let existing_chunks: Vec<weaver_state::ExtractionChunk> = db
+            .get_extraction_chunks(job_id, set_name)
+            .map_err(|e| format!("failed to load existing extraction chunks: {e}"))?
+            .into_iter()
+            .filter(|chunk| chunk.member_name == member_name)
+            .collect();
+
+        if out_path.exists()
+            && let Ok(Some(checkpoint)) = Self::validate_member_extraction_manifest(
+                &existing_chunks,
+                first_volume,
+                last_volume,
+            )
+        {
+            let finalized_size = std::fs::metadata(&out_path)
+                .map_err(|e| {
+                    format!(
+                        "failed to stat finalized output {}: {e}",
+                        out_path.display()
+                    )
+                })?
+                .len();
+            if checkpoint.next_offset >= unpacked_size && finalized_size == unpacked_size {
+                db.clear_member_chunks(job_id, set_name, &member_name)
+                    .map_err(|e| format!("failed to clear extraction chunk rows: {e}"))?;
+                match std::fs::remove_dir_all(&chunk_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            path = %chunk_dir.display(),
+                            error = %error,
+                            "failed to remove legacy chunk dir during checkpoint reconcile"
+                        );
+                    }
+                }
+                return Ok((member_name, finalized_size, unpacked_size));
+            }
+        }
+
+        let mut cleared_stale_artifacts = false;
+        let resume_checkpoint = match Self::validate_member_extraction_checkpoint(
+            &existing_chunks,
             &partial_path,
-            &chunk_dir,
-        )?;
+            first_volume,
+            last_volume,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name,
+                    member = %member_name,
+                    error = %error,
+                    "discarding invalid extraction checkpoint and restarting member extraction"
+                );
+                Self::clear_member_extraction_artifacts(
+                    db,
+                    job_id,
+                    set_name,
+                    &member_name,
+                    &partial_path,
+                    &chunk_dir,
+                )?;
+                cleared_stale_artifacts = true;
+                None
+            }
+        };
+
+        if let Some(checkpoint) = &resume_checkpoint {
+            info!(
+                job_id = job_id.0,
+                set_name,
+                member = %member_name,
+                temp_path = %partial_path.display(),
+                resumed_offset = checkpoint.next_offset,
+                completed_volumes = checkpoint.completed_volumes.len(),
+                "resuming extraction from persisted checkpoint"
+            );
+        }
+
+        if resume_checkpoint.is_none()
+            && !cleared_stale_artifacts
+            && (!existing_chunks.is_empty() || partial_path.exists())
+        {
+            Self::clear_member_extraction_artifacts(
+                db,
+                job_id,
+                set_name,
+                &member_name,
+                &partial_path,
+                &chunk_dir,
+            )?;
+        }
 
         // Open the shared output file — all volumes write directly here.
-        let partial_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&partial_path)
-            .map_err(|e| {
-                format!(
-                    "failed to create partial output {}: {e}",
-                    partial_path.display()
-                )
-            })?;
+        let mut partial_file_options = std::fs::OpenOptions::new();
+        partial_file_options.create(true).write(true);
+        if resume_checkpoint.is_some() {
+            partial_file_options.append(true);
+        } else {
+            partial_file_options.truncate(true);
+        }
+        let partial_file = partial_file_options.open(&partial_path).map_err(|e| {
+            format!(
+                "failed to create partial output {}: {e}",
+                partial_path.display()
+            )
+        })?;
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
+        let resumed_manifest = resume_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.manifest.clone())
+            .unwrap_or_default();
+        let resumed_offset = resume_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.next_offset)
+            .unwrap_or(0);
+        let completed_volumes = resume_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.completed_volumes.clone())
+            .unwrap_or_default();
+        let checkpoint = Arc::new(ExtractionCheckpointState {
+            db: db.clone(),
+            job_id,
+            set_name: set_name.to_string(),
+            member_name: member_name.clone(),
+            temp_path: partial_path.to_string_lossy().to_string(),
+            manifest: Mutex::new(resumed_manifest),
+            next_offset: AtomicU64::new(resumed_offset),
+            error: Mutex::new(None),
+        });
 
         let chunk_records: Result<Vec<(u32, u64)>, weaver_rar::RarError> = if is_solid {
             let shared_ref = Rc::clone(&shared);
+            let checkpoint_ref = Arc::clone(&checkpoint);
+            let completed_volumes = completed_volumes.clone();
             archive
                 .extract_member_solid_chunked(idx, options, |absolute_volume| {
                     let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
@@ -326,10 +640,20 @@ impl Pipeline {
                             ),
                         }
                     })?;
-                    let _ = absolute_volume; // used only for the u32 check
+                    let already_completed = completed_volumes.contains(&absolute_volume);
                     Ok(Box::new(DirectOutputWriter {
-                        shared: Rc::clone(&shared_ref),
+                        shared: if already_completed {
+                            None
+                        } else {
+                            Some(Rc::clone(&shared_ref))
+                        },
                         bytes_written: 0,
+                        volume_index: absolute_volume,
+                        checkpoint: if already_completed {
+                            None
+                        } else {
+                            Some(Arc::clone(&checkpoint_ref))
+                        },
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -359,11 +683,25 @@ impl Pipeline {
             }
             let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
             let shared_ref = Rc::clone(&shared);
+            let checkpoint_ref = Arc::clone(&checkpoint);
+            let completed_volumes = completed_volumes.clone();
             archive
-                .extract_member_streaming_chunked(idx, options, &provider, |_local_volume| {
+                .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
+                    let volume_index = first_volume + local_volume as u32;
+                    let already_completed = completed_volumes.contains(&volume_index);
                     Ok(Box::new(DirectOutputWriter {
-                        shared: Rc::clone(&shared_ref),
+                        shared: if already_completed {
+                            None
+                        } else {
+                            Some(Rc::clone(&shared_ref))
+                        },
                         bytes_written: 0,
+                        volume_index,
+                        checkpoint: if already_completed {
+                            None
+                        } else {
+                            Some(Arc::clone(&checkpoint_ref))
+                        },
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -379,6 +717,10 @@ impl Pipeline {
             let _ = std::fs::remove_file(&partial_path);
             format!("failed to extract {member_name}: {error}")
         })?;
+        if let Some(error) = checkpoint.take_error() {
+            let _ = std::fs::remove_file(&partial_path);
+            return Err(error);
+        }
 
         // Flush, sync to NFS, and close the file handle before finalizing.
         // Without this, the rename() in finalize forces the NFS client to
@@ -401,32 +743,6 @@ impl Pipeline {
         }
         drop(shared);
 
-        // Persist chunk offset records to DB for progress tracking.
-        let partial_path_str = partial_path.to_string_lossy().to_string();
-        let mut persisted_chunks = Vec::with_capacity(chunk_records.len());
-        let mut next_offset = 0u64;
-        for (absolute_volume, bytes_written) in &chunk_records {
-            let start_offset = next_offset;
-            let end_offset = start_offset + bytes_written;
-            next_offset = end_offset;
-            persisted_chunks.push(weaver_state::ExtractionChunk {
-                member_name: member_name.clone(),
-                volume_index: *absolute_volume,
-                bytes_written: *bytes_written,
-                temp_path: partial_path_str.clone(),
-                start_offset,
-                end_offset,
-                verified: true,
-                appended: true,
-            });
-        }
-        if let Err(error) =
-            db.replace_member_chunks(job_id, set_name, &member_name, &persisted_chunks)
-        {
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(format!("failed to persist extraction chunks: {error}"));
-        }
-
         // Finalize: rename .partial → final output, emit events, clear DB rows.
         let bytes_written = match Self::finalize_member_output(FinalizeMemberContext {
             db,
@@ -444,6 +760,8 @@ impl Pipeline {
                 return Err(error);
             }
         };
+
+        let _ = chunk_records;
 
         Ok((member_name, bytes_written, unpacked_size))
     }
@@ -521,11 +839,29 @@ impl Pipeline {
             .values()
             .map(|state| state.active_workers)
             .sum::<usize>();
+        let job_active_workers = self
+            .rar_sets
+            .iter()
+            .filter(|((jid, _), _)| *jid == job_id)
+            .map(|(_, state)| state.active_workers)
+            .sum::<usize>();
         let available_slots = self
             .tuner
             .max_concurrent_extractions()
             .saturating_sub(active_workers);
         if available_slots == 0 {
+            if job_active_workers == 0
+                && self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
+            {
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::QueuedExtract,
+                    Some("queued_extract"),
+                );
+            }
             return;
         }
 
@@ -1067,5 +1403,85 @@ impl Pipeline {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_manifest(temp_path: &std::path::Path) -> Vec<weaver_state::ExtractionChunk> {
+        vec![
+            weaver_state::ExtractionChunk {
+                member_name: "movie.mkv".to_string(),
+                volume_index: 0,
+                bytes_written: 10,
+                temp_path: temp_path.to_string_lossy().to_string(),
+                start_offset: 0,
+                end_offset: 10,
+                verified: true,
+                appended: false,
+            },
+            weaver_state::ExtractionChunk {
+                member_name: "movie.mkv".to_string(),
+                volume_index: 1,
+                bytes_written: 15,
+                temp_path: temp_path.to_string_lossy().to_string(),
+                start_offset: 10,
+                end_offset: 25,
+                verified: true,
+                appended: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn validate_member_extraction_checkpoint_accepts_contiguous_manifest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let partial_path = temp_dir.path().join("movie.mkv.partial");
+        std::fs::write(&partial_path, vec![0u8; 25]).unwrap();
+
+        let checkpoint = Pipeline::validate_member_extraction_checkpoint(
+            &sample_manifest(&partial_path),
+            &partial_path,
+            0,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(checkpoint.next_offset, 25);
+        assert_eq!(checkpoint.completed_volumes, HashSet::from([0u32, 1u32]));
+    }
+
+    #[test]
+    fn validate_member_extraction_checkpoint_rejects_partial_size_mismatch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let partial_path = temp_dir.path().join("movie.mkv.partial");
+        std::fs::write(&partial_path, vec![0u8; 20]).unwrap();
+
+        let error = Pipeline::validate_member_extraction_checkpoint(
+            &sample_manifest(&partial_path),
+            &partial_path,
+            0,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("manifest ends at 25"));
+    }
+
+    #[test]
+    fn validate_member_extraction_manifest_allows_finalize_reconcile_without_partial_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let partial_path = temp_dir.path().join("movie.mkv.partial");
+
+        let manifest =
+            Pipeline::validate_member_extraction_manifest(&sample_manifest(&partial_path), 0, 2)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(manifest.next_offset, 25);
+        assert_eq!(manifest.completed_volumes, HashSet::from([0u32, 1u32]));
     }
 }

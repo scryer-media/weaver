@@ -86,6 +86,7 @@ const ja: LocaleDictionary = {
   "upload.sharedSettingsHint": "パスワード、カテゴリ、優先度は選択したすべての NZB に適用されます。",
   "upload.batchFailure": "{{name}} のアップロードに失敗しました。",
   "upload.partialFailure": "{{total}} 件中 {{submitted}} 件を送信後、{{name}} で失敗しました。",
+  "upload.rejected": "アップロードはサーバーに拒否されました。",
 
   // Jobs page
   "jobs.title": "キュー",
@@ -387,6 +388,7 @@ const ja: LocaleDictionary = {
   "settings.apiKeyNamePlaceholder": "例: Scryer",
   "settings.apiKeyScope": "スコープ",
   "settings.scopeIntegration": "インテグレーション",
+  "settings.scopeRead": "読み取り",
   "settings.scopeAdmin": "管理者",
   "settings.apiKeyCreated": "API キーが作成されました",
   "settings.apiKeyCopyWarning": "今すぐこのキーをコピーしてください。再度表示されません。",

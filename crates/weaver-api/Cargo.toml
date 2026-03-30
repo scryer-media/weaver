@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-graphql = { workspace = true }
+chrono = { workspace = true }
 zstd = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

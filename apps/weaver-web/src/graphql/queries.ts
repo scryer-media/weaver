@@ -1,7 +1,7 @@
 import { gql } from "urql";
 
-const JOB_LIST_ITEM_FIELDS = `
-  fragment JobListItemFields on Job {
+const FACADE_QUEUE_ITEM_FIELDS = `
+  fragment FacadeQueueItemFields on QueueItem {
     id
     name
     displayTitle
@@ -9,8 +9,8 @@ const JOB_LIST_ITEM_FIELDS = `
     parsedRelease {
       ...ParsedReleaseFields
     }
-    status
-    progress
+    status: state
+    progressPercent
     totalBytes
     downloadedBytes
     optionalRecoveryBytes
@@ -19,8 +19,36 @@ const JOB_LIST_ITEM_FIELDS = `
     health
     hasPassword
     category
+    metadata: attributes {
+      key
+      value
+    }
+  }
+`;
+
+const FACADE_HISTORY_ITEM_FIELDS = `
+  fragment FacadeHistoryItemFields on HistoryItem {
+    id
+    name
+    displayTitle
+    originalTitle
+    parsedRelease {
+      ...ParsedReleaseFields
+    }
+    status: state
+    progressPercent
+    totalBytes
+    downloadedBytes
+    optionalRecoveryBytes
+    optionalRecoveryDownloadedBytes
+    failedBytes
+    health
+    hasPassword
+    category
+    outputDir
     createdAt
-    metadata {
+    completedAt
+    metadata: attributes {
       key
       value
     }
@@ -64,13 +92,6 @@ const PARSED_RELEASE_FIELDS = `
       absoluteEpisode
       raw
     }
-  }
-`;
-
-const HISTORY_JOB_FIELDS = `
-  fragment HistoryJobFields on Job {
-    ...JobListItemFields
-    outputDir
   }
 `;
 
@@ -303,38 +324,37 @@ const RSS_SEEN_ITEM_FIELDS = `
   }
 `;
 
-export const JOBS_QUERY = gql`
-  query Jobs {
-    jobs {
-      ...JobListItemFields
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
-`;
-
 export const JOBS_PAGE_QUERY = gql`
   query JobsPage {
-    jobs {
-      ...JobListItemFields
+    jobs: queueItems {
+      ...FacadeQueueItemFields
     }
-    metrics {
+    metrics: queueSummary {
       currentDownloadSpeed
     }
-    isPaused
-    downloadBlock {
-      ...DownloadBlockFields
+    globalState: globalQueueState {
+      isPaused
+      downloadBlock {
+        ...DownloadBlockFields
+      }
     }
   }
   ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
+  ${FACADE_QUEUE_ITEM_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const JOB_QUERY = gql`
   query Job($id: Int!) {
-    job(id: $id) {
-      ...JobListItemFields
+    queueItem(id: $id) {
+      ...FacadeQueueItemFields
+      error
+      outputDir
+      createdAt
+    }
+    historyItem(id: $id) {
+      ...FacadeHistoryItemFields
+      error
     }
     jobTimeline(jobId: $id) {
       ...JobTimelineFields
@@ -349,7 +369,8 @@ export const JOB_QUERY = gql`
   }
   ${JOB_TIMELINE_FIELDS}
   ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
+  ${FACADE_QUEUE_ITEM_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const METRICS_QUERY = gql`
@@ -363,54 +384,34 @@ export const METRICS_QUERY = gql`
 
 export const METRICS_PAGE_QUERY = gql`
   query MetricsPage {
-    metrics {
+    metrics: systemMetrics {
       ...MetricsFields
     }
-    isPaused
-    downloadBlock {
-      ...DownloadBlockFields
+    globalState: globalQueueState {
+      isPaused
+      downloadBlock {
+        ...DownloadBlockFields
+      }
     }
   }
   ${METRICS_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
-export const IS_PAUSED_QUERY = gql`
-  query IsPaused {
-    isPaused
-  }
-`;
-
-export const SETTINGS_PAGE_QUERY = gql`
-  query SettingsPage {
-    settings {
-      ...GeneralSettingsFields
-    }
-    metrics {
-      ...MetricsFields
-    }
-    isPaused
-    downloadBlock {
-      ...DownloadBlockFields
+export const METRICS_HISTORY_QUERY = gql`
+  query MetricsHistory($minutes: Int!, $metrics: [String!]!) {
+    metricsHistory(minutes: $minutes, metrics: $metrics) {
+      timestamps
+      series {
+        metric
+        labels {
+          key
+          value
+        }
+        values
+      }
     }
   }
-  ${GENERAL_SETTINGS_FIELDS}
-  ${ISP_BANDWIDTH_CAP_FIELDS}
-  ${METRICS_FIELDS}
-  ${DOWNLOAD_BLOCK_FIELDS}
-`;
-
-export const SUBMIT_NZB_MUTATION = gql`
-  mutation SubmitNzb($source: NzbSourceInput!, $filename: String, $password: String, $category: String, $metadata: [MetadataInput!]) {
-    submitNzb(source: $source, filename: $filename, password: $password, category: $category, metadata: $metadata) {
-      ...JobListItemFields
-      error
-      outputDir
-      createdAt
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
 `;
 
 export const PAUSE_JOB_MUTATION = gql`
@@ -440,34 +441,31 @@ export const REPROCESS_JOB_MUTATION = gql`
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {
     deleteHistory(id: $id, deleteFiles: $deleteFiles) {
-      ...HistoryJobFields
+      ...FacadeHistoryItemFields
     }
   }
-  ${JOB_LIST_ITEM_FIELDS}
-  ${HISTORY_JOB_FIELDS}
   ${PARSED_RELEASE_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const DELETE_HISTORY_BATCH_MUTATION = gql`
   mutation DeleteHistoryBatch($ids: [Int!]!, $deleteFiles: Boolean) {
     deleteHistoryBatch(ids: $ids, deleteFiles: $deleteFiles) {
-      ...HistoryJobFields
+      ...FacadeHistoryItemFields
     }
   }
-  ${JOB_LIST_ITEM_FIELDS}
-  ${HISTORY_JOB_FIELDS}
   ${PARSED_RELEASE_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const DELETE_ALL_HISTORY_MUTATION = gql`
   mutation DeleteAllHistory($deleteFiles: Boolean) {
     deleteAllHistory(deleteFiles: $deleteFiles) {
-      ...HistoryJobFields
+      ...FacadeHistoryItemFields
     }
   }
-  ${JOB_LIST_ITEM_FIELDS}
-  ${HISTORY_JOB_FIELDS}
   ${PARSED_RELEASE_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const PAUSE_ALL_MUTATION = gql`
@@ -507,38 +505,52 @@ export const EVENTS_SUBSCRIPTION = gql`
 
 export const JOB_UPDATES_SUBSCRIPTION = gql`
   subscription JobUpdates {
-    jobUpdates {
-      jobs {
-        ...JobListItemFields
+    queueSnapshots {
+      items {
+        ...FacadeQueueItemFields
       }
-      metrics {
+      summary {
         currentDownloadSpeed
       }
-      isPaused
-      downloadBlock {
-        ...DownloadBlockFields
+      globalState {
+        isPaused
+        downloadBlock {
+          ...DownloadBlockFields
+        }
       }
     }
   }
   ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
+  ${FACADE_QUEUE_ITEM_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
 export const METRICS_PAGE_SUBSCRIPTION = gql`
   subscription MetricsPageUpdates {
-    jobUpdates {
+    queueSnapshots {
       metrics {
         ...MetricsFields
       }
-      isPaused
-      downloadBlock {
-        ...DownloadBlockFields
+      globalState {
+        isPaused
+        downloadBlock {
+          ...DownloadBlockFields
+        }
       }
     }
   }
   ${METRICS_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const HISTORY_FACADE_EVENTS_SUBSCRIPTION = gql`
+  subscription HistoryFacadeEvents {
+    queueEvents {
+      kind
+      itemId
+      state
+    }
+  }
 `;
 
 export const SERVICE_LOGS_QUERY = gql`
@@ -557,19 +569,20 @@ export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
 `;
 
 export const HISTORY_JOBS_QUERY = gql`
-  query HistoryJobs($limit: Int, $offset: Int) {
-    jobs(status: [COMPLETE, FAILED], limit: $limit, offset: $offset) {
-      ...HistoryJobFields
+  query HistoryJobs($first: Int, $after: String, $filter: QueueFilterInput) {
+    historyItems(first: $first, after: $after, filter: $filter) {
+      ...FacadeHistoryItemFields
     }
   }
   ${PARSED_RELEASE_FIELDS}
-  ${JOB_LIST_ITEM_FIELDS}
-  ${HISTORY_JOB_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const HISTORY_JOBS_COUNT_QUERY = gql`
   query HistoryJobsCount {
-    jobCount(status: [COMPLETE, FAILED])
+    all: historyItemsCount
+    success: historyItemsCount(filter: { states: [COMPLETED] })
+    failure: historyItemsCount(filter: { states: [FAILED] })
   }
 `;
 
@@ -667,8 +680,10 @@ export const SETTINGS_QUERY = gql`
     settings {
       ...GeneralSettingsFields
     }
-    downloadBlock {
-      ...DownloadBlockFields
+    globalState: globalQueueState {
+      downloadBlock {
+        ...DownloadBlockFields
+      }
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
@@ -720,9 +735,9 @@ export const DELETE_API_KEY_MUTATION = gql`
 
 // --- Login Protection ---
 
-export const LOGIN_STATUS_MUTATION = gql`
-  mutation LoginStatus {
-    loginStatus {
+export const LOGIN_STATUS_QUERY = gql`
+  query LoginStatus {
+    adminLoginStatus {
       enabled
       username
     }

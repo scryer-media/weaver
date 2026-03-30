@@ -1,8 +1,9 @@
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use async_graphql::UploadValue;
 use tracing::{info, warn};
 
 use weaver_core::classify::FileRole;
@@ -39,6 +40,8 @@ pub enum SubmitNzbError {
     CreateStorageDir(std::io::Error),
     #[error("failed to save NZB: {0}")]
     Save(std::io::Error),
+    #[error("failed to read uploaded NZB: {0}")]
+    Upload(std::io::Error),
     #[error("scheduler error: {0}")]
     Scheduler(#[from] weaver_scheduler::SchedulerError),
     #[error("NZB fetch failed: {0}")]
@@ -46,6 +49,8 @@ pub enum SubmitNzbError {
     #[error("NZB response was not valid XML")]
     NotXml,
 }
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 pub async fn submit_nzb_bytes(
     handle: &SchedulerHandle,
@@ -62,24 +67,7 @@ pub async fn submit_nzb_bytes(
         return Err(SubmitNzbError::Empty);
     }
 
-    // Resolve category against predefined categories (name or alias match).
-    let resolved_category = if let Some(ref cat) = category {
-        let cfg = config.read().await;
-        if cfg.categories.is_empty() {
-            // No categories defined yet — pass through unchanged.
-            Some(cat.clone())
-        } else {
-            match weaver_core::config::resolve_category(&cfg.categories, cat) {
-                Some(canonical) => Some(canonical),
-                None => {
-                    warn!(category = %cat, "unknown category, submitting without category");
-                    None
-                }
-            }
-        }
-    } else {
-        None
-    };
+    let resolved_category = resolve_submission_category(config, category.as_deref()).await;
 
     let job_id = JobId(NEXT_API_JOB_ID.fetch_add(1, Ordering::Relaxed));
     let spec = nzb_to_spec(
@@ -90,23 +78,26 @@ pub async fn submit_nzb_bytes(
         metadata,
     );
 
-    let data_dir = {
-        let cfg = config.read().await;
-        PathBuf::from(&cfg.data_dir)
-    };
-    let nzb_dir = data_dir.join(".weaver-nzbs");
+    let nzb_dir = nzb_storage_dir(config).await;
     tokio::fs::create_dir_all(&nzb_dir)
         .await
         .map_err(SubmitNzbError::CreateStorageDir)?;
     let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
     let write_path = nzb_path.clone();
     let compressed_bytes = nzb_bytes.to_vec();
-    tokio::task::spawn_blocking(move || write_compressed_nzb(&write_path, &compressed_bytes))
-        .await
-        .map_err(|error| SubmitNzbError::Save(std::io::Error::other(error.to_string())))?
-        .map_err(SubmitNzbError::Save)?;
+    let persist_result =
+        tokio::task::spawn_blocking(move || write_compressed_nzb(&write_path, &compressed_bytes))
+            .await
+            .map_err(|error| SubmitNzbError::Save(std::io::Error::other(error.to_string())))?;
+    if let Err(error) = persist_result {
+        cleanup_persisted_nzb(&nzb_path).await;
+        return Err(SubmitNzbError::Save(error));
+    }
 
-    handle.add_job(job_id, spec.clone(), nzb_path).await?;
+    if let Err(error) = handle.add_job(job_id, spec.clone(), nzb_path.clone()).await {
+        cleanup_persisted_nzb(&nzb_path).await;
+        return Err(error.into());
+    }
 
     info!(
         job_id = job_id.0,
@@ -124,6 +115,107 @@ pub async fn submit_nzb_bytes(
     })
 }
 
+pub async fn submit_uploaded_nzb(
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    upload: UploadValue,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let submit_started = Instant::now();
+    let resolved_category = resolve_submission_category(config, category.as_deref()).await;
+    let job_id = JobId(NEXT_API_JOB_ID.fetch_add(1, Ordering::Relaxed));
+    let nzb_dir = nzb_storage_dir(config).await;
+    tokio::fs::create_dir_all(&nzb_dir)
+        .await
+        .map_err(SubmitNzbError::CreateStorageDir)?;
+    let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
+    let persisted_path = nzb_path.clone();
+    let persist_result =
+        tokio::task::spawn_blocking(move || persist_uploaded_nzb(&persisted_path, upload))
+            .await
+            .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
+    let nzb = match persist_result {
+        Ok(nzb) => nzb,
+        Err(error) => {
+            cleanup_persisted_nzb(&nzb_path).await;
+            return Err(error);
+        }
+    };
+    if nzb.files.is_empty() {
+        cleanup_persisted_nzb(&nzb_path).await;
+        return Err(SubmitNzbError::Empty);
+    }
+
+    let spec = nzb_to_spec(
+        &nzb,
+        filename.as_deref(),
+        password,
+        resolved_category,
+        metadata,
+    );
+
+    if let Err(error) = handle.add_job(job_id, spec.clone(), nzb_path.clone()).await {
+        cleanup_persisted_nzb(&nzb_path).await;
+        return Err(error.into());
+    }
+
+    info!(
+        job_id = job_id.0,
+        name = %spec.name,
+        category = spec.category,
+        metadata_len = spec.metadata.len(),
+        elapsed_ms = submit_started.elapsed().as_millis() as u64,
+        "submitted uploaded NZB job"
+    );
+
+    Ok(SubmittedJob {
+        job_id,
+        spec,
+        created_at_epoch_ms: weaver_scheduler::job::epoch_ms_now(),
+    })
+}
+
+async fn resolve_submission_category(
+    config: &SharedConfig,
+    category: Option<&str>,
+) -> Option<String> {
+    let Some(cat) = category else {
+        return None;
+    };
+    let cfg = config.read().await;
+    if cfg.categories.is_empty() {
+        return Some(cat.to_string());
+    }
+
+    match weaver_core::config::resolve_category(&cfg.categories, cat) {
+        Some(canonical) => Some(canonical),
+        None => {
+            warn!(category = %cat, "unknown category, submitting without category");
+            None
+        }
+    }
+}
+
+async fn nzb_storage_dir(config: &SharedConfig) -> PathBuf {
+    let cfg = config.read().await;
+    PathBuf::from(&cfg.data_dir).join(".weaver-nzbs")
+}
+
+async fn cleanup_persisted_nzb(nzb_path: &Path) {
+    if let Err(error) = tokio::fs::remove_file(nzb_path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            path = %nzb_path.display(),
+            error = %error,
+            "failed to remove orphaned persisted nzb"
+        );
+    }
+}
+
 fn write_compressed_nzb(nzb_path: &Path, nzb_bytes: &[u8]) -> Result<(), std::io::Error> {
     let file = std::fs::File::create(nzb_path)?;
     let writer = std::io::BufWriter::new(file);
@@ -132,6 +224,62 @@ fn write_compressed_nzb(nzb_path: &Path, nzb_bytes: &[u8]) -> Result<(), std::io
     let mut writer = encoder.finish()?;
     writer.flush()?;
     Ok(())
+}
+
+fn write_compressed_nzb_from_reader<R: Read>(
+    nzb_path: &Path,
+    mut reader: R,
+) -> Result<(), std::io::Error> {
+    let file = std::fs::File::create(nzb_path)?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = zstd::stream::Encoder::new(writer, NZB_COMPRESSION_LEVEL)?;
+    std::io::copy(&mut reader, &mut encoder)?;
+    let mut writer = encoder.finish()?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn persist_uploaded_nzb(nzb_path: &Path, upload: UploadValue) -> Result<Nzb, SubmitNzbError> {
+    if upload_is_zstd(&upload)? {
+        let parse_upload = upload.try_clone().map_err(SubmitNzbError::Upload)?;
+        let parse_reader = parse_upload.into_read();
+        let decoder =
+            zstd::stream::read::Decoder::new(parse_reader).map_err(SubmitNzbError::Upload)?;
+        let nzb = weaver_nzb::parse_nzb_reader(BufReader::new(decoder))?;
+
+        let mut source = upload.into_read();
+        let mut output = std::fs::File::create(nzb_path).map_err(SubmitNzbError::Save)?;
+        std::io::copy(&mut source, &mut output).map_err(SubmitNzbError::Save)?;
+        output.flush().map_err(SubmitNzbError::Save)?;
+        return Ok(nzb);
+    }
+
+    let parse_upload = upload.try_clone().map_err(SubmitNzbError::Upload)?;
+    let nzb = weaver_nzb::parse_nzb_reader(BufReader::new(parse_upload.into_read()))?;
+    write_compressed_nzb_from_reader(nzb_path, upload.into_read()).map_err(SubmitNzbError::Save)?;
+    Ok(nzb)
+}
+
+fn upload_is_zstd(upload: &UploadValue) -> Result<bool, SubmitNzbError> {
+    let has_zst_filename = upload
+        .filename
+        .trim()
+        .to_ascii_lowercase()
+        .ends_with(".zst");
+    if !has_zst_filename {
+        return Ok(false);
+    }
+
+    let mut reader = upload
+        .try_clone()
+        .map_err(SubmitNzbError::Upload)?
+        .into_read();
+    let mut magic = [0u8; 4];
+    match reader.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == ZSTD_MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(SubmitNzbError::Upload(error)),
+    }
 }
 
 /// Fetch an NZB from a URL. Returns `(nzb_bytes, optional_filename)`.
@@ -160,9 +308,9 @@ pub async fn fetch_nzb_from_url(
         return Err(SubmitNzbError::Fetch("empty response body".into()));
     }
 
-    let text = String::from_utf8_lossy(&nzb_bytes);
-    if !text.trim_start().starts_with('<') {
-        return Err(SubmitNzbError::NotXml);
+    let nzb = weaver_nzb::parse_nzb(&nzb_bytes)?;
+    if nzb.files.is_empty() {
+        return Err(SubmitNzbError::Empty);
     }
 
     Ok((nzb_bytes.to_vec(), filename))

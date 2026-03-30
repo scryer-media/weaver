@@ -6,19 +6,53 @@ use async_graphql::Request;
 use common::TestHarness;
 use tokio_stream::StreamExt;
 use weaver_api::auth::CallerScope;
+use weaver_api::{
+    PersistedQueueEvent, QueueEventKind, QueueItemState, encode_event_cursor, queue_item_from_job,
+};
+use weaver_core::id::JobId;
+use weaver_state::IntegrationEventRow;
+
+fn persist_event(
+    h: &TestHarness,
+    item_id: u64,
+    kind: QueueEventKind,
+    state: QueueItemState,
+) -> String {
+    let info = h.handle.get_job(JobId(item_id)).expect("job should exist");
+    let occurred_at_ms = chrono::Utc::now().timestamp_millis();
+    let payload = PersistedQueueEvent {
+        occurred_at_ms,
+        kind,
+        item_id: Some(item_id),
+        item: Some(queue_item_from_job(&info)),
+        state: Some(state),
+        previous_state: None,
+        attention: None,
+        global_state: None,
+    };
+    h.db.insert_integration_events(&[IntegrationEventRow {
+        id: 0,
+        timestamp: occurred_at_ms,
+        kind: format!("{kind:?}"),
+        item_id: Some(item_id),
+        payload_json: serde_json::to_string(&payload).unwrap(),
+    }])
+    .unwrap();
+    let latest = h.db.latest_integration_event_id().unwrap().unwrap();
+    encode_event_cursor(latest)
+}
 
 #[tokio::test]
-async fn job_updates_subscription_emits_snapshot() {
+async fn queue_snapshots_subscription_emits_snapshot() {
     let h = TestHarness::new().await;
 
     let request = Request::new(
-        "subscription { jobUpdates { jobs { id } metrics { bytesDownloaded } isPaused } }",
+        "subscription { queueSnapshots { items { id } summary { totalItems } globalState { isPaused } latestCursor } }",
     )
-    .data(CallerScope::Local);
+    .data(CallerScope::Read);
 
     let mut stream = h.schema.execute_stream(request);
 
-    // The subscription should emit at least one snapshot (heartbeat fires every 2s).
     let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
     assert!(item.is_ok(), "subscription should emit within 3 seconds");
     let response = item.unwrap().unwrap();
@@ -26,64 +60,37 @@ async fn job_updates_subscription_emits_snapshot() {
 }
 
 #[tokio::test]
-async fn events_subscription_receives_after_submit() {
+async fn queue_snapshots_include_new_job() {
     let h = TestHarness::new().await;
-
-    let request =
-        Request::new("subscription { events { kind jobId message } }").data(CallerScope::Local);
-
-    let mut stream = h.schema.execute_stream(request);
-
-    // Give the subscription a moment to establish before sending the event.
-    tokio::task::yield_now().await;
-
-    // Submit a job to trigger a JobCreated event.
-    h.submit_test_nzb("event-test").await;
-
-    // The events subscription should fire with a JobCreated event.
-    // Broadcast may miss events if subscription wasn't ready, so accept timeout as non-fatal
-    // in test environments. The primary test is that the subscription query is valid.
-    let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
-    // If we got an item, verify it's not an error response.
-    if let Ok(Some(response)) = item {
-        assert!(response.errors.is_empty());
-    }
-    // If timeout, that's acceptable — broadcast subscription timing in tests is inherently racy.
-}
-
-#[tokio::test]
-async fn job_updates_includes_new_job() {
-    let h = TestHarness::new().await;
-
-    // Submit a job first.
     h.submit_test_nzb("sub-test").await;
 
-    let request = Request::new("subscription { jobUpdates { jobs { id name } isPaused } }")
-        .data(CallerScope::Local);
+    let request = Request::new(
+        "subscription { queueSnapshots { items { id name state } summary { totalItems } } }",
+    )
+    .data(CallerScope::Read);
 
     let mut stream = h.schema.execute_stream(request);
 
-    // Next snapshot should include the job.
     let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
     assert!(item.is_ok());
     let response = item.unwrap().unwrap();
     assert!(response.errors.is_empty());
     let data = response.data.into_json().unwrap();
-    let jobs = data["jobUpdates"]["jobs"].as_array().unwrap();
+    let items = data["queueSnapshots"]["items"].as_array().unwrap();
     assert!(
-        !jobs.is_empty(),
-        "jobUpdates should include the submitted job"
+        !items.is_empty(),
+        "queueSnapshots should include the submitted job"
     );
 }
 
 #[tokio::test]
-async fn job_updates_reflects_pause_state() {
+async fn queue_snapshots_reflect_pause_state() {
     let h = TestHarness::new().await;
 
-    // Pause first.
-    h.execute("mutation { pauseAll }").await;
+    h.execute("mutation { pauseQueue { success } }").await;
 
-    let request = Request::new("subscription { jobUpdates { isPaused } }").data(CallerScope::Local);
+    let request = Request::new("subscription { queueSnapshots { globalState { isPaused } } }")
+        .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
 
     let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
@@ -91,5 +98,58 @@ async fn job_updates_reflects_pause_state() {
     let response = item.unwrap().unwrap();
     assert!(response.errors.is_empty());
     let data = response.data.into_json().unwrap();
-    assert!(data["jobUpdates"]["isPaused"].as_bool().unwrap());
+    assert!(
+        data["queueSnapshots"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn queue_events_replay_from_cursor_then_tail() {
+    let h = TestHarness::new().await;
+    let item_id = h.submit_test_nzb("event-test").await;
+
+    let after = persist_event(
+        &h,
+        item_id,
+        QueueEventKind::ItemCreated,
+        QueueItemState::Queued,
+    );
+    persist_event(
+        &h,
+        item_id,
+        QueueEventKind::ItemStateChanged,
+        QueueItemState::Downloading,
+    );
+
+    let request = Request::new(format!(
+        r#"subscription {{
+            queueEvents(after: "{after}") {{
+                cursor
+                kind
+                itemId
+                state
+                item {{ id state }}
+            }}
+        }}"#
+    ))
+    .data(CallerScope::Read);
+
+    let mut stream = h.schema.execute_stream(request);
+
+    let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
+    assert!(item.is_ok(), "queueEvents should replay after cursor");
+    let response = item.unwrap().unwrap();
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    assert_eq!(
+        data["queueEvents"]["kind"].as_str().unwrap(),
+        "ITEM_STATE_CHANGED"
+    );
+    assert_eq!(data["queueEvents"]["itemId"].as_u64().unwrap(), item_id);
+    assert_eq!(
+        data["queueEvents"]["state"].as_str().unwrap(),
+        "DOWNLOADING"
+    );
 }

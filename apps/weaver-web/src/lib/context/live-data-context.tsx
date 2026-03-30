@@ -9,7 +9,7 @@ export interface LiveConnectionState {
 }
 
 export interface DownloadBlockState {
-  kind: "NONE" | "MANUAL_PAUSE" | "ISP_CAP";
+  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP";
   capEnabled: boolean;
   period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
   usedBytes: number;

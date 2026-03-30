@@ -47,7 +47,6 @@ impl Pipeline {
 
 const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
 const MAX_CONCURRENT_REPAIRS: usize = 1;
-const MAX_CONCURRENT_EXTRACTIONS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct ScannedExtractionFile {
@@ -479,10 +478,48 @@ fn move_path_with_copy_fallback(
 }
 
 impl Pipeline {
-    pub(super) fn persist_active_status(&self, job_id: JobId, status: &'static str) {
+    pub(super) fn persist_active_runtime(&self, job_id: JobId) {
+        let Some((
+            status,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+        )) = self.jobs.get(&job_id).and_then(|state| {
+            let status = Self::persist_active_status_for(&state.status)?;
+            Some((
+                status.to_string(),
+                match &state.status {
+                    JobStatus::Failed { error } => Some(error.clone()),
+                    _ => None,
+                },
+                state.queued_repair_at_epoch_ms,
+                state.queued_extract_at_epoch_ms,
+                state
+                    .paused_resume_status
+                    .as_ref()
+                    .and_then(Self::persist_active_status_for)
+                    .map(str::to_string),
+            ))
+        })
+        else {
+            return;
+        };
+
         self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.set_active_job_status(job_id, status, None) {
-                tracing::error!(error = %error, status, "db write failed for active job status");
+            if let Err(error) = db.set_active_job_runtime(
+                job_id,
+                &status,
+                error.as_deref(),
+                queued_repair_at_epoch_ms,
+                queued_extract_at_epoch_ms,
+                paused_resume_status.as_deref(),
+            ) {
+                tracing::error!(
+                    error = %error,
+                    status,
+                    "db write failed for active job runtime"
+                );
             }
         });
     }
@@ -596,20 +633,20 @@ impl Pipeline {
             previous_status,
             JobStatus::Complete | JobStatus::Failed { .. }
         ) {
-            return Err(weaver_scheduler::SchedulerError::Other(format!(
+            return Err(weaver_scheduler::SchedulerError::Conflict(format!(
                 "cannot pause job in {:?} state",
                 previous_status
             )));
         }
         if matches!(previous_status, JobStatus::Repairing) {
-            return Err(weaver_scheduler::SchedulerError::Other(
+            return Err(weaver_scheduler::SchedulerError::Conflict(
                 "cannot pause while PAR2 repair is running".to_string(),
             ));
         }
         if matches!(previous_status, JobStatus::Extracting)
             && self.job_has_active_extraction_tasks(job_id)
         {
-            return Err(weaver_scheduler::SchedulerError::Other(
+            return Err(weaver_scheduler::SchedulerError::Conflict(
                 "cannot pause while extraction tasks are running".to_string(),
             ));
         }
@@ -671,6 +708,14 @@ impl Pipeline {
         new_status: JobStatus,
         persist_status: Option<&'static str>,
     ) {
+        let failpoint_name = match &new_status {
+            JobStatus::Verifying => Some("status.enter_verifying"),
+            JobStatus::Repairing => Some("status.enter_repairing"),
+            JobStatus::QueuedRepair => Some("status.enter_queued_repair"),
+            JobStatus::QueuedExtract => Some("status.enter_queued_extract"),
+            JobStatus::Paused => Some("status.enter_paused"),
+            _ => None,
+        };
         let (released_repair, released_extract, entered_repair, entered_extract) = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
@@ -729,8 +774,12 @@ impl Pipeline {
         if entered_extract {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(status) = persist_status {
-            self.persist_active_status(job_id, status);
+        if persist_status.is_some() {
+            self.persist_active_runtime(job_id);
+        }
+        if let Some(name) = failpoint_name {
+            crate::e2e_failpoint::maybe_delay(name);
+            crate::e2e_failpoint::maybe_trip(name);
         }
         if released_repair {
             self.promote_queued_repairs();
@@ -788,7 +837,7 @@ impl Pipeline {
         if matches!(status, JobStatus::Extracting) {
             return true;
         }
-        if self.active_extract_jobs() >= MAX_CONCURRENT_EXTRACTIONS {
+        if self.active_extract_jobs() >= self.tuner.max_concurrent_extractions() {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::QueuedExtract,
@@ -818,7 +867,10 @@ impl Pipeline {
     }
 
     pub(super) fn promote_queued_extractions(&mut self) {
-        let available = MAX_CONCURRENT_EXTRACTIONS.saturating_sub(self.active_extract_jobs());
+        let available = self
+            .tuner
+            .max_concurrent_extractions()
+            .saturating_sub(self.active_extract_jobs());
         if available == 0 {
             return;
         }
@@ -2428,6 +2480,13 @@ impl Pipeline {
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(super) async fn check_job_completion(&mut self, job_id: JobId) {
+        let current_status = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            state.status.clone()
+        };
+
         // Step 1: Are all data files (non-recovery) complete?
         {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -2475,6 +2534,13 @@ impl Pipeline {
             }
         }
 
+        if matches!(current_status, JobStatus::QueuedRepair) {
+            if self.active_repair_jobs() == 0 {
+                self.promote_queued_repairs();
+            }
+            return;
+        }
+
         // Don't finalize while concatenation is still pending.
         if self
             .pending_concat
@@ -2507,11 +2573,18 @@ impl Pipeline {
 
             let par2_set = self.par2_set(job_id).cloned();
             if let Some(par2_set) = par2_set {
-                self.transition_postprocessing_status(
-                    job_id,
-                    JobStatus::Verifying,
-                    Some("verifying"),
-                );
+                if !matches!(current_status, JobStatus::Repairing) {
+                    self.transition_postprocessing_status(
+                        job_id,
+                        JobStatus::Verifying,
+                        Some("verifying"),
+                    );
+                } else {
+                    info!(
+                        job_id = job_id.0,
+                        "rerunning PAR2 verification while preserving restored repair slot"
+                    );
+                }
                 self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
                 info!(job_id = job_id.0, "par2 verification started");
                 let _ = self
@@ -2755,6 +2828,7 @@ impl Pipeline {
                     let pp_pool = self.pp_pool.clone();
                     let repair_result = tokio::task::spawn_blocking(move || {
                         pp_pool.install(move || {
+                            crate::e2e_failpoint::maybe_delay("repair.task_start");
                             let mut file_access =
                                 weaver_par2::DiskFileAccess::new(repair_dir, &par2_for_repair);
                             let plan = weaver_par2::plan_repair(&par2_for_repair, &verification)

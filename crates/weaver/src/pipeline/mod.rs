@@ -34,13 +34,14 @@ use weaver_scheduler::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
     RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState, TokenBucket,
 };
-use weaver_state::CommittedSegment;
+use weaver_state::{ActiveFileProgress, CommittedSegment};
 
 use self::bandwidth_cap::BandwidthCapRuntime;
 use self::rar_state::RarSetState;
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
+const FILE_PROGRESS_FLUSH_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Result of a download task.
 pub(super) struct DownloadResult {
@@ -210,6 +211,10 @@ pub struct Pipeline {
     pub(super) nzb_dir: PathBuf,
     /// Pending segment commits (flushed to SQLite in batches).
     pub(super) segment_batch: Vec<CommittedSegment>,
+    /// Per-file contiguous write floors awaiting persistence.
+    pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
+    /// Last queued/persisted contiguous write floor per file.
+    pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.
@@ -365,6 +370,8 @@ impl Pipeline {
             complete_dir,
             nzb_dir,
             segment_batch: Vec::new(),
+            pending_file_progress: HashMap::new(),
+            persisted_file_progress: HashMap::new(),
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             download_done_tx,
@@ -429,6 +436,76 @@ impl Pipeline {
     {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || f(&db));
+    }
+
+    pub(super) fn effective_downloaded_bytes(state: &JobState) -> u64 {
+        state
+            .downloaded_bytes
+            .max(state.restored_download_floor_bytes)
+            .min(state.spec.total_bytes)
+    }
+
+    pub(super) fn effective_progress(state: &JobState) -> f64 {
+        let byte_progress = if state.spec.total_bytes == 0 {
+            0.0
+        } else {
+            Self::effective_downloaded_bytes(state) as f64 / state.spec.total_bytes as f64
+        };
+        state.assembly.progress().max(byte_progress).clamp(0.0, 1.0)
+    }
+
+    pub(super) fn note_file_progress_floor(
+        &mut self,
+        file_id: NzbFileId,
+        contiguous_bytes_written: u64,
+        force_flush: bool,
+    ) {
+        let current = self
+            .pending_file_progress
+            .get(&file_id)
+            .copied()
+            .or_else(|| self.persisted_file_progress.get(&file_id).copied())
+            .unwrap_or(0);
+        if contiguous_bytes_written <= current {
+            return;
+        }
+        self.pending_file_progress
+            .insert(file_id, contiguous_bytes_written);
+        if force_flush
+            || contiguous_bytes_written.saturating_sub(current) >= FILE_PROGRESS_FLUSH_DELTA_BYTES
+        {
+            self.flush_file_progress_batch();
+        }
+    }
+
+    pub(super) fn flush_file_progress_batch(&mut self) {
+        if self.pending_file_progress.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_file_progress);
+        for (file_id, bytes) in &pending {
+            self.persisted_file_progress.insert(*file_id, *bytes);
+        }
+        let batch: Vec<ActiveFileProgress> = pending
+            .into_iter()
+            .map(|(file_id, contiguous_bytes_written)| ActiveFileProgress {
+                job_id: file_id.job_id,
+                file_index: file_id.file_index,
+                contiguous_bytes_written,
+            })
+            .collect();
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.upsert_file_progress_batch(&batch) {
+                tracing::error!(count = batch.len(), error = %error, "failed to persist file progress floors");
+            }
+        });
+    }
+
+    pub(super) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
+        self.pending_file_progress
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.persisted_file_progress
+            .retain(|file_id, _| file_id.job_id != job_id);
     }
 
     /// Run the pipeline main loop until shutdown.
@@ -596,8 +673,12 @@ impl Pipeline {
                 job_id,
                 spec,
                 committed_segments,
+                file_progress,
                 extracted_members,
                 status,
+                queued_repair_at_epoch_ms,
+                queued_extract_at_epoch_ms,
+                paused_resume_status,
                 working_dir,
                 reply,
             } => {
@@ -606,8 +687,12 @@ impl Pipeline {
                         job_id,
                         spec,
                         committed_segments,
+                        file_progress,
                         extracted_members,
                         status,
+                        queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms,
+                        paused_resume_status,
                         working_dir,
                     )
                     .await;
@@ -625,11 +710,6 @@ impl Pipeline {
                             .send(PipelineEvent::DownloadFinished { job_id });
                     }
                     let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.set_active_job_status(job_id, "paused", None) {
-                            error!(error = %e, "db write failed for PauseJob");
-                        }
-                    });
                 }
                 let _ = reply.send(result);
             }
@@ -665,7 +745,7 @@ impl Pipeline {
                         status: "cancelled".to_string(),
                         error_message: None,
                         total_bytes: total,
-                        downloaded_bytes: state.downloaded_bytes,
+                        downloaded_bytes: Self::effective_downloaded_bytes(&state),
                         optional_recovery_bytes,
                         optional_recovery_downloaded_bytes,
                         failed_bytes: state.failed_bytes,
@@ -708,6 +788,7 @@ impl Pipeline {
                     self.active_downloads_by_job.remove(&job_id);
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
+                    self.clear_job_progress_floor_runtime(job_id);
 
                     // Delete per-job working and staging directories.
                     let working_dir = state.working_dir.clone();
@@ -872,7 +953,7 @@ impl Pipeline {
                 let result = std::fs::create_dir_all(&data_dir)
                     .and_then(|_| std::fs::create_dir_all(&intermediate_dir))
                     .and_then(|_| std::fs::create_dir_all(&complete_dir))
-                    .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))
+                    .map_err(weaver_scheduler::SchedulerError::Io)
                     .map(|_| {
                         self.intermediate_dir = intermediate_dir;
                         self.complete_dir = complete_dir;
@@ -905,7 +986,7 @@ impl Pipeline {
                 };
                 let result = match self.jobs.get(&job_id).map(|state| state.status.clone()) {
                     Some(status) if !is_terminal_status(&status) => {
-                        Err(weaver_scheduler::SchedulerError::Other(
+                        Err(weaver_scheduler::SchedulerError::Conflict(
                             "cannot delete active job — cancel it first".into(),
                         ))
                     }
@@ -951,11 +1032,11 @@ impl Pipeline {
                         match delete_result {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => {
-                                let _ = reply.send(Err(SchedulerError::Other(error)));
+                                let _ = reply.send(Err(SchedulerError::Internal(error)));
                                 return;
                             }
                             Err(error) => {
-                                let _ = reply.send(Err(SchedulerError::Other(format!(
+                                let _ = reply.send(Err(SchedulerError::Internal(format!(
                                     "failed to join history delete task: {error}"
                                 ))));
                                 return;
@@ -1014,11 +1095,11 @@ impl Pipeline {
                 match delete_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let _ = reply.send(Err(SchedulerError::Other(error)));
+                        let _ = reply.send(Err(SchedulerError::Internal(error)));
                         return;
                     }
                     Err(error) => {
-                        let _ = reply.send(Err(SchedulerError::Other(format!(
+                        let _ = reply.send(Err(SchedulerError::Internal(format!(
                             "failed to join delete-all-history task: {error}"
                         ))));
                         return;
@@ -1054,8 +1135,12 @@ impl Pipeline {
         let db = self.db.clone();
         let row = tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
             .await
-            .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))?
-            .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))?;
+            .map_err(|e| {
+                weaver_scheduler::SchedulerError::Internal(format!(
+                    "failed to join history lookup task: {e}"
+                ))
+            })?
+            .map_err(weaver_scheduler::SchedulerError::State)?;
         if let Some(row) = row
             && let Some(output_dir) = row.output_dir
             && let Some(path) =
@@ -1084,8 +1169,12 @@ impl Pipeline {
             db.list_job_history(&weaver_state::HistoryFilter::default())
         })
         .await
-        .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))?
-        .map_err(|e| weaver_scheduler::SchedulerError::Other(e.to_string()))?;
+        .map_err(|e| {
+            weaver_scheduler::SchedulerError::Internal(format!(
+                "failed to join history list task: {e}"
+            ))
+        })?
+        .map_err(weaver_scheduler::SchedulerError::State)?;
         for row in rows {
             if let Some(output_dir) = row.output_dir
                 && let Some(path) =
@@ -1109,9 +1198,12 @@ impl Pipeline {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(weaver_scheduler::SchedulerError::Other(format!(
-                        "failed to remove historical intermediate directory '{}': {error}",
-                        dir.display()
+                    return Err(weaver_scheduler::SchedulerError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to remove historical intermediate directory '{}': {error}",
+                            dir.display()
+                        ),
                     )));
                 }
             }
@@ -1198,6 +1290,7 @@ impl Pipeline {
         }
         // Flush any pending segment commits.
         self.flush_segment_batch();
+        self.flush_file_progress_batch();
     }
 
     /// Flush the pending segment batch to SQLite.
@@ -1210,6 +1303,8 @@ impl Pipeline {
         tokio::task::spawn_blocking(move || {
             if let Err(e) = db.commit_segments(&batch) {
                 tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
+            } else {
+                crate::e2e_failpoint::maybe_trip("download.after_batch_commit_before_ack");
             }
         });
     }
@@ -1514,6 +1609,7 @@ impl Pipeline {
         self.active_downloads_by_job.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
+        self.clear_job_progress_floor_runtime(job_id);
         // Clean up decode retry tracking for all segments in this job.
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
@@ -1554,7 +1650,7 @@ impl Pipeline {
             status: status_str,
             error_message,
             total_bytes: total,
-            downloaded_bytes: state.downloaded_bytes,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
             optional_recovery_downloaded_bytes,
             failed_bytes: state.failed_bytes,
@@ -1584,9 +1680,9 @@ impl Pipeline {
                 None
             },
             status: state.status.clone(),
-            progress: state.assembly.progress(),
+            progress: Self::effective_progress(state),
             total_bytes: total,
-            downloaded_bytes: state.downloaded_bytes,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
             optional_recovery_downloaded_bytes,
             failed_bytes: state.failed_bytes,
@@ -1776,6 +1872,7 @@ mod tests {
             paused_resume_status: None,
             working_dir,
             downloaded_bytes: 0,
+            restored_download_floor_bytes: 0,
             failed_bytes: 0,
             par2_bytes: 0,
             health_probing: false,
@@ -2419,6 +2516,7 @@ mod tests {
                 paused_resume_status: None,
                 working_dir: working_dir.clone(),
                 downloaded_bytes: 0,
+                restored_download_floor_bytes: 0,
                 failed_bytes: 0,
                 par2_bytes,
                 health_probing: false,
@@ -3889,8 +3987,12 @@ mod tests {
                 job_id,
                 spec,
                 committed_segments,
+                HashMap::new(),
                 ["E01.mkv".to_string()].into_iter().collect(),
                 JobStatus::Downloading,
+                None,
+                None,
+                None,
                 working_dir.clone(),
             )
             .await
@@ -4067,8 +4169,12 @@ mod tests {
                         }],
                     },
                 ),
+                HashMap::new(),
                 HashSet::new(),
                 JobStatus::Downloading,
+                None,
+                None,
+                None,
                 working_dir,
             )
             .await
@@ -4078,6 +4184,50 @@ mod tests {
         let par2_set = restored.par2_set(job_id).unwrap();
         assert_eq!(par2_set.files.len(), 1);
         assert_eq!(par2_set.recovery_block_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_job_uses_per_file_progress_floor_for_reporting() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30035);
+        let spec = standalone_job_spec(
+            "Restore Progress Floor",
+            &[("a.bin".to_string(), 100), ("b.bin".to_string(), 100)],
+        );
+        let working_dir = temp_dir.path().join("restore-progress-floor");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+        let committed_segments = HashSet::from([SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        }]);
+        let file_progress = HashMap::from([(0u32, 40u64), (1u32, 80u64)]);
+
+        pipeline
+            .restore_job(
+                job_id,
+                spec,
+                committed_segments,
+                file_progress,
+                HashSet::new(),
+                JobStatus::Downloading,
+                None,
+                None,
+                None,
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.downloaded_bytes, 100);
+        assert_eq!(state.restored_download_floor_bytes, 180);
+        assert_eq!(Pipeline::effective_downloaded_bytes(state), 180);
+        assert!((Pipeline::effective_progress(state) - 0.9).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -4145,8 +4295,12 @@ mod tests {
                 job_id,
                 spec,
                 committed_segments,
+                HashMap::new(),
                 HashSet::new(),
                 JobStatus::Downloading,
+                None,
+                None,
+                None,
                 working_dir,
             )
             .await
@@ -4222,8 +4376,12 @@ mod tests {
                     job_id,
                     &rar_job_spec("RAR Restart Runtime Restore", &files),
                 ),
+                HashMap::new(),
                 HashSet::new(),
                 JobStatus::Downloading,
+                None,
+                None,
+                None,
                 working_dir,
             )
             .await
@@ -4266,8 +4424,12 @@ mod tests {
                 job_id,
                 spec,
                 Pipeline::all_segment_ids(job_id, &rar_job_spec("RAR Ownerless Restore", &files)),
+                HashMap::new(),
                 HashSet::new(),
                 JobStatus::Downloading,
+                None,
+                None,
+                None,
                 working_dir.clone(),
             )
             .await
@@ -6254,8 +6416,12 @@ mod tests {
                 job_id,
                 spec,
                 HashSet::new(),
+                HashMap::new(),
                 HashSet::new(),
                 JobStatus::QueuedRepair,
+                None,
+                None,
+                None,
                 working_dir,
             )
             .await
@@ -6272,6 +6438,112 @@ mod tests {
         assert_eq!(
             pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
             Some(JobStatus::QueuedRepair)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_repairing_preserves_status_and_slot_ownership() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(31205);
+        let spec = standalone_job_spec("Restore repairing", &[("sample.bin".to_string(), 100)]);
+        let working_dir = temp_dir.path().join("restore-repairing");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+        pipeline
+            .restore_job(
+                job_id,
+                spec,
+                HashSet::new(),
+                HashMap::new(),
+                HashSet::new(),
+                JobStatus::Repairing,
+                Some(42_000.0),
+                None,
+                None,
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Repairing)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.queued_repair_at_epoch_ms),
+            Some(42_000.0)
+        );
+        assert_eq!(pipeline.metrics.repair_active.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pipeline
+                .pending_completion_checks
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![job_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_paused_preserves_resume_target_and_queue_age() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(31206);
+        let spec = standalone_job_spec("Restore paused", &[("sample.bin".to_string(), 100)]);
+        let working_dir = temp_dir.path().join("restore-paused");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+        pipeline
+            .restore_job(
+                job_id,
+                spec,
+                HashSet::new(),
+                HashMap::new(),
+                HashSet::new(),
+                JobStatus::Paused,
+                None,
+                Some(84_000.0),
+                Some(JobStatus::QueuedExtract),
+                working_dir,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Paused)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.paused_resume_status.clone()),
+            Some(JobStatus::QueuedExtract)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.queued_extract_at_epoch_ms),
+            Some(84_000.0)
+        );
+
+        pipeline.resume_job_runtime(job_id).unwrap();
+
+        assert_eq!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::QueuedExtract)
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.queued_extract_at_epoch_ms),
+            Some(84_000.0)
         );
     }
 

@@ -1,4 +1,4 @@
-use async_graphql::{Context, Guard, Result};
+use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 use sha2::{Digest, Sha256};
 
 /// Represents who is making the request.
@@ -6,15 +6,44 @@ use sha2::{Digest, Sha256};
 pub enum CallerScope {
     /// Local web UI — no token, full access.
     Local,
-    /// API key with integration scope.
-    Integration,
+    /// API key with read-only scope.
+    Read,
+    /// API key with queue control scope.
+    Control,
     /// API key with admin scope.
     Admin,
 }
 
 impl CallerScope {
+    pub fn can_read(&self) -> bool {
+        true
+    }
+
+    pub fn can_control(&self) -> bool {
+        matches!(
+            self,
+            CallerScope::Local | CallerScope::Control | CallerScope::Admin
+        )
+    }
+
     pub fn is_admin(&self) -> bool {
         matches!(self, CallerScope::Local | CallerScope::Admin)
+    }
+}
+
+/// Guard that rejects requests from callers without read scope.
+pub struct ReadGuard;
+
+impl Guard for ReadGuard {
+    async fn check(&self, ctx: &Context<'_>) -> Result<()> {
+        let scope = ctx
+            .data::<CallerScope>()
+            .map_err(|_| internal_error("missing caller scope"))?;
+        if scope.can_read() {
+            Ok(())
+        } else {
+            Err(graphql_error("FORBIDDEN", "read scope required"))
+        }
     }
 }
 
@@ -25,13 +54,39 @@ impl Guard for AdminGuard {
     async fn check(&self, ctx: &Context<'_>) -> Result<()> {
         let scope = ctx
             .data::<CallerScope>()
-            .map_err(|_| async_graphql::Error::new("internal: missing caller scope"))?;
+            .map_err(|_| internal_error("missing caller scope"))?;
         if scope.is_admin() {
             Ok(())
         } else {
-            Err(async_graphql::Error::new("Forbidden: admin scope required"))
+            Err(graphql_error("FORBIDDEN", "admin scope required"))
         }
     }
+}
+
+/// Guard that rejects requests from callers without queue-control scope.
+pub struct ControlGuard;
+
+impl Guard for ControlGuard {
+    async fn check(&self, ctx: &Context<'_>) -> Result<()> {
+        let scope = ctx
+            .data::<CallerScope>()
+            .map_err(|_| internal_error("missing caller scope"))?;
+        if scope.can_control() {
+            Ok(())
+        } else {
+            Err(graphql_error("FORBIDDEN", "control scope required"))
+        }
+    }
+}
+
+pub fn graphql_error(code: &'static str, message: impl Into<String>) -> Error {
+    Error::new(message.into()).extend_with(|_, ext| {
+        ext.set("code", code);
+    })
+}
+
+pub fn internal_error(message: impl Into<String>) -> Error {
+    graphql_error("INTERNAL", format!("internal: {}", message.into()))
 }
 
 /// Generate a new API key: `wvr_<32 hex chars>` (16 random bytes).
@@ -104,7 +159,16 @@ mod tests {
     fn scope_is_admin() {
         assert!(CallerScope::Local.is_admin());
         assert!(CallerScope::Admin.is_admin());
-        assert!(!CallerScope::Integration.is_admin());
+        assert!(!CallerScope::Read.is_admin());
+        assert!(!CallerScope::Control.is_admin());
+    }
+
+    #[test]
+    fn scope_permissions() {
+        assert!(CallerScope::Read.can_read());
+        assert!(!CallerScope::Read.can_control());
+        assert!(CallerScope::Control.can_control());
+        assert!(CallerScope::Admin.can_control());
     }
 
     #[test]

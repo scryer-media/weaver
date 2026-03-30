@@ -1,3 +1,5 @@
+use std::io::{BufRead, Cursor};
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -6,7 +8,12 @@ use crate::types::{Nzb, NzbFile, NzbMeta, NzbSegment};
 
 /// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
-    let mut reader = Reader::from_reader(xml);
+    parse_nzb_reader(Cursor::new(xml))
+}
+
+/// Parse an NZB XML document from a buffered reader.
+pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
+    let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();

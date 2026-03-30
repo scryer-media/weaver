@@ -36,11 +36,15 @@ pub struct RecoveredJob {
     pub nzb_path: PathBuf,
     pub output_dir: PathBuf,
     pub committed_segments: HashSet<SegmentId>,
+    pub file_progress: HashMap<u32, u64>,
     pub complete_files: HashSet<NzbFileId>,
     pub extracted_members: HashSet<String>,
     pub status: String,
     pub error: Option<String>,
     pub created_at: u64,
+    pub queued_repair_at_epoch_ms: Option<f64>,
+    pub queued_extract_at_epoch_ms: Option<f64>,
+    pub paused_resume_status: Option<String>,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
 }
@@ -51,6 +55,13 @@ pub struct ActivePar2File {
     pub filename: String,
     pub recovery_block_count: u32,
     pub promoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveFileProgress {
+    pub job_id: JobId,
+    pub file_index: u32,
+    pub contiguous_bytes_written: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,10 +147,36 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StateError> {
+        self.set_active_job_runtime(job_id, status, error, None, None, None)
+    }
+
+    /// Update the status and runtime restore fields of an active job together.
+    pub fn set_active_job_runtime(
+        &self,
+        job_id: JobId,
+        status: &str,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+    ) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE active_jobs SET status = ?1, error = ?2 WHERE job_id = ?3",
-            rusqlite::params![status, error, job_id.0 as i64],
+            "UPDATE active_jobs
+             SET status = ?1,
+                 error = ?2,
+                 queued_repair_at_epoch_ms = ?3,
+                 queued_extract_at_epoch_ms = ?4,
+                 paused_resume_status = ?5
+             WHERE job_id = ?6",
+            rusqlite::params![
+                status,
+                error,
+                queued_repair_at_epoch_ms,
+                queued_extract_at_epoch_ms,
+                paused_resume_status,
+                job_id.0 as i64
+            ],
         )
         .map_err(db_err)?;
         Ok(())
@@ -176,6 +213,51 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_file_progress_batch(
+        &self,
+        progress: &[ActiveFileProgress],
+    ) -> Result<(), StateError> {
+        if progress.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO active_file_progress
+                     (job_id, file_index, contiguous_bytes_written)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(job_id, file_index)
+                     DO UPDATE SET contiguous_bytes_written = MAX(
+                        active_file_progress.contiguous_bytes_written,
+                        excluded.contiguous_bytes_written
+                     )",
+                )
+                .map_err(db_err)?;
+            for entry in progress {
+                stmt.execute(rusqlite::params![
+                    entry.job_id.0 as i64,
+                    entry.file_index,
+                    entry.contiguous_bytes_written as i64,
+                ])
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_file_progress(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_file_progress WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Record a completed file.
     pub fn complete_file(
         &self,
@@ -191,6 +273,11 @@ impl Database {
             rusqlite::params![job_id.0 as i64, file_index, filename, md5.as_slice()],
         )
         .map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM active_file_progress WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -198,6 +285,11 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "DELETE FROM active_segments WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM active_file_progress WHERE job_id = ?1 AND file_index = ?2",
             rusqlite::params![job_id.0 as i64, file_index],
         )
         .map_err(db_err)?;
@@ -504,7 +596,9 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT job_id, nzb_path, output_dir, status, error,
-                            created_at, category, metadata
+                            created_at, queued_repair_at_epoch_ms,
+                            queued_extract_at_epoch_ms, paused_resume_status,
+                            category, metadata
                      FROM active_jobs",
                 )
                 .map_err(db_err)?;
@@ -516,8 +610,11 @@ impl Database {
                     let status: String = row.get(3)?;
                     let error: Option<String> = row.get(4)?;
                     let created_at = row.get::<_, i64>(5)? as u64;
-                    let category: Option<String> = row.get(6)?;
-                    let metadata_json: Option<String> = row.get(7)?;
+                    let queued_repair_at_epoch_ms: Option<f64> = row.get(6)?;
+                    let queued_extract_at_epoch_ms: Option<f64> = row.get(7)?;
+                    let paused_resume_status: Option<String> = row.get(8)?;
+                    let category: Option<String> = row.get(9)?;
+                    let metadata_json: Option<String> = row.get(10)?;
                     let metadata: Vec<(String, String)> = metadata_json
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default();
@@ -526,11 +623,15 @@ impl Database {
                         nzb_path: PathBuf::from(nzb_path),
                         output_dir: PathBuf::from(output_dir),
                         committed_segments: HashSet::new(),
+                        file_progress: HashMap::new(),
                         complete_files: HashSet::new(),
                         extracted_members: HashSet::new(),
                         status,
                         error,
                         created_at,
+                        queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms,
+                        paused_resume_status,
                         category,
                         metadata,
                     })
@@ -562,6 +663,31 @@ impl Database {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number,
                     });
+                }
+            }
+        }
+
+        // Load per-file progress floors.
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, file_index, contiguous_bytes_written
+                     FROM active_file_progress",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let job_id = JobId(row.get::<_, i64>(0)? as u64);
+                    let file_index: u32 = row.get(1)?;
+                    let contiguous_bytes_written = row.get::<_, i64>(2)? as u64;
+                    Ok((job_id, file_index, contiguous_bytes_written))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let (job_id, file_index, contiguous_bytes_written) = row.map_err(db_err)?;
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.file_progress
+                        .insert(file_index, contiguous_bytes_written);
                 }
             }
         }
@@ -668,6 +794,8 @@ impl Database {
         let id = job_id.0 as i64;
         tx.execute("DELETE FROM active_segments WHERE job_id = ?1", [id])
             .map_err(db_err)?;
+        tx.execute("DELETE FROM active_file_progress WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM active_files WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_par2 WHERE job_id = ?1", [id])
@@ -715,6 +843,8 @@ impl Database {
         let id = job_id.0 as i64;
         let tx = conn.unchecked_transaction().map_err(db_err)?;
         tx.execute("DELETE FROM active_segments WHERE job_id = ?1", [id])
+            .map_err(db_err)?;
+        tx.execute("DELETE FROM active_file_progress WHERE job_id = ?1", [id])
             .map_err(db_err)?;
         tx.execute("DELETE FROM active_files WHERE job_id = ?1", [id])
             .map_err(db_err)?;
@@ -1172,6 +1302,32 @@ mod tests {
     }
 
     #[test]
+    fn upsert_and_load_file_progress() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+        db.upsert_file_progress_batch(&[
+            ActiveFileProgress {
+                job_id: JobId(1),
+                file_index: 0,
+                contiguous_bytes_written: 8 * 1024 * 1024,
+            },
+            ActiveFileProgress {
+                job_id: JobId(1),
+                file_index: 1,
+                contiguous_bytes_written: 1024,
+            },
+        ])
+        .unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        assert_eq!(
+            jobs[&JobId(1)].file_progress.get(&0).copied(),
+            Some(8 * 1024 * 1024)
+        );
+        assert_eq!(jobs[&JobId(1)].file_progress.get(&1).copied(), Some(1024));
+    }
+
+    #[test]
     fn duplicate_segments_ignored() {
         let db = Database::open_in_memory().unwrap();
         db.create_active_job(&sample_job(1)).unwrap();
@@ -1187,6 +1343,12 @@ mod tests {
     fn complete_file_and_load() {
         let db = Database::open_in_memory().unwrap();
         db.create_active_job(&sample_job(1)).unwrap();
+        db.upsert_file_progress_batch(&[ActiveFileProgress {
+            job_id: JobId(1),
+            file_index: 0,
+            contiguous_bytes_written: 4096,
+        }])
+        .unwrap();
         db.complete_file(JobId(1), 0, "data.rar", &[0x11; 16])
             .unwrap();
         db.complete_file(JobId(1), 1, "data.r00", &[0x22; 16])
@@ -1194,6 +1356,7 @@ mod tests {
 
         let jobs = db.load_active_jobs().unwrap();
         assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
+        assert_eq!(jobs[&JobId(1)].file_progress.get(&0), None);
     }
 
     #[test]
@@ -1205,6 +1368,31 @@ mod tests {
 
         let jobs = db.load_active_jobs().unwrap();
         assert_eq!(jobs[&JobId(1)].status, "verifying");
+    }
+
+    #[test]
+    fn set_runtime_state_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+        db.set_active_job_runtime(
+            JobId(1),
+            "paused",
+            None,
+            Some(12_345.0),
+            Some(67_890.0),
+            Some("queued_extract"),
+        )
+        .unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        let recovered = &jobs[&JobId(1)];
+        assert_eq!(recovered.status, "paused");
+        assert_eq!(recovered.queued_repair_at_epoch_ms, Some(12_345.0));
+        assert_eq!(recovered.queued_extract_at_epoch_ms, Some(67_890.0));
+        assert_eq!(
+            recovered.paused_resume_status.as_deref(),
+            Some("queued_extract")
+        );
     }
 
     #[test]
@@ -1250,12 +1438,35 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.create_active_job(&sample_job(1)).unwrap();
         db.commit_segments(&sample_segments(1, 5)).unwrap();
+        db.upsert_file_progress_batch(&[ActiveFileProgress {
+            job_id: JobId(1),
+            file_index: 0,
+            contiguous_bytes_written: 4096,
+        }])
+        .unwrap();
         db.complete_file(JobId(1), 0, "f.rar", &[0; 16]).unwrap();
 
         db.delete_active_job(JobId(1)).unwrap();
 
         let jobs = db.load_active_jobs().unwrap();
         assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn mark_file_incomplete_clears_progress_rows() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_job(1)).unwrap();
+        db.upsert_file_progress_batch(&[ActiveFileProgress {
+            job_id: JobId(1),
+            file_index: 0,
+            contiguous_bytes_written: 1234,
+        }])
+        .unwrap();
+
+        db.mark_file_incomplete(JobId(1), 0).unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        assert!(jobs[&JobId(1)].file_progress.is_empty());
     }
 
     #[test]

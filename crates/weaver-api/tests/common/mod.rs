@@ -91,6 +91,12 @@ impl TestHarness {
         self.schema.execute(request).await
     }
 
+    /// Execute a GraphQL query/mutation as a specific caller scope.
+    pub async fn execute_as(&self, query: &str, scope: CallerScope) -> Response {
+        let request = Request::new(query).data(scope);
+        self.schema.execute(request).await
+    }
+
     /// Execute a GraphQL query/mutation with variables.
     #[allow(dead_code)]
     pub async fn execute_with_variables(&self, query: &str, variables: Variables) -> Response {
@@ -131,15 +137,18 @@ impl TestHarness {
                 .iter()
                 .map(|(k, v)| format!(r#"{{ key: "{k}", value: "{v}" }}"#))
                 .collect();
-            format!(", metadata: [{}]", entries.join(", "))
+            format!(", attributes: [{}]", entries.join(", "))
         };
 
         let query = format!(
             r#"mutation {{
-                submitNzb(source: {{ nzbBase64: "{nzb_b64}" }}, filename: "{name}.nzb"{cat_arg}{pwd_arg}{meta_arg}) {{
-                    id
-                    name
-                    status
+                submitNzb(input: {{ nzbBase64: "{nzb_b64}", filename: "{name}.nzb"{cat_arg}{pwd_arg}{meta_arg} }}) {{
+                    accepted
+                    item {{
+                        id
+                        name
+                        state
+                    }}
                 }}
             }}"#
         );
@@ -147,7 +156,10 @@ impl TestHarness {
         let resp = self.execute(&query).await;
         assert_no_errors(&resp);
         let data = resp.data.into_json().unwrap();
-        data["submitNzb"]["id"].as_u64().expect("missing job id")
+        assert!(data["submitNzb"]["accepted"].as_bool().unwrap_or(false));
+        data["submitNzb"]["item"]["id"]
+            .as_u64()
+            .expect("missing queue item id")
     }
 }
 
@@ -261,6 +273,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         paused_resume_status: None,
+                        restored_download_floor_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -358,6 +371,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         paused_resume_status: None,
+                        restored_download_floor_bytes: 0,
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));

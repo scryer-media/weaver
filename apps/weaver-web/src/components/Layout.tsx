@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
 import {
-  BarChart3,
   Clock3,
   FolderUp,
   ListOrdered,
@@ -25,7 +24,11 @@ import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { LiveDataContext } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
-import type { JobData } from "@/lib/job-types";
+import {
+  normalizeJobData,
+  type GraphqlJobData,
+  type JobData,
+} from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/SettingsLayout";
@@ -41,27 +44,89 @@ import {
 const navItems = [
   { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
-  { to: "/metrics", labelKey: "nav.metrics", icon: BarChart3 },
   { to: "/logs", labelKey: "nav.logs", icon: ScrollText },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
+interface RawSnapshot {
+  jobs: GraphqlJobData[];
+  metrics: { currentDownloadSpeed: number };
+  globalState: {
+    isPaused: boolean;
+    downloadBlock: {
+      kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP";
+      capEnabled: boolean;
+      period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
+      usedBytes: number;
+      limitBytes: number;
+      remainingBytes: number;
+      reservedBytes: number;
+      windowStartsAtEpochMs?: number | null;
+      windowEndsAtEpochMs?: number | null;
+      timezoneName: string;
+      scheduledSpeedLimit: number;
+    };
+  };
+}
+
 interface Snapshot {
   jobs: JobData[];
   metrics: { currentDownloadSpeed: number };
-  isPaused: boolean;
-  downloadBlock: {
-    kind: "NONE" | "MANUAL_PAUSE" | "ISP_CAP";
-    capEnabled: boolean;
-    period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
-    usedBytes: number;
-    limitBytes: number;
-    remainingBytes: number;
-    reservedBytes: number;
-    windowStartsAtEpochMs?: number | null;
-    windowEndsAtEpochMs?: number | null;
-    timezoneName: string;
-    scheduledSpeedLimit: number;
+  globalState: {
+    isPaused: boolean;
+    downloadBlock: {
+      kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP";
+      capEnabled: boolean;
+      period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
+      usedBytes: number;
+      limitBytes: number;
+      remainingBytes: number;
+      reservedBytes: number;
+      windowStartsAtEpochMs?: number | null;
+      windowEndsAtEpochMs?: number | null;
+      timezoneName: string;
+      scheduledSpeedLimit: number;
+    };
+  };
+}
+
+interface QueueSnapshotPayload {
+  items: GraphqlJobData[];
+  summary: { currentDownloadSpeed: number };
+  globalState: Snapshot["globalState"];
+}
+
+function mapSnapshot(snapshot: RawSnapshot | undefined): Snapshot | undefined {
+  if (!snapshot) {
+    return undefined;
+  }
+
+  return {
+    ...snapshot,
+    jobs: (snapshot.jobs ?? []).map((job) => normalizeJobData(job)),
+  };
+}
+
+function mapQueueSnapshot(snapshot: QueueSnapshotPayload | undefined): RawSnapshot {
+  return {
+    jobs: snapshot?.items ?? [],
+    metrics: snapshot?.summary ?? { currentDownloadSpeed: 0 },
+    globalState: snapshot?.globalState ?? {
+      isPaused: false,
+      downloadBlock: {
+        kind: "NONE",
+        capEnabled: false,
+        period: null,
+        usedBytes: 0,
+        limitBytes: 0,
+        remainingBytes: 0,
+        reservedBytes: 0,
+        windowStartsAtEpochMs: null,
+        windowEndsAtEpochMs: null,
+        timezoneName: "",
+        scheduledSpeedLimit: 0,
+      },
+    },
   };
 }
 
@@ -153,18 +218,18 @@ export function Layout() {
   const location = useLocation();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [polledSnapshot, setPolledSnapshot] = useState<Snapshot | undefined>();
+  const [polledSnapshot, setPolledSnapshot] = useState<RawSnapshot | undefined>();
   const connectionState = useGraphqlConnectionState();
 
-  const [{ data: queryData }] = useQuery<Snapshot>({
+  const [{ data: queryData }] = useQuery<RawSnapshot>({
     query: JOBS_PAGE_QUERY,
   });
   const [{ data: versionData }] = useQuery<{ version: string }>({
     query: VERSION_QUERY,
   });
   const handleSubscription = useCallback(
-    (_prev: Snapshot | undefined, response: { jobUpdates: Snapshot }) =>
-      response.jobUpdates,
+    (_prev: RawSnapshot | undefined, response: { queueSnapshots: QueueSnapshotPayload }) =>
+      mapQueueSnapshot(response.queueSnapshots),
     [],
   );
 
@@ -173,7 +238,7 @@ export function Layout() {
     handleSubscription,
   );
 
-  const reconnectPolling = useReconnectPolling<Snapshot>({
+  const reconnectPolling = useReconnectPolling<RawSnapshot>({
     enabled: connectionState.status === "disconnected",
     query: JOBS_PAGE_QUERY,
     onData: (nextSnapshot) => {
@@ -188,13 +253,16 @@ export function Layout() {
     }
   }, [connectionState.status]);
 
-  const snapshot = data ?? polledSnapshot ?? queryData;
+  const snapshot = useMemo(
+    () => mapSnapshot(data ?? polledSnapshot ?? queryData),
+    [data, polledSnapshot, queryData],
+  );
   const liveData = useMemo(
     () => ({
       jobs: snapshot?.jobs ?? [],
       speed: snapshot?.metrics?.currentDownloadSpeed ?? 0,
-      isPaused: snapshot?.isPaused ?? false,
-      downloadBlock: snapshot?.downloadBlock ?? {
+      isPaused: snapshot?.globalState?.isPaused ?? false,
+      downloadBlock: snapshot?.globalState?.downloadBlock ?? {
         kind: "NONE",
         capEnabled: false,
         period: null,

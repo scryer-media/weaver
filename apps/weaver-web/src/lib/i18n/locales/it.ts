@@ -86,6 +86,7 @@ const it: LocaleDictionary = {
   "upload.sharedSettingsHint": "Password, categoria e priorità verranno applicati a ogni NZB selezionato.",
   "upload.batchFailure": "Caricamento fallito per {{name}}.",
   "upload.partialFailure": "Inviati {{submitted}} di {{total}} file prima del fallimento su {{name}}.",
+  "upload.rejected": "Il caricamento è stato rifiutato dal server.",
 
   // Jobs page
   "jobs.title": "Coda",
@@ -387,6 +388,7 @@ const it: LocaleDictionary = {
   "settings.apiKeyNamePlaceholder": "es.: Scryer",
   "settings.apiKeyScope": "Ambito",
   "settings.scopeIntegration": "Integrazione",
+  "settings.scopeRead": "Lettura",
   "settings.scopeAdmin": "Admin",
   "settings.apiKeyCreated": "Chiave API Creata",
   "settings.apiKeyCopyWarning": "Copia questa chiave ora. Non verrà mostrata di nuovo.",

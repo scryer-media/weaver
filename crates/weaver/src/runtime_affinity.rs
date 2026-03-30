@@ -92,8 +92,8 @@ fn detect_preferred_cpus() -> Vec<usize> {
         };
 
         let topology = cpu_dir.join("topology");
-        let package_id = read_trimmed(&topology.join("physical_package_id"))
-            .unwrap_or_else(|| "0".to_string());
+        let package_id =
+            read_trimmed(&topology.join("physical_package_id")).unwrap_or_else(|| "0".to_string());
         let core_id = read_trimmed(&topology.join("core_id")).unwrap_or_else(|| cpu.to_string());
 
         infos.push(CpuInfo {
@@ -112,7 +112,10 @@ fn detect_preferred_cpus() -> Vec<usize> {
     let mut seen_cores = HashSet::new();
     let mut selected = Vec::new();
 
-    for info in infos.into_iter().filter(|info| info.max_freq_khz == max_freq_khz) {
+    for info in infos
+        .into_iter()
+        .filter(|info| info.max_freq_khz == max_freq_khz)
+    {
         let core_key = format!("{}:{}", info.package_id, info.core_id);
         if !seen_cores.insert(core_key) {
             continue;

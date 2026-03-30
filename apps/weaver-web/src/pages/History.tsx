@@ -23,32 +23,46 @@ import {
   DELETE_ALL_HISTORY_MUTATION,
   DELETE_HISTORY_BATCH_MUTATION,
   DELETE_HISTORY_MUTATION,
-  EVENTS_SUBSCRIPTION,
   HISTORY_JOBS_COUNT_QUERY,
+  HISTORY_FACADE_EVENTS_SUBSCRIPTION,
   HISTORY_JOBS_QUERY,
 } from "@/graphql/queries";
+import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 
-type HistoryJob = {
-  id: number;
-  name: string;
-  displayTitle: string;
-  originalTitle: string;
-  status: string;
-  totalBytes: number;
-  downloadedBytes: number;
-  failedBytes: number;
-  health: number;
-  hasPassword: boolean;
-  category: string | null;
-  outputDir: string | null;
-  createdAt: number | null;
-};
+type HistoryJob = JobData;
 
 type HistoryFilter = "all" | "success" | "failure";
 
 const PAGE_SIZE = 50;
+
+type FacadeHistoryJob = GraphqlJobData;
+
+type HistoryCountResponse = {
+  all: number;
+  success: number;
+  failure: number;
+};
+
+function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
+  return normalizeJobData(job);
+}
+
+function encodeOffsetCursor(offset: number): string {
+  return btoa(`off:${offset}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function historyFilterVariables(filter: HistoryFilter) {
+  switch (filter) {
+    case "success":
+      return { states: ["COMPLETED"] };
+    case "failure":
+      return { states: ["FAILED"] };
+    default:
+      return null;
+  }
+}
 
 export function History() {
   const t = useTranslate();
@@ -73,29 +87,50 @@ export function History() {
   const desktopSentinelRef = useRef<HTMLDivElement>(null);
   const mobileSentinelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const queryFilter = useMemo(() => historyFilterVariables(filter), [filter]);
 
   // Initial page + count
   const [{ data: initialData }] = useQuery({
     query: HISTORY_JOBS_QUERY,
-    variables: { limit: PAGE_SIZE, offset: 0 },
+    variables: { first: PAGE_SIZE, after: null, filter: queryFilter },
   });
-  const [{ data: countData }, refetchCount] = useQuery({
+  const [{ data: countData }, refetchCount] = useQuery<{ all: number; success: number; failure: number }>({
     query: HISTORY_JOBS_COUNT_QUERY,
   });
 
   useEffect(() => {
-    if (initialData?.jobs) {
-      setJobs(initialData.jobs);
-      setHasMore(initialData.jobs.length >= PAGE_SIZE);
-      setInitialFetching(false);
-    }
-  }, [initialData?.jobs]);
+    setJobs([]);
+    setTotalCount(0);
+    setHasMore(true);
+    setLoadingMore(false);
+    setInitialFetching(true);
+    setSelectedIds(new Set());
+  }, [filter]);
 
   useEffect(() => {
-    if (countData?.jobCount != null) {
-      setTotalCount(countData.jobCount);
+    if (initialData?.historyItems) {
+      const nextJobs = (initialData.historyItems as FacadeHistoryJob[]).map(normalizeHistoryJob);
+      setJobs(nextJobs);
+      setHasMore(nextJobs.length >= PAGE_SIZE);
+      setInitialFetching(false);
     }
-  }, [countData?.jobCount]);
+  }, [initialData?.historyItems]);
+
+  useEffect(() => {
+    if (!countData) {
+      return;
+    }
+    const counts = countData as HistoryCountResponse;
+    if (filter === "success") {
+      setTotalCount(counts.success ?? 0);
+      return;
+    }
+    if (filter === "failure") {
+      setTotalCount(counts.failure ?? 0);
+      return;
+    }
+    setTotalCount(counts.all ?? 0);
+  }, [countData, filter]);
 
   // Load next page
   const loadMore = useCallback(async () => {
@@ -103,9 +138,14 @@ export function History() {
     setLoadingMore(true);
     try {
       const result = await client
-        .query(HISTORY_JOBS_QUERY, { limit: PAGE_SIZE, offset: jobs.length })
+        .query(HISTORY_JOBS_QUERY, {
+          first: PAGE_SIZE,
+          after: encodeOffsetCursor(jobs.length),
+          filter: queryFilter,
+        })
         .toPromise();
-      const nextJobs: HistoryJob[] = result.data?.jobs ?? [];
+      const nextJobs: HistoryJob[] = ((result.data?.historyItems ?? []) as FacadeHistoryJob[])
+        .map(normalizeHistoryJob);
       if (nextJobs.length > 0) {
         setJobs((prev) => {
           const existingIds = new Set(prev.map((j) => j.id));
@@ -117,7 +157,7 @@ export function History() {
     } finally {
       setLoadingMore(false);
     }
-  }, [loadingMore, hasMore, jobs.length, client]);
+  }, [loadingMore, hasMore, jobs.length, client, queryFilter]);
 
   // Desktop: sentinel is inside the scrollable Table container
   useEffect(() => {
@@ -147,14 +187,16 @@ export function History() {
   // Delete mutations update local state
   useEffect(() => {
     if (deleteState.data?.deleteHistory) {
-      setJobs(deleteState.data.deleteHistory);
+      setJobs((deleteState.data.deleteHistory as FacadeHistoryJob[]).map(normalizeHistoryJob));
       void refetchCount();
     }
   }, [deleteState.data, refetchCount]);
 
   useEffect(() => {
     if (deleteBatchState.data?.deleteHistoryBatch) {
-      setJobs(deleteBatchState.data.deleteHistoryBatch);
+      setJobs(
+        (deleteBatchState.data.deleteHistoryBatch as FacadeHistoryJob[]).map(normalizeHistoryJob),
+      );
       setSelectedIds(new Set());
       void refetchCount();
     }
@@ -162,7 +204,9 @@ export function History() {
 
   useEffect(() => {
     if (deleteAllState.data?.deleteAllHistory) {
-      setJobs(deleteAllState.data.deleteAllHistory);
+      setJobs(
+        (deleteAllState.data.deleteAllHistory as FacadeHistoryJob[]).map(normalizeHistoryJob),
+      );
       setSelectedIds(new Set());
       setTotalCount(0);
       setHasMore(false);
@@ -171,17 +215,22 @@ export function History() {
 
   // Prepend newly completed/failed jobs from event stream
   const handleSubscription = useCallback(
-    (_prev: unknown, response: { events: { kind: string; jobId: number | null } }) => {
-      const event = response.events;
+    (
+      _prev: unknown,
+      response: { queueEvents: { kind: string; itemId: number | null; state: string | null } },
+    ) => {
+      const event = response.queueEvents;
       if (
-        (event.kind === "JOB_COMPLETED" || event.kind === "JOB_FAILED") &&
-        event.jobId != null
+        (event.kind === "ITEM_COMPLETED"
+          || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED")) &&
+        event.itemId != null
       ) {
         void client
-          .query(HISTORY_JOBS_QUERY, { limit: 1, offset: 0 })
+          .query(HISTORY_JOBS_QUERY, { first: 1, after: null, filter: queryFilter })
           .toPromise()
           .then((result) => {
-            const newJobs: HistoryJob[] = result.data?.jobs ?? [];
+            const newJobs: HistoryJob[] = ((result.data?.historyItems ?? []) as FacadeHistoryJob[])
+              .map(normalizeHistoryJob);
             if (newJobs.length > 0) {
               setJobs((prev) => {
                 const existingIds = new Set(prev.map((j) => j.id));
@@ -194,17 +243,17 @@ export function History() {
       }
       return [];
     },
-    [client],
+    [client, queryFilter],
   );
-  useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
+  useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handleSubscription);
 
   const counts = useMemo(
     () => ({
-      all: totalCount,
-      success: jobs.filter((job) => job.status === "COMPLETE").length,
-      failure: jobs.filter((job) => job.status === "FAILED").length,
+      all: (countData as HistoryCountResponse | undefined)?.all ?? totalCount,
+      success: (countData as HistoryCountResponse | undefined)?.success ?? 0,
+      failure: (countData as HistoryCountResponse | undefined)?.failure ?? 0,
     }),
-    [jobs, totalCount],
+    [countData, totalCount],
   );
   const sortedJobs = useMemo(
     () =>
@@ -230,12 +279,6 @@ export function History() {
   const filteredJobs = useMemo(
     () =>
       sortedJobs.filter((job) => {
-        if (filter === "success" && job.status !== "COMPLETE") {
-          return false;
-        }
-        if (filter === "failure" && job.status !== "FAILED") {
-          return false;
-        }
         if (!normalizedSearch) {
           return true;
         }
@@ -244,7 +287,7 @@ export function History() {
           .toLowerCase()
           .includes(normalizedSearch);
       }),
-    [filter, normalizedSearch, sortedJobs],
+    [normalizedSearch, sortedJobs],
   );
 
   const filteredIds = useMemo(() => new Set(filteredJobs.map((j) => j.id)), [filteredJobs]);
@@ -435,9 +478,9 @@ export function History() {
                       </TableCell>
                       <TableCell
                         className="px-2 py-1.5 text-[10px] text-muted-foreground"
-                        title={formatHistoryTimestamp(job.createdAt)}
+                        title={formatHistoryTimestamp(job.createdAt ?? null)}
                       >
-                        {formatHistoryTimestamp(job.createdAt, timestampFormatter)}
+                        {formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}
                       </TableCell>
                       <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
                         {(job.health / 10).toFixed(1)}%
@@ -499,7 +542,7 @@ export function History() {
                         <JobStatusBadge status={job.status} compact />
                       </div>
                       <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                        <span>{formatHistoryTimestamp(job.createdAt, timestampFormatter)}</span>
+                        <span>{formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}</span>
                         <span>{formatBytes(job.totalBytes)}</span>
                         <span>Health {(job.health / 10).toFixed(1)}%</span>
                         {job.category ? <span>{job.category}</span> : null}

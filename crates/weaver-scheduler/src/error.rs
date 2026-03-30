@@ -9,6 +9,12 @@ pub enum SchedulerError {
     #[error("job {0} already exists")]
     JobExists(JobId),
 
+    #[error("{0}")]
+    Conflict(String),
+
+    #[error("{0}")]
+    InvalidInput(String),
+
     #[error("assembly error: {0}")]
     Assembly(#[from] weaver_assembly::AssemblyError),
 
@@ -20,6 +26,9 @@ pub enum SchedulerError {
 
     #[error("channel closed")]
     ChannelClosed,
+
+    #[error("{0}")]
+    Internal(String),
 
     #[error("{0}")]
     Other(String),

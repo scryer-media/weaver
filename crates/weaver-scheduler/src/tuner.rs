@@ -1,3 +1,5 @@
+use std::env;
+
 use serde::{Deserialize, Serialize};
 
 use weaver_core::system::SystemProfile;
@@ -8,6 +10,7 @@ use crate::metrics::MetricsSnapshot;
 /// bottleneck and we can use all configured connections. Below this, we
 /// throttle to avoid disk contention.
 const FAST_STORAGE_IOPS: f64 = 1_000.0;
+const MAX_CONCURRENT_EXTRACTIONS_ENV: &str = "WEAVER_MAX_CONCURRENT_EXTRACTIONS";
 
 /// Runtime-tunable parameters. The tuner adjusts these based on observed performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,7 @@ pub struct TunedParameters {
 pub struct RuntimeTuner {
     profile: SystemProfile,
     current: TunedParameters,
+    max_concurrent_extractions_override: Option<usize>,
     /// Total connections across all configured servers (hard ceiling).
     total_connections: usize,
     /// Number of consecutive snapshots where decode_pending > max_decode_queue.
@@ -54,6 +58,8 @@ impl RuntimeTuner {
     /// Create with an explicit connection limit (from config).
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
         let cores = profile.cpu.physical_cores.max(1);
+        let max_concurrent_extractions_override =
+            parse_max_concurrent_extractions_override(env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref());
 
         // Start with all configured connections — the adaptive tuner will
         // reduce if decode pressure builds or disk can't keep up. Never cap
@@ -78,6 +84,7 @@ impl RuntimeTuner {
         Self {
             profile,
             current,
+            max_concurrent_extractions_override,
             total_connections,
             decode_pressure_streak: 0,
             download_idle_streak: 0,
@@ -225,6 +232,9 @@ impl RuntimeTuner {
     /// HDD: seeking between concurrent read positions kills throughput (1-2).
     /// Network/Unknown: moderate (2).
     pub fn max_concurrent_extractions(&self) -> usize {
+        if let Some(override_value) = self.max_concurrent_extractions_override {
+            return override_value;
+        }
         if self.is_fast_storage() {
             // Fast storage: bottleneck is CPU decompression, not I/O.
             let cores = self.profile.cpu.physical_cores;
@@ -243,6 +253,17 @@ impl RuntimeTuner {
     /// Current bandwidth estimate (bytes/sec, exponential moving average).
     pub fn bandwidth_ema(&self) -> f64 {
         self.bandwidth_ema
+    }
+}
+
+fn parse_max_concurrent_extractions_override(raw: Option<&str>) -> Option<usize> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<usize>() {
+        Ok(parsed) if parsed >= 1 => Some(parsed),
+        _ => None,
     }
 }
 
@@ -425,6 +446,28 @@ mod tests {
         tuner.adjust(&m);
         // HDD: reduced to baseline/4 = 20/4 = 5.
         assert_eq!(tuner.params().max_concurrent_downloads, 5);
+    }
+
+    #[test]
+    fn parse_max_concurrent_extractions_override_accepts_positive_values() {
+        assert_eq!(parse_max_concurrent_extractions_override(Some("1")), Some(1));
+        assert_eq!(parse_max_concurrent_extractions_override(Some("6")), Some(6));
+    }
+
+    #[test]
+    fn parse_max_concurrent_extractions_override_rejects_invalid_values() {
+        assert_eq!(parse_max_concurrent_extractions_override(None), None);
+        assert_eq!(parse_max_concurrent_extractions_override(Some("")), None);
+        assert_eq!(parse_max_concurrent_extractions_override(Some("0")), None);
+        assert_eq!(parse_max_concurrent_extractions_override(Some("-1")), None);
+        assert_eq!(parse_max_concurrent_extractions_override(Some("nope")), None);
+    }
+
+    #[test]
+    fn max_concurrent_extractions_honors_override() {
+        let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
+        tuner.max_concurrent_extractions_override = Some(1);
+        assert_eq!(tuner.max_concurrent_extractions(), 1);
     }
 
     #[test]

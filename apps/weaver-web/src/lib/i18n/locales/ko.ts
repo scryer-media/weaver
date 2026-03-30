@@ -86,6 +86,7 @@ const ko: LocaleDictionary = {
   "upload.sharedSettingsHint": "비밀번호, 카테고리, 우선순위가 선택된 모든 NZB에 적용됩니다.",
   "upload.batchFailure": "{{name}} 업로드 실패.",
   "upload.partialFailure": "{{name}}에서 실패하기 전 {{total}}개 중 {{submitted}}개 파일 제출됨.",
+  "upload.rejected": "업로드가 서버에서 거부되었습니다.",
 
   // Jobs page
   "jobs.title": "대기열",
@@ -387,6 +388,7 @@ const ko: LocaleDictionary = {
   "settings.apiKeyNamePlaceholder": "예: Scryer",
   "settings.apiKeyScope": "범위",
   "settings.scopeIntegration": "통합",
+  "settings.scopeRead": "읽기",
   "settings.scopeAdmin": "관리자",
   "settings.apiKeyCreated": "API 키 생성됨",
   "settings.apiKeyCopyWarning": "이 키를 지금 복사하세요. 다시 표시되지 않습니다.",

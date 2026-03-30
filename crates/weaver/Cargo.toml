@@ -50,3 +50,4 @@ bzip2 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+tower = { workspace = true }

@@ -78,10 +78,12 @@ export function GeneralSettingsPage() {
   }, [updateState.data, reexecuteQuery]);
 
   const persistSettings = async () => {
+    const nextIntermediateDir = intermediateDir.trim();
+    const nextCompleteDir = completeDir.trim();
     await updateSettings({
       input: {
-        intermediateDir: intermediateDir || null,
-        completeDir: completeDir || null,
+        intermediateDir: nextIntermediateDir ? nextIntermediateDir : null,
+        completeDir: nextCompleteDir ? nextCompleteDir : null,
         cleanupAfterExtract: cleanup,
         maxDownloadSpeed: speedValue,
         maxRetries,

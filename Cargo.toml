@@ -28,7 +28,7 @@ thiserror = "2.0"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
-async-graphql = "7.0"
+async-graphql = { version = "7.0", features = ["chrono"] }
 crc32fast = "1.4"
 md-5 = "0.10"
 blake2 = "0.10"
@@ -56,7 +56,8 @@ rmp-serde = "1.3"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "compression-zstd", "decompression-gzip", "decompression-br", "decompression-zstd"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "compression-zstd", "compression-deflate", "decompression-gzip", "decompression-br", "decompression-zstd", "decompression-deflate"] }
+tower = "0.5"
 rust-embed = "8"
 mime_guess = "2"
 async-graphql-axum = "7.0"

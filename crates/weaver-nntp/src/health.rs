@@ -163,24 +163,54 @@ impl ServerHealth {
         }
     }
 
-    /// Record a short-lived transport or capacity failure without advancing
-    /// the longer-lived degraded/disabled thresholds.
+    /// Record a short-lived transport or capacity failure.
+    ///
+    /// Capacity failures only trigger a brief cooldown. Transport failures also
+    /// advance the longer-lived degraded/disabled thresholds so a flaky primary
+    /// eventually yields to backup servers instead of re-entering immediately forever.
     pub fn record_cooldown(&mut self, reason: CooldownReason) {
         self.failure_count += 1;
 
-        let resume_degraded = match self.state {
-            ServerState::Degraded {
-                consecutive_failures,
-            } => Some(consecutive_failures),
-            ServerState::CoolingDown {
-                resume_degraded, ..
-            } => resume_degraded,
-            _ => None,
-        };
+        let (duration, resume_degraded) = match reason {
+            // Transport problems should still participate in the longer-lived
+            // degraded/disabled state machine so a server that repeatedly
+            // times out does not keep hopping in and out of short cooldowns
+            // forever while remaining the preferred primary.
+            CooldownReason::Transport => {
+                self.consecutive_failures += 1;
 
-        let duration = match reason {
-            CooldownReason::Transport => self.config.transient_cooldown,
-            CooldownReason::Capacity => self.config.capacity_cooldown,
+                if self.consecutive_failures >= self.config.disable_threshold {
+                    let backoff = self.compute_backoff();
+                    self.disable_count += 1;
+                    self.state = ServerState::Disabled {
+                        until: Instant::now() + backoff,
+                        reason: DisableReason::ConsecutiveFailures,
+                    };
+                    return;
+                }
+
+                let resume_degraded = if self.consecutive_failures >= self.config.degraded_threshold
+                {
+                    Some(self.consecutive_failures)
+                } else {
+                    None
+                };
+
+                (self.config.transient_cooldown, resume_degraded)
+            }
+            CooldownReason::Capacity => {
+                let resume_degraded = match self.state {
+                    ServerState::Degraded {
+                        consecutive_failures,
+                    } => Some(consecutive_failures),
+                    ServerState::CoolingDown {
+                        resume_degraded, ..
+                    } => resume_degraded,
+                    _ => None,
+                };
+
+                (self.config.capacity_cooldown, resume_degraded)
+            }
         };
 
         self.state = ServerState::CoolingDown {
@@ -560,7 +590,7 @@ mod tests {
 
         assert_eq!(*health.state(), ServerState::Healthy);
         assert!(health.is_available());
-        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.consecutive_failures, 1);
     }
 
     #[test]
@@ -589,6 +619,44 @@ mod tests {
             }
         ));
         assert_eq!(health.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn repeated_transport_cooldowns_eventually_disable_server() {
+        let mut health = ServerHealth::new(test_config());
+
+        for expected_failures in 1..test_config().disable_threshold {
+            health.record_cooldown(CooldownReason::Transport);
+            assert!(matches!(
+                health.state(),
+                ServerState::CoolingDown {
+                    reason: CooldownReason::Transport,
+                    ..
+                }
+            ));
+            assert_eq!(health.consecutive_failures, expected_failures);
+
+            std::thread::sleep(Duration::from_millis(60));
+            health.check_reenable();
+        }
+
+        assert!(matches!(
+            health.state(),
+            ServerState::Degraded {
+                consecutive_failures: 4
+            }
+        ));
+
+        health.record_cooldown(CooldownReason::Transport);
+        assert!(matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::ConsecutiveFailures,
+                ..
+            }
+        ));
+        assert!(!health.is_available());
+        assert_eq!(health.consecutive_failures, test_config().disable_threshold);
     }
 
     #[test]

@@ -106,6 +106,9 @@ pub struct JobState {
     pub working_dir: PathBuf,
     /// Bytes downloaded for this specific job.
     pub downloaded_bytes: u64,
+    /// Conservative restored progress floor from persisted file-write checkpoints.
+    /// This is only used for reporting after restart and must not affect scheduling.
+    pub restored_download_floor_bytes: u64,
     /// Bytes from segments that are permanently lost (430 / max retries exhausted).
     pub failed_bytes: u64,
     /// Total bytes of PAR2 recovery files, cached from spec at job creation.
