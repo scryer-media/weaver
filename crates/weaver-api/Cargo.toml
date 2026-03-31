@@ -21,6 +21,8 @@ tracing = { workspace = true }
 async-graphql = { workspace = true }
 chrono = { workspace = true }
 zstd = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 argon2 = { workspace = true }

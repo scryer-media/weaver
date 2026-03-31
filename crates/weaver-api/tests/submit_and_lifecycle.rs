@@ -24,6 +24,45 @@ fn minimal_nzb(name: &str) -> String {
     )
 }
 
+fn submit_upload(
+    h: &TestHarness,
+    upload: UploadValue,
+) -> impl std::future::Future<Output = async_graphql::Response> + '_ {
+    let mut request = Request::new(
+        r#"
+        mutation Submit($input: SubmitNzbInput!) {
+            submitNzb(input: $input) {
+                accepted
+                item {
+                    id
+                    state
+                }
+            }
+        }
+        "#,
+    )
+    .data(CallerScope::Local)
+    .variables(Variables::from_json(json!({
+        "input": {
+            "nzbUpload": null
+        }
+    })));
+    request.set_upload("variables.input.nzbUpload", upload);
+    h.schema.execute(request)
+}
+
+fn assert_upload_accepts(encoded_bytes: &[u8], filename: &str, content_type: &str) -> UploadValue {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(encoded_bytes).unwrap();
+    file.flush().unwrap();
+
+    UploadValue {
+        filename: filename.to_string(),
+        content_type: Some(content_type.to_string()),
+        content: file.reopen().unwrap(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NZB Submission
 // ---------------------------------------------------------------------------
@@ -61,39 +100,126 @@ async fn submit_valid_nzb() {
 #[tokio::test]
 async fn submit_with_upload() {
     let h = TestHarness::new().await;
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(minimal_nzb("upload-test").as_bytes())
+    let upload = assert_upload_accepts(
+        minimal_nzb("upload-test").as_bytes(),
+        "upload-test.nzb",
+        "application/x-nzb",
+    );
+    let resp = submit_upload(&h, upload).await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert!(data["submitNzb"]["item"]["id"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
+    );
+}
+
+#[tokio::test]
+async fn submit_with_zstd_upload() {
+    let h = TestHarness::new().await;
+    let compressed = zstd::bulk::compress(minimal_nzb("upload-zstd-test").as_bytes(), 3).unwrap();
+    let upload = assert_upload_accepts(&compressed, "upload-zstd-test.nzb.zst", "application/zstd");
+    let resp = submit_upload(&h, upload).await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert!(data["submitNzb"]["item"]["id"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
+    );
+}
+
+#[tokio::test]
+async fn submit_with_zstd_content_type_without_zst_filename() {
+    let h = TestHarness::new().await;
+    let compressed =
+        zstd::bulk::compress(minimal_nzb("upload-zstd-content-type").as_bytes(), 3).unwrap();
+    let upload = assert_upload_accepts(
+        &compressed,
+        "upload-zstd-content-type.nzb",
+        "application/zstd",
+    );
+    let resp = submit_upload(&h, upload).await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert!(data["submitNzb"]["item"]["id"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
+    );
+}
+
+#[tokio::test]
+async fn submit_with_gzip_upload() {
+    let h = TestHarness::new().await;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(minimal_nzb("upload-gzip-test").as_bytes())
         .unwrap();
-    file.flush().unwrap();
+    let compressed = encoder.finish().unwrap();
+    let upload = assert_upload_accepts(&compressed, "upload-gzip-test.nzb.gz", "application/gzip");
+    let resp = submit_upload(&h, upload).await;
 
-    let upload = UploadValue {
-        filename: "upload-test.nzb".to_string(),
-        content_type: Some("application/x-nzb".to_string()),
-        content: file.reopen().unwrap(),
-    };
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert!(data["submitNzb"]["item"]["id"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
+    );
+}
 
-    let mut request = Request::new(
-        r#"
-        mutation Submit($input: SubmitNzbInput!) {
-            submitNzb(input: $input) {
-                accepted
-                item {
-                    id
-                    state
-                }
-            }
-        }
-        "#,
-    )
-    .data(CallerScope::Local)
-    .variables(Variables::from_json(json!({
-        "input": {
-            "nzbUpload": null
-        }
-    })));
-    request.set_upload("variables.input.nzbUpload", upload);
+#[tokio::test]
+async fn submit_with_brotli_upload() {
+    let h = TestHarness::new().await;
+    let mut compressed = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::new(&mut compressed, 64 * 1024, 5, 22);
+        encoder
+            .write_all(minimal_nzb("upload-brotli-test").as_bytes())
+            .unwrap();
+        encoder.flush().unwrap();
+    }
+    let upload = assert_upload_accepts(
+        &compressed,
+        "upload-brotli-test.nzb.br",
+        "application/brotli",
+    );
+    let resp = submit_upload(&h, upload).await;
 
-    let resp = h.schema.execute(request).await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    assert!(data["submitNzb"]["item"]["id"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["submitNzb"]["item"]["state"].as_str().unwrap(),
+        "QUEUED"
+    );
+}
+
+#[tokio::test]
+async fn submit_with_deflate_upload() {
+    let h = TestHarness::new().await;
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(minimal_nzb("upload-deflate-test").as_bytes())
+        .unwrap();
+    let compressed = encoder.finish().unwrap();
+    let upload = assert_upload_accepts(
+        &compressed,
+        "upload-deflate-test.nzb.deflate",
+        "application/deflate",
+    );
+    let resp = submit_upload(&h, upload).await;
 
     assert_no_errors(&resp);
     let data = response_data(&resp);

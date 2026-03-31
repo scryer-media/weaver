@@ -17,6 +17,15 @@ use weaver_scheduler::{FileSpec, JobSpec, SchedulerHandle, SegmentSpec};
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
 const NZB_COMPRESSION_LEVEL: i32 = 3;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadEncoding {
+    Plain,
+    Zstd,
+    Gzip,
+    Brotli,
+    Deflate,
+}
+
 /// Seed the job ID counter so IDs are stable across restarts.
 /// Call this on startup with the max job ID found in the journal + 1.
 pub fn init_job_counter(start: u64) {
@@ -49,8 +58,6 @@ pub enum SubmitNzbError {
     #[error("NZB response was not valid XML")]
     NotXml,
 }
-
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 pub async fn submit_nzb_bytes(
     handle: &SchedulerHandle,
@@ -224,60 +231,90 @@ fn write_compressed_nzb(nzb_path: &Path, nzb_bytes: &[u8]) -> Result<(), std::io
     Ok(())
 }
 
-fn write_compressed_nzb_from_reader<R: Read>(
-    nzb_path: &Path,
-    mut reader: R,
-) -> Result<(), std::io::Error> {
-    let file = std::fs::File::create(nzb_path)?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder = zstd::stream::Encoder::new(writer, NZB_COMPRESSION_LEVEL)?;
-    std::io::copy(&mut reader, &mut encoder)?;
-    let mut writer = encoder.finish()?;
-    writer.flush()?;
-    Ok(())
+fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
+    let filename = upload.filename.trim().to_ascii_lowercase();
+    if filename.ends_with(".zst") {
+        return UploadEncoding::Zstd;
+    }
+    if filename.ends_with(".gz") || filename.ends_with(".gzip") {
+        return UploadEncoding::Gzip;
+    }
+    if filename.ends_with(".br") {
+        return UploadEncoding::Brotli;
+    }
+    if filename.ends_with(".deflate") {
+        return UploadEncoding::Deflate;
+    }
+
+    let Some(content_type) = upload.content_type.as_deref() else {
+        return UploadEncoding::Plain;
+    };
+    let normalized = content_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "application/zstd" | "application/x-zstd" | "application/octet-stream+zstd" => {
+            UploadEncoding::Zstd
+        }
+        "application/gzip" | "application/x-gzip" | "application/octet-stream+gzip" => {
+            UploadEncoding::Gzip
+        }
+        "application/brotli" | "application/x-brotli" | "application/octet-stream+brotli" => {
+            UploadEncoding::Brotli
+        }
+        "application/deflate" | "application/x-deflate" | "application/octet-stream+deflate" => {
+            UploadEncoding::Deflate
+        }
+        _ => UploadEncoding::Plain,
+    }
+}
+
+fn normalize_uploaded_nzb_reader(upload: UploadValue) -> Result<Box<dyn Read>, SubmitNzbError> {
+    let encoding = detect_upload_encoding(&upload);
+    let source = upload.into_read();
+
+    match encoding {
+        UploadEncoding::Plain => Ok(Box::new(source)),
+        UploadEncoding::Zstd => {
+            let decoder =
+                zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?;
+            Ok(Box::new(decoder))
+        }
+        UploadEncoding::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(source);
+            Ok(Box::new(decoder))
+        }
+        UploadEncoding::Brotli => {
+            let decoder = brotli::Decompressor::new(source, 64 * 1024);
+            Ok(Box::new(decoder))
+        }
+        UploadEncoding::Deflate => {
+            let decoder = flate2::read::DeflateDecoder::new(source);
+            Ok(Box::new(decoder))
+        }
+    }
 }
 
 fn persist_uploaded_nzb(nzb_path: &Path, upload: UploadValue) -> Result<Nzb, SubmitNzbError> {
-    if upload_is_zstd(&upload)? {
-        let parse_upload = upload.try_clone().map_err(SubmitNzbError::Upload)?;
-        let parse_reader = parse_upload.into_read();
-        let decoder =
-            zstd::stream::read::Decoder::new(parse_reader).map_err(SubmitNzbError::Upload)?;
-        let nzb = weaver_nzb::parse_nzb_reader(BufReader::new(decoder))?;
+    let partial_path = nzb_path.with_extension("nzb.part");
+    let persist_result = (|| {
+        let mut source = normalize_uploaded_nzb_reader(upload)?;
+        let file = std::fs::File::create(&partial_path).map_err(SubmitNzbError::Save)?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = zstd::stream::Encoder::new(writer, NZB_COMPRESSION_LEVEL)
+            .map_err(SubmitNzbError::Save)?;
+        std::io::copy(&mut source, &mut encoder).map_err(SubmitNzbError::Save)?;
+        let mut writer = encoder.finish().map_err(SubmitNzbError::Save)?;
+        writer.flush().map_err(SubmitNzbError::Save)?;
+        std::fs::rename(&partial_path, nzb_path).map_err(SubmitNzbError::Save)?;
+        let file = std::fs::File::open(nzb_path).map_err(SubmitNzbError::Save)?;
+        let decoder = zstd::stream::read::Decoder::new(file).map_err(SubmitNzbError::Save)?;
+        weaver_nzb::parse_nzb_reader(BufReader::new(decoder)).map_err(SubmitNzbError::Parse)
+    })();
 
-        let mut source = upload.into_read();
-        let mut output = std::fs::File::create(nzb_path).map_err(SubmitNzbError::Save)?;
-        std::io::copy(&mut source, &mut output).map_err(SubmitNzbError::Save)?;
-        output.flush().map_err(SubmitNzbError::Save)?;
-        return Ok(nzb);
+    if persist_result.is_err() {
+        let _ = std::fs::remove_file(&partial_path);
     }
 
-    let parse_upload = upload.try_clone().map_err(SubmitNzbError::Upload)?;
-    let nzb = weaver_nzb::parse_nzb_reader(BufReader::new(parse_upload.into_read()))?;
-    write_compressed_nzb_from_reader(nzb_path, upload.into_read()).map_err(SubmitNzbError::Save)?;
-    Ok(nzb)
-}
-
-fn upload_is_zstd(upload: &UploadValue) -> Result<bool, SubmitNzbError> {
-    let has_zst_filename = upload
-        .filename
-        .trim()
-        .to_ascii_lowercase()
-        .ends_with(".zst");
-    if !has_zst_filename {
-        return Ok(false);
-    }
-
-    let mut reader = upload
-        .try_clone()
-        .map_err(SubmitNzbError::Upload)?
-        .into_read();
-    let mut magic = [0u8; 4];
-    match reader.read_exact(&mut magic) {
-        Ok(()) => Ok(magic == ZSTD_MAGIC),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(SubmitNzbError::Upload(error)),
-    }
+    persist_result
 }
 
 /// Fetch an NZB from a URL. Returns `(nzb_bytes, optional_filename)`.
