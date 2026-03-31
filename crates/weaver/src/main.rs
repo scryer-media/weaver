@@ -1,5 +1,6 @@
 mod e2e_failpoint;
 mod import;
+mod persisted_nzb;
 mod pipeline;
 mod runtime_affinity;
 mod server;
@@ -26,17 +27,6 @@ use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_nntp::pool::ServerPoolConfig;
 use weaver_scheduler::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 use weaver_state::Database;
-
-/// Decompress a stored NZB file. Handles both zstd-compressed and legacy
-/// uncompressed files transparently (detects zstd magic bytes).
-pub(crate) fn decompress_nzb(raw: &[u8]) -> Vec<u8> {
-    // zstd magic: 0x28 0xB5 0x2F 0xFD
-    if raw.len() >= 4 && raw[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-        zstd::bulk::decompress(raw, 64 * 1024 * 1024).unwrap_or_else(|_| raw.to_vec())
-    } else {
-        raw.to_vec()
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "weaver", about = "Usenet binary downloader")]
@@ -1113,48 +1103,41 @@ async fn run_server_command(
                 continue;
             }
 
-            match std::fs::read(&recovered.nzb_path) {
-                Ok(raw) => {
-                    let nzb_bytes = decompress_nzb(&raw);
-                    match weaver_nzb::parse_nzb(&nzb_bytes) {
-                        Ok(nzb) => {
-                            let spec = import::nzb_to_spec(
-                                &nzb,
-                                &recovered.nzb_path,
-                                recovered.category,
-                                recovered.metadata,
-                            );
-                            let status = status_str_to_job_status(
-                                &recovered.status,
-                                recovered.error.as_deref(),
-                            );
-                            let paused_resume_status = recovered
-                                .paused_resume_status
-                                .as_deref()
-                                .map(|status| status_str_to_job_status(status, None));
-                            to_restore.push((
-                                job_id,
-                                spec,
-                                recovered.committed_segments,
-                                recovered.file_progress,
-                                recovered.extracted_members,
-                                status,
-                                recovered.queued_repair_at_epoch_ms,
-                                recovered.queued_extract_at_epoch_ms,
-                                paused_resume_status,
-                                recovered.output_dir,
-                            ));
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                job_id = job_id.0,
-                                error = %e,
-                                "failed to parse NZB for recovered job"
-                            );
-                        }
-                    }
+            match persisted_nzb::parse_persisted_nzb(&recovered.nzb_path) {
+                Ok(nzb) => {
+                    let spec = import::nzb_to_spec(
+                        &nzb,
+                        &recovered.nzb_path,
+                        recovered.category,
+                        recovered.metadata,
+                    );
+                    let status =
+                        status_str_to_job_status(&recovered.status, recovered.error.as_deref());
+                    let paused_resume_status = recovered
+                        .paused_resume_status
+                        .as_deref()
+                        .map(|status| status_str_to_job_status(status, None));
+                    to_restore.push((
+                        job_id,
+                        spec,
+                        recovered.committed_segments,
+                        recovered.file_progress,
+                        recovered.extracted_members,
+                        status,
+                        recovered.queued_repair_at_epoch_ms,
+                        recovered.queued_extract_at_epoch_ms,
+                        paused_resume_status,
+                        recovered.output_dir,
+                    ));
                 }
-                Err(e) => {
+                Err(persisted_nzb::PersistedNzbError::Parse(e)) => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        error = %e,
+                        "failed to parse NZB for recovered job"
+                    );
+                }
+                Err(persisted_nzb::PersistedNzbError::Io(e)) => {
                     tracing::warn!(
                         job_id = job_id.0,
                         error = %e,

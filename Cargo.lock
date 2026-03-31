@@ -3633,6 +3633,7 @@ dependencies = [
  "mime_guess",
  "rayon",
  "rmp-serde",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",

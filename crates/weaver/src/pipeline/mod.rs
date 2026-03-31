@@ -1689,6 +1689,7 @@ impl Pipeline {
 mod tests {
     use super::*;
 
+    use std::io::Read;
     use std::time::Duration;
 
     use chrono::Timelike;
@@ -2693,16 +2694,17 @@ mod tests {
             })
         );
 
-        let stored_nzb = tokio::fs::read(
-            harness
-                .data_dir
-                .join(".weaver-nzbs")
-                .join(format!("{}.nzb", submitted.job_id.0)),
-        )
-        .await
-        .unwrap();
+        let stored_path = harness
+            .data_dir
+            .join(".weaver-nzbs")
+            .join(format!("{}.nzb", submitted.job_id.0));
+        let stored_nzb = tokio::fs::read(&stored_path).await.unwrap();
         assert!(stored_nzb.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
-        assert_eq!(crate::decompress_nzb(&stored_nzb), nzb_bytes);
+
+        let mut reader = crate::persisted_nzb::open_persisted_nzb_reader(&stored_path).unwrap();
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, nzb_bytes);
 
         harness.shutdown().await;
     }
@@ -3998,6 +4000,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30036);
+        let spec = standalone_job_spec("Streamed Hash", &[("episode.mkv".to_string(), 123)]);
+        let xml = sample_nzb_bytes();
+        tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+        let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+        let compressed = zstd::bulk::compress(&xml, 3).unwrap();
+        tokio::fs::write(&nzb_path, &compressed).await.unwrap();
+
+        let expected_hash = crate::persisted_nzb::hash_persisted_nzb(&nzb_path).unwrap();
+
+        pipeline.add_job(job_id, spec, nzb_path).await.unwrap();
+
+        let conn = rusqlite::Connection::open(temp_dir.path().join("weaver.db")).unwrap();
+        let stored_hash: Vec<u8> = conn
+            .query_row(
+                "SELECT nzb_hash FROM active_jobs WHERE job_id = ?1",
+                rusqlite::params![job_id.0 as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_hash, expected_hash);
+    }
+
+    #[tokio::test]
     async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4160,6 +4189,56 @@ mod tests {
         let par2_set = restored.par2_set(job_id).unwrap();
         assert_eq!(par2_set.files.len(), 1);
         assert_eq!(par2_set.recovery_block_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30037);
+        let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+        tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+        tokio::fs::write(
+            &nzb_path,
+            zstd::bulk::compress(&sample_nzb_bytes(), 3).unwrap(),
+        )
+        .await
+        .unwrap();
+        pipeline.finished_jobs.push(JobInfo {
+            job_id,
+            name: "Failed History Job".to_string(),
+            status: JobStatus::Failed {
+                error: "boom".to_string(),
+            },
+            progress: 0.0,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 0,
+            password: None,
+            category: Some("tv".to_string()),
+            metadata: vec![("source".to_string(), "history".to_string())],
+            output_dir: None,
+            error: Some("boom".to_string()),
+            created_at_epoch_ms: 0.0,
+        });
+
+        pipeline.reprocess_job(job_id).await.unwrap();
+
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.status, JobStatus::Extracting);
+        assert_eq!(state.spec.files.len(), 1);
+        assert_eq!(state.spec.category.as_deref(), Some("tv"));
+        assert_eq!(
+            state.spec.metadata,
+            vec![
+                ("source".to_string(), "history".to_string()),
+                ("weaver.original_title".to_string(), job_id.0.to_string()),
+            ]
+        );
+        assert!(state.download_queue.is_empty());
     }
 
     #[tokio::test]

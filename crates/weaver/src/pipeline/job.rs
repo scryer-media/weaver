@@ -54,14 +54,7 @@ impl Pipeline {
         );
 
         // Persist job creation to SQLite for crash recovery.
-        let nzb_hash = {
-            use sha2::{Digest, Sha256};
-            let bytes = std::fs::read(&nzb_path).unwrap_or_default();
-            let hash = Sha256::digest(&bytes);
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&hash);
-            arr
-        };
+        let nzb_hash = crate::persisted_nzb::hash_persisted_nzb_or_empty(&nzb_path);
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -267,19 +260,21 @@ impl Pipeline {
             }
 
             let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
-            let raw = tokio::fs::read(&nzb_path).await.map_err(|e| {
-                weaver_scheduler::SchedulerError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to read NZB for job {}: {e}", job_id.0),
-                ))
-            })?;
-            let nzb_bytes = crate::decompress_nzb(&raw);
-            let nzb = weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| {
-                weaver_scheduler::SchedulerError::Internal(format!(
-                    "failed to parse NZB for job {}: {e}",
-                    job_id.0
-                ))
-            })?;
+            let nzb =
+                crate::persisted_nzb::parse_persisted_nzb(&nzb_path).map_err(|e| match e {
+                    crate::persisted_nzb::PersistedNzbError::Io(error) => {
+                        weaver_scheduler::SchedulerError::Io(std::io::Error::new(
+                            error.kind(),
+                            format!("failed to read NZB for job {}: {error}", job_id.0),
+                        ))
+                    }
+                    crate::persisted_nzb::PersistedNzbError::Parse(error) => {
+                        weaver_scheduler::SchedulerError::Internal(format!(
+                            "failed to parse NZB for job {}: {error}",
+                            job_id.0
+                        ))
+                    }
+                })?;
 
             let spec = crate::import::nzb_to_spec(
                 &nzb,
