@@ -26,6 +26,7 @@ brotli = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 argon2 = { workspace = true }
+scrypt = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }

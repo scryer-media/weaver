@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
 import {
+  Activity,
   Clock3,
   FolderUp,
   ListOrdered,
@@ -44,6 +45,7 @@ import {
 const navItems = [
   { to: "/", labelKey: "nav.jobs", icon: ListOrdered },
   { to: "/history", labelKey: "nav.history", icon: Clock3 },
+  { to: "/monitoring", labelKey: "nav.monitoring", icon: Activity },
   { to: "/logs", labelKey: "nav.logs", icon: ScrollText },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];

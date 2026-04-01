@@ -1,5 +1,81 @@
+use std::sync::{Arc, RwLock};
+
 use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 use sha2::{Digest, Sha256};
+use weaver_state::db::AuthCredentials;
+
+const ARGON2_M_COST: u32 = 19 * 1024;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+const ARGON2_OUTPUT_LEN: usize = 32;
+
+fn pinned_argon2() -> argon2::Argon2<'static> {
+    let params = argon2::Params::new(
+        ARGON2_M_COST,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(ARGON2_OUTPUT_LEN),
+    )
+    .expect("pinned argon2 parameters must be valid");
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedLoginAuth {
+    pub username: String,
+    pub password_hash: String,
+    pub jwt_secret: [u8; 32],
+}
+
+impl CachedLoginAuth {
+    pub fn new(username: impl Into<String>, password_hash: impl Into<String>) -> Self {
+        let username = username.into();
+        let password_hash = password_hash.into();
+        let jwt_secret = crate::jwt::derive_jwt_secret(&password_hash);
+        Self {
+            username,
+            password_hash,
+            jwt_secret,
+        }
+    }
+
+    pub fn from_credentials(credentials: AuthCredentials) -> Self {
+        Self::new(credentials.username, credentials.password_hash)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoginAuthCache(Arc<RwLock<Option<CachedLoginAuth>>>);
+
+impl LoginAuthCache {
+    pub fn from_credentials(credentials: Option<AuthCredentials>) -> Self {
+        let cache = Self::default();
+        cache.replace_credentials(credentials);
+        cache
+    }
+
+    pub fn snapshot(&self) -> Option<CachedLoginAuth> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn replace(&self, auth: Option<CachedLoginAuth>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = auth;
+    }
+
+    pub fn replace_credentials(&self, credentials: Option<AuthCredentials>) {
+        self.replace(credentials.map(CachedLoginAuth::from_credentials));
+    }
+
+    pub fn clear(&self) {
+        self.replace(None);
+    }
+}
 
 /// Represents who is making the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,32 +183,63 @@ pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
 pub fn hash_password(password: &str) -> Result<String, String> {
     use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
     let salt = SaltString::generate(&mut OsRng);
-    argon2::Argon2::default()
+    pinned_argon2()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| format!("argon2 hash failed: {e}"))
 }
 
-/// Verify a password against a stored hash (argon2id or legacy scrypt).
+fn is_argon2_hash(hash: &str) -> bool {
+    hash.starts_with("$argon2")
+}
+
+fn is_legacy_scrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$scrypt$")
+}
+
+/// Verify a password against a stored hash (argon2 or legacy scrypt).
 pub fn verify_password(password: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
-    argon2::Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
+    if is_argon2_hash(hash) {
+        pinned_argon2()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    } else if is_legacy_scrypt_hash(hash) {
+        scrypt::Scrypt
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    } else {
+        false
+    }
 }
 
-/// Returns true if the stored hash uses a legacy algorithm that should be
-/// re-hashed on next successful login.
+/// Returns true only for recognized legacy password hashes that Weaver can
+/// verify and safely upgrade in-place during the bridge release.
+///
+/// Unknown or malformed hashes intentionally return `false`: those credentials
+/// fail closed instead of being treated as upgrade candidates. Recovery for
+/// corrupted or out-of-band hash formats is an explicit admin action
+/// (disable/reset login), not an opportunistic rewrite.
 pub fn needs_rehash(hash: &str) -> bool {
-    !hash.starts_with("$argon2")
+    is_legacy_scrypt_hash(hash)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
+    use scrypt::password_hash::rand_core::OsRng;
+
+    fn fixed_scrypt_hash(password: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        scrypt::Scrypt
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
 
     #[test]
     fn key_format() {
@@ -174,7 +281,13 @@ mod tests {
     #[test]
     fn password_hash_and_verify() {
         let hash = hash_password("hunter2").unwrap();
-        assert!(hash.starts_with("$argon2"));
+        assert!(hash.starts_with("$argon2id$"));
+        let parsed = PasswordHash::new(&hash).unwrap();
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        let params = parsed.params;
+        assert_eq!(params.get("m").unwrap().decimal().unwrap(), ARGON2_M_COST);
+        assert_eq!(params.get("t").unwrap().decimal().unwrap(), ARGON2_T_COST);
+        assert_eq!(params.get("p").unwrap().decimal().unwrap(), ARGON2_P_COST);
         assert!(verify_password("hunter2", &hash));
         assert!(!verify_password("wrong", &hash));
         assert!(!needs_rehash(&hash));
@@ -182,6 +295,33 @@ mod tests {
 
     #[test]
     fn legacy_scrypt_needs_rehash() {
-        assert!(needs_rehash("$scrypt$ln=17,r=8,p=1$somesalt$somehash"));
+        let hash = fixed_scrypt_hash("hunter2");
+        assert!(hash.starts_with("$scrypt$"));
+        assert!(verify_password("hunter2", &hash));
+        assert!(!verify_password("wrong", &hash));
+        assert!(needs_rehash(&hash));
+    }
+
+    #[test]
+    fn malformed_and_unknown_hashes_fail_cleanly() {
+        assert!(!verify_password("hunter2", "not-a-phc-hash"));
+        assert!(!verify_password("hunter2", "$bcrypt$v=2b$bad"));
+        assert!(!needs_rehash("not-a-phc-hash"));
+        assert!(!needs_rehash("$bcrypt$v=2b$bad"));
+    }
+
+    #[test]
+    fn login_auth_cache_roundtrips_credentials() {
+        let cache = LoginAuthCache::default();
+        assert!(cache.snapshot().is_none());
+
+        cache.replace(Some(CachedLoginAuth::new("admin", "hash")));
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(snapshot.username, "admin");
+        assert_eq!(snapshot.password_hash, "hash");
+        assert_eq!(snapshot.jwt_secret, crate::jwt::derive_jwt_secret("hash"));
+
+        cache.clear();
+        assert!(cache.snapshot().is_none());
     }
 }

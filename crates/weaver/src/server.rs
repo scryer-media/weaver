@@ -19,7 +19,8 @@ use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
 use weaver_api::auth::{
-    CallerScope, generate_api_key, hash_api_key, hash_password, needs_rehash, verify_password,
+    CachedLoginAuth, CallerScope, LoginAuthCache, generate_api_key, hash_api_key, hash_password,
+    needs_rehash, verify_password,
 };
 use weaver_api::jwt::{self, JWT_TTL_SECS};
 use weaver_api::{BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, WeaverSchema};
@@ -84,23 +85,15 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Check if login auth is enabled and return the JWT secret if so.
-async fn jwt_secret_if_auth_enabled(db: &Database) -> Option<[u8; 32]> {
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        db.get_auth_credentials()
-            .ok()
-            .flatten()
-            .map(|creds| jwt::derive_jwt_secret(&creds.password_hash))
-    })
-    .await
-    .ok()
-    .flatten()
+/// Check if login auth is enabled and return the cached JWT secret if so.
+fn jwt_secret_if_auth_enabled(auth_cache: &LoginAuthCache) -> Option<[u8; 32]> {
+    auth_cache.snapshot().map(|auth| auth.jwt_secret)
 }
 
 /// Resolve the caller scope from API key header, JWT cookie, or session token.
 async fn resolve_scope(
     db: &Database,
+    auth_cache: &LoginAuthCache,
     session_token: &str,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
@@ -141,15 +134,16 @@ async fn resolve_scope(
     }
 
     // 2. JWT cookie (when login auth is enabled).
+    let cached_auth = auth_cache.snapshot();
     if let Some(token) = extract_jwt_cookie(headers)
-        && let Some(secret) = jwt_secret_if_auth_enabled(db).await
-        && jwt::verify_jwt(&token, &secret).is_ok()
+        && let Some(auth) = cached_auth.as_ref()
+        && jwt::verify_jwt(&token, &auth.jwt_secret).is_ok()
     {
         return Ok(CallerScope::Admin);
     }
 
     // 3. No login auth enabled: require an explicit session token or API key.
-    if jwt_secret_if_auth_enabled(db).await.is_none() {
+    if cached_auth.is_none() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -159,11 +153,12 @@ async fn resolve_scope(
 async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
-    let scope = resolve_scope(&db, &session_token, &headers).await?;
+    let scope = resolve_scope(&db, &auth_cache, &session_token, &headers).await?;
     let mut request = req.into_inner();
     request = request.data(scope);
     Ok(schema.execute(request).await.into())
@@ -176,10 +171,11 @@ struct BackupExportRequest {
 
 async fn require_admin(
     db: &Database,
+    auth_cache: &LoginAuthCache,
     session_token: &str,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    let scope = resolve_scope(db, session_token, headers).await?;
+    let scope = resolve_scope(db, auth_cache, session_token, headers).await?;
     if scope.is_admin() {
         Ok(())
     } else {
@@ -189,11 +185,12 @@ async fn require_admin(
 
 async fn backup_status_handler(
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(backup): Extension<BackupService>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
 ) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(&db, &session_token, &headers).await?;
+    require_admin(&db, &auth_cache, &session_token, &headers).await?;
     let status = backup
         .status()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -202,12 +199,13 @@ async fn backup_status_handler(
 
 async fn backup_export_handler(
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(backup): Extension<BackupService>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, &headers).await {
+    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
         return status.into_response();
     }
     match backup.create_backup(body.password).await {
@@ -228,12 +226,13 @@ async fn backup_export_handler(
 
 async fn backup_inspect_handler(
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(backup): Extension<BackupService>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, &headers).await {
+    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -250,12 +249,13 @@ async fn backup_inspect_handler(
 
 async fn backup_restore_handler(
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(backup): Extension<BackupService>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &session_token, &headers).await {
+    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -397,6 +397,7 @@ fn internal_upload_err(e: impl std::fmt::Display) -> (StatusCode, String) {
 async fn ws_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
     headers: HeaderMap,
     protocol: GraphQLProtocol,
@@ -405,7 +406,9 @@ async fn ws_handler(
     // Pre-resolve scope from cookies on the upgrade request. Browsers
     // automatically send cookies on WebSocket upgrade, so JWT auth works
     // without needing api_key in connection_init.
-    let upgrade_scope = resolve_scope(&db, &session_token, &headers).await.ok();
+    let upgrade_scope = resolve_scope(&db, &auth_cache, &session_token, &headers)
+        .await
+        .ok();
 
     ws.protocols(["graphql-transport-ws", "graphql-ws"])
         .on_upgrade(move |stream| {
@@ -518,7 +521,7 @@ async fn static_handler(
     headers: HeaderMap,
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     Extension(SessionToken(session_token)): Extension<SessionToken>,
-    Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
@@ -564,7 +567,7 @@ async fn static_handler(
         // SPA fallback: serve index.html (or login page if auth is enabled).
         // When auth is enabled and the user doesn't have a valid JWT cookie,
         // serve the standalone login page instead of the React app.
-        if let Some(secret) = jwt_secret_if_auth_enabled(&db).await {
+        if let Some(secret) = jwt_secret_if_auth_enabled(&auth_cache) {
             let has_valid_jwt = extract_jwt_cookie(&headers)
                 .is_some_and(|token| jwt::verify_jwt(&token, &secret).is_ok());
             if !has_valid_jwt {
@@ -597,15 +600,10 @@ struct LoginRequest {
 
 async fn login_handler(
     Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let db_clone = db.clone();
-    let creds = match tokio::task::spawn_blocking(move || db_clone.get_auth_credentials())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten()
-    {
+    let creds = match auth_cache.snapshot() {
         Some(c) => c,
         None => {
             return error_response(StatusCode::BAD_REQUEST, "login is not enabled");
@@ -627,7 +625,7 @@ async fn login_handler(
     }
 
     // Transparent rehash: upgrade legacy scrypt hashes to argon2id on successful login.
-    let password_hash = if needs_rehash(&creds.password_hash) {
+    let effective_auth = if needs_rehash(&creds.password_hash) {
         let pw = body.password.clone();
         let db_rehash = db.clone();
         let username = creds.username.clone();
@@ -642,16 +640,21 @@ async fn login_handler(
         .await
         .unwrap_or(Err("task failed".into()))
         {
-            new_hash
+            let auth = CachedLoginAuth::new(creds.username.clone(), new_hash);
+            auth_cache.replace(Some(auth.clone()));
+            auth
         } else {
-            creds.password_hash.clone()
+            creds.clone()
         }
     } else {
-        creds.password_hash.clone()
+        creds.clone()
     };
 
-    let secret = jwt::derive_jwt_secret(&password_hash);
-    let token = jwt::create_jwt(&creds.username, &secret, JWT_TTL_SECS);
+    let token = jwt::create_jwt(
+        &effective_auth.username,
+        &effective_auth.jwt_secret,
+        JWT_TTL_SECS,
+    );
     let cookie =
         format!("weaver_jwt={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}");
 
@@ -674,21 +677,13 @@ async fn logout_handler() -> Response {
 }
 
 async fn auth_status_handler(
-    Extension(db): Extension<Database>,
+    Extension(auth_cache): Extension<LoginAuthCache>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
-    let db_clone = db.clone();
-    let creds = tokio::task::spawn_blocking(move || db_clone.get_auth_credentials())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten();
-
-    let enabled = creds.is_some();
-    let authenticated = if let Some(creds) = creds {
+    let creds = auth_cache.snapshot();
+    let authenticated = if let Some(creds) = creds.as_ref() {
         if let Some(token) = extract_jwt_cookie(&headers) {
-            let secret = jwt::derive_jwt_secret(&creds.password_hash);
-            jwt::verify_jwt(&token, &secret).is_ok()
+            jwt::verify_jwt(&token, &creds.jwt_secret).is_ok()
         } else {
             false
         }
@@ -697,7 +692,7 @@ async fn auth_status_handler(
     };
 
     Json(serde_json::json!({
-        "enabled": enabled,
+        "enabled": creds.is_some(),
         "authenticated": authenticated,
     }))
 }
@@ -818,6 +813,7 @@ pub async fn run_server(
     schema: WeaverSchema,
     handle: SchedulerHandle,
     db: Database,
+    auth_cache: LoginAuthCache,
     backup: BackupService,
     metrics_exporter: PrometheusMetricsExporter,
     addr: SocketAddr,
@@ -843,6 +839,7 @@ pub async fn run_server(
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))
+        .layer(Extension(auth_cache))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
         .layer(Extension(session_token));
@@ -1535,33 +1532,196 @@ fn job_status_label(status: &JobStatus) -> &'static str {
 mod tests {
     use super::*;
     use axum::body::{Body, Bytes, to_bytes};
-    use axum::http::{HeaderMap, HeaderValue, header};
-    use axum::routing::post;
+    use axum::http::{HeaderMap, HeaderValue, Request, header};
+    use axum::routing::{get, post};
     use flate2::Compression;
     use flate2::write::{GzEncoder, ZlibEncoder};
+    use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
     use std::io::Write;
     use tower::ServiceExt;
     use weaver_core::id::JobId;
     use weaver_state::Database;
 
+    fn legacy_scrypt_hash(password: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        scrypt::Scrypt
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
+        Router::new()
+            .route("/api/login", post(login_handler))
+            .route("/api/auth/status", get(auth_status_handler))
+            .layer(Extension(db))
+            .layer(Extension(auth_cache))
+    }
+
     #[tokio::test]
     async fn resolve_scope_requires_explicit_auth_when_login_is_disabled() {
         let db = Database::open_in_memory().unwrap();
+        let auth_cache = LoginAuthCache::default();
         let headers = HeaderMap::new();
-        let result = resolve_scope(&db, "session-token", &headers).await;
+        let result = resolve_scope(&db, &auth_cache, "session-token", &headers).await;
         assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
     }
 
     #[tokio::test]
     async fn resolve_scope_accepts_session_bearer_without_login() {
         let db = Database::open_in_memory().unwrap();
+        let auth_cache = LoginAuthCache::default();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer session-token"),
         );
-        let result = resolve_scope(&db, "session-token", &headers).await;
+        let result = resolve_scope(&db, &auth_cache, "session-token", &headers).await;
         assert_eq!(result, Ok(CallerScope::Local));
+    }
+
+    #[tokio::test]
+    async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
+        let db = Database::open_in_memory().unwrap();
+        let password_hash = hash_password("hunter2").unwrap();
+        let auth_cache = LoginAuthCache::default();
+        let auth = CachedLoginAuth::new("admin", password_hash);
+        let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
+        auth_cache.replace(Some(auth));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("weaver_jwt={token}")).unwrap(),
+        );
+
+        let result = resolve_scope(&db, &auth_cache, "session-token", &headers).await;
+        assert_eq!(result, Ok(CallerScope::Admin));
+    }
+
+    #[tokio::test]
+    async fn login_handler_rehashes_legacy_scrypt_and_updates_cache() {
+        let db = Database::open_in_memory().unwrap();
+        let legacy_hash = legacy_scrypt_hash("hunter2");
+        db.set_auth_credentials("admin", &legacy_hash).unwrap();
+        let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+        let old_secret = auth_cache.snapshot().unwrap().jwt_secret;
+        let app = auth_test_router(db.clone(), auth_cache.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let token = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("weaver_jwt=")
+            .unwrap();
+
+        let stored = db.get_auth_credentials().unwrap().unwrap();
+        assert!(stored.password_hash.starts_with("$argon2id$"));
+        let cached = auth_cache.snapshot().unwrap();
+        assert_eq!(cached.password_hash, stored.password_hash);
+        assert!(jwt::verify_jwt(token, &cached.jwt_secret).is_ok());
+        assert!(jwt::verify_jwt(token, &old_secret).is_err());
+    }
+
+    #[tokio::test]
+    async fn login_handler_wrong_password_keeps_legacy_hash_and_cache() {
+        let db = Database::open_in_memory().unwrap();
+        let legacy_hash = legacy_scrypt_hash("hunter2");
+        db.set_auth_credentials("admin", &legacy_hash).unwrap();
+        let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+        let original = auth_cache.snapshot().unwrap();
+        let app = auth_test_router(db.clone(), auth_cache.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let stored = db.get_auth_credentials().unwrap().unwrap();
+        assert_eq!(stored.password_hash, legacy_hash);
+        assert_eq!(auth_cache.snapshot().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn login_handler_malformed_hash_fails_cleanly() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
+        let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+        let original = auth_cache.snapshot().unwrap();
+        let app = auth_test_router(db.clone(), auth_cache.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"hunter2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let stored = db.get_auth_credentials().unwrap().unwrap();
+        assert_eq!(stored.password_hash, "not-a-phc-hash");
+        assert_eq!(auth_cache.snapshot().unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn auth_status_handler_uses_cached_auth_state() {
+        let db = Database::open_in_memory().unwrap();
+        let password_hash = hash_password("hunter2").unwrap();
+        let auth_cache = LoginAuthCache::default();
+        let auth = CachedLoginAuth::new("admin", password_hash);
+        let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
+        auth_cache.replace(Some(auth));
+        let app = auth_test_router(db, auth_cache);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/auth/status")
+                    .header(header::COOKIE, format!("weaver_jwt={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["authenticated"], true);
     }
 
     #[test]

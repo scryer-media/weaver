@@ -12,7 +12,7 @@ async fn create_control_api_key() {
             r#"mutation {
                 createApiKey(name: "test", scope: CONTROL) {
                     rawKey
-                    key { id name scope }
+                    key { id name scope createdAt }
                 }
             }"#,
         )
@@ -24,6 +24,7 @@ async fn create_control_api_key() {
     assert!(result["key"]["id"].as_i64().is_some());
     assert_eq!(result["key"]["name"].as_str().unwrap(), "test");
     assert_eq!(result["key"]["scope"].as_str().unwrap(), "CONTROL");
+    assert!(result["key"]["createdAt"].as_f64().unwrap() > 1_000_000_000_000.0);
 }
 
 #[tokio::test]
@@ -65,7 +66,9 @@ async fn list_api_keys_hides_raw_key() {
     assert_no_errors(&resp);
 
     // List keys — rawKey is not a field on ApiKey.
-    let resp = h.execute(r#"{ apiKeys { id name scope } }"#).await;
+    let resp = h
+        .execute(r#"{ apiKeys { id name scope createdAt lastUsedAt } }"#)
+        .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let keys = data["apiKeys"].as_array().unwrap();
@@ -74,6 +77,8 @@ async fn list_api_keys_hides_raw_key() {
     assert!(key["id"].as_i64().is_some());
     assert_eq!(key["name"].as_str().unwrap(), "listed");
     assert_eq!(key["scope"].as_str().unwrap(), "CONTROL");
+    assert!(key["createdAt"].as_f64().unwrap() > 1_000_000_000_000.0);
+    assert!(key["lastUsedAt"].is_null());
 }
 
 #[tokio::test]
@@ -133,6 +138,12 @@ async fn enable_login() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["enableLogin"].as_bool().unwrap());
+    let creds = h.db.get_auth_credentials().unwrap().unwrap();
+    assert_eq!(creds.username, "admin");
+    assert!(creds.password_hash.starts_with("$argon2id$"));
+    let cached = h.auth_cache.snapshot().unwrap();
+    assert_eq!(cached.username, "admin");
+    assert_eq!(cached.password_hash, creds.password_hash);
 }
 
 #[tokio::test]
@@ -205,6 +216,8 @@ async fn disable_login() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(!data["adminLoginStatus"]["enabled"].as_bool().unwrap());
+    assert!(h.db.get_auth_credentials().unwrap().is_none());
+    assert!(h.auth_cache.snapshot().is_none());
 }
 
 #[tokio::test]
@@ -216,6 +229,7 @@ async fn change_password_correct() {
         .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
         .await;
     assert_no_errors(&resp);
+    let old_hash = h.db.get_auth_credentials().unwrap().unwrap().password_hash;
 
     // Change password.
     let resp = h
@@ -224,6 +238,11 @@ async fn change_password_correct() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["changePassword"].as_bool().unwrap());
+    let creds = h.db.get_auth_credentials().unwrap().unwrap();
+    assert!(creds.password_hash.starts_with("$argon2id$"));
+    assert_ne!(creds.password_hash, old_hash);
+    let cached = h.auth_cache.snapshot().unwrap();
+    assert_eq!(cached.password_hash, creds.password_hash);
 }
 
 #[tokio::test]

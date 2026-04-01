@@ -41,6 +41,7 @@ pub fn build_schema(
     handle: weaver_scheduler::SchedulerHandle,
     config: SharedConfig,
     db: Database,
+    auth_cache: auth::LoginAuthCache,
     rss: rss::RssService,
     schedules: weaver_scheduler::schedule::SharedSchedules,
     log_buffer: weaver_core::log_buffer::LogRingBuffer,
@@ -60,6 +61,7 @@ pub fn build_schema(
         .data(handle)
         .data(config)
         .data(db)
+        .data(auth_cache)
         .data(rss)
         .data(schedules)
         .data(http_client)

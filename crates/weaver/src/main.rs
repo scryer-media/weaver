@@ -1229,6 +1229,8 @@ async fn run_server_command(
         db.clone(),
         rss.clone(),
     );
+    let login_auth_cache =
+        weaver_api::auth::LoginAuthCache::from_credentials(db.get_auth_credentials()?);
 
     // Load schedules from DB and spawn the schedule evaluator.
     let shared_schedules: weaver_scheduler::schedule::SharedSchedules = {
@@ -1243,6 +1245,7 @@ async fn run_server_command(
         handle.clone(),
         shared_config,
         db.clone(),
+        login_auth_cache.clone(),
         rss.clone(),
         shared_schedules,
         log_ring_buffer,
@@ -1342,6 +1345,7 @@ async fn run_server_command(
         schema,
         handle.clone(),
         db.clone(),
+        login_auth_cache,
         backup,
         metrics_exporter,
         addr,

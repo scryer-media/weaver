@@ -489,6 +489,7 @@ impl Pipeline {
             set_name: set_name.to_string(),
             member: member_name.clone(),
         });
+        crate::e2e_failpoint::maybe_delay("extract.member_start");
 
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
         let existing_chunks: Vec<weaver_state::ExtractionChunk> = db

@@ -26,7 +26,7 @@ export const router = createBrowserRouter([
       { path: "jobs/:id", element: <JobDetail /> },
       { path: "upload", element: <Upload /> },
       {
-        path: "metrics",
+        path: "monitoring",
         lazy: async () => {
           const page = await import("@/pages/MetricsPage");
           return { Component: page.MetricsPage };

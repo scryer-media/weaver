@@ -8,6 +8,15 @@ pub trait KeyStore: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+fn force_key_file() -> bool {
+    std::env::var("WEAVER_FORCE_KEY_FILE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
+}
+
 #[allow(clippy::vec_init_then_push)]
 pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> {
     let mut stores: Vec<Box<dyn KeyStore>> = Vec::new();
@@ -15,7 +24,7 @@ pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> 
     // Skip macOS Keychain in debug builds — each recompile changes the binary
     // hash, causing repeated password prompts. Use file-based key instead.
     #[cfg(target_os = "macos")]
-    if cfg!(debug_assertions) {
+    if force_key_file() || cfg!(debug_assertions) {
         if let Some(dir) = _data_dir.clone() {
             stores.push(Box::new(super::key_file::KeyFile::new(dir)));
         }

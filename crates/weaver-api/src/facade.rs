@@ -385,8 +385,8 @@ pub fn history_item_from_row(row: &JobHistoryRow) -> HistoryItem {
         attributes,
         client_request_id,
         output_dir: row.output_dir.clone(),
-        created_at: ms_to_datetime(row.created_at),
-        completed_at: ms_to_datetime(row.completed_at),
+        created_at: secs_to_datetime(row.created_at),
+        completed_at: secs_to_datetime(row.completed_at),
         attention: attention_for_history_row(row, state),
     }
 }
@@ -591,6 +591,10 @@ fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
+fn secs_to_datetime(secs: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp(secs, 0).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
 fn wait_reason_for_status(status: &JobStatus) -> Option<QueueWaitReason> {
     match status {
         JobStatus::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
@@ -754,8 +758,8 @@ mod tests {
             category: Some("tv".to_string()),
             output_dir: Some("/tmp/history".to_string()),
             nzb_path: None,
-            created_at: 1_700_000_000_000,
-            completed_at: 1_700_000_100_000,
+            created_at: 1_700_000_000,
+            completed_at: 1_700_000_100,
             metadata: Some(
                 serde_json::to_string(&vec![
                     ("source".to_string(), "rss".to_string()),
@@ -775,5 +779,7 @@ mod tests {
         assert_eq!(item.attributes[0].key, "source");
         assert_eq!(item.attributes[0].value, "rss");
         assert_eq!(item.attention.unwrap().code, "JOB_FAILED");
+        assert_eq!(item.created_at.timestamp(), 1_700_000_000);
+        assert_eq!(item.completed_at.timestamp(), 1_700_000_100);
     }
 }

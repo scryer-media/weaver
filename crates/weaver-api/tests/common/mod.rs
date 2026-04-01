@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use weaver_api::auth::CallerScope;
+use weaver_api::auth::{CallerScope, LoginAuthCache};
 use weaver_api::{RssService, WeaverSchema, build_schema};
 use weaver_core::config::{Config, SharedConfig};
 use weaver_core::event::PipelineEvent;
@@ -34,6 +34,7 @@ pub struct TestHarness {
     pub handle: SchedulerHandle,
     pub config: SharedConfig,
     pub db: Database,
+    pub auth_cache: LoginAuthCache,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -63,6 +64,7 @@ impl TestHarness {
 
         let (handle, scheduler_task) = spawn_test_scheduler();
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
+        let auth_cache = LoginAuthCache::from_credentials(None);
         let shared_schedules: weaver_scheduler::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));
 
@@ -70,6 +72,7 @@ impl TestHarness {
             handle.clone(),
             shared_config.clone(),
             db.clone(),
+            auth_cache.clone(),
             rss,
             shared_schedules,
             weaver_core::log_buffer::LogRingBuffer::with_default_capacity(),
@@ -80,6 +83,7 @@ impl TestHarness {
             handle,
             config: shared_config,
             db,
+            auth_cache,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

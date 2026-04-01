@@ -72,6 +72,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const [showForm, setShowForm] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
     success: boolean;
     message: string;
@@ -97,23 +98,27 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
   const openAdd = () => {
     setEditingServer(null);
+    setSaveError(null);
     setTestResult(null);
     setShowForm(true);
   };
 
   const openEdit = (server: Server) => {
     setEditingServer(server);
+    setSaveError(null);
     setTestResult(null);
     setShowForm(true);
   };
 
   const closeForm = () => {
     setEditingServer(null);
+    setSaveError(null);
     setTestResult(null);
     setShowForm(false);
   };
 
   const handleSave = async (values: ServerFormValues) => {
+    setSaveError(null);
     const input = {
       host: values.host.trim(),
       port: values.port,
@@ -133,7 +138,15 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
             server.id === editingServer.id ? result.data.updateServer : server,
           ),
         );
+        closeForm();
+        return;
       }
+      setSaveError(
+        result.error?.graphQLErrors[0]?.message
+          ?? result.error?.message
+          ?? "Unable to save server settings. Fix the connection details and try again.",
+      );
+      return;
     } else {
       const result = await addServer({ input });
       if (result.data?.addServer) {
@@ -142,10 +155,16 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
             left.priority - right.priority || left.host.localeCompare(right.host),
           ),
         );
+        closeForm();
+        return;
       }
+      setSaveError(
+        result.error?.graphQLErrors[0]?.message
+          ?? result.error?.message
+          ?? "Unable to save server settings. Fix the connection details and try again.",
+      );
+      return;
     }
-
-    closeForm();
   };
 
   const handleDelete = async (id: number) => {
@@ -158,6 +177,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
   const handleTest = async (values: ServerFormValues) => {
     setTesting(true);
+    setSaveError(null);
     setTestResult(null);
     const result = await testConnection({
       input: {
@@ -201,6 +221,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
           }
           editing={!!editingServer}
           testing={testing}
+          saveError={saveError}
           testResult={testResult}
           onCancel={closeForm}
           onSave={handleSave}
@@ -280,6 +301,7 @@ function ServerFormCard({
   initialValues,
   editing,
   testing,
+  saveError,
   testResult,
   onSave,
   onTest,
@@ -288,6 +310,7 @@ function ServerFormCard({
   initialValues: ServerFormValues;
   editing: boolean;
   testing: boolean;
+  saveError: string | null;
   testResult: {
     success: boolean;
     message: string;
@@ -410,6 +433,12 @@ function ServerFormCard({
             {testResult.success
               ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""})`
               : `${t("servers.testFailed")}: ${testResult.message}`}
+          </div>
+        ) : null}
+
+        {saveError ? (
+          <div className="rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+            {saveError}
           </div>
         ) : null}
 

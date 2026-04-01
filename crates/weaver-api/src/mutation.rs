@@ -49,6 +49,112 @@ fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefi
     }
 }
 
+#[derive(Clone)]
+struct NormalizedServerInput {
+    host: String,
+    port: u16,
+    tls: bool,
+    username: Option<String>,
+    password: Option<String>,
+    connections: u16,
+    active: bool,
+    priority: u16,
+    tls_ca_cert: Option<PathBuf>,
+}
+
+impl NormalizedServerInput {
+    fn from_input(
+        input: ServerInput,
+        fallback_password: Option<String>,
+    ) -> std::result::Result<Self, String> {
+        let host = input.host.trim().to_string();
+        if host.is_empty() {
+            return Err("server host must not be empty".to_string());
+        }
+
+        let password = normalize_optional_string(input.password).or(fallback_password);
+
+        Ok(Self {
+            host,
+            port: input.port,
+            tls: input.tls,
+            username: normalize_optional_string(input.username),
+            password,
+            connections: input.connections,
+            active: input.active,
+            priority: input.priority,
+            tls_ca_cert: normalize_optional_string(input.tls_ca_cert).map(PathBuf::from),
+        })
+    }
+
+    fn as_runtime_server_config(&self, id: u32) -> weaver_core::config::ServerConfig {
+        weaver_core::config::ServerConfig {
+            id,
+            host: self.host.clone(),
+            port: self.port,
+            tls: self.tls,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            connections: self.connections,
+            active: self.active,
+            supports_pipelining: false,
+            priority: self.priority as u32,
+            tls_ca_cert: self.tls_ca_cert.clone(),
+        }
+    }
+
+    fn as_nntp_server_config(&self) -> weaver_nntp::ServerConfig {
+        weaver_nntp::ServerConfig {
+            host: self.host.clone(),
+            port: self.port,
+            tls: self.tls,
+            username: self.username.clone(),
+            password: self.password.clone(),
+            tls_ca_cert: self.tls_ca_cert.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+async fn probe_server_connection(config: weaver_nntp::ServerConfig) -> TestConnectionResult {
+    let start = std::time::Instant::now();
+    match weaver_nntp::NntpConnection::connect(&config).await {
+        Ok(mut conn) => {
+            let latency = start.elapsed().as_millis() as u64;
+            let pipelining = conn.capabilities().supports_pipelining();
+            let _ = conn.quit().await;
+            TestConnectionResult {
+                success: true,
+                message: "Connected successfully".to_string(),
+                latency_ms: Some(latency),
+                supports_pipelining: pipelining,
+            }
+        }
+        Err(error) => TestConnectionResult {
+            success: false,
+            message: format!("{error}"),
+            latency_ms: None,
+            supports_pipelining: false,
+        },
+    }
+}
+
+async fn validate_server_before_save(input: &NormalizedServerInput) -> Result<()> {
+    if !input.active {
+        return Ok(());
+    }
+
+    let result = probe_server_connection(input.as_nntp_server_config()).await;
+    if result.success {
+        Ok(())
+    } else {
+        Err(async_graphql::Error::new(format!(
+            "server connection test failed: {}",
+            result.message
+        )))
+    }
+}
+
 fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
     match error {
         SchedulerError::JobNotFound(job_id) => {
@@ -507,6 +613,10 @@ impl MutationRoot {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
+        let normalized =
+            NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
+
+        validate_server_before_save(&normalized).await?;
 
         let id = {
             let db = db.clone();
@@ -516,19 +626,7 @@ impl MutationRoot {
                 .map_err(|e| async_graphql::Error::new(format!("db error: {e}")))?
         };
 
-        let server = weaver_core::config::ServerConfig {
-            id,
-            host: input.host,
-            port: input.port,
-            tls: input.tls,
-            username: input.username,
-            password: input.password,
-            connections: input.connections,
-            active: input.active,
-            supports_pipelining: false,
-            priority: input.priority as u32,
-            tls_ca_cert: input.tls_ca_cert.map(std::path::PathBuf::from),
-        };
+        let server = normalized.as_runtime_server_config(id);
 
         {
             let db = db.clone();
@@ -565,6 +663,19 @@ impl MutationRoot {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
 
+        let existing_password = {
+            let cfg = config.read().await;
+            cfg.servers
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.password.clone())
+                .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))?
+        };
+        let normalized = NormalizedServerInput::from_input(input, existing_password)
+            .map_err(async_graphql::Error::new)?;
+
+        validate_server_before_save(&normalized).await?;
+
         {
             let mut cfg = config.write().await;
             let s = cfg
@@ -572,19 +683,15 @@ impl MutationRoot {
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))?;
-            s.host = input.host;
-            s.port = input.port;
-            s.tls = input.tls;
-            s.username = input.username;
-            // Preserve existing password when the client sends null (edit form
-            // leaves it blank unless the user explicitly re-enters it).
-            if input.password.is_some() {
-                s.password = input.password;
-            }
-            s.connections = input.connections;
-            s.active = input.active;
-            s.priority = input.priority as u32;
-            s.tls_ca_cert = input.tls_ca_cert.map(std::path::PathBuf::from);
+            s.host = normalized.host.clone();
+            s.port = normalized.port;
+            s.tls = normalized.tls;
+            s.username = normalized.username.clone();
+            s.password = normalized.password.clone();
+            s.connections = normalized.connections;
+            s.active = normalized.active;
+            s.priority = normalized.priority as u32;
+            s.tls_ca_cert = normalized.tls_ca_cert.clone();
 
             let server = s.clone();
             let db = db.clone();
@@ -638,36 +745,19 @@ impl MutationRoot {
         _ctx: &Context<'_>,
         input: ServerInput,
     ) -> Result<TestConnectionResult> {
-        let nntp_config = weaver_nntp::ServerConfig {
-            host: input.host,
-            port: input.port,
-            tls: input.tls,
-            username: input.username,
-            password: input.password,
-            tls_ca_cert: input.tls_ca_cert.map(std::path::PathBuf::from),
-            ..Default::default()
+        let normalized = match NormalizedServerInput::from_input(input, None) {
+            Ok(normalized) => normalized,
+            Err(message) => {
+                return Ok(TestConnectionResult {
+                    success: false,
+                    message,
+                    latency_ms: None,
+                    supports_pipelining: false,
+                });
+            }
         };
 
-        let start = std::time::Instant::now();
-        match weaver_nntp::NntpConnection::connect(&nntp_config).await {
-            Ok(mut conn) => {
-                let latency = start.elapsed().as_millis() as u64;
-                let pipelining = conn.capabilities().supports_pipelining();
-                let _ = conn.quit().await;
-                Ok(TestConnectionResult {
-                    success: true,
-                    message: "Connected successfully".to_string(),
-                    latency_ms: Some(latency),
-                    supports_pipelining: pipelining,
-                })
-            }
-            Err(e) => Ok(TestConnectionResult {
-                success: false,
-                message: format!("{e}"),
-                latency_ms: None,
-                supports_pipelining: false,
-            }),
-        }
+        Ok(probe_server_connection(normalized.as_nntp_server_config()).await)
     }
 
     // ── Categories ────────────────────────────────────────────────────
@@ -1035,8 +1125,8 @@ impl MutationRoot {
                     "admin" => ApiKeyScope::Admin,
                     _ => ApiKeyScope::Control,
                 },
-                created_at: row.created_at as f64,
-                last_used_at: row.last_used_at.map(|value| value as f64),
+                created_at: row.created_at as f64 * 1000.0,
+                last_used_at: row.last_used_at.map(|value| value as f64 * 1000.0),
             })
             .collect())
     }
@@ -1059,10 +1149,16 @@ impl MutationRoot {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
-        tokio::task::spawn_blocking(move || db.set_auth_credentials(&username, &hash))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
+        let username_for_db = username.clone();
+        let hash_for_db = hash.clone();
+        tokio::task::spawn_blocking(move || {
+            db.set_auth_credentials(&username_for_db, &hash_for_db)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(username, hash)));
         info!("login protection enabled");
         Ok(true)
     }
@@ -1071,10 +1167,12 @@ impl MutationRoot {
     #[graphql(guard = "AdminGuard")]
     async fn disable_login(&self, ctx: &Context<'_>) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         tokio::task::spawn_blocking(move || db.clear_auth_credentials())
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        auth_cache.clear();
         info!("login protection disabled");
         Ok(true)
     }
@@ -1091,11 +1189,10 @@ impl MutationRoot {
             return Err(async_graphql::Error::new("new password must not be empty"));
         }
         let db = ctx.data::<Database>()?.clone();
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         let db2 = db.clone();
-        let creds = tokio::task::spawn_blocking(move || db.get_auth_credentials())
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        let creds = auth_cache
+            .snapshot()
             .ok_or_else(|| async_graphql::Error::new("login is not enabled"))?;
 
         let hash = creds.password_hash.clone();
@@ -1113,11 +1210,16 @@ impl MutationRoot {
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?
                 .map_err(async_graphql::Error::new)?;
-        let username = creds.username;
-        tokio::task::spawn_blocking(move || db2.set_auth_credentials(&username, &new_hash))
+        let username = creds.username.clone();
+        let new_hash_for_db = new_hash.clone();
+        tokio::task::spawn_blocking(move || db2.set_auth_credentials(&username, &new_hash_for_db))
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
+            creds.username,
+            new_hash,
+        )));
         info!("login password changed");
         Ok(true)
     }

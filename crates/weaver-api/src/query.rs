@@ -517,12 +517,8 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::mutation::LoginStatusResult> {
-        let db = ctx.data::<Database>()?.clone();
-        let credentials = tokio::task::spawn_blocking(move || db.get_auth_credentials())
-            .await
-            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
-        Ok(match credentials {
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
+        Ok(match auth_cache.snapshot() {
             Some(creds) => crate::mutation::LoginStatusResult {
                 enabled: true,
                 username: Some(creds.username),
@@ -554,8 +550,8 @@ impl QueryRoot {
                     "admin" => ApiKeyScope::Admin,
                     _ => ApiKeyScope::Control,
                 },
-                created_at: r.created_at as f64,
-                last_used_at: r.last_used_at.map(|t| t as f64),
+                created_at: r.created_at as f64 * 1000.0,
+                last_used_at: r.last_used_at.map(|t| t as f64 * 1000.0),
             })
             .collect())
     }
@@ -740,7 +736,7 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         metadata,
         output_dir: row.output_dir.clone(),
         error,
-        created_at_epoch_ms: row.created_at as f64,
+        created_at_epoch_ms: row.created_at as f64 * 1000.0,
     }
 }
 

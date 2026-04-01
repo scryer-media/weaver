@@ -95,8 +95,8 @@ export function MetricsPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={t("metrics.title")}
-        description={t("metrics.description")}
+        title={t("monitoring.title")}
+        description={t("monitoring.description")}
       />
 
       {error ? (

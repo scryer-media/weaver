@@ -7,6 +7,7 @@ const en: LocaleDictionary = {
   // Navigation
   "nav.jobs": "Queue",
   "nav.metrics": "Metrics",
+  "nav.monitoring": "Monitoring",
   "nav.upload": "Upload",
   "nav.settings": "Settings",
   "nav.logs": "Logs",
@@ -339,6 +340,8 @@ const en: LocaleDictionary = {
   "metrics.committed": "Committed",
   "metrics.title": "Metrics",
   "metrics.description": "Inspect queue pressure, disk behavior, decode throughput, and failure counters without digging through logs.",
+  "monitoring.title": "Monitoring",
+  "monitoring.description": "Inspect queue pressure, disk behavior, decode throughput, and failure counters without digging through logs.",
   "metrics.pipelineState": "Pipeline State",
   "metrics.activeState": "Active",
   "metrics.activeJobs": "Active Jobs",

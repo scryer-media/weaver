@@ -1,6 +1,53 @@
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Duration;
+
+struct ScriptStep {
+    expect_prefix: Option<&'static str>,
+    response: &'static [u8],
+}
+
+async fn read_command_line(socket: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = socket.read(&mut byte).await.unwrap();
+        assert!(n > 0, "client closed connection before command completed");
+        buf.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    String::from_utf8(buf).unwrap()
+}
+
+async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        for step in steps {
+            if let Some(prefix) = step.expect_prefix {
+                let line = read_command_line(&mut socket).await;
+                assert!(
+                    line.starts_with(prefix),
+                    "expected command starting with {prefix:?}, got {line:?}"
+                );
+            }
+            if !step.response.is_empty() {
+                socket.write_all(step.response).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    });
+
+    port
+}
 
 #[tokio::test]
 async fn list_servers_empty() {
@@ -15,30 +62,45 @@ async fn list_servers_empty() {
 #[tokio::test]
 async fn add_server_basic() {
     let h = TestHarness::new().await;
+    let port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("QUIT"),
+            response: b"205 bye\r\n",
+        },
+    ])
+    .await;
     let resp = h
-        .execute(
-            r#"mutation {
-                addServer(input: {
-                    host: "news.example.com",
-                    port: 119,
+        .execute(&format!(
+            r#"mutation {{
+                addServer(input: {{
+                    host: "127.0.0.1",
+                    port: {port},
                     tls: false,
                     connections: 5
-                }) {
+                }}) {{
                     id
                     host
                     port
                     tls
                     connections
-                }
-            }"#,
-        )
+                }}
+            }}"#,
+        ))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let server = &data["addServer"];
     assert!(server["id"].as_u64().unwrap() > 0);
-    assert_eq!(server["host"].as_str().unwrap(), "news.example.com");
-    assert_eq!(server["port"].as_u64().unwrap(), 119);
+    assert_eq!(server["host"].as_str().unwrap(), "127.0.0.1");
+    assert_eq!(server["port"].as_u64().unwrap(), port as u64);
     assert!(!server["tls"].as_bool().unwrap());
     assert_eq!(server["connections"].as_u64().unwrap(), 5);
 }
@@ -53,7 +115,8 @@ async fn add_server_with_tls() {
                     host: "news.example.com",
                     port: 563,
                     tls: true,
-                    connections: 10
+                    connections: 10,
+                    active: false
                 }) {
                     id
                     host
@@ -73,23 +136,50 @@ async fn add_server_with_tls() {
 #[tokio::test]
 async fn add_server_with_auth() {
     let h = TestHarness::new().await;
+    let port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("AUTHINFO USER"),
+            response: b"381 password required\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("AUTHINFO PASS"),
+            response: b"281 authentication accepted\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("QUIT"),
+            response: b"205 bye\r\n",
+        },
+    ])
+    .await;
     let resp = h
-        .execute(
-            r#"mutation {
-                addServer(input: {
-                    host: "news.example.com",
-                    port: 119,
+        .execute(&format!(
+            r#"mutation {{
+                addServer(input: {{
+                    host: "127.0.0.1",
+                    port: {port},
                     tls: false,
                     connections: 5,
                     username: "user",
                     password: "pass"
-                }) {
+                }}) {{
                     id
                     host
                     username
-                }
-            }"#,
-        )
+                }}
+            }}"#,
+        ))
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -340,6 +430,134 @@ async fn test_connection_invalid_host() {
     let result = &data["testConnection"];
     assert!(!result["success"].as_bool().unwrap());
     assert!(!result["message"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn add_active_server_invalid_host_is_rejected() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "invalid.host.example",
+                    port: 119,
+                    tls: false,
+                    connections: 5
+                }) {
+                    id
+                }
+            }"#,
+        )
+        .await;
+    assert_has_errors(&resp);
+}
+
+#[tokio::test]
+async fn update_active_server_invalid_host_is_rejected() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "draft.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "invalid.host.example",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: true
+                }}) {{
+                    id
+                }}
+            }}"#
+        ))
+        .await;
+    assert_has_errors(&resp);
+}
+
+#[tokio::test]
+async fn update_active_server_preserves_password_during_validation() {
+    let h = TestHarness::new().await;
+    let port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("AUTHINFO USER"),
+            response: b"381 password required\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("AUTHINFO PASS"),
+            response: b"281 authentication accepted\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("QUIT"),
+            response: b"205 bye\r\n",
+        },
+    ])
+    .await;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                addServer(input: {{
+                    host: "127.0.0.1",
+                    port: {port},
+                    tls: false,
+                    connections: 5,
+                    username: "user",
+                    password: "secret",
+                    active: false
+                }}) {{ id }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "127.0.0.1",
+                    port: {port},
+                    tls: false,
+                    connections: 5,
+                    username: "user",
+                    active: true
+                }}) {{
+                    id
+                    active
+                }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["updateServer"]["active"].as_bool().unwrap());
 }
 
 #[tokio::test]

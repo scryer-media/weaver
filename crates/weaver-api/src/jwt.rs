@@ -33,7 +33,7 @@ pub enum JwtError {
     InvalidClaims(String),
 }
 
-/// Derive the HMAC secret from the stored scrypt password hash.
+/// Derive the HMAC secret from the stored password hash.
 ///
 /// SHA-256 of the hash string — deterministic, changes when the password
 /// changes (which invalidates all existing JWTs).
