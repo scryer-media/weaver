@@ -106,6 +106,62 @@ async fn queue_snapshots_reflect_pause_state() {
 }
 
 #[tokio::test]
+async fn queue_snapshots_drop_cancelled_job_while_globally_paused() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("cancel-paused-subscription").await;
+
+    h.execute("mutation { pauseAll }").await;
+
+    let request = Request::new(
+        "subscription { queueSnapshots { items { id } globalState { isPaused } } }",
+    )
+    .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit an initial snapshot")
+        .expect("stream should stay open");
+    assert!(first.errors.is_empty());
+    let first_data = first.data.into_json().unwrap();
+    assert!(
+        first_data["queueSnapshots"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        first_data["queueSnapshots"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"].as_u64() == Some(job_id))
+    );
+
+    let cancel = h.execute(&format!("mutation {{ cancelJob(id: {job_id}) }}")).await;
+    assert!(cancel.errors.is_empty());
+
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit after cancellation")
+        .expect("stream should stay open");
+    assert!(second.errors.is_empty());
+    let second_data = second.data.into_json().unwrap();
+    assert!(
+        second_data["queueSnapshots"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        second_data["queueSnapshots"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"].as_u64() != Some(job_id)),
+        "cancelled job should be removed from the live queue snapshot",
+    );
+}
+
+#[tokio::test]
 async fn queue_events_replay_from_cursor_then_tail() {
     let h = TestHarness::new().await;
     let item_id = h.submit_test_nzb("event-test").await;

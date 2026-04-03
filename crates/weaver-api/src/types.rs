@@ -768,6 +768,7 @@ pub enum EventKind {
     JobCreated,
     JobPaused,
     JobResumed,
+    JobCancelled,
     JobCompleted,
     JobFailed,
     DownloadStarted,
@@ -811,6 +812,7 @@ impl std::str::FromStr for EventKind {
             "JobCreated" => Ok(Self::JobCreated),
             "JobPaused" => Ok(Self::JobPaused),
             "JobResumed" => Ok(Self::JobResumed),
+            "JobCancelled" => Ok(Self::JobCancelled),
             "JobCompleted" => Ok(Self::JobCompleted),
             "JobFailed" => Ok(Self::JobFailed),
             "DownloadStarted" => Ok(Self::DownloadStarted),
@@ -1096,6 +1098,12 @@ impl From<&weaver_core::event::PipelineEvent> for PipelineEventGql {
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: "resumed".into(),
+            },
+            PipelineEvent::JobCancelled { job_id } => PipelineEventGql {
+                kind: EventKind::JobCancelled,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "cancelled".into(),
             },
             PipelineEvent::JobCompleted { job_id } => PipelineEventGql {
                 kind: EventKind::JobCompleted,

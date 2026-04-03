@@ -1493,6 +1493,7 @@ fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         PipelineEvent::JobCreated { job_id, .. }
         | PipelineEvent::JobPaused { job_id }
         | PipelineEvent::JobResumed { job_id }
+        | PipelineEvent::JobCancelled { job_id }
         | PipelineEvent::JobCompleted { job_id }
         | PipelineEvent::JobFailed { job_id, .. }
         | PipelineEvent::DownloadStarted { job_id }

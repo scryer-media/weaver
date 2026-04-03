@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_graphql::{Context, Result, SimpleObject, Subscription};
@@ -121,7 +120,6 @@ impl SubscriptionRoot {
         let db = ctx.data::<weaver_state::Database>()?.clone();
         let config = ctx.data::<weaver_core::config::SharedConfig>()?.clone();
         let event_rx = handle.subscribe_events();
-        let cached_items = Arc::new(tokio::sync::Mutex::new(Vec::<QueueItem>::new()));
 
         let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
             .filter_map(|r| r.ok().map(|_| SnapshotTrigger::ItemsChanged));
@@ -132,32 +130,25 @@ impl SubscriptionRoot {
         let merged = initial.merge(event_stream).merge(heartbeat);
         let throttled = throttle(merged, SNAPSHOT_THROTTLE);
 
-        let stream = throttled.then(move |trigger| {
+        let stream = throttled.then(move |_| {
             let handle = handle.clone();
             let db = db.clone();
             let config = config.clone();
             let filter = filter.clone();
-            let cached_items = cached_items.clone();
             async move {
-                let items = if matches!(trigger, SnapshotTrigger::ItemsChanged) {
-                    let rebuilt: Vec<QueueItem> = handle
-                        .list_jobs()
-                        .into_iter()
-                        .filter(|info| {
-                            !matches!(
-                                info.status,
-                                weaver_scheduler::JobStatus::Complete
-                                    | weaver_scheduler::JobStatus::Failed { .. }
-                            )
-                        })
-                        .map(|info| queue_item_from_job(&info))
-                        .filter(|item| matches_queue_filter(item, filter.as_ref()))
-                        .collect();
-                    *cached_items.lock().await = rebuilt.clone();
-                    rebuilt
-                } else {
-                    cached_items.lock().await.clone()
-                };
+                let items: Vec<QueueItem> = handle
+                    .list_jobs()
+                    .into_iter()
+                    .filter(|info| {
+                        !matches!(
+                            info.status,
+                            weaver_scheduler::JobStatus::Complete
+                                | weaver_scheduler::JobStatus::Failed { .. }
+                        )
+                    })
+                    .map(|info| queue_item_from_job(&info))
+                    .filter(|item| matches_queue_filter(item, filter.as_ref()))
+                    .collect();
                 let metrics = handle.get_metrics();
                 let latest_cursor =
                     tokio::task::spawn_blocking(move || db.latest_integration_event_id())

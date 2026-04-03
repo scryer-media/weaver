@@ -23,6 +23,9 @@ pub enum PipelineEvent {
     /// Job was resumed by the user.
     JobResumed { job_id: JobId },
 
+    /// Job was cancelled by the user.
+    JobCancelled { job_id: JobId },
+
     /// All downloads paused globally.
     GlobalPaused,
 

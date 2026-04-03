@@ -795,6 +795,10 @@ impl Pipeline {
                 } else {
                     Err(weaver_scheduler::SchedulerError::JobNotFound(job_id))
                 };
+                if result.is_ok() {
+                    self.publish_snapshot();
+                    let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
+                }
                 let _ = reply.send(result);
             }
             SchedulerCommand::UpdateJob {

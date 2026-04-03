@@ -227,7 +227,7 @@ fn collect_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
                 reopen_after_pause = false;
             }
-            EventKind::JobFailed => {
+            EventKind::JobFailed | EventKind::JobCancelled => {
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Failed);
                 reopen_after_pause = false;
             }
@@ -257,6 +257,7 @@ fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
             }
             EventKind::DownloadFinished
             | EventKind::JobFailed
+            | EventKind::JobCancelled
             | EventKind::JobCompleted
             | EventKind::JobCreated => {
                 if kind == EventKind::DownloadFinished && download_active {
@@ -310,7 +311,7 @@ fn close_open_job_span(
 fn stage_boundary_state(kind: EventKind) -> Option<TimelineSpanState> {
     match kind {
         EventKind::JobCreated | EventKind::JobCompleted => Some(TimelineSpanState::Complete),
-        EventKind::JobFailed => Some(TimelineSpanState::Failed),
+        EventKind::JobFailed | EventKind::JobCancelled => Some(TimelineSpanState::Failed),
         _ => None,
     }
 }
@@ -326,7 +327,7 @@ fn collect_interruption_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan>
         let at = event.timestamp as f64;
 
         match kind {
-            EventKind::JobFailed => {
+            EventKind::JobFailed | EventKind::JobCancelled => {
                 pending_gap = Some((at, TimelineSpanState::Failed, "Recovery gap"));
             }
             EventKind::JobResumed | EventKind::JobCreated => {
