@@ -1,0 +1,51 @@
+[package]
+name = "weaver"
+description = "Unified Usenet binary downloader, repair, and extraction engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "weaver"
+path = "src/main.rs"
+
+[dependencies]
+weaver-server-core = { path = "../../crates/weaver-server-core" }
+weaver-nntp = { path = "../../../engines/weaver-nntp" }
+weaver-nzb = { path = "../../../engines/weaver-nzb" }
+weaver-yenc = { path = "../../../engines/weaver-yenc" }
+weaver-par2 = { path = "../../../engines/weaver-par2" }
+weaver-rar = { path = "../../../engines/weaver-rar" }
+weaver-server-api = { path = "../../crates/weaver-server-api" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+tower-http = { workspace = true }
+async-graphql = { workspace = true }
+async-graphql-axum = { workspace = true }
+libc = { workspace = true }
+rayon = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+zstd = { workspace = true }
+sevenz-rust2 = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+bzip2 = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+rusqlite = { workspace = true }
+scrypt = { workspace = true }

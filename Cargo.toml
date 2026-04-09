@@ -1,16 +1,15 @@
 [workspace]
 members = [
-    "crates/weaver",
-    "crates/weaver-core",
-    "crates/weaver-nntp",
-    "crates/weaver-nzb",
-    "crates/weaver-yenc",
-    "crates/weaver-assembly",
-    "crates/weaver-par2",
-    "crates/weaver-rar",
-    "crates/weaver-scheduler",
-    "crates/weaver-state",
-    "crates/weaver-api",
+    "xtask",
+    "shared/crates/weaver-model",
+    "server/app/weaver",
+    "server/crates/weaver-server-core",
+    "server/crates/weaver-server-api",
+    "engines/weaver-nntp",
+    "engines/weaver-nzb",
+    "engines/weaver-yenc",
+    "engines/weaver-par2",
+    "engines/weaver-rar",
 ]
 resolver = "2"
 

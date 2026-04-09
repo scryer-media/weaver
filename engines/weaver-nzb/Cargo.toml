@@ -1,0 +1,14 @@
+[package]
+name = "weaver-nzb"
+description = "NZB XML parser for Usenet binary article references"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+weaver-model = { path = "../../shared/crates/weaver-model" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+quick-xml = { workspace = true }
+tracing = { workspace = true }

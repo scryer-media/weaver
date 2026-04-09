@@ -1,0 +1,67 @@
+[package]
+name = "weaver-server-core"
+description = "Shared types, errors, config, and buffer pool primitives for Weaver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+slow-tests = []
+
+[dependencies]
+weaver-model = { path = "../../../shared/crates/weaver-model" }
+weaver-nntp = { path = "../../../engines/weaver-nntp" }
+weaver-nzb = { path = "../../../engines/weaver-nzb" }
+weaver-yenc = { path = "../../../engines/weaver-yenc" }
+weaver-par2 = { path = "../../../engines/weaver-par2" }
+weaver-rar = { path = "../../../engines/weaver-rar" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+crossbeam-queue = { workspace = true }
+bitvec = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+scryer-release-parser = { workspace = true }
+rayon = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+feed-rs = { workspace = true }
+zstd = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+bzip2 = { workspace = true }
+rusqlite = { workspace = true }
+rmp-serde = { workspace = true }
+tempfile = { workspace = true }
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+sevenz-rust2 = { workspace = true }
+argon2 = { workspace = true }
+scrypt = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+pbkdf2 = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+security-framework-sys = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+sevenz-rust2 = { workspace = true }
+axum = { workspace = true }

@@ -3660,7 +3660,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
- "sha2",
  "tar",
  "tempfile",
  "tokio",
@@ -3669,22 +3668,99 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "weaver-api",
- "weaver-assembly",
- "weaver-core",
  "weaver-nntp",
  "weaver-nzb",
  "weaver-par2",
  "weaver-rar",
- "weaver-scheduler",
- "weaver-state",
+ "weaver-server-api",
+ "weaver-server-core",
  "weaver-yenc",
  "zip",
  "zstd",
 ]
 
 [[package]]
-name = "weaver-api"
+name = "weaver-model"
+version = "0.2.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "weaver-nntp"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "criterion",
+ "memchr",
+ "pin-project-lite",
+ "rand",
+ "rustls-pemfile",
+ "socket2 0.5.10",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "weaver-yenc",
+ "webpki-roots",
+]
+
+[[package]]
+name = "weaver-nzb"
+version = "0.2.1"
+dependencies = [
+ "quick-xml",
+ "serde",
+ "thiserror",
+ "tracing",
+ "weaver-model",
+]
+
+[[package]]
+name = "weaver-par2"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "criterion",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "weaver-model",
+ "weaver-rar",
+]
+
+[[package]]
+name = "weaver-rar"
+version = "0.2.1"
+dependencies = [
+ "aes",
+ "blake2",
+ "cbc",
+ "crc32fast",
+ "criterion",
+ "hmac",
+ "memchr",
+ "memmap2",
+ "pbkdf2",
+ "rayon",
+ "rmp-serde",
+ "serde",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "weaver-server-api"
 version = "0.2.1"
 dependencies = [
  "aes-gcm",
@@ -3715,157 +3791,58 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "weaver-assembly",
- "weaver-core",
- "weaver-nntp",
- "weaver-nzb",
- "weaver-scheduler",
- "weaver-state",
+ "weaver-server-core",
  "zstd",
 ]
 
 [[package]]
-name = "weaver-assembly"
-version = "0.2.1"
-dependencies = [
- "bitvec",
- "serde_json",
- "thiserror",
- "tracing",
- "weaver-core",
-]
-
-[[package]]
-name = "weaver-core"
-version = "0.2.1"
-dependencies = [
- "bytes",
- "chrono",
- "crc32fast",
- "crossbeam-queue",
- "libc",
- "md-5",
- "rayon",
- "scryer-release-parser",
- "serde",
- "serde_json",
- "sevenz-rust2",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "weaver-assembly",
-]
-
-[[package]]
-name = "weaver-nntp"
-version = "0.2.1"
-dependencies = [
- "bytes",
- "criterion",
- "memchr",
- "pin-project-lite",
- "rand",
- "rustls-pemfile",
- "socket2 0.5.10",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "weaver-core",
- "weaver-yenc",
- "webpki-roots",
-]
-
-[[package]]
-name = "weaver-nzb"
-version = "0.2.1"
-dependencies = [
- "quick-xml",
- "serde",
- "thiserror",
- "tracing",
- "weaver-core",
-]
-
-[[package]]
-name = "weaver-par2"
-version = "0.2.1"
-dependencies = [
- "bytes",
- "crc32fast",
- "criterion",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "tempfile",
- "thiserror",
- "tracing",
- "weaver-core",
- "weaver-rar",
-]
-
-[[package]]
-name = "weaver-rar"
-version = "0.2.1"
-dependencies = [
- "aes",
- "blake2",
- "cbc",
- "crc32fast",
- "criterion",
- "hmac",
- "memchr",
- "memmap2",
- "pbkdf2",
- "rayon",
- "rmp-serde",
- "serde",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "weaver-scheduler"
-version = "0.2.1"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "weaver-assembly",
- "weaver-core",
- "weaver-state",
-]
-
-[[package]]
-name = "weaver-state"
+name = "weaver-server-core"
 version = "0.2.1"
 dependencies = [
  "aes-gcm",
+ "argon2",
+ "axum",
  "base64",
- "crc32fast",
+ "bitvec",
+ "brotli 7.0.0",
+ "bytes",
+ "bzip2 0.5.2",
+ "chrono",
+ "crossbeam-queue",
+ "feed-rs",
+ "flate2",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
  "keyring",
+ "libc",
+ "pbkdf2",
+ "rayon",
+ "regex",
+ "reqwest",
  "rmp-serde",
  "rusqlite",
+ "scryer-release-parser",
+ "scrypt",
  "security-framework",
  "security-framework-sys",
  "serde",
  "serde_json",
+ "sevenz-rust2",
+ "sha2",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
  "toml",
  "tracing",
- "weaver-core",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-par2",
+ "weaver-rar",
+ "weaver-yenc",
+ "zip",
  "zstd",
 ]
 
@@ -4260,6 +4237,23 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "xtask"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "clap",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]

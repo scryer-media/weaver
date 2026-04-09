@@ -1,0 +1,29 @@
+[package]
+name = "weaver-nntp"
+description = "Async NNTP protocol client with TLS and connection pooling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+weaver-yenc = { path = "../weaver-yenc" }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+pin-project-lite = { workspace = true }
+socket2 = { workspace = true }
+memchr = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "multiline_decode"
+harness = false
