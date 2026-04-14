@@ -25,11 +25,7 @@ impl Pipeline {
             SchedulerCommand::PauseJob { job_id, reply } => {
                 let result = self.pause_job_runtime(job_id);
                 if result.is_ok() {
-                    if self.active_download_passes.remove(&job_id) {
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::DownloadFinished { job_id });
-                    }
+                    self.emit_download_finished_if_active(job_id);
                     let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
                 }
                 let _ = reply.send(result);
@@ -104,6 +100,7 @@ impl Pipeline {
                     self.clear_job_extraction_runtime(job_id);
                     self.active_download_passes.remove(&job_id);
                     self.active_downloads_by_job.remove(&job_id);
+                    self.job_last_download_activity.remove(&job_id);
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
                     self.clear_job_progress_floor_runtime(job_id);

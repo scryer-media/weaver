@@ -4988,6 +4988,77 @@ async fn pause_clears_stale_completion_rechecks() {
 }
 
 #[tokio::test]
+async fn auto_pause_stalled_download_releases_blocking_runtime() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31232);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.jobs.insert(
+        job_id,
+        minimal_job_state(job_id, "stalled-job", temp_dir.path().join("stalled-job")),
+    );
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.bandwidth_cap.reserve(256);
+    pipeline.bandwidth_reservations.insert(segment_id, 256);
+    pipeline.job_last_download_activity.insert(
+        job_id,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+
+    pipeline.auto_pause_stalled_downloads();
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Paused)
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.paused_resume_status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(pipeline.active_downloads, 0);
+    assert!(!pipeline.active_download_passes.contains(&job_id));
+    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(pipeline.bandwidth_reservations.is_empty());
+}
+
+#[tokio::test]
+async fn auto_pause_ignores_stale_jobs_without_inflight_downloads() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31233);
+
+    pipeline.jobs.insert(
+        job_id,
+        minimal_job_state(job_id, "idle-job", temp_dir.path().join("idle-job")),
+    );
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.job_last_download_activity.insert(
+        job_id,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+
+    pipeline.auto_pause_stalled_downloads();
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert!(pipeline.active_download_passes.contains(&job_id));
+}
+
+#[tokio::test]
 async fn pause_rejects_active_extraction_tasks() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

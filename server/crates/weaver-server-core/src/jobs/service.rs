@@ -98,6 +98,7 @@ impl Pipeline {
             staging_dir: None,
         };
         self.jobs.insert(job_id, state);
+        self.note_download_activity(job_id);
         self.job_order.push(job_id);
 
         info!(
@@ -282,6 +283,7 @@ impl Pipeline {
                 staging_dir: None,
             };
             self.jobs.insert(job_id, state);
+            self.note_download_activity(job_id);
         }
 
         if in_jobs {
@@ -297,6 +299,7 @@ impl Pipeline {
             state.recovery_queue = recovery_queue;
             state.held_segments.clear();
             state.failed_bytes = 0;
+            self.note_download_activity(job_id);
         }
 
         self.finished_jobs.retain(|j| j.job_id != job_id);
@@ -547,6 +550,7 @@ impl Pipeline {
             staging_dir: None,
         };
         self.jobs.insert(job_id, state);
+        self.note_download_activity(job_id);
         self.job_order.push(job_id);
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);

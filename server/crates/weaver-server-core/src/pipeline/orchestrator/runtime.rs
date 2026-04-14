@@ -62,6 +62,7 @@ impl Pipeline {
             active_download_passes: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
+            job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             intermediate_dir,
             complete_dir,
@@ -205,9 +206,106 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
     }
 
+    pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
+        self.job_last_download_activity
+            .insert(job_id, Instant::now());
+    }
+
+    pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
+        if self.active_download_passes.remove(&job_id) {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::DownloadFinished { job_id });
+        }
+    }
+
+    fn release_stalled_download_runtime(&mut self, job_id: JobId) -> usize {
+        let in_flight = self.active_downloads_by_job.remove(&job_id).unwrap_or(0);
+        self.active_downloads = self.active_downloads.saturating_sub(in_flight);
+
+        let reserved_segments: Vec<_> = self
+            .bandwidth_reservations
+            .keys()
+            .copied()
+            .filter(|segment_id| segment_id.file_id.job_id == job_id)
+            .collect();
+        for segment_id in reserved_segments {
+            if let Err(error) = self.release_bandwidth_reservation(segment_id) {
+                error!(
+                    error = %error,
+                    segment = %segment_id,
+                    "failed to release stalled job bandwidth reservation"
+                );
+            }
+        }
+
+        in_flight
+    }
+
+    pub(crate) fn auto_pause_stalled_downloads(&mut self) {
+        let stalled_jobs: Vec<_> = self
+            .jobs
+            .iter()
+            .filter_map(|(job_id, state)| {
+                if !matches!(state.status, JobStatus::Downloading) || state.health_probing {
+                    return None;
+                }
+
+                let in_flight = self
+                    .active_downloads_by_job
+                    .get(job_id)
+                    .copied()
+                    .unwrap_or(0);
+                if in_flight == 0 {
+                    return None;
+                }
+
+                let elapsed = self.job_last_download_activity.get(job_id)?.elapsed();
+                (elapsed >= STALLED_DOWNLOAD_IDLE_THRESHOLD).then_some((
+                    *job_id,
+                    in_flight,
+                    elapsed,
+                    state.download_queue.len(),
+                ))
+            })
+            .collect();
+
+        for (job_id, in_flight, elapsed, queued_segments) in stalled_jobs {
+            warn!(
+                job_id = job_id.0,
+                in_flight,
+                queued_segments,
+                idle_secs = elapsed.as_secs(),
+                "auto-pausing stalled download job"
+            );
+
+            match self.pause_job_runtime(job_id) {
+                Ok(()) => {
+                    let released = self.release_stalled_download_runtime(job_id);
+                    self.emit_download_finished_if_active(job_id);
+                    let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
+                    info!(
+                        job_id = job_id.0,
+                        released_downloads = released,
+                        "stalled download job paused"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "failed to auto-pause stalled download job"
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn run(&mut self) {
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
+        stalled_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         info!("pipeline started");
 
@@ -306,6 +404,9 @@ impl Pipeline {
                             "tuner adjusted parameters"
                         );
                     }
+                }
+                _ = stalled_download_interval.tick() => {
+                    self.auto_pause_stalled_downloads();
                 }
             }
 

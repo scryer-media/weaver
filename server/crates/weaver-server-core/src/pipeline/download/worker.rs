@@ -28,6 +28,7 @@ impl Pipeline {
             state.status = JobStatus::Downloading;
             self.persist_active_runtime(job_id);
         }
+        self.note_download_activity(job_id);
         if self.active_download_passes.insert(job_id) {
             let _ = self
                 .event_tx
@@ -53,10 +54,8 @@ impl Pipeline {
             .unwrap_or(0)
             > 0;
 
-        if in_flight == 0 && !has_remaining_work && self.active_download_passes.remove(&job_id) {
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::DownloadFinished { job_id });
+        if in_flight == 0 && !has_remaining_work {
+            self.emit_download_finished_if_active(job_id);
             self.schedule_job_completion_check(job_id);
         }
     }
@@ -425,12 +424,13 @@ impl Pipeline {
 
     /// Handle a completed download — queue for decode.
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
-        self.active_downloads -= 1;
+        self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.is_recovery {
-            self.active_recovery -= 1;
+            self.active_recovery = self.active_recovery.saturating_sub(1);
         }
 
         let job_id = result.segment_id.file_id.job_id;
+        self.note_download_activity(job_id);
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {

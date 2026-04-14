@@ -166,6 +166,7 @@ impl Pipeline {
         self.clear_job_extraction_runtime(job_id);
         self.active_download_passes.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
+        self.job_last_download_activity.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);

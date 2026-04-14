@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc};
@@ -51,6 +52,8 @@ use self::archive::rar_state::RarSetState;
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const FILE_PROGRESS_FLUSH_DELTA_BYTES: u64 = 4 * 1024 * 1024;
+const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const STALLED_DOWNLOAD_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 /// Result of a download task.
 pub(super) struct DownloadResult {
@@ -210,6 +213,8 @@ pub struct Pipeline {
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
     /// In-flight decode task count per job.
     pub(super) active_decodes_by_job: HashMap<JobId, usize>,
+    /// Last time a job made observable progress in the download stage.
+    pub(super) job_last_download_activity: HashMap<JobId, Instant>,
     /// Delayed retry tasks that have been scheduled but not yet re-queued.
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Directory for active downloads (per-job subdirectories).
