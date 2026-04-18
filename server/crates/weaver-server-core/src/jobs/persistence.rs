@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
+
 use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
@@ -10,6 +12,32 @@ use crate::jobs::record::{
 use crate::persistence::Database;
 
 use super::repository::db_err;
+
+fn active_job_exists(conn: &rusqlite::Connection, job_id: JobId) -> Result<bool, StateError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM active_jobs WHERE job_id = ?1 LIMIT 1",
+            [job_id.0 as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_err)?
+        .is_some();
+    Ok(exists)
+}
+
+fn active_job_exists_tx(tx: &rusqlite::Transaction<'_>, job_id: JobId) -> Result<bool, StateError> {
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM active_jobs WHERE job_id = ?1 LIMIT 1",
+            [job_id.0 as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_err)?
+        .is_some();
+    Ok(exists)
+}
 
 impl Database {
     pub fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
@@ -129,6 +157,8 @@ impl Database {
         }
         let conn = self.conn();
         let tx = conn.unchecked_transaction().map_err(db_err)?;
+        let mut known_active_jobs = HashSet::new();
+        let mut missing_jobs = HashSet::new();
         {
             let mut stmt = tx
                 .prepare_cached(
@@ -138,6 +168,17 @@ impl Database {
                 )
                 .map_err(db_err)?;
             for seg in segments {
+                if missing_jobs.contains(&seg.job_id) {
+                    continue;
+                }
+                if !known_active_jobs.contains(&seg.job_id) {
+                    if active_job_exists_tx(&tx, seg.job_id)? {
+                        known_active_jobs.insert(seg.job_id);
+                    } else {
+                        missing_jobs.insert(seg.job_id);
+                        continue;
+                    }
+                }
                 stmt.execute(rusqlite::params![
                     seg.job_id.0 as i64,
                     seg.file_index,
@@ -162,6 +203,8 @@ impl Database {
         }
         let conn = self.conn();
         let tx = conn.unchecked_transaction().map_err(db_err)?;
+        let mut known_active_jobs = HashSet::new();
+        let mut missing_jobs = HashSet::new();
         {
             let mut stmt = tx
                 .prepare_cached(
@@ -176,6 +219,17 @@ impl Database {
                 )
                 .map_err(db_err)?;
             for entry in progress {
+                if missing_jobs.contains(&entry.job_id) {
+                    continue;
+                }
+                if !known_active_jobs.contains(&entry.job_id) {
+                    if active_job_exists_tx(&tx, entry.job_id)? {
+                        known_active_jobs.insert(entry.job_id);
+                    } else {
+                        missing_jobs.insert(entry.job_id);
+                        continue;
+                    }
+                }
                 stmt.execute(rusqlite::params![
                     entry.job_id.0 as i64,
                     entry.file_index,
@@ -206,12 +260,14 @@ impl Database {
         md5: &[u8; 16],
     ) -> Result<(), StateError> {
         let conn = self.conn();
-        conn.execute(
-            "INSERT OR IGNORE INTO active_files (job_id, file_index, filename, md5)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![job_id.0 as i64, file_index, filename, md5.as_slice()],
-        )
-        .map_err(db_err)?;
+        if active_job_exists(&conn, job_id)? {
+            conn.execute(
+                "INSERT OR IGNORE INTO active_files (job_id, file_index, filename, md5)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![job_id.0 as i64, file_index, filename, md5.as_slice()],
+            )
+            .map_err(db_err)?;
+        }
         conn.execute(
             "DELETE FROM active_file_progress WHERE job_id = ?1 AND file_index = ?2",
             rusqlite::params![job_id.0 as i64, file_index],
@@ -247,6 +303,9 @@ impl Database {
         recovery_block_count: u32,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_par2 (job_id, slice_size, recovery_block_count)
              VALUES (?1, ?2, ?3)",
@@ -265,6 +324,9 @@ impl Database {
         promoted: bool,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_par2_files
              (job_id, file_index, filename, recovery_block_count, promoted)
@@ -302,6 +364,9 @@ impl Database {
         members: &HashSet<String>,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         let tx = conn.unchecked_transaction().map_err(db_err)?;
         tx.execute(
             "DELETE FROM active_failed_extractions WHERE job_id = ?1",
@@ -330,6 +395,9 @@ impl Database {
         member_name: &str,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR IGNORE INTO active_failed_extractions (job_id, member_name)
              VALUES (?1, ?2)",
@@ -375,6 +443,9 @@ impl Database {
         volumes: &HashSet<u32>,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         let tx = conn.unchecked_transaction().map_err(db_err)?;
         tx.execute(
             "DELETE FROM active_rar_verified_suspect
@@ -416,6 +487,9 @@ impl Database {
         output_path: &Path,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR IGNORE INTO active_extracted (job_id, member_name, output_path)
              VALUES (?1, ?2, ?3)",
@@ -441,6 +515,9 @@ impl Database {
 
     pub fn insert_extraction_chunk(&self, chunk: &ActiveExtractionChunk) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, chunk.job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_extraction_chunks
              (job_id, set_name, member_name, volume_index, bytes_written, temp_path,
@@ -486,6 +563,9 @@ impl Database {
         chunks: &[ExtractionChunk],
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute_batch("BEGIN").map_err(db_err)?;
 
         conn.execute(
@@ -567,6 +647,9 @@ impl Database {
         headers: &[u8],
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_archive_headers (job_id, set_name, headers)
              VALUES (?1, ?2, ?3)",
@@ -594,6 +677,9 @@ impl Database {
         facts_blob: &[u8],
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_rar_volume_facts
              (job_id, set_name, volume_index, facts_blob)
@@ -624,6 +710,9 @@ impl Database {
         deleted: bool,
     ) -> Result<(), StateError> {
         let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR REPLACE INTO active_volume_status
              (job_id, set_name, volume_index, extracted, par2_clean, deleted)

@@ -58,6 +58,10 @@ impl Default for BufferPoolConfig {
 }
 
 impl BufferPoolConfig {
+    /// On uncapped hosts, keep idle/runtime provisioning within the existing
+    /// 4–8 GiB tier instead of scaling buffers with very large available RAM.
+    const UNCAPPED_HOST_MEMORY_CAP_BYTES: u64 = (8 * 1024 * 1024 * 1024) - 1;
+
     /// Total memory this pool will allocate.
     pub fn total_bytes(&self) -> usize {
         self.small_count * BufferTier::Small.size_bytes()
@@ -102,6 +106,20 @@ impl BufferPoolConfig {
             medium_count: medium,
             large_count: large,
         }
+    }
+
+    /// Runtime sizing policy:
+    /// - respect explicit cgroup limits
+    /// - otherwise cap uncapped hosts to the existing 4–8 GiB tier
+    pub fn for_runtime_memory(available_bytes: u64, cgroup_limit: Option<u64>) -> Self {
+        Self::for_available_memory(Self::runtime_sizing_memory_bytes(
+            available_bytes,
+            cgroup_limit,
+        ))
+    }
+
+    pub fn runtime_sizing_memory_bytes(available_bytes: u64, cgroup_limit: Option<u64>) -> u64 {
+        cgroup_limit.unwrap_or_else(|| available_bytes.min(Self::UNCAPPED_HOST_MEMORY_CAP_BYTES))
     }
 
     /// Recommended write buffer max_pending for this memory tier.

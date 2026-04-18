@@ -126,6 +126,20 @@ fn config_total_bytes() {
 }
 
 #[test]
+fn runtime_memory_caps_uncapped_hosts_but_respects_cgroup_limits() {
+    let uncapped = BufferPoolConfig::for_runtime_memory(32 * 1024 * 1024 * 1024, None);
+    assert_eq!(uncapped.small_count, 192);
+    assert_eq!(uncapped.medium_count, 24);
+    assert_eq!(uncapped.large_count, 6);
+
+    let capped =
+        BufferPoolConfig::for_runtime_memory(32 * 1024 * 1024 * 1024, Some(1536 * 1024 * 1024));
+    assert_eq!(capped.small_count, 64);
+    assert_eq!(capped.medium_count, 8);
+    assert_eq!(capped.large_count, 2);
+}
+
+#[test]
 #[should_panic(expected = "len exceeds buffer capacity")]
 fn set_len_panics_on_overflow() {
     let rt = tokio::runtime::Builder::new_current_thread()

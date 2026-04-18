@@ -539,3 +539,168 @@ fn deleted_volume_statuses_roundtrip() {
         vec![("set-a".to_string(), 0), ("set-b".to_string(), 4)]
     );
 }
+
+#[test]
+fn late_active_state_writes_noop_after_archive() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.archive_job(
+        JobId(1),
+        &JobHistoryRow {
+            job_id: 1,
+            name: "test.nzb".to_string(),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 10,
+            downloaded_bytes: 10,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: Some("/tmp/output_1".to_string()),
+            nzb_path: Some("/tmp/test_1.nzb".to_string()),
+            created_at: 1_700_000_001,
+            completed_at: 1_700_000_010,
+            metadata: None,
+        },
+    )
+    .unwrap();
+
+    db.commit_segments(&sample_segments(1, 3)).unwrap();
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
+        job_id: JobId(1),
+        file_index: 0,
+        contiguous_bytes_written: 4096,
+    }])
+    .unwrap();
+    db.complete_file(JobId(1), 0, "late.rar", &[0x11; 16])
+        .unwrap();
+    db.set_par2_metadata(JobId(1), 384000, 8).unwrap();
+    db.upsert_par2_file(JobId(1), 4, "repair.par2", 12, false)
+        .unwrap();
+    db.replace_failed_extractions(JobId(1), &HashSet::from(["bad.mkv".to_string()]))
+        .unwrap();
+    db.add_failed_extraction(JobId(1), "another.mkv").unwrap();
+    db.replace_verified_suspect_volumes(JobId(1), "show", &HashSet::from([1u32, 2u32]))
+        .unwrap();
+    db.add_extracted_member(JobId(1), "movie.mkv", Path::new("/tmp/output_1/movie.mkv"))
+        .unwrap();
+    db.insert_extraction_chunk(&crate::jobs::record::ActiveExtractionChunk {
+        job_id: JobId(1),
+        set_name: "set".into(),
+        member_name: "movie.mkv".into(),
+        volume_index: 0,
+        bytes_written: 123,
+        temp_path: "/tmp/chunk0".into(),
+        start_offset: 0,
+        end_offset: 123,
+    })
+    .unwrap();
+    db.replace_member_chunks(
+        JobId(1),
+        "set",
+        "movie.mkv",
+        &[ExtractionChunk {
+            member_name: "movie.mkv".into(),
+            volume_index: 0,
+            bytes_written: 123,
+            temp_path: "/tmp/chunk0".into(),
+            start_offset: 0,
+            end_offset: 123,
+            verified: true,
+            appended: false,
+        }],
+    )
+    .unwrap();
+    db.save_archive_headers(JobId(1), "set", &[1, 2, 3])
+        .unwrap();
+    db.save_rar_volume_facts(JobId(1), "set", 0, &[4, 5, 6])
+        .unwrap();
+    db.set_volume_status(JobId(1), "set", 0, true, true, true)
+        .unwrap();
+
+    let conn = db.conn();
+    for table in [
+        "active_segments",
+        "active_file_progress",
+        "active_files",
+        "active_par2",
+        "active_par2_files",
+        "active_failed_extractions",
+        "active_rar_verified_suspect",
+        "active_extracted",
+        "active_extraction_chunks",
+        "active_archive_headers",
+        "active_rar_volume_facts",
+        "active_volume_status",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} should remain empty after late writes");
+    }
+}
+
+#[test]
+fn prune_orphan_active_state_removes_only_orphans() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.commit_segments(&sample_segments(1, 1)).unwrap();
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
+        job_id: JobId(1),
+        file_index: 0,
+        contiguous_bytes_written: 2048,
+    }])
+    .unwrap();
+
+    {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO active_segments
+             (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
+             VALUES (99, 0, 0, 0, 10, 123)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO active_file_progress
+             (job_id, file_index, contiguous_bytes_written)
+             VALUES (100, 0, 1024)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO active_archive_headers (job_id, set_name, headers)
+             VALUES (101, 'set', x'0102')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let counts = db.prune_orphan_active_state().unwrap();
+    assert_eq!(counts.active_segments, 1);
+    assert_eq!(counts.active_file_progress, 1);
+    assert_eq!(counts.active_archive_headers, 1);
+    assert_eq!(counts.total_removed(), 3);
+
+    let conn = db.conn();
+    let remaining_segments: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM active_segments WHERE job_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let remaining_progress: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_segments, 1);
+    assert_eq!(remaining_progress, 1);
+}

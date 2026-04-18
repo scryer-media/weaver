@@ -28,14 +28,22 @@ pub(crate) fn build_runtime_context(output_dir: &Path) -> RuntimeContext {
         "system profile"
     );
 
-    let effective_memory = profile
-        .memory
-        .cgroup_limit
-        .unwrap_or(profile.memory.available_bytes);
-    let buf_config = BufferPoolConfig::for_available_memory(effective_memory);
+    let buffer_sizing_memory = BufferPoolConfig::runtime_sizing_memory_bytes(
+        profile.memory.available_bytes,
+        profile.memory.cgroup_limit,
+    );
+    let buf_config = BufferPoolConfig::for_runtime_memory(
+        profile.memory.available_bytes,
+        profile.memory.cgroup_limit,
+    );
     let write_buf_max = buf_config.write_buffer_max_pending();
     info!(
-        available_mb = effective_memory / (1024 * 1024),
+        available_mb = profile.memory.available_bytes / (1024 * 1024),
+        cgroup_limit_mb = profile
+            .memory
+            .cgroup_limit
+            .map(|value| value / (1024 * 1024)),
+        sizing_mb = buffer_sizing_memory / (1024 * 1024),
         total_mb = buf_config.total_bytes() / (1024 * 1024),
         small = buf_config.small_count,
         medium = buf_config.medium_count,

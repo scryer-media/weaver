@@ -3,8 +3,59 @@ use crate::history;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanActiveStateCounts {
+    pub active_segments: usize,
+    pub active_file_progress: usize,
+    pub active_files: usize,
+    pub active_par2: usize,
+    pub active_par2_files: usize,
+    pub active_extracted: usize,
+    pub active_failed_extractions: usize,
+    pub active_extraction_chunks: usize,
+    pub active_archive_headers: usize,
+    pub active_rar_volume_facts: usize,
+    pub active_volume_status: usize,
+    pub active_rar_verified_suspect: usize,
+}
+
+impl OrphanActiveStateCounts {
+    pub fn total_removed(self) -> usize {
+        self.active_segments
+            + self.active_file_progress
+            + self.active_files
+            + self.active_par2
+            + self.active_par2_files
+            + self.active_extracted
+            + self.active_failed_extractions
+            + self.active_extraction_chunks
+            + self.active_archive_headers
+            + self.active_rar_volume_facts
+            + self.active_volume_status
+            + self.active_rar_verified_suspect
+    }
+}
+
 pub(crate) fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
+}
+
+fn delete_orphan_rows(
+    tx: &rusqlite::Transaction<'_>,
+    table: &'static str,
+) -> Result<usize, StateError> {
+    let deleted = tx
+        .execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                 )"
+            ),
+            [],
+        )
+        .map_err(db_err)?;
+    Ok(deleted)
 }
 
 fn delete_active_job_rows(tx: &rusqlite::Transaction<'_>, id: i64) -> Result<(), StateError> {
@@ -99,6 +150,31 @@ impl Database {
         conn.execute_batch("PRAGMA incremental_vacuum")
             .map_err(db_err)?;
         Ok(())
+    }
+
+    pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        let counts = OrphanActiveStateCounts {
+            active_segments: delete_orphan_rows(&tx, "active_segments")?,
+            active_file_progress: delete_orphan_rows(&tx, "active_file_progress")?,
+            active_files: delete_orphan_rows(&tx, "active_files")?,
+            active_par2: delete_orphan_rows(&tx, "active_par2")?,
+            active_par2_files: delete_orphan_rows(&tx, "active_par2_files")?,
+            active_extracted: delete_orphan_rows(&tx, "active_extracted")?,
+            active_failed_extractions: delete_orphan_rows(&tx, "active_failed_extractions")?,
+            active_extraction_chunks: delete_orphan_rows(&tx, "active_extraction_chunks")?,
+            active_archive_headers: delete_orphan_rows(&tx, "active_archive_headers")?,
+            active_rar_volume_facts: delete_orphan_rows(&tx, "active_rar_volume_facts")?,
+            active_volume_status: delete_orphan_rows(&tx, "active_volume_status")?,
+            active_rar_verified_suspect: delete_orphan_rows(&tx, "active_rar_verified_suspect")?,
+        };
+        tx.commit().map_err(db_err)?;
+        if counts.total_removed() > 0 {
+            conn.execute_batch("PRAGMA incremental_vacuum")
+                .map_err(db_err)?;
+        }
+        Ok(counts)
     }
 }
 

@@ -1,6 +1,8 @@
 use super::*;
 use std::path::PathBuf;
 
+use crate::jobs::working_dir::WORKING_DIR_MARKER;
+
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -205,7 +207,10 @@ impl Pipeline {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let file_name = entry.file_name();
                 // Skip leftover chunk workspaces and staging dirs.
-                if file_name == ".weaver-chunks" || file_name == ".weaver-staging" {
+                if file_name == ".weaver-chunks"
+                    || file_name == ".weaver-staging"
+                    || file_name == WORKING_DIR_MARKER
+                {
                     continue;
                 }
                 let src = entry.path();
@@ -272,6 +277,18 @@ impl Pipeline {
                 dir = %staging.display(),
                 error = %e,
                 "failed to remove staging directory after move"
+            );
+        }
+
+        let marker_path = working_dir.join(WORKING_DIR_MARKER);
+        if let Err(error) = tokio::fs::remove_file(&marker_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %marker_path.display(),
+                error = %error,
+                "failed to remove working directory marker during final move"
             );
         }
 

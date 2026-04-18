@@ -58,7 +58,8 @@ pub(crate) async fn run(
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
 
     let recovered_state =
-        weaver_server_core::operations::recover_server_state(&db, &data_dir).await?;
+        weaver_server_core::operations::recover_server_state(&db, &data_dir, &intermediate_dir)
+            .await?;
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
     let initial_global_paused = recovered_state.initial_global_paused;

@@ -772,6 +772,12 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
         candidate
     };
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&working_dir),
+        [],
+    )
+    .await
+    .unwrap();
     pipeline
         .db
         .create_active_job(&crate::ActiveJob {

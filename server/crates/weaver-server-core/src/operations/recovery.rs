@@ -5,6 +5,7 @@ use tracing::{error, info, warn};
 
 use crate::Database;
 use crate::ingest;
+use crate::jobs::working_dir::is_weaver_owned_working_dir;
 use crate::runtime::load_global_pause_from_db;
 use crate::{JobInfo, JobStatus, RestoreJobRequest};
 
@@ -23,6 +24,7 @@ pub struct RestoreCandidate {
 pub async fn recover_server_state(
     db: &Database,
     data_dir: &Path,
+    intermediate_dir: &Path,
 ) -> Result<RecoveredServerState, Box<dyn std::error::Error>> {
     // One-time migration: convert binary journal to SQLite if it exists.
     let journal_path = data_dir.join(".weaver-journal");
@@ -39,10 +41,39 @@ pub async fn recover_server_state(
     }
     crate::ingest::init_job_counter(max_id + 1);
 
+    match db.prune_orphan_active_state() {
+        Ok(counts) if counts.total_removed() > 0 => {
+            info!(
+                active_segments = counts.active_segments,
+                active_file_progress = counts.active_file_progress,
+                active_files = counts.active_files,
+                active_par2 = counts.active_par2,
+                active_par2_files = counts.active_par2_files,
+                active_extracted = counts.active_extracted,
+                active_failed_extractions = counts.active_failed_extractions,
+                active_extraction_chunks = counts.active_extraction_chunks,
+                active_archive_headers = counts.active_archive_headers,
+                active_rar_volume_facts = counts.active_rar_volume_facts,
+                active_volume_status = counts.active_volume_status,
+                active_rar_verified_suspect = counts.active_rar_verified_suspect,
+                "removed orphaned active-state rows before recovery"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(error = %error, "failed to cleanup orphaned active-state rows before recovery");
+        }
+    }
+
     let active_jobs = db.load_active_jobs().unwrap_or_default();
     let mut referenced_nzb_paths: HashSet<PathBuf> = active_jobs
         .values()
         .map(|recovered| recovered.nzb_path.clone())
+        .collect();
+    let mut referenced_intermediate_dirs: HashSet<PathBuf> = active_jobs
+        .values()
+        .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
+        .map(|recovered| recovered.output_dir.clone())
         .collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
@@ -177,6 +208,12 @@ pub async fn recover_server_state(
                 if let Some(nzb_path) = row.nzb_path.as_ref() {
                     referenced_nzb_paths.insert(PathBuf::from(nzb_path));
                 }
+                if let Some(output_dir) = row.output_dir.as_ref() {
+                    let output_dir = PathBuf::from(output_dir);
+                    if output_dir.starts_with(intermediate_dir) {
+                        referenced_intermediate_dirs.insert(output_dir);
+                    }
+                }
                 let job_id = crate::jobs::ids::JobId(row.job_id);
                 // Skip if we already have this job from active_jobs recovery.
                 if initial_history.iter().any(|job| job.job_id == job_id) {
@@ -215,6 +252,24 @@ pub async fn recover_server_state(
         }
     }
 
+    match cleanup_unreferenced_intermediate_dirs(intermediate_dir, &referenced_intermediate_dirs) {
+        Ok(removed) if removed > 0 => {
+            info!(
+                removed,
+                intermediate_dir = %intermediate_dir.display(),
+                "removed unreferenced intermediate directories"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                error = %error,
+                intermediate_dir = %intermediate_dir.display(),
+                "failed to cleanup unreferenced intermediate directories"
+            );
+        }
+    }
+
     let nzb_dir = data_dir.join(".weaver-nzbs");
     match ingest::cleanup_orphaned_persisted_nzbs(&nzb_dir, &referenced_nzb_paths) {
         Ok(removed) if removed > 0 => {
@@ -249,6 +304,34 @@ pub async fn recover_server_state(
     })
 }
 
+fn cleanup_unreferenced_intermediate_dirs(
+    intermediate_dir: &Path,
+    referenced_dirs: &HashSet<PathBuf>,
+) -> Result<usize, std::io::Error> {
+    if !intermediate_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(intermediate_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_weaver_owned_working_dir(&path) {
+            continue;
+        }
+        if referenced_dirs.contains(&path) {
+            continue;
+        }
+        std::fs::remove_dir_all(&path)?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
 fn status_str_to_job_status(status: &str, error: Option<&str>) -> JobStatus {
     match status {
         "queued" => JobStatus::Queued,
@@ -270,5 +353,139 @@ fn status_str_to_job_status(status: &str, error: Option<&str>) -> JobStatus {
         other => JobStatus::Failed {
             error: format!("unknown status: {other}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recover_server_state;
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use crate::jobs::working_dir::working_dir_marker_path;
+    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId};
+
+    fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
+        ActiveJob {
+            job_id: JobId(id),
+            nzb_hash: [0xAA; 32],
+            nzb_path,
+            output_dir,
+            created_at: 1_700_000_000 + id,
+            category: None,
+            metadata: vec![],
+        }
+    }
+
+    fn sample_nzb_bytes() -> Vec<u8> {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="sample">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>
+              <segment bytes="10" number="1">abc@test</segment>
+            </segments>
+          </file>
+        </nzb>"#
+            .to_vec()
+    }
+
+    fn count_rows(db: &Database, table: &str, job_id: u64) -> i64 {
+        let conn = db.conn();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            [job_id as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_cleans_orphan_active_rows_and_unreferenced_intermediate_dirs() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let intermediate_dir = temp.path().join("intermediate");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&intermediate_dir).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let active_output_dir = intermediate_dir.join("active-job");
+        let history_output_dir = intermediate_dir.join("failed-history-job");
+        let orphan_output_dir = intermediate_dir.join("orphan-job");
+        let unrelated_output_dir = intermediate_dir.join("not-weaver-owned");
+        std::fs::create_dir_all(&active_output_dir).unwrap();
+        std::fs::create_dir_all(&history_output_dir).unwrap();
+        std::fs::create_dir_all(&orphan_output_dir).unwrap();
+        std::fs::create_dir_all(&unrelated_output_dir).unwrap();
+        std::fs::write(working_dir_marker_path(&active_output_dir), []).unwrap();
+        std::fs::write(working_dir_marker_path(&history_output_dir), []).unwrap();
+        std::fs::write(working_dir_marker_path(&orphan_output_dir), []).unwrap();
+
+        let nzb_path = data_dir.join("active-job.nzb");
+        std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
+
+        db.create_active_job(&sample_active_job(1, nzb_path, active_output_dir.clone()))
+            .unwrap();
+        db.commit_segments(&[CommittedSegment {
+            job_id: JobId(1),
+            file_index: 0,
+            segment_number: 0,
+            file_offset: 0,
+            decoded_size: 10,
+            crc32: 42,
+        }])
+        .unwrap();
+
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO active_segments
+                 (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
+                 VALUES (?1, 0, 0, 0, 10, 99)",
+                [99i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO active_file_progress
+                 (job_id, file_index, contiguous_bytes_written)
+                 VALUES (?1, 0, 1024)",
+                [100i64],
+            )
+            .unwrap();
+        }
+
+        db.insert_job_history(&JobHistoryRow {
+            job_id: 2,
+            name: "failed-history".to_string(),
+            status: "failed".to_string(),
+            error_message: Some("boom".to_string()),
+            total_bytes: 10,
+            downloaded_bytes: 5,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 5,
+            health: 100,
+            category: None,
+            output_dir: Some(history_output_dir.display().to_string()),
+            nzb_path: None,
+            created_at: 1_700_000_000,
+            completed_at: 1_700_000_100,
+            metadata: None,
+        })
+        .unwrap();
+
+        let recovered = recover_server_state(&db, &data_dir, &intermediate_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(count_rows(&db, "active_segments", 99), 0);
+        assert_eq!(count_rows(&db, "active_file_progress", 100), 0);
+        assert_eq!(count_rows(&db, "active_segments", 1), 1);
+        assert!(active_output_dir.exists());
+        assert!(history_output_dir.exists());
+        assert!(!orphan_output_dir.exists());
+        assert!(unrelated_output_dir.exists());
+        assert_eq!(recovered.to_restore.len(), 1);
     }
 }

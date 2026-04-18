@@ -8,7 +8,7 @@ use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::JobAssembly;
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
-use crate::jobs::working_dir::compute_working_dir;
+use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
 use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
@@ -26,6 +26,9 @@ impl Pipeline {
 
         let working_dir = compute_working_dir(&self.intermediate_dir, job_id, &spec.name);
         tokio::fs::create_dir_all(&working_dir)
+            .await
+            .map_err(crate::SchedulerError::Io)?;
+        tokio::fs::write(working_dir_marker_path(&working_dir), [])
             .await
             .map_err(crate::SchedulerError::Io)?;
         info!(
@@ -253,6 +256,18 @@ impl Pipeline {
                 .as_ref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| compute_working_dir(&self.intermediate_dir, job_id, &spec.name));
+            if working_dir.starts_with(&self.intermediate_dir)
+                && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
+                && let Err(error) =
+                    tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+            {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    dir = %working_dir.display(),
+                    error = %error,
+                    "failed to stamp reprocessed working directory as Weaver-owned"
+                );
+            }
 
             let all_segments = Self::all_segment_ids(job_id, &spec);
             let (assembly, download_queue, recovery_queue) =
@@ -479,6 +494,17 @@ impl Pipeline {
         } = request;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
+        }
+        if working_dir.starts_with(&self.intermediate_dir)
+            && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
+            && let Err(error) = tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+        {
+            tracing::warn!(
+                job_id = job_id.0,
+                dir = %working_dir.display(),
+                error = %error,
+                "failed to stamp restored working directory as Weaver-owned"
+            );
         }
 
         let committed_count = committed_segments.len();

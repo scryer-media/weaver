@@ -18,6 +18,23 @@ fn schema_version_is_set() {
 }
 
 #[test]
+fn open_applies_sqlite_memory_pragmas() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("weaver.db")).unwrap();
+    let conn = db.conn();
+
+    let cache_size: i64 = conn
+        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(cache_size, -16000);
+
+    let mmap_size: i64 = conn
+        .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mmap_size, 16 * 1024 * 1024);
+}
+
+#[test]
 fn migrate_v3_creates_extraction_chunks_with_appended_once() {
     let conn = Connection::open_in_memory().unwrap();
     // Create tables as they existed at v3 (no appended, no priority).
