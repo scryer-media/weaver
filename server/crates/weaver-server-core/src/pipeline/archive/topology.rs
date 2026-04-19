@@ -43,7 +43,7 @@ impl Pipeline {
             .collect()
     }
 
-    pub(in crate::pipeline::archive) async fn parse_rar_volume_facts_from_path(
+    pub(crate) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
         password: Option<String>,
     ) -> Result<weaver_rar::RarVolumeFacts, String> {
@@ -148,18 +148,18 @@ impl Pipeline {
         }
 
         for file_asm in state.assembly.files() {
-            let weaver_model::files::FileRole::RarVolume { volume_number } = file_asm.role() else {
+            let weaver_model::files::FileRole::RarVolume { volume_number } =
+                file_asm.effective_role()
+            else {
                 continue;
             };
-            let base_name =
-                weaver_model::files::archive_base_name(file_asm.filename(), file_asm.role());
-            if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
+            if file_asm.archive_set_name().as_deref() != Some(set_name) || !file_asm.is_complete() {
                 continue;
             }
             if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename())
                 && path.exists()
             {
-                volume_paths.entry(*volume_number).or_insert(path);
+                volume_paths.entry(volume_number).or_insert(path);
             }
         }
 
@@ -459,20 +459,18 @@ impl Pipeline {
                         return None;
                     }
                     let weaver_model::files::FileRole::RarVolume { volume_number } =
-                        file_asm.role()
+                        file_asm.effective_role()
                     else {
                         return None;
                     };
-                    let base_name = weaver_model::files::archive_base_name(
-                        file_asm.filename(),
-                        file_asm.role(),
-                    );
-                    if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
+                    if file_asm.archive_set_name().as_deref() != Some(set_name)
+                        || !file_asm.is_complete()
+                    {
                         return None;
                     }
                     let path = state.working_dir.join(file_asm.filename());
                     path.exists()
-                        .then_some((*volume_number, file_asm.filename().to_string(), path))
+                        .then_some((volume_number, file_asm.filename().to_string(), path))
                 })
                 .collect()
         };
@@ -571,15 +569,15 @@ impl Pipeline {
             }
         }
         for file_asm in state.assembly.files() {
-            let weaver_model::files::FileRole::RarVolume { volume_number } = file_asm.role() else {
+            let weaver_model::files::FileRole::RarVolume { volume_number } =
+                file_asm.effective_role()
+            else {
                 continue;
             };
-            let base_name =
-                weaver_model::files::archive_base_name(file_asm.filename(), file_asm.role());
-            if base_name.as_deref() == Some(set_name) && file_asm.is_complete() {
+            if file_asm.archive_set_name().as_deref() == Some(set_name) && file_asm.is_complete() {
                 volume_map
                     .entry(file_asm.filename().to_string())
-                    .or_insert(*volume_number);
+                    .or_insert(volume_number);
             }
         }
         volume_map
@@ -700,15 +698,12 @@ impl Pipeline {
                     .assembly
                     .files()
                     .filter_map(|file_asm| {
-                        let weaver_model::files::FileRole::RarVolume { .. } = file_asm.role()
+                        let weaver_model::files::FileRole::RarVolume { .. } =
+                            file_asm.effective_role()
                         else {
                             return None;
                         };
-                        let base_name = weaver_model::files::archive_base_name(
-                            file_asm.filename(),
-                            file_asm.role(),
-                        );
-                        if base_name.as_deref() != Some(set_name.as_str())
+                        if file_asm.archive_set_name().as_deref() != Some(set_name.as_str())
                             || !file_asm.is_complete()
                         {
                             return None;
@@ -785,43 +780,43 @@ impl Pipeline {
     /// When a RAR volume file completes, rebuild topology from the persistent
     /// multi-volume header snapshot instead of inferring spans by volume order.
     pub(crate) async fn try_update_archive_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let (volume_number, filename, path, password) = {
+        let (observed_volume, filename, set_name, path, password) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
             let Some(file_asm) = state.assembly.file(file_id) else {
                 return;
             };
-            let vol = match file_asm.role() {
-                weaver_model::files::FileRole::RarVolume { volume_number } => *volume_number,
-                _ => return,
+            let weaver_model::files::FileRole::RarVolume { volume_number } =
+                file_asm.effective_role()
+            else {
+                return;
+            };
+            let Some(set_name) = file_asm.archive_set_name() else {
+                return;
             };
             (
-                vol,
+                volume_number,
                 file_asm.filename().to_string(),
+                set_name,
                 state.working_dir.join(file_asm.filename()),
                 state.spec.password.clone(),
             )
         };
 
-        let set_name = weaver_model::files::archive_base_name(
-            &filename,
-            &weaver_model::files::FileRole::RarVolume { volume_number },
-        )
-        .unwrap_or_else(|| "rar".into());
-
         match Self::parse_rar_volume_facts_from_path(path, password).await {
             Ok(facts) => {
+                let parsed_volume = facts.volume_number;
                 if let Err(error) = self.persist_rar_volume_facts(
                     job_id,
                     &set_name,
                     &filename,
-                    Some(volume_number),
+                    Some(observed_volume),
                     facts,
                 ) {
                     warn!(
                         job_id = job_id.0,
-                        volume = volume_number,
+                        volume = parsed_volume,
                         set_name = %set_name,
                         error = %error,
                         "failed to register RAR volume facts"
@@ -830,14 +825,14 @@ impl Pipeline {
                 }
                 debug!(
                     job_id = job_id.0,
-                    volume = volume_number,
+                    volume = parsed_volume,
                     set_name = %set_name,
                     "RAR volume facts parsed"
                 );
                 if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
                     warn!(
                         job_id = job_id.0,
-                        volume = volume_number,
+                        volume = parsed_volume,
                         set_name = %set_name,
                         error,
                         "failed to recompute RAR set state"
@@ -846,7 +841,7 @@ impl Pipeline {
             }
             Err(error) => warn!(
                 job_id = job_id.0,
-                volume = volume_number,
+                filename = %filename,
                 set_name = %set_name,
                 error,
                 "failed to parse RAR volume facts"
@@ -867,9 +862,9 @@ impl Pipeline {
             return;
         };
 
-        let role = file_asm.role().clone();
+        let role = file_asm.effective_role();
         let filename = file_asm.filename().to_string();
-        let set_name = match weaver_model::files::archive_base_name(&filename, &role) {
+        let set_name = match file_asm.archive_set_name() {
             Some(name) => name,
             None => return,
         };
@@ -936,12 +931,12 @@ impl Pipeline {
                 let mut volume_map = std::collections::HashMap::new();
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
-                    if let weaver_model::files::FileRole::SevenZipSplit { number: n } = f.role() {
-                        let f_base = weaver_model::files::archive_base_name(f.filename(), f.role());
-                        if f_base.as_deref() == Some(&set_name) {
-                            volume_map.insert(f.filename().to_string(), *n);
-                            max_number = max_number.max(*n);
-                        }
+                    if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
+                        f.effective_role()
+                        && f.archive_set_name().as_deref() == Some(&set_name)
+                    {
+                        volume_map.insert(f.filename().to_string(), n);
+                        max_number = max_number.max(n);
                     }
                 }
 
@@ -970,13 +965,11 @@ impl Pipeline {
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
-                        if let weaver_model::files::FileRole::SevenZipSplit { number: n } = f.role()
+                        if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
+                            f.effective_role()
+                            && f.archive_set_name().as_deref() == Some(&set_name)
                         {
-                            let f_base =
-                                weaver_model::files::archive_base_name(f.filename(), f.role());
-                            if f_base.as_deref() == Some(&set_name) {
-                                return Some(*n);
-                            }
+                            return Some(n);
                         }
                         None
                     })
@@ -1074,12 +1067,12 @@ impl Pipeline {
                 let mut volume_map = std::collections::HashMap::new();
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
-                    if let weaver_model::files::FileRole::SplitFile { number: n } = f.role() {
-                        let f_base = weaver_model::files::archive_base_name(f.filename(), f.role());
-                        if f_base.as_deref() == Some(&set_name) {
-                            volume_map.insert(f.filename().to_string(), *n);
-                            max_number = max_number.max(*n);
-                        }
+                    if let weaver_model::files::FileRole::SplitFile { number: n } =
+                        f.effective_role()
+                        && f.archive_set_name().as_deref() == Some(&set_name)
+                    {
+                        volume_map.insert(f.filename().to_string(), n);
+                        max_number = max_number.max(n);
                     }
                 }
 
@@ -1108,12 +1101,11 @@ impl Pipeline {
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
-                        if let weaver_model::files::FileRole::SplitFile { number: n } = f.role() {
-                            let f_base =
-                                weaver_model::files::archive_base_name(f.filename(), f.role());
-                            if f_base.as_deref() == Some(&set_name) {
-                                return Some(*n);
-                            }
+                        if let weaver_model::files::FileRole::SplitFile { number: n } =
+                            f.effective_role()
+                            && f.archive_set_name().as_deref() == Some(&set_name)
+                        {
+                            return Some(n);
                         }
                         None
                     })

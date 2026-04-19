@@ -186,11 +186,10 @@ impl Pipeline {
                     if !normalized_files.contains(file.filename()) {
                         return None;
                     }
-                    match file.role() {
-                        weaver_model::files::FileRole::RarVolume { .. } => {
-                            weaver_model::files::archive_base_name(file.filename(), file.role())
-                                .map(|set_name| (set_name, file.filename().to_string()))
-                        }
+                    match file.effective_role() {
+                        weaver_model::files::FileRole::RarVolume { .. } => file
+                            .archive_set_name()
+                            .map(|set_name| (set_name, file.filename().to_string())),
                         _ => None,
                     }
                 })
@@ -420,7 +419,7 @@ impl Pipeline {
 
         let mut has_rar = false;
         for file in state.assembly.files() {
-            match file.role() {
+            match file.effective_role() {
                 weaver_model::files::FileRole::RarVolume { .. } => has_rar = true,
                 weaver_model::files::FileRole::SevenZipArchive
                 | weaver_model::files::FileRole::SevenZipSplit { .. } => return false,
@@ -450,9 +449,10 @@ impl Pipeline {
         }
 
         for file in state.assembly.files() {
-            if matches!(file.role(), weaver_model::files::FileRole::RarVolume { .. })
-                && let Some(set_name) =
-                    weaver_model::files::archive_base_name(file.filename(), file.role())
+            if matches!(
+                file.effective_role(),
+                weaver_model::files::FileRole::RarVolume { .. }
+            ) && let Some(set_name) = file.archive_set_name()
             {
                 set_names.insert(set_name);
             }
@@ -470,7 +470,7 @@ impl Pipeline {
                 .files()
                 .filter(|f| {
                     matches!(
-                        f.role(),
+                        f.effective_role(),
                         weaver_model::files::FileRole::Par2 { .. }
                             | weaver_model::files::FileRole::RarVolume { .. }
                             | weaver_model::files::FileRole::SevenZipArchive
@@ -802,6 +802,7 @@ impl Pipeline {
             for mut retry_file in retry_files {
                 if let Some(file_asm) = state.assembly.file_mut(retry_file.file_id) {
                     file_asm.reset();
+                    file_asm.clear_detected_archive();
                 }
 
                 for topo in state.assembly.archive_topologies_mut().values_mut() {

@@ -1,4 +1,7 @@
-use crate::jobs::assembly::{ArchiveMember, ArchiveTopology, ArchiveType};
+use crate::jobs::assembly::{
+    ArchiveMember, ArchiveTopology, ArchiveType, DetectedArchiveIdentity,
+    DetectedArchiveKind as PersistedDetectedArchiveKind,
+};
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::Pipeline;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +20,7 @@ pub(crate) struct ArchiveProbeCandidate {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum DetectedArchiveKind {
+pub(crate) enum ProbedArchiveKind {
     Rar {
         facts: weaver_rar::RarVolumeFacts,
     },
@@ -31,8 +34,8 @@ pub(crate) enum DetectedArchiveKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DetectedArchiveRegistration {
-    pub(crate) set_name: String,
-    pub(crate) kind: DetectedArchiveKind,
+    pub(crate) identity: DetectedArchiveIdentity,
+    pub(crate) kind: ProbedArchiveKind,
 }
 
 impl Pipeline {
@@ -45,10 +48,10 @@ impl Pipeline {
             .jobs
             .get(&job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .map(|file| file.role().clone())
         {
-            Some(role) => role,
+            Some(file) if file.is_complete() => file.effective_role(),
             None => return,
+            Some(_) => return,
         };
 
         match role {
@@ -57,6 +60,7 @@ impl Pipeline {
             }
             FileRole::SevenZipArchive
             | FileRole::SevenZipSplit { .. }
+            | FileRole::SplitFile { .. }
             | FileRole::ZipArchive
             | FileRole::TarArchive
             | FileRole::TarGzArchive
@@ -65,8 +69,7 @@ impl Pipeline {
             | FileRole::DeflateArchive
             | FileRole::BrotliArchive
             | FileRole::ZstdArchive
-            | FileRole::Bzip2Archive
-            | FileRole::SplitFile { .. } => {
+            | FileRole::Bzip2Archive => {
                 self.try_update_7z_topology(job_id, file_id);
             }
             _ => {}
@@ -101,24 +104,39 @@ impl Pipeline {
             return;
         };
 
+        if let Err(error) = self.persist_detected_archive_identity(
+            job_id,
+            candidate.file_id,
+            &registration.identity,
+        ) {
+            tracing::warn!(
+                job_id = job_id.0,
+                file_id = %file_id,
+                set_name = %registration.identity.set_name,
+                error = %error,
+                "failed to persist detected archive identity"
+            );
+            return;
+        }
+
         match registration.kind {
-            DetectedArchiveKind::Rar { facts } => {
+            ProbedArchiveKind::Rar { facts } => {
                 match self.persist_rar_volume_facts(
                     job_id,
-                    &registration.set_name,
+                    &registration.identity.set_name,
                     &candidate.filename,
                     None,
                     facts,
                 ) {
                     Ok(_) => {
                         if let Err(error) = self
-                            .recompute_rar_set_state(job_id, &registration.set_name)
+                            .recompute_rar_set_state(job_id, &registration.identity.set_name)
                             .await
                         {
                             tracing::warn!(
                                 job_id = job_id.0,
                                 file_id = %file_id,
-                                set_name = %registration.set_name,
+                                set_name = %registration.identity.set_name,
                                 error,
                                 "failed to recompute detected RAR set state"
                             );
@@ -128,30 +146,53 @@ impl Pipeline {
                         tracing::warn!(
                             job_id = job_id.0,
                             file_id = %file_id,
-                            set_name = %registration.set_name,
+                            set_name = %registration.identity.set_name,
                             error = %error,
                             "failed to register detected RAR volume"
                         );
                     }
                 }
             }
-            DetectedArchiveKind::SevenZipSingle => {
-                self.register_detected_seven_zip_single(job_id, &registration.set_name, &candidate);
+            ProbedArchiveKind::SevenZipSingle => {
+                self.register_detected_seven_zip_single(
+                    job_id,
+                    &registration.identity.set_name,
+                    &candidate,
+                );
             }
-            DetectedArchiveKind::SevenZipSplit {
+            ProbedArchiveKind::SevenZipSplit {
                 volume_map,
                 complete_volumes,
                 expected_volume_count,
             } => {
                 self.register_detected_seven_zip_split(
                     job_id,
-                    &registration.set_name,
+                    &registration.identity.set_name,
                     volume_map,
                     complete_volumes,
                     expected_volume_count,
                 );
             }
         }
+    }
+
+    fn persist_detected_archive_identity(
+        &mut self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        identity: &DetectedArchiveIdentity,
+    ) -> Result<(), String> {
+        self.db
+            .save_detected_archive_identity(job_id, file_id.file_index, identity)
+            .map_err(|error| format!("failed to save detected archive identity: {error}"))?;
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        let Some(file) = state.assembly.file_mut(file_id) else {
+            return Ok(());
+        };
+        file.set_detected_archive(identity.clone());
+        Ok(())
     }
 
     fn archive_probe_candidate(
@@ -161,7 +202,10 @@ impl Pipeline {
     ) -> Option<ArchiveProbeCandidate> {
         let state = self.jobs.get(&job_id)?;
         let file = state.assembly.file(file_id)?;
-        let role = file.role();
+        if file.detected_archive().is_some() || !file.is_complete() {
+            return None;
+        }
+        let role = file.declared_role();
 
         match role {
             FileRole::Unknown | FileRole::SplitFile { .. } => {}
@@ -193,22 +237,34 @@ impl Pipeline {
 
         if let Ok(facts) = Self::parse_rar_volume_facts_from_path(path.clone(), password).await {
             return Ok(Some(DetectedArchiveRegistration {
-                set_name: candidate.set_key.clone(),
-                kind: DetectedArchiveKind::Rar { facts },
+                identity: DetectedArchiveIdentity {
+                    kind: PersistedDetectedArchiveKind::Rar,
+                    set_name: candidate.set_key.clone(),
+                    volume_index: Some(facts.volume_number),
+                },
+                kind: ProbedArchiveKind::Rar { facts },
             }));
         }
 
         if candidate.numeric_suffix.is_some()
-            && self.detected_archive_type(job_id, &candidate.set_key) == Some(ArchiveType::SevenZip)
+            && self.known_detected_archive_kind(job_id, &candidate.set_key)
+                == Some(PersistedDetectedArchiveKind::SevenZipSplit)
         {
             let Some((volume_map, complete_volumes, expected_volume_count)) =
                 self.detected_seven_zip_split_group(job_id, &candidate.set_key)
             else {
                 return Ok(None);
             };
+            let Some(volume_index) = volume_map.get(&candidate.filename).copied() else {
+                return Ok(None);
+            };
             return Ok(Some(DetectedArchiveRegistration {
-                set_name: candidate.set_key.clone(),
-                kind: DetectedArchiveKind::SevenZipSplit {
+                identity: DetectedArchiveIdentity {
+                    kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                    set_name: candidate.set_key.clone(),
+                    volume_index: Some(volume_index),
+                },
+                kind: ProbedArchiveKind::SevenZipSplit {
                     volume_map,
                     complete_volumes,
                     expected_volume_count,
@@ -226,9 +282,16 @@ impl Pipeline {
             else {
                 return Ok(None);
             };
+            let Some(volume_index) = volume_map.get(&candidate.filename).copied() else {
+                return Ok(None);
+            };
             return Ok(Some(DetectedArchiveRegistration {
-                set_name: candidate.set_key.clone(),
-                kind: DetectedArchiveKind::SevenZipSplit {
+                identity: DetectedArchiveIdentity {
+                    kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                    set_name: candidate.set_key.clone(),
+                    volume_index: Some(volume_index),
+                },
+                kind: ProbedArchiveKind::SevenZipSplit {
                     volume_map,
                     complete_volumes,
                     expected_volume_count,
@@ -237,19 +300,29 @@ impl Pipeline {
         }
 
         Ok(Some(DetectedArchiveRegistration {
-            set_name: candidate.set_key.clone(),
-            kind: DetectedArchiveKind::SevenZipSingle,
+            identity: DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::SevenZipSingle,
+                set_name: candidate.set_key.clone(),
+                volume_index: None,
+            },
+            kind: ProbedArchiveKind::SevenZipSingle,
         }))
     }
 
-    fn detected_archive_type(&self, job_id: JobId, set_key: &str) -> Option<ArchiveType> {
-        self.jobs
-            .get(&job_id)
-            .and_then(|state| state.assembly.archive_topology_for(set_key))
-            .map(|topology| topology.archive_type)
+    fn known_detected_archive_kind(
+        &self,
+        job_id: JobId,
+        set_key: &str,
+    ) -> Option<PersistedDetectedArchiveKind> {
+        self.jobs.get(&job_id).and_then(|state| {
+            state.assembly.files().find_map(|file| {
+                let detected = file.detected_archive()?;
+                (detected.set_name == set_key).then_some(detected.kind.clone())
+            })
+        })
     }
 
-    async fn path_has_7z_signature(path: PathBuf) -> Result<bool, String> {
+    pub(crate) async fn path_has_7z_signature(path: PathBuf) -> Result<bool, String> {
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::open(&path)
                 .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
@@ -274,7 +347,7 @@ impl Pipeline {
             .assembly
             .files()
             .filter_map(|file| {
-                let role = file.role();
+                let role = file.declared_role();
                 if !matches!(role, FileRole::Unknown | FileRole::SplitFile { .. }) {
                     return None;
                 }
@@ -368,7 +441,10 @@ impl Pipeline {
     }
 }
 
-fn probe_set_key_and_suffix(filename: &str, role: &FileRole) -> Option<(String, Option<u32>)> {
+pub(crate) fn probe_set_key_and_suffix(
+    filename: &str,
+    role: &FileRole,
+) -> Option<(String, Option<u32>)> {
     match role {
         FileRole::SplitFile { .. } => {
             let (set_key, numeric_suffix) = numeric_suffix_set_key(filename)?;

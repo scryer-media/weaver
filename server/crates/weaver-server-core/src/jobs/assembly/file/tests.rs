@@ -51,3 +51,24 @@ fn segment_out_of_range() {
     let mut asm = make_assembly(vec![500]);
     assert!(asm.commit_segment(1, 500).is_err());
 }
+
+#[test]
+fn detected_archive_overlay_preserves_declared_role_and_set_name() {
+    let file_id = NzbFileId {
+        job_id: JobId(1),
+        file_index: 0,
+    };
+    let mut asm = FileAssembly::new(file_id, "release.2024".into(), FileRole::Unknown, vec![1]);
+    asm.set_detected_archive(DetectedArchiveIdentity {
+        kind: DetectedArchiveKind::Rar,
+        set_name: "release.2024".to_string(),
+        volume_index: Some(7),
+    });
+
+    assert!(matches!(asm.role(), FileRole::Unknown));
+    assert!(matches!(
+        asm.effective_role(),
+        FileRole::RarVolume { volume_number: 7 }
+    ));
+    assert_eq!(asm.archive_set_name().as_deref(), Some("release.2024"));
+}

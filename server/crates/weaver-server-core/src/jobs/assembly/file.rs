@@ -1,14 +1,63 @@
 use crate::jobs::ids::NzbFileId;
 use bitvec::prelude::*;
+use serde::{Deserialize, Serialize};
 use weaver_model::files::FileRole;
 
 use super::error::AssemblyError;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectedArchiveKind {
+    Rar,
+    SevenZipSingle,
+    SevenZipSplit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedArchiveIdentity {
+    pub kind: DetectedArchiveKind,
+    pub set_name: String,
+    pub volume_index: Option<u32>,
+}
+
+impl DetectedArchiveIdentity {
+    pub fn effective_role(&self) -> FileRole {
+        match self.kind {
+            DetectedArchiveKind::Rar => FileRole::RarVolume {
+                volume_number: self.volume_index.unwrap_or(0),
+            },
+            DetectedArchiveKind::SevenZipSingle => FileRole::SevenZipArchive,
+            DetectedArchiveKind::SevenZipSplit => FileRole::SevenZipSplit {
+                number: self.volume_index.unwrap_or(0),
+            },
+        }
+    }
+}
+
+impl DetectedArchiveKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rar => "rar",
+            Self::SevenZipSingle => "seven_zip_single",
+            Self::SevenZipSplit => "seven_zip_split",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rar" => Some(Self::Rar),
+            "seven_zip_single" => Some(Self::SevenZipSingle),
+            "seven_zip_split" => Some(Self::SevenZipSplit),
+            _ => None,
+        }
+    }
+}
 
 /// Tracks the assembly state of a single NZB file.
 pub struct FileAssembly {
     file_id: NzbFileId,
     filename: String,
-    role: FileRole,
+    declared_role: FileRole,
+    detected_archive: Option<DetectedArchiveIdentity>,
     total_segments: u32,
     total_bytes: u64,
     /// Cumulative byte offsets: cumulative_offsets[i] = sum of segment_sizes[0..i].
@@ -52,7 +101,8 @@ impl FileAssembly {
         Self {
             file_id,
             filename,
-            role,
+            declared_role: role,
+            detected_archive: None,
             total_segments,
             total_bytes,
             cumulative_offsets,
@@ -117,7 +167,37 @@ impl FileAssembly {
 
     /// The file's role.
     pub fn role(&self) -> &FileRole {
-        &self.role
+        &self.declared_role
+    }
+
+    pub fn declared_role(&self) -> &FileRole {
+        &self.declared_role
+    }
+
+    pub fn effective_role(&self) -> FileRole {
+        self.detected_archive
+            .as_ref()
+            .map(DetectedArchiveIdentity::effective_role)
+            .unwrap_or_else(|| self.declared_role.clone())
+    }
+
+    pub fn detected_archive(&self) -> Option<&DetectedArchiveIdentity> {
+        self.detected_archive.as_ref()
+    }
+
+    pub fn set_detected_archive(&mut self, detected_archive: DetectedArchiveIdentity) {
+        self.detected_archive = Some(detected_archive);
+    }
+
+    pub fn clear_detected_archive(&mut self) {
+        self.detected_archive = None;
+    }
+
+    pub fn archive_set_name(&self) -> Option<String> {
+        self.detected_archive
+            .as_ref()
+            .map(|detected| detected.set_name.clone())
+            .or_else(|| weaver_model::files::archive_base_name(&self.filename, &self.declared_role))
     }
 
     /// The filename.
