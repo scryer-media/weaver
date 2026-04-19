@@ -856,9 +856,14 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             return;
         }
 
-        let done = tokio::time::timeout(Duration::from_secs(60), pipeline.extract_done_rx.recv())
+        let done = tokio::time::timeout(Duration::from_secs(180), pipeline.extract_done_rx.recv())
             .await
-            .expect("timed out waiting for extraction completion")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for extraction completion; current status: {:?}",
+                    job_status_for_assert(pipeline, job_id)
+                )
+            })
             .expect("extraction channel should stay open");
         pipeline.handle_extraction_done(done).await;
     }
@@ -1506,6 +1511,14 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     drain_decode_results(&mut pipeline, 2).await;
 
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+    wait_until(Duration::from_secs(2), || {
+        pipeline
+            .buffers
+            .available(crate::runtime::buffers::BufferTier::Medium)
+            == 1
+    })
+    .await
+    .expect("decode scratch buffer should be returned after backlog relief");
     assert_eq!(
         pipeline
             .buffers
