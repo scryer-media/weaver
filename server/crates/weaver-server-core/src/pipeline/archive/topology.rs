@@ -43,7 +43,7 @@ impl Pipeline {
             .collect()
     }
 
-    async fn parse_rar_volume_facts_from_path(
+    pub(in crate::pipeline::archive) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
         password: Option<String>,
     ) -> Result<weaver_rar::RarVolumeFacts, String> {
@@ -59,6 +59,49 @@ impl Pipeline {
         })
         .await
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
+    }
+
+    pub(in crate::pipeline::archive) fn persist_rar_volume_facts(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        filename: &str,
+        observed_volume: Option<u32>,
+        facts: weaver_rar::RarVolumeFacts,
+    ) -> Result<bool, String> {
+        if let Some(expected_volume) = observed_volume
+            && facts.volume_number != expected_volume
+        {
+            info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                filename = %filename,
+                expected_volume,
+                parsed_volume = facts.volume_number,
+                "RAR facts parse detected filename-to-volume mismatch"
+            );
+        }
+
+        let state_key = (job_id, set_name.to_string());
+        let unchanged = self.rar_sets.get(&state_key).is_some_and(|state| {
+            state.facts.get(&facts.volume_number) == Some(&facts)
+                && state.volume_files.get(&facts.volume_number) == Some(&filename.to_string())
+        });
+        if unchanged {
+            return Ok(false);
+        }
+
+        let encoded = rmp_serde::to_vec_named(&facts)
+            .map_err(|error| format!("failed to encode RAR volume facts: {error}"))?;
+        self.db
+            .save_rar_volume_facts(job_id, set_name, facts.volume_number, &encoded)
+            .map_err(|error| format!("failed to persist RAR volume facts: {error}"))?;
+
+        let state = self.rar_sets.entry(state_key).or_default();
+        Self::register_rar_volume_file(state, facts.volume_number, filename.to_string());
+        state.facts.insert(facts.volume_number, facts);
+
+        Ok(true)
     }
 
     pub(in crate::pipeline) fn rar_volume_filename(
@@ -96,9 +139,10 @@ impl Pipeline {
 
         if let Some(rar_state) = self.rar_sets.get(&(job_id, set_name.to_string())) {
             for (logical_volume, filename) in &rar_state.volume_files {
-                let path = state.working_dir.join(filename);
-                if path.exists() {
-                    volume_paths.insert(*logical_volume, path);
+                if let Some(path) = self.resolve_job_input_path(job_id, filename) {
+                    if path.exists() {
+                        volume_paths.insert(*logical_volume, path);
+                    }
                 }
             }
         }
@@ -112,9 +156,10 @@ impl Pipeline {
             if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
                 continue;
             }
-            let path = state.working_dir.join(file_asm.filename());
-            if path.exists() {
-                volume_paths.entry(*volume_number).or_insert(path);
+            if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
+                if path.exists() {
+                    volume_paths.entry(*volume_number).or_insert(path);
+                }
             }
         }
 
@@ -767,46 +812,22 @@ impl Pipeline {
 
         match Self::parse_rar_volume_facts_from_path(path, password).await {
             Ok(facts) => {
-                if facts.volume_number != volume_number {
-                    info!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        filename = %filename,
-                        expected_volume = volume_number,
-                        parsed_volume = facts.volume_number,
-                        "RAR facts parse detected filename-to-volume mismatch"
-                    );
-                }
-                let encoded = match rmp_serde::to_vec_named(&facts) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            volume = volume_number,
-                            set_name = %set_name,
-                            error = %error,
-                            "failed to encode RAR volume facts"
-                        );
-                        return;
-                    }
-                };
-                if let Err(error) =
-                    self.db
-                        .save_rar_volume_facts(job_id, &set_name, facts.volume_number, &encoded)
-                {
+                if let Err(error) = self.persist_rar_volume_facts(
+                    job_id,
+                    &set_name,
+                    &filename,
+                    Some(volume_number),
+                    facts,
+                ) {
                     warn!(
                         job_id = job_id.0,
                         volume = volume_number,
                         set_name = %set_name,
                         error = %error,
-                        "failed to persist RAR volume facts"
+                        "failed to register RAR volume facts"
                     );
                     return;
                 }
-
-                let state = self.rar_sets.entry((job_id, set_name.clone())).or_default();
-                Self::register_rar_volume_file(state, facts.volume_number, filename.clone());
-                state.facts.insert(facts.volume_number, facts);
                 debug!(
                     job_id = job_id.0,
                     volume = volume_number,

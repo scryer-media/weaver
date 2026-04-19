@@ -420,6 +420,7 @@ impl Pipeline {
 
     async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
         self.restore_par2_state_from_disk(job_id).await;
+        self.restore_rar_state_for_job(job_id).await;
 
         let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -432,30 +433,9 @@ impl Pipeline {
                 .collect()
         };
 
-        for (file_id, role) in &files {
-            if matches!(role, weaver_model::files::FileRole::RarVolume { .. }) {
-                self.try_update_archive_topology(job_id, *file_id).await;
-            }
-        }
-
-        for (file_id, role) in &files {
-            if matches!(
-                role,
-                weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                    | weaver_model::files::FileRole::ZipArchive
-                    | weaver_model::files::FileRole::TarArchive
-                    | weaver_model::files::FileRole::TarGzArchive
-                    | weaver_model::files::FileRole::TarBz2Archive
-                    | weaver_model::files::FileRole::GzArchive
-                    | weaver_model::files::FileRole::DeflateArchive
-                    | weaver_model::files::FileRole::BrotliArchive
-                    | weaver_model::files::FileRole::ZstdArchive
-                    | weaver_model::files::FileRole::Bzip2Archive
-                    | weaver_model::files::FileRole::SplitFile { .. }
-            ) {
-                self.try_update_7z_topology(job_id, *file_id);
-            }
+        for (file_id, _) in &files {
+            self.try_register_archive_topology_for_completed_file(job_id, *file_id)
+                .await;
         }
     }
 

@@ -379,26 +379,8 @@ impl Pipeline {
                 .jobs
                 .get(&job_id)
                 .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let mut parts = std::collections::BTreeMap::new();
-            for file_asm in state.assembly.files() {
-                let weaver_model::files::FileRole::RarVolume { volume_number } = file_asm.role()
-                else {
-                    continue;
-                };
-                let base_name =
-                    weaver_model::files::archive_base_name(file_asm.filename(), file_asm.role());
-                if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
-                    continue;
-                }
-                let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) else {
-                    continue;
-                };
-                if path.exists() {
-                    parts.insert(*volume_number, path);
-                }
-            }
             (
-                parts,
+                self.volume_paths_for_rar_set(job_id, set_name),
                 self.load_rar_snapshot(job_id, set_name),
                 state.spec.password.clone(),
             )

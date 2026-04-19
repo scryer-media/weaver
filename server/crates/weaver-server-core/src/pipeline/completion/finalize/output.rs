@@ -322,7 +322,7 @@ impl Pipeline {
         Ok(dest)
     }
 
-    pub(super) fn resolve_job_input_path(
+    pub(in crate::pipeline) fn resolve_job_input_path(
         &self,
         job_id: JobId,
         relative_path: &str,

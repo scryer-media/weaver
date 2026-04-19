@@ -832,6 +832,22 @@ fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
+fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sevenz");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&fixture_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let filename = path.file_name()?.to_str()?.to_string();
+            (filename.starts_with(prefix)).then(|| (filename, std::fs::read(path).unwrap()))
+        })
+        .collect();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, max_rounds: usize) {
     for _ in 0..max_rounds {
         if matches!(
@@ -874,8 +890,37 @@ async fn write_and_complete_rar_volume(
             .unwrap();
     }
 
-    pipeline.try_update_archive_topology(job_id, file_id).await;
-    pipeline.try_update_7z_topology(job_id, file_id);
+    pipeline
+        .try_register_archive_topology_for_completed_file(job_id, file_id)
+        .await;
+}
+
+async fn write_and_complete_file(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    filename: &str,
+    bytes: &[u8],
+) {
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    tokio::fs::write(working_dir.join(filename), bytes)
+        .await
+        .unwrap();
+
+    let file_id = NzbFileId { job_id, file_index };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, bytes.len() as u32)
+            .unwrap();
+    }
+
+    pipeline
+        .try_register_archive_topology_for_completed_file(job_id, file_id)
+        .await;
 }
 
 fn member_span(
@@ -1194,6 +1239,199 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
     ));
     assert!(dest.join("level2.rar").exists());
     assert!(!dest.join("sample.mkv").exists());
+}
+
+#[tokio::test]
+async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10072);
+    let files = build_multifile_multivolume_rar_set();
+    let obfuscated_files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.1{}", index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("Obfuscated Unknown RAR Recovery", &obfuscated_files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let mut rar_topologies: Vec<String> = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .assembly
+        .archive_topologies()
+        .iter()
+        .filter_map(|(set_name, topology)| {
+            (topology.archive_type == crate::jobs::assembly::ArchiveType::Rar)
+                .then_some(set_name.clone())
+        })
+        .collect();
+    rar_topologies.sort();
+    assert_eq!(rar_topologies, vec!["51273aad56a8b904e96928935278a627"]);
+
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Obfuscated Unknown RAR Recovery",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(dest.join("E01.mkv").exists());
+    assert!(dest.join("E02.mkv").exists());
+}
+
+#[tokio::test]
+async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10073);
+    let files = build_multifile_multivolume_rar_set();
+    let obfuscated_files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.10{}", index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("Obfuscated Split RAR Recovery", &obfuscated_files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let mut rar_topologies: Vec<String> = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .assembly
+        .archive_topologies()
+        .iter()
+        .filter_map(|(set_name, topology)| {
+            (topology.archive_type == crate::jobs::assembly::ArchiveType::Rar)
+                .then_some(set_name.clone())
+        })
+        .collect();
+    rar_topologies.sort();
+    assert_eq!(rar_topologies, vec!["51273aad56a8b904e96928935278a627"]);
+
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Obfuscated Split RAR Recovery",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(dest.join("E01.mkv").exists());
+    assert!(dest.join("E02.mkv").exists());
+}
+
+#[tokio::test]
+async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10074);
+    let fixture_files = sevenz_fixture_bytes("generated_split_store_plain.7z");
+    let obfuscated_files: Vec<(String, Vec<u8>)> = fixture_files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.{}", index + 10),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("Obfuscated Split 7z Detection", &obfuscated_files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let set_name = "51273aad56a8b904e96928935278a627";
+    for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+
+        let topology = pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for(set_name))
+            .cloned()
+            .expect("detected 7z topology should exist");
+        assert_eq!(topology.archive_type, crate::jobs::assembly::ArchiveType::SevenZip);
+        assert_eq!(topology.expected_volume_count, Some(obfuscated_files.len() as u32));
+
+        let expected_complete_volumes: std::collections::HashSet<u32> =
+            (0..=file_index as u32).collect();
+        assert_eq!(topology.complete_volumes, expected_complete_volumes);
+    }
+
+    pipeline.check_job_completion(job_id).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 2).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Obfuscated Split 7z Detection",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(dest.join("generated_split_clip.mkv").exists());
+}
+
+#[tokio::test]
+async fn upstream_probe_does_not_misclassify_unknown_numeric_plain_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10075);
+    let files = vec![
+        ("51273aad56a8b904e96928935278a627.10".to_string(), b"plain-a".to_vec()),
+        ("51273aad56a8b904e96928935278a627.11".to_string(), b"plain-b".to_vec()),
+    ];
+    let spec = rar_job_spec("Unknown Numeric Plain Files", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .archive_topologies()
+            .is_empty()
+    );
+
+    pipeline.check_job_completion(job_id).await;
+
+    let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Unknown Numeric Plain Files",
+    ));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(dest.join("51273aad56a8b904e96928935278a627.10").exists());
+    assert!(dest.join("51273aad56a8b904e96928935278a627.11").exists());
 }
 
 #[tokio::test]
@@ -4075,6 +4313,43 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
     assert!(topo.complete_volumes.contains(&0));
     assert!(matches!(
         state.assembly.set_extraction_readiness("archive.7z"),
+        crate::jobs::assembly::ExtractionReadiness::Ready
+    ));
+}
+
+#[tokio::test]
+async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30030);
+    let filename = "archive.rar";
+    let fixture_bytes = rar5_fixture_bytes("rar5_store.rar");
+    let spec = rar_job_spec("RAR Recompute On Same Facts", &[(filename.to_string(), fixture_bytes.clone())]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let topo = state.assembly.archive_topology_for_mut("archive").unwrap();
+        topo.complete_volumes.clear();
+    }
+
+    pipeline
+        .try_register_archive_topology_for_completed_file(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        )
+        .await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let topo = state.assembly.archive_topology_for("archive").unwrap();
+    assert!(topo.complete_volumes.contains(&0));
+    assert!(matches!(
+        state.assembly.set_extraction_readiness("archive"),
         crate::jobs::assembly::ExtractionReadiness::Ready
     ));
 }

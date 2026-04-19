@@ -44,6 +44,79 @@ impl Pipeline {
 }
 
 impl Pipeline {
+    fn try_deobfuscate_files_with_par2(&self, job_id: JobId) -> usize {
+        let Some(par2) = self.par2_set(job_id).cloned() else {
+            return 0;
+        };
+        let Some(rename_dir) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.working_dir.clone())
+        else {
+            return 0;
+        };
+
+        if weaver_nzb::is_protected_media_structure(&rename_dir) {
+            info!(
+                job_id = job_id.0,
+                "skipping PAR2 rename inside protected media structure"
+            );
+            return 0;
+        }
+
+        let suggestions = match weaver_par2::scan_for_renames(&rename_dir, &par2) {
+            Ok(suggestions) => suggestions,
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "PAR2 rename scan failed"
+                );
+                return 0;
+            }
+        };
+
+        let mut renamed = 0usize;
+        for suggestion in &suggestions {
+            let old = &suggestion.current_path;
+            let new = old.parent().unwrap().join(&suggestion.correct_name);
+            if old
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                == Some(suggestion.correct_name.clone())
+            {
+                continue;
+            }
+
+            match std::fs::rename(old, &new) {
+                Ok(()) => {
+                    renamed += 1;
+                    info!(
+                        job_id = job_id.0,
+                        from = %old.file_name().unwrap().to_string_lossy(),
+                        to = %suggestion.correct_name,
+                        "deobfuscated file via PAR2 metadata"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        from = %old.display(),
+                        to = %new.display(),
+                        error = %error,
+                        "PAR2 rename failed"
+                    );
+                }
+            }
+        }
+
+        if renamed > 0 {
+            info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
+        }
+
+        renamed
+    }
+
     async fn check_rar_job_completion(&mut self, job_id: JobId) {
         let set_names = self.rar_set_names_for_job(job_id);
         if set_names.is_empty() {
@@ -362,28 +435,7 @@ impl Pipeline {
 
                     // Rename obfuscated files using PAR2 metadata even when
                     // verification is clean (files may be intact but obfuscated).
-                    if let Some(par2) = self.par2_set(job_id).cloned() {
-                        let rename_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
-                        if !weaver_nzb::is_protected_media_structure(&rename_dir)
-                            && let Ok(suggestions) =
-                                weaver_par2::scan_for_renames(&rename_dir, &par2)
-                        {
-                            for s in &suggestions {
-                                let old = &s.current_path;
-                                let new = old.parent().unwrap().join(&s.correct_name);
-                                if old.file_name().map(|n| n.to_string_lossy().to_string())
-                                    == Some(s.correct_name.clone())
-                                {
-                                    continue;
-                                }
-                                if let Err(e) = std::fs::rename(old, &new) {
-                                    warn!(job_id = job_id.0, from = %old.display(), to = %new.display(), error = %e, "PAR2 rename failed");
-                                } else {
-                                    info!(job_id = job_id.0, from = %old.file_name().unwrap().to_string_lossy(), to = %s.correct_name, "deobfuscated file via PAR2 metadata");
-                                }
-                            }
-                        }
-                    }
+                    self.try_deobfuscate_files_with_par2(job_id);
 
                     if has_crc_failures {
                         if self.normalization_retried.contains(&job_id) {
@@ -540,63 +592,7 @@ impl Pipeline {
 
                             // Rename obfuscated files using PAR2 metadata (16KB hash matching).
                             // Must happen after repair and before extraction retry.
-                            // Skip if inside a DVD/Bluray structure.
-                            if let Some(par2) = self.par2_set(job_id).cloned() {
-                                let rename_dir =
-                                    self.jobs.get(&job_id).unwrap().working_dir.clone();
-                                if weaver_nzb::is_protected_media_structure(&rename_dir) {
-                                    info!(
-                                        job_id = job_id.0,
-                                        "skipping PAR2 rename inside protected media structure"
-                                    );
-                                } else {
-                                    match weaver_par2::scan_for_renames(&rename_dir, &par2) {
-                                        Ok(suggestions) => {
-                                            for s in &suggestions {
-                                                let old = &s.current_path;
-                                                let new =
-                                                    old.parent().unwrap().join(&s.correct_name);
-                                                if old
-                                                    .file_name()
-                                                    .map(|n| n.to_string_lossy().to_string())
-                                                    == Some(s.correct_name.clone())
-                                                {
-                                                    continue; // already correct
-                                                }
-                                                match std::fs::rename(old, &new) {
-                                                    Ok(()) => {
-                                                        info!(
-                                                            job_id = job_id.0,
-                                                            from = %old.file_name().unwrap().to_string_lossy(),
-                                                            to = %s.correct_name,
-                                                            "deobfuscated file via PAR2 metadata"
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(
-                                                            job_id = job_id.0,
-                                                            from = %old.display(),
-                                                            to = %new.display(),
-                                                            error = %e,
-                                                            "PAR2 rename failed"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            if !suggestions.is_empty() {
-                                                info!(
-                                                    job_id = job_id.0,
-                                                    renamed = suggestions.len(),
-                                                    "PAR2 deobfuscation complete"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(job_id = job_id.0, error = %e, "PAR2 rename scan failed");
-                                        }
-                                    }
-                                }
-                            }
+                            self.try_deobfuscate_files_with_par2(job_id);
 
                             let cleared =
                                 self.failed_extractions.get(&job_id).map_or(0, HashSet::len);
@@ -659,205 +655,213 @@ impl Pipeline {
             state.assembly.extraction_readiness()
         };
         match readiness {
-            ExtractionReadiness::NotApplicable => {
-                if !par2_bypassed {
-                    self.cleanup_par2_files(job_id).await;
-                }
-                // No archives — move to complete and finish.
-                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
-                if let Err(error) = self.move_to_complete(job_id).await {
-                    self.fail_job(job_id, error);
+                ExtractionReadiness::NotApplicable => {
+                    if !par2_bypassed {
+                        self.cleanup_par2_files(job_id).await;
+                    }
+                    // No archives — move to complete and finish.
+                    self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
+                    if let Err(error) = self.move_to_complete(job_id).await {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                    let state = self.jobs.get_mut(&job_id).unwrap();
+                    state.status = JobStatus::Complete;
+                    if self.active_download_passes.remove(&job_id) {
+                        let _ = self
+                            .event_tx
+                            .send(PipelineEvent::DownloadFinished { job_id });
+                    }
+                    self.clear_par2_runtime_state(job_id);
+                    self.clear_job_rar_runtime(job_id);
+                    self.job_order.retain(|id| *id != job_id);
+                    let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
+                    info!(job_id = job_id.0, "job completed (no archives)");
+                    self.record_job_history(job_id);
                     return;
                 }
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state.status = JobStatus::Complete;
-                if self.active_download_passes.remove(&job_id) {
+                ExtractionReadiness::Ready => {
+                    // Collect sets that still need extraction (some may have been
+                    // extracted during the partial extraction phase).
+                    let already_extracted = self
+                        .extracted_archives
+                        .get(&job_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let already_spawned = self
+                        .inflight_extractions
+                        .get(&job_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let sets_to_extract: Vec<(String, crate::jobs::assembly::ArchiveType)> = {
+                        let state = self.jobs.get(&job_id).unwrap();
+                        state
+                            .assembly
+                            .archive_topologies()
+                            .iter()
+                            .filter(|(name, _)| {
+                                !already_extracted.contains(*name)
+                                    && !already_spawned.contains(*name)
+                            })
+                            .map(|(name, topo)| (name.clone(), topo.archive_type))
+                            .collect()
+                    };
+
+                    // If extractions are still in-flight, wait for them to complete.
+                    if !already_spawned.is_empty() && sets_to_extract.is_empty() {
+                        return;
+                    }
+
+                    if !sets_to_extract.is_empty() {
+                        // Spawn extraction tasks in the background.
+                        // handle_extraction_done will re-enter check_job_completion
+                        // when each set finishes, and we'll reach the empty branch below.
+                        if !self.maybe_start_extraction(job_id).await {
+                            return;
+                        }
+
+                        self.spawn_extractions(job_id, &sets_to_extract).await;
+                        // Return — extraction runs in background.
+                        // handle_extraction_done will call check_job_completion again.
+                        return;
+                    }
+
+                    // All sets extracted — finish the job.
+                    // Clean up archive source files before moving to complete.
+                    {
+                        let state = self.jobs.get(&job_id).unwrap();
+                        let mut cleanup_files: HashSet<String> = state
+                            .assembly
+                            .files()
+                            .filter(|f| {
+                                matches!(
+                                    f.role(),
+                                    weaver_model::files::FileRole::Par2 { .. }
+                                        | weaver_model::files::FileRole::RarVolume { .. }
+                                        | weaver_model::files::FileRole::SevenZipArchive
+                                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                                )
+                            })
+                            .map(|f| f.filename().to_string())
+                            .collect();
+                        for topology in state.assembly.archive_topologies().values() {
+                            cleanup_files.extend(topology.volume_map.keys().cloned());
+                        }
+                        let mut removed = 0u32;
+                        for filename in &cleanup_files {
+                            let Some(path) = self.resolve_job_input_path(job_id, filename) else {
+                                continue;
+                            };
+                            match tokio::fs::remove_file(&path).await {
+                                Ok(()) => removed += 1,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    warn!(
+                                        file = %path.display(),
+                                        error = %e,
+                                        "failed to clean up source file"
+                                    );
+                                }
+                            }
+                        }
+                        info!(
+                            job_id = job_id.0,
+                            removed,
+                            total = cleanup_files.len(),
+                            "post-extraction cleanup complete"
+                        );
+                    }
+
+                    match self.maybe_start_nested_extraction(job_id).await {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
+                    }
+
+                    self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
+                    info!(job_id = job_id.0, "extraction complete");
                     let _ = self
                         .event_tx
-                        .send(PipelineEvent::DownloadFinished { job_id });
-                }
-                self.clear_par2_runtime_state(job_id);
-                self.clear_job_rar_runtime(job_id);
-                self.job_order.retain(|id| *id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-                info!(job_id = job_id.0, "job completed (no archives)");
-                self.record_job_history(job_id);
-            }
-            ExtractionReadiness::Ready => {
-                // Collect sets that still need extraction (some may have been
-                // extracted during the partial extraction phase).
-                let already_extracted = self
-                    .extracted_archives
-                    .get(&job_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let already_spawned = self
-                    .inflight_extractions
-                    .get(&job_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let sets_to_extract: Vec<(String, crate::jobs::assembly::ArchiveType)> = {
-                    let state = self.jobs.get(&job_id).unwrap();
-                    state
-                        .assembly
-                        .archive_topologies()
-                        .iter()
-                        .filter(|(name, _)| {
-                            !already_extracted.contains(*name) && !already_spawned.contains(*name)
-                        })
-                        .map(|(name, topo)| (name.clone(), topo.archive_type))
-                        .collect()
-                };
+                        .send(PipelineEvent::ExtractionComplete { job_id });
 
-                // If extractions are still in-flight, wait for them to complete.
-                if !already_spawned.is_empty() && sets_to_extract.is_empty() {
+                    // Move extracted files to complete directory.
+                    if let Err(error) = self.move_to_complete(job_id).await {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+
+                    {
+                        let state = self.jobs.get_mut(&job_id).unwrap();
+                        state.status = JobStatus::Complete;
+                    }
+                    if self.active_download_passes.remove(&job_id) {
+                        let _ = self
+                            .event_tx
+                            .send(PipelineEvent::DownloadFinished { job_id });
+                    }
+                    self.clear_par2_runtime_state(job_id);
+                    self.clear_job_rar_runtime(job_id);
+                    self.job_order.retain(|id| *id != job_id);
+                    let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
+                    self.record_job_history(job_id);
                     return;
                 }
+                ExtractionReadiness::Blocked { reason } => {
+                    self.fail_job(job_id, reason);
+                    return;
+                }
+                ExtractionReadiness::Partial {
+                    extractable,
+                    waiting_on,
+                } => {
+                    // Some archives are ready (e.g. all 7z split files arrived)
+                    // while others are still downloading. Spawn what we can.
+                    let already_done = self
+                        .extracted_archives
+                        .get(&job_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let already_inflight = self
+                        .inflight_extractions
+                        .get(&job_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let to_spawn: Vec<(String, crate::jobs::assembly::ArchiveType)> = {
+                        let state = self.jobs.get(&job_id).unwrap();
+                        extractable
+                            .iter()
+                            .filter(|name| {
+                                !already_done.contains(*name) && !already_inflight.contains(*name)
+                            })
+                            .filter_map(|name| {
+                                state
+                                    .assembly
+                                    .archive_topology_for(name)
+                                    .map(|topo| (name.clone(), topo.archive_type))
+                            })
+                            .collect()
+                    };
 
-                if !sets_to_extract.is_empty() {
-                    // Spawn extraction tasks in the background.
-                    // handle_extraction_done will re-enter check_job_completion
-                    // when each set finishes, and we'll reach the empty branch below.
+                    if to_spawn.is_empty() {
+                        return;
+                    }
+
                     if !self.maybe_start_extraction(job_id).await {
                         return;
                     }
 
-                    self.spawn_extractions(job_id, &sets_to_extract).await;
-                    // Return — extraction runs in background.
-                    // handle_extraction_done will call check_job_completion again.
-                    return;
-                }
-
-                // All sets extracted — finish the job.
-                // Clean up archive source files before moving to complete.
-                {
-                    let state = self.jobs.get(&job_id).unwrap();
-                    let cleanup_files: Vec<String> = state
-                        .assembly
-                        .files()
-                        .filter(|f| {
-                            matches!(
-                                f.role(),
-                                weaver_model::files::FileRole::Par2 { .. }
-                                    | weaver_model::files::FileRole::RarVolume { .. }
-                                    | weaver_model::files::FileRole::SevenZipArchive
-                                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                            )
-                        })
-                        .map(|f| f.filename().to_string())
-                        .collect();
-                    let mut removed = 0u32;
-                    for filename in &cleanup_files {
-                        let Some(path) = self.resolve_job_input_path(job_id, filename) else {
-                            continue;
-                        };
-                        match tokio::fs::remove_file(&path).await {
-                            Ok(()) => removed += 1,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                warn!(
-                                    file = %path.display(),
-                                    error = %e,
-                                    "failed to clean up source file"
-                                );
-                            }
-                        }
-                    }
+                    let spawned = self.spawn_extractions(job_id, &to_spawn).await;
                     info!(
                         job_id = job_id.0,
-                        removed,
-                        total = cleanup_files.len(),
-                        "post-extraction cleanup complete"
+                        spawned,
+                        waiting = ?waiting_on,
+                        "started extraction for ready archives, waiting on remaining"
                     );
-                }
-
-                match self.maybe_start_nested_extraction(job_id).await {
-                    Ok(true) => return,
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.fail_job(job_id, error);
-                        return;
-                    }
-                }
-
-                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
-                info!(job_id = job_id.0, "extraction complete");
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionComplete { job_id });
-
-                // Move extracted files to complete directory.
-                if let Err(error) = self.move_to_complete(job_id).await {
-                    self.fail_job(job_id, error);
                     return;
                 }
-
-                {
-                    let state = self.jobs.get_mut(&job_id).unwrap();
-                    state.status = JobStatus::Complete;
-                }
-                if self.active_download_passes.remove(&job_id) {
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::DownloadFinished { job_id });
-                }
-                self.clear_par2_runtime_state(job_id);
-                self.clear_job_rar_runtime(job_id);
-                self.job_order.retain(|id| *id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-                self.record_job_history(job_id);
-            }
-            ExtractionReadiness::Blocked { reason } => {
-                self.fail_job(job_id, reason);
-            }
-            ExtractionReadiness::Partial {
-                extractable,
-                waiting_on,
-            } => {
-                // Some archives are ready (e.g. all 7z split files arrived)
-                // while others are still downloading. Spawn what we can.
-                let already_done = self
-                    .extracted_archives
-                    .get(&job_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let already_inflight = self
-                    .inflight_extractions
-                    .get(&job_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let to_spawn: Vec<(String, crate::jobs::assembly::ArchiveType)> = {
-                    let state = self.jobs.get(&job_id).unwrap();
-                    extractable
-                        .iter()
-                        .filter(|name| {
-                            !already_done.contains(*name) && !already_inflight.contains(*name)
-                        })
-                        .filter_map(|name| {
-                            state
-                                .assembly
-                                .archive_topology_for(name)
-                                .map(|topo| (name.clone(), topo.archive_type))
-                        })
-                        .collect()
-                };
-
-                if to_spawn.is_empty() {
-                    return;
-                }
-
-                if !self.maybe_start_extraction(job_id).await {
-                    return;
-                }
-
-                let spawned = self.spawn_extractions(job_id, &to_spawn).await;
-                info!(
-                    job_id = job_id.0,
-                    spawned,
-                    waiting = ?waiting_on,
-                    "started extraction for ready archives, waiting on remaining"
-                );
-            }
         }
     }
 }

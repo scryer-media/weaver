@@ -584,9 +584,9 @@ impl Pipeline {
 
                     self.try_load_par2_metadata(job_id, file_id).await;
                     self.try_merge_par2_recovery(job_id, file_id).await;
-                    self.try_update_archive_topology(job_id, file_id).await;
+                    self.try_register_archive_topology_for_completed_file(job_id, file_id)
+                        .await;
                     debug!(job_id = job_id.0, "post-topology");
-                    self.try_update_7z_topology(job_id, file_id);
                     debug!(job_id = job_id.0, "entering try_rar_extraction");
                     self.try_rar_extraction(job_id).await;
                     debug!(job_id = job_id.0, "post-extraction");

@@ -399,6 +399,25 @@ impl Pipeline {
             return false;
         };
 
+        if !state.assembly.archive_topologies().is_empty() {
+            let has_rar = state
+                .assembly
+                .archive_topologies()
+                .values()
+                .any(|topology| topology.archive_type == crate::jobs::assembly::ArchiveType::Rar);
+            let has_non_rar = state
+                .assembly
+                .archive_topologies()
+                .values()
+                .any(|topology| topology.archive_type != crate::jobs::assembly::ArchiveType::Rar);
+            if has_non_rar {
+                return false;
+            }
+            if has_rar {
+                return true;
+            }
+        }
+
         let mut has_rar = false;
         for file in state.assembly.files() {
             match file.role() {
@@ -417,6 +436,19 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
+
+        for (set_name, topology) in state.assembly.archive_topologies() {
+            if topology.archive_type == crate::jobs::assembly::ArchiveType::Rar {
+                set_names.insert(set_name.clone());
+            }
+        }
+
+        for (jid, set_name) in self.rar_sets.keys() {
+            if *jid == job_id {
+                set_names.insert(set_name.clone());
+            }
+        }
+
         for file in state.assembly.files() {
             if matches!(file.role(), weaver_model::files::FileRole::RarVolume { .. })
                 && let Some(set_name) =
@@ -433,7 +465,7 @@ impl Pipeline {
     pub(super) async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
         {
             let state = self.jobs.get(&job_id).unwrap();
-            let cleanup_files: Vec<String> = state
+            let mut cleanup_files: HashSet<String> = state
                 .assembly
                 .files()
                 .filter(|f| {
@@ -447,6 +479,9 @@ impl Pipeline {
                 })
                 .map(|f| f.filename().to_string())
                 .collect();
+            for topology in state.assembly.archive_topologies().values() {
+                cleanup_files.extend(topology.volume_map.keys().cloned());
+            }
             let mut removed = 0u32;
             for filename in &cleanup_files {
                 let Some(path) = self.resolve_job_input_path(job_id, filename) else {
