@@ -678,7 +678,6 @@ impl Pipeline {
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
                 info!(job_id = job_id.0, "job completed (no archives)");
                 self.record_job_history(job_id);
-                return;
             }
             ExtractionReadiness::Ready => {
                 // Collect sets that still need extraction (some may have been
@@ -806,11 +805,9 @@ impl Pipeline {
                 self.job_order.retain(|id| *id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
                 self.record_job_history(job_id);
-                return;
             }
             ExtractionReadiness::Blocked { reason } => {
                 self.fail_job(job_id, reason);
-                return;
             }
             ExtractionReadiness::Partial {
                 extractable,
@@ -859,7 +856,6 @@ impl Pipeline {
                     waiting = ?waiting_on,
                     "started extraction for ready archives, waiting on remaining"
                 );
-                return;
             }
         }
     }
