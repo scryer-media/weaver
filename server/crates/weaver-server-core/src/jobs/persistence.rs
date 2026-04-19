@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite::OptionalExtension;
 
 use crate::StateError;
+use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{
@@ -290,6 +291,11 @@ impl Database {
         .map_err(db_err)?;
         conn.execute(
             "DELETE FROM active_files WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM active_detected_archives WHERE job_id = ?1 AND file_index = ?2",
             rusqlite::params![job_id.0 as i64, file_index],
         )
         .map_err(db_err)?;
@@ -685,6 +691,46 @@ impl Database {
              (job_id, set_name, volume_index, facts_blob)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![job_id.0 as i64, set_name, volume_index, facts_blob],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn save_detected_archive_identity(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        detected: &DetectedArchiveIdentity,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO active_detected_archives
+             (job_id, file_index, kind, set_name, volume_index)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                job_id.0 as i64,
+                file_index,
+                detected.kind.as_str(),
+                detected.set_name,
+                detected.volume_index,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn delete_detected_archive_identity(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_detected_archives WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
         )
         .map_err(db_err)?;
         Ok(())

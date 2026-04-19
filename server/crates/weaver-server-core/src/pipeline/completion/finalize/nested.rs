@@ -83,7 +83,102 @@ impl Pipeline {
         segments
     }
 
-    fn scan_extraction_root(root: &Path) -> Result<Vec<ScannedExtractionFile>, String> {
+    async fn detect_nested_archive_identities(
+        root: &Path,
+        files: &mut [ScannedExtractionFile],
+        password: Option<String>,
+    ) -> Result<(), String> {
+        let mut numeric_groups = HashMap::<String, Vec<(usize, u32)>>::new();
+        for (index, file) in files.iter().enumerate() {
+            if let Some((set_key, Some(numeric_suffix))) =
+                crate::pipeline::archive::probe::probe_set_key_and_suffix(
+                    &file.relative_path,
+                    &file.declared_role,
+                )
+            {
+                numeric_groups
+                    .entry(set_key)
+                    .or_default()
+                    .push((index, numeric_suffix));
+            }
+        }
+
+        let mut detected_split_7z_sets = HashSet::new();
+        for file in files.iter_mut() {
+            if file.detected_archive.is_some() {
+                continue;
+            }
+            if !matches!(
+                file.declared_role,
+                weaver_model::files::FileRole::Unknown
+                    | weaver_model::files::FileRole::SplitFile { .. }
+            ) {
+                continue;
+            }
+
+            let Some((set_key, numeric_suffix)) =
+                crate::pipeline::archive::probe::probe_set_key_and_suffix(
+                    &file.relative_path,
+                    &file.declared_role,
+                )
+            else {
+                continue;
+            };
+
+            let path = root.join(&file.relative_path);
+            if let Ok(facts) =
+                Pipeline::parse_rar_volume_facts_from_path(path.clone(), password.clone()).await
+            {
+                file.detected_archive = Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name: set_key,
+                    volume_index: Some(facts.volume_number),
+                });
+                continue;
+            }
+
+            if numeric_suffix.is_some() {
+                if Self::path_has_7z_signature(path).await? {
+                    detected_split_7z_sets.insert(set_key);
+                }
+                continue;
+            }
+
+            if Self::path_has_7z_signature(path).await? {
+                file.detected_archive = Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle,
+                    set_name: set_key,
+                    volume_index: None,
+                });
+            }
+        }
+
+        for set_key in detected_split_7z_sets {
+            let Some(group) = numeric_groups.get(&set_key) else {
+                continue;
+            };
+            let mut ordered_group = group.clone();
+            ordered_group.sort_by_key(|(_, numeric_suffix)| *numeric_suffix);
+            for (normalized_index, (file_index, _)) in ordered_group.into_iter().enumerate() {
+                if files[file_index].detected_archive.is_some() {
+                    continue;
+                }
+                files[file_index].detected_archive =
+                    Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                        kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSplit,
+                        set_name: set_key.clone(),
+                        volume_index: Some(normalized_index as u32),
+                    });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn scan_extraction_root(
+        root: &Path,
+        password: Option<String>,
+    ) -> Result<Vec<ScannedExtractionFile>, String> {
         fn walk(
             root: &Path,
             current: &Path,
@@ -112,7 +207,7 @@ impl Pipeline {
                     .map_err(|error| format!("failed to relativize {}: {error}", path.display()))?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let role = weaver_model::files::FileRole::from_filename(&relative_path);
+                let declared_role = weaver_model::files::FileRole::from_filename(&relative_path);
                 let size = entry
                     .metadata()
                     .map_err(|error| format!("failed to stat {}: {error}", path.display()))?
@@ -120,7 +215,8 @@ impl Pipeline {
 
                 files.push(ScannedExtractionFile {
                     relative_path,
-                    role,
+                    declared_role,
+                    detected_archive: None,
                     size,
                 });
             }
@@ -132,6 +228,7 @@ impl Pipeline {
             walk(root, root, &mut files)?;
         }
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Self::detect_nested_archive_identities(root, &mut files, password).await?;
         Ok(files)
     }
 
@@ -199,9 +296,12 @@ impl Pipeline {
             let mut file_assembly = crate::jobs::assembly::FileAssembly::new(
                 file_id,
                 archive.relative_path.clone(),
-                archive.role.clone(),
+                archive.declared_role.clone(),
                 segment_sizes.clone(),
             );
+            if let Some(detected_archive) = archive.detected_archive.clone() {
+                file_assembly.set_detected_archive(detected_archive);
+            }
             for (segment_number, segment_size) in segment_sizes.into_iter().enumerate() {
                 file_assembly
                     .commit_segment(segment_number as u32, segment_size)
@@ -259,24 +359,29 @@ impl Pipeline {
         Ok(to_extract)
     }
 
-    pub(super) async fn maybe_start_nested_extraction(
+    pub(crate) async fn maybe_start_nested_extraction(
         &mut self,
         job_id: JobId,
     ) -> Result<bool, String> {
         let scan_root = self.nested_scan_root(job_id)?;
-        let scanned_files = Self::scan_extraction_root(&scan_root)?;
+        let password = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.spec.password.clone());
+        let scanned_files = Self::scan_extraction_root(&scan_root, password).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()
             .filter_map(|file| {
-                let archive_type = Self::archive_type_for_role(&file.role)?;
-                let set_name =
-                    weaver_model::files::archive_base_name(&file.relative_path, &file.role)?;
+                let effective_role = file.effective_role();
+                let archive_type = Self::archive_type_for_role(&effective_role)?;
+                let set_name = file.archive_set_name()?;
                 Some(NestedArchiveFile {
                     relative_path: file.relative_path.clone(),
-                    role: file.role.clone(),
+                    declared_role: file.declared_role.clone(),
+                    detected_archive: file.detected_archive.clone(),
                     archive_type,
                     set_name,
-                    volume_number: Self::archive_volume_number(&file.role),
+                    volume_number: Self::archive_volume_number(&effective_role),
                     size: file.size,
                 })
             })
@@ -302,7 +407,7 @@ impl Pipeline {
         }
 
         for file in &scanned_files {
-            if Self::archive_type_for_role(&file.role).is_some() {
+            if Self::archive_type_for_role(&file.effective_role()).is_some() {
                 continue;
             }
             let path = scan_root.join(&file.relative_path);

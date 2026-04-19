@@ -15,6 +15,7 @@ pub struct OrphanActiveStateCounts {
     pub active_extraction_chunks: usize,
     pub active_archive_headers: usize,
     pub active_rar_volume_facts: usize,
+    pub active_detected_archives: usize,
     pub active_volume_status: usize,
     pub active_rar_verified_suspect: usize,
 }
@@ -31,6 +32,7 @@ impl OrphanActiveStateCounts {
             + self.active_extraction_chunks
             + self.active_archive_headers
             + self.active_rar_volume_facts
+            + self.active_detected_archives
             + self.active_volume_status
             + self.active_rar_verified_suspect
     }
@@ -85,6 +87,11 @@ fn delete_active_job_rows(tx: &rusqlite::Transaction<'_>, id: i64) -> Result<(),
         .map_err(db_err)?;
     tx.execute(
         "DELETE FROM active_rar_volume_facts WHERE job_id = ?1",
+        [id],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "DELETE FROM active_detected_archives WHERE job_id = ?1",
         [id],
     )
     .map_err(db_err)?;
@@ -166,6 +173,7 @@ impl Database {
             active_extraction_chunks: delete_orphan_rows(&tx, "active_extraction_chunks")?,
             active_archive_headers: delete_orphan_rows(&tx, "active_archive_headers")?,
             active_rar_volume_facts: delete_orphan_rows(&tx, "active_rar_volume_facts")?,
+            active_detected_archives: delete_orphan_rows(&tx, "active_detected_archives")?,
             active_volume_status: delete_orphan_rows(&tx, "active_volume_status")?,
             active_rar_verified_suspect: delete_orphan_rows(&tx, "active_rar_verified_suspect")?,
         };

@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use tracing::{error, info};
 
 use crate::events::model::PipelineEvent;
-use crate::jobs::assembly::JobAssembly;
+use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
@@ -13,6 +13,25 @@ use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 impl Pipeline {
+    fn apply_detected_archive_identities(
+        &mut self,
+        job_id: JobId,
+        detected_archives: &HashMap<u32, DetectedArchiveIdentity>,
+    ) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        for file in state.assembly.files_mut() {
+            file.clear_detected_archive();
+        }
+        for (&file_index, detected_archive) in detected_archives {
+            let file_id = NzbFileId { job_id, file_index };
+            if let Some(file) = state.assembly.file_mut(file_id) {
+                file.set_detected_archive(detected_archive.clone());
+            }
+        }
+    }
+
     pub(crate) async fn add_job(
         &mut self,
         job_id: JobId,
@@ -420,21 +439,29 @@ impl Pipeline {
 
     async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
         self.restore_par2_state_from_disk(job_id).await;
+        match self.db.load_detected_archive_identities(job_id) {
+            Ok(detected_archives) => {
+                self.apply_detected_archive_identities(job_id, &detected_archives);
+            }
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted detected archive identities"
+                );
+            }
+        }
         self.restore_rar_state_for_job(job_id).await;
 
-        let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
+        let files: Vec<NzbFileId> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            state
-                .assembly
-                .files()
-                .map(|f| (f.file_id(), f.role().clone()))
-                .collect()
+            state.assembly.files().map(|f| f.file_id()).collect()
         };
 
-        for (file_id, _) in &files {
-            self.try_register_archive_topology_for_completed_file(job_id, *file_id)
+        for file_id in files {
+            self.try_register_archive_topology_for_completed_file(job_id, file_id)
                 .await;
         }
     }
@@ -465,6 +492,7 @@ impl Pipeline {
             spec,
             committed_segments,
             file_progress,
+            detected_archives,
             extracted_members,
             status,
             queued_repair_at_epoch_ms,
@@ -558,6 +586,7 @@ impl Pipeline {
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
+        self.apply_detected_archive_identities(job_id, &detected_archives);
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);
         }
@@ -587,8 +616,7 @@ impl Pipeline {
                 );
             }
         }
-        self.restore_par2_state_from_disk(job_id).await;
-        self.restore_rar_state_for_job(job_id).await;
+        self.reload_metadata_from_disk(job_id).await;
 
         if matches!(status, JobStatus::Repairing) {
             self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);

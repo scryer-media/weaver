@@ -54,6 +54,7 @@ pub async fn recover_server_state(
                 active_extraction_chunks = counts.active_extraction_chunks,
                 active_archive_headers = counts.active_archive_headers,
                 active_rar_volume_facts = counts.active_rar_volume_facts,
+                active_detected_archives = counts.active_detected_archives,
                 active_volume_status = counts.active_volume_status,
                 active_rar_verified_suspect = counts.active_rar_verified_suspect,
                 "removed orphaned active-state rows before recovery"
@@ -174,6 +175,7 @@ pub async fn recover_server_state(
                             spec,
                             committed_segments: recovered.committed_segments,
                             file_progress: recovered.file_progress,
+                            detected_archives: recovered.detected_archives,
                             extracted_members: recovered.extracted_members,
                             status,
                             queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,

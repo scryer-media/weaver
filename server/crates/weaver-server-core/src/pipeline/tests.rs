@@ -927,6 +927,18 @@ async fn write_and_complete_file(
         .await;
 }
 
+async fn write_and_complete_file_like_decode_worker(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    filename: &str,
+    bytes: &[u8],
+) {
+    write_and_complete_file(pipeline, job_id, file_index, filename, bytes).await;
+    pipeline.try_rar_extraction(job_id).await;
+    pipeline.check_job_completion(job_id).await;
+}
+
 fn member_span(
     pipeline: &Pipeline,
     job_id: JobId,
@@ -1246,6 +1258,148 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
 }
 
 #[tokio::test]
+async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_711);
+    let staging_dir = temp_dir.path().join("nested-obfuscated-rar");
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+    let files = build_multifile_multivolume_rar_set();
+    let obfuscated_files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.1{}", index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    for (filename, bytes) in &obfuscated_files {
+        tokio::fs::write(staging_dir.join(filename), bytes)
+            .await
+            .unwrap();
+    }
+
+    let mut state = minimal_job_state(job_id, "Nested Obfuscated RAR", temp_dir.path().join("wd"));
+    state.staging_dir = Some(staging_dir);
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+
+    assert!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap()
+    );
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let topology = state
+        .assembly
+        .archive_topology_for("51273aad56a8b904e96928935278a627")
+        .unwrap();
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::Rar
+    );
+    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
+    for file_index in 0..obfuscated_files.len() {
+        let file = state
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: file_index as u32,
+            })
+            .unwrap();
+        assert!(matches!(
+            file.role(),
+            weaver_model::files::FileRole::Unknown
+        ));
+        assert!(matches!(
+            file.effective_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ));
+        assert_eq!(
+            file.detected_archive()
+                .map(|detected| detected.set_name.as_str()),
+            Some("51273aad56a8b904e96928935278a627")
+        );
+    }
+}
+
+#[tokio::test]
+async fn nested_scan_detects_obfuscated_split_7z_archives_from_staging() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_712);
+    let staging_dir = temp_dir.path().join("nested-obfuscated-7z");
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+    let fixture_files = sevenz_fixture_bytes("generated_split_store_plain.7z");
+    let obfuscated_files: Vec<(String, Vec<u8>)> = fixture_files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.1{}", index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    for (filename, bytes) in &obfuscated_files {
+        tokio::fs::write(staging_dir.join(filename), bytes)
+            .await
+            .unwrap();
+    }
+
+    let mut state = minimal_job_state(job_id, "Nested Obfuscated 7z", temp_dir.path().join("wd"));
+    state.staging_dir = Some(staging_dir);
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+
+    assert!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap()
+    );
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let topology = state
+        .assembly
+        .archive_topology_for("51273aad56a8b904e96928935278a627")
+        .unwrap();
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::SevenZip
+    );
+    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
+    for file_index in 0..obfuscated_files.len() {
+        let file = state
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: file_index as u32,
+            })
+            .unwrap();
+        assert!(matches!(
+            file.role(),
+            weaver_model::files::FileRole::Unknown
+        ));
+        assert!(matches!(
+            file.effective_role(),
+            weaver_model::files::FileRole::SevenZipSplit { .. }
+        ));
+        assert_eq!(
+            file.detected_archive()
+                .map(|detected| detected.set_name.as_str()),
+            Some("51273aad56a8b904e96928935278a627")
+        );
+    }
+}
+
+#[tokio::test]
 async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -1265,7 +1419,14 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
-        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        write_and_complete_file_like_decode_worker(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            filename,
+            bytes,
+        )
+        .await;
     }
 
     let mut rar_topologies: Vec<String> = pipeline
@@ -1282,6 +1443,42 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
         .collect();
     rar_topologies.sort();
     assert_eq!(rar_topologies, vec!["51273aad56a8b904e96928935278a627"]);
+    let detected_archives = pipeline
+        .db
+        .load_detected_archive_identities(job_id)
+        .unwrap();
+    assert_eq!(detected_archives.len(), obfuscated_files.len());
+    for file_index in 0..obfuscated_files.len() {
+        let file = pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: file_index as u32,
+            })
+            .unwrap();
+        assert!(matches!(
+            file.role(),
+            weaver_model::files::FileRole::Unknown
+        ));
+        assert!(matches!(
+            file.effective_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ));
+        assert_eq!(
+            file.detected_archive()
+                .map(|detected| detected.set_name.as_str()),
+            Some("51273aad56a8b904e96928935278a627")
+        );
+        assert!(matches!(
+            detected_archives
+                .get(&(file_index as u32))
+                .map(|detected| &detected.kind),
+            Some(crate::jobs::assembly::DetectedArchiveKind::Rar)
+        ));
+    }
 
     pipeline.check_job_completion(job_id).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
@@ -1317,7 +1514,14 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
-        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        write_and_complete_file_like_decode_worker(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            filename,
+            bytes,
+        )
+        .await;
     }
 
     let mut rar_topologies: Vec<String> = pipeline
@@ -1334,6 +1538,11 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
         .collect();
     rar_topologies.sort();
     assert_eq!(rar_topologies, vec!["51273aad56a8b904e96928935278a627"]);
+    let detected_archives = pipeline
+        .db
+        .load_detected_archive_identities(job_id)
+        .unwrap();
+    assert_eq!(detected_archives.len(), obfuscated_files.len());
 
     pipeline.check_job_completion(job_id).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
@@ -1370,7 +1579,14 @@ async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
 
     let set_name = "51273aad56a8b904e96928935278a627";
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
-        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        write_and_complete_file_like_decode_worker(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            filename,
+            bytes,
+        )
+        .await;
 
         let topology = pipeline
             .jobs
@@ -1403,6 +1619,193 @@ async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
         Some(JobStatus::Complete)
     ));
     assert!(dest.join("generated_split_clip.mkv").exists());
+}
+
+#[tokio::test]
+async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10076);
+    let files = build_multifile_multivolume_rar_set();
+    let obfuscated_files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.1{}", index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("Restore Obfuscated RAR", &obfuscated_files);
+    insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+
+    for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let recovered = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .unwrap();
+    drop(pipeline);
+    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
+
+    let (mut restored, _intermediate_dir, complete_dir_restored) =
+        new_direct_pipeline(&temp_dir).await;
+    restored
+        .restore_job(RestoreJobRequest {
+            job_id,
+            spec,
+            committed_segments,
+            file_progress: recovered.file_progress,
+            detected_archives: recovered.detected_archives,
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            working_dir: recovered.output_dir,
+        })
+        .await
+        .unwrap();
+
+    let restored_file = restored
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .assembly
+        .file(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .unwrap();
+    assert!(matches!(
+        restored_file.role(),
+        weaver_model::files::FileRole::Unknown
+    ));
+    assert!(matches!(
+        restored_file.effective_role(),
+        weaver_model::files::FileRole::RarVolume { .. }
+    ));
+    assert_eq!(
+        restored_file
+            .detected_archive()
+            .map(|detected| detected.set_name.as_str()),
+        Some("51273aad56a8b904e96928935278a627")
+    );
+
+    let set_name = "51273aad56a8b904e96928935278a627";
+    let topology = restored
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for(set_name))
+        .cloned()
+        .expect("restored RAR topology should exist");
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::Rar
+    );
+    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
+    assert!(!topology.members.is_empty());
+    let _ = complete_dir;
+    let _ = complete_dir_restored;
+}
+
+#[tokio::test]
+async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10077);
+    let fixture_files = sevenz_fixture_bytes("generated_split_store_plain.7z");
+    let obfuscated_files: Vec<(String, Vec<u8>)> = fixture_files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.{}", index + 10),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("Restore Obfuscated Split 7z", &obfuscated_files);
+    insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+
+    for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let recovered = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .unwrap();
+    drop(pipeline);
+    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
+
+    let (mut restored, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    restored
+        .restore_job(RestoreJobRequest {
+            job_id,
+            spec,
+            committed_segments,
+            file_progress: recovered.file_progress,
+            detected_archives: recovered.detected_archives,
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            working_dir: recovered.output_dir,
+        })
+        .await
+        .unwrap();
+
+    let restored_file = restored
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .assembly
+        .file(NzbFileId {
+            job_id,
+            file_index: 1,
+        })
+        .unwrap();
+    assert!(matches!(
+        restored_file.role(),
+        weaver_model::files::FileRole::Unknown | weaver_model::files::FileRole::SplitFile { .. }
+    ));
+    assert!(matches!(
+        restored_file.effective_role(),
+        weaver_model::files::FileRole::SevenZipSplit { .. }
+    ));
+    assert_eq!(
+        restored_file
+            .detected_archive()
+            .map(|detected| detected.set_name.as_str()),
+        Some("51273aad56a8b904e96928935278a627")
+    );
+
+    let set_name = "51273aad56a8b904e96928935278a627";
+    let topology = restored
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for(set_name))
+        .cloned()
+        .expect("restored 7z topology should exist");
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::SevenZip
+    );
+    assert_eq!(
+        topology.expected_volume_count,
+        Some(obfuscated_files.len() as u32)
+    );
+    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
+    let _ = complete_dir;
 }
 
 #[tokio::test]
@@ -2547,6 +2950,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: ["E01.mkv".to_string()].into_iter().collect(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -2756,6 +3160,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
                 },
             ),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -2849,6 +3254,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
             spec,
             committed_segments,
             file_progress,
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -2932,6 +3338,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3013,6 +3420,7 @@ async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
                 &rar_job_spec("RAR Restart Runtime Restore", &files),
             ),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3064,6 +3472,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
                 &rar_job_spec("RAR Ownerless Restore", &files),
             ),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -4342,6 +4751,154 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
 }
 
 #[tokio::test]
+async fn split_files_register_topology_when_completed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30077);
+    let files = [
+        ("archive.001".to_string(), b"split-a".to_vec()),
+        ("archive.002".to_string(), b"split-b".to_vec()),
+    ];
+    let spec = JobSpec {
+        name: "Split Topology Registration".to_string(),
+        password: None,
+        total_bytes: files.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        category: None,
+        metadata: vec![],
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, bytes))| FileSpec {
+                filename: filename.clone(),
+                role: FileRole::from_filename(filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: bytes.len() as u32,
+                    message_id: format!("split-register-{index}@example.com"),
+                }],
+            })
+            .collect(),
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let topology = state
+        .assembly
+        .archive_topology_for("archive")
+        .expect("split topology should be registered");
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::Split
+    );
+    assert_eq!(topology.expected_volume_count, Some(files.len() as u32));
+    assert_eq!(topology.complete_volumes.len(), files.len());
+    assert!(topology.volume_map.contains_key("archive.001"));
+    assert!(topology.volume_map.contains_key("archive.002"));
+    assert!(matches!(
+        state.assembly.set_extraction_readiness("archive"),
+        crate::jobs::assembly::ExtractionReadiness::Ready
+    ));
+}
+
+#[tokio::test]
+async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30078);
+    let filename = "51273aad56a8b904e96928935278a627";
+    let fixture_bytes = rar5_fixture_bytes("rar5_store.rar");
+    let spec = rar_job_spec(
+        "Obfuscated RAR Retry Clears Detection",
+        &[(filename.to_string(), fixture_bytes.clone())],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state.assembly.file(file_id).unwrap();
+        assert!(matches!(file.role(), FileRole::Unknown));
+        assert!(matches!(
+            file.effective_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ));
+        assert_eq!(
+            file.detected_archive()
+                .map(|detected| detected.set_name.as_str()),
+            Some(filename)
+        );
+    }
+    assert_eq!(
+        pipeline
+            .db
+            .load_detected_archive_identities(job_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    pipeline
+        .failed_extractions
+        .insert(job_id, HashSet::from([filename.to_string()]));
+
+    pipeline.check_job_completion(job_id).await;
+
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state.assembly.file(file_id).unwrap();
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert_eq!(state.download_queue.len(), 1);
+        assert!(!file.is_complete());
+        assert!(matches!(file.effective_role(), FileRole::Unknown));
+        assert!(file.detected_archive().is_none());
+    }
+    assert!(
+        pipeline
+            .db
+            .load_detected_archive_identities(job_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!pipeline.failed_extractions.contains_key(&job_id));
+    assert!(pipeline.normalization_retried.contains(&job_id));
+
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
+
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state.assembly.file(file_id).unwrap();
+        assert!(matches!(
+            file.effective_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ));
+        assert_eq!(
+            file.detected_archive()
+                .map(|detected| detected.set_name.as_str()),
+            Some(filename)
+        );
+    }
+    assert_eq!(
+        pipeline
+            .db
+            .load_detected_archive_identities(job_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4849,6 +5406,67 @@ async fn probe_completion_clears_health_probing_and_restores_queues() {
 }
 
 #[tokio::test]
+async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30076);
+    let working_dir = intermediate_dir.join("impossible-rar-state");
+    let mut state = minimal_job_state(job_id, "Impossible RAR State", working_dir);
+    let topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::new(),
+        complete_volumes: HashSet::new(),
+        expected_volume_count: None,
+        members: vec![crate::jobs::assembly::ArchiveMember {
+            name: "E10.mkv".to_string(),
+            first_volume: 0,
+            last_volume: 1,
+            unpacked_size: 0,
+        }],
+        unresolved_spans: Vec::new(),
+    };
+    state
+        .assembly
+        .set_archive_topology("show".to_string(), topology.clone());
+    pipeline.jobs.insert(job_id, state);
+    pipeline.job_order.push(job_id);
+    pipeline.rar_sets.insert(
+        (job_id, "show".to_string()),
+        rar_state::RarSetState {
+            facts: std::collections::BTreeMap::from([(0u32, dummy_rar_volume_facts(0))]),
+            volume_files: std::collections::BTreeMap::new(),
+            cached_headers: None,
+            verified_suspect_volumes: HashSet::new(),
+            active_workers: 0,
+            in_flight_members: HashSet::new(),
+            phase: rar_state::RarSetPhase::Ready,
+            plan: Some(rar_state::RarDerivedPlan {
+                phase: rar_state::RarSetPhase::Ready,
+                is_solid: false,
+                ready_members: Vec::new(),
+                member_names: vec!["E10.mkv".to_string()],
+                waiting_on_volumes: HashSet::new(),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: std::collections::BTreeMap::new(),
+                topology,
+                fallback_reason: None,
+            }),
+        },
+    );
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!("job should have failed");
+    };
+    assert!(error.contains("invalid RAR state after recompute"));
+}
+
+#[tokio::test]
 async fn probe_completion_does_not_immediately_reenter_checking() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -5009,6 +5627,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::QueuedRepair,
             queued_repair_at_epoch_ms: None,
@@ -5048,6 +5667,7 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Repairing,
             queued_repair_at_epoch_ms: Some(42_000.0),
@@ -5095,6 +5715,7 @@ async fn restore_paused_preserves_resume_target_and_queue_age() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Paused,
             queued_repair_at_epoch_ms: None,

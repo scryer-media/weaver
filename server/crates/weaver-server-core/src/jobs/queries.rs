@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::StateError;
+use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::record::{ActivePar2File, ExtractionChunk, RarVolumeFactsBySet, RecoveredJob};
 use crate::persistence::Database;
@@ -128,6 +129,7 @@ impl Database {
                         output_dir: PathBuf::from(output_dir),
                         committed_segments: HashSet::new(),
                         file_progress: HashMap::new(),
+                        detected_archives: HashMap::new(),
                         complete_files: HashSet::new(),
                         extracted_members: HashSet::new(),
                         status,
@@ -196,6 +198,41 @@ impl Database {
 
         {
             let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, file_index, kind, set_name, volume_index
+                     FROM active_detected_archives",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let job_id = JobId(row.get::<_, i64>(0)? as u64);
+                    let file_index: u32 = row.get(1)?;
+                    let kind = row.get::<_, String>(2)?;
+                    let set_name = row.get::<_, String>(3)?;
+                    let volume_index: Option<u32> = row.get(4)?;
+                    Ok((job_id, file_index, kind, set_name, volume_index))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let (job_id, file_index, kind, set_name, volume_index) = row.map_err(db_err)?;
+                let Some(kind) = DetectedArchiveKind::parse(&kind) else {
+                    continue;
+                };
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.detected_archives.insert(
+                        file_index,
+                        DetectedArchiveIdentity {
+                            kind,
+                            set_name,
+                            volume_index,
+                        },
+                    );
+                }
+            }
+        }
+
+        {
+            let mut stmt = conn
                 .prepare("SELECT job_id, file_index FROM active_files")
                 .map_err(db_err)?;
             let rows = stmt
@@ -234,6 +271,46 @@ impl Database {
         }
 
         Ok(jobs)
+    }
+
+    pub fn load_detected_archive_identities(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, DetectedArchiveIdentity>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_index, kind, set_name, volume_index
+                 FROM active_detected_archives
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u32>>(3)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut detected = HashMap::new();
+        for row in rows {
+            let (file_index, kind, set_name, volume_index) = row.map_err(db_err)?;
+            let Some(kind) = DetectedArchiveKind::parse(&kind) else {
+                continue;
+            };
+            detected.insert(
+                file_index,
+                DetectedArchiveIdentity {
+                    kind,
+                    set_name,
+                    volume_index,
+                },
+            );
+        }
+        Ok(detected)
     }
 
     pub fn max_job_id_all(&self) -> Result<u64, StateError> {

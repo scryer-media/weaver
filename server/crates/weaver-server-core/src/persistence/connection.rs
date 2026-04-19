@@ -273,6 +273,15 @@ impl Database {
                 PRIMARY KEY (job_id, set_name, volume_index)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS active_detected_archives (
+                job_id       INTEGER NOT NULL,
+                file_index   INTEGER NOT NULL,
+                kind         TEXT NOT NULL,
+                set_name     TEXT NOT NULL,
+                volume_index INTEGER,
+                PRIMARY KEY (job_id, file_index)
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS active_volume_status (
                 job_id       INTEGER NOT NULL,
                 set_name     TEXT NOT NULL,

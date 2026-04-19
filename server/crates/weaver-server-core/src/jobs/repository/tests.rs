@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
     HistoryFilter, JobHistoryRow, JobId,
@@ -147,6 +148,35 @@ fn set_runtime_state_roundtrip() {
         recovered.paused_resume_status.as_deref(),
         Some("queued_extract")
     );
+}
+
+#[test]
+fn detected_archive_identities_roundtrip() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.save_detected_archive_identity(
+        JobId(1),
+        4,
+        &DetectedArchiveIdentity {
+            kind: DetectedArchiveKind::SevenZipSplit,
+            set_name: "51273aad56a8b904e96928935278a627".to_string(),
+            volume_index: Some(2),
+        },
+    )
+    .unwrap();
+
+    let loaded = db.load_detected_archive_identities(JobId(1)).unwrap();
+    assert_eq!(
+        loaded.get(&4),
+        Some(&DetectedArchiveIdentity {
+            kind: DetectedArchiveKind::SevenZipSplit,
+            set_name: "51273aad56a8b904e96928935278a627".to_string(),
+            volume_index: Some(2),
+        })
+    );
+
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(jobs[&JobId(1)].detected_archives, loaded);
 }
 
 #[test]
@@ -633,6 +663,7 @@ fn late_active_state_writes_noop_after_archive() {
         "active_extraction_chunks",
         "active_archive_headers",
         "active_rar_volume_facts",
+        "active_detected_archives",
         "active_volume_status",
     ] {
         let count: i64 = conn
@@ -678,13 +709,21 @@ fn prune_orphan_active_state_removes_only_orphans() {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO active_detected_archives
+             (job_id, file_index, kind, set_name, volume_index)
+             VALUES (102, 0, 'rar', 'set', 0)",
+            [],
+        )
+        .unwrap();
     }
 
     let counts = db.prune_orphan_active_state().unwrap();
     assert_eq!(counts.active_segments, 1);
     assert_eq!(counts.active_file_progress, 1);
     assert_eq!(counts.active_archive_headers, 1);
-    assert_eq!(counts.total_removed(), 3);
+    assert_eq!(counts.active_detected_archives, 1);
+    assert_eq!(counts.total_removed(), 4);
 
     let conn = db.conn();
     let remaining_segments: i64 = conn

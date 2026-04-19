@@ -171,7 +171,7 @@ impl JobAssembly {
             // Check if there are archive files without any topology yet.
             let has_archive = self.files.values().any(|f| {
                 matches!(
-                    f.role(),
+                    f.effective_role(),
                     FileRole::RarVolume { .. }
                         | FileRole::SevenZipArchive
                         | FileRole::SevenZipSplit { .. }
@@ -186,7 +186,7 @@ impl JobAssembly {
         }
 
         // Check if all archive files appear in some topology's volume_map.
-        let all_archive_files_covered = self.files.values().all(|f| match f.role() {
+        let all_archive_files_covered = self.files.values().all(|f| match f.effective_role() {
             FileRole::RarVolume { .. }
             | FileRole::SevenZipArchive
             | FileRole::SevenZipSplit { .. } => self
@@ -466,6 +466,11 @@ impl JobAssembly {
     /// Iterator over all files.
     pub fn files(&self) -> impl Iterator<Item = &FileAssembly> {
         self.files.values()
+    }
+
+    /// Mutable iterator over all files.
+    pub fn files_mut(&mut self) -> impl Iterator<Item = &mut FileAssembly> {
+        self.files.values_mut()
     }
 
     /// The job id.

@@ -156,27 +156,33 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
-        let mut fallback_sets = Vec::new();
-        let mut has_incomplete_sets = false;
-        let mut has_ready_incremental_work = false;
-        for set_name in &set_names {
-            let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
-            let set_complete = extracted_archives.contains(set_name)
-                || set_state
-                    .and_then(|state| state.plan.as_ref())
-                    .is_some_and(|plan| {
-                        !plan.member_names.is_empty()
-                            && plan
-                                .member_names
-                                .iter()
-                                .all(|member| extracted.contains(member))
-                    });
-            if set_complete {
-                self.extracted_archives
-                    .entry(job_id)
-                    .or_default()
-                    .insert(set_name.clone());
-            } else {
+        let mut forced_recompute = false;
+        let (fallback_sets, has_incomplete_sets, has_ready_incremental_work) = loop {
+            let mut fallback_sets = Vec::new();
+            let mut has_incomplete_sets = false;
+            let mut has_ready_incremental_work = false;
+            let mut impossible_sets = Vec::new();
+
+            for set_name in &set_names {
+                let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
+                let set_complete = extracted_archives.contains(set_name)
+                    || set_state
+                        .and_then(|state| state.plan.as_ref())
+                        .is_some_and(|plan| {
+                            !plan.member_names.is_empty()
+                                && plan
+                                    .member_names
+                                    .iter()
+                                    .all(|member| extracted.contains(member))
+                        });
+                if set_complete {
+                    self.extracted_archives
+                        .entry(job_id)
+                        .or_default()
+                        .insert(set_name.clone());
+                    continue;
+                }
+
                 has_incomplete_sets = true;
                 if let Some(state) = set_state
                     && let Some(plan) = state.plan.as_ref()
@@ -188,12 +194,44 @@ impl Pipeline {
                         fallback_sets.push(set_name.clone());
                     } else if !plan.ready_members.is_empty() {
                         has_ready_incremental_work = true;
+                    } else if plan.waiting_on_volumes.is_empty() {
+                        impossible_sets.push(set_name.clone());
                     }
                 } else {
                     fallback_sets.push(set_name.clone());
                 }
             }
-        }
+
+            if impossible_sets.is_empty() {
+                break (
+                    fallback_sets,
+                    has_incomplete_sets,
+                    has_ready_incremental_work,
+                );
+            }
+
+            if forced_recompute {
+                let set_list = impossible_sets.join(", ");
+                let msg = format!(
+                    "invalid RAR state after recompute: sets [{set_list}] are incomplete with no ready members, no fallback, and no waiting volumes"
+                );
+                warn!(job_id = job_id.0, error = %msg);
+                self.fail_job(job_id, msg);
+                return;
+            }
+
+            forced_recompute = true;
+            for set_name in impossible_sets {
+                if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error,
+                        "failed forced RAR recompute for impossible state"
+                    );
+                }
+            }
+        };
 
         if has_incomplete_sets {
             if (has_ready_incremental_work || !fallback_sets.is_empty())
@@ -733,7 +771,7 @@ impl Pipeline {
                         .files()
                         .filter(|f| {
                             matches!(
-                                f.role(),
+                                f.effective_role(),
                                 weaver_model::files::FileRole::Par2 { .. }
                                     | weaver_model::files::FileRole::RarVolume { .. }
                                     | weaver_model::files::FileRole::SevenZipArchive

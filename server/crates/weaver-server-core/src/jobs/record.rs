@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ pub struct RecoveredJob {
     pub output_dir: PathBuf,
     pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,
+    pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub complete_files: HashSet<NzbFileId>,
     pub extracted_members: HashSet<String>,
     pub status: String,
