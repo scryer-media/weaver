@@ -833,8 +833,7 @@ fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
 }
 
 fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
-    let fixture_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sevenz");
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sevenz");
     let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&fixture_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -1374,8 +1373,14 @@ async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
             .and_then(|state| state.assembly.archive_topology_for(set_name))
             .cloned()
             .expect("detected 7z topology should exist");
-        assert_eq!(topology.archive_type, crate::jobs::assembly::ArchiveType::SevenZip);
-        assert_eq!(topology.expected_volume_count, Some(obfuscated_files.len() as u32));
+        assert_eq!(
+            topology.archive_type,
+            crate::jobs::assembly::ArchiveType::SevenZip
+        );
+        assert_eq!(
+            topology.expected_volume_count,
+            Some(obfuscated_files.len() as u32)
+        );
 
         let expected_complete_volumes: std::collections::HashSet<u32> =
             (0..=file_index as u32).collect();
@@ -1401,8 +1406,14 @@ async fn upstream_probe_does_not_misclassify_unknown_numeric_plain_files() {
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(10075);
     let files = vec![
-        ("51273aad56a8b904e96928935278a627.10".to_string(), b"plain-a".to_vec()),
-        ("51273aad56a8b904e96928935278a627.11".to_string(), b"plain-b".to_vec()),
+        (
+            "51273aad56a8b904e96928935278a627.10".to_string(),
+            b"plain-a".to_vec(),
+        ),
+        (
+            "51273aad56a8b904e96928935278a627.11".to_string(),
+            b"plain-b".to_vec(),
+        ),
     ];
     let spec = rar_job_spec("Unknown Numeric Plain Files", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4324,7 +4335,10 @@ async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
     let job_id = JobId(30030);
     let filename = "archive.rar";
     let fixture_bytes = rar5_fixture_bytes("rar5_store.rar");
-    let spec = rar_job_spec("RAR Recompute On Same Facts", &[(filename.to_string(), fixture_bytes.clone())]);
+    let spec = rar_job_spec(
+        "RAR Recompute On Same Facts",
+        &[(filename.to_string(), fixture_bytes.clone())],
+    );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;

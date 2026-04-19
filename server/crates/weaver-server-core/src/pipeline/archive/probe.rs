@@ -111,8 +111,9 @@ impl Pipeline {
                     facts,
                 ) {
                     Ok(_) => {
-                        if let Err(error) =
-                            self.recompute_rar_set_state(job_id, &registration.set_name).await
+                        if let Err(error) = self
+                            .recompute_rar_set_state(job_id, &registration.set_name)
+                            .await
                         {
                             tracing::warn!(
                                 job_id = job_id.0,
@@ -198,8 +199,7 @@ impl Pipeline {
         }
 
         if candidate.numeric_suffix.is_some()
-            && self.detected_archive_type(job_id, &candidate.set_key)
-                == Some(ArchiveType::SevenZip)
+            && self.detected_archive_type(job_id, &candidate.set_key) == Some(ArchiveType::SevenZip)
         {
             let Some((volume_map, complete_volumes, expected_volume_count)) =
                 self.detected_seven_zip_split_group(job_id, &candidate.set_key)
@@ -393,5 +393,8 @@ fn numeric_suffix_set_key(filename: &str) -> Option<(String, u32)> {
         return None;
     }
 
-    suffix.parse::<u32>().ok().map(|numeric_suffix| (set_key.to_string(), numeric_suffix))
+    suffix
+        .parse::<u32>()
+        .ok()
+        .map(|numeric_suffix| (set_key.to_string(), numeric_suffix))
 }
