@@ -139,10 +139,10 @@ impl Pipeline {
 
         if let Some(rar_state) = self.rar_sets.get(&(job_id, set_name.to_string())) {
             for (logical_volume, filename) in &rar_state.volume_files {
-                if let Some(path) = self.resolve_job_input_path(job_id, filename) {
-                    if path.exists() {
-                        volume_paths.insert(*logical_volume, path);
-                    }
+                if let Some(path) = self.resolve_job_input_path(job_id, filename)
+                    && path.exists()
+                {
+                    volume_paths.insert(*logical_volume, path);
                 }
             }
         }
@@ -156,10 +156,10 @@ impl Pipeline {
             if base_name.as_deref() != Some(set_name) || !file_asm.is_complete() {
                 continue;
             }
-            if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
-                if path.exists() {
-                    volume_paths.entry(*volume_number).or_insert(path);
-                }
+            if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename())
+                && path.exists()
+            {
+                volume_paths.entry(*volume_number).or_insert(path);
             }
         }
 
