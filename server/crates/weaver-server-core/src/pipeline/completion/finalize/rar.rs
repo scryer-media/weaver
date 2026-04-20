@@ -3,6 +3,59 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 impl Pipeline {
+    fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {
+        let set_key = (job_id, set_name.to_string());
+        let retry_filenames: HashSet<String> = {
+            let mut filenames = HashSet::new();
+            if let Some(state) = self.jobs.get(&job_id)
+                && let Some(topology) = state.assembly.archive_topology_for(set_name)
+            {
+                filenames.extend(topology.volume_map.keys().cloned());
+            }
+            if let Some(rar_state) = self.rar_sets.get(&set_key) {
+                filenames.extend(rar_state.volume_files.values().cloned());
+            }
+            filenames
+        };
+
+        if !retry_filenames.is_empty() {
+            let mut remove_deleted_entry = false;
+            if let Some(deleted) = self.eagerly_deleted.get_mut(&job_id) {
+                for filename in &retry_filenames {
+                    deleted.remove(filename);
+                }
+                remove_deleted_entry = deleted.is_empty();
+            }
+            if remove_deleted_entry {
+                self.eagerly_deleted.remove(&job_id);
+            }
+        }
+
+        self.clear_rar_snapshot(job_id, set_name);
+        self.rar_sets.remove(&set_key);
+
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.assembly.archive_topologies_mut().remove(set_name);
+        }
+
+        for result in [
+            self.db.delete_rar_volume_facts_for_set(job_id, set_name),
+            self.db
+                .clear_verified_suspect_volumes_for_set(job_id, set_name),
+            self.db.clear_volume_status_for_set(job_id, set_name),
+            self.db.clear_extraction_chunks_for_set(job_id, set_name),
+        ] {
+            if let Err(error) = result {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to clear archive-set retry state"
+                );
+            }
+        }
+    }
+
     fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
         let mut volume_numbers = HashMap::new();
         let Some(state) = self.jobs.get(&job_id) else {
@@ -186,9 +239,9 @@ impl Pipeline {
                     if !normalized_files.contains(file.filename()) {
                         return None;
                     }
-                    match file.effective_role() {
-                        weaver_model::files::FileRole::RarVolume { .. } => file
-                            .archive_set_name()
+                    match self.classified_role_for_file(job_id, file) {
+                        weaver_model::files::FileRole::RarVolume { .. } => self
+                            .classified_archive_set_name_for_file(job_id, file)
                             .map(|set_name| (set_name, file.filename().to_string())),
                         _ => None,
                     }
@@ -419,7 +472,7 @@ impl Pipeline {
 
         let mut has_rar = false;
         for file in state.assembly.files() {
-            match file.effective_role() {
+            match self.classified_role_for_file(job_id, file) {
                 weaver_model::files::FileRole::RarVolume { .. } => has_rar = true,
                 weaver_model::files::FileRole::SevenZipArchive
                 | weaver_model::files::FileRole::SevenZipSplit { .. } => return false,
@@ -450,9 +503,9 @@ impl Pipeline {
 
         for file in state.assembly.files() {
             if matches!(
-                file.effective_role(),
+                self.classified_role_for_file(job_id, file),
                 weaver_model::files::FileRole::RarVolume { .. }
-            ) && let Some(set_name) = file.archive_set_name()
+            ) && let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
             {
                 set_names.insert(set_name);
             }
@@ -470,7 +523,7 @@ impl Pipeline {
                 .files()
                 .filter(|f| {
                     matches!(
-                        f.effective_role(),
+                        self.classified_role_for_file(job_id, f),
                         weaver_model::files::FileRole::Par2 { .. }
                             | weaver_model::files::FileRole::RarVolume { .. }
                             | weaver_model::files::FileRole::SevenZipArchive
@@ -769,6 +822,10 @@ impl Pipeline {
             self.clear_persisted_extracted_members(job_id);
         }
 
+        for set_name in &retry_sets {
+            self.clear_archive_set_for_source_retry(job_id, set_name);
+        }
+
         for retry_file in &retry_files {
             let path = working_dir.join(&retry_file.filename);
             match std::fs::remove_file(&path) {
@@ -794,6 +851,7 @@ impl Pipeline {
             }
         }
 
+        let mut cleared_detected_file_ids = Vec::new();
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return Ok(false);
@@ -802,7 +860,13 @@ impl Pipeline {
             for mut retry_file in retry_files {
                 if let Some(file_asm) = state.assembly.file_mut(retry_file.file_id) {
                     file_asm.reset();
-                    file_asm.clear_detected_archive();
+                    if state
+                        .detected_archives
+                        .remove(&retry_file.file_id.file_index)
+                        .is_some()
+                    {
+                        cleared_detected_file_ids.push(retry_file.file_id);
+                    }
                 }
 
                 for topo in state.assembly.archive_topologies_mut().values_mut() {
@@ -815,6 +879,10 @@ impl Pipeline {
                     state.download_queue.push(work);
                 }
             }
+        }
+
+        for file_id in cleared_detected_file_ids {
+            self.clear_detected_archive_identity(job_id, file_id);
         }
 
         info!(

@@ -163,6 +163,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         par2_bytes: 0,
         health_probing: false,
         last_health_probe_failed_bytes: 0,
+        detected_archives: HashMap::new(),
         held_segments: Vec::new(),
         download_queue: DownloadQueue::new(),
         recovery_queue: DownloadQueue::new(),
@@ -813,6 +814,7 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
             par2_bytes,
             health_probing: false,
             last_health_probe_failed_bytes: 0,
+            detected_archives: HashMap::new(),
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -849,6 +851,7 @@ fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
 
 async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, max_rounds: usize) {
     for _ in 0..max_rounds {
+        pump_pipeline_runtime_queues(pipeline).await;
         if matches!(
             job_status_for_assert(pipeline, job_id),
             Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
@@ -860,12 +863,13 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "timed out waiting for extraction completion; current status: {:?}",
-                    job_status_for_assert(pipeline, job_id)
+                    "timed out waiting for extraction completion\n{}",
+                    debug_job_state(pipeline, job_id)
                 )
             })
             .expect("extraction channel should stay open");
         pipeline.handle_extraction_done(done).await;
+        pump_pipeline_runtime_queues(pipeline).await;
     }
 
     panic!("job {job_id} did not reach a terminal state after {max_rounds} extraction rounds");
@@ -895,7 +899,7 @@ async fn write_and_complete_rar_volume(
     }
 
     pipeline
-        .try_register_archive_topology_for_completed_file(job_id, file_id)
+        .refresh_archive_state_for_completed_file(job_id, file_id, true)
         .await;
 }
 
@@ -923,7 +927,7 @@ async fn write_and_complete_file(
     }
 
     pipeline
-        .try_register_archive_topology_for_completed_file(job_id, file_id)
+        .refresh_archive_state_for_completed_file(job_id, file_id, true)
         .await;
 }
 
@@ -937,6 +941,7 @@ async fn write_and_complete_file_like_decode_worker(
     write_and_complete_file(pipeline, job_id, file_index, filename, bytes).await;
     pipeline.try_rar_extraction(job_id).await;
     pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(pipeline).await;
 }
 
 fn member_span(
@@ -987,6 +992,117 @@ fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus
                 .find(|job| job.job_id == job_id)
                 .map(|job| job.status.clone())
         })
+}
+
+fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "status={:?}",
+        job_status_for_assert(pipeline, job_id)
+    ));
+    lines.push(format!(
+        "pending_completion_checks={:?}",
+        pipeline
+            .pending_completion_checks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+    ));
+    lines.push(format!(
+        "inflight_extractions={:?}",
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "extracted_archives={:?}",
+        pipeline
+            .extracted_archives
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "failed_extractions={:?}",
+        pipeline
+            .failed_extractions
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default()
+    ));
+
+    if let Some(state) = pipeline.jobs.get(&job_id) {
+        let topologies: Vec<String> = state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .map(|(set_name, topology)| {
+                format!(
+                    "{}:{:?}:complete={:?}:expected={:?}:members={}:unresolved={:?}",
+                    set_name,
+                    topology.archive_type,
+                    topology.complete_volumes,
+                    topology.expected_volume_count,
+                    topology.members.len(),
+                    topology.unresolved_spans
+                )
+            })
+            .collect();
+        lines.push(format!("topologies={topologies:?}"));
+    }
+
+    let rar_sets: Vec<String> = pipeline
+        .rar_sets
+        .iter()
+        .filter(|((jid, _), _)| *jid == job_id)
+        .map(|((_, set_name), state)| {
+            let plan = state.plan.as_ref().map(|plan| {
+                format!(
+                    "phase={:?},ready={:?},waiting={:?},members={:?},solid={}",
+                    plan.phase,
+                    plan.ready_members
+                        .iter()
+                        .map(|member| member.name.clone())
+                        .collect::<Vec<_>>(),
+                    plan.waiting_on_volumes,
+                    plan.member_names,
+                    plan.is_solid
+                )
+            });
+            format!(
+                "{}:active_workers={}:in_flight={:?}:facts={:?}:volume_files={:?}:plan={:?}",
+                set_name,
+                state.active_workers,
+                state.in_flight_members,
+                state.facts.keys().copied().collect::<Vec<_>>(),
+                state.volume_files,
+                plan
+            )
+        })
+        .collect();
+    lines.push(format!("rar_sets={rar_sets:?}"));
+
+    lines.join("\n")
+}
+
+async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+    pipeline.pump_decode_queue();
+
+    while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+        pipeline.check_job_completion(queued_job).await;
+        pipeline.pump_decode_queue();
+    }
+
+    while let Ok(done) = pipeline.extract_done_rx.try_recv() {
+        pipeline.handle_extraction_done(done).await;
+        pipeline.pump_decode_queue();
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+            pipeline.pump_decode_queue();
+        }
+    }
 }
 
 async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
@@ -1317,11 +1433,12 @@ async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
             weaver_model::files::FileRole::Unknown
         ));
         assert!(matches!(
-            file.effective_role(),
+            pipeline.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
         ));
         assert_eq!(
-            file.detected_archive()
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
                 .map(|detected| detected.set_name.as_str()),
             Some("51273aad56a8b904e96928935278a627")
         );
@@ -1388,11 +1505,12 @@ async fn nested_scan_detects_obfuscated_split_7z_archives_from_staging() {
             weaver_model::files::FileRole::Unknown
         ));
         assert!(matches!(
-            file.effective_role(),
+            pipeline.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::SevenZipSplit { .. }
         ));
         assert_eq!(
-            file.detected_archive()
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
                 .map(|detected| detected.set_name.as_str()),
             Some("51273aad56a8b904e96928935278a627")
         );
@@ -1464,11 +1582,12 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
             weaver_model::files::FileRole::Unknown
         ));
         assert!(matches!(
-            file.effective_role(),
+            pipeline.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
         ));
         assert_eq!(
-            file.detected_archive()
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
                 .map(|detected| detected.set_name.as_str()),
             Some("51273aad56a8b904e96928935278a627")
         );
@@ -1687,12 +1806,12 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
         weaver_model::files::FileRole::Unknown
     ));
     assert!(matches!(
-        restored_file.effective_role(),
+        restored.classified_role_for_file(job_id, restored_file),
         weaver_model::files::FileRole::RarVolume { .. }
     ));
     assert_eq!(
-        restored_file
-            .detected_archive()
+        restored
+            .detected_archive_identity(job_id, restored_file.file_id())
             .map(|detected| detected.set_name.as_str()),
         Some("51273aad56a8b904e96928935278a627")
     );
@@ -1779,12 +1898,12 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
         weaver_model::files::FileRole::Unknown | weaver_model::files::FileRole::SplitFile { .. }
     ));
     assert!(matches!(
-        restored_file.effective_role(),
+        restored.classified_role_for_file(job_id, restored_file),
         weaver_model::files::FileRole::SevenZipSplit { .. }
     ));
     assert_eq!(
-        restored_file
-            .detected_archive()
+        restored
+            .detected_archive_identity(job_id, restored_file.file_id())
             .map(|detected| detected.set_name.as_str()),
         Some("51273aad56a8b904e96928935278a627")
     );
@@ -4631,8 +4750,7 @@ async fn no_par2_single_file_retry_marks_zip_volume_complete_after_redownload() 
 
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
-        let topo = state.assembly.archive_topology_for("archive.zip").unwrap();
-        assert!(topo.complete_volumes.is_empty());
+        assert!(state.assembly.archive_topology_for("archive.zip").is_none());
     }
 
     let file_id = NzbFileId {
@@ -4721,8 +4839,7 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
 
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
-        let topo = state.assembly.archive_topology_for("archive.7z").unwrap();
-        assert!(topo.complete_volumes.is_empty());
+        assert!(state.assembly.archive_topology_for("archive.7z").is_none());
     }
 
     let file_id = NzbFileId {
@@ -4830,11 +4947,12 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
         let file = state.assembly.file(file_id).unwrap();
         assert!(matches!(file.role(), FileRole::Unknown));
         assert!(matches!(
-            file.effective_role(),
+            pipeline.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
         ));
         assert_eq!(
-            file.detected_archive()
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
                 .map(|detected| detected.set_name.as_str()),
             Some(filename)
         );
@@ -4860,13 +4978,35 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
         assert!(matches!(state.status, JobStatus::Downloading));
         assert_eq!(state.download_queue.len(), 1);
         assert!(!file.is_complete());
-        assert!(matches!(file.effective_role(), FileRole::Unknown));
-        assert!(file.detected_archive().is_none());
+        assert!(matches!(
+            pipeline.classified_role_for_file(job_id, file),
+            FileRole::Unknown
+        ));
+        assert!(
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
+                .is_none()
+        );
+        assert!(state.assembly.archive_topology_for(filename).is_none());
     }
     assert!(
         pipeline
             .db
             .load_detected_archive_identities(job_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pipeline
+            .db
+            .load_all_archive_headers(job_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pipeline
+            .db
+            .load_all_rar_volume_facts(job_id)
             .unwrap()
             .is_empty()
     );
@@ -4879,11 +5019,12 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
         let state = pipeline.jobs.get(&job_id).unwrap();
         let file = state.assembly.file(file_id).unwrap();
         assert!(matches!(
-            file.effective_role(),
+            pipeline.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
         ));
         assert_eq!(
-            file.detected_archive()
+            pipeline
+                .detected_archive_identity(job_id, file.file_id())
                 .map(|detected| detected.set_name.as_str()),
             Some(filename)
         );
@@ -4896,6 +5037,88 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30079);
+    let filename = "51273aad56a8b904e96928935278a627";
+    let rar_bytes = rar5_fixture_bytes("rar5_store.rar");
+    let seven_zip_bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+    let spec = rar_job_spec(
+        "Obfuscated RAR Retry Reclassifies As 7z",
+        &[(filename.to_string(), rar_bytes.clone())],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &rar_bytes).await;
+    pipeline
+        .failed_extractions
+        .insert(job_id, HashSet::from([filename.to_string()]));
+
+    pipeline.check_job_completion(job_id).await;
+
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        let file = state
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            pipeline.classified_role_for_file(job_id, file),
+            FileRole::Unknown
+        ));
+        assert!(state.assembly.archive_topology_for(filename).is_none());
+    }
+    assert!(pipeline.rar_sets.is_empty());
+    assert!(
+        pipeline
+            .db
+            .load_all_archive_headers(job_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        pipeline
+            .db
+            .load_all_rar_volume_facts(job_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    write_and_complete_file(&mut pipeline, job_id, 0, filename, &seven_zip_bytes).await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let file = state
+        .assembly
+        .file(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .unwrap();
+    assert!(matches!(
+        pipeline.classified_role_for_file(job_id, file),
+        weaver_model::files::FileRole::SevenZipArchive
+    ));
+    let topology = state
+        .assembly
+        .archive_topology_for(filename)
+        .expect("replacement payload should create a fresh 7z topology");
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::SevenZip
+    );
+    assert!(topology.complete_volumes.contains(&0));
+    assert!(matches!(
+        state.assembly.set_extraction_readiness(filename),
+        crate::jobs::assembly::ExtractionReadiness::Ready
+    ));
 }
 
 #[tokio::test]
@@ -4920,12 +5143,13 @@ async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
     }
 
     pipeline
-        .try_register_archive_topology_for_completed_file(
+        .refresh_archive_state_for_completed_file(
             job_id,
             NzbFileId {
                 job_id,
                 file_index: 0,
             },
+            true,
         )
         .await;
 

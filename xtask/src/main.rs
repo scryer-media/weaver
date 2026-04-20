@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -274,6 +275,56 @@ fn run_capture(command: &mut Command) -> Result<String> {
         bail!("command failed: {debug}\n{stderr}");
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn read_pid_command_line(pid: &str) -> Result<Option<String>> {
+    let output = Command::new("ps")
+        .args(["-o", "command=", "-p", pid])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(command))
+    }
+}
+
+fn command_matches_local_weaver(command_line: &str, binaries: &[PathBuf]) -> bool {
+    binaries.iter().any(|binary| {
+        let binary = binary.display().to_string();
+        command_line == binary || command_line.starts_with(&format!("{binary} "))
+    })
+}
+
+fn list_port_pids(ctx: &TaskContext, port: u16) -> Result<Vec<String>> {
+    let mut lsof = ctx.command("lsof");
+    lsof.args(["-ti", &format!(":{port}")]);
+    let output = lsof.output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn signal_pids(ctx: &TaskContext, pids: &[String], signal: Option<&str>) -> Result<()> {
+    if pids.is_empty() {
+        return Ok(());
+    }
+    let mut kill = ctx.command("kill");
+    if let Some(signal) = signal {
+        kill.arg(signal);
+    }
+    kill.args(pids);
+    let _ = run_status(&mut kill);
+    Ok(())
 }
 
 fn run_streaming(command: &mut Command, prefix: &'static str) -> Result<()> {
@@ -1131,6 +1182,9 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
 fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     let log_file = PathBuf::from("/tmp/weaver.log");
     let binary = ctx.path("target/release/weaver");
+    let debug_binary = ctx.path("target/debug/weaver");
+    let local_binaries = vec![binary.clone(), debug_binary];
+    let pid_file = ctx.path("tmp/weaver-local.pid");
     let rust_log = build_rust_log(args.target.as_deref());
     let config_file = ctx.path("weaver.toml");
     let backup_dir = ctx.path("tmp/config-backups");
@@ -1154,50 +1208,82 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     }
 
     println!("==> Stopping existing weaver...");
-    for pattern in [
-        "weaver serve",
-        "target/release/weaver",
-        "target/debug/weaver",
-    ] {
-        let mut pkill = ctx.command("pkill");
-        pkill.args(["-f", pattern]);
-        let _ = run_status(&mut pkill);
-    }
-    let mut lsof = ctx.command("lsof");
-    lsof.args(["-ti:9090"]);
-    let output = lsof.output()?;
-    if output.status.success() {
-        let pids = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !pids.is_empty() {
-            let mut kill = ctx.command("kill");
-            kill.args(&pids);
-            let _ = run_status(&mut kill);
+    if let Some(pid) = fs::read_to_string(&pid_file)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(command_line) = read_pid_command_line(&pid)? {
+            if command_matches_local_weaver(&command_line, &local_binaries) {
+                signal_pids(ctx, &[pid], None)?;
+            }
         }
     }
+
+    let initial_port_pids = list_port_pids(ctx, 9090)?;
+    let mut weaver_port_pids = BTreeSet::new();
+    let mut foreign_port_owners = Vec::new();
+    for pid in initial_port_pids {
+        match read_pid_command_line(&pid)? {
+            Some(command_line) if command_matches_local_weaver(&command_line, &local_binaries) => {
+                weaver_port_pids.insert(pid);
+            }
+            Some(command_line) => foreign_port_owners.push((pid, command_line)),
+            None => foreign_port_owners.push((pid, "<unknown command>".to_string())),
+        }
+    }
+    if !foreign_port_owners.is_empty() {
+        let owners = foreign_port_owners
+            .into_iter()
+            .map(|(pid, command)| format!("pid {pid}: {command}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "Refusing to stop non-Weaver process(es) on port 9090.\n{owners}\nFree the port or change Weaver's port before running deploy local."
+        );
+    }
+    let weaver_port_pids = weaver_port_pids.into_iter().collect::<Vec<_>>();
+    signal_pids(ctx, &weaver_port_pids, None)?;
     thread::sleep(std::time::Duration::from_secs(1));
 
-    let mut lsof = ctx.command("lsof");
-    lsof.args(["-ti:9090"]);
-    let output = lsof.output()?;
-    if output.status.success() && !output.stdout.is_empty() {
-        println!("    Port 9090 still in use, sending SIGKILL...");
-        let pids = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if !pids.is_empty() {
-            let mut kill = ctx.command("kill");
-            kill.arg("-9").args(&pids);
-            let _ = run_status(&mut kill);
-        }
+    let remaining_weaver_pids = list_port_pids(ctx, 9090)?
+        .into_iter()
+        .filter_map(|pid| match read_pid_command_line(&pid) {
+            Ok(Some(command_line))
+                if command_matches_local_weaver(&command_line, &local_binaries) =>
+            {
+                Some(Ok(pid))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !remaining_weaver_pids.is_empty() {
+        println!("    Weaver still owns port 9090, sending SIGKILL...");
+        signal_pids(ctx, &remaining_weaver_pids, Some("-9"))?;
         thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let remaining_port_pids = list_port_pids(ctx, 9090)?;
+    if !remaining_port_pids.is_empty() {
+        let owners = remaining_port_pids
+            .into_iter()
+            .map(|pid| {
+                let command =
+                    read_pid_command_line(&pid)?.unwrap_or_else(|| "<unknown command>".to_string());
+                Ok(format!("pid {pid}: {command}"))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
+        bail!(
+            "Port 9090 is still occupied after stopping local Weaver.\n{owners}\nRefusing to kill non-Weaver processes."
+        );
     }
 
     println!("==> Cleaning old logs...");
     fs::write(&log_file, "")?;
+    if let Some(parent) = pid_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     println!("==> Building frontend...");
     let mut frontend = ctx.command_in("npm", &ctx.path("apps/weaver-web"));
@@ -1229,6 +1315,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     let mut child = child.spawn()?;
     thread::sleep(std::time::Duration::from_secs(2));
     if child.try_wait()?.is_none() {
+        fs::write(&pid_file, format!("{}\n", child.id()))?;
         println!("==> Weaver running (PID={}, port=9090)", child.id());
         println!("==> Log: tail -f {}", log_file.display());
         let preview = tail_file(&log_file, 10)?;

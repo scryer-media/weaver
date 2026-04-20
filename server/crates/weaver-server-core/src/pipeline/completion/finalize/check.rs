@@ -688,10 +688,7 @@ impl Pipeline {
         }
 
         // Check extraction readiness.
-        let readiness = {
-            let state = self.jobs.get(&job_id).unwrap();
-            state.assembly.extraction_readiness()
-        };
+        let readiness = self.extraction_readiness_for_job(job_id);
         match readiness {
             ExtractionReadiness::NotApplicable => {
                 if !par2_bypassed {
@@ -771,7 +768,7 @@ impl Pipeline {
                         .files()
                         .filter(|f| {
                             matches!(
-                                f.effective_role(),
+                                self.classified_role_for_file(job_id, f),
                                 weaver_model::files::FileRole::Par2 { .. }
                                     | weaver_model::files::FileRole::RarVolume { .. }
                                     | weaver_model::files::FileRole::SevenZipArchive
