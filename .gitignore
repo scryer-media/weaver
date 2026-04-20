@@ -42,3 +42,6 @@ AUDIT-*.md
 apps/weaver-web/node_modules
 apps/weaver-web/dist
 apps/weaver-web/.vite
+
+# Local agent skills (machine-specific only)
+.agents/skills/claude-context/
