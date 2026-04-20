@@ -5,7 +5,7 @@ use weaver_server_core::JobHistoryRow;
 
 use crate::jobs::types::{
     Attribute, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobStatusGql, ParsedRelease, QueueAttention,
-    QueueFilterInput, QueueItemState,
+    QueueFilterInput, QueueItemState, matches_attribute_filter,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -311,12 +311,7 @@ pub fn matches_history_filter(item: &HistoryItem, filter: Option<&QueueFilterInp
     {
         return false;
     }
-    if let Some(attribute_key) = &filter.has_attribute_key
-        && !item
-            .attributes
-            .iter()
-            .any(|entry| entry.key == *attribute_key)
-    {
+    if !matches_attribute_filter(&item.attributes, filter) {
         return false;
     }
     true
