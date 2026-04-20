@@ -1,6 +1,68 @@
 use super::*;
 
 impl Pipeline {
+    pub(crate) async fn retained_nzb_path_for_job(&self, job_id: JobId) -> Option<PathBuf> {
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| matches!(state.status, JobStatus::Failed { .. }))
+        {
+            return Some(self.nzb_dir.join(format!("{}.nzb", job_id.0)));
+        }
+
+        let db = self.db.clone();
+        let row = tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
+            .await
+            .ok()?
+            .ok()?;
+        row.and_then(|entry| entry.nzb_path).map(PathBuf::from)
+    }
+
+    pub(crate) async fn all_retained_nzb_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        for (job_id, state) in &self.jobs {
+            if matches!(state.status, JobStatus::Failed { .. }) {
+                paths.push(self.nzb_dir.join(format!("{}.nzb", job_id.0)));
+            }
+        }
+
+        let db = self.db.clone();
+        if let Ok(Ok(rows)) = tokio::task::spawn_blocking(move || {
+            db.list_job_history(&crate::HistoryFilter::default())
+        })
+        .await
+        {
+            for row in rows {
+                if let Some(path) = row.nzb_path {
+                    let path = PathBuf::from(path);
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+
+        paths
+    }
+
+    pub(crate) async fn cleanup_retained_nzb(&self, path: Option<&std::path::Path>) {
+        let Some(path) = path else { return };
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {
+                info!(path = %path.display(), "removed retained persisted NZB");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to remove retained persisted NZB"
+                );
+            }
+        }
+    }
+
     fn cleanupable_history_output_dir(&self, output_dir: &std::path::Path) -> Option<PathBuf> {
         output_dir
             .strip_prefix(&self.intermediate_dir)
@@ -212,7 +274,12 @@ impl Pipeline {
             health,
             category: state.spec.category.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
-            nzb_path: None,
+            nzb_path: matches!(state.status, JobStatus::Failed { .. }).then(|| {
+                self.nzb_dir
+                    .join(format!("{}.nzb", job_id.0))
+                    .display()
+                    .to_string()
+            }),
             created_at,
             completed_at: now,
             metadata: if state.spec.metadata.is_empty() {
@@ -253,7 +320,8 @@ impl Pipeline {
             tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
             return;
         }
-        if let Err(e) = std::fs::remove_file(&nzb_path)
+        if !matches!(state.status, JobStatus::Failed { .. })
+            && let Err(e) = std::fs::remove_file(&nzb_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");

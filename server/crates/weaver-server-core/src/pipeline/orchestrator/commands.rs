@@ -272,6 +272,16 @@ impl Pipeline {
             }
             SchedulerCommand::ReprocessJob { job_id, reply } => {
                 let result = self.reprocess_job(job_id).await;
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::RedownloadJob { job_id, reply } => {
+                let result = self.redownload_job(job_id).await;
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteHistory {
@@ -291,6 +301,7 @@ impl Pipeline {
                 } else {
                     None
                 };
+                let retained_nzb_path = self.retained_nzb_path_for_job(job_id).await;
                 let result = match self.jobs.get(&job_id).map(|state| state.status.clone()) {
                     Some(status) if !is_terminal_status(&status) => {
                         Err(crate::SchedulerError::Conflict(
@@ -306,6 +317,8 @@ impl Pipeline {
                             return;
                         }
                         self.cleanup_output_dir(output_dir.as_deref()).await;
+                        self.cleanup_retained_nzb(retained_nzb_path.as_deref())
+                            .await;
                         self.purge_terminal_job_runtime(job_id);
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
@@ -325,6 +338,8 @@ impl Pipeline {
                             return;
                         }
                         self.cleanup_output_dir(output_dir.as_deref()).await;
+                        self.cleanup_retained_nzb(retained_nzb_path.as_deref())
+                            .await;
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
                         let delete_result =
@@ -378,6 +393,10 @@ impl Pipeline {
                     for dir in &output_dirs {
                         self.cleanup_output_dir(Some(dir)).await;
                     }
+                }
+                let retained_nzb_paths = self.all_retained_nzb_paths().await;
+                for path in &retained_nzb_paths {
+                    self.cleanup_retained_nzb(Some(path)).await;
                 }
                 let terminal_job_ids: Vec<JobId> = self
                     .jobs

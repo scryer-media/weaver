@@ -438,6 +438,12 @@ export const REPROCESS_JOB_MUTATION = gql`
   }
 `;
 
+export const REDOWNLOAD_JOB_MUTATION = gql`
+  mutation RedownloadJob($id: Int!) {
+    redownloadJob(id: $id)
+  }
+`;
+
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {
     deleteHistory(id: $id, deleteFiles: $deleteFiles) {

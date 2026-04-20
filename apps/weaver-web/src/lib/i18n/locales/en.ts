@@ -39,6 +39,7 @@ const en: LocaleDictionary = {
   "action.backToJobs": "Back to queue",
   "action.delete": "Delete",
   "action.reprocess": "Reprocess",
+  "action.redownload": "Re-download",
   "action.refresh": "Refresh",
   "action.clearFilters": "Clear Filters",
 
@@ -49,6 +50,10 @@ const en: LocaleDictionary = {
   "confirm.cancelJobDismiss": "Keep Downloading",
   "confirm.cancelSelected": "Cancel {{count}} selected jobs?",
   "confirm.cancelSelectedMessage": "These downloads will be stopped and cannot be resumed.",
+  "confirm.redownloadJob": "Re-download this failed job?",
+  "confirm.redownloadJobMessage": "This will delete any partially downloaded or post-processed files and restart the NZB under the same job ID.",
+  "confirm.redownloadJobConfirm": "Re-download",
+  "confirm.redownloadJobDismiss": "Keep Failed Job",
   "bulk.selected": "{{count}} selected",
   "bulk.editSelected": "Edit Selected",
   "bulk.pauseSelected": "Pause Selected",

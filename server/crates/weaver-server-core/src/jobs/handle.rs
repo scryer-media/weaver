@@ -218,6 +218,11 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// Re-download a failed job from its persisted NZB under the same job ID.
+    RedownloadJob {
+        job_id: JobId,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Delete a completed/failed/cancelled job from history.
     DeleteHistory {
         job_id: JobId,
@@ -367,6 +372,16 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::ReprocessJob { job_id, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Re-download a failed job from its persisted NZB under the same job ID.
+    pub async fn redownload_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::RedownloadJob { job_id, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

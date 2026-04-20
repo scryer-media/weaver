@@ -824,3 +824,14 @@ async fn reprocess_nonexistent_job() {
 
     assert_has_errors(&resp);
 }
+
+#[tokio::test]
+async fn redownload_nonexistent_job() {
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(r#"mutation { redownloadQueueItem(id: 999999) { success } }"#)
+        .await;
+
+    assert_has_errors(&resp);
+}
