@@ -2276,7 +2276,10 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
         pipeline.pending_retries_by_job.get(&job_id).copied(),
         Some(1)
     );
-    assert_eq!(pipeline.jobs.get(&job_id).map(|state| state.failed_bytes), Some(0));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
     assert_eq!(
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Downloading)
