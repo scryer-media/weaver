@@ -3,6 +3,37 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 impl Pipeline {
+    fn nested_declared_archive_identity(
+        filename: &str,
+        role: &weaver_model::files::FileRole,
+    ) -> Option<crate::jobs::assembly::DetectedArchiveIdentity> {
+        let set_name = weaver_model::files::archive_base_name(filename, role)?;
+        match role {
+            weaver_model::files::FileRole::RarVolume { volume_number } => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name,
+                    volume_index: Some(*volume_number),
+                })
+            }
+            weaver_model::files::FileRole::SevenZipArchive => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle,
+                    set_name,
+                    volume_index: None,
+                })
+            }
+            weaver_model::files::FileRole::SevenZipSplit { number } => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSplit,
+                    set_name,
+                    volume_index: Some(*number),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn nested_scan_root(&self, job_id: JobId) -> Result<PathBuf, String> {
         let state = self
             .jobs
@@ -287,6 +318,7 @@ impl Pipeline {
     ) -> Result<Vec<(String, crate::jobs::assembly::ArchiveType)>, String> {
         let mut assembly = crate::jobs::assembly::JobAssembly::new(job_id);
         let mut detected_archives = HashMap::new();
+        let mut file_identities = HashMap::new();
         let mut topologies = BTreeMap::<String, crate::jobs::assembly::ArchiveTopology>::new();
 
         for (index, archive) in nested_archives.iter().enumerate() {
@@ -303,6 +335,27 @@ impl Pipeline {
             if let Some(detected_archive) = archive.detected_archive.clone() {
                 detected_archives.insert(file_id.file_index, detected_archive);
             }
+            let classification = archive.detected_archive.clone().or_else(|| {
+                Self::nested_declared_archive_identity(
+                    &archive.relative_path,
+                    &archive.declared_role,
+                )
+            });
+            file_identities.insert(
+                file_id.file_index,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index,
+                    source_filename: archive.relative_path.clone(),
+                    current_filename: archive.relative_path.clone(),
+                    canonical_filename: None,
+                    classification,
+                    classification_source: if archive.detected_archive.is_some() {
+                        crate::jobs::FileIdentitySource::Nested
+                    } else {
+                        crate::jobs::FileIdentitySource::Declared
+                    },
+                },
+            );
             for (segment_number, segment_size) in segment_sizes.into_iter().enumerate() {
                 file_assembly
                     .commit_segment(segment_number as u32, segment_size)
@@ -352,15 +405,70 @@ impl Pipeline {
             assembly.set_archive_topology(set_name, topology);
         }
 
+        let previous_detected_keys: Vec<u32> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.detected_archives.keys().copied().collect())
+            .unwrap_or_default();
+        let previous_identity_keys: Vec<u32> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.file_identities.keys().copied().collect())
+            .unwrap_or_default();
+
         {
             let state = self
                 .jobs
                 .get_mut(&job_id)
                 .ok_or_else(|| format!("job {} not found", job_id.0))?;
             state.assembly = assembly;
-            state.detected_archives.clear();
+            state.detected_archives = detected_archives.clone();
+            state.file_identities = file_identities.clone();
         }
-        self.replace_detected_archive_identities_for_job(job_id, detected_archives)?;
+
+        for file_index in previous_detected_keys {
+            if detected_archives.contains_key(&file_index) {
+                continue;
+            }
+            self.db
+                .delete_detected_archive_identity(job_id, file_index)
+                .map_err(|error| {
+                    format!(
+                        "failed to delete nested detected archive identity for file {file_index}: {error}"
+                    )
+                })?;
+        }
+        for (file_index, identity) in &detected_archives {
+            self.db
+                .save_detected_archive_identity(job_id, *file_index, identity)
+                .map_err(|error| {
+                    format!(
+                        "failed to save nested detected archive identity for file {file_index}: {error}"
+                    )
+                })?;
+        }
+
+        for file_index in previous_identity_keys {
+            if file_identities.contains_key(&file_index) {
+                continue;
+            }
+            self.db
+                .delete_file_identity(job_id, file_index)
+                .map_err(|error| {
+                    format!("failed to delete nested file identity for file {file_index}: {error}")
+                })?;
+        }
+        for identity in file_identities.values() {
+            self.db
+                .save_file_identity(job_id, identity)
+                .map_err(|error| {
+                    format!(
+                        "failed to save nested file identity for file {}: {error}",
+                        identity.file_index
+                    )
+                })?;
+        }
+
         Ok(to_extract)
     }
 

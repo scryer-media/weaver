@@ -1,9 +1,61 @@
 use super::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+
 impl Pipeline {
-    fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {
+    pub(crate) fn invalidate_archive_set_for_identity_rebind(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        touched_filenames: &HashSet<String>,
+    ) {
+        let set_key = (job_id, set_name.to_string());
+        let affected_volumes: HashSet<u32> = self
+            .rar_sets
+            .get(&set_key)
+            .map(|state| {
+                state
+                    .volume_files
+                    .iter()
+                    .filter_map(|(volume, filename)| {
+                        touched_filenames.contains(filename).then_some(*volume)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(state) = self.rar_sets.get_mut(&set_key) {
+            state
+                .volume_files
+                .retain(|_, filename| !touched_filenames.contains(filename));
+            for volume in &affected_volumes {
+                state.facts.remove(volume);
+                state.verified_suspect_volumes.remove(volume);
+            }
+            state.in_flight_members.clear();
+            state.plan = None;
+            state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
+            state.active_workers = 0;
+        }
+
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.assembly.archive_topologies_mut().remove(set_name);
+        }
+
+        if let Err(error) = self.db.clear_extraction_chunks_for_set(job_id, set_name) {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                error = %error,
+                "failed to clear archive-set identity rebind extraction state"
+            );
+        }
+    }
+
+    pub(crate) fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {
         let set_key = (job_id, set_name.to_string());
         let retry_filenames: HashSet<String> = {
             let mut filenames = HashSet::new();
@@ -218,6 +270,7 @@ impl Pipeline {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_rar_topology_after_normalization(
         &mut self,
         job_id: JobId,
@@ -236,13 +289,14 @@ impl Pipeline {
                 .assembly
                 .files()
                 .filter_map(|file| {
-                    if !normalized_files.contains(file.filename()) {
+                    let current_filename = self.current_filename_for_file(job_id, file);
+                    if !normalized_files.contains(&current_filename) {
                         return None;
                     }
                     match self.classified_role_for_file(job_id, file) {
                         weaver_model::files::FileRole::RarVolume { .. } => self
                             .classified_archive_set_name_for_file(job_id, file)
-                            .map(|set_name| (set_name, file.filename().to_string())),
+                            .map(|set_name| (set_name, current_filename)),
                         _ => None,
                     }
                 })
@@ -251,7 +305,6 @@ impl Pipeline {
                     acc
                 })
         };
-
         let mut errors = Vec::new();
         for (set_name, touched_filenames) in touched_sets {
             match self
@@ -290,16 +343,27 @@ impl Pipeline {
         })
     }
 
-    fn placement_normalized_files(plan: &weaver_par2::PlacementPlan) -> HashSet<String> {
-        let mut normalized_files = HashSet::new();
-        for (left, right) in &plan.swaps {
-            normalized_files.insert(left.correct_name.clone());
-            normalized_files.insert(right.correct_name.clone());
-        }
+    fn placement_normalization_map(plan: &weaver_par2::PlacementPlan) -> HashMap<String, String> {
+        let mut normalized_files = HashMap::new();
         for entry in &plan.renames {
-            normalized_files.insert(entry.correct_name.clone());
+            normalized_files.insert(entry.current_name.clone(), entry.correct_name.clone());
         }
         normalized_files
+    }
+
+    fn placement_touched_files(plan: &weaver_par2::PlacementPlan) -> HashSet<String> {
+        let mut touched = HashSet::new();
+        for (left, right) in &plan.swaps {
+            touched.insert(left.current_name.clone());
+            touched.insert(left.correct_name.clone());
+            touched.insert(right.current_name.clone());
+            touched.insert(right.correct_name.clone());
+        }
+        for entry in &plan.renames {
+            touched.insert(entry.current_name.clone());
+            touched.insert(entry.correct_name.clone());
+        }
+        touched
     }
 
     pub(super) fn log_placement_plan(job_id: JobId, plan: &weaver_par2::PlacementPlan) {
@@ -342,7 +406,8 @@ impl Pipeline {
         }
 
         let plan = plan.clone();
-        let normalized_files = Self::placement_normalized_files(&plan);
+        let normalization_map = Self::placement_normalization_map(&plan);
+        let normalized_files = Self::placement_touched_files(&plan);
         let plan_for_apply = plan.clone();
         let moved = tokio::task::spawn_blocking(move || {
             weaver_par2::apply_placement_plan(&working_dir, &plan_for_apply)
@@ -359,8 +424,117 @@ impl Pipeline {
             "applied placement normalization after verify"
         );
 
-        self.refresh_rar_topology_after_normalization(job_id, &normalized_files)
-            .await
+        let touched_rar_files: HashMap<String, HashSet<String>> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        let current_filename = self.current_filename_for_file(job_id, file);
+                        let future_filename = normalization_map
+                            .get(&current_filename)
+                            .cloned()
+                            .unwrap_or_else(|| current_filename.clone());
+                        if !normalized_files.contains(&current_filename)
+                            && !normalized_files.contains(&future_filename)
+                        {
+                            return None;
+                        }
+                        match self.classified_role_for_file(job_id, file) {
+                            weaver_model::files::FileRole::RarVolume { .. } => self
+                                .classified_archive_set_name_for_file(job_id, file)
+                                .map(|set_name| (set_name, current_filename)),
+                            _ => None,
+                        }
+                    })
+                    .fold(
+                        HashMap::<String, HashSet<String>>::new(),
+                        |mut acc, (set_name, current_filename)| {
+                            acc.entry(set_name).or_default().insert(current_filename);
+                            acc
+                        },
+                    )
+            })
+            .unwrap_or_default();
+        let file_rows: Vec<(NzbFileId, crate::jobs::record::ActiveFileIdentity, bool)> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        self.effective_file_identity(job_id, file.file_id())
+                            .map(|identity| (file.file_id(), identity, file.is_complete()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let by_current: HashMap<String, (NzbFileId, bool)> = file_rows
+            .iter()
+            .map(|(file_id, identity, is_complete)| {
+                (identity.current_filename.clone(), (*file_id, *is_complete))
+            })
+            .collect();
+
+        for (current_name, correct_name) in &normalization_map {
+            let Some((file_id, _)) = by_current.get(current_name).copied() else {
+                continue;
+            };
+            let Some((_, identity, _)) = file_rows
+                .iter()
+                .find(|(candidate_file_id, _, _)| *candidate_file_id == file_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let classification = Self::canonical_archive_identity_from_filename(correct_name)
+                .or(identity.classification.clone());
+            let mut rebound_identity = identity;
+            rebound_identity.current_filename = correct_name.clone();
+            rebound_identity.canonical_filename = Some(correct_name.clone());
+            rebound_identity.classification = classification;
+            rebound_identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+            self.set_file_identity(job_id, rebound_identity)?;
+        }
+
+        let touched_complete_files: Vec<NzbFileId> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        let identity = self.effective_file_identity(job_id, file.file_id())?;
+                        let current_filename = identity.current_filename.clone();
+                        let future_filename = normalization_map
+                            .get(&current_filename)
+                            .cloned()
+                            .unwrap_or_else(|| current_filename.clone());
+                        if !normalized_files.contains(&current_filename)
+                            && !normalized_files.contains(&future_filename)
+                        {
+                            return None;
+                        }
+                        file.is_complete().then_some(file.file_id())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (set_name, touched_filenames) in &touched_rar_files {
+            self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
+        }
+
+        for file_id in touched_complete_files {
+            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
+                .await;
+        }
+
+        Ok(())
     }
 
     pub(super) async fn recompute_rar_retry_frontier(&mut self, job_id: JobId) {
@@ -530,7 +704,7 @@ impl Pipeline {
                             | weaver_model::files::FileRole::SevenZipSplit { .. }
                     )
                 })
-                .map(|f| f.filename().to_string())
+                .map(|f| self.current_filename_for_file(job_id, f))
                 .collect();
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());

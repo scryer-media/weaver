@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
+use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
 use crate::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
     HistoryFilter, JobHistoryRow, JobId,
@@ -353,6 +354,52 @@ fn par2_file_roundtrip() {
             promoted: true,
         })
     );
+}
+
+#[test]
+fn active_file_identity_roundtrip() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.save_file_identity(
+        JobId(1),
+        &ActiveFileIdentity {
+            file_index: 7,
+            source_filename: "51273aad56a8b904e96928935278a627.101".to_string(),
+            current_filename: "show.part001.rar".to_string(),
+            canonical_filename: Some("show.part001.rar".to_string()),
+            classification: Some(DetectedArchiveIdentity {
+                kind: DetectedArchiveKind::Rar,
+                set_name: "show".to_string(),
+                volume_index: Some(1),
+            }),
+            classification_source: FileIdentitySource::Par2,
+        },
+    )
+    .unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    let recovered = &jobs[&JobId(1)];
+    let identity = recovered
+        .file_identities
+        .get(&7)
+        .expect("persisted file identity should reload");
+    assert_eq!(
+        identity.source_filename,
+        "51273aad56a8b904e96928935278a627.101"
+    );
+    assert_eq!(identity.current_filename, "show.part001.rar");
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some("show.part001.rar")
+    );
+    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+    assert!(matches!(
+        identity
+            .classification
+            .as_ref()
+            .map(|classification| &classification.kind),
+        Some(DetectedArchiveKind::Rar)
+    ));
 }
 
 #[test]

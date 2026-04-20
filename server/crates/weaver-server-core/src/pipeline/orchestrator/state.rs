@@ -172,7 +172,7 @@ impl Pipeline {
         let job_id = file_id.job_id;
         let state = self.jobs.get(&job_id)?;
         let file_asm = state.assembly.file(file_id)?;
-        let filename = file_asm.filename().to_string();
+        let filename = self.current_filename_for_file(job_id, file_asm);
         let working_dir = state.working_dir.clone();
         let file_path = working_dir.join(&filename);
         Some((job_id, filename, working_dir, file_path))

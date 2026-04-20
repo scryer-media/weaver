@@ -8,12 +8,13 @@ use crate::StateError;
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
 pub use crate::history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
 pub use crate::jobs::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, ExtractionChunk, RecoveredJob,
+    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
+    ExtractionChunk, RecoveredJob,
 };
 pub use crate::operations::{MetricsScrapeRow, StableStateExport};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 fn ensure_column(
     conn: &Connection,
@@ -282,6 +283,19 @@ impl Database {
                 PRIMARY KEY (job_id, file_index)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS active_file_identities (
+                job_id                INTEGER NOT NULL,
+                file_index            INTEGER NOT NULL,
+                source_filename       TEXT NOT NULL,
+                current_filename      TEXT NOT NULL,
+                canonical_filename    TEXT,
+                classification_kind   TEXT,
+                classification_set_name TEXT,
+                classification_volume_index INTEGER,
+                classification_source TEXT NOT NULL DEFAULT 'declared',
+                PRIMARY KEY (job_id, file_index)
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS active_volume_status (
                 job_id       INTEGER NOT NULL,
                 set_name     TEXT NOT NULL,
@@ -487,6 +501,11 @@ impl Database {
             }
             Some(16) => {
                 // v16→v17: active runtime restore columns are added below via ensure_column.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
+            Some(17) => {
+                // v17→v18: active file identity state is created above via IF NOT EXISTS.
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::Database;
 use crate::ingest::submit_nzb_bytes;
+use crate::jobs::FileIdentitySource;
 use crate::jobs::ids::MessageId;
 use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
 use crate::runtime::system_profile::{
@@ -164,6 +165,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         health_probing: false,
         last_health_probe_failed_bytes: 0,
         detected_archives: HashMap::new(),
+        file_identities: HashMap::new(),
         held_segments: Vec::new(),
         download_queue: DownloadQueue::new(),
         recovery_queue: DownloadQueue::new(),
@@ -815,6 +817,7 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
             health_probing: false,
             last_health_probe_failed_bytes: 0,
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -1781,6 +1784,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
             committed_segments,
             file_progress: recovered.file_progress,
             detected_archives: recovered.detected_archives,
+            file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -1873,6 +1877,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
             committed_segments,
             file_progress: recovered.file_progress,
             detected_archives: recovered.detected_archives,
+            file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3070,6 +3075,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             committed_segments,
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: ["E01.mkv".to_string()].into_iter().collect(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3280,6 +3286,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
             ),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3294,6 +3301,95 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
     let par2_set = restored.par2_set(job_id).unwrap();
     assert_eq!(par2_set.files.len(), 1);
     assert_eq!(par2_set.recovery_block_count(), 0);
+}
+
+#[tokio::test]
+async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30111);
+    let canonical_filename = "show.part001.rar";
+    let obfuscated_filename = "51273aad56a8b904e96928935278a627.101";
+    let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
+    let par2_filename = "repair.par2";
+    let par2_bytes = build_test_par2_index(canonical_filename, &rar_bytes, 8);
+    let spec = JobSpec {
+        name: "PAR2 Canonical Rebind".to_string(),
+        password: None,
+        total_bytes: (rar_bytes.len() + par2_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: obfuscated_filename.to_string(),
+                role: FileRole::from_filename(obfuscated_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: rar_bytes.len() as u32,
+                    message_id: "rar-obfuscated@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: par2_filename.to_string(),
+                role: FileRole::from_filename(par2_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "repair-index@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_file(&mut pipeline, job_id, 0, obfuscated_filename, &rar_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, par2_filename, &par2_bytes).await;
+    pipeline
+        .try_load_par2_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+        )
+        .await;
+
+    let identity = pipeline
+        .file_identity(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        )
+        .cloned()
+        .expect("data file identity should exist");
+    assert_eq!(identity.current_filename, canonical_filename);
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some(canonical_filename)
+    );
+    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+    assert!(matches!(
+        identity
+            .classification
+            .as_ref()
+            .map(|classification| &classification.kind),
+        Some(crate::jobs::assembly::DetectedArchiveKind::Rar)
+    ));
+    assert!(!working_dir.join(obfuscated_filename).exists());
+    assert!(working_dir.join(canonical_filename).exists());
+
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("show"))
+        .cloned()
+        .expect("PAR2 rebinding should rebuild RAR topology");
+    assert!(topology.volume_map.contains_key(canonical_filename));
+    assert!(!topology.volume_map.contains_key(obfuscated_filename));
 }
 
 #[tokio::test]
@@ -3374,6 +3470,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
             committed_segments,
             file_progress,
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3458,6 +3555,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
             committed_segments,
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3540,6 +3638,7 @@ async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
             ),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -3592,6 +3691,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
             ),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             queued_repair_at_epoch_ms: None,
@@ -5852,6 +5952,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::QueuedRepair,
             queued_repair_at_epoch_ms: None,
@@ -5892,6 +5993,7 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Repairing,
             queued_repair_at_epoch_ms: Some(42_000.0),
@@ -5940,6 +6042,7 @@ async fn restore_paused_preserves_resume_target_and_queue_age() {
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
             status: JobStatus::Paused,
             queued_repair_at_epoch_ms: None,

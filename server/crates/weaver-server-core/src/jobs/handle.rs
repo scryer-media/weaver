@@ -10,6 +10,7 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::{JobId, SegmentId};
+use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
 use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
@@ -133,6 +134,7 @@ pub struct RestoreJobRequest {
     pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
+    pub file_identities: HashMap<u32, ActiveFileIdentity>,
     pub extracted_members: HashSet<String>,
     pub status: JobStatus,
     pub queued_repair_at_epoch_ms: Option<f64>,

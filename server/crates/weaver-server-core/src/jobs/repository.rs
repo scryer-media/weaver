@@ -8,6 +8,7 @@ pub struct OrphanActiveStateCounts {
     pub active_segments: usize,
     pub active_file_progress: usize,
     pub active_files: usize,
+    pub active_file_identities: usize,
     pub active_par2: usize,
     pub active_par2_files: usize,
     pub active_extracted: usize,
@@ -25,6 +26,7 @@ impl OrphanActiveStateCounts {
         self.active_segments
             + self.active_file_progress
             + self.active_files
+            + self.active_file_identities
             + self.active_par2
             + self.active_par2_files
             + self.active_extracted
@@ -66,6 +68,8 @@ fn delete_active_job_rows(tx: &rusqlite::Transaction<'_>, id: i64) -> Result<(),
     tx.execute("DELETE FROM active_file_progress WHERE job_id = ?1", [id])
         .map_err(db_err)?;
     tx.execute("DELETE FROM active_files WHERE job_id = ?1", [id])
+        .map_err(db_err)?;
+    tx.execute("DELETE FROM active_file_identities WHERE job_id = ?1", [id])
         .map_err(db_err)?;
     tx.execute("DELETE FROM active_par2 WHERE job_id = ?1", [id])
         .map_err(db_err)?;
@@ -166,6 +170,7 @@ impl Database {
             active_segments: delete_orphan_rows(&tx, "active_segments")?,
             active_file_progress: delete_orphan_rows(&tx, "active_file_progress")?,
             active_files: delete_orphan_rows(&tx, "active_files")?,
+            active_file_identities: delete_orphan_rows(&tx, "active_file_identities")?,
             active_par2: delete_orphan_rows(&tx, "active_par2")?,
             active_par2_files: delete_orphan_rows(&tx, "active_par2_files")?,
             active_extracted: delete_orphan_rows(&tx, "active_extracted")?,

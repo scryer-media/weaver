@@ -50,6 +50,7 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "active_segments",
     "active_file_progress",
     "active_files",
+    "active_file_identities",
     "active_par2",
     "active_par2_files",
     "active_extracted",

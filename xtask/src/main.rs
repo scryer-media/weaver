@@ -98,6 +98,9 @@ enum DeployCommand {
 #[derive(Args)]
 struct DeployLocalArgs {
     target: Option<String>,
+    /// Port to run the local Weaver server on (default: 9090).
+    #[arg(long, short = 'p', default_value_t = 9090)]
+    port: u16,
 }
 
 #[derive(Args)]
@@ -1180,11 +1183,20 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
 }
 
 fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
-    let log_file = PathBuf::from("/tmp/weaver.log");
+    let port = args.port;
+    let log_file = if port == 9090 {
+        PathBuf::from("/tmp/weaver.log")
+    } else {
+        PathBuf::from(format!("/tmp/weaver-{port}.log"))
+    };
     let binary = ctx.path("target/release/weaver");
     let debug_binary = ctx.path("target/debug/weaver");
     let local_binaries = vec![binary.clone(), debug_binary];
-    let pid_file = ctx.path("tmp/weaver-local.pid");
+    let pid_file = if port == 9090 {
+        ctx.path("tmp/weaver-local.pid")
+    } else {
+        ctx.repo_root.join(format!("tmp/weaver-local-{port}.pid"))
+    };
     let rust_log = build_rust_log(args.target.as_deref());
     let config_file = ctx.path("weaver.toml");
     let backup_dir = ctx.path("tmp/config-backups");
@@ -1207,7 +1219,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         }
     }
 
-    println!("==> Stopping existing weaver...");
+    println!("==> Stopping existing weaver on port {port}...");
     if let Some(pid) = fs::read_to_string(&pid_file)
         .ok()
         .map(|value| value.trim().to_string())
@@ -1220,7 +1232,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         }
     }
 
-    let initial_port_pids = list_port_pids(ctx, 9090)?;
+    let initial_port_pids = list_port_pids(ctx, port)?;
     let mut weaver_port_pids = BTreeSet::new();
     let mut foreign_port_owners = Vec::new();
     for pid in initial_port_pids {
@@ -1239,14 +1251,14 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n");
         bail!(
-            "Refusing to stop non-Weaver process(es) on port 9090.\n{owners}\nFree the port or change Weaver's port before running deploy local."
+            "Refusing to stop non-Weaver process(es) on port {port}.\n{owners}\nFree the port or choose a different --port before running deploy local."
         );
     }
     let weaver_port_pids = weaver_port_pids.into_iter().collect::<Vec<_>>();
     signal_pids(ctx, &weaver_port_pids, None)?;
     thread::sleep(std::time::Duration::from_secs(1));
 
-    let remaining_weaver_pids = list_port_pids(ctx, 9090)?
+    let remaining_weaver_pids = list_port_pids(ctx, port)?
         .into_iter()
         .filter_map(|pid| match read_pid_command_line(&pid) {
             Ok(Some(command_line))
@@ -1259,11 +1271,11 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     if !remaining_weaver_pids.is_empty() {
-        println!("    Weaver still owns port 9090, sending SIGKILL...");
+        println!("    Weaver still owns port {port}, sending SIGKILL...");
         signal_pids(ctx, &remaining_weaver_pids, Some("-9"))?;
         thread::sleep(std::time::Duration::from_secs(1));
     }
-    let remaining_port_pids = list_port_pids(ctx, 9090)?;
+    let remaining_port_pids = list_port_pids(ctx, port)?;
     if !remaining_port_pids.is_empty() {
         let owners = remaining_port_pids
             .into_iter()
@@ -1275,7 +1287,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
             .join("\n");
         bail!(
-            "Port 9090 is still occupied after stopping local Weaver.\n{owners}\nRefusing to kill non-Weaver processes."
+            "Port {port} is still occupied after stopping local Weaver.\n{owners}\nRefusing to kill non-Weaver processes."
         );
     }
 
@@ -1310,13 +1322,15 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     child
         .env("RUST_LOG", &rust_log)
         .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     let mut child = child.spawn()?;
     thread::sleep(std::time::Duration::from_secs(2));
     if child.try_wait()?.is_none() {
         fs::write(&pid_file, format!("{}\n", child.id()))?;
-        println!("==> Weaver running (PID={}, port=9090)", child.id());
+        println!("==> Weaver running (PID={}, port={port})", child.id());
         println!("==> Log: tail -f {}", log_file.display());
         let preview = tail_file(&log_file, 10)?;
         if !preview.is_empty() {

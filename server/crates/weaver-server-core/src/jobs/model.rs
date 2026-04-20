@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
+use crate::jobs::record::ActiveFileIdentity;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
@@ -158,6 +159,8 @@ pub struct JobState {
     pub last_health_probe_failed_bytes: u64,
     /// Persisted probe facts used for pre-extraction classification.
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
+    /// Mutable file identity used by runtime/archive logic after rename/classification.
+    pub file_identities: std::collections::HashMap<u32, ActiveFileIdentity>,
     /// Segments pulled from queues while health probe runs. Restored on
     /// probe pass, dropped on probe fail.
     pub held_segments: Vec<DownloadWork>,

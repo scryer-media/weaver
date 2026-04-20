@@ -161,7 +161,8 @@ impl Pipeline {
             {
                 continue;
             }
-            if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename())
+            let current_filename = self.current_filename_for_file(job_id, file_asm);
+            if let Some(path) = self.resolve_job_input_path(job_id, &current_filename)
                 && path.exists()
             {
                 volume_paths.entry(volume_number).or_insert(path);
@@ -454,6 +455,7 @@ impl Pipeline {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::pipeline) async fn refresh_rar_volume_facts_for_set(
         &mut self,
         job_id: JobId,
@@ -469,7 +471,8 @@ impl Pipeline {
                 .assembly
                 .files()
                 .filter_map(|file_asm| {
-                    if !touched_filenames.contains(file_asm.filename()) {
+                    let current_filename = self.current_filename_for_file(job_id, file_asm);
+                    if !touched_filenames.contains(&current_filename) {
                         return None;
                     }
                     let weaver_model::files::FileRole::RarVolume { volume_number } =
@@ -485,9 +488,9 @@ impl Pipeline {
                     {
                         return None;
                     }
-                    let path = state.working_dir.join(file_asm.filename());
+                    let path = state.working_dir.join(&current_filename);
                     path.exists()
-                        .then_some((volume_number, file_asm.filename().to_string(), path))
+                        .then_some((volume_number, current_filename, path))
                 })
                 .collect()
         };
@@ -598,7 +601,7 @@ impl Pipeline {
                 && file_asm.is_complete()
             {
                 volume_map
-                    .entry(file_asm.filename().to_string())
+                    .entry(self.current_filename_for_file(job_id, file_asm))
                     .or_insert(volume_number);
             }
         }
@@ -733,9 +736,9 @@ impl Pipeline {
                         {
                             return None;
                         }
-                        let path = state.working_dir.join(file_asm.filename());
-                        path.exists()
-                            .then_some((file_asm.filename().to_string(), path))
+                        let current_filename = self.current_filename_for_file(job_id, file_asm);
+                        let path = state.working_dir.join(&current_filename);
+                        path.exists().then_some((current_filename, path))
                     })
                     .collect::<Vec<_>>()
             };
@@ -822,9 +825,11 @@ impl Pipeline {
             };
             (
                 volume_number,
-                file_asm.filename().to_string(),
+                self.current_filename_for_file(job_id, file_asm),
                 set_name,
-                state.working_dir.join(file_asm.filename()),
+                state
+                    .working_dir
+                    .join(self.current_filename_for_file(job_id, file_asm)),
                 state.spec.password.clone(),
             )
         };
@@ -888,7 +893,7 @@ impl Pipeline {
         };
 
         let role = self.classified_role_for_file(job_id, file_asm);
-        let filename = file_asm.filename().to_string();
+        let filename = self.current_filename_for_file(job_id, file_asm);
         let set_name = match self.classified_archive_set_name_for_file(job_id, file_asm) {
             Some(name) => name,
             None => return,
@@ -963,7 +968,7 @@ impl Pipeline {
                             .as_deref()
                             == Some(&set_name)
                     {
-                        volume_map.insert(f.filename().to_string(), n);
+                        volume_map.insert(self.current_filename_for_file(job_id, f), n);
                         max_number = max_number.max(n);
                     }
                 }
@@ -1104,7 +1109,7 @@ impl Pipeline {
                             .as_deref()
                             == Some(&set_name)
                     {
-                        volume_map.insert(f.filename().to_string(), n);
+                        volume_map.insert(self.current_filename_for_file(job_id, f), n);
                         max_number = max_number.max(n);
                     }
                 }

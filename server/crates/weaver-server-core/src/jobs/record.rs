@@ -25,6 +25,45 @@ pub struct CommittedSegment {
     pub crc32: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileIdentitySource {
+    Declared,
+    Probe,
+    Par2,
+    Nested,
+}
+
+impl FileIdentitySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Probe => "probe",
+            Self::Par2 => "par2",
+            Self::Nested => "nested",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "declared" => Some(Self::Declared),
+            "probe" => Some(Self::Probe),
+            "par2" => Some(Self::Par2),
+            "nested" => Some(Self::Nested),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveFileIdentity {
+    pub file_index: u32,
+    pub source_filename: String,
+    pub current_filename: String,
+    pub canonical_filename: Option<String>,
+    pub classification: Option<DetectedArchiveIdentity>,
+    pub classification_source: FileIdentitySource,
+}
+
 #[derive(Debug)]
 pub struct RecoveredJob {
     pub job_id: JobId,
@@ -33,6 +72,7 @@ pub struct RecoveredJob {
     pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
+    pub file_identities: HashMap<u32, ActiveFileIdentity>,
     pub complete_files: HashSet<NzbFileId>,
     pub extracted_members: HashSet<String>,
     pub status: String,
