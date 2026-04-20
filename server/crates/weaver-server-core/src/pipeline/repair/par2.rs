@@ -237,7 +237,8 @@ impl Pipeline {
             };
 
             let old_current = identity.current_filename.clone();
-            if old_current != canonical_filename {
+            let filename_changed = old_current != canonical_filename;
+            if filename_changed {
                 let old_path = working_dir.join(&old_current);
                 let new_path = working_dir.join(&canonical_filename);
                 if old_path.exists() {
@@ -254,7 +255,8 @@ impl Pipeline {
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
                     .or(identity.classification.clone());
-            if let Some(classification) = classification.as_ref()
+            if filename_changed
+                && let Some(classification) = classification.as_ref()
                 && matches!(
                     classification.kind,
                     crate::jobs::assembly::DetectedArchiveKind::Rar
@@ -273,7 +275,7 @@ impl Pipeline {
             rebound_identity.classification_source = FileIdentitySource::Par2;
             self.set_file_identity(job_id, rebound_identity)?;
 
-            if is_complete {
+            if is_complete && filename_changed {
                 touched_files.push(file_id);
             }
             rebound += 1;
@@ -296,6 +298,23 @@ impl Pipeline {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn retry_par2_authoritative_identity(&mut self, job_id: JobId) {
+        let Some(par2_set) = self.par2_set(job_id).cloned() else {
+            return;
+        };
+
+        if let Err(error) = self
+            .apply_par2_authoritative_identity(job_id, par2_set.as_ref())
+            .await
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to retry authoritative PAR2 file identity"
+            );
+        }
     }
 
     pub(crate) fn par2_runtime(&self, job_id: JobId) -> Option<&crate::pipeline::Par2RuntimeState> {

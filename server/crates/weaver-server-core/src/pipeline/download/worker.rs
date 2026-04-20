@@ -417,6 +417,7 @@ impl Pipeline {
                     data,
                     is_recovery,
                     retry_count,
+                    exclude_servers,
                 })
                 .await;
         });
@@ -466,6 +467,8 @@ impl Pipeline {
             return;
         }
 
+        let excluded_servers = result.exclude_servers.clone();
+
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
                 let raw_size = raw.len() as u32;
@@ -491,7 +494,10 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
             Err(DownloadError::Fetch(e)) => {
-                if e.contains("no such article") || e.contains("article not found") {
+                let article_not_found =
+                    e.contains("no such article") || e.contains("article not found");
+
+                if article_not_found && excluded_servers.is_empty() {
                     self.metrics
                         .articles_not_found
                         .fetch_add(1, Ordering::Relaxed);
@@ -558,7 +564,7 @@ impl Pipeline {
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
-                                exclude_servers: vec![],
+                                exclude_servers: excluded_servers.clone(),
                             };
                             self.metrics
                                 .segments_retried

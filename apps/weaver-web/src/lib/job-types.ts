@@ -77,6 +77,8 @@ export function normalizeFacadeJobStatus(status: string): string {
       return "COMPLETE";
     case "FINALIZING":
       return "MOVING";
+    case "CHECKING":
+      return "VERIFYING";
     default:
       return status;
   }
