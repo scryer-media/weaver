@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
@@ -14,6 +14,129 @@ use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 impl Pipeline {
+    async fn load_history_row(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<crate::JobHistoryRow>, crate::SchedulerError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "failed to join history lookup task: {error}"
+                ))
+            })?
+            .map_err(crate::SchedulerError::State)
+    }
+
+    fn persisted_nzb_path_for_job(
+        &self,
+        job_id: JobId,
+        history_row: Option<&crate::JobHistoryRow>,
+    ) -> PathBuf {
+        history_row
+            .and_then(|row| row.nzb_path.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.nzb_dir.join(format!("{}.nzb", job_id.0)))
+    }
+
+    fn parse_restart_nzb(
+        &self,
+        job_id: JobId,
+        nzb_path: &std::path::Path,
+    ) -> Result<weaver_nzb::Nzb, crate::SchedulerError> {
+        crate::ingest::parse_persisted_nzb(nzb_path).map_err(|error| match error {
+            crate::ingest::PersistedNzbError::Io(inner) => {
+                crate::SchedulerError::Io(std::io::Error::new(
+                    inner.kind(),
+                    format!("failed to read NZB for job {}: {inner}", job_id.0),
+                ))
+            }
+            crate::ingest::PersistedNzbError::Parse(inner) => crate::SchedulerError::Internal(
+                format!("failed to parse NZB for job {}: {inner}", job_id.0),
+            ),
+        })
+    }
+
+    fn redownload_staging_dir(&self, job_id: JobId) -> PathBuf {
+        self.complete_dir
+            .join(".weaver-staging")
+            .join(job_id.0.to_string())
+    }
+
+    async fn remove_redownload_artifacts(
+        &self,
+        job_id: JobId,
+        working_dir: &std::path::Path,
+        staging_dir: Option<&std::path::Path>,
+    ) {
+        let paths = [
+            Some(working_dir.to_path_buf()),
+            staging_dir.map(|path| path.to_path_buf()),
+            Some(self.redownload_staging_dir(job_id)),
+        ];
+
+        for path in paths.into_iter().flatten() {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    info!(
+                        job_id = job_id.0,
+                        dir = %path.display(),
+                        "removed redownload artifact directory"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        dir = %path.display(),
+                        error = %error,
+                        "failed to remove redownload artifact directory"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn delete_failed_history_entry(&mut self, job_id: JobId) {
+        self.finished_jobs.retain(|job| job.job_id != job_id);
+        let db = self.db.clone();
+        match tokio::task::spawn_blocking(move || db.delete_job_history(job_id.0)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to delete failed job history entry during restart"
+                );
+            }
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to join failed job history delete task during restart"
+                );
+            }
+        }
+    }
+
+    fn reset_failed_job_runtime(&mut self, job_id: JobId) {
+        self.remove_pending_completion_check(job_id);
+        self.clear_par2_runtime_state(job_id);
+        self.clear_job_extraction_runtime(job_id);
+        self.clear_job_rar_runtime(job_id);
+        self.clear_job_write_backlog(job_id);
+        self.replace_failed_extraction_members(job_id, HashSet::new());
+        self.set_normalization_retried_state(job_id, false);
+        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
+            error!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to clear persisted verified suspect RAR volumes during failed-job restart"
+            );
+        }
+    }
+
     fn declared_archive_identity(
         filename: &str,
         role: &weaver_model::files::FileRole,
@@ -326,7 +449,7 @@ impl Pipeline {
                 )));
             }
         } else {
-            let history_entry = self.finished_jobs.iter().find(|j| j.job_id == job_id);
+            let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
             let Some(info) = history_entry else {
                 return Err(crate::SchedulerError::JobNotFound(job_id));
             };
@@ -337,18 +460,9 @@ impl Pipeline {
                 )));
             }
 
-            let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
-            let nzb = crate::ingest::parse_persisted_nzb(&nzb_path).map_err(|e| match e {
-                crate::ingest::PersistedNzbError::Io(error) => {
-                    crate::SchedulerError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("failed to read NZB for job {}: {error}", job_id.0),
-                    ))
-                }
-                crate::ingest::PersistedNzbError::Parse(error) => crate::SchedulerError::Internal(
-                    format!("failed to parse NZB for job {}: {error}", job_id.0),
-                ),
-            })?;
+            let history_row = self.load_history_row(job_id).await?;
+            let nzb_path = self.persisted_nzb_path_for_job(job_id, history_row.as_ref());
+            let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
 
             let spec = crate::ingest::nzb_to_spec(
                 &nzb,
@@ -367,7 +481,7 @@ impl Pipeline {
                 && let Err(error) =
                     tokio::fs::write(working_dir_marker_path(&working_dir), []).await
             {
-                tracing::warn!(
+                warn!(
                     job_id = job_id.0,
                     dir = %working_dir.display(),
                     error = %error,
@@ -434,26 +548,8 @@ impl Pipeline {
             self.persist_file_identities(job_id, &file_identities);
         }
 
-        self.finished_jobs.retain(|j| j.job_id != job_id);
-        let db = self.db.clone();
-        let jid = job_id.0;
-        tokio::task::spawn_blocking(move || {
-            let _ = db.delete_job_history(jid);
-        });
-
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
-        self.clear_job_rar_runtime(job_id);
-        self.clear_job_write_backlog(job_id);
-        self.replace_failed_extraction_members(job_id, HashSet::new());
-        self.set_normalization_retried_state(job_id, false);
-        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
-            error!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to clear persisted verified suspect RAR volumes during reprocess"
-            );
-        }
+        self.delete_failed_history_entry(job_id).await;
+        self.reset_failed_job_runtime(job_id);
 
         if !self.job_order.contains(&job_id) {
             self.job_order.push(job_id);
@@ -465,6 +561,77 @@ impl Pipeline {
 
         self.reload_metadata_from_disk(job_id).await;
         self.check_job_completion(job_id).await;
+
+        Ok(())
+    }
+
+    pub(crate) async fn redownload_job(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), crate::SchedulerError> {
+        if let Some(state) = self.jobs.get(&job_id) {
+            if !matches!(state.status, JobStatus::Failed { .. }) {
+                return Err(crate::SchedulerError::Conflict(format!(
+                    "job {} is not failed",
+                    job_id.0
+                )));
+            }
+
+            let category = state.spec.category.clone();
+            let metadata = state.spec.metadata.clone();
+            let working_dir = state.working_dir.clone();
+            let staging_dir = state.staging_dir.clone();
+            let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
+            let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
+            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+
+            self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
+                .await;
+            self.purge_terminal_job_runtime(job_id);
+            self.db
+                .delete_active_job(job_id)
+                .map_err(crate::SchedulerError::State)?;
+            self.add_job(job_id, spec, nzb_path).await?;
+            self.reset_failed_job_runtime(job_id);
+            self.reload_metadata_from_disk(job_id).await;
+            info!(job_id = job_id.0, "re-downloading failed job");
+            return Ok(());
+        }
+
+        let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
+        let Some(info) = history_entry else {
+            return Err(crate::SchedulerError::JobNotFound(job_id));
+        };
+        if !matches!(info.status, JobStatus::Failed { .. }) {
+            return Err(crate::SchedulerError::Conflict(format!(
+                "job {} is not failed",
+                job_id.0
+            )));
+        }
+
+        let history_row = self.load_history_row(job_id).await?;
+        let nzb_path = self.persisted_nzb_path_for_job(job_id, history_row.as_ref());
+        let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
+        let spec = crate::ingest::nzb_to_spec(
+            &nzb,
+            &nzb_path,
+            info.category.clone(),
+            info.metadata.clone(),
+        );
+        let working_dir = history_row
+            .as_ref()
+            .and_then(|row| row.output_dir.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| compute_working_dir(&self.intermediate_dir, job_id, &spec.name));
+
+        self.remove_redownload_artifacts(job_id, &working_dir, None)
+            .await;
+        self.add_job(job_id, spec, nzb_path).await?;
+        self.delete_failed_history_entry(job_id).await;
+        self.reset_failed_job_runtime(job_id);
+        self.reload_metadata_from_disk(job_id).await;
+
+        info!(job_id = job_id.0, "re-downloading failed history job");
 
         Ok(())
     }

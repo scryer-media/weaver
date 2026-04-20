@@ -11,8 +11,9 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use weaver_server_api::auth::{CallerScope, LoginAuthCache};
-use weaver_server_api::{RssService, WeaverSchema, build_schema};
+use weaver_server_api::{RssService, SchemaContext, WeaverSchema, build_schema};
 use weaver_server_core::Database;
+use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::jobs::handle::{JobInfo, SharedPipelineState};
 use weaver_server_core::jobs::ids::JobId;
@@ -65,18 +66,21 @@ impl TestHarness {
         let (handle, scheduler_task) = spawn_test_scheduler();
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
         let auth_cache = LoginAuthCache::from_credentials(None);
+        let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));
 
-        let schema = build_schema(
-            handle.clone(),
-            shared_config.clone(),
-            db.clone(),
-            auth_cache.clone(),
+        let schema = build_schema(SchemaContext {
+            handle: handle.clone(),
+            config: shared_config.clone(),
+            db: db.clone(),
+            auth_cache: auth_cache.clone(),
+            api_key_cache,
             rss,
-            shared_schedules,
-            weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
-        );
+            schedules: shared_schedules,
+            log_buffer:
+                weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+        });
 
         Self {
             schema,
@@ -398,6 +402,20 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
                             state.status = JobStatus::Downloading;
+                            Ok(())
+                        }
+                        Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(
+                            "job {} is not failed",
+                            job_id.0
+                        ))),
+                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
+                    };
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::RedownloadJob { job_id, reply } => {
+                    let result = match jobs.get_mut(&job_id) {
+                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
+                            state.status = JobStatus::Queued;
                             Ok(())
                         }
                         Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(

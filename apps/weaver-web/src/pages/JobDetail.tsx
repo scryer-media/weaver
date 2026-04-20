@@ -28,6 +28,7 @@ import {
   JOB_OUTPUT_FILES_QUERY,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
+  REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
@@ -76,10 +77,12 @@ export function JobDetail() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
 
   const [events, setEvents] = useState<EventEntry[]>([]);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showRedownloadConfirm, setShowRedownloadConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
@@ -283,9 +286,21 @@ export function JobDetail() {
               </Button>
             ) : null}
             {job.status === "FAILED" ? (
-              <Button variant="outline" onClick={() => void reprocessJob({ id: job.id })}>
-                {t("action.reprocess")}
-              </Button>
+              <>
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    void reprocessJob({ id: job.id }).then(() => {
+                      void reexecuteJobQuery({ requestPolicy: "network-only" });
+                    });
+                  }}
+                >
+                  {t("action.reprocess")}
+                </Button>
+                <Button variant="outline" onClick={() => setShowRedownloadConfirm(true)}>
+                  {t("action.redownload")}
+                </Button>
+              </>
             ) : null}
             {job.status !== "COMPLETE" && job.status !== "FAILED" ? (
               <Button variant="destructive" onClick={() => setShowCancelConfirm(true)}>
@@ -429,6 +444,21 @@ export function JobDetail() {
           setShowCancelConfirm(false);
         }}
         onCancel={() => setShowCancelConfirm(false)}
+      />
+
+      <ConfirmDialog
+        open={showRedownloadConfirm}
+        title={t("confirm.redownloadJob")}
+        message={t("confirm.redownloadJobMessage")}
+        confirmLabel={t("confirm.redownloadJobConfirm")}
+        cancelLabel={t("confirm.redownloadJobDismiss")}
+        onConfirm={() => {
+          void redownloadJob({ id: job.id }).then(() => {
+            void reexecuteJobQuery({ requestPolicy: "network-only" });
+          });
+          setShowRedownloadConfirm(false);
+        }}
+        onCancel={() => setShowRedownloadConfirm(false)}
       />
 
       <ConfirmDialog

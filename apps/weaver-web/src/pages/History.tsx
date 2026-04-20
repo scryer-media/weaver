@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trash2 } from "lucide-react";
+import { Download, RefreshCcw, Trash2 } from "lucide-react";
 import { Link } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -26,6 +26,8 @@ import {
   HISTORY_JOBS_COUNT_QUERY,
   HISTORY_FACADE_EVENTS_SUBSCRIPTION,
   HISTORY_JOBS_QUERY,
+  REDOWNLOAD_JOB_MUTATION,
+  REPROCESS_JOB_MUTATION,
 } from "@/graphql/queries";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -70,6 +72,8 @@ export function History() {
   const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
   const [deleteBatchState, deleteHistoryBatch] = useMutation(DELETE_HISTORY_BATCH_MUTATION);
   const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
+  const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
 
   const [jobs, setJobs] = useState<HistoryJob[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -78,6 +82,7 @@ export function History() {
   const [initialFetching, setInitialFetching] = useState(true);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [redownloadConfirmId, setRedownloadConfirmId] = useState<number | null>(null);
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
@@ -329,6 +334,85 @@ export function History() {
     }
   }
 
+  function removeHistoryJob(jobId: number) {
+    setJobs((prev) => prev.filter((job) => job.id !== jobId));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      next.delete(jobId);
+      return next;
+    });
+    setTotalCount((prev) => Math.max(0, prev - 1));
+    void refetchCount();
+  }
+
+  async function handleReprocess(jobId: number) {
+    const result = await reprocessJob({ id: jobId });
+    if (!result.error) {
+      removeHistoryJob(jobId);
+    }
+  }
+
+  async function handleRedownload(jobId: number) {
+    const result = await redownloadJob({ id: jobId });
+    if (!result.error) {
+      removeHistoryJob(jobId);
+    }
+  }
+
+  function renderActions(job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) {
+    const isFailed = job.status === "FAILED";
+    const actionsBusy =
+      deleteState.fetching
+      || deleteBatchState.fetching
+      || deleteAllState.fetching
+      || reprocessState.fetching
+      || redownloadState.fetching;
+
+    return (
+      <div className="flex justify-end gap-0.5">
+        {isFailed ? (
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={t("action.reprocess")}
+              aria-label={t("action.reprocess")}
+              className={buttonSizeClassName}
+              disabled={actionsBusy}
+              onClick={() => {
+                void handleReprocess(job.id);
+              }}
+            >
+              <RefreshCcw className={iconSizeClassName} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              title={t("action.redownload")}
+              aria-label={t("action.redownload")}
+              className={buttonSizeClassName}
+              disabled={actionsBusy}
+              onClick={() => setRedownloadConfirmId(job.id)}
+            >
+              <Download className={iconSizeClassName} />
+            </Button>
+          </>
+        ) : null}
+        <Button
+          variant="ghost"
+          size="icon"
+          title={t("action.delete")}
+          aria-label={t("action.delete")}
+          className={buttonSizeClassName}
+          disabled={actionsBusy}
+          onClick={() => setDeleteConfirmId(job.id)}
+        >
+          <Trash2 className={iconSizeClassName} />
+        </Button>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -437,13 +521,13 @@ export function History() {
                         aria-label="Select all"
                       />
                     </TableHead>
-                    <TableHead className="h-7 w-[32%] px-2 text-[9px]">{t("table.name")}</TableHead>
+                    <TableHead className="h-7 w-[30%] px-2 text-[9px]">{t("table.name")}</TableHead>
                     <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.status")}</TableHead>
                     <TableHead className="h-7 w-[16%] px-2 text-[9px]">{t("table.time")}</TableHead>
                     <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.health")}</TableHead>
                     <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
                     <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.category")}</TableHead>
-                    <TableHead className="h-7 w-[6%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
+                    <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -492,18 +576,7 @@ export function History() {
                         {job.category ?? "\u2014"}
                       </TableCell>
                       <TableCell className="px-2 py-1.5">
-                        <div className="flex justify-end gap-0.5">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            title={t("action.delete")}
-                            aria-label={t("action.delete")}
-                            className="size-6"
-                            onClick={() => setDeleteConfirmId(job.id)}
-                          >
-                            <Trash2 className="size-3.5" />
-                          </Button>
-                        </div>
+                        {renderActions(job, "size-6", "size-3.5")}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -549,11 +622,7 @@ export function History() {
                       </div>
                     </div>
                   </div>
-                  <div className="flex justify-end">
-                    <Button variant="ghost" size="sm" onClick={() => setDeleteConfirmId(job.id)}>
-                      {t("action.delete")}
-                    </Button>
-                  </div>
+                  {renderActions(job, "size-7", "size-4")}
                 </CardContent>
               </Card>
             ))}
@@ -592,6 +661,21 @@ export function History() {
           <span className="text-sm">{t("confirm.deleteFiles")}</span>
         </label>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        open={redownloadConfirmId != null}
+        title={t("confirm.redownloadJob")}
+        message={t("confirm.redownloadJobMessage")}
+        confirmLabel={t("confirm.redownloadJobConfirm")}
+        cancelLabel={t("confirm.redownloadJobDismiss")}
+        onConfirm={() => {
+          if (redownloadConfirmId != null) {
+            void handleRedownload(redownloadConfirmId);
+          }
+          setRedownloadConfirmId(null);
+        }}
+        onCancel={() => setRedownloadConfirmId(null)}
+      />
 
       {/* Batch delete confirm */}
       <ConfirmDialog

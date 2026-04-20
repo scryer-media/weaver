@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::events::model::PipelineEvent;
@@ -211,6 +211,20 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::RedownloadJob { job_id, reply } => {
+                    let result = match jobs.get_mut(&job_id) {
+                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
+                            state.status = JobStatus::Queued;
+                            Ok(())
+                        }
+                        Some(_) => Err(SchedulerError::Conflict(format!(
+                            "job {} is not failed",
+                            job_id.0
+                        ))),
+                        None => Err(SchedulerError::JobNotFound(job_id)),
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::UpdateJob {
                     job_id,
                     update,
@@ -303,6 +317,38 @@ async fn cancel_job() {
 
     handle.cancel_job(JobId(1)).await.unwrap();
     assert_eq!(handle.list_jobs().len(), 0);
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn redownload_failed_job() {
+    let (handle, task) = test_scheduler();
+
+    handle
+        .restore_job(RestoreJobRequest {
+            job_id: JobId(1),
+            spec: make_spec("Failed Job"),
+            committed_segments: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Failed {
+                error: "boom".to_string(),
+            },
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            working_dir: PathBuf::from("/tmp/test"),
+        })
+        .await
+        .unwrap();
+
+    handle.redownload_job(JobId(1)).await.unwrap();
+    let info = handle.get_job(JobId(1)).unwrap();
+    assert_eq!(info.status, JobStatus::Queued);
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();

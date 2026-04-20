@@ -2744,6 +2744,39 @@ async fn delete_history_removes_intermediate_output_dir() {
 }
 
 #[tokio::test]
+async fn delete_history_removes_retained_failed_nzb() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30023);
+    let output_dir = intermediate_dir.join("history-retained-nzb-job");
+    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+    tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+    tokio::fs::write(&nzb_path, b"persisted").await.unwrap();
+
+    let mut row = history_row_with_output_dir(job_id, "History Retained NZB", "failed", output_dir);
+    row.nzb_path = Some(nzb_path.display().to_string());
+    pipeline.db.insert_job_history(&row).unwrap();
+
+    let (reply, recv) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::DeleteHistory {
+            job_id,
+            delete_files: false,
+            reply,
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), recv)
+        .await
+        .expect("delete history reply should arrive")
+        .unwrap()
+        .unwrap();
+
+    assert!(!nzb_path.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn delete_all_history_keeps_complete_output_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -3250,6 +3283,35 @@ async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
 }
 
 #[tokio::test]
+async fn record_job_history_retains_failed_job_nzb() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30034);
+    let spec = standalone_job_spec(
+        "Failed History Retention",
+        &[("episode.mkv".to_string(), 123)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+    tokio::fs::write(&nzb_path, b"persisted").await.unwrap();
+
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Failed {
+        error: "boom".to_string(),
+    };
+    pipeline.record_job_history(job_id);
+
+    let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "failed");
+    assert_eq!(
+        history.nzb_path.as_deref(),
+        Some(nzb_path.to_str().unwrap())
+    );
+    assert!(nzb_path.exists());
+}
+
+#[tokio::test]
 async fn swapped_rar_volume_arrival_uses_parsed_volume_identity_for_claims() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -3586,6 +3648,79 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
         ]
     );
     assert!(state.download_queue.is_empty());
+}
+
+#[tokio::test]
+async fn redownload_job_rebuilds_failed_history_as_queued_download() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30038);
+    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+    let working_dir = intermediate_dir.join("failed-redownload-job");
+    let staging_dir = pipeline
+        .complete_dir
+        .join(".weaver-staging")
+        .join(job_id.0.to_string());
+
+    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+    tokio::fs::write(working_dir.join("partial.mkv"), b"partial")
+        .await
+        .unwrap();
+    tokio::fs::write(staging_dir.join("partial.srt"), b"partial")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &nzb_path,
+        zstd::bulk::compress(&sample_nzb_bytes(), 3).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut row =
+        history_row_with_output_dir(job_id, "Failed History Job", "failed", working_dir.clone());
+    row.category = Some("tv".to_string());
+    row.nzb_path = Some(nzb_path.display().to_string());
+    row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
+    pipeline.db.insert_job_history(&row).unwrap();
+    pipeline.finished_jobs.push(JobInfo {
+        job_id,
+        name: "Failed History Job".to_string(),
+        status: JobStatus::Failed {
+            error: "boom".to_string(),
+        },
+        progress: 0.0,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 0,
+        password: None,
+        category: Some("tv".to_string()),
+        metadata: vec![("source".to_string(), "history".to_string())],
+        output_dir: Some(working_dir.display().to_string()),
+        error: Some("boom".to_string()),
+        created_at_epoch_ms: 0.0,
+    });
+
+    pipeline.redownload_job(job_id).await.unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.status, JobStatus::Queued);
+    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.downloaded_bytes, 0);
+    assert_eq!(state.spec.category.as_deref(), Some("tv"));
+    assert!(!working_dir.exists());
+    assert!(!staging_dir.exists());
+    assert!(
+        pipeline
+            .finished_jobs
+            .iter()
+            .all(|job| job.job_id != job_id)
+    );
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
 
 #[tokio::test]

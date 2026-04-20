@@ -61,6 +61,13 @@ impl JobsMutation {
         handle.reprocess_job(JobId(id)).await?;
         Ok(true)
     }
+    /// Re-download a failed job from its persisted NZB under the same job ID.
+    #[graphql(guard = "ControlGuard")]
+    async fn redownload_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        handle.redownload_job(JobId(id)).await?;
+        Ok(true)
+    }
     /// Delete a completed/failed/cancelled job from history.
     /// Returns the remaining history jobs after deletion.
     async fn delete_history(
@@ -209,6 +216,26 @@ impl JobsMutation {
     async fn reprocess_queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
         map_scheduler_result(handle.reprocess_job(JobId(id)).await)?;
+        let item = handle
+            .get_job(JobId(id))
+            .ok()
+            .map(|info| queue_item_from_job(&info));
+        Ok(QueueCommandResult {
+            success: true,
+            message: None,
+            item,
+            global_state: None,
+        })
+    }
+    /// Re-download a failed queue item under the same job ID.
+    #[graphql(guard = "ControlGuard")]
+    async fn redownload_queue_item(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+    ) -> Result<QueueCommandResult> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        map_scheduler_result(handle.redownload_job(JobId(id)).await)?;
         let item = handle
             .get_job(JobId(id))
             .ok()
