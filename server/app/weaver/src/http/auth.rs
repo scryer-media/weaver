@@ -7,8 +7,8 @@ use serde::Deserialize;
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
 use weaver_server_core::auth::{
-    CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key, hash_password, needs_rehash,
-    verify_password,
+    ApiKeyAuthRow, ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key,
+    hash_password, needs_rehash, verify_password,
 };
 
 /// Extract the `weaver_jwt` cookie value from request headers.
@@ -40,10 +40,78 @@ pub(super) fn jwt_secret_if_auth_enabled(auth_cache: &LoginAuthCache) -> Option<
     auth_cache.snapshot().map(|auth| auth.jwt_secret)
 }
 
+pub(super) fn caller_scope_from_api_key_scope(scope: &str) -> CallerScope {
+    match scope {
+        "admin" => CallerScope::Admin,
+        "read" => CallerScope::Read,
+        "control" | "integration" => CallerScope::Control,
+        _ => CallerScope::Control,
+    }
+}
+
+pub(super) async fn lookup_api_key_auth(
+    db: &Database,
+    api_key_cache: &ApiKeyCache,
+    key_hash: [u8; 32],
+) -> Result<Option<ApiKeyAuthRow>, StatusCode> {
+    if let Some(row) = api_key_cache.get(&key_hash) {
+        return Ok(Some(row));
+    }
+
+    let db_clone = db.clone();
+    let row = tokio::task::spawn_blocking(move || db_clone.lookup_api_key(&key_hash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let cached = ApiKeyAuthRow {
+        key_hash,
+        id: row.id,
+        scope: row.scope,
+    };
+    api_key_cache.upsert(cached.clone());
+    Ok(Some(cached))
+}
+
+pub(super) fn queue_touch_api_key_last_used(db: &Database, id: i64) {
+    let db_touch = db.clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    tokio::task::spawn_blocking(move || {
+        let _ = db_touch.touch_api_key_last_used(id, now);
+    });
+}
+
+pub(super) async fn refresh_auth_caches(
+    db: &Database,
+    auth_cache: &LoginAuthCache,
+    api_key_cache: &ApiKeyCache,
+) -> Result<(), StatusCode> {
+    let db_clone = db.clone();
+    let (credentials, api_keys) = tokio::task::spawn_blocking(move || {
+        let credentials = db_clone.get_auth_credentials().map_err(|_| ())?;
+        let api_keys = db_clone.list_api_key_auth_rows().map_err(|_| ())?;
+        Ok::<_, ()>((credentials, api_keys))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    auth_cache.replace_credentials(credentials);
+    api_key_cache.replace_rows(api_keys);
+    Ok(())
+}
+
 /// Resolve the caller scope from API key header, JWT cookie, or session token.
 pub(super) async fn resolve_scope(
     db: &Database,
     auth_cache: &LoginAuthCache,
+    api_key_cache: &ApiKeyCache,
     session_token: &str,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
@@ -59,27 +127,9 @@ pub(super) async fn resolve_scope(
             return Ok(CallerScope::Local);
         }
         let key_hash = hash_api_key(raw_key);
-        let db_clone = db.clone();
-        let db_touch = db.clone();
-        let row = tokio::task::spawn_blocking(move || db_clone.lookup_api_key(&key_hash))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if let Some(row) = row {
-            let id = row.id;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            tokio::task::spawn_blocking(move || {
-                let _ = db_touch.touch_api_key_last_used(id, now);
-            });
-            return match row.scope.as_str() {
-                "admin" => Ok(CallerScope::Admin),
-                "read" => Ok(CallerScope::Read),
-                "control" | "integration" => Ok(CallerScope::Control),
-                _ => Ok(CallerScope::Control),
-            };
+        if let Some(row) = lookup_api_key_auth(db, api_key_cache, key_hash).await? {
+            queue_touch_api_key_last_used(db, row.id);
+            return Ok(caller_scope_from_api_key_scope(&row.scope));
         }
     }
 

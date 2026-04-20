@@ -19,18 +19,27 @@ use tracing::info;
 use weaver_server_api::{BackupService, WeaverSchema};
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
-use weaver_server_core::auth::LoginAuthCache;
+use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
 
 pub(crate) use self::metrics::PrometheusMetricsExporter;
 
 #[derive(Clone)]
 struct SessionToken(Arc<String>);
 
+#[derive(Clone)]
+struct RequestAuthContext {
+    db: Database,
+    auth_cache: LoginAuthCache,
+    api_key_cache: ApiKeyCache,
+    session_token: SessionToken,
+}
+
 pub struct ServerRuntime {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
     pub db: Database,
     pub auth_cache: LoginAuthCache,
+    pub api_key_cache: ApiKeyCache,
     pub backup: BackupService,
     pub metrics_exporter: PrometheusMetricsExporter,
     pub base_url: String,
@@ -48,24 +57,8 @@ pub async fn run_server(
     runtime: ServerRuntime,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ServerRuntime {
-        schema,
-        handle,
-        db,
-        auth_cache,
-        backup,
-        metrics_exporter,
-        base_url,
-    } = runtime;
-    let app = routes::build_router(
-        schema,
-        handle,
-        db,
-        auth_cache,
-        backup,
-        metrics_exporter,
-        base_url.clone(),
-    )
+    let base_url = runtime.base_url.clone();
+    let app = routes::build_router(runtime)
     .layer(
         CompressionLayer::new()
             .gzip(true)

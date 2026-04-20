@@ -4,6 +4,7 @@ use tracing::info;
 use crate::auth::types::{ApiKey, ApiKeyScope, CreateApiKeyResult};
 use crate::auth::{AdminGuard, generate_api_key, hash_api_key};
 use weaver_server_core::Database;
+use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache};
 
 #[derive(Default)]
 pub(crate) struct AuthMutation;
@@ -34,6 +35,11 @@ impl AuthMutation {
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        ctx.data::<ApiKeyCache>()?.upsert(ApiKeyAuthRow {
+            key_hash,
+            id,
+            scope: scope_str.to_string(),
+        });
 
         info!(id, name = %name, scope = scope_str, "API key created");
 
@@ -62,6 +68,7 @@ impl AuthMutation {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         if deleted {
+            ctx.data::<ApiKeyCache>()?.remove_by_id(id);
             info!(id, "API key deleted");
         }
         let db = ctx.data::<Database>()?.clone();

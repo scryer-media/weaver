@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use super::ApiKeyAuthRow;
 use super::service::derive_jwt_secret;
 use crate::auth::repository::AuthCredentials;
 
@@ -57,6 +59,49 @@ impl LoginAuthCache {
 
     pub fn clear(&self) {
         self.replace(None);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyCache(Arc<RwLock<HashMap<[u8; 32], ApiKeyAuthRow>>>);
+
+impl ApiKeyCache {
+    pub fn from_rows(rows: Vec<ApiKeyAuthRow>) -> Self {
+        let cache = Self::default();
+        cache.replace_rows(rows);
+        cache
+    }
+
+    pub fn get(&self, key_hash: &[u8; 32]) -> Option<ApiKeyAuthRow> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key_hash)
+            .cloned()
+    }
+
+    pub fn upsert(&self, row: ApiKeyAuthRow) {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(row.key_hash, row);
+    }
+
+    pub fn remove_by_id(&self, id: i64) {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, row| row.id != id);
+    }
+
+    pub fn replace_rows(&self, rows: Vec<ApiKeyAuthRow>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rows
+            .into_iter()
+            .map(|row| (row.key_hash, row))
+            .collect();
     }
 }
 

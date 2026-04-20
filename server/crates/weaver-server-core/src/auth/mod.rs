@@ -4,8 +4,8 @@ pub mod password;
 pub mod repository;
 pub mod service;
 
-pub use api_keys::ApiKeyRow;
-pub use model::{CachedLoginAuth, CallerScope, LoginAuthCache};
+pub use api_keys::{ApiKeyAuthRow, ApiKeyRow};
+pub use model::{ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache};
 pub use password::{hash_password, needs_rehash, verify_password};
 pub use repository::AuthCredentials;
 pub use service::{

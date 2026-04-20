@@ -11,7 +11,10 @@ use std::io::Write;
 use tower::ServiceExt;
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
-use weaver_server_core::auth::{CachedLoginAuth, CallerScope, LoginAuthCache, hash_password};
+use weaver_server_core::auth::{
+    ApiKeyAuthRow, ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key,
+    hash_password,
+};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot};
@@ -36,8 +39,10 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 async fn resolve_scope_requires_explicit_auth_when_login_is_disabled() {
     let db = Database::open_in_memory().unwrap();
     let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
     let headers = HeaderMap::new();
-    let result = auth::resolve_scope(&db, &auth_cache, "session-token", &headers).await;
+    let result =
+        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
     assert_eq!(result, Err(StatusCode::UNAUTHORIZED));
 }
 
@@ -45,12 +50,14 @@ async fn resolve_scope_requires_explicit_auth_when_login_is_disabled() {
 async fn resolve_scope_accepts_session_bearer_without_login() {
     let db = Database::open_in_memory().unwrap();
     let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
     let mut headers = HeaderMap::new();
     headers.insert(
         header::AUTHORIZATION,
         HeaderValue::from_static("Bearer session-token"),
     );
-    let result = auth::resolve_scope(&db, &auth_cache, "session-token", &headers).await;
+    let result =
+        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
     assert_eq!(result, Ok(CallerScope::Local));
 }
 
@@ -59,6 +66,7 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
     let db = Database::open_in_memory().unwrap();
     let password_hash = hash_password("hunter2").unwrap();
     let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
     let auth = CachedLoginAuth::new("admin", password_hash);
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
@@ -69,8 +77,32 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
         HeaderValue::from_str(&format!("weaver_jwt={token}")).unwrap(),
     );
 
-    let result = auth::resolve_scope(&db, &auth_cache, "session-token", &headers).await;
+    let result =
+        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
     assert_eq!(result, Ok(CallerScope::Admin));
+}
+
+#[tokio::test]
+async fn resolve_scope_accepts_cached_api_key_without_db_lookup() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let raw_key = "wvr_cached";
+    api_key_cache.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(raw_key),
+        id: 42,
+        scope: "read".to_string(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+    );
+
+    let result =
+        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    assert_eq!(result, Ok(CallerScope::Read));
 }
 
 #[tokio::test]
