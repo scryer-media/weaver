@@ -98,10 +98,8 @@ impl ApiKeyCache {
         *self
             .0
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rows
-            .into_iter()
-            .map(|row| (row.key_hash, row))
-            .collect();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            rows.into_iter().map(|row| (row.key_hash, row)).collect();
     }
 }
 
