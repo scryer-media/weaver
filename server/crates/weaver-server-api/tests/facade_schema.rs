@@ -47,4 +47,8 @@ async fn public_facade_schema_exposes_core_surface() {
         sdl.contains("queueEvents(after: String, filter: QueueFilterInput): QueueEvent!"),
         "queueEvents subscription should be present"
     );
+    assert!(
+        sdl.contains("attributeEquals: AttributeInput"),
+        "QueueFilterInput should expose exact attribute matching"
+    );
 }

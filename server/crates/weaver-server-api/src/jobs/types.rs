@@ -173,6 +173,7 @@ pub struct QueueFilterInput {
     pub states: Option<Vec<QueueItemState>>,
     pub category: Option<String>,
     pub has_attribute_key: Option<String>,
+    pub attribute_equals: Option<AttributeInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, InputObject, Default)]
@@ -586,15 +587,11 @@ pub fn matches_queue_event_filter(event: &QueueEvent, filter: Option<&QueueFilte
         }
     }
 
-    if let Some(attribute_key) = &filter.has_attribute_key {
+    if filter.has_attribute_key.is_some() || filter.attribute_equals.is_some() {
         let Some(item) = &event.item else {
             return false;
         };
-        if !item
-            .attributes
-            .iter()
-            .any(|entry| entry.key == *attribute_key)
-        {
+        if !matches_attribute_filter(&item.attributes, filter) {
             return false;
         }
     }
@@ -703,11 +700,30 @@ fn matches_item_filter(
     {
         return false;
     }
+    if !matches_attribute_filter(attributes, filter) {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn matches_attribute_filter(
+    attributes: &[Attribute],
+    filter: &QueueFilterInput,
+) -> bool {
     if let Some(attribute_key) = &filter.has_attribute_key
         && !attributes.iter().any(|entry| entry.key == *attribute_key)
     {
         return false;
     }
+
+    if let Some(attribute) = &filter.attribute_equals
+        && !attributes
+            .iter()
+            .any(|entry| entry.key == attribute.key && entry.value == attribute.value)
+    {
+        return false;
+    }
+
     true
 }
 

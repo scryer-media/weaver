@@ -76,3 +76,29 @@ fn queue_item_surfaces_unhealthy_attention() {
     assert_eq!(attention.code, "UNHEALTHY_ARTICLES");
     assert!(attention.message.contains("1234"));
 }
+
+#[test]
+fn queue_filter_supports_exact_attribute_matches() {
+    let mut job = base_job(JobStatus::Downloading);
+    job.metadata
+        .push(("*scryer_title_id".to_string(), "title-42".to_string()));
+    let item = queue_item_from_job(&job);
+
+    let matches = QueueFilterInput {
+        attribute_equals: Some(AttributeInput {
+            key: "*scryer_title_id".to_string(),
+            value: "title-42".to_string(),
+        }),
+        ..QueueFilterInput::default()
+    };
+    assert!(matches_queue_filter(&item, Some(&matches)));
+
+    let misses = QueueFilterInput {
+        attribute_equals: Some(AttributeInput {
+            key: "*scryer_title_id".to_string(),
+            value: "title-99".to_string(),
+        }),
+        ..QueueFilterInput::default()
+    };
+    assert!(!matches_queue_filter(&item, Some(&misses)));
+}
