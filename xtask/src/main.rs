@@ -1224,12 +1224,10 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        && let Some(command_line) = read_pid_command_line(&pid)?
+        && command_matches_local_weaver(&command_line, &local_binaries)
     {
-        if let Some(command_line) = read_pid_command_line(&pid)? {
-            if command_matches_local_weaver(&command_line, &local_binaries) {
-                signal_pids(ctx, &[pid], None)?;
-            }
-        }
+        signal_pids(ctx, &[pid], None)?;
     }
 
     let initial_port_pids = list_port_pids(ctx, port)?;

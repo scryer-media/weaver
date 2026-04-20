@@ -63,6 +63,8 @@ pub(super) struct DownloadResult {
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
     pub(super) retry_count: u32,
+    /// Servers intentionally excluded for this fetch attempt.
+    pub(super) exclude_servers: Vec<usize>,
 }
 
 pub(super) enum DownloadPayload {

@@ -942,6 +942,7 @@ async fn write_and_complete_file_like_decode_worker(
     bytes: &[u8],
 ) {
     write_and_complete_file(pipeline, job_id, file_index, filename, bytes).await;
+    pipeline.retry_par2_authoritative_identity(job_id).await;
     pipeline.try_rar_extraction(job_id).await;
     pipeline.check_job_completion(job_id).await;
     pump_pipeline_runtime_queues(pipeline).await;
@@ -2029,6 +2030,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 data: Ok(DownloadPayload::Raw(raw)),
                 is_recovery: false,
                 retry_count: 0,
+                exclude_servers: Vec::new(),
             }),
         )
         .await
@@ -2083,6 +2085,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             data: Ok(DownloadPayload::Raw(raw)),
             is_recovery: false,
             retry_count: 0,
+            exclude_servers: Vec::new(),
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
@@ -2167,6 +2170,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
                 data: Ok(DownloadPayload::Raw(raw)),
                 is_recovery: false,
                 retry_count: 0,
+                exclude_servers: Vec::new(),
             })
             .await;
     }
@@ -2219,6 +2223,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
             is_recovery: false,
             retry_count: 0,
+            exclude_servers: Vec::new(),
         })
         .await;
 
@@ -2231,6 +2236,60 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Downloading)
     );
+}
+
+#[tokio::test]
+async fn excluded_source_not_found_retries_without_marking_health_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20011);
+    let spec = segmented_job_spec("Excluded Source Not Found", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::Fetch("article not found".to_string())),
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: vec![0],
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert_eq!(pipeline.jobs.get(&job_id).map(|state| state.failed_bytes), Some(0));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("excluded-source miss should requeue the segment");
+    assert_eq!(work.exclude_servers, vec![0]);
+    assert_eq!(work.retry_count, 1);
 }
 
 #[tokio::test]
@@ -2277,6 +2336,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             ))),
             is_recovery: false,
             retry_count: 0,
+            exclude_servers: Vec::new(),
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
@@ -2306,6 +2366,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: Vec::new(),
         })
         .await;
 
@@ -2587,6 +2648,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
             ))),
             is_recovery: false,
             retry_count: 0,
+            exclude_servers: Vec::new(),
         })
         .await;
 
@@ -3390,6 +3452,87 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
         .expect("PAR2 rebinding should rebuild RAR topology");
     assert!(topology.volume_map.contains_key(canonical_filename));
     assert!(!topology.volume_map.contains_key(obfuscated_filename));
+}
+
+#[tokio::test]
+async fn par2_metadata_rebinds_obfuscated_rar_after_late_content_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30112);
+    let canonical_files = build_multifile_multivolume_rar_set();
+    let obfuscated_files: Vec<(String, Vec<u8>)> = canonical_files
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            (
+                format!("51273aad56a8b904e96928935278a627.{}", index + 101),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let spec = rar_job_spec("PAR2 Late Canonical Rebind", &obfuscated_files);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&canonical_files),
+        &[],
+    );
+
+    for (index, ((_, _), (obfuscated_filename, bytes))) in canonical_files
+        .iter()
+        .zip(obfuscated_files.iter())
+        .enumerate()
+    {
+        write_and_complete_file(
+            &mut pipeline,
+            job_id,
+            index as u32,
+            obfuscated_filename,
+            bytes,
+        )
+        .await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+    }
+
+    for (index, ((canonical_filename, _), (obfuscated_filename, _))) in canonical_files
+        .iter()
+        .zip(obfuscated_files.iter())
+        .enumerate()
+    {
+        let identity = pipeline
+            .file_identity(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                },
+            )
+            .cloned()
+            .expect("data file identity should exist");
+        assert_eq!(identity.current_filename, *canonical_filename);
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(canonical_filename.as_str())
+        );
+        assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+        assert!(!working_dir.join(obfuscated_filename).exists());
+        assert!(working_dir.join(canonical_filename).exists());
+    }
+
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("show"))
+        .cloned()
+        .expect("late PAR2 rebinding should rebuild RAR topology");
+    for (canonical_filename, _) in &canonical_files {
+        assert!(topology.volume_map.contains_key(canonical_filename));
+    }
+    for (obfuscated_filename, _) in &obfuscated_files {
+        assert!(!topology.volume_map.contains_key(obfuscated_filename));
+    }
 }
 
 #[tokio::test]

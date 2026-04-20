@@ -91,7 +91,7 @@ const LIVE_JOB_STATUS_TO_METRIC_LABEL: Record<string, JobStatusMetricLabel> = {
   QUEUED: "queued",
   DOWNLOADING: "downloading",
   PAUSED: "paused",
-  CHECKING: "checking",
+  CHECKING: "verifying",
   VERIFYING: "verifying",
   QUEUED_REPAIR: "queued_repair",
   REPAIRING: "repairing",

@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 const STATUS_VARIANTS: Record<string, ComponentProps<typeof Badge>["variant"]> = {
   QUEUED: "muted",
   DOWNLOADING: "info",
-  CHECKING: "info",
+  CHECKING: "warning",
   VERIFYING: "warning",
   QUEUED_REPAIR: "muted",
   REPAIRING: "warning",
@@ -23,7 +23,7 @@ const STATUS_VARIANTS: Record<string, ComponentProps<typeof Badge>["variant"]> =
 const STATUS_LABELS: Record<string, string> = {
   QUEUED: "Queued",
   DOWNLOADING: "Downloading",
-  CHECKING: "Checking",
+  CHECKING: "Verifying",
   VERIFYING: "Verifying",
   QUEUED_REPAIR: "Queued",
   REPAIRING: "Repairing",

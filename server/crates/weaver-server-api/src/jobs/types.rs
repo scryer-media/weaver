@@ -22,6 +22,9 @@ pub struct AttributeInput {
     pub value: String,
 }
 
+/// Public queue states collapse the internal `Checking` phase into
+/// `Verifying` so clients see one post-download verification step before
+/// extraction begins.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
 pub enum QueueItemState {
     Queued,
@@ -43,7 +46,7 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             | weaver_server_core::JobStatus::QueuedRepair
             | weaver_server_core::JobStatus::QueuedExtract => Self::Queued,
             weaver_server_core::JobStatus::Downloading => Self::Downloading,
-            weaver_server_core::JobStatus::Checking => Self::Checking,
+            weaver_server_core::JobStatus::Checking => Self::Verifying,
             weaver_server_core::JobStatus::Verifying => Self::Verifying,
             weaver_server_core::JobStatus::Repairing => Self::Repairing,
             weaver_server_core::JobStatus::Extracting => Self::Extracting,
@@ -372,6 +375,9 @@ impl From<&weaver_server_core::JobInfo> for Job {
     }
 }
 
+/// GraphQL job statuses collapse the internal `Checking` phase into
+/// `Verifying` so clients see one post-download verification step before
+/// extraction begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum JobStatusGql {
     Queued,
@@ -393,7 +399,7 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
         match status {
             weaver_server_core::JobStatus::Queued => Self::Queued,
             weaver_server_core::JobStatus::Downloading => Self::Downloading,
-            weaver_server_core::JobStatus::Checking => Self::Checking,
+            weaver_server_core::JobStatus::Checking => Self::Verifying,
             weaver_server_core::JobStatus::Verifying => Self::Verifying,
             weaver_server_core::JobStatus::QueuedRepair => Self::QueuedRepair,
             weaver_server_core::JobStatus::Repairing => Self::Repairing,
@@ -628,8 +634,12 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
                 summary.active_items += 1;
                 summary.extracting_items += 1;
             }
-            QueueItemState::Downloading | QueueItemState::Checking | QueueItemState::Finalizing => {
+            QueueItemState::Downloading | QueueItemState::Finalizing => {
                 summary.active_items += 1;
+            }
+            QueueItemState::Checking => {
+                summary.active_items += 1;
+                summary.verifying_items += 1;
             }
             QueueItemState::Completed => {}
         }

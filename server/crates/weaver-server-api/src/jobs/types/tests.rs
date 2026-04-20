@@ -53,6 +53,20 @@ fn queue_item_maps_moving_to_finalizing() {
 }
 
 #[test]
+fn queue_item_maps_checking_to_verifying() {
+    let item = queue_item_from_job(&base_job(JobStatus::Checking));
+    assert_eq!(item.state, QueueItemState::Verifying);
+}
+
+#[test]
+fn job_status_gql_maps_checking_to_verifying() {
+    assert_eq!(
+        JobStatusGql::from(&JobStatus::Checking),
+        JobStatusGql::Verifying
+    );
+}
+
+#[test]
 fn queue_item_surfaces_unhealthy_attention() {
     let mut job = base_job(JobStatus::Downloading);
     job.failed_bytes = 1234;

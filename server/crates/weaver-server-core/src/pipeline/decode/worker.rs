@@ -586,6 +586,7 @@ impl Pipeline {
                     self.try_merge_par2_recovery(job_id, file_id).await;
                     self.refresh_archive_state_for_completed_file(job_id, file_id, true)
                         .await;
+                    self.retry_par2_authoritative_identity(job_id).await;
                     debug!(job_id = job_id.0, "post-topology");
                     debug!(job_id = job_id.0, "entering try_rar_extraction");
                     self.try_rar_extraction(job_id).await;
