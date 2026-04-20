@@ -149,11 +149,16 @@ impl Pipeline {
 
         for file_asm in state.assembly.files() {
             let weaver_model::files::FileRole::RarVolume { volume_number } =
-                file_asm.effective_role()
+                self.classified_role_for_file(job_id, file_asm)
             else {
                 continue;
             };
-            if file_asm.archive_set_name().as_deref() != Some(set_name) || !file_asm.is_complete() {
+            if self
+                .classified_archive_set_name_for_file(job_id, file_asm)
+                .as_deref()
+                != Some(set_name)
+                || !file_asm.is_complete()
+            {
                 continue;
             }
             if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename())
@@ -316,6 +321,7 @@ impl Pipeline {
             } else {
                 RarTopologyRebuildSource::VolumeZero
             };
+            let has_cached_headers = cached_headers.is_some();
             let mut archive = match cached_headers {
                 Some(headers) => match weaver_rar::RarArchive::deserialize_headers_with_password(
                     &headers,
@@ -370,11 +376,19 @@ impl Pipeline {
             };
 
             for (volume_number, path) in &volume_paths {
-                let volume_file = std::fs::File::open(path).map_err(|e| {
-                    format!(
-                        "failed to open RAR volume {volume_number} for set '{set_name_owned}': {e}"
-                    )
-                })?;
+                let volume_file = match std::fs::File::open(path) {
+                    Ok(file) => file,
+                    Err(error)
+                        if has_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
+                        ));
+                    }
+                };
                 if archive.has_volume(*volume_number as usize) {
                     archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
                 } else {
@@ -459,11 +473,14 @@ impl Pipeline {
                         return None;
                     }
                     let weaver_model::files::FileRole::RarVolume { volume_number } =
-                        file_asm.effective_role()
+                        self.classified_role_for_file(job_id, file_asm)
                     else {
                         return None;
                     };
-                    if file_asm.archive_set_name().as_deref() != Some(set_name)
+                    if self
+                        .classified_archive_set_name_for_file(job_id, file_asm)
+                        .as_deref()
+                        != Some(set_name)
                         || !file_asm.is_complete()
                     {
                         return None;
@@ -570,11 +587,16 @@ impl Pipeline {
         }
         for file_asm in state.assembly.files() {
             let weaver_model::files::FileRole::RarVolume { volume_number } =
-                file_asm.effective_role()
+                self.classified_role_for_file(job_id, file_asm)
             else {
                 continue;
             };
-            if file_asm.archive_set_name().as_deref() == Some(set_name) && file_asm.is_complete() {
+            if self
+                .classified_archive_set_name_for_file(job_id, file_asm)
+                .as_deref()
+                == Some(set_name)
+                && file_asm.is_complete()
+            {
                 volume_map
                     .entry(file_asm.filename().to_string())
                     .or_insert(volume_number);
@@ -699,11 +721,14 @@ impl Pipeline {
                     .files()
                     .filter_map(|file_asm| {
                         let weaver_model::files::FileRole::RarVolume { .. } =
-                            file_asm.effective_role()
+                            self.classified_role_for_file(job_id, file_asm)
                         else {
                             return None;
                         };
-                        if file_asm.archive_set_name().as_deref() != Some(set_name.as_str())
+                        if self
+                            .classified_archive_set_name_for_file(job_id, file_asm)
+                            .as_deref()
+                            != Some(set_name.as_str())
                             || !file_asm.is_complete()
                         {
                             return None;
@@ -788,11 +813,11 @@ impl Pipeline {
                 return;
             };
             let weaver_model::files::FileRole::RarVolume { volume_number } =
-                file_asm.effective_role()
+                self.classified_role_for_file(job_id, file_asm)
             else {
                 return;
             };
-            let Some(set_name) = file_asm.archive_set_name() else {
+            let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) else {
                 return;
             };
             (
@@ -862,9 +887,9 @@ impl Pipeline {
             return;
         };
 
-        let role = file_asm.effective_role();
+        let role = self.classified_role_for_file(job_id, file_asm);
         let filename = file_asm.filename().to_string();
-        let set_name = match file_asm.archive_set_name() {
+        let set_name = match self.classified_archive_set_name_for_file(job_id, file_asm) {
             Some(name) => name,
             None => return,
         };
@@ -932,8 +957,11 @@ impl Pipeline {
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
                     if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                        f.effective_role()
-                        && f.archive_set_name().as_deref() == Some(&set_name)
+                        self.classified_role_for_file(job_id, f)
+                        && self
+                            .classified_archive_set_name_for_file(job_id, f)
+                            .as_deref()
+                            == Some(&set_name)
                     {
                         volume_map.insert(f.filename().to_string(), n);
                         max_number = max_number.max(n);
@@ -955,25 +983,27 @@ impl Pipeline {
                     unresolved_spans: vec![],
                 };
 
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state
-                    .assembly
-                    .set_archive_topology(set_name.clone(), topology);
-
                 let completed: Vec<u32> = state
                     .assembly
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
                         if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                            f.effective_role()
-                            && f.archive_set_name().as_deref() == Some(&set_name)
+                            self.classified_role_for_file(job_id, f)
+                            && self
+                                .classified_archive_set_name_for_file(job_id, f)
+                                .as_deref()
+                                == Some(&set_name)
                         {
                             return Some(n);
                         }
                         None
                     })
                     .collect();
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
                 for n in completed {
                     state.assembly.mark_volume_complete(&set_name, n);
                 }
@@ -1068,8 +1098,11 @@ impl Pipeline {
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
                     if let weaver_model::files::FileRole::SplitFile { number: n } =
-                        f.effective_role()
-                        && f.archive_set_name().as_deref() == Some(&set_name)
+                        self.classified_role_for_file(job_id, f)
+                        && self
+                            .classified_archive_set_name_for_file(job_id, f)
+                            .as_deref()
+                            == Some(&set_name)
                     {
                         volume_map.insert(f.filename().to_string(), n);
                         max_number = max_number.max(n);
@@ -1091,25 +1124,27 @@ impl Pipeline {
                     unresolved_spans: vec![],
                 };
 
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state
-                    .assembly
-                    .set_archive_topology(set_name.clone(), topology);
-
                 let completed: Vec<u32> = state
                     .assembly
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
                         if let weaver_model::files::FileRole::SplitFile { number: n } =
-                            f.effective_role()
-                            && f.archive_set_name().as_deref() == Some(&set_name)
+                            self.classified_role_for_file(job_id, f)
+                            && self
+                                .classified_archive_set_name_for_file(job_id, f)
+                                .as_deref()
+                                == Some(&set_name)
                         {
                             return Some(n);
                         }
                         None
                     })
                     .collect();
+                let state = self.jobs.get_mut(&job_id).unwrap();
+                state
+                    .assembly
+                    .set_archive_topology(set_name.clone(), topology);
                 for n in completed {
                     state.assembly.mark_volume_complete(&set_name, n);
                 }

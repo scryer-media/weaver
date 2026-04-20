@@ -357,6 +357,7 @@ impl Pipeline {
         password: Option<String>,
         cached_headers: Option<Vec<u8>>,
     ) -> Result<weaver_rar::RarArchive, String> {
+        let has_cached_headers = cached_headers.is_some();
         let mut archive = match cached_headers {
             Some(headers) => weaver_rar::RarArchive::deserialize_headers_with_password(
                 &headers,
@@ -381,9 +382,19 @@ impl Pipeline {
         };
 
         for (volume_number, path) in volume_paths {
-            let file = std::fs::File::open(&path).map_err(|e| {
-                format!("failed to open RAR volume {volume_number} for set '{set_name}': {e}")
-            })?;
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error)
+                    if has_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to open RAR volume {volume_number} for set '{set_name}': {error}"
+                    ));
+                }
+            };
             if archive.has_volume(volume_number as usize) {
                 archive.attach_volume_reader(volume_number as usize, Box::new(file));
             } else {

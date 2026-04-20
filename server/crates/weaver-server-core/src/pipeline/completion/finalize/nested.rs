@@ -286,6 +286,7 @@ impl Pipeline {
         nested_archives: &[NestedArchiveFile],
     ) -> Result<Vec<(String, crate::jobs::assembly::ArchiveType)>, String> {
         let mut assembly = crate::jobs::assembly::JobAssembly::new(job_id);
+        let mut detected_archives = HashMap::new();
         let mut topologies = BTreeMap::<String, crate::jobs::assembly::ArchiveTopology>::new();
 
         for (index, archive) in nested_archives.iter().enumerate() {
@@ -300,7 +301,7 @@ impl Pipeline {
                 segment_sizes.clone(),
             );
             if let Some(detected_archive) = archive.detected_archive.clone() {
-                file_assembly.set_detected_archive(detected_archive);
+                detected_archives.insert(file_id.file_index, detected_archive);
             }
             for (segment_number, segment_size) in segment_sizes.into_iter().enumerate() {
                 file_assembly
@@ -351,11 +352,15 @@ impl Pipeline {
             assembly.set_archive_topology(set_name, topology);
         }
 
-        let state = self
-            .jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| format!("job {} not found", job_id.0))?;
-        state.assembly = assembly;
+        {
+            let state = self
+                .jobs
+                .get_mut(&job_id)
+                .ok_or_else(|| format!("job {} not found", job_id.0))?;
+            state.assembly = assembly;
+            state.detected_archives.clear();
+        }
+        self.replace_detected_archive_identities_for_job(job_id, detected_archives)?;
         Ok(to_extract)
     }
 

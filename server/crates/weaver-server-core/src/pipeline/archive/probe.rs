@@ -1,6 +1,6 @@
 use crate::jobs::assembly::{
-    ArchiveMember, ArchiveTopology, ArchiveType, DetectedArchiveIdentity,
-    DetectedArchiveKind as PersistedDetectedArchiveKind,
+    DetectedArchiveIdentity, DetectedArchiveKind as PersistedDetectedArchiveKind,
+    ExtractionReadiness,
 };
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::Pipeline;
@@ -19,42 +19,27 @@ pub(crate) struct ArchiveProbeCandidate {
     pub(crate) numeric_suffix: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum ProbedArchiveKind {
-    Rar {
-        facts: weaver_rar::RarVolumeFacts,
-    },
-    SevenZipSingle,
-    SevenZipSplit {
-        volume_map: HashMap<String, u32>,
-        complete_volumes: HashSet<u32>,
-        expected_volume_count: u32,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DetectedArchiveRegistration {
-    pub(crate) identity: DetectedArchiveIdentity,
-    pub(crate) kind: ProbedArchiveKind,
-}
-
 impl Pipeline {
-    pub(crate) async fn try_register_archive_topology_for_completed_file(
+    pub(crate) async fn refresh_archive_state_for_completed_file(
         &mut self,
         job_id: JobId,
         file_id: NzbFileId,
+        allow_probe: bool,
     ) {
-        let role = match self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.assembly.file(file_id))
-        {
-            Some(file) if file.is_complete() => file.effective_role(),
-            None => return,
-            Some(_) => return,
-        };
+        self.classify_completed_file(job_id, file_id, allow_probe)
+            .await;
 
-        match role {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return;
+        };
+        if !file.is_complete() {
+            return;
+        }
+
+        match self.classified_role_for_file(job_id, file) {
             FileRole::RarVolume { .. } => {
                 self.try_update_archive_topology(job_id, file_id).await;
             }
@@ -74,20 +59,178 @@ impl Pipeline {
             }
             _ => {}
         }
+    }
 
+    pub(crate) fn classified_role_for_file(
+        &self,
+        job_id: JobId,
+        file: &crate::jobs::assembly::FileAssembly,
+    ) -> FileRole {
+        self.detected_archive_identity(job_id, file.file_id())
+            .map(DetectedArchiveIdentity::effective_role)
+            .unwrap_or_else(|| file.role().clone())
+    }
+
+    pub(crate) fn classified_archive_set_name_for_file(
+        &self,
+        job_id: JobId,
+        file: &crate::jobs::assembly::FileAssembly,
+    ) -> Option<String> {
+        self.detected_archive_identity(job_id, file.file_id())
+            .map(|detected| detected.set_name.clone())
+            .or_else(|| weaver_model::files::archive_base_name(file.filename(), file.role()))
+    }
+
+    pub(crate) fn detected_archive_identity(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+    ) -> Option<&DetectedArchiveIdentity> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|state| state.detected_archives.get(&file_id.file_index))
+    }
+
+    fn set_detected_archive_identity(
+        &mut self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        identity: DetectedArchiveIdentity,
+    ) -> Result<(), String> {
+        self.db
+            .save_detected_archive_identity(job_id, file_id.file_index, &identity)
+            .map_err(|error| format!("failed to save detected archive identity: {error}"))?;
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.detected_archives.insert(file_id.file_index, identity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_detected_archive_identity(&mut self, job_id: JobId, file_id: NzbFileId) {
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.detected_archives.remove(&file_id.file_index);
+        }
+        if let Err(error) = self
+            .db
+            .delete_detected_archive_identity(job_id, file_id.file_index)
+        {
+            tracing::warn!(
+                job_id = job_id.0,
+                file_index = file_id.file_index,
+                error = %error,
+                "failed to clear detected archive identity"
+            );
+        }
+    }
+
+    pub(crate) fn replace_detected_archive_identities_for_job(
+        &mut self,
+        job_id: JobId,
+        detected_archives: HashMap<u32, DetectedArchiveIdentity>,
+    ) -> Result<(), String> {
+        let previous_keys: Vec<u32> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.detected_archives.keys().copied().collect())
+            .unwrap_or_default();
+
+        for file_index in previous_keys {
+            if detected_archives.contains_key(&file_index) {
+                continue;
+            }
+            self.db
+                .delete_detected_archive_identity(job_id, file_index)
+                .map_err(|error| {
+                    format!(
+                        "failed to delete detected archive identity for file {file_index}: {error}"
+                    )
+                })?;
+        }
+
+        for (file_index, identity) in &detected_archives {
+            self.db
+                .save_detected_archive_identity(job_id, *file_index, identity)
+                .map_err(|error| {
+                    format!(
+                        "failed to save detected archive identity for file {file_index}: {error}"
+                    )
+                })?;
+        }
+
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.detected_archives = detected_archives;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn extraction_readiness_for_job(&self, job_id: JobId) -> ExtractionReadiness {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return ExtractionReadiness::NotApplicable;
+        };
+
+        if state.assembly.archive_topologies().is_empty() {
+            let has_archive = state.assembly.files().any(|file| {
+                matches!(
+                    self.classified_role_for_file(job_id, file),
+                    FileRole::RarVolume { .. }
+                        | FileRole::SevenZipArchive
+                        | FileRole::SevenZipSplit { .. }
+                )
+            });
+            if has_archive {
+                return ExtractionReadiness::Blocked {
+                    reason: "archive topology not yet available".into(),
+                };
+            }
+            return ExtractionReadiness::NotApplicable;
+        }
+
+        let all_archive_files_covered =
+            state
+                .assembly
+                .files()
+                .all(|file| match self.classified_role_for_file(job_id, file) {
+                    FileRole::RarVolume { .. }
+                    | FileRole::SevenZipArchive
+                    | FileRole::SevenZipSplit { .. } => state
+                        .assembly
+                        .archive_topologies()
+                        .values()
+                        .any(|topology| topology.volume_map.contains_key(file.filename())),
+                    _ => true,
+                });
+        if !all_archive_files_covered {
+            return ExtractionReadiness::Blocked {
+                reason: "archive topology not yet available for all sets".into(),
+            };
+        }
+
+        state.assembly.extraction_readiness()
+    }
+
+    async fn classify_completed_file(
+        &mut self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        allow_probe: bool,
+    ) {
         let Some(candidate) = self.archive_probe_candidate(job_id, file_id) else {
             return;
         };
+        if !allow_probe {
+            return;
+        }
 
         let password = self
             .jobs
             .get(&job_id)
             .and_then(|state| state.spec.password.clone());
-        let registration = match self
+        let identity = match self
             .probe_archive_candidate(job_id, &candidate, password)
             .await
         {
-            Ok(registration) => registration,
+            Ok(identity) => identity,
             Err(error) => {
                 tracing::warn!(
                     job_id = job_id.0,
@@ -100,99 +243,33 @@ impl Pipeline {
             }
         };
 
-        let Some(registration) = registration else {
+        let Some(identity) = identity else {
             return;
         };
 
-        if let Err(error) = self.persist_detected_archive_identity(
-            job_id,
-            candidate.file_id,
-            &registration.identity,
-        ) {
+        if identity.kind == PersistedDetectedArchiveKind::SevenZipSplit {
+            if let Err(error) = self.set_detected_seven_zip_split_group(job_id, &candidate.set_key)
+            {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    file_id = %file_id,
+                    set_name = %candidate.set_key,
+                    error = %error,
+                    "failed to persist detected 7z split classification group"
+                );
+            }
+            return;
+        }
+
+        if let Err(error) = self.set_detected_archive_identity(job_id, file_id, identity.clone()) {
             tracing::warn!(
                 job_id = job_id.0,
                 file_id = %file_id,
-                set_name = %registration.identity.set_name,
+                set_name = %identity.set_name,
                 error = %error,
                 "failed to persist detected archive identity"
             );
-            return;
         }
-
-        match registration.kind {
-            ProbedArchiveKind::Rar { facts } => {
-                match self.persist_rar_volume_facts(
-                    job_id,
-                    &registration.identity.set_name,
-                    &candidate.filename,
-                    None,
-                    facts,
-                ) {
-                    Ok(_) => {
-                        if let Err(error) = self
-                            .recompute_rar_set_state(job_id, &registration.identity.set_name)
-                            .await
-                        {
-                            tracing::warn!(
-                                job_id = job_id.0,
-                                file_id = %file_id,
-                                set_name = %registration.identity.set_name,
-                                error,
-                                "failed to recompute detected RAR set state"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            job_id = job_id.0,
-                            file_id = %file_id,
-                            set_name = %registration.identity.set_name,
-                            error = %error,
-                            "failed to register detected RAR volume"
-                        );
-                    }
-                }
-            }
-            ProbedArchiveKind::SevenZipSingle => {
-                self.register_detected_seven_zip_single(
-                    job_id,
-                    &registration.identity.set_name,
-                    &candidate,
-                );
-            }
-            ProbedArchiveKind::SevenZipSplit {
-                volume_map,
-                complete_volumes,
-                expected_volume_count,
-            } => {
-                self.register_detected_seven_zip_split(
-                    job_id,
-                    &registration.identity.set_name,
-                    volume_map,
-                    complete_volumes,
-                    expected_volume_count,
-                );
-            }
-        }
-    }
-
-    fn persist_detected_archive_identity(
-        &mut self,
-        job_id: JobId,
-        file_id: NzbFileId,
-        identity: &DetectedArchiveIdentity,
-    ) -> Result<(), String> {
-        self.db
-            .save_detected_archive_identity(job_id, file_id.file_index, identity)
-            .map_err(|error| format!("failed to save detected archive identity: {error}"))?;
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return Ok(());
-        };
-        let Some(file) = state.assembly.file_mut(file_id) else {
-            return Ok(());
-        };
-        file.set_detected_archive(identity.clone());
-        Ok(())
     }
 
     fn archive_probe_candidate(
@@ -202,7 +279,7 @@ impl Pipeline {
     ) -> Option<ArchiveProbeCandidate> {
         let state = self.jobs.get(&job_id)?;
         let file = state.assembly.file(file_id)?;
-        if file.detected_archive().is_some() || !file.is_complete() {
+        if self.detected_archive_identity(job_id, file_id).is_some() || !file.is_complete() {
             return None;
         }
         let role = file.declared_role();
@@ -227,7 +304,7 @@ impl Pipeline {
         job_id: JobId,
         candidate: &ArchiveProbeCandidate,
         password: Option<String>,
-    ) -> Result<Option<DetectedArchiveRegistration>, String> {
+    ) -> Result<Option<DetectedArchiveIdentity>, String> {
         let Some(path) = self.resolve_job_input_path(job_id, &candidate.filename) else {
             return Ok(None);
         };
@@ -236,13 +313,10 @@ impl Pipeline {
         }
 
         if let Ok(facts) = Self::parse_rar_volume_facts_from_path(path.clone(), password).await {
-            return Ok(Some(DetectedArchiveRegistration {
-                identity: DetectedArchiveIdentity {
-                    kind: PersistedDetectedArchiveKind::Rar,
-                    set_name: candidate.set_key.clone(),
-                    volume_index: Some(facts.volume_number),
-                },
-                kind: ProbedArchiveKind::Rar { facts },
+            return Ok(Some(DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::Rar,
+                set_name: candidate.set_key.clone(),
+                volume_index: Some(facts.volume_number),
             }));
         }
 
@@ -250,7 +324,7 @@ impl Pipeline {
             && self.known_detected_archive_kind(job_id, &candidate.set_key)
                 == Some(PersistedDetectedArchiveKind::SevenZipSplit)
         {
-            let Some((volume_map, complete_volumes, expected_volume_count)) =
+            let Some((volume_map, _, _)) =
                 self.detected_seven_zip_split_group(job_id, &candidate.set_key)
             else {
                 return Ok(None);
@@ -258,17 +332,10 @@ impl Pipeline {
             let Some(volume_index) = volume_map.get(&candidate.filename).copied() else {
                 return Ok(None);
             };
-            return Ok(Some(DetectedArchiveRegistration {
-                identity: DetectedArchiveIdentity {
-                    kind: PersistedDetectedArchiveKind::SevenZipSplit,
-                    set_name: candidate.set_key.clone(),
-                    volume_index: Some(volume_index),
-                },
-                kind: ProbedArchiveKind::SevenZipSplit {
-                    volume_map,
-                    complete_volumes,
-                    expected_volume_count,
-                },
+            return Ok(Some(DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                set_name: candidate.set_key.clone(),
+                volume_index: Some(volume_index),
             }));
         }
 
@@ -277,7 +344,7 @@ impl Pipeline {
         }
 
         if candidate.numeric_suffix.is_some() {
-            let Some((volume_map, complete_volumes, expected_volume_count)) =
+            let Some((volume_map, _, _)) =
                 self.detected_seven_zip_split_group(job_id, &candidate.set_key)
             else {
                 return Ok(None);
@@ -285,27 +352,17 @@ impl Pipeline {
             let Some(volume_index) = volume_map.get(&candidate.filename).copied() else {
                 return Ok(None);
             };
-            return Ok(Some(DetectedArchiveRegistration {
-                identity: DetectedArchiveIdentity {
-                    kind: PersistedDetectedArchiveKind::SevenZipSplit,
-                    set_name: candidate.set_key.clone(),
-                    volume_index: Some(volume_index),
-                },
-                kind: ProbedArchiveKind::SevenZipSplit {
-                    volume_map,
-                    complete_volumes,
-                    expected_volume_count,
-                },
+            return Ok(Some(DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                set_name: candidate.set_key.clone(),
+                volume_index: Some(volume_index),
             }));
         }
 
-        Ok(Some(DetectedArchiveRegistration {
-            identity: DetectedArchiveIdentity {
-                kind: PersistedDetectedArchiveKind::SevenZipSingle,
-                set_name: candidate.set_key.clone(),
-                volume_index: None,
-            },
-            kind: ProbedArchiveKind::SevenZipSingle,
+        Ok(Some(DetectedArchiveIdentity {
+            kind: PersistedDetectedArchiveKind::SevenZipSingle,
+            set_name: candidate.set_key.clone(),
+            volume_index: None,
         }))
     }
 
@@ -315,8 +372,7 @@ impl Pipeline {
         set_key: &str,
     ) -> Option<PersistedDetectedArchiveKind> {
         self.jobs.get(&job_id).and_then(|state| {
-            state.assembly.files().find_map(|file| {
-                let detected = file.detected_archive()?;
+            state.detected_archives.values().find_map(|detected| {
                 (detected.set_name == set_key).then_some(detected.kind.clone())
             })
         })
@@ -381,63 +437,47 @@ impl Pipeline {
         Some((volume_map, complete_volumes, expected_volume_count))
     }
 
-    fn register_detected_seven_zip_single(
+    fn set_detected_seven_zip_split_group(
         &mut self,
         job_id: JobId,
-        set_name: &str,
-        candidate: &ArchiveProbeCandidate,
-    ) {
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return;
+        set_key: &str,
+    ) -> Result<(), String> {
+        let Some((volume_map, _, _)) = self.detected_seven_zip_split_group(job_id, set_key) else {
+            return Ok(());
         };
-        let mut complete_volumes = HashSet::new();
-        complete_volumes.insert(0);
-        state.assembly.set_archive_topology(
-            set_name.to_string(),
-            ArchiveTopology {
-                archive_type: ArchiveType::SevenZip,
-                volume_map: HashMap::from([(candidate.filename.clone(), 0)]),
-                complete_volumes,
-                expected_volume_count: Some(1),
-                members: vec![ArchiveMember {
-                    name: set_name.to_string(),
-                    first_volume: 0,
-                    last_volume: 0,
-                    unpacked_size: 0,
-                }],
-                unresolved_spans: Vec::new(),
-            },
-        );
-    }
 
-    fn register_detected_seven_zip_split(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        volume_map: HashMap<String, u32>,
-        complete_volumes: HashSet<u32>,
-        expected_volume_count: u32,
-    ) {
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return;
+        let matches: Vec<(NzbFileId, u32)> = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return Ok(());
+            };
+            state
+                .assembly
+                .files()
+                .filter_map(|file| {
+                    let (candidate_set_key, _) =
+                        probe_set_key_and_suffix(file.filename(), file.declared_role())?;
+                    if candidate_set_key != set_key {
+                        return None;
+                    }
+                    let volume_index = volume_map.get(file.filename()).copied()?;
+                    Some((file.file_id(), volume_index))
+                })
+                .collect()
         };
-        let last_volume = expected_volume_count.saturating_sub(1);
-        state.assembly.set_archive_topology(
-            set_name.to_string(),
-            ArchiveTopology {
-                archive_type: ArchiveType::SevenZip,
-                volume_map,
-                complete_volumes,
-                expected_volume_count: Some(expected_volume_count),
-                members: vec![ArchiveMember {
-                    name: set_name.to_string(),
-                    first_volume: 0,
-                    last_volume,
-                    unpacked_size: 0,
-                }],
-                unresolved_spans: Vec::new(),
-            },
-        );
+
+        for (file_id, volume_index) in matches {
+            self.set_detected_archive_identity(
+                job_id,
+                file_id,
+                DetectedArchiveIdentity {
+                    kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                    set_name: set_key.to_string(),
+                    volume_index: Some(volume_index),
+                },
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -461,16 +501,12 @@ pub(crate) fn probe_set_key_and_suffix(
 }
 
 fn numeric_suffix_set_key(filename: &str) -> Option<(String, u32)> {
-    let (set_key, suffix) = filename.rsplit_once('.')?;
-    if set_key.is_empty() || suffix.is_empty() || suffix.len() > 3 {
-        return None;
-    }
-    if !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+    let dot = filename.rfind('.')?;
+    let suffix = filename.get(dot + 1..)?;
+    if suffix.is_empty() || suffix.len() > 5 || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
 
-    suffix
-        .parse::<u32>()
-        .ok()
-        .map(|numeric_suffix| (set_key.to_string(), numeric_suffix))
+    let numeric_suffix = suffix.parse::<u32>().ok()?;
+    Some((filename[..dot].to_string(), numeric_suffix))
 }

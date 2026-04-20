@@ -21,15 +21,7 @@ impl Pipeline {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        for file in state.assembly.files_mut() {
-            file.clear_detected_archive();
-        }
-        for (&file_index, detected_archive) in detected_archives {
-            let file_id = NzbFileId { job_id, file_index };
-            if let Some(file) = state.assembly.file_mut(file_id) {
-                file.set_detected_archive(detected_archive.clone());
-            }
-        }
+        state.detected_archives = detected_archives.clone();
     }
 
     pub(crate) async fn add_job(
@@ -114,6 +106,7 @@ impl Pipeline {
             par2_bytes,
             health_probing: false,
             last_health_probe_failed_bytes: 0,
+            detected_archives: HashMap::new(),
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -311,6 +304,7 @@ impl Pipeline {
                 par2_bytes,
                 health_probing: false,
                 last_health_probe_failed_bytes: 0,
+                detected_archives: HashMap::new(),
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
@@ -461,7 +455,7 @@ impl Pipeline {
         };
 
         for file_id in files {
-            self.try_register_archive_topology_for_completed_file(job_id, file_id)
+            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
                 .await;
         }
     }
@@ -578,6 +572,7 @@ impl Pipeline {
             par2_bytes,
             health_probing: false,
             last_health_probe_failed_bytes: 0,
+            detected_archives: HashMap::new(),
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,

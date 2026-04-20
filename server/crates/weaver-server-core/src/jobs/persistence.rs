@@ -746,6 +746,20 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_rar_volume_facts_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_rar_volume_facts WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn set_volume_status(
         &self,
         job_id: JobId,
@@ -771,6 +785,48 @@ impl Database {
                 par2_clean as i64,
                 deleted as i64,
             ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_volume_status_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_volume_status WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_verified_suspect_volumes_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_rar_verified_suspect WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_extraction_chunks_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_extraction_chunks WHERE job_id = ?1 AND set_name = ?2",
+            rusqlite::params![job_id.0 as i64, set_name],
         )
         .map_err(db_err)?;
         Ok(())

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::jobs::assembly::JobAssembly;
+use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
@@ -156,6 +156,8 @@ pub struct JobState {
     pub health_probing: bool,
     /// Highest failed-byte watermark that has already been health-probed.
     pub last_health_probe_failed_bytes: u64,
+    /// Persisted probe facts used for pre-extraction classification.
+    pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
     /// Segments pulled from queues while health probe runs. Restored on
     /// probe pass, dropped on probe fail.
     pub held_segments: Vec<DownloadWork>,

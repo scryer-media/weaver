@@ -320,7 +320,7 @@ impl Pipeline {
             if let Some(state) = self.jobs.get(&job_id) {
                 for file_asm in state.assembly.files() {
                     if let weaver_model::files::FileRole::RarVolume { volume_number } =
-                        file_asm.effective_role()
+                        self.classified_role_for_file(job_id, file_asm)
                     {
                         assembly_by_volume.insert(volume_number, file_asm.filename().to_string());
                     }

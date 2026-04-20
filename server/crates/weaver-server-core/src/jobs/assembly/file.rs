@@ -57,7 +57,6 @@ pub struct FileAssembly {
     file_id: NzbFileId,
     filename: String,
     declared_role: FileRole,
-    detected_archive: Option<DetectedArchiveIdentity>,
     total_segments: u32,
     total_bytes: u64,
     /// Cumulative byte offsets: cumulative_offsets[i] = sum of segment_sizes[0..i].
@@ -102,7 +101,6 @@ impl FileAssembly {
             file_id,
             filename,
             declared_role: role,
-            detected_archive: None,
             total_segments,
             total_bytes,
             cumulative_offsets,
@@ -175,29 +173,11 @@ impl FileAssembly {
     }
 
     pub fn effective_role(&self) -> FileRole {
-        self.detected_archive
-            .as_ref()
-            .map(DetectedArchiveIdentity::effective_role)
-            .unwrap_or_else(|| self.declared_role.clone())
-    }
-
-    pub fn detected_archive(&self) -> Option<&DetectedArchiveIdentity> {
-        self.detected_archive.as_ref()
-    }
-
-    pub fn set_detected_archive(&mut self, detected_archive: DetectedArchiveIdentity) {
-        self.detected_archive = Some(detected_archive);
-    }
-
-    pub fn clear_detected_archive(&mut self) {
-        self.detected_archive = None;
+        self.declared_role.clone()
     }
 
     pub fn archive_set_name(&self) -> Option<String> {
-        self.detected_archive
-            .as_ref()
-            .map(|detected| detected.set_name.clone())
-            .or_else(|| weaver_model::files::archive_base_name(&self.filename, &self.declared_role))
+        weaver_model::files::archive_base_name(&self.filename, &self.declared_role)
     }
 
     /// The filename.
