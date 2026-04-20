@@ -10,7 +10,7 @@ use weaver_server_api::{
     BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, backup_error_status_code,
 };
 use weaver_server_core::Database;
-use weaver_server_core::auth::LoginAuthCache;
+use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct BackupExportRequest {
@@ -20,10 +20,13 @@ pub(super) struct BackupExportRequest {
 async fn require_admin(
     db: &Database,
     auth_cache: &LoginAuthCache,
+    api_key_cache: &ApiKeyCache,
     session_token: &str,
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
-    let scope = super::auth::resolve_scope(db, auth_cache, session_token, headers).await?;
+    let scope =
+        super::auth::resolve_scope(db, auth_cache, api_key_cache, session_token, headers)
+            .await?;
     if scope.is_admin() {
         Ok(())
     } else {
@@ -34,11 +37,12 @@ async fn require_admin(
 pub(super) async fn backup_status_handler(
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     headers: HeaderMap,
 ) -> Result<Json<BackupStatus>, StatusCode> {
-    require_admin(&db, &auth_cache, &session_token, &headers).await?;
+    require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await?;
     let status = backup
         .status()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -48,12 +52,15 @@ pub(super) async fn backup_status_handler(
 pub(super) async fn backup_export_handler(
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
+    if let Err(status) =
+        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    {
         return status.into_response();
     }
     match backup.create_backup(body.password).await {
@@ -75,12 +82,15 @@ pub(super) async fn backup_export_handler(
 pub(super) async fn backup_inspect_handler(
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
+    if let Err(status) =
+        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -100,12 +110,15 @@ pub(super) async fn backup_inspect_handler(
 pub(super) async fn backup_restore_handler(
     Extension(db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(api_key_cache): Extension<ApiKeyCache>,
     Extension(backup): Extension<BackupService>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(&db, &auth_cache, &session_token, &headers).await {
+    if let Err(status) =
+        require_admin(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    {
         return status.into_response();
     }
     match parse_backup_upload(multipart).await {
@@ -123,7 +136,14 @@ pub(super) async fn backup_restore_handler(
                 .restore_backup(&upload.file_path, upload.password, options)
                 .await
             {
-                Ok(report) => Json(report).into_response(),
+                Ok(report) => {
+                    if let Err(status) =
+                        super::auth::refresh_auth_caches(&db, &auth_cache, &api_key_cache).await
+                    {
+                        return status.into_response();
+                    }
+                    Json(report).into_response()
+                }
                 Err(error) => {
                     super::error_response(backup_error_status_code(&error), &error.to_string())
                 }

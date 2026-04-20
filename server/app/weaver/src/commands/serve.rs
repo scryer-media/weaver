@@ -76,6 +76,8 @@ pub(crate) async fn run(
     );
     let login_auth_cache =
         weaver_server_core::auth::LoginAuthCache::from_credentials(db.get_auth_credentials()?);
+    let api_key_cache =
+        weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 
     // Load schedules from DB and spawn the schedule evaluator.
     let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules = {
@@ -89,15 +91,16 @@ pub(crate) async fn run(
 
     // Build GraphQL schema with shared config and database.
     let pipeline_config = shared_config.clone();
-    let schema = weaver_server_api::build_schema(
-        handle.clone(),
-        shared_config,
-        db.clone(),
-        login_auth_cache.clone(),
-        rss.clone(),
-        shared_schedules,
-        log_ring_buffer,
-    );
+    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
+        handle: handle.clone(),
+        config: shared_config,
+        db: db.clone(),
+        auth_cache: login_auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        rss: rss.clone(),
+        schedules: shared_schedules,
+        log_buffer: log_ring_buffer,
+    });
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
     {
@@ -159,6 +162,7 @@ pub(crate) async fn run(
         handle: handle.clone(),
         db: db.clone(),
         auth_cache: login_auth_cache,
+        api_key_cache,
         backup,
         metrics_exporter,
         base_url,

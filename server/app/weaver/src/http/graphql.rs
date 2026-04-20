@@ -5,18 +5,22 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use weaver_server_api::WeaverSchema;
-use weaver_server_core::Database;
-use weaver_server_core::auth::{CallerScope, LoginAuthCache, hash_api_key};
+use weaver_server_core::auth::{CallerScope, hash_api_key};
 
 pub(super) async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
-    let scope = super::auth::resolve_scope(&db, &auth_cache, &session_token, &headers).await?;
+    let scope = super::auth::resolve_scope(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &headers,
+    )
+    .await?;
     let mut request = req.into_inner();
     request = request.data(scope);
     Ok(schema.execute(request).await.into())
@@ -24,9 +28,7 @@ pub(super) async fn graphql_handler(
 
 pub(super) async fn ws_handler(
     Extension(schema): Extension<WeaverSchema>,
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
     headers: HeaderMap,
     protocol: GraphQLProtocol,
     ws: WebSocketUpgrade,
@@ -34,12 +36,19 @@ pub(super) async fn ws_handler(
     // Pre-resolve scope from cookies on the upgrade request. Browsers
     // automatically send cookies on WebSocket upgrade, so JWT auth works
     // without needing api_key in connection_init.
-    let upgrade_scope = super::auth::resolve_scope(&db, &auth_cache, &session_token, &headers)
-        .await
-        .ok();
+    let upgrade_scope = super::auth::resolve_scope(
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
+        &headers,
+    )
+    .await
+    .ok();
 
     ws.protocols(["graphql-transport-ws", "graphql-ws"])
         .on_upgrade(move |stream| {
+            let request_auth = request_auth.clone();
             let ws = GraphQLWebSocket::new(stream, schema, protocol).on_connection_init(
                 move |payload: serde_json::Value| async move {
                     // If the upgrade request was already authenticated (via cookie),
@@ -61,23 +70,25 @@ pub(super) async fn ws_handler(
                             "Missing authorization or api_key in connection_init",
                         ));
                     };
-                    if key == session_token.as_str() {
+                    if key == request_auth.session_token.0.as_str() {
                         let mut data = Data::default();
                         data.insert(CallerScope::Local);
                         return Ok(data);
                     }
                     let key_hash = hash_api_key(key);
-                    let row = db.lookup_api_key(&key_hash).map_err(|error| {
-                        async_graphql::Error::new(format!("auth lookup failed: {error}"))
-                    })?;
+                    let row = super::auth::lookup_api_key_auth(
+                        &request_auth.db,
+                        &request_auth.api_key_cache,
+                        key_hash,
+                    )
+                    .await
+                    .map_err(|status| {
+                            async_graphql::Error::new(format!("auth lookup failed: {status}"))
+                        })?;
                     match row {
                         Some(row) => {
-                            let scope = match row.scope.as_str() {
-                                "admin" => CallerScope::Admin,
-                                "read" => CallerScope::Read,
-                                "control" | "integration" => CallerScope::Control,
-                                _ => CallerScope::Control,
-                            };
+                            super::auth::queue_touch_api_key_last_used(&request_auth.db, row.id);
+                            let scope = super::auth::caller_scope_from_api_key_scope(&row.scope);
                             let mut data = Data::default();
                             data.insert(scope);
                             Ok(data)

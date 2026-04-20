@@ -18,7 +18,7 @@ pub use backup::{
     backup_error_status_code,
 };
 pub use categories::types::*;
-pub use context::{WeaverSchema, build_schema};
+pub use context::{SchemaContext, WeaverSchema, build_schema};
 pub use history::types::*;
 pub use jobs::types::*;
 pub use rss::RssService;

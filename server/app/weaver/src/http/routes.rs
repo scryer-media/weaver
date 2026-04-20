@@ -4,22 +4,27 @@ use axum::Router;
 use axum::extract::Extension;
 use axum::routing::{get, post};
 
-use weaver_server_api::{BackupService, WeaverSchema};
-use weaver_server_core::Database;
-use weaver_server_core::SchedulerHandle;
-use weaver_server_core::auth::{LoginAuthCache, generate_api_key};
+use weaver_server_core::auth::generate_api_key;
 
-pub(super) fn build_router(
-    schema: WeaverSchema,
-    handle: SchedulerHandle,
-    db: Database,
-    auth_cache: LoginAuthCache,
-    backup: BackupService,
-    metrics_exporter: super::PrometheusMetricsExporter,
-    base_url: String,
-) -> Router {
+pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
+    let super::ServerRuntime {
+        schema,
+        handle,
+        db,
+        auth_cache,
+        api_key_cache,
+        backup,
+        metrics_exporter,
+        base_url,
+    } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
+    let request_auth = super::RequestAuthContext {
+        db: db.clone(),
+        auth_cache: auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        session_token: session_token.clone(),
+    };
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
@@ -51,6 +56,8 @@ pub(super) fn build_router(
         .layer(Extension(backup))
         .layer(Extension(db))
         .layer(Extension(auth_cache))
+        .layer(Extension(api_key_cache))
+        .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
         .layer(Extension(session_token));
