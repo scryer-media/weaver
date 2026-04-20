@@ -59,21 +59,21 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
     let app = routes::build_router(runtime)
-    .layer(
-        CompressionLayer::new()
-            .gzip(true)
-            .deflate(true)
-            .br(true)
-            .zstd(true),
-    )
-    .layer(
-        RequestDecompressionLayer::new()
-            .gzip(true)
-            .deflate(true)
-            .br(true)
-            .zstd(true),
-    )
-    .layer(CorsLayer::permissive());
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .deflate(true)
+                .br(true)
+                .zstd(true),
+        )
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .deflate(true)
+                .br(true)
+                .zstd(true),
+        )
+        .layer(CorsLayer::permissive());
 
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {

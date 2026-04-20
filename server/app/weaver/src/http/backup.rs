@@ -25,8 +25,7 @@ async fn require_admin(
     headers: &HeaderMap,
 ) -> Result<(), StatusCode> {
     let scope =
-        super::auth::resolve_scope(db, auth_cache, api_key_cache, session_token, headers)
-            .await?;
+        super::auth::resolve_scope(db, auth_cache, api_key_cache, session_token, headers).await?;
     if scope.is_admin() {
         Ok(())
     } else {

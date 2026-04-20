@@ -100,36 +100,36 @@ impl Database {
         Ok(rows)
     }
 
-        pub fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
-            let conn = self.conn();
-            let mut stmt = conn
-                .prepare("SELECT key_hash, id, scope FROM api_keys")
-                .map_err(db_err)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let key_hash_bytes: Vec<u8> = row.get(0)?;
-                    let key_hash = <[u8; 32]>::try_from(key_hash_bytes.as_slice()).map_err(|_| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Blob,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "api key hash must be 32 bytes",
-                            )),
-                        )
-                    })?;
+    pub fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT key_hash, id, scope FROM api_keys")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key_hash_bytes: Vec<u8> = row.get(0)?;
+                let key_hash = <[u8; 32]>::try_from(key_hash_bytes.as_slice()).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "api key hash must be 32 bytes",
+                        )),
+                    )
+                })?;
 
-                    Ok(ApiKeyAuthRow {
-                        key_hash,
-                        id: row.get(1)?,
-                        scope: row.get(2)?,
-                    })
+                Ok(ApiKeyAuthRow {
+                    key_hash,
+                    id: row.get(1)?,
+                    scope: row.get(2)?,
                 })
-                .map_err(db_err)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(db_err)?;
-            Ok(rows)
-        }
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
 
     /// Delete an API key by ID. Returns true if a row was deleted.
     pub fn delete_api_key(&self, id: i64) -> Result<bool, StateError> {

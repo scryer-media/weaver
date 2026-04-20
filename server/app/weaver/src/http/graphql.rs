@@ -83,8 +83,8 @@ pub(super) async fn ws_handler(
                     )
                     .await
                     .map_err(|status| {
-                            async_graphql::Error::new(format!("auth lookup failed: {status}"))
-                        })?;
+                        async_graphql::Error::new(format!("auth lookup failed: {status}"))
+                    })?;
                     match row {
                         Some(row) => {
                             super::auth::queue_touch_api_key_last_used(&request_auth.db, row.id);
