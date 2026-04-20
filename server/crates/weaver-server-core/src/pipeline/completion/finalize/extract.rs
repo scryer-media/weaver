@@ -601,13 +601,10 @@ impl Pipeline {
             let mut parts: Vec<(u32, PathBuf)> = Vec::new();
 
             for file_asm in state.assembly.files() {
-                if set_filenames.contains(file_asm.filename()) {
-                    let vol = topo
-                        .volume_map
-                        .get(file_asm.filename())
-                        .copied()
-                        .unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
+                let current_filename = self.current_filename_for_file(job_id, file_asm);
+                if set_filenames.contains(current_filename.as_str()) {
+                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
+                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
                         parts.push((vol, path));
                     }
                 }
@@ -760,13 +757,10 @@ impl Pipeline {
             let mut parts: Vec<(u32, std::path::PathBuf)> = Vec::new();
 
             for file_asm in state.assembly.files() {
-                if set_filenames.contains(file_asm.filename()) {
-                    let vol = topo
-                        .volume_map
-                        .get(file_asm.filename())
-                        .copied()
-                        .unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, file_asm.filename()) {
+                let current_filename = self.current_filename_for_file(job_id, file_asm);
+                if set_filenames.contains(current_filename.as_str()) {
+                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
+                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
                         parts.push((vol, path));
                     }
                 }

@@ -8,11 +8,102 @@ use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
+use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
 use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 impl Pipeline {
+    fn declared_archive_identity(
+        filename: &str,
+        role: &weaver_model::files::FileRole,
+    ) -> Option<DetectedArchiveIdentity> {
+        let set_name = weaver_model::files::archive_base_name(filename, role)?;
+        match role {
+            weaver_model::files::FileRole::RarVolume { volume_number } => {
+                Some(DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name,
+                    volume_index: Some(*volume_number),
+                })
+            }
+            weaver_model::files::FileRole::SevenZipArchive => Some(DetectedArchiveIdentity {
+                kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle,
+                set_name,
+                volume_index: None,
+            }),
+            weaver_model::files::FileRole::SevenZipSplit { number } => {
+                Some(DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSplit,
+                    set_name,
+                    volume_index: Some(*number),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn default_file_identity(
+        file_index: u32,
+        filename: &str,
+        role: &weaver_model::files::FileRole,
+        detected: Option<&DetectedArchiveIdentity>,
+    ) -> ActiveFileIdentity {
+        ActiveFileIdentity {
+            file_index,
+            source_filename: filename.to_string(),
+            current_filename: filename.to_string(),
+            canonical_filename: None,
+            classification: detected
+                .cloned()
+                .or_else(|| Self::declared_archive_identity(filename, role)),
+            classification_source: if detected.is_some() {
+                FileIdentitySource::Probe
+            } else {
+                FileIdentitySource::Declared
+            },
+        }
+    }
+
+    fn build_initial_file_identities(
+        spec: &JobSpec,
+        detected_archives: &HashMap<u32, DetectedArchiveIdentity>,
+    ) -> HashMap<u32, ActiveFileIdentity> {
+        spec.files
+            .iter()
+            .enumerate()
+            .map(|(file_index, file_spec)| {
+                let file_index = file_index as u32;
+                (
+                    file_index,
+                    Self::default_file_identity(
+                        file_index,
+                        &file_spec.filename,
+                        &file_spec.role,
+                        detected_archives.get(&file_index),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn persist_file_identities(
+        &self,
+        job_id: JobId,
+        file_identities: &HashMap<u32, ActiveFileIdentity>,
+    ) {
+        for identity in file_identities.values() {
+            if let Err(error) = self.db.save_file_identity(job_id, identity) {
+                error!(
+                    job_id = job_id.0,
+                    file_index = identity.file_index,
+                    error = %error,
+                    "db write failed for save_file_identity"
+                );
+            }
+        }
+    }
+
     fn apply_detected_archive_identities(
         &mut self,
         job_id: JobId,
@@ -75,6 +166,8 @@ impl Pipeline {
 
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
+        let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
+        self.persist_file_identities(job_id, &file_identities);
 
         check_disk_space(&self.intermediate_dir, spec.total_bytes);
 
@@ -107,6 +200,7 @@ impl Pipeline {
             health_probing: false,
             last_health_probe_failed_bytes: 0,
             detected_archives: HashMap::new(),
+            file_identities,
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -284,6 +378,7 @@ impl Pipeline {
             let all_segments = Self::all_segment_ids(job_id, &spec);
             let (assembly, download_queue, recovery_queue) =
                 Self::build_job_assembly(job_id, &spec, &all_segments);
+            let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
 
             let par2_bytes = spec.par2_bytes();
             let state = JobState {
@@ -305,12 +400,16 @@ impl Pipeline {
                 health_probing: false,
                 last_health_probe_failed_bytes: 0,
                 detected_archives: HashMap::new(),
+                file_identities,
                 held_segments: Vec::new(),
                 download_queue,
                 recovery_queue,
                 staging_dir: None,
             };
             self.jobs.insert(job_id, state);
+            if let Some(state) = self.jobs.get(&job_id) {
+                self.persist_file_identities(job_id, &state.file_identities);
+            }
             self.note_download_activity(job_id);
         }
 
@@ -323,11 +422,16 @@ impl Pipeline {
             let state = self.jobs.get_mut(&job_id).unwrap();
             state.assembly = assembly;
             state.status = JobStatus::Downloading;
+            state.file_identities =
+                Self::build_initial_file_identities(&spec_clone, &HashMap::new());
             state.download_queue = download_queue;
             state.recovery_queue = recovery_queue;
             state.held_segments.clear();
             state.failed_bytes = 0;
+            let file_identities = state.file_identities.clone();
+            let _ = state;
             self.note_download_activity(job_id);
+            self.persist_file_identities(job_id, &file_identities);
         }
 
         self.finished_jobs.retain(|j| j.job_id != job_id);
@@ -487,6 +591,7 @@ impl Pipeline {
             committed_segments,
             file_progress,
             detected_archives,
+            file_identities,
             extracted_members,
             status,
             queued_repair_at_epoch_ms,
@@ -545,6 +650,11 @@ impl Pipeline {
         }
 
         let queue_depth = download_queue.len() + recovery_queue.len();
+        let file_identities = if file_identities.is_empty() {
+            Self::build_initial_file_identities(&spec, &detected_archives)
+        } else {
+            file_identities
+        };
 
         let _ = self.event_tx.send(PipelineEvent::JobCreated {
             job_id,
@@ -573,6 +683,7 @@ impl Pipeline {
             health_probing: false,
             last_health_probe_failed_bytes: 0,
             detected_archives: HashMap::new(),
+            file_identities,
             held_segments: Vec::new(),
             download_queue,
             recovery_queue,
@@ -581,6 +692,9 @@ impl Pipeline {
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
+        if let Some(state) = self.jobs.get(&job_id) {
+            self.persist_file_identities(job_id, &state.file_identities);
+        }
         self.apply_detected_archive_identities(job_id, &detected_archives);
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);

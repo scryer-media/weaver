@@ -176,6 +176,7 @@ pub async fn recover_server_state(
                             committed_segments: recovered.committed_segments,
                             file_progress: recovered.file_progress,
                             detected_archives: recovered.detected_archives,
+                            file_identities: recovered.file_identities,
                             extracted_members: recovered.extracted_members,
                             status,
                             queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,

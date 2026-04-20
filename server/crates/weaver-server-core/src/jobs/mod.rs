@@ -20,5 +20,6 @@ pub use model::{
     FieldUpdate, FileSpec, JobSpec, JobState, JobStatus, JobUpdate, SegmentSpec, epoch_ms_now,
 };
 pub use record::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, ExtractionChunk, RecoveredJob,
+    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
+    ExtractionChunk, FileIdentitySource, RecoveredJob,
 };

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
+use crate::jobs::record::FileIdentitySource;
 
 const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
@@ -125,6 +126,178 @@ fn select_recovery_file_indices(
 }
 
 impl Pipeline {
+    pub(crate) fn canonical_archive_identity_from_filename(
+        filename: &str,
+    ) -> Option<crate::jobs::assembly::DetectedArchiveIdentity> {
+        let role = weaver_model::files::FileRole::from_filename(filename);
+        let set_name = weaver_model::files::archive_base_name(filename, &role)?;
+        match role {
+            weaver_model::files::FileRole::RarVolume { volume_number } => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                    set_name,
+                    volume_index: Some(volume_number),
+                })
+            }
+            weaver_model::files::FileRole::SevenZipArchive => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle,
+                    set_name,
+                    volume_index: None,
+                })
+            }
+            weaver_model::files::FileRole::SevenZipSplit { number } => {
+                Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                    kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSplit,
+                    set_name,
+                    volume_index: Some(number),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    async fn apply_par2_authoritative_identity(
+        &mut self,
+        job_id: JobId,
+        par2_set: &weaver_par2::Par2FileSet,
+    ) -> Result<(), String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Ok(());
+        };
+
+        let files: Vec<(
+            NzbFileId,
+            crate::jobs::record::ActiveFileIdentity,
+            weaver_model::files::FileRole,
+            bool,
+        )> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                self.effective_file_identity(job_id, file.file_id())
+                    .map(|identity| {
+                        (
+                            file.file_id(),
+                            identity,
+                            self.classified_role_for_file(job_id, file),
+                            file.is_complete(),
+                        )
+                    })
+            })
+            .collect();
+        let working_dir = state.working_dir.clone();
+        let _ = state;
+
+        let mut by_current = HashMap::<String, NzbFileId>::new();
+        let mut by_source = HashMap::<String, NzbFileId>::new();
+        let mut by_canonical = HashMap::<String, NzbFileId>::new();
+        let mut by_rar_volume = HashMap::<u32, NzbFileId>::new();
+
+        for (file_id, identity, role, _) in &files {
+            by_current.insert(identity.current_filename.clone(), *file_id);
+            by_source.insert(identity.source_filename.clone(), *file_id);
+            if let Some(canonical) = identity.canonical_filename.as_ref() {
+                by_canonical.insert(canonical.clone(), *file_id);
+            }
+            if let weaver_model::files::FileRole::RarVolume { volume_number } = role {
+                by_rar_volume.insert(*volume_number, *file_id);
+            }
+        }
+
+        let mut touched_files = Vec::<NzbFileId>::new();
+        let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
+        let mut rebound = 0usize;
+
+        for desc in par2_set.files.values() {
+            let canonical_filename = desc.filename.clone();
+            let matched_file_id = by_current
+                .get(&canonical_filename)
+                .copied()
+                .or_else(|| by_source.get(&canonical_filename).copied())
+                .or_else(|| by_canonical.get(&canonical_filename).copied())
+                .or_else(|| {
+                    match weaver_model::files::FileRole::from_filename(&canonical_filename) {
+                        weaver_model::files::FileRole::RarVolume { volume_number } => {
+                            by_rar_volume.get(&volume_number).copied()
+                        }
+                        _ => None,
+                    }
+                });
+            let Some(file_id) = matched_file_id else {
+                continue;
+            };
+
+            let Some((_, identity, _, is_complete)) = files
+                .iter()
+                .find(|(candidate_file_id, _, _, _)| *candidate_file_id == file_id)
+                .cloned()
+            else {
+                continue;
+            };
+
+            let old_current = identity.current_filename.clone();
+            if old_current != canonical_filename {
+                let old_path = working_dir.join(&old_current);
+                let new_path = working_dir.join(&canonical_filename);
+                if old_path.exists() {
+                    std::fs::rename(&old_path, &new_path).map_err(|error| {
+                        format!(
+                            "failed to rename {} to {} from PAR2 metadata: {error}",
+                            old_path.display(),
+                            new_path.display()
+                        )
+                    })?;
+                }
+            }
+
+            let classification =
+                Self::canonical_archive_identity_from_filename(&canonical_filename)
+                    .or(identity.classification.clone());
+            if let Some(classification) = classification.as_ref()
+                && matches!(
+                    classification.kind,
+                    crate::jobs::assembly::DetectedArchiveKind::Rar
+                )
+            {
+                touched_rar_files
+                    .entry(classification.set_name.clone())
+                    .or_default()
+                    .insert(old_current.clone());
+            }
+
+            let mut rebound_identity = identity;
+            rebound_identity.current_filename = canonical_filename.clone();
+            rebound_identity.canonical_filename = Some(canonical_filename);
+            rebound_identity.classification = classification;
+            rebound_identity.classification_source = FileIdentitySource::Par2;
+            self.set_file_identity(job_id, rebound_identity)?;
+
+            if is_complete {
+                touched_files.push(file_id);
+            }
+            rebound += 1;
+        }
+
+        for (set_name, touched_filenames) in &touched_rar_files {
+            self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
+        }
+
+        for file_id in touched_files {
+            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
+                .await;
+        }
+
+        if rebound > 0 {
+            info!(
+                job_id = job_id.0,
+                rebound, "PAR2 canonical file identity applied"
+            );
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn par2_runtime(&self, job_id: JobId) -> Option<&crate::pipeline::Par2RuntimeState> {
         self.par2_runtime.get(&job_id)
     }
@@ -260,8 +433,8 @@ impl Pipeline {
     }
 
     /// If the completed file is a PAR2 index, read it from disk, parse it,
-    /// and retain the Par2FileSet for repair. For obfuscated uploads, remap
-    /// PAR2 file descriptions to use deobfuscated filenames (matched by volume number).
+    /// retain the Par2FileSet for repair, and adopt canonical filenames as
+    /// authoritative file identity when available.
     pub(crate) async fn try_load_par2_metadata(&mut self, job_id: JobId, file_id: NzbFileId) {
         let (filename, file_path, is_par2, is_index) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -276,7 +449,7 @@ impl Pipeline {
                 file_asm.role(),
                 weaver_model::files::FileRole::Par2 { is_index: true, .. }
             );
-            let filename = file_asm.filename().to_string();
+            let filename = self.current_filename_for_file(job_id, file_asm);
             let file_path = state.working_dir.join(&filename);
             (filename, file_path, is_par2, is_index)
         };
@@ -289,7 +462,7 @@ impl Pipeline {
         }
 
         let parse_path = file_path.clone();
-        let mut par2_set = match tokio::task::spawn_blocking(move || {
+        let par2_set = match tokio::task::spawn_blocking(move || {
             weaver_par2::Par2FileSet::from_paths(&[parse_path])
         })
         .await
@@ -305,52 +478,15 @@ impl Pipeline {
             }
         };
 
-        let has_matches = self.jobs.get(&job_id).is_some_and(|state| {
-            par2_set.files.values().any(|desc| {
-                state
-                    .assembly
-                    .files()
-                    .any(|f| f.filename() == desc.filename)
-            })
-        });
-
-        if !has_matches && !par2_set.files.is_empty() {
-            let mut assembly_by_volume: std::collections::HashMap<u32, String> =
-                std::collections::HashMap::new();
-            if let Some(state) = self.jobs.get(&job_id) {
-                for file_asm in state.assembly.files() {
-                    if let weaver_model::files::FileRole::RarVolume { volume_number } =
-                        self.classified_role_for_file(job_id, file_asm)
-                    {
-                        assembly_by_volume.insert(volume_number, file_asm.filename().to_string());
-                    }
-                }
-            }
-
-            let mut remapped = 0u32;
-            for desc in par2_set.files.values_mut() {
-                let role = weaver_model::files::FileRole::from_filename(&desc.filename);
-                if let weaver_model::files::FileRole::RarVolume { volume_number } = role
-                    && let Some(deobfuscated) = assembly_by_volume.get(&volume_number)
-                {
-                    desc.filename = deobfuscated.clone();
-                    remapped += 1;
-                }
-            }
-
-            if remapped > 0 {
-                info!(
-                    job_id = job_id.0,
-                    remapped,
-                    total = par2_set.files.len(),
-                    "PAR2 filenames obfuscated — remapped by volume number"
-                );
-            } else {
-                warn!(
-                    job_id = job_id.0,
-                    "PAR2 filenames don't match assembly and volume-number matching failed"
-                );
-            }
+        if let Err(error) = self
+            .apply_par2_authoritative_identity(job_id, &par2_set)
+            .await
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to apply authoritative PAR2 file identity"
+            );
         }
 
         let slice_size = par2_set.slice_size;
@@ -417,7 +553,7 @@ impl Pipeline {
                     ..
                 }
             );
-            let filename = file_asm.filename().to_string();
+            let filename = self.current_filename_for_file(job_id, file_asm);
             let file_path = state.working_dir.join(&filename);
             (filename, file_path, is_par2_volume)
         };

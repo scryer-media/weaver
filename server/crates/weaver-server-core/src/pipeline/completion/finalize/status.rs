@@ -433,7 +433,7 @@ impl Pipeline {
             .assembly
             .files()
             .filter(|f| matches!(f.role(), weaver_model::files::FileRole::Par2 { .. }))
-            .map(|f| f.filename().to_string())
+            .map(|f| self.current_filename_for_file(job_id, f))
             .collect();
         if par2_files.is_empty() {
             return;

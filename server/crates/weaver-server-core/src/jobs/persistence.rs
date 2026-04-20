@@ -8,7 +8,8 @@ use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{
-    ActiveExtractionChunk, ActiveFileProgress, ActiveJob, CommittedSegment, ExtractionChunk,
+    ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, CommittedSegment,
+    ExtractionChunk,
 };
 use crate::persistence::Database;
 
@@ -296,6 +297,56 @@ impl Database {
         .map_err(db_err)?;
         conn.execute(
             "DELETE FROM active_detected_archives WHERE job_id = ?1 AND file_index = ?2",
+            rusqlite::params![job_id.0 as i64, file_index],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn save_file_identity(
+        &self,
+        job_id: JobId,
+        identity: &ActiveFileIdentity,
+    ) -> Result<(), StateError> {
+        let conn = self.conn();
+        if !active_job_exists(&conn, job_id)? {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO active_file_identities
+             (job_id, file_index, source_filename, current_filename, canonical_filename,
+              classification_kind, classification_set_name, classification_volume_index,
+              classification_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                job_id.0 as i64,
+                identity.file_index,
+                identity.source_filename,
+                identity.current_filename,
+                identity.canonical_filename,
+                identity
+                    .classification
+                    .as_ref()
+                    .map(|classification| classification.kind.as_str()),
+                identity
+                    .classification
+                    .as_ref()
+                    .map(|classification| classification.set_name.as_str()),
+                identity
+                    .classification
+                    .as_ref()
+                    .and_then(|classification| classification.volume_index),
+                identity.classification_source.as_str(),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn delete_file_identity(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM active_file_identities WHERE job_id = ?1 AND file_index = ?2",
             rusqlite::params![job_id.0 as i64, file_index],
         )
         .map_err(db_err)?;

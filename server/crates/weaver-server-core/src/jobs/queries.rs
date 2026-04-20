@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::record::{ActivePar2File, ExtractionChunk, RarVolumeFactsBySet, RecoveredJob};
+use crate::jobs::record::{
+    ActiveFileIdentity, ActivePar2File, ExtractionChunk, FileIdentitySource, RarVolumeFactsBySet,
+    RecoveredJob,
+};
 use crate::persistence::Database;
 
 use super::repository::db_err;
@@ -130,6 +133,7 @@ impl Database {
                         committed_segments: HashSet::new(),
                         file_progress: HashMap::new(),
                         detected_archives: HashMap::new(),
+                        file_identities: HashMap::new(),
                         complete_files: HashSet::new(),
                         extracted_members: HashSet::new(),
                         status,
@@ -192,6 +196,58 @@ impl Database {
                 if let Some(job) = jobs.get_mut(&job_id) {
                     job.file_progress
                         .insert(file_index, contiguous_bytes_written);
+                }
+            }
+        }
+
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, file_index, source_filename, current_filename,
+                            canonical_filename, classification_kind, classification_set_name,
+                            classification_volume_index, classification_source
+                     FROM active_file_identities",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let job_id = JobId(row.get::<_, i64>(0)? as u64);
+                    let file_index: u32 = row.get(1)?;
+                    let source_filename: String = row.get(2)?;
+                    let current_filename: String = row.get(3)?;
+                    let canonical_filename: Option<String> = row.get(4)?;
+                    let classification_kind: Option<String> = row.get(5)?;
+                    let classification_set_name: Option<String> = row.get(6)?;
+                    let classification_volume_index: Option<u32> = row.get(7)?;
+                    let classification_source: String = row.get(8)?;
+                    Ok((
+                        job_id,
+                        ActiveFileIdentity {
+                            file_index,
+                            source_filename,
+                            current_filename,
+                            canonical_filename,
+                            classification: classification_kind.and_then(|kind| {
+                                let kind = DetectedArchiveKind::parse(&kind)?;
+                                let set_name = classification_set_name.clone()?;
+                                Some(DetectedArchiveIdentity {
+                                    kind,
+                                    set_name,
+                                    volume_index: classification_volume_index,
+                                })
+                            }),
+                            classification_source: FileIdentitySource::parse(
+                                &classification_source,
+                            )
+                            .unwrap_or(FileIdentitySource::Declared),
+                        },
+                    ))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let (job_id, identity) = row.map_err(db_err)?;
+                if let Some(job) = jobs.get_mut(&job_id) {
+                    job.file_identities.insert(identity.file_index, identity);
                 }
             }
         }

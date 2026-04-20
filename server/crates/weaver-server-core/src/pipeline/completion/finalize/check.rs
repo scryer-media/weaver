@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 impl Pipeline {
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
@@ -44,17 +44,14 @@ impl Pipeline {
 }
 
 impl Pipeline {
-    fn try_deobfuscate_files_with_par2(&self, job_id: JobId) -> usize {
+    async fn try_deobfuscate_files_with_par2(&mut self, job_id: JobId) -> usize {
         let Some(par2) = self.par2_set(job_id).cloned() else {
             return 0;
         };
-        let Some(rename_dir) = self
-            .jobs
-            .get(&job_id)
-            .map(|state| state.working_dir.clone())
-        else {
+        let Some(state) = self.jobs.get(&job_id) else {
             return 0;
         };
+        let rename_dir = state.working_dir.clone();
 
         if weaver_nzb::is_protected_media_structure(&rename_dir) {
             info!(
@@ -76,10 +73,41 @@ impl Pipeline {
             }
         };
 
+        let file_rows: Vec<(NzbFileId, crate::jobs::record::ActiveFileIdentity, bool)> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                self.effective_file_identity(job_id, file.file_id())
+                    .map(|identity| (file.file_id(), identity, file.is_complete()))
+            })
+            .collect();
+        let mut by_current = HashMap::<String, (NzbFileId, bool)>::new();
+        let mut by_source = HashMap::<String, (NzbFileId, bool)>::new();
+        let mut by_canonical = HashMap::<String, (NzbFileId, bool)>::new();
+        for (file_id, identity, is_complete) in &file_rows {
+            by_current.insert(identity.current_filename.clone(), (*file_id, *is_complete));
+            by_source.insert(identity.source_filename.clone(), (*file_id, *is_complete));
+            if let Some(canonical) = identity.canonical_filename.as_ref() {
+                by_canonical.insert(canonical.clone(), (*file_id, *is_complete));
+            }
+        }
+        let _ = state;
+
         let mut renamed = 0usize;
+        let mut touched_files = Vec::<NzbFileId>::new();
+        let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
         for suggestion in &suggestions {
             let old = &suggestion.current_path;
             let new = old.parent().unwrap().join(&suggestion.correct_name);
+            let old_name = old
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let matched = by_current
+                .get(&old_name)
+                .copied()
+                .or_else(|| by_source.get(&old_name).copied())
+                .or_else(|| by_canonical.get(&old_name).copied());
             if old
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -108,6 +136,55 @@ impl Pipeline {
                     );
                 }
             }
+
+            if let Some((file_id, is_complete)) = matched {
+                let Some((_, identity, _)) = file_rows
+                    .iter()
+                    .find(|(candidate_file_id, _, _)| *candidate_file_id == file_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let old_current_filename = identity.current_filename.clone();
+                let classification =
+                    Self::canonical_archive_identity_from_filename(&suggestion.correct_name)
+                        .or(identity.classification.clone());
+                if let Some(classification) = classification.as_ref()
+                    && matches!(
+                        classification.kind,
+                        crate::jobs::assembly::DetectedArchiveKind::Rar
+                    )
+                {
+                    touched_rar_files
+                        .entry(classification.set_name.clone())
+                        .or_default()
+                        .insert(old_current_filename);
+                }
+                let mut rebound_identity = identity;
+                rebound_identity.current_filename = suggestion.correct_name.clone();
+                rebound_identity.canonical_filename = Some(suggestion.correct_name.clone());
+                rebound_identity.classification = classification;
+                rebound_identity.classification_source =
+                    crate::jobs::record::FileIdentitySource::Par2;
+                if let Err(error) = self.set_file_identity(job_id, rebound_identity) {
+                    warn!(
+                        job_id = job_id.0,
+                        file_index = file_id.file_index,
+                        error = %error,
+                        "failed to persist PAR2 deobfuscation identity"
+                    );
+                } else if is_complete {
+                    touched_files.push(file_id);
+                }
+            }
+        }
+
+        for (set_name, touched_filenames) in &touched_rar_files {
+            self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
+        }
+        for file_id in touched_files {
+            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
+                .await;
         }
 
         if renamed > 0 {
@@ -473,7 +550,7 @@ impl Pipeline {
 
                     // Rename obfuscated files using PAR2 metadata even when
                     // verification is clean (files may be intact but obfuscated).
-                    self.try_deobfuscate_files_with_par2(job_id);
+                    self.try_deobfuscate_files_with_par2(job_id).await;
 
                     if has_crc_failures {
                         if self.normalization_retried.contains(&job_id) {
@@ -630,7 +707,7 @@ impl Pipeline {
 
                             // Rename obfuscated files using PAR2 metadata (16KB hash matching).
                             // Must happen after repair and before extraction retry.
-                            self.try_deobfuscate_files_with_par2(job_id);
+                            self.try_deobfuscate_files_with_par2(job_id).await;
 
                             let cleared =
                                 self.failed_extractions.get(&job_id).map_or(0, HashSet::len);
@@ -775,7 +852,7 @@ impl Pipeline {
                                     | weaver_model::files::FileRole::SevenZipSplit { .. }
                             )
                         })
-                        .map(|f| f.filename().to_string())
+                        .map(|f| self.current_filename_for_file(job_id, f))
                         .collect();
                     for topology in state.assembly.archive_topologies().values() {
                         cleanup_files.extend(topology.volume_map.keys().cloned());
