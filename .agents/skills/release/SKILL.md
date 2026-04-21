@@ -60,6 +60,7 @@ Do not:
 - Skip validation steps or pass flags that weaken them.
 - Amend or rewrite the version-bump commit.
 - Manually create the tag or push if the task failed.
+- **Bypass the 1Password SSH commit/tag signer.** `git tag -s` in the release task uses `op-ssh-sign`. If signing fails because 1Password is locked (symptoms: `agent refused operation`, `gpg failed to sign`, Touch ID prompt times out), STOP and ask the user to unlock 1Password. Do not pass `--no-gpg-sign`, `-c tag.gpgsign=false`, edit git config to disable signing, or substitute a different signer. An unsigned tag is a release bug.
 
 ## Post-release
 
