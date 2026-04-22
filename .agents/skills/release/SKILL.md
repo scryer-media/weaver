@@ -7,6 +7,8 @@ description: Release a new weaver version. Runs the full validation suite, bumps
 
 Releases are driven entirely by `cargo xtask release`. Never bump the workspace version, create tags, or push release commits by hand.
 
+If you need code discovery while debugging a release issue, use the shared `claude-context` MCP bridge first (`http://127.0.0.1:8765/mcp`) and only use shell search afterward for exact follow-up confirmation.
+
 ## When to activate
 
 - User asks to release, tag, bump, or cut a release for weaver

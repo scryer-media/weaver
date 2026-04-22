@@ -1,0 +1,1 @@
+Always use the `claude-context` MCP server for repository exploration, caller tracing, symbol lookup, implementation discovery, and file discovery in this repo before using shell search tools. The shared local MCP endpoint is `http://127.0.0.1:8765/mcp`. If MCP appears unavailable, check `http://127.0.0.1:8765/health` before falling back to non-MCP discovery.
