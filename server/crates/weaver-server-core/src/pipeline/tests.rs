@@ -1649,14 +1649,10 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
-        write_and_complete_file_like_decode_worker(
-            &mut pipeline,
-            job_id,
-            file_index as u32,
-            filename,
-            bytes,
-        )
-        .await;
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
     }
 
     let mut rar_topologies: Vec<String> = pipeline
@@ -1745,14 +1741,10 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
-        write_and_complete_file_like_decode_worker(
-            &mut pipeline,
-            job_id,
-            file_index as u32,
-            filename,
-            bytes,
-        )
-        .await;
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+        pipeline.try_rar_extraction(job_id).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
     }
 
     let mut rar_topologies: Vec<String> = pipeline
