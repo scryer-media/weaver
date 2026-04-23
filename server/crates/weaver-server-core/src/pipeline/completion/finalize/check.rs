@@ -41,6 +41,25 @@ impl Pipeline {
             || has_pending_decode
             || has_buffered_segments
     }
+
+    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId) -> bool {
+        let has_queued_recovery = self.jobs.get(&job_id).is_some_and(|state| {
+            state.download_queue.has_recovery_work() || !state.recovery_queue.is_empty()
+        });
+        let has_inflight_recovery =
+            self.active_recovery > 0 && self.active_downloads_by_job.contains_key(&job_id);
+        let has_pending_recovery_decode = self.pending_decode.iter().any(|work| {
+            work.segment_id.file_id.job_id == job_id
+                && self.par2_runtime(job_id).is_some_and(|runtime| {
+                    runtime
+                        .files
+                        .get(&work.segment_id.file_id.file_index)
+                        .is_some_and(|file| file.promoted)
+                })
+        });
+
+        has_queued_recovery || has_inflight_recovery || has_pending_recovery_decode
+    }
 }
 
 impl Pipeline {
@@ -1119,7 +1138,9 @@ impl Pipeline {
                 // promoted PAR2 recovery segments in flight. Do not let stale
                 // completion checks finalize damaged direct/gzip/etc. payloads
                 // before those recovery files are decoded and repaired.
-                if !download_pipeline_exhausted {
+                if !download_pipeline_exhausted
+                    && self.job_has_promoted_recovery_pipeline_work(job_id)
+                {
                     debug!(
                         job_id = job_id.0,
                         "deferring completion — pending download pipeline work"
