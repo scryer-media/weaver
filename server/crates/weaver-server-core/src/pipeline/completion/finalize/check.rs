@@ -704,7 +704,10 @@ impl Pipeline {
             || rar_waiting_for_missing_volumes
             || par2_validation_needed;
 
-        if has_incomplete_data_files && !download_pipeline_exhausted {
+        if has_incomplete_data_files
+            && !download_pipeline_exhausted
+            && !self.job_has_active_extraction_tasks(job_id)
+        {
             return;
         }
 
@@ -717,17 +720,6 @@ impl Pipeline {
             debug!(
                 job_id = job_id.0,
                 "deferring completion — pending concatenation"
-            );
-            return;
-        }
-
-        // A complete payload can still have explicitly promoted PAR2 recovery
-        // segments in flight. Do not let stale completion checks finalize the
-        // damaged payload before those recovery files are decoded and repaired.
-        if !download_pipeline_exhausted {
-            debug!(
-                job_id = job_id.0,
-                "deferring completion — pending download pipeline work"
             );
             return;
         }
@@ -1123,6 +1115,17 @@ impl Pipeline {
         let readiness = self.extraction_readiness_for_job(job_id);
         match readiness {
             ExtractionReadiness::NotApplicable => {
+                // A complete non-archive payload can still have explicitly
+                // promoted PAR2 recovery segments in flight. Do not let stale
+                // completion checks finalize damaged direct/gzip/etc. payloads
+                // before those recovery files are decoded and repaired.
+                if !download_pipeline_exhausted {
+                    debug!(
+                        job_id = job_id.0,
+                        "deferring completion — pending download pipeline work"
+                    );
+                    return;
+                }
                 if self
                     .reconcile_extracted_outputs_for_completion(job_id)
                     .await
