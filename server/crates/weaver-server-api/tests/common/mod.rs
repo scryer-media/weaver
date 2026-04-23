@@ -25,6 +25,90 @@ use weaver_server_core::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 
 use weaver_server_core::jobs::assembly::JobAssembly;
 
+fn runtime_lanes_for_status(
+    status: &JobStatus,
+) -> (
+    weaver_server_core::DownloadState,
+    weaver_server_core::PostState,
+    weaver_server_core::RunState,
+    Option<String>,
+) {
+    match status {
+        JobStatus::Queued => (
+            weaver_server_core::DownloadState::Queued,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Downloading => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Checking => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Verifying => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Verifying,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedRepair => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedRepair,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Repairing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Repairing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedExtract => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedExtract,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Extracting => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Extracting,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Moving => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Finalizing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Complete => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Failed { error } => (
+            weaver_server_core::DownloadState::Failed,
+            weaver_server_core::PostState::Failed,
+            weaver_server_core::RunState::Active,
+            Some(error.clone()),
+        ),
+        JobStatus::Paused => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Paused,
+            None,
+        ),
+    }
+}
+
 /// Self-contained test harness that provides a fully-wired GraphQL schema
 /// backed by an in-memory database and a mock scheduler.
 ///
@@ -260,16 +344,25 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     }
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
+                    let status = JobStatus::Queued;
+                    let (download_state, post_state, run_state, failure_error) =
+                        runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
                         spec,
-                        status: JobStatus::Queued,
+                        status,
+                        download_state,
+                        post_state,
+                        run_state,
                         assembly,
                         extraction_depth: 0,
                         created_at: std::time::Instant::now(),
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_download_state: None,
+                        paused_resume_post_state: None,
+                        failure_error,
                         working_dir: PathBuf::from("/tmp/test"),
                         downloaded_bytes: 0,
                         failed_bytes: 0,
@@ -282,7 +375,6 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
-                        paused_resume_status: None,
                         restored_download_floor_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
@@ -297,7 +389,12 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::PauseJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
-                            state.status = JobStatus::Paused;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Paused);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.refresh_legacy_status();
                             let _ = event_tx.send(PipelineEvent::JobPaused { job_id });
                             Ok(())
                         }
@@ -308,7 +405,12 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::ResumeJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
-                            state.status = JobStatus::Downloading;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Downloading);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.refresh_legacy_status();
                             let _ = event_tx.send(PipelineEvent::JobResumed { job_id });
                             Ok(())
                         }
@@ -360,16 +462,24 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     } = *request;
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
+                    let (download_state, post_state, run_state, failure_error) =
+                        runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
                         spec,
                         status,
+                        download_state,
+                        post_state,
+                        run_state,
                         assembly,
                         extraction_depth: 0,
                         created_at: std::time::Instant::now(),
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_download_state: None,
+                        paused_resume_post_state: None,
+                        failure_error,
                         working_dir,
                         downloaded_bytes: 0,
                         failed_bytes: 0,
@@ -382,7 +492,6 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
-                        paused_resume_status: None,
                         restored_download_floor_bytes: 0,
                     };
                     jobs.insert(job_id, state);
@@ -401,7 +510,13 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::ReprocessJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            state.status = JobStatus::Downloading;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Downloading);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.failure_error = None;
+                            state.refresh_legacy_status();
                             Ok(())
                         }
                         Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(
@@ -415,7 +530,13 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::RedownloadJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            state.status = JobStatus::Queued;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Queued);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.failure_error = None;
+                            state.refresh_legacy_status();
                             Ok(())
                         }
                         Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(
@@ -461,6 +582,9 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
                 None
             },
             status: state.status.clone(),
+            download_state: state.download_state,
+            post_state: state.post_state,
+            run_state: state.run_state,
             progress: state.assembly.progress(),
             total_bytes: state.spec.total_bytes,
             downloaded_bytes: 0,

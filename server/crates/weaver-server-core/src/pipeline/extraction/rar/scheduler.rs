@@ -10,6 +10,59 @@ impl Pipeline {
         if plan.is_solid { 1 } else { 2 }
     }
 
+    fn reconcile_waiting_members_for_set(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        members: &[String],
+    ) {
+        let waiting_on_volumes = self
+            .rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .and_then(|state| state.plan.as_ref())
+            .map(|plan| plan.waiting_on_volumes.clone())
+            .unwrap_or_default();
+
+        for member in members {
+            let key = (job_id, set_name.to_string(), member.clone());
+            let next_wait_volume =
+                self.member_volume_span(job_id, set_name, member)
+                    .and_then(|(first, last)| {
+                        (first..=last)
+                            .find(|volume| waiting_on_volumes.contains(volume))
+                            .map(|volume| volume as usize)
+                    });
+
+            match next_wait_volume {
+                Some(volume_index) => {
+                    let previous = self.rar_waiting_members.insert(key.clone(), volume_index);
+                    if previous != Some(volume_index) {
+                        let _ = self
+                            .event_tx
+                            .send(PipelineEvent::ExtractionMemberWaitingStarted {
+                                job_id,
+                                set_name: set_name.to_string(),
+                                member: member.clone(),
+                                volume_index,
+                            });
+                    }
+                }
+                None => {
+                    if let Some(volume_index) = self.rar_waiting_members.remove(&key) {
+                        let _ =
+                            self.event_tx
+                                .send(PipelineEvent::ExtractionMemberWaitingFinished {
+                                    job_id,
+                                    set_name: set_name.to_string(),
+                                    member: member.clone(),
+                                    volume_index,
+                                });
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) async fn try_rar_extraction(&mut self, job_id: JobId) {
         self.try_batch_extraction(job_id).await;
     }
@@ -18,9 +71,22 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
-        match &state.status {
-            JobStatus::Downloading | JobStatus::Verifying | JobStatus::Extracting => {}
-            _ => return,
+        if matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            || matches!(
+                state.download_state,
+                crate::jobs::model::DownloadState::Checking
+                    | crate::jobs::model::DownloadState::Failed
+            )
+            || matches!(
+                state.post_state,
+                crate::jobs::model::PostState::Finalizing
+                    | crate::jobs::model::PostState::Completed
+                    | crate::jobs::model::PostState::Failed
+                    | crate::jobs::model::PostState::Repairing
+                    | crate::jobs::model::PostState::QueuedRepair
+            )
+        {
+            return;
         }
 
         let active_workers = self
@@ -40,16 +106,11 @@ impl Pipeline {
             .saturating_sub(active_workers);
         if available_slots == 0 {
             if job_active_workers == 0
-                && self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
+                && self.jobs.get(&job_id).is_some_and(|state| {
+                    matches!(state.post_state, crate::jobs::model::PostState::Extracting)
+                })
             {
-                self.transition_postprocessing_status(
-                    job_id,
-                    JobStatus::QueuedExtract,
-                    Some("queued_extract"),
-                );
+                self.transition_post_state(job_id, crate::jobs::model::PostState::QueuedExtract);
             }
             return;
         }
@@ -122,6 +183,20 @@ impl Pipeline {
                     if let Some(plan) = set_state.plan.as_mut() {
                         plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
                     }
+                }
+                if let Some(volume_index) = self.rar_waiting_members.remove(&(
+                    job_id,
+                    set_name.clone(),
+                    member_name.clone(),
+                )) {
+                    let _ = self
+                        .event_tx
+                        .send(PipelineEvent::ExtractionMemberWaitingFinished {
+                            job_id,
+                            set_name: set_name.clone(),
+                            member: member_name.clone(),
+                            volume_index,
+                        });
                 }
                 scheduled_slots += 1;
 
@@ -474,6 +549,8 @@ impl Pipeline {
                         "failed to refresh RAR set state after batch extraction"
                     );
                 }
+                self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                self.reconcile_job_progress(job_id).await;
                 self.try_delete_volumes(job_id, &set_name);
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
@@ -482,18 +559,6 @@ impl Pipeline {
                     self.check_job_completion(job_id).await;
                 } else {
                     self.try_rar_extraction(job_id).await;
-                    if !self.has_active_rar_workers(job_id)
-                        && self
-                            .jobs
-                            .get(&job_id)
-                            .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
-                    {
-                        self.transition_postprocessing_status(
-                            job_id,
-                            JobStatus::Downloading,
-                            Some("downloading"),
-                        );
-                    }
                 }
             }
             ExtractionDone::FullSet {
@@ -555,6 +620,7 @@ impl Pipeline {
                     if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
                         let _ = self.recompute_rar_set_state(job_id, &set_name).await;
                     }
+                    self.reconcile_job_progress(job_id).await;
                     self.try_delete_volumes(job_id, &set_name);
                     self.check_job_completion(job_id).await;
                 }

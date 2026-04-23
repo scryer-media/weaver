@@ -134,9 +134,14 @@ fn set_runtime_state_roundtrip() {
         JobId(1),
         "paused",
         None,
+        None,
+        None,
+        None,
         Some(12_345.0),
         Some(67_890.0),
         Some("queued_extract"),
+        None,
+        None,
     )
     .unwrap();
 

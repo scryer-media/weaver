@@ -25,10 +25,87 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
 }
 
 fn job(status: JobStatus) -> JobInfo {
+    let (download_state, post_state, run_state, error) = match &status {
+        JobStatus::Queued => (
+            weaver_server_core::DownloadState::Queued,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Downloading => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Checking => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Verifying => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Verifying,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedRepair => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedRepair,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Repairing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Repairing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedExtract => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedExtract,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Extracting => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Extracting,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Moving => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Finalizing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Complete => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Failed { error } => (
+            weaver_server_core::DownloadState::Failed,
+            weaver_server_core::PostState::Failed,
+            weaver_server_core::RunState::Active,
+            Some(error.clone()),
+        ),
+        JobStatus::Paused => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Paused,
+            None,
+        ),
+    };
     JobInfo {
         job_id: JobId(42),
         name: "job".into(),
         status,
+        download_state,
+        post_state,
+        run_state,
         progress: 0.0,
         total_bytes: 0,
         downloaded_bytes: 0,
@@ -40,7 +117,7 @@ fn job(status: JobStatus) -> JobInfo {
         category: None,
         metadata: Vec::new(),
         output_dir: None,
-        error: None,
+        error,
         created_at_epoch_ms: 1_000.0,
     }
 }

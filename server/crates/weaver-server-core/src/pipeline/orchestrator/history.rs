@@ -301,6 +301,9 @@ impl Pipeline {
                 None
             },
             status: state.status.clone(),
+            download_state: state.download_state,
+            post_state: state.post_state,
+            run_state: state.run_state,
             progress: Self::effective_progress(state),
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),

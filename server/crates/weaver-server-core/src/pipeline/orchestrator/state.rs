@@ -1,16 +1,19 @@
 use super::*;
 
 impl Pipeline {
+    pub(crate) fn deterministic_extraction_staging_dir(&self, job_id: JobId) -> PathBuf {
+        self.complete_dir
+            .join(".weaver-staging")
+            .join(job_id.0.to_string())
+    }
+
     pub(crate) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
         if let Some(state) = self.jobs.get(&job_id)
             && let Some(ref staging) = state.staging_dir
         {
             return staging.clone();
         }
-        let staging = self
-            .complete_dir
-            .join(".weaver-staging")
-            .join(job_id.0.to_string());
+        let staging = self.deterministic_extraction_staging_dir(job_id);
         if let Err(e) = std::fs::create_dir_all(&staging) {
             tracing::warn!(
                 job_id = job_id.0,
@@ -75,11 +78,14 @@ impl Pipeline {
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
+        self.par2_verified.remove(&job_id);
     }
 
     pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
         self.eagerly_deleted.remove(&job_id);
         self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+        self.rar_waiting_members
+            .retain(|(jid, _, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);
     }
 

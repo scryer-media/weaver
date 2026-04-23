@@ -151,18 +151,12 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
         .unwrap_or_default();
     let error = row.error_message.clone();
-    let status = match row.status.to_ascii_lowercase().as_str() {
-        "complete" => JobStatus::Complete,
-        "paused" => JobStatus::Paused,
-        "cancelled" => JobStatus::Failed {
-            error: error
-                .clone()
-                .unwrap_or_else(|| "item was cancelled".to_string()),
-        },
-        _ => JobStatus::Failed {
-            error: error.clone().unwrap_or_else(|| "job failed".to_string()),
-        },
-    };
+    let status = weaver_server_core::job_status_from_persisted_str(
+        &row.status,
+        row.error_message.as_deref(),
+    );
+    let (download_state, post_state, run_state) =
+        weaver_server_core::runtime_lanes_from_status_snapshot(&status);
     let progress = if row.total_bytes == 0 {
         0.0
     } else {
@@ -173,6 +167,9 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         job_id: JobId(row.job_id),
         name: row.name.clone(),
         status,
+        download_state,
+        post_state,
+        run_state,
         progress,
         total_bytes: row.total_bytes,
         downloaded_bytes: row.downloaded_bytes,

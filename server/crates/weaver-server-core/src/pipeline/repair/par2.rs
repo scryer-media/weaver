@@ -238,6 +238,13 @@ impl Pipeline {
 
             let old_current = identity.current_filename.clone();
             let filename_changed = old_current != canonical_filename;
+            let old_rar_set_name = identity.classification.as_ref().and_then(|classification| {
+                matches!(
+                    classification.kind,
+                    crate::jobs::assembly::DetectedArchiveKind::Rar
+                )
+                .then(|| classification.set_name.clone())
+            });
             if filename_changed {
                 let old_path = working_dir.join(&old_current);
                 let new_path = working_dir.join(&canonical_filename);
@@ -255,15 +262,9 @@ impl Pipeline {
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
                     .or(identity.classification.clone());
-            if filename_changed
-                && let Some(classification) = classification.as_ref()
-                && matches!(
-                    classification.kind,
-                    crate::jobs::assembly::DetectedArchiveKind::Rar
-                )
-            {
+            if filename_changed && let Some(set_name) = old_rar_set_name {
                 touched_rar_files
-                    .entry(classification.set_name.clone())
+                    .entry(set_name)
                     .or_default()
                     .insert(old_current.clone());
             }
@@ -957,6 +958,9 @@ impl Pipeline {
                     None
                 },
                 status: state.status.clone(),
+                download_state: state.download_state,
+                post_state: state.post_state,
+                run_state: state.run_state,
                 progress: Self::effective_progress(state),
                 total_bytes: total,
                 downloaded_bytes: Self::effective_downloaded_bytes(state),

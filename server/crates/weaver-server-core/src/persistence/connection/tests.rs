@@ -384,3 +384,56 @@ fn migrate_v16_adds_active_runtime_columns() {
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
 }
+
+#[test]
+fn migrate_v18_adds_two_lane_runtime_columns() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (18);
+             CREATE TABLE active_jobs (
+                 job_id       INTEGER PRIMARY KEY NOT NULL,
+                 nzb_hash     BLOB NOT NULL,
+                 nzb_path     TEXT NOT NULL,
+                 output_dir   TEXT NOT NULL,
+                 status       TEXT NOT NULL DEFAULT 'downloading',
+                 error        TEXT,
+                 created_at   INTEGER NOT NULL,
+                 normalization_retried INTEGER NOT NULL DEFAULT 0,
+                 queued_repair_at_epoch_ms REAL,
+                 queued_extract_at_epoch_ms REAL,
+                 paused_resume_status TEXT,
+                 category     TEXT,
+                 metadata     TEXT
+             );",
+    )
+    .unwrap();
+
+    let db = Database {
+        conn: Arc::new(Mutex::new(conn)),
+        encryption_key: None,
+    };
+    db.create_schema().unwrap();
+
+    let conn = db.conn();
+    let runtime_cols: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('active_jobs')
+                 WHERE name IN (
+                    'download_state',
+                    'post_state',
+                    'run_state',
+                    'paused_resume_download_state',
+                    'paused_resume_post_state'
+                 )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(runtime_cols, 5);
+
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}

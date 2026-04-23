@@ -158,13 +158,22 @@ async fn persist_events(
     config: SharedConfig,
 ) {
     use weaver_server_api::{
-        PersistedQueueEvent, PipelineEventGql, QueueEventKind, QueueItemState, global_queue_state,
-        queue_item_from_job,
+        PersistedQueueEvent, PipelineEventGql, QueueDownloadState, QueueEventKind, QueueItemState,
+        QueuePostState, QueueWaitReason, global_queue_state, queue_item_from_job,
     };
 
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
     let mut last_states: std::collections::HashMap<u64, QueueItemState> =
         std::collections::HashMap::new();
+    let mut last_item_details: std::collections::HashMap<
+        u64,
+        (
+            QueueItemState,
+            QueueDownloadState,
+            QueuePostState,
+            Option<QueueWaitReason>,
+        ),
+    > = std::collections::HashMap::new();
     let mut last_progress_buckets: std::collections::HashMap<u64, u8> =
         std::collections::HashMap::new();
     let mut last_attention: std::collections::HashMap<u64, Option<(String, String)>> =
@@ -260,7 +269,14 @@ async fn persist_events(
                         item.state,
                         QueueItemState::Completed | QueueItemState::Failed
                     );
+                    let detail_signature = (
+                        item.state,
+                        item.download_state,
+                        item.post_state,
+                        item.wait_reason,
+                    );
                     let previous_state = last_states.insert(job_id, item.state);
+                    let previous_detail = last_item_details.insert(job_id, detail_signature);
                     let progress_bucket = item.progress_percent.floor() as u8;
                     let previous_progress = last_progress_buckets.insert(job_id, progress_bucket);
                     let attention_signature = item
@@ -284,8 +300,8 @@ async fn persist_events(
                         });
                     }
 
-                    if let Some(previous_state) = previous_state
-                        && previous_state != item.state
+                    if let Some(previous_detail) = previous_detail
+                        && previous_detail != detail_signature
                     {
                         records.push(PersistedQueueEvent {
                             occurred_at_ms: now,
@@ -297,7 +313,7 @@ async fn persist_events(
                             item_id: Some(job_id),
                             item: Some(item.clone()),
                             state: Some(item.state),
-                            previous_state: Some(previous_state),
+                            previous_state: previous_state.or(Some(previous_detail.0)),
                             attention: item.attention.clone(),
                             global_state: None,
                         });
@@ -349,6 +365,7 @@ async fn persist_events(
 
                     if should_evict {
                         last_states.remove(&job_id);
+                        last_item_details.remove(&job_id);
                         last_progress_buckets.remove(&job_id);
                         last_attention.remove(&job_id);
                     }

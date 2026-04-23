@@ -7,7 +7,10 @@ use crate::Database;
 use crate::ingest;
 use crate::jobs::working_dir::is_weaver_owned_working_dir;
 use crate::runtime::load_global_pause_from_db;
-use crate::{JobInfo, JobStatus, RestoreJobRequest};
+use crate::{
+    DownloadState, JobInfo, JobStatus, PostState, RestoreJobRequest, RunState,
+    job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
+};
 
 pub struct RecoveredServerState {
     pub initial_history: Vec<JobInfo>,
@@ -94,7 +97,10 @@ pub async fn recover_server_state(
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")
                 .to_string();
-            let status = status_str_to_job_status(&recovered.status, recovered.error.as_deref());
+            let status =
+                job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
+            let (download_state, post_state, run_state) =
+                runtime_lanes_from_status_snapshot(&status);
             initial_history.push(JobInfo {
                 job_id,
                 name,
@@ -104,6 +110,9 @@ pub async fn recover_server_state(
                     None
                 },
                 status,
+                download_state,
+                post_state,
+                run_state,
                 progress: 1.0,
                 total_bytes: 0,
                 downloaded_bytes: 0,
@@ -137,6 +146,9 @@ pub async fn recover_server_state(
                     status: JobStatus::Failed {
                         error: "NZB file missing after restart".to_string(),
                     },
+                    download_state: DownloadState::Failed,
+                    post_state: PostState::Failed,
+                    run_state: RunState::Active,
                     progress: 0.0,
                     total_bytes: 0,
                     downloaded_bytes: 0,
@@ -161,12 +173,28 @@ pub async fn recover_server_state(
                         recovered.category,
                         recovered.metadata,
                     );
-                    let status =
-                        status_str_to_job_status(&recovered.status, recovered.error.as_deref());
+                    let status = job_status_from_persisted_str(
+                        &recovered.status,
+                        recovered.error.as_deref(),
+                    );
+                    let download_state = recovered
+                        .download_state
+                        .as_deref()
+                        .and_then(DownloadState::parse);
+                    let post_state = recovered.post_state.as_deref().and_then(PostState::parse);
+                    let run_state = recovered.run_state.as_deref().and_then(RunState::parse);
                     let paused_resume_status = recovered
                         .paused_resume_status
                         .as_deref()
-                        .map(|status| status_str_to_job_status(status, None));
+                        .map(|status| job_status_from_persisted_str(status, None));
+                    let paused_resume_download_state = recovered
+                        .paused_resume_download_state
+                        .as_deref()
+                        .and_then(DownloadState::parse);
+                    let paused_resume_post_state = recovered
+                        .paused_resume_post_state
+                        .as_deref()
+                        .and_then(PostState::parse);
                     to_restore.push(RestoreCandidate {
                         job_id,
                         committed_count: recovered.committed_segments.len(),
@@ -179,9 +207,14 @@ pub async fn recover_server_state(
                             file_identities: recovered.file_identities,
                             extracted_members: recovered.extracted_members,
                             status,
+                            download_state,
+                            post_state,
+                            run_state,
                             queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
                             queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
                             paused_resume_status,
+                            paused_resume_download_state,
+                            paused_resume_post_state,
                             working_dir: recovered.output_dir,
                         },
                     });
@@ -222,16 +255,23 @@ pub async fn recover_server_state(
                 if initial_history.iter().any(|job| job.job_id == job_id) {
                     continue;
                 }
-                let status = status_str_to_job_status(&row.status, row.error_message.as_deref());
+                let status =
+                    job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+                let history_error = if let JobStatus::Failed { error } = &status {
+                    Some(error.clone())
+                } else {
+                    None
+                };
+                let (download_state, post_state, run_state) =
+                    runtime_lanes_from_status_snapshot(&status);
                 initial_history.push(JobInfo {
                     job_id,
                     name: row.name,
-                    error: if let JobStatus::Failed { error } = &status {
-                        Some(error.clone())
-                    } else {
-                        None
-                    },
+                    error: history_error,
                     status,
+                    download_state,
+                    post_state,
+                    run_state,
                     progress: 1.0,
                     total_bytes: row.total_bytes,
                     downloaded_bytes: row.downloaded_bytes,
@@ -333,30 +373,6 @@ fn cleanup_unreferenced_intermediate_dirs(
     }
 
     Ok(removed)
-}
-
-fn status_str_to_job_status(status: &str, error: Option<&str>) -> JobStatus {
-    match status {
-        "queued" => JobStatus::Queued,
-        "downloading" => JobStatus::Downloading,
-        "checking" => JobStatus::Checking,
-        "verifying" => JobStatus::Verifying,
-        "queued_repair" => JobStatus::QueuedRepair,
-        "repairing" => JobStatus::Repairing,
-        "queued_extract" => JobStatus::QueuedExtract,
-        "extracting" => JobStatus::Extracting,
-        "complete" => JobStatus::Complete,
-        "failed" => JobStatus::Failed {
-            error: error.unwrap_or("unknown error").to_string(),
-        },
-        "paused" => JobStatus::Paused,
-        "cancelled" => JobStatus::Failed {
-            error: "cancelled".to_string(),
-        },
-        other => JobStatus::Failed {
-            error: format!("unknown status: {other}"),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -490,5 +506,49 @@ mod tests {
         assert!(!orphan_output_dir.exists());
         assert!(unrelated_output_dir.exists());
         assert_eq!(recovered.to_restore.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_jobs_persisted_in_moving_status() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let intermediate_dir = temp.path().join("intermediate");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&intermediate_dir).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let output_dir = intermediate_dir.join("moving-job");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(working_dir_marker_path(&output_dir), []).unwrap();
+
+        let nzb_path = data_dir.join("moving-job.nzb");
+        std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
+
+        db.create_active_job(&sample_active_job(7, nzb_path, output_dir))
+            .unwrap();
+        db.set_active_job_runtime(
+            JobId(7),
+            "moving",
+            Some("complete"),
+            Some("finalizing"),
+            Some("active"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let recovered = recover_server_state(&db, &data_dir, &intermediate_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.to_restore.len(), 1);
+        let request = &recovered.to_restore[0].request;
+        assert_eq!(request.status, crate::JobStatus::Moving);
+        assert_eq!(request.download_state, Some(crate::DownloadState::Complete));
+        assert_eq!(request.post_state, Some(crate::PostState::Finalizing));
     }
 }

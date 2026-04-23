@@ -103,9 +103,10 @@ impl Database {
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT job_id, nzb_path, output_dir, status, error,
+                    "SELECT job_id, nzb_path, output_dir, status, download_state, post_state, run_state, error,
                             created_at, queued_repair_at_epoch_ms,
                             queued_extract_at_epoch_ms, paused_resume_status,
+                            paused_resume_download_state, paused_resume_post_state,
                             category, metadata
                      FROM active_jobs",
                 )
@@ -116,13 +117,18 @@ impl Database {
                     let nzb_path: String = row.get(1)?;
                     let output_dir: String = row.get(2)?;
                     let status: String = row.get(3)?;
-                    let error: Option<String> = row.get(4)?;
-                    let created_at = row.get::<_, i64>(5)? as u64;
-                    let queued_repair_at_epoch_ms: Option<f64> = row.get(6)?;
-                    let queued_extract_at_epoch_ms: Option<f64> = row.get(7)?;
-                    let paused_resume_status: Option<String> = row.get(8)?;
-                    let category: Option<String> = row.get(9)?;
-                    let metadata_json: Option<String> = row.get(10)?;
+                    let download_state: Option<String> = row.get(4)?;
+                    let post_state: Option<String> = row.get(5)?;
+                    let run_state: Option<String> = row.get(6)?;
+                    let error: Option<String> = row.get(7)?;
+                    let created_at = row.get::<_, i64>(8)? as u64;
+                    let queued_repair_at_epoch_ms: Option<f64> = row.get(9)?;
+                    let queued_extract_at_epoch_ms: Option<f64> = row.get(10)?;
+                    let paused_resume_status: Option<String> = row.get(11)?;
+                    let paused_resume_download_state: Option<String> = row.get(12)?;
+                    let paused_resume_post_state: Option<String> = row.get(13)?;
+                    let category: Option<String> = row.get(14)?;
+                    let metadata_json: Option<String> = row.get(15)?;
                     let metadata: Vec<(String, String)> = metadata_json
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default();
@@ -137,11 +143,16 @@ impl Database {
                         complete_files: HashSet::new(),
                         extracted_members: HashSet::new(),
                         status,
+                        download_state,
+                        post_state,
+                        run_state,
                         error,
                         created_at,
                         queued_repair_at_epoch_ms,
                         queued_extract_at_epoch_ms,
                         paused_resume_status,
+                        paused_resume_download_state,
+                        paused_resume_post_state,
                         category,
                         metadata,
                     })

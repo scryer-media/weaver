@@ -240,8 +240,7 @@ fn repairs_heavy_damage_28_regions_rar5() {
     let prefix = "fixture_rar5_heavy_damage";
     let rar_path = temp.path().join("fixture_rar5_heavy_damage.rar");
     let rar_size = fs::metadata(&rar_path).unwrap().len();
-    let total_slices =
-        ((rar_size + HEAVY_DAMAGE_SLICE_SIZE - 1) / HEAVY_DAMAGE_SLICE_SIZE) as usize;
+    let total_slices = rar_size.div_ceil(HEAVY_DAMAGE_SLICE_SIZE) as usize;
     let par2_paths = collect_paths(temp.path(), "fixture_rar5_heavy_damage_repair", "par2");
     let par2_set = load_par2_set(&par2_paths);
 

@@ -59,6 +59,60 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueueDownloadState {
+    Queued,
+    Downloading,
+    Checking,
+    Complete,
+    Failed,
+}
+
+impl From<weaver_server_core::DownloadState> for QueueDownloadState {
+    fn from(value: weaver_server_core::DownloadState) -> Self {
+        match value {
+            weaver_server_core::DownloadState::Queued => Self::Queued,
+            weaver_server_core::DownloadState::Downloading => Self::Downloading,
+            weaver_server_core::DownloadState::Checking => Self::Checking,
+            weaver_server_core::DownloadState::Complete => Self::Complete,
+            weaver_server_core::DownloadState::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueuePostState {
+    Idle,
+    QueuedRepair,
+    Repairing,
+    QueuedExtract,
+    Extracting,
+    WaitingForVolumes,
+    AwaitingRepair,
+    Verifying,
+    Finalizing,
+    Completed,
+    Failed,
+}
+
+impl From<weaver_server_core::PostState> for QueuePostState {
+    fn from(value: weaver_server_core::PostState) -> Self {
+        match value {
+            weaver_server_core::PostState::Idle => Self::Idle,
+            weaver_server_core::PostState::QueuedRepair => Self::QueuedRepair,
+            weaver_server_core::PostState::Repairing => Self::Repairing,
+            weaver_server_core::PostState::QueuedExtract => Self::QueuedExtract,
+            weaver_server_core::PostState::Extracting => Self::Extracting,
+            weaver_server_core::PostState::WaitingForVolumes => Self::WaitingForVolumes,
+            weaver_server_core::PostState::AwaitingRepair => Self::AwaitingRepair,
+            weaver_server_core::PostState::Verifying => Self::Verifying,
+            weaver_server_core::PostState::Finalizing => Self::Finalizing,
+            weaver_server_core::PostState::Completed => Self::Completed,
+            weaver_server_core::PostState::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
 pub enum QueueWaitReason {
     RepairCapacity,
     ExtractionCapacity,
@@ -78,6 +132,8 @@ pub struct QueueItem {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    pub download_state: QueueDownloadState,
+    pub post_state: QueuePostState,
     pub wait_reason: Option<QueueWaitReason>,
     pub error: Option<String>,
     pub progress_percent: f64,
@@ -487,7 +543,9 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         original_title,
         parsed_release,
         state,
-        wait_reason: wait_reason_for_status(&info.status),
+        download_state: QueueDownloadState::from(info.download_state),
+        post_state: QueuePostState::from(info.post_state),
+        wait_reason: wait_reason_for_post_state(info.post_state),
         error: info.error.clone(),
         progress_percent: normalize_progress_percent(info.progress),
         total_bytes: info.total_bytes,
@@ -523,6 +581,8 @@ pub fn queue_item_from_submission(
         original_title,
         parsed_release,
         state: QueueItemState::Queued,
+        download_state: QueueDownloadState::Queued,
+        post_state: QueuePostState::Idle,
         wait_reason: None,
         error: None,
         progress_percent: 0.0,
@@ -751,10 +811,12 @@ fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
-fn wait_reason_for_status(status: &weaver_server_core::JobStatus) -> Option<QueueWaitReason> {
-    match status {
-        weaver_server_core::JobStatus::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
-        weaver_server_core::JobStatus::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
+fn wait_reason_for_post_state(
+    post_state: weaver_server_core::PostState,
+) -> Option<QueueWaitReason> {
+    match post_state {
+        weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
+        weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
         _ => None,
     }
 }
@@ -771,6 +833,24 @@ fn attention_for_live_job(
             },
             message: error.clone(),
         });
+    }
+
+    match info.post_state {
+        weaver_server_core::PostState::WaitingForVolumes => {
+            return Some(QueueAttention {
+                code: "WAITING_FOR_VOLUMES".to_string(),
+                message: "Waiting for additional archive volumes before extraction can continue"
+                    .to_string(),
+            });
+        }
+        weaver_server_core::PostState::AwaitingRepair => {
+            return Some(QueueAttention {
+                code: "AWAITING_REPAIR".to_string(),
+                message: "Waiting for verification or repair before extraction can resume"
+                    .to_string(),
+            });
+        }
+        _ => {}
     }
 
     if info.failed_bytes > 0 && state != QueueItemState::Completed {

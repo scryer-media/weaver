@@ -10,6 +10,90 @@ use crate::jobs::model::{FieldUpdate, JobSpec, JobState, JobStatus, JobUpdate, e
 use crate::operations::metrics::PipelineMetrics;
 use crate::pipeline::download::queue::DownloadQueue;
 
+fn runtime_lanes_for_status(
+    status: &JobStatus,
+) -> (
+    crate::jobs::model::DownloadState,
+    crate::jobs::model::PostState,
+    crate::jobs::model::RunState,
+    Option<String>,
+) {
+    match status {
+        JobStatus::Queued => (
+            crate::jobs::model::DownloadState::Queued,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Downloading => (
+            crate::jobs::model::DownloadState::Downloading,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Checking => (
+            crate::jobs::model::DownloadState::Checking,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Verifying => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Verifying,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedRepair => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::QueuedRepair,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Repairing => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Repairing,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::QueuedExtract => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::QueuedExtract,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Extracting => (
+            crate::jobs::model::DownloadState::Downloading,
+            crate::jobs::model::PostState::Extracting,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Moving => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Finalizing,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Complete => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Completed,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::Failed { error } => (
+            crate::jobs::model::DownloadState::Failed,
+            crate::jobs::model::PostState::Failed,
+            crate::jobs::model::RunState::Active,
+            Some(error.clone()),
+        ),
+        JobStatus::Paused => (
+            crate::jobs::model::DownloadState::Downloading,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Paused,
+            None,
+        ),
+    }
+}
+
 fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
     jobs.values()
         .map(|state| JobInfo {
@@ -21,6 +105,9 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
                 None
             },
             status: state.status.clone(),
+            download_state: state.download_state,
+            post_state: state.post_state,
+            run_state: state.run_state,
             progress: state.assembly.progress(),
             total_bytes: state.spec.total_bytes,
             downloaded_bytes: 0,
@@ -63,16 +150,25 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     }
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
+                    let status = JobStatus::Queued;
+                    let (download_state, post_state, run_state, failure_error) =
+                        runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
                         spec,
-                        status: JobStatus::Queued,
+                        status,
+                        download_state,
+                        post_state,
+                        run_state,
                         assembly,
                         extraction_depth: 0,
                         created_at: std::time::Instant::now(),
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_download_state: None,
+                        paused_resume_post_state: None,
+                        failure_error,
                         working_dir: PathBuf::from("/tmp/test"),
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
@@ -86,7 +182,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
-                        paused_resume_status: None,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -100,7 +195,12 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::PauseJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
-                            state.status = JobStatus::Paused;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Paused);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.refresh_legacy_status();
                             let _ = event_tx.send(PipelineEvent::JobPaused { job_id });
                             Ok(())
                         }
@@ -111,7 +211,12 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::ResumeJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
-                            state.status = JobStatus::Downloading;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Downloading);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.refresh_legacy_status();
                             let _ = event_tx.send(PipelineEvent::JobResumed { job_id });
                             Ok(())
                         }
@@ -163,16 +268,24 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     } = *request;
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
+                    let (download_state, post_state, run_state, failure_error) =
+                        runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
                         spec,
                         status,
+                        download_state,
+                        post_state,
+                        run_state,
                         assembly,
                         extraction_depth: 0,
                         created_at: std::time::Instant::now(),
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_download_state: None,
+                        paused_resume_post_state: None,
+                        failure_error,
                         working_dir,
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
@@ -186,7 +299,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         download_queue: DownloadQueue::new(),
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
-                        paused_resume_status: None,
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
@@ -200,7 +312,13 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::ReprocessJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            state.status = JobStatus::Downloading;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Downloading);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.failure_error = None;
+                            state.refresh_legacy_status();
                             Ok(())
                         }
                         Some(_) => Err(SchedulerError::Conflict(format!(
@@ -214,7 +332,13 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::RedownloadJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            state.status = JobStatus::Queued;
+                            let (download_state, post_state, run_state, _) =
+                                runtime_lanes_for_status(&JobStatus::Queued);
+                            state.download_state = download_state;
+                            state.post_state = post_state;
+                            state.run_state = run_state;
+                            state.failure_error = None;
+                            state.refresh_legacy_status();
                             Ok(())
                         }
                         Some(_) => Err(SchedulerError::Conflict(format!(
@@ -338,9 +462,14 @@ async fn redownload_failed_job() {
             status: JobStatus::Failed {
                 error: "boom".to_string(),
             },
+            download_state: None,
+            post_state: None,
+            run_state: None,
             queued_repair_at_epoch_ms: None,
             queued_extract_at_epoch_ms: None,
             paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
             working_dir: PathBuf::from("/tmp/test"),
         })
         .await

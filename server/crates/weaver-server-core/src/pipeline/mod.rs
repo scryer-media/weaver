@@ -294,6 +294,9 @@ pub struct Pipeline {
     pub(super) eagerly_deleted: HashMap<JobId, HashSet<String>>,
     /// Pipeline-owned RAR scheduling state derived from immutable completed-volume facts.
     rar_sets: HashMap<(JobId, String), RarSetState>,
+    /// Members currently blocked on future RAR volumes. Used to emit stable
+    /// waiting-started / waiting-finished events without relying on log text.
+    pub(super) rar_waiting_members: HashMap<(JobId, String, String), usize>,
     /// Jobs that have already attempted normalization retry (one-shot guard).
     pub(super) normalization_retried: HashSet<JobId>,
     /// Members where extraction CRC passed and chunks are in the DB, but the
@@ -303,6 +306,8 @@ pub struct Pipeline {
     /// Jobs where all archive members extracted with CRC pass — PAR2
     /// verification/repair is unnecessary.
     pub(super) par2_bypassed: HashSet<JobId>,
+    /// Jobs whose PAR2 set has already validated the current payload bytes.
+    pub(super) par2_verified: HashSet<JobId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
     pub(super) finished_jobs: Vec<JobInfo>,
     /// Shared state for control plane reads (API handlers read without channel round-trip).

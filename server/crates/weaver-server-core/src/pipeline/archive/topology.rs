@@ -827,9 +827,13 @@ impl Pipeline {
                 volume_number,
                 self.current_filename_for_file(job_id, file_asm),
                 set_name,
-                state
-                    .working_dir
-                    .join(self.current_filename_for_file(job_id, file_asm)),
+                match self.resolve_job_input_path(
+                    job_id,
+                    &self.current_filename_for_file(job_id, file_asm),
+                ) {
+                    Some(path) => path,
+                    None => return,
+                },
                 state.spec.password.clone(),
             )
         };

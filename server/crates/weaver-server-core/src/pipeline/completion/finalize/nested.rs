@@ -157,6 +157,9 @@ impl Pipeline {
             };
 
             let path = root.join(&file.relative_path);
+            if !path.exists() {
+                continue;
+            }
             if let Ok(facts) =
                 Pipeline::parse_rar_volume_facts_from_path(path.clone(), password.clone()).await
             {
@@ -169,13 +172,13 @@ impl Pipeline {
             }
 
             if numeric_suffix.is_some() {
-                if Self::path_has_7z_signature(path).await? {
+                if Self::path_has_7z_signature(path).await.unwrap_or(false) {
                     detected_split_7z_sets.insert(set_key);
                 }
                 continue;
             }
 
-            if Self::path_has_7z_signature(path).await? {
+            if Self::path_has_7z_signature(path).await.unwrap_or(false) {
                 file.detected_archive = Some(crate::jobs::assembly::DetectedArchiveIdentity {
                     kind: crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle,
                     set_name: set_key,
@@ -475,7 +478,16 @@ impl Pipeline {
     pub(crate) async fn maybe_start_nested_extraction(
         &mut self,
         job_id: JobId,
-    ) -> Result<bool, String> {
+    ) -> Result<NestedExtractionDecision, String> {
+        let current_archive_sources: HashSet<String> = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {} not found", job_id.0))?
+            .assembly
+            .archive_topologies()
+            .values()
+            .flat_map(|topology| topology.volume_map.keys().cloned())
+            .collect();
         let scan_root = self.nested_scan_root(job_id)?;
         let password = self
             .jobs
@@ -485,6 +497,9 @@ impl Pipeline {
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()
             .filter_map(|file| {
+                if current_archive_sources.contains(&file.relative_path) {
+                    return None;
+                }
                 let effective_role = file.effective_role();
                 let archive_type = Self::archive_type_for_role(&effective_role)?;
                 let set_name = file.archive_set_name()?;
@@ -501,7 +516,7 @@ impl Pipeline {
             .collect();
 
         if nested_archives.is_empty() {
-            return Ok(false);
+            return Ok(NestedExtractionDecision::NoNestedArchives);
         }
 
         let current_depth = self
@@ -516,7 +531,7 @@ impl Pipeline {
                 archives = nested_archives.len(),
                 "nested archive extraction depth limit reached; leaving archive output in place"
             );
-            return Ok(false);
+            return Ok(NestedExtractionDecision::PreserveOutputsAtDepthLimit);
         }
 
         for file in &scanned_files {
@@ -544,12 +559,24 @@ impl Pipeline {
 
         let to_extract = self.rebuild_assembly_from_staging(job_id, &nested_archives)?;
         if to_extract.is_empty() {
-            return Ok(false);
+            return Ok(NestedExtractionDecision::NoNestedArchives);
+        }
+
+        let nested_file_ids: Vec<crate::jobs::ids::NzbFileId> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.assembly.files().map(|file| file.file_id()).collect())
+            .unwrap_or_default();
+        for file_id in nested_file_ids {
+            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
+                .await;
         }
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.extraction_depth = state.extraction_depth.saturating_add(1);
         }
+
+        self.transition_post_state(job_id, crate::jobs::model::PostState::Extracting);
 
         info!(
             job_id = job_id.0,
@@ -564,6 +591,6 @@ impl Pipeline {
             return Err("nested archive extraction could not be started".to_string());
         }
 
-        Ok(true)
+        Ok(NestedExtractionDecision::Started)
     }
 }

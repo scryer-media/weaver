@@ -9,7 +9,7 @@ use tokio_stream::{Stream, StreamExt};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::runtime::log_buffer::LogRingBuffer;
 use weaver_server_core::settings::SharedConfig;
-use weaver_server_core::{Database, JobHistoryRow, JobInfo, JobStatus, SchedulerHandle};
+use weaver_server_core::{Database, JobHistoryRow, JobInfo, SchedulerHandle};
 
 use crate::auth::types::{ApiKey, ApiKeyScope};
 use crate::auth::{AdminGuard, ReadGuard, graphql_error};

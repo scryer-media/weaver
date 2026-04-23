@@ -108,9 +108,12 @@ impl Pipeline {
             )
         };
 
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.status = JobStatus::Moving;
-        }
+        self.transition_runtime_state(
+            job_id,
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Finalizing,
+            crate::jobs::model::RunState::Active,
+        );
 
         let _ = self
             .event_tx

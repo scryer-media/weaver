@@ -145,6 +145,11 @@ impl FileAssembly {
         self.received_bytes = 0;
     }
 
+    pub fn mark_complete(&mut self) {
+        self.received.fill(true);
+        self.received_bytes = self.total_bytes;
+    }
+
     /// How many segments are still missing.
     pub fn missing_count(&self) -> u32 {
         self.total_segments - self.received.count_ones() as u32

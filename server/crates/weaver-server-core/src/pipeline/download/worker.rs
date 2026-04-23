@@ -23,10 +23,13 @@ impl Pipeline {
     fn mark_download_pass_started(&mut self, job_id: JobId) {
         // Transition Queued → Downloading when the first segment is dispatched.
         if let Some(state) = self.jobs.get_mut(&job_id)
-            && state.status == JobStatus::Queued
+            && matches!(
+                state.download_state,
+                crate::jobs::model::DownloadState::Queued
+            )
         {
-            state.status = JobStatus::Downloading;
-            self.persist_active_runtime(job_id);
+            let _ = state;
+            self.transition_download_state(job_id, crate::jobs::model::DownloadState::Downloading);
         }
         self.note_download_activity(job_id);
         if self.active_download_passes.insert(job_id) {
@@ -252,7 +255,12 @@ impl Pipeline {
         let active_probes = self
             .jobs
             .values()
-            .filter(|s| matches!(s.status, JobStatus::Checking))
+            .filter(|s| {
+                matches!(
+                    s.download_state,
+                    crate::jobs::model::DownloadState::Checking
+                )
+            })
             .count();
         let max = tuner_max
             .min(self.connection_ramp)
@@ -269,15 +277,16 @@ impl Pipeline {
             .job_order
             .iter()
             .filter(|id| {
-                self.jobs.get(id).is_some_and(|s| match s.status {
-                    JobStatus::Queued | JobStatus::Downloading => !s.download_queue.is_empty(),
-                    // Post-processing jobs may have promoted recovery segments.
-                    JobStatus::QueuedExtract
-                    | JobStatus::Extracting
-                    | JobStatus::Verifying
-                    | JobStatus::QueuedRepair
-                    | JobStatus::Repairing => !s.download_queue.is_empty(),
-                    _ => false,
+                self.jobs.get(id).is_some_and(|s| {
+                    matches!(s.run_state, crate::jobs::model::RunState::Active)
+                        && !s.download_queue.is_empty()
+                        && !matches!(s.download_state, crate::jobs::model::DownloadState::Failed)
+                        && !matches!(
+                            s.post_state,
+                            crate::jobs::model::PostState::Finalizing
+                                | crate::jobs::model::PostState::Completed
+                                | crate::jobs::model::PostState::Failed
+                        )
                 })
             })
             .copied()

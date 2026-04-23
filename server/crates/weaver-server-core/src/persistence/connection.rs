@@ -14,7 +14,7 @@ pub use crate::jobs::{
 pub use crate::operations::{MetricsScrapeRow, StableStateExport};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 fn ensure_column(
     conn: &Connection,
@@ -154,12 +154,17 @@ impl Database {
                 nzb_path     TEXT NOT NULL,
                 output_dir   TEXT NOT NULL,
                 status       TEXT NOT NULL DEFAULT 'downloading',
+                download_state TEXT,
+                post_state   TEXT,
+                run_state    TEXT,
                 error        TEXT,
                 created_at   INTEGER NOT NULL,
                 normalization_retried INTEGER NOT NULL DEFAULT 0,
                 queued_repair_at_epoch_ms REAL,
                 queued_extract_at_epoch_ms REAL,
                 paused_resume_status TEXT,
+                paused_resume_download_state TEXT,
+                paused_resume_post_state TEXT,
                 category     TEXT,
                 metadata     TEXT
             );
@@ -509,6 +514,11 @@ impl Database {
                 conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
+            Some(18) => {
+                // v18→v19: two-lane runtime columns are added below via ensure_column.
+                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                    .map_err(|e| StateError::Database(e.to_string()))?;
+            }
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -550,6 +560,11 @@ impl Database {
         ensure_column(&conn, "active_jobs", "queued_repair_at_epoch_ms", "REAL")?;
         ensure_column(&conn, "active_jobs", "queued_extract_at_epoch_ms", "REAL")?;
         ensure_column(&conn, "active_jobs", "paused_resume_status", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "download_state", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "post_state", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "run_state", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "paused_resume_download_state", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "paused_resume_post_state", "TEXT")?;
         ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
 
         Ok(())

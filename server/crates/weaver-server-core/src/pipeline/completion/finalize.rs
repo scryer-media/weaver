@@ -55,6 +55,13 @@ pub(crate) enum SimpleArchiveKind {
     Split,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NestedExtractionDecision {
+    Started,
+    NoNestedArchives,
+    PreserveOutputsAtDepthLimit,
+}
+
 mod check;
 mod extract;
 mod nested;

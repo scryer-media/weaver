@@ -1,6 +1,8 @@
 use super::*;
 
 impl Pipeline {
+    const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -100,9 +102,11 @@ impl Pipeline {
             failed_extractions: HashMap::new(),
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
+            rar_waiting_members: HashMap::new(),
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
+            par2_verified: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
             db,
@@ -247,7 +251,11 @@ impl Pipeline {
             .jobs
             .iter()
             .filter_map(|(job_id, state)| {
-                if !matches!(state.status, JobStatus::Downloading) || state.health_probing {
+                if !matches!(
+                    state.download_state,
+                    crate::jobs::model::DownloadState::Downloading
+                ) || state.health_probing
+                {
                     return None;
                 }
 
@@ -306,13 +314,24 @@ impl Pipeline {
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
         stalled_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut state_reconcile_interval = tokio::time::interval(Self::STATE_RECONCILE_INTERVAL);
+        state_reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         info!("pipeline started");
+
+        let startup_jobs: Vec<_> = self.jobs.keys().copied().collect();
+        for job_id in startup_jobs {
+            self.reconcile_job_progress(job_id).await;
+        }
 
         loop {
             self.pump_decode_queue();
 
-            while let Some(job_id) = self.pending_completion_checks.pop_front() {
+            let pending_completion_checks = self.pending_completion_checks.len();
+            for _ in 0..pending_completion_checks {
+                let Some(job_id) = self.pending_completion_checks.pop_front() else {
+                    break;
+                };
                 self.check_job_completion(job_id).await;
                 self.pump_decode_queue();
             }
@@ -407,6 +426,15 @@ impl Pipeline {
                 }
                 _ = stalled_download_interval.tick() => {
                     self.auto_pause_stalled_downloads();
+                }
+                _ = state_reconcile_interval.tick() => {
+                    let job_ids: Vec<_> = self.jobs.keys().copied().collect();
+                    for (index, job_id) in job_ids.into_iter().enumerate() {
+                        self.reconcile_job_progress(job_id).await;
+                        if index % 16 == 15 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
                 }
             }
 

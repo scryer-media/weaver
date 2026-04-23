@@ -21,10 +21,11 @@ pub use error::Error;
 pub use history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
 pub use jobs::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, DownloadBlockKind,
-    DownloadBlockState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo, JobSpec, JobState,
-    JobStatus, JobUpdate, MessageId, NzbFileId, RecoveredJob, RestoreJobRequest, SchedulerCommand,
-    SchedulerError, SchedulerHandle, SegmentId, SegmentSpec, ServerId, SharedPipelineState,
-    epoch_ms_now,
+    DownloadBlockState, DownloadState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo,
+    JobSpec, JobState, JobStatus, JobUpdate, MessageId, NzbFileId, PostState, RecoveredJob,
+    RestoreJobRequest, RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId,
+    SegmentSpec, ServerId, SharedPipelineState, derive_legacy_job_status, epoch_ms_now,
+    job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
 };
 pub use operations::metrics::{MetricsSnapshot, PipelineMetrics};
 pub use operations::{MetricsScrapeRow, StableStateExport};

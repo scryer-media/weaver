@@ -51,8 +51,8 @@ impl Database {
         };
         conn.execute(
             "INSERT INTO active_jobs
-             (job_id, nzb_hash, nzb_path, output_dir, status, created_at, category, metadata)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7)",
+             (job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
+             VALUES (?1, ?2, ?3, ?4, 'queued', 'queued', 'idle', 'active', ?5, ?6, ?7)",
             rusqlite::params![
                 job.job_id.0 as i64,
                 job.nzb_hash.as_slice(),
@@ -119,33 +119,54 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StateError> {
-        self.set_active_job_runtime(job_id, status, error, None, None, None)
+        self.set_active_job_runtime(
+            job_id, status, None, None, None, error, None, None, None, None, None,
+        )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active job runtime is persisted as one atomic SQL update"
+    )]
     pub fn set_active_job_runtime(
         &self,
         job_id: JobId,
         status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
         error: Option<&str>,
         queued_repair_at_epoch_ms: Option<f64>,
         queued_extract_at_epoch_ms: Option<f64>,
         paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
     ) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute(
             "UPDATE active_jobs
              SET status = ?1,
-                 error = ?2,
-                 queued_repair_at_epoch_ms = ?3,
-                 queued_extract_at_epoch_ms = ?4,
-                 paused_resume_status = ?5
-             WHERE job_id = ?6",
+                 download_state = ?2,
+                 post_state = ?3,
+                 run_state = ?4,
+                 error = ?5,
+                 queued_repair_at_epoch_ms = ?6,
+                 queued_extract_at_epoch_ms = ?7,
+                 paused_resume_status = ?8,
+                 paused_resume_download_state = ?9,
+                 paused_resume_post_state = ?10
+             WHERE job_id = ?11",
             rusqlite::params![
                 status,
+                download_state,
+                post_state,
+                run_state,
                 error,
                 queued_repair_at_epoch_ms,
                 queued_extract_at_epoch_ms,
                 paused_resume_status,
+                paused_resume_download_state,
+                paused_resume_post_state,
                 job_id.0 as i64
             ],
         )

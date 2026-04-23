@@ -27,7 +27,7 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
-        if let Some(state) = self.rar_sets.get_mut(&set_key) {
+        let remove_empty_set = if let Some(state) = self.rar_sets.get_mut(&set_key) {
             state
                 .volume_files
                 .retain(|_, filename| !touched_filenames.contains(filename));
@@ -37,8 +37,16 @@ impl Pipeline {
             }
             state.in_flight_members.clear();
             state.plan = None;
-            state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
             state.active_workers = 0;
+            state.facts.is_empty() && state.volume_files.is_empty()
+        } else {
+            false
+        };
+
+        if remove_empty_set {
+            self.rar_sets.remove(&set_key);
+        } else if let Some(state) = self.rar_sets.get_mut(&set_key) {
+            state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
         }
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
@@ -690,7 +698,16 @@ impl Pipeline {
     }
 
     pub(super) async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
+        if self
+            .reconcile_extracted_outputs_for_completion(job_id)
+            .await
         {
+            self.reconcile_job_progress(job_id).await;
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
+
+        let cleanup_files: HashSet<String> = {
             let state = self.jobs.get(&job_id).unwrap();
             let mut cleanup_files: HashSet<String> = state
                 .assembly
@@ -709,38 +726,47 @@ impl Pipeline {
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());
             }
-            let mut removed = 0u32;
-            for filename in &cleanup_files {
-                let Some(path) = self.resolve_job_input_path(job_id, filename) else {
-                    continue;
-                };
-                match tokio::fs::remove_file(&path).await {
-                    Ok(()) => removed += 1,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        warn!(
-                            file = %path.display(),
-                            error = %e,
-                            "failed to clean up source file"
-                        );
-                    }
-                }
-            }
-            info!(
-                job_id = job_id.0,
-                removed,
-                total = cleanup_files.len(),
-                "post-extraction cleanup complete"
-            );
-        }
+            cleanup_files
+        };
 
-        match self.maybe_start_nested_extraction(job_id).await {
-            Ok(true) => return,
-            Ok(false) => {}
+        let nested_decision = match self.maybe_start_nested_extraction(job_id).await {
+            Ok(decision) => decision,
             Err(error) => {
                 self.fail_job(job_id, error);
                 return;
             }
+        };
+
+        match nested_decision {
+            NestedExtractionDecision::Started | NestedExtractionDecision::NoNestedArchives => {
+                let mut removed = 0u32;
+                for filename in &cleanup_files {
+                    let Some(path) = self.resolve_job_input_path(job_id, filename) else {
+                        continue;
+                    };
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => removed += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            warn!(
+                                file = %path.display(),
+                                error = %e,
+                                "failed to clean up source file"
+                            );
+                        }
+                    }
+                }
+                info!(
+                    job_id = job_id.0,
+                    removed,
+                    total = cleanup_files.len(),
+                    "post-extraction cleanup complete"
+                );
+                if matches!(nested_decision, NestedExtractionDecision::Started) {
+                    return;
+                }
+            }
+            NestedExtractionDecision::PreserveOutputsAtDepthLimit => {}
         }
 
         self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
@@ -753,10 +779,7 @@ impl Pipeline {
             return;
         }
 
-        {
-            let state = self.jobs.get_mut(&job_id).unwrap();
-            state.status = JobStatus::Complete;
-        }
+        self.transition_completed_runtime(job_id);
         // Ensure DownloadFinished is journaled before JobCompleted so the
         // timeline shows an accurate download duration.
         if self.active_download_passes.remove(&job_id) {
@@ -772,7 +795,7 @@ impl Pipeline {
     }
 
     pub(super) async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {
-        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
+        self.transition_post_state(job_id, crate::jobs::model::PostState::Idle);
 
         if self.job_has_only_rar_archives(job_id) {
             let set_names: Vec<String> = self
@@ -784,6 +807,7 @@ impl Pipeline {
             for set_name in set_names {
                 let _ = self.recompute_rar_set_state(job_id, &set_name).await;
             }
+            self.reconcile_job_progress(job_id).await;
             self.try_rar_extraction(job_id).await;
             return;
         }
@@ -1066,7 +1090,12 @@ impl Pipeline {
             "re-queueing archive source files after extraction failure without PAR2"
         );
 
-        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
+        self.transition_runtime_state(
+            job_id,
+            crate::jobs::model::DownloadState::Downloading,
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+        );
         Ok(true)
     }
 }

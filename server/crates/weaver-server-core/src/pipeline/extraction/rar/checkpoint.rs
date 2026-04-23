@@ -392,4 +392,30 @@ impl Pipeline {
 
         Ok(size)
     }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "thin wrapper around finalized checkpoint path components"
+    )]
+    pub(crate) fn finalize_member_output_paths(
+        db: &crate::Database,
+        event_tx: &broadcast::Sender<PipelineEvent>,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+        partial_path: &std::path::Path,
+        out_path: &std::path::Path,
+        chunk_dir: &std::path::Path,
+    ) -> Result<u64, String> {
+        Self::finalize_member_output(FinalizeMemberContext {
+            db,
+            event_tx,
+            job_id,
+            set_name,
+            member_name,
+            partial_path,
+            out_path,
+            chunk_dir,
+        })
+    }
 }

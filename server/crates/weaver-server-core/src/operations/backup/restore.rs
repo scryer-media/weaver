@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use super::manifest::{BackupServiceError, RestoreOptions};
 use crate::settings::Config;
-use crate::{Database, HistoryFilter, JobInfo, JobStatus};
+use crate::{
+    Database, HistoryFilter, JobInfo, JobStatus, job_status_from_persisted_str,
+    runtime_lanes_from_status_snapshot,
+};
 
 pub(crate) fn rewrite_backup_db_for_restore(
     backup_db_path: &Path,
@@ -145,31 +148,16 @@ pub(crate) async fn load_history_snapshot(
 }
 
 fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
-    let status = match row.status.as_str() {
-        "downloading" => JobStatus::Downloading,
-        "verifying" => JobStatus::Verifying,
-        "queued_repair" | "repairing" => JobStatus::QueuedRepair,
-        "queued_extract" | "extracting" => JobStatus::QueuedExtract,
-        "complete" => JobStatus::Complete,
-        "failed" => JobStatus::Failed {
-            error: row
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "unknown error".into()),
-        },
-        "paused" => JobStatus::Paused,
-        "cancelled" => JobStatus::Failed {
-            error: "cancelled".into(),
-        },
-        other => JobStatus::Failed {
-            error: format!("unknown status: {other}"),
-        },
-    };
+    let status = job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+    let (download_state, post_state, run_state) = runtime_lanes_from_status_snapshot(&status);
 
     JobInfo {
         job_id: crate::jobs::ids::JobId(row.job_id),
         name: row.name,
         status: status.clone(),
+        download_state,
+        post_state,
+        run_state,
         progress: 1.0,
         total_bytes: row.total_bytes,
         downloaded_bytes: row.downloaded_bytes,
@@ -190,5 +178,57 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
             None
         },
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::job_info_from_history;
+
+    #[test]
+    fn history_snapshot_preserves_repairing_and_moving_status_shapes() {
+        let repairing = job_info_from_history(crate::JobHistoryRow {
+            job_id: 1,
+            name: "repairing".into(),
+            status: "repairing".into(),
+            error_message: None,
+            total_bytes: 1,
+            downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+        });
+        assert_eq!(repairing.status, crate::JobStatus::Repairing);
+        assert_eq!(repairing.download_state, crate::DownloadState::Complete);
+        assert_eq!(repairing.post_state, crate::PostState::Repairing);
+
+        let moving = job_info_from_history(crate::JobHistoryRow {
+            job_id: 2,
+            name: "moving".into(),
+            status: "moving".into(),
+            error_message: None,
+            total_bytes: 1,
+            downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+        });
+        assert_eq!(moving.status, crate::JobStatus::Moving);
+        assert_eq!(moving.download_state, crate::DownloadState::Complete);
+        assert_eq!(moving.post_state, crate::PostState::Finalizing);
     }
 }
