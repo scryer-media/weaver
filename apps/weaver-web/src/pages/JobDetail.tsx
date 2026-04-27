@@ -195,6 +195,7 @@ export function JobDetail() {
     && job.downloadedBytes < job.totalBytes
     && optionalRecoveryBytes === 0
     && optionalRecoveryDownloadedBytes === 0;
+  const canRestart = job.status === "COMPLETE" || job.status === "FAILED";
   const savedBandwidthDetail =
     savedBandwidthBytes > 0
       ? t("job.savedBandwidthSkipped")
@@ -222,7 +223,7 @@ export function JobDetail() {
                 {t("action.pause")}
               </Button>
             ) : null}
-            {job.status === "FAILED" ? (
+            {canRestart ? (
               <>
                 <Button
                   variant="outline"

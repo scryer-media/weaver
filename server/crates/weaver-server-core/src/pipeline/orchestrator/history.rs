@@ -274,12 +274,12 @@ impl Pipeline {
             health,
             category: state.spec.category.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
-            nzb_path: matches!(state.status, JobStatus::Failed { .. }).then(|| {
+            nzb_path: Some(
                 self.nzb_dir
                     .join(format!("{}.nzb", job_id.0))
                     .display()
-                    .to_string()
-            }),
+                    .to_string(),
+            ),
             created_at,
             completed_at: now,
             metadata: if state.spec.metadata.is_empty() {
@@ -320,16 +320,9 @@ impl Pipeline {
             created_at_epoch_ms: state.created_at_epoch_ms,
         });
 
-        let nzb_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
         if let Err(e) = self.db.archive_job(job_id, &row) {
             tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
             return;
-        }
-        if !matches!(state.status, JobStatus::Failed { .. })
-            && let Err(e) = std::fs::remove_file(&nzb_path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %nzb_path.display(), error = %e, "failed to remove NZB file");
         }
         self.purge_terminal_job_runtime(job_id);
     }

@@ -54,14 +54,14 @@ impl JobsMutation {
         handle.cancel_job(JobId(id)).await?;
         Ok(true)
     }
-    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     #[graphql(guard = "ControlGuard")]
     async fn reprocess_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.reprocess_job(JobId(id)).await?;
         Ok(true)
     }
-    /// Re-download a failed job from its persisted NZB under the same job ID.
+    /// Re-download a completed or failed job from its persisted NZB under the same job ID.
     #[graphql(guard = "ControlGuard")]
     async fn redownload_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;

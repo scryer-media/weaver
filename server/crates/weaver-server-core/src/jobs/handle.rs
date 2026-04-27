@@ -225,12 +225,12 @@ pub enum SchedulerCommand {
         complete_dir: PathBuf,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     ReprocessJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Re-download a failed job from its persisted NZB under the same job ID.
+    /// Re-download a completed or failed job from its persisted NZB under the same job ID.
     RedownloadJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
@@ -382,7 +382,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Reprocess a failed job (re-run post-download stages without re-downloading).
+    /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -392,7 +392,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Re-download a failed job from its persisted NZB under the same job ID.
+    /// Re-download a completed or failed job from its persisted NZB under the same job ID.
     pub async fn redownload_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx

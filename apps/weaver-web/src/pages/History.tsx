@@ -390,7 +390,7 @@ export function History() {
   }
 
   function renderActions(job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) {
-    const isFailed = job.status === "FAILED";
+    const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
     const actionsBusy =
       deleteState.fetching
       || deleteBatchFetching
@@ -400,7 +400,7 @@ export function History() {
 
     return (
       <div className="flex justify-end gap-0.5">
-        {isFailed ? (
+        {isRestartable ? (
           <>
             <Button
               variant="ghost"
