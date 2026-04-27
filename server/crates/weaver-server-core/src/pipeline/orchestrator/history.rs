@@ -292,6 +292,8 @@ impl Pipeline {
         self.finished_jobs.retain(|j| j.job_id != job_id);
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             state.assembly.optional_recovery_bytes();
+        let (download_state, post_state, run_state) =
+            crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
         self.finished_jobs.push(JobInfo {
             job_id,
             name: state.spec.name.clone(),
@@ -301,9 +303,9 @@ impl Pipeline {
                 None
             },
             status: state.status.clone(),
-            download_state: state.download_state,
-            post_state: state.post_state,
-            run_state: state.run_state,
+            download_state,
+            post_state,
+            run_state,
             progress: Self::effective_progress(state),
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),

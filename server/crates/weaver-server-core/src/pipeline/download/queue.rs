@@ -89,6 +89,10 @@ impl DownloadQueue {
         self.heap.iter().any(|item| item.0.work.is_recovery)
     }
 
+    pub fn has_primary_work(&self) -> bool {
+        self.heap.iter().any(|item| !item.0.work.is_recovery)
+    }
+
     /// Remove and return all queued segments.
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
         self.heap.drain().map(|Reverse(pw)| pw.work).collect()

@@ -1286,6 +1286,37 @@ fn open_multi(dir: &str, filenames: &[&str]) -> weaver_rar::RarArchive {
     weaver_rar::RarArchive::open_volumes(readers).unwrap()
 }
 
+fn streaming_prefix_len_with_available_volumes(
+    dir: &str,
+    filenames: &[&str],
+    available_volumes: usize,
+    password: Option<&str>,
+) -> usize {
+    let mut archive = open_multi(dir, filenames);
+    if let Some(password) = password {
+        archive.set_password(password);
+    }
+
+    let paths: Vec<_> = filenames.iter().map(|name| fixture(dir, name)).collect();
+    let provider = weaver_rar::StaticVolumeProvider::from_ordered(
+        paths[..available_volumes].to_vec(),
+    );
+    let options = weaver_rar::ExtractOptions {
+        verify: false,
+        password: password.map(str::to_owned),
+    };
+    let mut out = Vec::new();
+    let result = archive.extract_member_streaming(0, &options, &provider, &mut out);
+
+    if available_volumes == filenames.len() {
+        result.unwrap();
+    } else {
+        assert!(result.is_err());
+    }
+
+    out.len()
+}
+
 // -- RAR5 unencrypted (fast) --------------------------------------------------
 
 #[test]
@@ -1475,6 +1506,62 @@ fn test_rar5_fixture_multivolume_video_streaming() {
         .extract_member_streaming(0, &opts, &provider, &mut out)
         .unwrap();
     assert_eq!(out, original("test_clip.mkv"));
+}
+
+#[test]
+fn test_rar5_fixture_multivolume_video_chunked_matches_prefix_deltas() {
+    let vol_names = [
+        "rar5_mv_video.part1.rar",
+        "rar5_mv_video.part2.rar",
+        "rar5_mv_video.part3.rar",
+        "rar5_mv_video.part4.rar",
+        "rar5_mv_video.part5.rar",
+    ];
+    let mut archive = open_multi("rar5", &vol_names);
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: None,
+    };
+    let paths: Vec<_> = vol_names.iter().map(|name| fixture("rar5", name)).collect();
+    let provider = weaver_rar::StaticVolumeProvider::from_ordered(paths.clone());
+
+    let chunk_dir = tempfile::tempdir().unwrap();
+    let mut chunk_paths = std::collections::BTreeMap::new();
+    let chunk_records = archive
+        .extract_member_streaming_chunked(0, &options, &provider, |volume_index| {
+            let path = chunk_dir.path().join(format!("vol{volume_index:03}.chunk"));
+            chunk_paths.insert(volume_index, path.clone());
+            std::fs::File::create(path)
+                .map(|file| Box::new(file) as Box<dyn std::io::Write>)
+                .map_err(weaver_rar::RarError::Io)
+        })
+        .unwrap();
+
+    let mut actual_sizes = vec![0u64; vol_names.len()];
+    for (volume_index, bytes_written) in chunk_records {
+        actual_sizes[volume_index] = bytes_written;
+        let data = std::fs::read(chunk_paths.get(&volume_index).unwrap()).unwrap();
+        assert_eq!(data.len() as u64, bytes_written);
+    }
+
+    let mut prefix_lengths = Vec::with_capacity(vol_names.len());
+    for available_volumes in 1..=vol_names.len() {
+        prefix_lengths.push(streaming_prefix_len_with_available_volumes(
+            "rar5",
+            &vol_names,
+            available_volumes,
+            None,
+        ));
+    }
+
+    let mut expected_sizes = Vec::with_capacity(vol_names.len());
+    let mut previous_prefix = 0usize;
+    for prefix_len in prefix_lengths {
+        expected_sizes.push((prefix_len - previous_prefix) as u64);
+        previous_prefix = prefix_len;
+    }
+
+    assert_eq!(actual_sizes, expected_sizes);
 }
 
 #[test]

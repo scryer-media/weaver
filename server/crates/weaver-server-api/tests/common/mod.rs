@@ -119,6 +119,8 @@ pub struct TestHarness {
     pub handle: SchedulerHandle,
     pub config: SharedConfig,
     pub db: Database,
+    pub metrics: Arc<PipelineMetrics>,
+    pub shared_state: SharedPipelineState,
     pub auth_cache: LoginAuthCache,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
@@ -147,7 +149,7 @@ impl TestHarness {
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
-        let (handle, scheduler_task) = spawn_test_scheduler();
+        let (handle, metrics, shared_state, scheduler_task) = spawn_test_scheduler();
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
         let auth_cache = LoginAuthCache::from_credentials(None);
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
@@ -171,6 +173,8 @@ impl TestHarness {
             handle,
             config: shared_config,
             db,
+            metrics,
+            shared_state,
             auth_cache,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
@@ -317,13 +321,19 @@ pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
 
 /// Spawn a mock scheduler that handles commands without performing real
 /// downloads. Returns the handle and the background task.
-fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
+fn spawn_test_scheduler() -> (
+    SchedulerHandle,
+    Arc<PipelineMetrics>,
+    SharedPipelineState,
+    JoinHandle<()>,
+) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
     let (event_tx, _) = broadcast::channel(256);
     let metrics = PipelineMetrics::new();
-    let shared_state = SharedPipelineState::new(metrics, vec![]);
+    let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
 
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    let scheduler_state = shared_state.clone();
 
     let task = tokio::spawn(async move {
         let mut jobs: HashMap<JobId, JobState> = HashMap::new();
@@ -339,7 +349,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     if jobs.contains_key(&job_id) {
                         let _ =
                             reply.send(Err(weaver_server_core::SchedulerError::JobExists(job_id)));
-                        shared_state.publish_jobs(build_job_list(&jobs));
+                        scheduler_state.publish_jobs(build_job_list(&jobs));
                         continue;
                     }
                     let assembly = JobAssembly::new(job_id);
@@ -360,6 +370,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_status: None,
                         paused_resume_download_state: None,
                         paused_resume_post_state: None,
                         failure_error,
@@ -427,11 +438,11 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                     let _ = reply.send(result);
                 }
                 SchedulerCommand::PauseAll { reply } => {
-                    shared_state.set_paused(true);
+                    scheduler_state.set_paused(true);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::ResumeAll { reply } => {
-                    shared_state.set_paused(false);
+                    scheduler_state.set_paused(false);
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetSpeedLimit { reply, .. } => {
@@ -477,6 +488,7 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_status: None,
                         paused_resume_download_state: None,
                         paused_resume_post_state: None,
                         failure_error,
@@ -564,11 +576,11 @@ fn spawn_test_scheduler() -> (SchedulerHandle, JoinHandle<()>) {
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
-            shared_state.publish_jobs(build_job_list(&jobs));
+            scheduler_state.publish_jobs(build_job_list(&jobs));
         }
     });
 
-    (handle, task)
+    (handle, metrics, shared_state, task)
 }
 
 fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {

@@ -26,7 +26,7 @@ const FACADE_QUEUE_ITEM_FIELDS = `
   }
 `;
 
-const FACADE_HISTORY_ITEM_FIELDS = `
+export const FACADE_HISTORY_ITEM_FIELDS = `
   fragment FacadeHistoryItemFields on HistoryItem {
     id
     name
@@ -55,7 +55,7 @@ const FACADE_HISTORY_ITEM_FIELDS = `
   }
 `;
 
-const PARSED_RELEASE_FIELDS = `
+export const PARSED_RELEASE_FIELDS = `
   fragment ParsedReleaseFields on ParsedRelease {
     normalizedTitle
     releaseGroup
@@ -326,16 +326,16 @@ const RSS_SEEN_ITEM_FIELDS = `
 
 export const JOBS_PAGE_QUERY = gql`
   query JobsPage {
-    jobs: queueItems {
-      ...FacadeQueueItemFields
-    }
-    metrics: queueSummary {
-      currentDownloadSpeed
-    }
-    globalState: globalQueueState {
-      isPaused
-      downloadBlock {
-        ...DownloadBlockFields
+    queueSnapshot {
+      items {
+        ...FacadeQueueItemFields
+      }
+      latestCursor
+      globalState {
+        isPaused
+        downloadBlock {
+          ...DownloadBlockFields
+        }
       }
     }
   }
@@ -346,25 +346,58 @@ export const JOBS_PAGE_QUERY = gql`
 
 export const JOB_QUERY = gql`
   query Job($id: Int!) {
-    queueItem(id: $id) {
-      ...FacadeQueueItemFields
-      error
-      outputDir
-      createdAt
+    jobDetailSnapshot(jobId: $id) {
+      queueItem {
+        ...FacadeQueueItemFields
+        error
+        outputDir
+        createdAt
+      }
+      historyItem {
+        ...FacadeHistoryItemFields
+        error
+      }
+      jobTimeline {
+        ...JobTimelineFields
+      }
+      jobEvents {
+        kind
+        jobId
+        fileId
+        message
+        timestamp
+      }
     }
-    historyItem(id: $id) {
-      ...FacadeHistoryItemFields
-      error
-    }
-    jobTimeline(jobId: $id) {
-      ...JobTimelineFields
-    }
-    jobEvents(jobId: $id) {
-      kind
-      jobId
-      fileId
-      message
-      timestamp
+  }
+  ${JOB_TIMELINE_FIELDS}
+  ${PARSED_RELEASE_FIELDS}
+  ${FACADE_QUEUE_ITEM_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
+`;
+
+export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
+  subscription JobDetailUpdates($id: Int!) {
+    jobDetailUpdates(jobId: $id) {
+      queueItem {
+        ...FacadeQueueItemFields
+        error
+        outputDir
+        createdAt
+      }
+      historyItem {
+        ...FacadeHistoryItemFields
+        error
+      }
+      jobTimeline {
+        ...JobTimelineFields
+      }
+      jobEvents {
+        kind
+        jobId
+        fileId
+        message
+        timestamp
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -395,6 +428,21 @@ export const METRICS_PAGE_QUERY = gql`
     }
   }
   ${METRICS_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const LIVE_METRICS_QUERY = gql`
+  query LiveMetrics {
+    metrics: systemMetrics {
+      currentDownloadSpeed
+    }
+    globalState: globalQueueState {
+      isPaused
+      downloadBlock {
+        ...DownloadBlockFields
+      }
+    }
+  }
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
@@ -531,9 +579,50 @@ export const JOB_UPDATES_SUBSCRIPTION = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+export const QUEUE_EVENTS_SUBSCRIPTION = gql`
+  subscription QueueEvents($after: String) {
+    queueEvents(after: $after) {
+      cursor
+      kind
+      itemId
+      state
+      previousState
+      item {
+        ...FacadeQueueItemFields
+      }
+      globalState {
+        isPaused
+        downloadBlock {
+          ...DownloadBlockFields
+        }
+      }
+    }
+  }
+  ${PARSED_RELEASE_FIELDS}
+  ${FACADE_QUEUE_ITEM_FIELDS}
+  ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const LIVE_METRICS_SUBSCRIPTION = gql`
+  subscription LiveMetricsUpdates {
+    systemMetricsUpdates {
+      metrics {
+        currentDownloadSpeed
+      }
+      globalState {
+        isPaused
+        downloadBlock {
+          ...DownloadBlockFields
+        }
+      }
+    }
+  }
+  ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
 export const METRICS_PAGE_SUBSCRIPTION = gql`
   subscription MetricsPageUpdates {
-    queueSnapshots {
+    systemMetricsUpdates {
       metrics {
         ...MetricsFields
       }

@@ -72,6 +72,53 @@ impl JobsQuery {
             .collect();
         Ok(queue_summary(&items, &handle.get_metrics()))
     }
+    /// Atomic queue bootstrap snapshot for initial page load and reconnect polling.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_snapshot(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<QueueFilterInput>,
+    ) -> Result<QueueSnapshot> {
+        let handle = ctx.data::<SchedulerHandle>()?.clone();
+        let db = ctx.data::<Database>()?.clone();
+        let config = ctx.data::<SharedConfig>()?.clone();
+
+        let items: Vec<QueueItem> = handle
+            .list_jobs()
+            .into_iter()
+            .filter(|info| {
+                !matches!(
+                    info.status,
+                    weaver_server_core::JobStatus::Complete
+                        | weaver_server_core::JobStatus::Failed { .. }
+                )
+            })
+            .map(|info| queue_item_from_job(&info))
+            .filter(|item| matches_queue_filter(item, filter.as_ref()))
+            .collect();
+        let metrics = handle.get_metrics();
+        let latest_cursor = tokio::task::spawn_blocking(move || db.latest_integration_event_id())
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .flatten()
+            .map(encode_event_cursor)
+            .unwrap_or_else(|| encode_event_cursor(0));
+        let cfg = config.read().await;
+
+        Ok(QueueSnapshot {
+            summary: queue_summary(&items, &metrics),
+            metrics: metrics_from_snapshot(&metrics),
+            global_state: global_queue_state(
+                handle.is_globally_paused(),
+                &handle.get_download_block(),
+                cfg.max_download_speed.unwrap_or(0),
+            ),
+            items,
+            latest_cursor,
+            generated_at: chrono::Utc::now(),
+        })
+    }
     /// Current global queue state facade.
     #[graphql(guard = "ReadGuard")]
     async fn global_queue_state(&self, ctx: &Context<'_>) -> Result<GlobalQueueState> {
@@ -83,6 +130,17 @@ impl JobsQuery {
             &handle.get_download_block(),
             cfg.max_download_speed.unwrap_or(0),
         ))
+    }
+    /// Cursor for replaying queue events from a bootstrap snapshot.
+    #[graphql(guard = "ReadGuard")]
+    async fn latest_queue_cursor(&self, ctx: &Context<'_>) -> Result<String> {
+        let db = ctx.data::<Database>()?.clone();
+        let latest = tokio::task::spawn_blocking(move || db.latest_integration_event_id())
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+
+        Ok(encode_event_cursor(latest.unwrap_or(0)))
     }
     /// List jobs, optionally filtered by status, category, or metadata key.
     /// Supports pagination via `limit` and `offset`.

@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { ChevronDown, ChevronRight, Pause, Pencil, Play, X } from "lucide-react";
-import { useMutation, useQuery } from "urql";
+import { useClient, useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
   PAUSE_ALL_MUTATION,
@@ -10,8 +10,8 @@ import {
   RESUME_JOB_MUTATION,
   SERVERS_QUERY,
   SET_SPEED_LIMIT_MUTATION,
-  UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
+import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import { BulkEditModal } from "@/components/BulkEditModal";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -24,6 +24,7 @@ import { UploadModal } from "@/components/UploadModal";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
+import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -60,80 +61,6 @@ function formatJobPriority(priority: "LOW" | "NORMAL" | "HIGH") {
   return "Normal";
 }
 
-function formatEta(remainingBytes: number, speed: number): string {
-  if (speed <= 0 || remainingBytes <= 0) return "\u2014";
-  const secs = Math.ceil(remainingBytes / speed);
-  if (secs < 60) return `${secs}s`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
-  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
-}
-
-const ETA_UPDATE_INTERVAL_MS = 2500;
-
-function buildQueueEtaById(
-  jobs: {
-    id: number;
-    status: string;
-    totalBytes: number;
-    downloadedBytes: number;
-  }[],
-  speed: number,
-): Map<number, string> {
-  const etaById = new Map<number, string>();
-  if (speed <= 0) {
-    return etaById;
-  }
-
-  let bytesAhead = 0;
-  for (const job of jobs) {
-    if (job.status !== "DOWNLOADING" && job.status !== "QUEUED") {
-      continue;
-    }
-    const remaining = Math.max(job.totalBytes - job.downloadedBytes, 0);
-    bytesAhead += remaining;
-    etaById.set(job.id, formatEta(bytesAhead, speed));
-  }
-
-  return etaById;
-}
-
-function useThrottledQueueEta(
-  jobs: {
-    id: number;
-    status: string;
-    totalBytes: number;
-    downloadedBytes: number;
-  }[],
-  speed: number,
-) {
-  const cache = useRef({
-    at: 0,
-    signature: "",
-    etaById: new Map<number, string>(),
-  });
-
-  const signature = jobs
-    .filter((job) => job.status === "DOWNLOADING" || job.status === "QUEUED")
-    .map((job) => `${job.id}:${job.status}:${job.totalBytes}`)
-    .join("|");
-
-  // Signature changed or speed dropped to zero — always refresh.
-  // Otherwise, throttle by checking elapsed time via the ref.
-  const signatureChanged = speed <= 0 || cache.current.signature !== signature;
-  // eslint-disable-next-line react-hooks/purity -- Date.now() is intentional for throttling
-  const stale = !signatureChanged && Date.now() - cache.current.at >= ETA_UPDATE_INTERVAL_MS;
-
-  if (signatureChanged || stale) {
-    cache.current = {
-      at: Date.now(), // eslint-disable-line react-hooks/purity
-      signature,
-      etaById: buildQueueEtaById(jobs, speed),
-    };
-  }
-
-  return cache.current.etaById;
-}
-
 function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {
   return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED");
 }
@@ -159,6 +86,7 @@ function formatResetAt(epochMs?: number | null) {
 }
 
 export function JobList() {
+  const client = useClient();
   const [serversResult] = useQuery({ query: SERVERS_QUERY });
   const hasNoServers = (serversResult.data?.servers?.length ?? 1) === 0;
 
@@ -174,7 +102,6 @@ export function JobList() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, setSpeedLimit] = useMutation(SET_SPEED_LIMIT_MUTATION);
-  const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
   const [uploadOpen, setUploadOpen] = useState(false);
   const [speedLimitOpen, setSpeedLimitOpen] = useState(false);
@@ -244,27 +171,67 @@ export function JobList() {
 
   const handleBulkEdit = async (category: string | null, priority: string | null) => {
     const ids = Array.from(selectedIds);
-    await updateJobs({ ids, category, priority });
-    setSelectedIds(new Set());
-    setBulkEditOpen(false);
+    if (ids.length === 0) {
+      return;
+    }
+
+    const result = await executeAliasedIdMutation<boolean>({
+      client,
+      ids,
+      operationName: "UpdateSelectedJobs",
+      aliasPrefix: "updateJob",
+      fieldName: "updateJobs",
+      sharedVariables: {
+        category: { type: "String", value: category },
+        priority: { type: "String", value: priority },
+      },
+      buildFieldArguments: (idVariable) =>
+        `ids: [${idVariable}], category: $category, priority: $priority`,
+    });
+    if (!result.error) {
+      setSelectedIds(new Set());
+      setBulkEditOpen(false);
+    }
   };
 
   const handleBulkPause = async () => {
-    for (const id of selectedIds) {
-      await pauseJob({ id });
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) {
+      return;
     }
-    setSelectedIds(new Set());
+
+    const result = await executeAliasedIdMutation<boolean>({
+      client,
+      ids,
+      operationName: "PauseSelectedJobs",
+      aliasPrefix: "pauseJob",
+      fieldName: "pauseJob",
+    });
+    if (!result.error) {
+      setSelectedIds(new Set());
+    }
   };
 
   const handleBulkCancel = async () => {
-    for (const id of selectedIds) {
-      await cancelJob({ id });
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) {
+      return;
     }
-    setSelectedIds(new Set());
+
+    const result = await executeAliasedIdMutation<boolean>({
+      client,
+      ids,
+      operationName: "CancelSelectedJobs",
+      aliasPrefix: "cancelJob",
+      fieldName: "cancelJob",
+    });
+    if (!result.error) {
+      setSelectedIds(new Set());
+    }
     setCancelSelectedConfirm(false);
   };
 
-  const queueEtaById = useThrottledQueueEta(jobs, speed);
+  const queueEtaById = useStableQueueEta(jobs, speed);
 
   return (
     <div className="space-y-6">

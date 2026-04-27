@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
-use weaver_rar::{RarArchive, RarVolumeFacts};
+use weaver_rar::{RarArchive, RarVolumeFacts, archive::MemberPlannerState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarSetPhase {
@@ -99,6 +99,36 @@ fn sort_dedup(values: &mut Vec<String>) {
     values.dedup();
 }
 
+#[derive(Default)]
+struct PlannerMemberReadiness {
+    entries: usize,
+    extractable: bool,
+    missing_volumes: HashSet<u32>,
+}
+
+impl PlannerMemberReadiness {
+    fn push(&mut self, state: MemberPlannerState) {
+        self.entries += 1;
+        self.extractable |= state.extractable;
+        self.missing_volumes.extend(
+            state
+                .missing_volumes
+                .into_iter()
+                .map(|volume| volume as u32),
+        );
+    }
+
+    fn is_extractable(&self) -> bool {
+        self.extractable && self.missing_volumes.is_empty()
+    }
+
+    fn missing_volumes(&self) -> Vec<u32> {
+        let mut missing = self.missing_volumes.iter().copied().collect::<Vec<_>>();
+        missing.sort_unstable();
+        missing
+    }
+}
+
 pub(crate) fn contiguous_prefix_end(facts: &BTreeMap<u32, RarVolumeFacts>) -> Option<u32> {
     if !facts.contains_key(&0) {
         return None;
@@ -152,23 +182,13 @@ pub(crate) fn build_plan(
 
     let metadata = archive.metadata();
     let topology_members = archive.topology_members();
-    let planner_states: HashMap<String, (bool, Vec<u32>)> = archive
-        .planner_member_states()
-        .into_iter()
-        .map(|state| {
-            (
-                state.name,
-                (
-                    state.extractable,
-                    state
-                        .missing_volumes
-                        .into_iter()
-                        .map(|volume| volume as u32)
-                        .collect(),
-                ),
-            )
-        })
-        .collect();
+    let mut planner_states = HashMap::<String, PlannerMemberReadiness>::new();
+    for state in archive.planner_member_states() {
+        planner_states
+            .entry(state.name.clone())
+            .or_default()
+            .push(state);
+    }
     topology.expected_volume_count = metadata.volume_count.map(|count| count as u32);
     let final_volume_seen = facts
         .get(&prefix_end)
@@ -176,7 +196,7 @@ pub(crate) fn build_plan(
     let missing_for_member = |member: &weaver_rar::MemberInfo| {
         let mut missing = planner_states
             .get(&member.name)
-            .map(|(_, missing)| missing.clone())
+            .map(PlannerMemberReadiness::missing_volumes)
             .unwrap_or_default();
         if final_volume_seen && member.volumes.last_volume as u32 == prefix_end {
             missing.retain(|volume| *volume <= prefix_end);
@@ -278,8 +298,7 @@ pub(crate) fn build_plan(
             }
             let extractable = planner_states
                 .get(&member.name)
-                .map(|(extractable, _)| *extractable)
-                .unwrap_or(false);
+                .is_some_and(PlannerMemberReadiness::is_extractable);
             if extractable {
                 if !failed.contains(&member.name) {
                     push_unique_ready_member(
@@ -303,8 +322,7 @@ pub(crate) fn build_plan(
             }
             let extractable = planner_states
                 .get(&member.name)
-                .map(|(extractable, _)| *extractable)
-                .unwrap_or(false);
+                .is_some_and(PlannerMemberReadiness::is_extractable);
             if extractable {
                 push_unique_ready_member(&mut ready_members, &mut ready_member_names, &member.name);
             } else {

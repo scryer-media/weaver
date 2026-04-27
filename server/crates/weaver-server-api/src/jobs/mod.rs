@@ -1,3 +1,4 @@
+pub(crate) mod release_display;
 pub mod types;
 
 pub use crate::schema::jobs_mutation as mutation;

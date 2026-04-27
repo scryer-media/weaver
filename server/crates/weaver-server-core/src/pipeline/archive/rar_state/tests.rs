@@ -412,6 +412,59 @@ fn build_plan_split_chain_gap_preserves_claims_from_both_halves() {
 }
 
 #[test]
+fn build_plan_duplicate_sanitized_gap_is_waiting_not_ready() {
+    let files = build_single_member_five_volume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    archive
+        .add_volume(1, Box::new(Cursor::new(files[1].1.clone())))
+        .unwrap();
+    archive
+        .add_volume(3, Box::new(Cursor::new(files[3].1.clone())))
+        .unwrap();
+    archive
+        .add_volume(4, Box::new(Cursor::new(files[4].1.clone())))
+        .unwrap();
+
+    let present_volumes = [0usize, 1, 3, 4];
+    let facts: BTreeMap<u32, RarVolumeFacts> = present_volumes
+        .iter()
+        .map(|&volume| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(files[volume].1.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    let volume_map = present_volumes
+        .iter()
+        .map(|&volume| (files[volume].0.clone(), volume as u32))
+        .collect();
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        plan.ready_members.is_empty(),
+        "duplicate unresolved E01 entries must not be scheduled: {:?}",
+        plan.ready_members
+    );
+    assert!(plan.waiting_on_volumes.contains(&2));
+    for volume in present_volumes {
+        assert!(
+            !plan.deletion_eligible.contains(&(volume as u32)),
+            "present volume {volume} must not be deletion-eligible while the member chain is unresolved"
+        );
+    }
+}
+
+#[test]
 fn build_plan_boundary_orphan_continuation_has_owner() {
     // Build the standard 4-volume set (E01 on vols 0-1, E02 on vols 2-3).
     // Add only vol 0 and vol 3 to the archive. Volume 3 has an E02.mkv

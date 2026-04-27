@@ -14,6 +14,119 @@ use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 impl Pipeline {
+    fn normalize_restored_download_state(
+        download_state: crate::jobs::model::DownloadState,
+        download_queue: &DownloadQueue,
+        recovery_queue: &DownloadQueue,
+    ) -> crate::jobs::model::DownloadState {
+        if !matches!(download_state, crate::jobs::model::DownloadState::Checking) {
+            return download_state;
+        }
+
+        if download_queue.is_empty() && recovery_queue.is_empty() {
+            crate::jobs::model::DownloadState::Complete
+        } else {
+            crate::jobs::model::DownloadState::Queued
+        }
+    }
+
+    fn restored_download_state_from_status(
+        status: &JobStatus,
+        download_queue: &DownloadQueue,
+        recovery_queue: &DownloadQueue,
+    ) -> crate::jobs::model::DownloadState {
+        let download_state = match status {
+            JobStatus::Queued => crate::jobs::model::DownloadState::Queued,
+            JobStatus::Checking => crate::jobs::model::DownloadState::Checking,
+            JobStatus::Complete | JobStatus::Moving => crate::jobs::model::DownloadState::Complete,
+            JobStatus::Failed { .. } => crate::jobs::model::DownloadState::Failed,
+            _ => {
+                if download_queue.is_empty() && recovery_queue.is_empty() {
+                    crate::jobs::model::DownloadState::Complete
+                } else {
+                    crate::jobs::model::DownloadState::Downloading
+                }
+            }
+        };
+        Self::normalize_restored_download_state(download_state, download_queue, recovery_queue)
+    }
+
+    fn normalize_restored_status(
+        status: JobStatus,
+        download_queue: &DownloadQueue,
+        recovery_queue: &DownloadQueue,
+    ) -> JobStatus {
+        if !matches!(status, JobStatus::Checking) {
+            return status;
+        }
+
+        if download_queue.is_empty() && recovery_queue.is_empty() {
+            JobStatus::Complete
+        } else {
+            JobStatus::Queued
+        }
+    }
+
+    fn normalize_paused_resume_status(paused_resume_status: Option<JobStatus>) -> Option<JobStatus> {
+        paused_resume_status.map(|status| match status {
+            JobStatus::Queued => JobStatus::Queued,
+            _ => JobStatus::Downloading,
+        })
+    }
+
+    fn scrub_restored_par2_file_identities(
+        file_identities: &mut HashMap<u32, ActiveFileIdentity>,
+    ) -> (HashSet<String>, HashSet<u32>) {
+        let mut stale_rar_sets = HashSet::new();
+        let mut refreshed_rar_files = HashSet::new();
+
+        for identity in file_identities.values_mut() {
+            if identity.classification_source != FileIdentitySource::Par2 {
+                continue;
+            }
+
+            let target_filename = identity
+                .canonical_filename
+                .as_deref()
+                .unwrap_or(identity.current_filename.as_str());
+            if identity.current_filename != target_filename {
+                continue;
+            }
+
+            let Some(canonical_classification) =
+                Self::canonical_archive_identity_from_filename(target_filename)
+            else {
+                continue;
+            };
+            if identity.classification.as_ref() == Some(&canonical_classification) {
+                continue;
+            }
+
+            if let Some(set_name) = identity.classification.as_ref().and_then(|classification| {
+                matches!(
+                    classification.kind,
+                    crate::jobs::assembly::DetectedArchiveKind::Rar
+                )
+                .then(|| classification.set_name.clone())
+            })
+                && canonical_classification.set_name != set_name
+            {
+                stale_rar_sets.insert(set_name);
+            }
+
+            if matches!(
+                canonical_classification.kind,
+                crate::jobs::assembly::DetectedArchiveKind::Rar
+            ) {
+                refreshed_rar_files.insert(identity.file_index);
+            }
+
+            identity.classification = Some(canonical_classification);
+        }
+
+        (stale_rar_sets, refreshed_rar_files)
+    }
+
     async fn load_history_row(
         &self,
         job_id: JobId,
@@ -317,6 +430,7 @@ impl Pipeline {
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
             queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             failure_error: None,
@@ -334,7 +448,7 @@ impl Pipeline {
             recovery_queue,
             staging_dir: None,
         };
-        state.refresh_legacy_status();
+        state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -514,6 +628,7 @@ impl Pipeline {
                 created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
                 queued_repair_at_epoch_ms: None,
                 queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
                 paused_resume_download_state: None,
                 paused_resume_post_state: None,
                 failure_error: None,
@@ -531,7 +646,7 @@ impl Pipeline {
                 recovery_queue,
                 staging_dir: None,
             };
-            state.refresh_legacy_status();
+            state.refresh_runtime_lanes_from_status();
             self.jobs.insert(job_id, state);
             if let Some(state) = self.jobs.get(&job_id) {
                 self.persist_file_identities(job_id, &state.file_identities);
@@ -558,11 +673,10 @@ impl Pipeline {
                 state.failed_bytes = 0;
                 file_identities = state.file_identities.clone();
             }
-            self.transition_runtime_state(
+            self.transition_postprocessing_status(
                 job_id,
-                crate::jobs::model::DownloadState::Downloading,
-                crate::jobs::model::PostState::Idle,
-                crate::jobs::model::RunState::Active,
+                JobStatus::Downloading,
+                Some("downloading"),
             );
             self.note_download_activity(job_id);
             self.persist_file_identities(job_id, &file_identities);
@@ -742,7 +856,17 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            state.assembly.files().map(|f| f.file_id()).collect()
+            state
+                .assembly
+                .files()
+                .filter(|file| {
+                    !matches!(
+                        self.classified_role_for_file(job_id, file),
+                        weaver_model::files::FileRole::RarVolume { .. }
+                    )
+                })
+                .map(|file| file.file_id())
+                .collect()
         };
 
         for file_id in files {
@@ -809,6 +933,7 @@ impl Pipeline {
         let committed_count = committed_segments.len();
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &committed_segments);
+        let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
 
         let committed_ref = &committed_segments;
         let mut downloaded_bytes = 0u64;
@@ -842,11 +967,30 @@ impl Pipeline {
         }
 
         let queue_depth = download_queue.len() + recovery_queue.len();
-        let file_identities = if file_identities.is_empty() {
+        let mut file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
             file_identities
         };
+        let (stale_rar_sets, refreshed_rar_files) =
+            Self::scrub_restored_par2_file_identities(&mut file_identities);
+        let paused_resume_status = matches!(status, JobStatus::Paused)
+            .then(|| {
+                paused_resume_status.clone().or_else(|| {
+                    paused_resume_download_state.zip(paused_resume_post_state).map(
+                        |(download_state, post_state)| {
+                            crate::jobs::model::derive_legacy_job_status(
+                                download_state,
+                                post_state,
+                                crate::jobs::model::RunState::Active,
+                                None,
+                            )
+                        },
+                    )
+                })
+            })
+            .flatten();
+        let paused_resume_status = Self::normalize_paused_resume_status(paused_resume_status);
         let restored_staging_dir = {
             let staging_dir = self.deterministic_extraction_staging_dir(job_id);
             tokio::fs::try_exists(&staging_dir)
@@ -867,21 +1011,17 @@ impl Pipeline {
             job_id,
             spec,
             status: status.clone(),
-            download_state: download_state.unwrap_or_else(|| match status {
-                JobStatus::Queued => crate::jobs::model::DownloadState::Queued,
-                JobStatus::Checking => crate::jobs::model::DownloadState::Checking,
-                JobStatus::Complete | JobStatus::Moving => {
-                    crate::jobs::model::DownloadState::Complete
-                }
-                JobStatus::Failed { .. } => crate::jobs::model::DownloadState::Failed,
-                _ => {
-                    if download_queue.is_empty() && recovery_queue.is_empty() {
-                        crate::jobs::model::DownloadState::Complete
-                    } else {
-                        crate::jobs::model::DownloadState::Downloading
-                    }
-                }
-            }),
+            download_state: Self::normalize_restored_download_state(
+                download_state.unwrap_or_else(|| {
+                    Self::restored_download_state_from_status(
+                        &status,
+                        &download_queue,
+                        &recovery_queue,
+                    )
+                }),
+                &download_queue,
+                &recovery_queue,
+            ),
             post_state: post_state.unwrap_or(match &status {
                 JobStatus::Queued => crate::jobs::model::PostState::Idle,
                 JobStatus::Verifying => crate::jobs::model::PostState::Verifying,
@@ -908,15 +1048,14 @@ impl Pipeline {
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms,
+            paused_resume_status: paused_resume_status.clone(),
             paused_resume_download_state: paused_resume_download_state.or_else(|| {
-                paused_resume_status.as_ref().map(|status| match status {
-                    JobStatus::Queued => crate::jobs::model::DownloadState::Queued,
-                    JobStatus::Checking => crate::jobs::model::DownloadState::Checking,
-                    JobStatus::Complete | JobStatus::Moving => {
-                        crate::jobs::model::DownloadState::Complete
-                    }
-                    JobStatus::Failed { .. } => crate::jobs::model::DownloadState::Failed,
-                    _ => crate::jobs::model::DownloadState::Downloading,
+                paused_resume_status.as_ref().map(|status| {
+                    Self::restored_download_state_from_status(
+                        status,
+                        &download_queue,
+                        &recovery_queue,
+                    )
                 })
             }),
             paused_resume_post_state: paused_resume_post_state.or_else(|| {
@@ -950,12 +1089,15 @@ impl Pipeline {
             recovery_queue,
             staging_dir: restored_staging_dir,
         };
-        state.refresh_legacy_status();
+        state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
         if let Some(state) = self.jobs.get(&job_id) {
             self.persist_file_identities(job_id, &state.file_identities);
+        }
+        for set_name in &stale_rar_sets {
+            self.clear_archive_set_for_source_retry(job_id, set_name);
         }
         self.apply_detected_archive_identities(job_id, &detected_archives);
         if !extracted_members.is_empty() {
@@ -988,16 +1130,28 @@ impl Pipeline {
             }
         }
         self.reload_metadata_from_disk(job_id).await;
+        for file_index in refreshed_rar_files {
+            self.refresh_archive_state_for_completed_file(
+                job_id,
+                NzbFileId { job_id, file_index },
+                false,
+            )
+            .await;
+        }
         self.reconcile_job_progress(job_id).await;
 
-        if self.jobs.get(&job_id).is_some_and(|state| {
-            matches!(state.post_state, crate::jobs::model::PostState::Repairing)
-        }) {
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| matches!(state.status, JobStatus::Repairing))
+        {
             self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
         }
-        if self.jobs.get(&job_id).is_some_and(|state| {
-            matches!(state.post_state, crate::jobs::model::PostState::Extracting)
-        }) {
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
+        {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -1024,17 +1178,13 @@ impl Pipeline {
             "job restored from journal"
         );
         if self.jobs.get(&job_id).is_some_and(|state| {
-            !matches!(state.run_state, crate::jobs::model::RunState::Paused)
-                && !matches!(
-                    state.post_state,
-                    crate::jobs::model::PostState::Finalizing
-                        | crate::jobs::model::PostState::Completed
-                        | crate::jobs::model::PostState::Failed
-                )
-                && !matches!(
-                    state.download_state,
-                    crate::jobs::model::DownloadState::Failed
-                )
+            !matches!(
+                state.status,
+                JobStatus::Paused
+                    | JobStatus::Moving
+                    | JobStatus::Complete
+                    | JobStatus::Failed { .. }
+            )
         }) {
             self.schedule_job_completion_check(job_id);
         }

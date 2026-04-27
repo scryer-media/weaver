@@ -95,6 +95,27 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Re-parse and replace the cached topology contribution for a volume.
+    ///
+    /// This is used after external placement correction swaps volume contents
+    /// while keeping the same filenames. Reader attachment is not enough in
+    /// that case because the cached member segments still describe the old
+    /// content at this volume index.
+    pub fn refresh_volume(&mut self, index: usize, reader: Box<dyn ReadSeek>) -> RarResult<()> {
+        self.remove_volume_segments(index);
+        self.add_volume(index, reader)
+    }
+
+    fn remove_volume_segments(&mut self, index: usize) {
+        for member in &mut self.members {
+            member
+                .segments
+                .retain(|segment| segment.volume_index != index);
+        }
+        self.members.retain(|member| !member.segments.is_empty());
+        self.reconcile_member_chains();
+    }
+
     /// Add a RAR4 volume incrementally.
     pub(super) fn add_volume_rar4(
         &mut self,

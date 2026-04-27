@@ -97,6 +97,17 @@ impl HistoryQuery {
             })
             .collect()
     }
+    /// Atomic snapshot for the job detail page.
+    #[graphql(guard = "ReadGuard")]
+    async fn job_detail_snapshot(
+        &self,
+        ctx: &Context<'_>,
+        job_id: u64,
+    ) -> Result<JobDetailSnapshot> {
+        let handle = ctx.data::<SchedulerHandle>()?.clone();
+        let db = ctx.data::<weaver_server_core::Database>()?.clone();
+        load_job_detail_snapshot(handle, db, job_id).await
+    }
     /// Get synthesized waterfall/timeline data for a job.
     async fn job_timeline(&self, ctx: &Context<'_>, job_id: u64) -> Result<Option<JobTimeline>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
@@ -142,6 +153,52 @@ impl HistoryQuery {
             })
             .collect())
     }
+}
+
+pub(crate) async fn load_job_detail_snapshot(
+    handle: SchedulerHandle,
+    db: weaver_server_core::Database,
+    job_id: u64,
+) -> Result<JobDetailSnapshot> {
+    let live_job = match handle.get_job(JobId(job_id)) {
+        Ok(info) => Some(info),
+        Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let (events, history) = tokio::task::spawn_blocking(move || {
+        let events = db.get_job_events(job_id)?;
+        let history = db.get_job_history(job_id)?;
+        Ok::<_, weaver_server_core::StateError>((events, history))
+    })
+    .await
+    .map_err(|error| async_graphql::Error::new(error.to_string()))?
+    .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+    let queue_item = live_job.as_ref().map(queue_item_from_job);
+    let history_item = history.as_ref().map(history_item_from_row);
+    let job_timeline = live_job
+        .as_ref()
+        .cloned()
+        .or_else(|| history.as_ref().map(job_info_from_history_row))
+        .map(|job| build_job_timeline(&job, history.as_ref(), &events));
+    let job_events = events
+        .into_iter()
+        .map(|event| JobEvent {
+            kind: event.kind.parse::<EventKind>().unwrap_or(EventKind::JobCreated),
+            job_id: event.job_id,
+            file_id: event.file_id,
+            message: event.message,
+            timestamp: event.timestamp as f64,
+        })
+        .collect();
+
+    Ok(JobDetailSnapshot {
+        queue_item,
+        history_item,
+        job_timeline,
+        job_events,
+    })
 }
 
 fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {

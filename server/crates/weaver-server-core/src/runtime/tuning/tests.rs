@@ -162,22 +162,6 @@ fn adjust_respects_minimums() {
 }
 
 #[test]
-fn pp_throttles_hdd_aggressively() {
-    let mut tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
-    assert_eq!(tuner.params().max_concurrent_downloads, 20);
-
-    let mut m = empty_metrics();
-    m.extract_active = 1;
-
-    // PP streak threshold is 2.
-    tuner.adjust(&m);
-    assert_eq!(tuner.params().max_concurrent_downloads, 20); // not yet
-    tuner.adjust(&m);
-    // HDD: reduced to baseline/4 = 20/4 = 5.
-    assert_eq!(tuner.params().max_concurrent_downloads, 5);
-}
-
-#[test]
 fn parse_max_concurrent_extractions_override_accepts_positive_values() {
     assert_eq!(
         parse_max_concurrent_extractions_override(Some("1")),
@@ -206,40 +190,6 @@ fn max_concurrent_extractions_honors_override() {
     let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
     tuner.max_concurrent_extractions_override = Some(1);
     assert_eq!(tuner.max_concurrent_extractions(), 1);
-}
-
-#[test]
-fn pp_throttles_ssd_gently() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
-    // SSD with 20 connections: max_concurrent_downloads = 20.
-    assert_eq!(tuner.params().max_concurrent_downloads, 20);
-
-    let mut m = empty_metrics();
-    m.verify_active = 2;
-
-    tuner.adjust(&m);
-    tuner.adjust(&m);
-    // SSD: reduced to baseline*3/4 = 20*3/4 = 15.
-    assert_eq!(tuner.params().max_concurrent_downloads, 15);
-}
-
-#[test]
-fn pp_restores_after_completion() {
-    let mut tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
-    assert_eq!(tuner.params().max_concurrent_downloads, 20);
-
-    // Trigger PP throttling.
-    let mut pp = empty_metrics();
-    pp.repair_active = 1;
-    tuner.adjust(&pp);
-    tuner.adjust(&pp);
-    assert_eq!(tuner.params().max_concurrent_downloads, 5);
-
-    // PP finishes.
-    let idle = empty_metrics();
-    tuner.adjust(&idle);
-    // Should restore to pre-PP value.
-    assert_eq!(tuner.params().max_concurrent_downloads, 20);
 }
 
 #[test]
@@ -286,30 +236,6 @@ fn recovery_slots_low_bandwidth() {
         tuner.adjust(&m);
     }
     assert_eq!(tuner.params().recovery_slots, 0);
-}
-
-#[test]
-fn no_idle_increase_during_pp() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(4), TEST_CONNECTIONS);
-    // Start: max_concurrent_downloads = 20.
-
-    // Reduce via decode pressure first.
-    let mut pressure = empty_metrics();
-    pressure.decode_pending = tuner.params().max_decode_queue + 10;
-    for _ in 0..3 {
-        tuner.adjust(&pressure);
-    }
-    let reduced = tuner.params().max_concurrent_downloads;
-
-    // Now PP is active with empty download queue — should NOT increase.
-    let mut pp_idle = empty_metrics();
-    pp_idle.extract_active = 1;
-    pp_idle.download_queue_depth = 0;
-    for _ in 0..5 {
-        tuner.adjust(&pp_idle);
-    }
-    // Should be PP-throttled, not increased.
-    assert!(tuner.params().max_concurrent_downloads <= reduced);
 }
 
 #[test]

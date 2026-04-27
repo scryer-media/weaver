@@ -13,6 +13,24 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) options: &'a weaver_rar::ExtractOptions,
 }
 
+fn summarize_extraction_chunks(
+    chunks: &[crate::ExtractionChunk],
+) -> Vec<(u32, u64, u64, u64, bool, bool)> {
+    chunks
+        .iter()
+        .map(|chunk| {
+            (
+                chunk.volume_index,
+                chunk.bytes_written,
+                chunk.start_offset,
+                chunk.end_offset,
+                chunk.verified,
+                chunk.appended,
+            )
+        })
+        .collect()
+}
+
 impl<'a> RarExtractionContext<'a> {
     pub(crate) fn new(
         volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -87,6 +105,26 @@ impl Pipeline {
             .into_iter()
             .filter(|chunk| chunk.member_name == member_name)
             .collect();
+        let existing_chunk_summary = summarize_extraction_chunks(&existing_chunks);
+        let partial_size = std::fs::metadata(&partial_path).ok().map(|meta| meta.len());
+        let out_size = std::fs::metadata(&out_path).ok().map(|meta| meta.len());
+        info!(
+            job_id = job_id.0,
+            set_name,
+            member = %member_name,
+            idx,
+            first_volume,
+            last_volume,
+            is_solid,
+            available_volumes = ?volume_paths.keys().copied().collect::<Vec<_>>(),
+            existing_chunk_rows = existing_chunks.len(),
+            existing_chunks = ?existing_chunk_summary,
+            partial_exists = partial_path.exists(),
+            partial_size,
+            out_exists = out_path.exists(),
+            out_size,
+            "RAR member extraction begin"
+        );
 
         if out_path.exists()
             && let Ok(Some(checkpoint)) = Self::validate_member_extraction_manifest(
@@ -104,6 +142,16 @@ impl Pipeline {
                 })?
                 .len();
             if checkpoint.next_offset >= unpacked_size && finalized_size == unpacked_size {
+                info!(
+                    job_id = job_id.0,
+                    set_name,
+                    member = %member_name,
+                    next_offset = checkpoint.next_offset,
+                    completed_volumes = ?checkpoint.completed_volumes,
+                    finalized_size,
+                    unpacked_size,
+                    "RAR member manifest already matches finalized output"
+                );
                 db.clear_member_chunks(job_id, set_name, &member_name)
                     .map_err(|e| format!("failed to clear extraction chunk rows: {e}"))?;
                 match std::fs::remove_dir_all(&chunk_dir) {
@@ -158,7 +206,8 @@ impl Pipeline {
                 member = %member_name,
                 temp_path = %partial_path.display(),
                 resumed_offset = checkpoint.next_offset,
-                completed_volumes = checkpoint.completed_volumes.len(),
+                completed_volumes = ?checkpoint.completed_volumes,
+                manifest = ?summarize_extraction_chunks(&checkpoint.manifest),
                 "resuming extraction from persisted checkpoint"
             );
         }
@@ -306,6 +355,30 @@ impl Pipeline {
             let _ = std::fs::remove_file(&partial_path);
             format!("failed to extract {member_name}: {error}")
         })?;
+        let chunk_total = chunk_records.iter().map(|(_, bytes_written)| *bytes_written).sum::<u64>();
+        let partial_size_after_extract = std::fs::metadata(&partial_path)
+            .ok()
+            .map(|meta| meta.len());
+        info!(
+            job_id = job_id.0,
+            set_name,
+            member = %member_name,
+            chunk_records = ?chunk_records,
+            chunk_total,
+            unpacked_size,
+            partial_size_after_extract,
+            "RAR member extraction produced chunk records"
+        );
+        if chunk_total != unpacked_size {
+            warn!(
+                job_id = job_id.0,
+                set_name,
+                member = %member_name,
+                chunk_total,
+                unpacked_size,
+                "RAR member chunk records do not sum to unpacked size"
+            );
+        }
 
         if let Some(error) = checkpoint.take_error() {
             let _ = std::fs::remove_file(&partial_path);
@@ -345,6 +418,15 @@ impl Pipeline {
                 return Err(error);
             }
         };
+        info!(
+            job_id = job_id.0,
+            set_name,
+            member = %member_name,
+            bytes_written,
+            unpacked_size,
+            out_path = %out_path.display(),
+            "RAR member extraction finalized"
+        );
 
         let _ = chunk_records;
 
@@ -356,6 +438,7 @@ impl Pipeline {
         volume_paths: std::collections::BTreeMap<u32, PathBuf>,
         password: Option<String>,
         cached_headers: Option<Vec<u8>>,
+        refresh_provided_volumes: bool,
     ) -> Result<weaver_rar::RarArchive, String> {
         let has_cached_headers = cached_headers.is_some();
         let mut archive = match cached_headers {
@@ -395,7 +478,18 @@ impl Pipeline {
                     ));
                 }
             };
-            if archive.has_volume(volume_number as usize) {
+            if has_cached_headers
+                && refresh_provided_volumes
+                && archive.has_volume(volume_number as usize)
+            {
+                archive
+                    .refresh_volume(volume_number as usize, Box::new(file))
+                    .map_err(|e| {
+                        format!(
+                            "failed to refresh RAR volume {volume_number} for set '{set_name}': {e}"
+                        )
+                    })?;
+            } else if archive.has_volume(volume_number as usize) {
                 archive.attach_volume_reader(volume_number as usize, Box::new(file));
             } else {
                 archive

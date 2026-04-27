@@ -44,6 +44,33 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
 }
 
 #[test]
+fn history_item_builds_when_release_parse_is_not_media() {
+    let row = JobHistoryRow {
+        job_id: 78,
+        name: "ubuntu-24.04.2-live-server-amd64".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/tmp/history".to_string()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: None,
+    };
+
+    let item = history_item_from_row(&row);
+
+    assert_eq!(item.display_title, "ubuntu-24 04 2-live-server-amd64");
+    assert_eq!(item.parsed_release, ParsedRelease::default());
+}
+
+#[test]
 fn history_filter_supports_exact_attribute_matches() {
     let row = JobHistoryRow {
         job_id: 88,

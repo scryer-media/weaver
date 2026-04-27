@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
 import {
@@ -20,11 +20,18 @@ import {
   requestGraphqlClientRestart,
   useGraphqlConnectionState,
 } from "@/graphql/client";
-import { JOB_UPDATES_SUBSCRIPTION, JOBS_PAGE_QUERY, VERSION_QUERY } from "@/graphql/queries";
+import {
+  JOB_UPDATES_SUBSCRIPTION,
+  JOBS_PAGE_QUERY,
+  LIVE_METRICS_QUERY,
+  LIVE_METRICS_SUBSCRIPTION,
+  VERSION_QUERY,
+} from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
-import { LiveDataContext } from "@/lib/context/live-data-context";
+import { LiveDataContext, type DownloadBlockState } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
+import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import {
   normalizeJobData,
   type GraphqlJobData,
@@ -50,85 +57,57 @@ const navItems = [
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
-interface RawSnapshot {
-  jobs: GraphqlJobData[];
-  metrics: { currentDownloadSpeed: number };
+interface QueueSnapshotPayload {
+  items: GraphqlJobData[];
+  latestCursor: string;
   globalState: {
     isPaused: boolean;
-    downloadBlock: {
-      kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP";
-      capEnabled: boolean;
-      period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
-      usedBytes: number;
-      limitBytes: number;
-      remainingBytes: number;
-      reservedBytes: number;
-      windowStartsAtEpochMs?: number | null;
-      windowEndsAtEpochMs?: number | null;
-      timezoneName: string;
-      scheduledSpeedLimit: number;
-    };
+    downloadBlock: DownloadBlockState;
   };
 }
 
 interface Snapshot {
   jobs: JobData[];
-  metrics: { currentDownloadSpeed: number };
+  latestCursor: string;
   globalState: {
     isPaused: boolean;
-    downloadBlock: {
-      kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP";
-      capEnabled: boolean;
-      period?: "DAILY" | "WEEKLY" | "MONTHLY" | null;
-      usedBytes: number;
-      limitBytes: number;
-      remainingBytes: number;
-      reservedBytes: number;
-      windowStartsAtEpochMs?: number | null;
-      windowEndsAtEpochMs?: number | null;
-      timezoneName: string;
-      scheduledSpeedLimit: number;
-    };
+    downloadBlock: DownloadBlockState;
   };
 }
 
-interface QueueSnapshotPayload {
-  items: GraphqlJobData[];
-  summary: { currentDownloadSpeed: number };
+interface LiveMetricsSnapshot {
+  metrics: { currentDownloadSpeed: number };
   globalState: Snapshot["globalState"];
 }
 
-function mapSnapshot(snapshot: RawSnapshot | undefined): Snapshot | undefined {
+const EMPTY_JOBS: JobData[] = [];
+const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
+  kind: "NONE",
+  capEnabled: false,
+  period: null,
+  usedBytes: 0,
+  limitBytes: 0,
+  remainingBytes: 0,
+  reservedBytes: 0,
+  windowStartsAtEpochMs: null,
+  windowEndsAtEpochMs: null,
+  timezoneName: "",
+  scheduledSpeedLimit: 0,
+};
+const DEFAULT_GLOBAL_STATE: Snapshot["globalState"] = {
+  isPaused: false,
+  downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
+};
+
+function mapQueueSnapshot(snapshot: QueueSnapshotPayload | undefined): Snapshot | undefined {
   if (!snapshot) {
     return undefined;
   }
 
   return {
-    ...snapshot,
-    jobs: (snapshot.jobs ?? []).map((job) => normalizeJobData(job)),
-  };
-}
-
-function mapQueueSnapshot(snapshot: QueueSnapshotPayload | undefined): RawSnapshot {
-  return {
-    jobs: snapshot?.items ?? [],
-    metrics: snapshot?.summary ?? { currentDownloadSpeed: 0 },
-    globalState: snapshot?.globalState ?? {
-      isPaused: false,
-      downloadBlock: {
-        kind: "NONE",
-        capEnabled: false,
-        period: null,
-        usedBytes: 0,
-        limitBytes: 0,
-        remainingBytes: 0,
-        reservedBytes: 0,
-        windowStartsAtEpochMs: null,
-        windowEndsAtEpochMs: null,
-        timezoneName: "",
-        scheduledSpeedLimit: 0,
-      },
-    },
+    latestCursor: snapshot.latestCursor,
+    globalState: snapshot.globalState,
+    jobs: (snapshot.items ?? []).map((job) => normalizeJobData(job)),
   };
 }
 
@@ -220,74 +199,99 @@ export function Layout() {
   const location = useLocation();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [polledSnapshot, setPolledSnapshot] = useState<RawSnapshot | undefined>();
+  const [polledSnapshot, setPolledSnapshot] = useState<QueueSnapshotPayload | undefined>();
+  const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
   const connectionState = useGraphqlConnectionState();
 
-  const [{ data: queryData }] = useQuery<RawSnapshot>({
+  const [{ data: queryData }] = useQuery<{ queueSnapshot: QueueSnapshotPayload }>({
     query: JOBS_PAGE_QUERY,
+  });
+  const [{ data: metricsQueryData }] = useQuery<LiveMetricsSnapshot>({
+    query: LIVE_METRICS_QUERY,
   });
   const [{ data: versionData }] = useQuery<{ version: string }>({
     query: VERSION_QUERY,
   });
-  const handleSubscription = useCallback(
-    (_prev: RawSnapshot | undefined, response: { queueSnapshots: QueueSnapshotPayload }) =>
-      mapQueueSnapshot(response.queueSnapshots),
-    [],
-  );
+  const [{ data: snapshotSubscriptionData }] = useSubscription<{
+    queueSnapshots: QueueSnapshotPayload;
+  }>({
+    query: JOB_UPDATES_SUBSCRIPTION,
+    pause: connectionState.status === "disconnected",
+  });
+  const [{ data: metricsSubscriptionData }] = useSubscription<{
+    systemMetricsUpdates: LiveMetricsSnapshot;
+  }>({
+    query: LIVE_METRICS_SUBSCRIPTION,
+    pause: connectionState.status === "disconnected",
+  });
 
-  const [{ data }] = useSubscription(
-    { query: JOB_UPDATES_SUBSCRIPTION },
-    handleSubscription,
-  );
-
-  const reconnectPolling = useReconnectPolling<RawSnapshot>({
+  const reconnectPolling = useReconnectPolling<{ queueSnapshot: QueueSnapshotPayload }>({
     enabled: connectionState.status === "disconnected",
     query: JOBS_PAGE_QUERY,
     onData: (nextSnapshot) => {
-      setPolledSnapshot(nextSnapshot);
+      setPolledSnapshot(nextSnapshot.queueSnapshot);
       requestGraphqlClientRestart();
+    },
+  });
+  const reconnectMetricsPolling = useReconnectPolling<LiveMetricsSnapshot>({
+    enabled: connectionState.status === "disconnected",
+    query: LIVE_METRICS_QUERY,
+    onData: (nextSnapshot) => {
+      setPolledMetrics(nextSnapshot);
     },
   });
 
   useEffect(() => {
-    if (connectionState.status === "connected") {
+    if (connectionState.status === "connected" && snapshotSubscriptionData?.queueSnapshots) {
       setPolledSnapshot(undefined);
     }
-  }, [connectionState.status]);
+  }, [connectionState.status, snapshotSubscriptionData]);
+
+  useEffect(() => {
+    if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
+      setPolledMetrics(undefined);
+    }
+  }, [connectionState.status, metricsSubscriptionData]);
 
   const snapshot = useMemo(
-    () => mapSnapshot(data ?? polledSnapshot ?? queryData),
-    [data, polledSnapshot, queryData],
+    () =>
+      mapQueueSnapshot(
+        polledSnapshot ?? snapshotSubscriptionData?.queueSnapshots ?? queryData?.queueSnapshot,
+      ),
+    [polledSnapshot, queryData, snapshotSubscriptionData],
   );
+
+  const snapshotJobs = snapshot?.jobs ?? EMPTY_JOBS;
+  const metricsSnapshot =
+    polledMetrics ?? metricsSubscriptionData?.systemMetricsUpdates ?? metricsQueryData;
+  const currentGlobalState =
+    metricsSnapshot?.globalState ?? snapshot?.globalState ?? DEFAULT_GLOBAL_STATE;
+  const isPolling = reconnectPolling.isPolling || reconnectMetricsPolling.isPolling;
   const liveData = useMemo(
     () => ({
-      jobs: snapshot?.jobs ?? [],
-      speed: snapshot?.metrics?.currentDownloadSpeed ?? 0,
-      isPaused: snapshot?.globalState?.isPaused ?? false,
-      downloadBlock: snapshot?.globalState?.downloadBlock ?? {
-        kind: "NONE",
-        capEnabled: false,
-        period: null,
-        usedBytes: 0,
-        limitBytes: 0,
-        remainingBytes: 0,
-        reservedBytes: 0,
-        windowStartsAtEpochMs: null,
-        windowEndsAtEpochMs: null,
-        timezoneName: "",
-        scheduledSpeedLimit: 0,
-      },
+      jobs: snapshotJobs,
+      speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
+      isPaused: currentGlobalState.isPaused,
+      downloadBlock: currentGlobalState.downloadBlock,
       connection: {
         status: connectionState.status,
         isDisconnected: connectionState.status === "disconnected",
-        isPolling: reconnectPolling.isPolling,
+        isPolling,
       },
     }),
-    [connectionState.status, reconnectPolling.isPolling, snapshot],
+    [
+      connectionState.status,
+      currentGlobalState.downloadBlock,
+      currentGlobalState.isPaused,
+      isPolling,
+      metricsSnapshot?.metrics?.currentDownloadSpeed,
+      snapshotJobs,
+    ],
   );
   const disconnectBannerMessage = liveData.connection.isPolling
     ? t("connection.pollingBody")
     : t("connection.retryingBody");
+  const titleEtaSpeed = useStableEtaSpeed(liveData.jobs, liveData.speed);
 
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
@@ -312,19 +316,14 @@ export function Layout() {
         (sum, job) => sum + (job.totalBytes - job.downloadedBytes),
         0,
       );
-      const etaSecs = remaining > 0 ? Math.ceil(remaining / liveData.speed) : 0;
-      let eta = "";
-      if (etaSecs > 0 && etaSecs < 360000) {
-        if (etaSecs < 60) eta = ` - ${etaSecs}s`;
-        else if (etaSecs < 3600) eta = ` - ${Math.floor(etaSecs / 60)}m ${etaSecs % 60}s`;
-        else eta = ` - ${Math.floor(etaSecs / 3600)}h ${Math.floor((etaSecs % 3600) / 60)}m`;
-      }
+      const formattedEta = formatEtaFromRemainingBytes(remaining, titleEtaSpeed);
+      const eta = formattedEta !== "\u2014" ? ` - ${formattedEta}` : "";
       document.title = `${formatSpeed(liveData.speed)}${eta} - Weaver`;
       return;
     }
 
     document.title = "Weaver";
-  }, [liveData]);
+  }, [liveData, titleEtaSpeed]);
 
   const isActive = (to: string) =>
     to === "/"

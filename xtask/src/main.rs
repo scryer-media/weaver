@@ -7,9 +7,11 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 use toml_edit::{DocumentMut, value};
 
 mod monitor;
@@ -22,6 +24,8 @@ const GREEN: &str = "\x1b[0;32m";
 const YELLOW: &str = "\x1b[1;33m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+const LSOF_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
+const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -101,6 +105,10 @@ struct DeployLocalArgs {
     /// Port to run the local Weaver server on (default: 9090).
     #[arg(long, short = 'p', default_value_t = 9090)]
     port: u16,
+    /// Skip the frontend and Rust release builds; reuse the existing
+    /// `target/release/weaver` binary as-is. Fails if that binary is missing.
+    #[arg(long)]
+    no_build: bool,
 }
 
 #[derive(Args)]
@@ -194,6 +202,11 @@ struct GhRelease {
     published_at: Option<String>,
 }
 
+#[derive(Default)]
+struct PortProbeState {
+    lsof_timed_out: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ctx = TaskContext::new();
@@ -280,6 +293,34 @@ fn run_capture(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn run_output_with_timeout(command: &mut Command, timeout: StdDuration) -> Result<Option<Output>> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(Some(child.wait_with_output()?));
+        }
+        if Instant::now() >= deadline {
+            terminate_child(&mut child);
+            return Ok(None);
+        }
+        thread::sleep(StdDuration::from_millis(25));
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let deadline = Instant::now() + StdDuration::from_millis(500);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(25));
+    }
+}
+
 fn read_pid_command_line(pid: &str) -> Result<Option<String>> {
     let output = Command::new("ps")
         .args(["-o", "command=", "-p", pid])
@@ -302,10 +343,32 @@ fn command_matches_local_weaver(command_line: &str, binaries: &[PathBuf]) -> boo
     })
 }
 
-fn list_port_pids(ctx: &TaskContext, port: u16) -> Result<Vec<String>> {
+fn list_port_pids(ctx: &TaskContext, port: u16, probe: &mut PortProbeState) -> Result<Vec<String>> {
+    if probe.lsof_timed_out {
+        if port_accepts_tcp(port) {
+            bail!(
+                "Port {port} is reachable, but a previous lsof check timed out. \
+                 Refusing to continue without a safe owner check."
+            );
+        }
+        return Ok(Vec::new());
+    }
+
     let mut lsof = ctx.command("lsof");
-    lsof.args(["-ti", &format!(":{port}")]);
-    let output = lsof.output()?;
+    lsof.args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"]);
+    let Some(output) = run_output_with_timeout(&mut lsof, LSOF_PORT_PROBE_TIMEOUT)? else {
+        probe.lsof_timed_out = true;
+        if port_accepts_tcp(port) {
+            bail!(
+                "Timed out while identifying the process listening on port {port}. \
+                 The port is reachable, so refusing to continue without a safe owner check."
+            );
+        }
+        println!(
+            "    lsof timed out while checking port {port}; no localhost listener detected, continuing."
+        );
+        return Ok(Vec::new());
+    };
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -315,6 +378,11 @@ fn list_port_pids(ctx: &TaskContext, port: u16) -> Result<Vec<String>> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+fn port_accepts_tcp(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, TCP_PORT_PROBE_TIMEOUT).is_ok()
 }
 
 fn signal_pids(ctx: &TaskContext, pids: &[String], signal: Option<&str>) -> Result<()> {
@@ -1200,6 +1268,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     let rust_log = build_rust_log(args.target.as_deref());
     let config_file = ctx.path("weaver.toml");
     let backup_dir = ctx.path("tmp/config-backups");
+    let mut port_probe = PortProbeState::default();
 
     if config_file.exists() {
         fs::create_dir_all(&backup_dir)?;
@@ -1230,7 +1299,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         signal_pids(ctx, &[pid], None)?;
     }
 
-    let initial_port_pids = list_port_pids(ctx, port)?;
+    let initial_port_pids = list_port_pids(ctx, port, &mut port_probe)?;
     let mut weaver_port_pids = BTreeSet::new();
     let mut foreign_port_owners = Vec::new();
     for pid in initial_port_pids {
@@ -1256,7 +1325,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
     signal_pids(ctx, &weaver_port_pids, None)?;
     thread::sleep(std::time::Duration::from_secs(1));
 
-    let remaining_weaver_pids = list_port_pids(ctx, port)?
+    let remaining_weaver_pids = list_port_pids(ctx, port, &mut port_probe)?
         .into_iter()
         .filter_map(|pid| match read_pid_command_line(&pid) {
             Ok(Some(command_line))
@@ -1273,7 +1342,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         signal_pids(ctx, &remaining_weaver_pids, Some("-9"))?;
         thread::sleep(std::time::Duration::from_secs(1));
     }
-    let remaining_port_pids = list_port_pids(ctx, port)?;
+    let remaining_port_pids = list_port_pids(ctx, port, &mut port_probe)?;
     if !remaining_port_pids.is_empty() {
         let owners = remaining_port_pids
             .into_iter()
@@ -1295,17 +1364,27 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    println!("==> Building frontend...");
-    let mut frontend = ctx.command_in("npm", &ctx.path("apps/weaver-web"));
-    frontend.args(["run", "build"]);
-    run_checked(&mut frontend)?;
+    if args.no_build {
+        if !binary.exists() {
+            bail!(
+                "--no-build requested but {} is missing; run a normal `cargo xtask deploy local` first to produce the release binary",
+                binary.display()
+            );
+        }
+        println!("==> Skipping frontend and release build (--no-build)");
+    } else {
+        println!("==> Building frontend...");
+        let mut frontend = ctx.command_in("npm", &ctx.path("apps/weaver-web"));
+        frontend.args(["run", "build"]);
+        run_checked(&mut frontend)?;
 
-    println!("==> Building release...");
-    let mut build = ctx.command_in("cargo", &ctx.repo_root);
-    build
-        .env("RUSTFLAGS", "-C target-cpu=native")
-        .args(["build", "--release", "-p", "weaver"]);
-    run_checked(&mut build)?;
+        println!("==> Building release...");
+        let mut build = ctx.command_in("cargo", &ctx.repo_root);
+        build
+            .env("RUSTFLAGS", "-C target-cpu=native")
+            .args(["build", "--release", "-p", "weaver"]);
+        run_checked(&mut build)?;
+    }
 
     println!(
         "==> Starting weaver (RUST_LOG={rust_log}, logging to {})...",
@@ -1325,18 +1404,19 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     let mut child = child.spawn()?;
-    thread::sleep(std::time::Duration::from_secs(2));
-    if child.try_wait()?.is_none() {
-        fs::write(&pid_file, format!("{}\n", child.id()))?;
-        println!("==> Weaver running (PID={}, port={port})", child.id());
-        println!("==> Log: tail -f {}", log_file.display());
-        let preview = tail_file(&log_file, 10)?;
-        if !preview.is_empty() {
-            println!("{preview}");
-        }
-        Ok(())
-    } else {
-        let tail = tail_file(&log_file, 20)?;
-        bail!("FAILED to start! Check {}\n{tail}", log_file.display());
+    let child_id = child.id();
+    if let Err(error) = wait_for_backend(child_id, port, &log_file) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
     }
+
+    fs::write(&pid_file, format!("{child_id}\n"))?;
+    println!("==> Weaver running (PID={child_id}, port={port})");
+    println!("==> Log: tail -f {}", log_file.display());
+    let preview = tail_file(&log_file, 10)?;
+    if !preview.is_empty() {
+        println!("{preview}");
+    }
+    Ok(())
 }

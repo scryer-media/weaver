@@ -39,10 +39,6 @@ pub struct RuntimeTuner {
     decode_pressure_streak: u32,
     /// Number of consecutive snapshots where download_queue_depth == 0.
     download_idle_streak: u32,
-    /// Number of consecutive snapshots where post-processing is active.
-    pp_active_streak: u32,
-    /// Saved max_concurrent_downloads before PP throttling (to restore after).
-    pre_pp_max_downloads: Option<usize>,
     /// Exponential moving average of download speed (bytes/sec).
     bandwidth_ema: f64,
 }
@@ -89,8 +85,6 @@ impl RuntimeTuner {
             total_connections,
             decode_pressure_streak: 0,
             download_idle_streak: 0,
-            pp_active_streak: 0,
-            pre_pp_max_downloads: None,
             bandwidth_ema: 0.0,
         }
     }
@@ -135,41 +129,6 @@ impl RuntimeTuner {
             changed = true;
         }
 
-        // --- Post-processing awareness ---
-        let pp_active =
-            metrics.verify_active > 0 || metrics.repair_active > 0 || metrics.extract_active > 0;
-
-        if pp_active {
-            self.pp_active_streak += 1;
-        } else if self.pp_active_streak > 0 {
-            // PP finished — restore download concurrency.
-            if let Some(saved) = self.pre_pp_max_downloads.take() {
-                self.current.max_concurrent_downloads = saved;
-                changed = true;
-            }
-            self.pp_active_streak = 0;
-        }
-
-        // Throttle downloads during PP. HDD needs aggressive reduction (disk
-        // contention between sequential writes and random reads kills throughput),
-        // SSD barely needs any.
-        const PP_STREAK_THRESHOLD: u32 = 2;
-        if self.pp_active_streak == PP_STREAK_THRESHOLD {
-            let baseline = self.max_downloads_limit();
-            if self.pre_pp_max_downloads.is_none() {
-                self.pre_pp_max_downloads = Some(self.current.max_concurrent_downloads);
-            }
-            let reduced = if self.is_fast_storage() {
-                (baseline * 3 / 4).max(1)
-            } else {
-                (baseline / 4).max(1)
-            };
-            if self.current.max_concurrent_downloads != reduced {
-                self.current.max_concurrent_downloads = reduced;
-                changed = true;
-            }
-        }
-
         // --- Decode pressure / idle streaks ---
         if metrics.decode_pending > self.current.max_decode_queue {
             self.decode_pressure_streak += 1;
@@ -192,7 +151,7 @@ impl RuntimeTuner {
             return true;
         }
 
-        if self.download_idle_streak >= STREAK_THRESHOLD && self.pre_pp_max_downloads.is_none() {
+        if self.download_idle_streak >= STREAK_THRESHOLD {
             let limit = self.max_downloads_limit();
             if self.current.max_concurrent_downloads < limit {
                 self.current.max_concurrent_downloads += 1;

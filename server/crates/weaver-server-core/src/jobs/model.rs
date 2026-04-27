@@ -356,7 +356,8 @@ pub fn runtime_lanes_from_status_snapshot(
 pub struct JobState {
     pub job_id: JobId,
     pub spec: JobSpec,
-    /// Backward-compatible legacy status cache derived from the runtime lanes.
+    /// Runtime status used by the pipeline choreography. The lane fields below
+    /// are compatibility projections and must not drive core lifecycle logic.
     pub status: JobStatus,
     pub download_state: DownloadState,
     pub post_state: PostState,
@@ -371,7 +372,9 @@ pub struct JobState {
     pub queued_repair_at_epoch_ms: Option<f64>,
     /// When this job most recently entered the bounded extraction queue.
     pub queued_extract_at_epoch_ms: Option<f64>,
-    /// Safe lane targets to restore when a paused job is resumed.
+    /// Safe status to restore when a paused job is resumed.
+    pub paused_resume_status: Option<JobStatus>,
+    /// Compatibility lane targets retained for v0.2.9-era persisted rows.
     pub paused_resume_download_state: Option<DownloadState>,
     pub paused_resume_post_state: Option<PostState>,
     /// Last terminal error associated with this job.
@@ -410,6 +413,14 @@ pub struct JobState {
 }
 
 impl JobState {
+    pub fn refresh_runtime_lanes_from_status(&mut self) {
+        let (download_state, post_state, run_state) =
+            runtime_lanes_from_status_snapshot(&self.status);
+        self.download_state = download_state;
+        self.post_state = post_state;
+        self.run_state = run_state;
+    }
+
     pub fn refresh_legacy_status(&mut self) {
         self.status = derive_legacy_job_status(
             self.download_state,
@@ -421,11 +432,9 @@ impl JobState {
 
     pub fn set_failure(&mut self, error: impl Into<String>) {
         let error = error.into();
-        self.failure_error = Some(error);
-        self.download_state = DownloadState::Failed;
-        self.post_state = PostState::Failed;
-        self.run_state = RunState::Active;
-        self.refresh_legacy_status();
+        self.failure_error = Some(error.clone());
+        self.status = JobStatus::Failed { error };
+        self.refresh_runtime_lanes_from_status();
     }
 }
 

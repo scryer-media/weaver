@@ -1,8 +1,68 @@
+use std::fs::File;
+use std::io::{self, Read};
 use std::time::Instant;
 
 use super::*;
 
 impl Pipeline {
+    pub(crate) fn yenc_name_matches_rewritten_source(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        yenc_name: &str,
+        current_filename: &str,
+    ) -> bool {
+        self.file_identity(job_id, file_id).is_some_and(|identity| {
+            identity.source_filename == yenc_name
+                && identity.current_filename == current_filename
+                && identity.source_filename != identity.current_filename
+        })
+    }
+
+    pub(crate) fn note_file_hash_chunk(&mut self, file_id: NzbFileId, file_offset: u64, data: &[u8]) {
+        if self.file_hash_reread_required.contains(&file_id) {
+            return;
+        }
+
+        let expected_offset = self
+            .file_hash_states
+            .get(&file_id)
+            .map(|state| state.bytes_fed())
+            .unwrap_or(0);
+        if expected_offset != file_offset {
+            self.mark_file_hash_reread_required(file_id);
+            return;
+        }
+
+        self.file_hash_states.entry(file_id).or_default().update(data);
+    }
+
+    pub(crate) fn mark_file_hash_reread_required(&mut self, file_id: NzbFileId) {
+        self.file_hash_states.remove(&file_id);
+        self.file_hash_reread_required.insert(file_id);
+    }
+
+    pub(crate) async fn finalize_completed_file_hash(
+        &mut self,
+        file_id: NzbFileId,
+        file_path: std::path::PathBuf,
+        total_bytes: u64,
+    ) -> Result<[u8; 16], String> {
+        let hash_state = self.file_hash_states.remove(&file_id);
+        let reread_required = self.file_hash_reread_required.remove(&file_id);
+        if !reread_required
+            && let Some(hash_state) = hash_state
+            && hash_state.bytes_fed() == total_bytes
+        {
+            return Ok(hash_state.finalize());
+        }
+
+        tokio::task::spawn_blocking(move || hash_file_md5(&file_path))
+            .await
+            .map_err(|error| format!("file hash task panicked: {error}"))?
+            .map_err(|error| format!("failed to hash completed file: {error}"))
+    }
+
     pub(crate) fn note_decode_started(&mut self, job_id: JobId) {
         *self.active_decodes_by_job.entry(job_id).or_default() += 1;
     }
@@ -483,6 +543,8 @@ impl Pipeline {
                     segment_id: segment.segment_id,
                 });
 
+                self.note_file_hash_chunk(file_id, file_offset, segment.data.as_slice());
+
                 self.segment_batch.push(CommittedSegment {
                     job_id,
                     file_index: segment.segment_id.file_id.file_index,
@@ -507,15 +569,16 @@ impl Pipeline {
 
                 if file_complete {
                     self.note_file_progress_floor(file_id, total_bytes, true);
+                    let file_path = working_dir.join(filename);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let leftovers = write_buf.flush_all();
                         if !leftovers.is_empty() {
+                            self.mark_file_hash_reread_required(file_id);
                             warn!(
                                 file_id = %file_id,
                                 leftover_segments = leftovers.len(),
                                 "file reached complete state with buffered decoded segments still pending; flushing directly"
                             );
-                            let file_path = working_dir.join(filename);
                             for (offset, buffered) in leftovers {
                                 let buffered_bytes = buffered.len_bytes();
                                 if let Err(e) = write_segment_to_disk(
@@ -537,13 +600,38 @@ impl Pipeline {
                         }
                     }
 
+                    let file_hash = match self
+                        .finalize_completed_file_hash(file_id, file_path.clone(), total_bytes)
+                        .await
+                    {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            warn!(file_id = %file_id, error = %error, "failed to persist real completed-file hash");
+                            [0u8; 16]
+                        }
+                    };
+
                     if !segment.yenc_name.is_empty() && segment.yenc_name != filename {
-                        warn!(
-                            job_id = job_id.0,
-                            assembly = %filename,
-                            yenc = %segment.yenc_name,
-                            "yEnc name disagrees with assembly filename"
-                        );
+                        if self.yenc_name_matches_rewritten_source(
+                            job_id,
+                            file_id,
+                            &segment.yenc_name,
+                            filename,
+                        ) {
+                            debug!(
+                                job_id = job_id.0,
+                                current = %filename,
+                                yenc = %segment.yenc_name,
+                                "yEnc name differs from current filename after file identity rewrite"
+                            );
+                        } else {
+                            warn!(
+                                job_id = job_id.0,
+                                assembly = %filename,
+                                yenc = %segment.yenc_name,
+                                "yEnc name disagrees with assembly filename"
+                            );
+                        }
                     }
 
                     info!(file_id = %file_id, filename = %filename, "file complete");
@@ -570,9 +658,10 @@ impl Pipeline {
                     {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
+                        let file_hash = file_hash;
                         if let Err(e) = self
                             .db_blocking(move |db| {
-                                db.complete_file(job_id, file_index, &fname, &[0u8; 16])
+                                db.complete_file(job_id, file_index, &fname, &file_hash)
                             })
                             .await
                         {
@@ -581,6 +670,8 @@ impl Pipeline {
                     }
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
+                    self.file_hash_states.remove(&file_id);
+                    self.file_hash_reread_required.remove(&file_id);
 
                     self.try_load_par2_metadata(job_id, file_id).await;
                     self.try_merge_par2_recovery(job_id, file_id).await;
@@ -604,4 +695,18 @@ impl Pipeline {
             }
         }
     }
+}
+
+fn hash_file_md5(path: &std::path::Path) -> io::Result<[u8; 16]> {
+    let mut file = File::open(path)?;
+    let mut hasher = weaver_par2::checksum::FileHashState::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(hasher.finalize())
 }

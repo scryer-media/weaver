@@ -29,8 +29,8 @@ export function MetricsPage() {
   });
   const handleSubscription = (
     _prev: MetricsPageData | undefined,
-    response: { queueSnapshots: MetricsPageData },
-  ) => response.queueSnapshots;
+    response: { systemMetricsUpdates: MetricsPageData },
+  ) => response.systemMetricsUpdates;
   const [{ data: subscriptionData }] = useSubscription(
     { query: METRICS_PAGE_SUBSCRIPTION },
     handleSubscription,
@@ -122,7 +122,7 @@ export function MetricsPage() {
             />
             <MetricTile
               label={t("metrics.downloadSpeed")}
-              value={<SpeedDisplay bytesPerSec={metrics.currentDownloadSpeed} className="text-base" />}
+              value={<SpeedDisplay bytesPerSec={liveData.speed} className="text-base" />}
             />
             <MetricTile label={t("metrics.activeJobs")} value={counts.active} />
             <MetricTile label={t("metrics.queuedJobs")} value={counts.queued} />

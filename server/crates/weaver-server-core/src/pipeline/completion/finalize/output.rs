@@ -108,12 +108,7 @@ impl Pipeline {
             )
         };
 
-        self.transition_runtime_state(
-            job_id,
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::Finalizing,
-            crate::jobs::model::RunState::Active,
-        );
+        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
         let _ = self
             .event_tx

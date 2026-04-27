@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::JobAssembly;
@@ -124,6 +126,31 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
         .collect()
 }
 
+#[test]
+fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
+    let metrics = PipelineMetrics::new();
+    let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
+
+    std::thread::sleep(Duration::from_millis(60));
+    metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+    shared_state.refresh_metrics_snapshot();
+
+    let initial = shared_state.metrics_snapshot();
+    assert!(initial.current_download_speed > 0);
+
+    for _ in 0..24 {
+        std::thread::sleep(Duration::from_millis(60));
+        let cached = shared_state.metrics_snapshot();
+        assert_eq!(cached.current_download_speed, initial.current_download_speed);
+    }
+
+    shared_state.refresh_metrics_snapshot();
+    let refreshed = shared_state.metrics_snapshot();
+    assert!(refreshed.current_download_speed < initial.current_download_speed);
+}
+
 /// Create a test scheduler handle with a minimal background loop.
 fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
@@ -166,6 +193,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_status: None,
                         paused_resume_download_state: None,
                         paused_resume_post_state: None,
                         failure_error,
@@ -283,6 +311,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
+                        paused_resume_status: None,
                         paused_resume_download_state: None,
                         paused_resume_post_state: None,
                         failure_error,

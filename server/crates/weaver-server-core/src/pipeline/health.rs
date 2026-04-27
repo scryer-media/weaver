@@ -146,7 +146,11 @@ impl Pipeline {
                     }
                 }
             }
-            self.transition_download_state(job_id, crate::jobs::model::DownloadState::Downloading);
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
         }
 
         // Evaluate health threshold — may abort the job on partial or final.
@@ -157,12 +161,11 @@ impl Pipeline {
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         let (staging_dir, released_repair, released_extract) =
             if let Some(state) = self.jobs.get_mut(&job_id) {
-                let released_repair =
-                    matches!(state.post_state, crate::jobs::model::PostState::Repairing);
-                let released_extract =
-                    matches!(state.post_state, crate::jobs::model::PostState::Extracting);
+                let released_repair = matches!(state.status, JobStatus::Repairing);
+                let released_extract = matches!(state.status, JobStatus::Extracting);
                 state.queued_repair_at_epoch_ms = None;
                 state.queued_extract_at_epoch_ms = None;
+                state.paused_resume_status = None;
                 state.paused_resume_download_state = None;
                 state.paused_resume_post_state = None;
                 state.set_failure(error.clone());
@@ -236,7 +239,7 @@ impl Pipeline {
             }
             None => return,
         }
-        self.transition_download_state(job_id, crate::jobs::model::DownloadState::Checking);
+        self.transition_postprocessing_status(job_id, JobStatus::Checking, Some("checking"));
 
         // Pull this job's segments out of its queues so the dispatcher skips it
         // and connections are freed for other jobs. Segments are restored (or
@@ -267,7 +270,11 @@ impl Pipeline {
                 state.last_health_probe_failed_bytes = state.failed_bytes;
                 state.health_probing = false;
             }
-            self.transition_download_state(job_id, crate::jobs::model::DownloadState::Downloading);
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
             return;
         }
 

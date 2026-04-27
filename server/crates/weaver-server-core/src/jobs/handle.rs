@@ -25,15 +25,18 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<Vec<JobInfo>>>,
     paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
+    metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
 }
 
 impl SharedPipelineState {
     pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
+        let metrics_snapshot = metrics.snapshot();
         Self {
             jobs: Arc::new(RwLock::new(initial_jobs)),
             paused: Arc::new(AtomicBool::new(false)),
             metrics,
+            metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
         }
     }
@@ -58,7 +61,7 @@ impl SharedPipelineState {
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        self.metrics.snapshot()
+        self.metrics_snapshot.read().unwrap().clone()
     }
 
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
@@ -73,6 +76,10 @@ impl SharedPipelineState {
 
     pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
         *self.jobs.write().unwrap() = jobs;
+    }
+
+    pub fn refresh_metrics_snapshot(&self) {
+        *self.metrics_snapshot.write().unwrap() = self.metrics.snapshot();
     }
 
     pub fn set_paused(&self, paused: bool) {

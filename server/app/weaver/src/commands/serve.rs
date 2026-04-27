@@ -139,18 +139,6 @@ pub(crate) async fn run(
         pipeline.run().await;
     });
 
-    // Restore in-progress jobs from SQLite.
-    for candidate in to_restore {
-        match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(
-                job_id = candidate.job_id.0,
-                committed_count = candidate.committed_count,
-                "job restored"
-            ),
-            Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
-        }
-    }
-
     let rss_task = rss.start_background_loop();
     let metrics_history_task =
         shutdown::spawn_metrics_history_task(metrics_exporter.clone(), db.clone());
@@ -167,7 +155,20 @@ pub(crate) async fn run(
         metrics_exporter,
         base_url,
     };
-    let server_task = tokio::spawn(http::run_server(server_runtime, addr));
+    let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
+
+    // Restore in-progress jobs from SQLite after the listener is available so
+    // long restore passes do not block process readiness.
+    for candidate in to_restore {
+        match handle.restore_job(candidate.request).await {
+            Ok(()) => info!(
+                job_id = candidate.job_id.0,
+                committed_count = candidate.committed_count,
+                "job restored"
+            ),
+            Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
+        }
+    }
 
     tokio::select! {
         _ = shutdown::wait_for_shutdown() => {
@@ -187,6 +188,19 @@ pub(crate) async fn run(
             rss_task.abort();
             metrics_history_task.abort();
             Err(error.into())
+        }
+        result = &mut server_task => {
+            handle.shutdown().await.ok();
+            if let Err(join_error) = pipeline_task.await {
+                error!(error = %join_error, "pipeline task failed during HTTP shutdown");
+            }
+            rss_task.abort();
+            metrics_history_task.abort();
+            match result {
+                Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
+                Ok(Err(error)) => Err(error),
+                Err(join_error) => Err(format!("HTTP server task failed: {join_error}").into()),
+            }
         }
     }
 }

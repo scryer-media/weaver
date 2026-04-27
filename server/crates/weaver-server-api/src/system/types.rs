@@ -138,6 +138,12 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct SystemMetricsSnapshot {
+    pub metrics: Metrics,
+    pub global_state: GlobalQueueState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct MetricLabel {
     pub key: String,

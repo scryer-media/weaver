@@ -40,6 +40,40 @@ impl std::io::Write for DirectOutputWriter {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_member_output_is_idempotent_when_partial_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("episode.mkv");
+        let partial_path = temp.path().join("episode.mkv.partial");
+        let chunk_dir = temp.path().join("chunks");
+        std::fs::write(&out_path, b"already-finalized").unwrap();
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+
+        let db = crate::Database::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let bytes = Pipeline::finalize_member_output(FinalizeMemberContext {
+            db: &db,
+            event_tx: &event_tx,
+            job_id: JobId(42),
+            set_name: "set",
+            member_name: "episode.mkv",
+            partial_path: &partial_path,
+            out_path: &out_path,
+            chunk_dir: &chunk_dir,
+        })
+        .unwrap();
+
+        assert_eq!(bytes, b"already-finalized".len() as u64);
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"already-finalized");
+        assert!(!partial_path.exists());
+        assert!(!chunk_dir.exists());
+    }
+}
+
 impl Drop for DirectOutputWriter {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
@@ -90,6 +124,17 @@ impl ExtractionCheckpointState {
         self.db
             .replace_member_chunks(self.job_id, &self.set_name, &self.member_name, &manifest)
             .map_err(|error| format!("failed to persist extraction chunks: {error}"))?;
+        info!(
+            job_id = self.job_id.0,
+            set_name = %self.set_name,
+            member = %self.member_name,
+            volume_index,
+            bytes_written,
+            start_offset,
+            end_offset,
+            manifest_rows = manifest.len(),
+            "persisted RAR extraction checkpoint volume"
+        );
         crate::e2e_failpoint::maybe_trip("extract.after_volume_checkpoint");
         Ok(())
     }
@@ -338,6 +383,62 @@ impl Pipeline {
             member: member_name.to_string(),
         });
 
+        let partial_metadata = match std::fs::metadata(partial_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && out_path.exists() => {
+                let size = std::fs::metadata(out_path)
+                    .map_err(|e| {
+                        format!(
+                            "failed to stat existing finalized output {}: {e}",
+                            out_path.display()
+                        )
+                    })?
+                    .len();
+                match std::fs::remove_dir_all(chunk_dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            path = %chunk_dir.display(),
+                            error = %error,
+                            "failed to remove legacy chunk dir during idempotent finalize"
+                        );
+                    }
+                }
+                if let Err(error) = db.clear_member_chunks(job_id, set_name, member_name) {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name,
+                        member = member_name,
+                        error = %error,
+                        "failed to clear extraction checkpoint manifest after idempotent finalize"
+                    );
+                }
+                let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendFinished {
+                    job_id,
+                    set_name: set_name.to_string(),
+                    member: member_name.to_string(),
+                });
+                info!(
+                    job_id = job_id.0,
+                    set_name,
+                    member = member_name,
+                    size,
+                    out_path = %out_path.display(),
+                    "RAR finalize used existing finalized output"
+                );
+                return Ok(size);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "failed to stat partial output {}: {e}",
+                    partial_path.display()
+                ));
+            }
+        };
+        let size = partial_metadata.len();
+
         match std::fs::remove_file(out_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -349,16 +450,13 @@ impl Pipeline {
             }
         }
 
-        let size = std::fs::metadata(partial_path)
-            .map_err(|e| {
-                format!(
-                    "failed to stat partial output {}: {e}",
-                    partial_path.display()
-                )
-            })?
-            .len();
-        std::fs::rename(partial_path, out_path)
-            .map_err(|e| format!("failed to finalize output {}: {e}", out_path.display()))?;
+        std::fs::rename(partial_path, out_path).map_err(|e| {
+            format!(
+                "failed to finalize output {} from {}: {e}",
+                out_path.display(),
+                partial_path.display()
+            )
+        })?;
         crate::e2e_failpoint::maybe_trip("extract.after_finalize_rename_before_record");
 
         match std::fs::remove_dir_all(chunk_dir) {
@@ -389,6 +487,15 @@ impl Pipeline {
             set_name: set_name.to_string(),
             member: member_name.to_string(),
         });
+
+        info!(
+            job_id = job_id.0,
+            set_name,
+            member = member_name,
+            size,
+            out_path = %out_path.display(),
+            "RAR finalize renamed partial output into place"
+        );
 
         Ok(size)
     }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { ChevronRight } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
@@ -24,8 +24,8 @@ import {
 import {
   CANCEL_JOB_MUTATION,
   DELETE_HISTORY_MUTATION,
-  EVENTS_SUBSCRIPTION,
   JOB_OUTPUT_FILES_QUERY,
+  JOB_DETAIL_UPDATES_SUBSCRIPTION,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
@@ -35,6 +35,7 @@ import {
 import { requestGraphqlClientRestart } from "@/graphql/client";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
+import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
@@ -48,7 +49,7 @@ interface EventEntry {
   timestamp: number;
 }
 
-interface JobDetailQueryData {
+interface JobDetailSnapshotData {
   queueItem?: GraphqlJobData | null;
   historyItem?: GraphqlJobData | null;
   jobTimeline?: JobTimelineData | null;
@@ -61,17 +62,28 @@ interface JobDetailQueryData {
   }>;
 }
 
+interface JobDetailQueryData {
+  jobDetailSnapshot?: JobDetailSnapshotData | null;
+}
+
 export function JobDetail() {
   const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const { jobs: liveJobs, connection } = useLiveData();
+  const { jobs: liveJobs, speed, connection } = useLiveData();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
 
   const [{ data, fetching }, reexecuteJobQuery] = useQuery<JobDetailQueryData>({
     query: JOB_QUERY,
     variables: queryVariables,
+  });
+  const [{ data: subscriptionData }] = useSubscription<{
+    jobDetailUpdates: JobDetailSnapshotData;
+  }>({
+    query: JOB_DETAIL_UPDATES_SUBSCRIPTION,
+    variables: queryVariables,
+    pause: connection.isDisconnected || !Number.isFinite(jobId),
   });
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
@@ -80,26 +92,38 @@ export function JobDetail() {
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
 
-  const [events, setEvents] = useState<EventEntry[]>([]);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showRedownloadConfirm, setShowRedownloadConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
-  const seededRef = useRef(false);
-  const lastTimelineRefreshRef = useRef(0);
   const liveJob = liveJobs.find((candidate) => candidate.id === jobId) ?? null;
-  const jobQueryData = polledData ?? data;
+  const jobQueryData =
+    polledData?.jobDetailSnapshot
+    ?? subscriptionData?.jobDetailUpdates
+    ?? data?.jobDetailSnapshot
+    ?? null;
   const queryJob = useMemo(() => {
     const rawJob = jobQueryData?.queueItem ?? jobQueryData?.historyItem;
     return rawJob ? normalizeJobData(rawJob) : null;
   }, [jobQueryData?.historyItem, jobQueryData?.queueItem]);
+  const events = useMemo(
+    () =>
+      (jobQueryData?.jobEvents ?? [])
+        .map((event) => ({
+          kind: event.kind,
+          jobId: event.jobId,
+          fileId: event.fileId,
+          message: event.message,
+          timestamp: event.timestamp,
+        }))
+        .reverse(),
+    [jobQueryData?.jobEvents],
+  );
 
   useEffect(() => {
     setLastLiveJob(null);
-    seededRef.current = false;
-    setEvents([]);
     setPolledData(undefined);
   }, [jobId]);
 
@@ -110,104 +134,16 @@ export function JobDetail() {
   }, [connection.isDisconnected]);
 
   useEffect(() => {
+    if (connection.status === "connected" && subscriptionData?.jobDetailUpdates) {
+      setPolledData(undefined);
+    }
+  }, [connection.status, subscriptionData]);
+
+  useEffect(() => {
     if (liveJob) {
       setLastLiveJob(liveJob);
     }
   }, [liveJob]);
-
-  useEffect(() => {
-    if (queryJob?.id !== jobId || !jobQueryData?.jobEvents) {
-      return;
-    }
-
-    if (!seededRef.current || connection.isDisconnected) {
-      seededRef.current = true;
-      setEvents(
-        jobQueryData.jobEvents
-          .map(
-            (event: {
-              kind: string;
-              jobId: number;
-              fileId: string | null;
-              message: string;
-              timestamp: number;
-            }) => ({
-              kind: event.kind,
-              jobId: event.jobId,
-              fileId: event.fileId,
-              message: event.message,
-              timestamp: event.timestamp,
-            }),
-          )
-          .reverse(),
-      );
-    }
-  }, [connection.isDisconnected, jobId, jobQueryData?.jobEvents, queryJob?.id]);
-
-  const handleSubscription = useCallback(
-    (
-      _prev: EventEntry[] | undefined,
-      result: {
-        events: { kind: string; jobId: number | null; fileId: string | null; message: string };
-      },
-    ) => {
-      const event = result.events;
-      const noisy = new Set([
-        "ARTICLE_DOWNLOADED",
-        "ARTICLE_NOT_FOUND",
-        "SEGMENT_QUEUED",
-        "SEGMENT_DECODED",
-        "SEGMENT_DECODE_FAILED",
-        "SEGMENT_COMMITTED",
-        "SEGMENT_RETRY_SCHEDULED",
-        "SEGMENT_FAILED_PERMANENT",
-        "FILE_COMPLETE",
-        "FILE_CLASSIFIED",
-        "VERIFICATION_STARTED",
-        "VERIFICATION_COMPLETE",
-        "EXTRACTION_PROGRESS",
-        "REPAIR_CONFIDENCE_UPDATED",
-      ]);
-      const timelineRelevant = new Set([
-        "JOB_PAUSED",
-        "JOB_RESUMED",
-        "DOWNLOAD_STARTED",
-        "DOWNLOAD_FINISHED",
-        "JOB_VERIFICATION_STARTED",
-        "JOB_VERIFICATION_COMPLETE",
-        "REPAIR_STARTED",
-        "REPAIR_COMPLETE",
-        "REPAIR_FAILED",
-        "EXTRACTION_MEMBER_STARTED",
-        "EXTRACTION_MEMBER_WAITING_STARTED",
-        "EXTRACTION_MEMBER_WAITING_FINISHED",
-        "EXTRACTION_MEMBER_APPEND_STARTED",
-        "EXTRACTION_MEMBER_APPEND_FINISHED",
-        "EXTRACTION_MEMBER_FINISHED",
-        "EXTRACTION_MEMBER_FAILED",
-        "MOVE_TO_COMPLETE_STARTED",
-        "MOVE_TO_COMPLETE_FINISHED",
-        "JOB_COMPLETED",
-        "JOB_FAILED",
-      ]);
-
-      if ((event.jobId === jobId || event.jobId === null) && !noisy.has(event.kind)) {
-        setEvents((current) => [{ ...event, timestamp: Date.now() }, ...current].slice(0, 500));
-        if (event.jobId === jobId && timelineRelevant.has(event.kind)) {
-          const now = Date.now();
-          if (now - lastTimelineRefreshRef.current > 250) {
-            lastTimelineRefreshRef.current = now;
-            void reexecuteJobQuery({ requestPolicy: "network-only" });
-          }
-        }
-      }
-
-      return [];
-    },
-    [jobId, reexecuteJobQuery],
-  );
-
-  useSubscription({ query: EVENTS_SUBSCRIPTION }, handleSubscription);
 
   useReconnectPolling<JobDetailQueryData>({
     enabled: connection.isDisconnected && Number.isFinite(jobId),
@@ -219,8 +155,17 @@ export function JobDetail() {
     },
   });
 
-  const job = liveJob ?? lastLiveJob ?? queryJob;
+  const queryJobIsTerminal = queryJob?.status === "COMPLETE" || queryJob?.status === "FAILED";
+  const job = liveJob ?? (queryJobIsTerminal ? queryJob : lastLiveJob ?? queryJob);
   const timeline = jobQueryData?.jobTimeline ?? null;
+  const etaSpeed = useStableEtaSpeed(job ? [job] : [], speed);
+  const eta = job
+    ? formatEtaFromRemainingBytes(
+        Math.max(job.totalBytes - job.downloadedBytes, 0),
+        etaSpeed,
+      )
+    : "\u2014";
+  const showEta = job?.status === "DOWNLOADING" || job?.status === "QUEUED";
 
   if (fetching && !job) {
     return <div className="text-muted-foreground">{t("label.loading")}</div>;
@@ -326,6 +271,18 @@ export function JobDetail() {
           </div>
         </CardHeader>
         <CardContent className="space-y-5">
+          {showEta ? (
+            <div className="flex justify-end">
+              <div className="text-right">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                  {t("table.eta")}
+                </div>
+                <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
+                  {eta}
+                </div>
+              </div>
+            </div>
+          ) : null}
           <JobProgress
             progress={job.progress}
             status={job.status}

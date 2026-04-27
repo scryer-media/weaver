@@ -231,6 +231,12 @@ pub struct Pipeline {
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
     /// Last queued/persisted contiguous write floor per file.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
+    /// Streaming MD5 state for files whose decoded bytes have been observed in order.
+    pub(super) file_hash_states: HashMap<NzbFileId, weaver_par2::checksum::FileHashState>,
+    /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
+    pub(super) file_hash_reread_required: HashSet<NzbFileId>,
+    #[cfg(test)]
+    pub(super) try_update_archive_topology_calls: usize,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.

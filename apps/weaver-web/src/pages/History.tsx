@@ -21,14 +21,16 @@ import {
 } from "@/components/ui/table";
 import {
   DELETE_ALL_HISTORY_MUTATION,
-  DELETE_HISTORY_BATCH_MUTATION,
   DELETE_HISTORY_MUTATION,
+  FACADE_HISTORY_ITEM_FIELDS,
   HISTORY_JOBS_COUNT_QUERY,
   HISTORY_FACADE_EVENTS_SUBSCRIPTION,
   HISTORY_JOBS_QUERY,
+  PARSED_RELEASE_FIELDS,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
 } from "@/graphql/queries";
+import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
@@ -70,7 +72,6 @@ export function History() {
   const t = useTranslate();
   const client = useClient();
   const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
-  const [deleteBatchState, deleteHistoryBatch] = useMutation(DELETE_HISTORY_BATCH_MUTATION);
   const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
   const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
@@ -86,6 +87,7 @@ export function History() {
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
+  const [deleteBatchFetching, setDeleteBatchFetching] = useState(false);
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const [search, setSearch] = useState("");
 
@@ -196,16 +198,6 @@ export function History() {
       void refetchCount();
     }
   }, [deleteState.data, refetchCount]);
-
-  useEffect(() => {
-    if (deleteBatchState.data?.deleteHistoryBatch) {
-      setJobs(
-        (deleteBatchState.data.deleteHistoryBatch as FacadeHistoryJob[]).map(normalizeHistoryJob),
-      );
-      setSelectedIds(new Set());
-      void refetchCount();
-    }
-  }, [deleteBatchState.data, refetchCount]);
 
   useEffect(() => {
     if (deleteAllState.data?.deleteAllHistory) {
@@ -359,11 +351,49 @@ export function History() {
     }
   }
 
+  async function handleBatchDelete() {
+    const ids = [...selectedIds].filter((id) => filteredIds.has(id));
+    if (ids.length === 0) {
+      setDeleteBatchConfirm(false);
+      setDeleteFiles(false);
+      return;
+    }
+
+    setDeleteBatchFetching(true);
+    const result = await executeAliasedIdMutation<FacadeHistoryJob[]>({
+      client,
+      ids,
+      operationName: "DeleteSelectedHistoryItems",
+      aliasPrefix: "deleteHistory",
+      fieldName: "deleteHistory",
+      sharedVariables: {
+        deleteFiles: { type: "Boolean", value: deleteFiles },
+      },
+      buildFieldArguments: (idVariable) => `id: ${idVariable}, deleteFiles: $deleteFiles`,
+      selectionSet: `{
+        ...FacadeHistoryItemFields
+      }`,
+      fragments: [PARSED_RELEASE_FIELDS, FACADE_HISTORY_ITEM_FIELDS],
+    });
+    setDeleteBatchFetching(false);
+    if (!result.error) {
+      const finalAlias = `deleteHistory${ids.length - 1}`;
+      const remainingItems = result.data?.[finalAlias];
+      if (remainingItems) {
+        setJobs(remainingItems.map(normalizeHistoryJob));
+      }
+      setSelectedIds(new Set());
+      void refetchCount();
+    }
+    setDeleteBatchConfirm(false);
+    setDeleteFiles(false);
+  }
+
   function renderActions(job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) {
     const isFailed = job.status === "FAILED";
     const actionsBusy =
       deleteState.fetching
-      || deleteBatchState.fetching
+      || deleteBatchFetching
       || deleteAllState.fetching
       || reprocessState.fetching
       || redownloadState.fetching;
@@ -685,12 +715,7 @@ export function History() {
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}
         onConfirm={() => {
-          const ids = [...selectedIds].filter((id) => filteredIds.has(id));
-          if (ids.length > 0) {
-            void deleteHistoryBatch({ ids, deleteFiles });
-          }
-          setDeleteBatchConfirm(false);
-          setDeleteFiles(false);
+          void handleBatchDelete();
         }}
         onCancel={() => { setDeleteBatchConfirm(false); setDeleteFiles(false); }}
       >

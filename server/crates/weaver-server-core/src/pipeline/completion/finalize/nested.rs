@@ -576,7 +576,7 @@ impl Pipeline {
             state.extraction_depth = state.extraction_depth.saturating_add(1);
         }
 
-        self.transition_post_state(job_id, crate::jobs::model::PostState::Extracting);
+        self.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
 
         info!(
             job_id = job_id.0,

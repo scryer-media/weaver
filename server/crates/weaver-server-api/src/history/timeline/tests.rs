@@ -252,6 +252,55 @@ fn preserves_pre_restart_history_and_marks_recovery_gap() {
 }
 
 #[test]
+fn reused_job_id_timeline_starts_at_current_attempt() {
+    let failed_member =
+        crate::history::types::encode_timeline_member_subject("set", "episode01.mkv", None);
+    let current_member =
+        crate::history::types::encode_timeline_member_subject("set", "episode02.mkv", None);
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(10, 13)),
+        &[
+            event("JobCreated", 1_000, None, "old attempt"),
+            event("DownloadStarted", 1_500, None, ""),
+            event("ExtractionMemberStarted", 2_000, failed_member.clone(), ""),
+            event("ExtractionMemberFailed", 2_500, failed_member, "crc failed"),
+            event("JobFailed", 3_000, None, "old failure"),
+            event("JobCreated", 10_000, None, "current attempt"),
+            event("DownloadStarted", 10_500, None, ""),
+            event(
+                "ExtractionMemberStarted",
+                11_000,
+                current_member.clone(),
+                "",
+            ),
+            event("ExtractionMemberFinished", 12_000, current_member, ""),
+            event("DownloadFinished", 12_500, None, ""),
+            event("JobCompleted", 13_000, None, "done"),
+        ],
+    );
+
+    assert_eq!(timeline.started_at, 10_000.0);
+    assert!(
+        timeline
+            .lanes
+            .iter()
+            .all(|lane| lane.stage != TimelineStage::Interrupted)
+    );
+    assert_eq!(timeline.extraction_groups.len(), 1);
+    let members = &timeline.extraction_groups[0].members;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].member, "episode02.mkv");
+    assert_eq!(members[0].state, ExtractionMemberState::Complete);
+    assert!(
+        members[0]
+            .spans
+            .iter()
+            .all(|span| span.state != TimelineSpanState::Failed)
+    );
+}
+
+#[test]
 fn tracks_pause_only_when_downloading() {
     let timeline = build_job_timeline(
         &job(JobStatus::Complete),
@@ -402,6 +451,25 @@ fn download_resumes_after_pause_without_explicit_second_start() {
     assert_eq!(download_lane.spans[0].ended_at, Some(4_000.0));
     assert_eq!(download_lane.spans[1].started_at, 6_000.0);
     assert_eq!(download_lane.spans[1].ended_at, Some(10_000.0));
+}
+
+#[test]
+fn synthesizes_running_download_lane_for_active_job_without_persisted_start_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Downloading),
+        None,
+        &[event("JobCreated", 1_000, None, "")],
+    );
+
+    let download_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Downloading)
+        .expect("download lane");
+    assert_eq!(download_lane.spans.len(), 1);
+    assert_eq!(download_lane.spans[0].started_at, 1_000.0);
+    assert_eq!(download_lane.spans[0].ended_at, None);
+    assert_eq!(download_lane.spans[0].state, TimelineSpanState::Running);
 }
 
 #[test]

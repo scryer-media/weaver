@@ -4,39 +4,48 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate
+const SPEED_EMA_HALF_LIFE_SECS: f64 = 1.0;
+
 /// Tracks download speed using a sliding window of byte samples.
 struct SpeedTracker {
     /// Ring buffer of (timestamp, cumulative_bytes) samples.
     samples: Vec<(Instant, u64)>,
     /// Next write position in the ring buffer.
     pos: usize,
-    /// Last computed speed (bytes/sec).
+    /// Last computed EMA-smoothed speed (bytes/sec).
     speed: u64,
+    /// Floating-point accumulator used by the EMA.
+    ema_speed: f64,
+    /// Timestamp of the last EMA update.
+    last_ema_at: Option<Instant>,
 }
 
 impl SpeedTracker {
     fn new() -> Self {
         Self {
-            samples: Vec::with_capacity(32),
+            samples: Vec::with_capacity(SPEED_WINDOW_SAMPLES),
             pos: 0,
             speed: 0,
+            ema_speed: 0.0,
+            last_ema_at: None,
         }
     }
 
-    /// Record a sample and recompute speed. Called from `snapshot()`.
+    /// Record a sample and recompute speed on the pipeline metrics tick.
     fn update(&mut self, now: Instant, bytes_downloaded: u64) -> u64 {
-        const WINDOW: usize = 20; // ~2 seconds at 100ms snapshot rate
-
-        if self.samples.len() < WINDOW {
+        if self.samples.len() < SPEED_WINDOW_SAMPLES {
             self.samples.push((now, bytes_downloaded));
         } else {
             self.samples[self.pos] = (now, bytes_downloaded);
         }
-        self.pos = (self.pos + 1) % WINDOW;
+        self.pos = (self.pos + 1) % SPEED_WINDOW_SAMPLES;
 
-        // Compare newest sample to oldest in the window
+        // Compare newest sample to oldest in the current window, then smooth
+        // the raw rate with a 1s half-life EMA so the published metric follows
+        // pipeline ticks without showing every short-lived burst.
         let newest = (now, bytes_downloaded);
-        let oldest_idx = if self.samples.len() < WINDOW {
+        let oldest_idx = if self.samples.len() < SPEED_WINDOW_SAMPLES {
             0
         } else {
             self.pos % self.samples.len()
@@ -46,7 +55,25 @@ impl SpeedTracker {
         let dt = newest.0.duration_since(oldest.0).as_secs_f64();
         if dt > 0.05 {
             let delta_bytes = newest.1.saturating_sub(oldest.1);
-            self.speed = (delta_bytes as f64 / dt) as u64;
+            let raw_speed = delta_bytes as f64 / dt;
+
+            if let Some(last_ema_at) = self.last_ema_at {
+                let elapsed = now.duration_since(last_ema_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    let alpha = 1.0 - 0.5_f64.powf(elapsed / SPEED_EMA_HALF_LIFE_SECS);
+                    self.ema_speed += alpha * (raw_speed - self.ema_speed);
+                } else {
+                    self.ema_speed = raw_speed;
+                }
+            } else {
+                self.ema_speed = raw_speed;
+            }
+
+            self.last_ema_at = Some(now);
+            if self.ema_speed < 1.0 {
+                self.ema_speed = 0.0;
+            }
+            self.speed = self.ema_speed as u64;
         }
         self.speed
     }
@@ -94,7 +121,7 @@ pub struct PipelineMetrics {
     pub segments_retried: AtomicU64,
     pub segments_failed_permanent: AtomicU64,
 
-    // Speed — computed from bytes_downloaded delta
+    // Speed — computed from bytes_downloaded delta, then smoothed via EMA
     speed_tracker: Mutex<SpeedTracker>,
 
     // Decode quality

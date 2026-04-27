@@ -25,6 +25,7 @@ impl Pipeline {
             SchedulerCommand::PauseJob { job_id, reply } => {
                 let result = self.pause_job_runtime(job_id);
                 if result.is_ok() {
+                    self.publish_snapshot();
                     self.emit_download_finished_if_active(job_id);
                     let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
                 }
@@ -33,6 +34,7 @@ impl Pipeline {
             SchedulerCommand::ResumeJob { job_id, reply } => {
                 let result = self.resume_job_runtime(job_id);
                 if result.is_ok() {
+                    self.publish_snapshot();
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
                 }
                 let _ = reply.send(result);

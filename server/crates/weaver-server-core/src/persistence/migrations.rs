@@ -165,6 +165,13 @@ fn recover_legacy(entries: Vec<JournalEntry>) -> HashMap<JobId, LegacyRecoveredJ
 }
 
 impl Database {
+    fn already_migrated_toml_path(toml_path: &Path) -> bool {
+        toml_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".toml.migrated"))
+    }
+
     /// If the database is empty and a `weaver.toml` file exists at the given path,
     /// import its settings and servers, then rename it to `weaver.toml.migrated`.
     pub fn migrate_from_toml(&self, toml_path: &Path) -> Result<bool, StateError> {
@@ -186,16 +193,24 @@ impl Database {
 
         self.save_config(&config)?;
 
-        // Rename the TOML file so it's not re-imported.
-        let migrated_path = toml_path.with_extension("toml.migrated");
-        std::fs::rename(toml_path, &migrated_path).map_err(StateError::Io)?;
+        if Self::already_migrated_toml_path(toml_path) {
+            tracing::info!(
+                from = %toml_path.display(),
+                servers = config.servers.len(),
+                "imported config from migrated TOML into SQLite"
+            );
+        } else {
+            // Rename the TOML file so it's not re-imported.
+            let migrated_path = toml_path.with_extension("toml.migrated");
+            std::fs::rename(toml_path, &migrated_path).map_err(StateError::Io)?;
 
-        tracing::info!(
-            from = %toml_path.display(),
-            to = %migrated_path.display(),
-            servers = config.servers.len(),
-            "migrated config from TOML to SQLite"
-        );
+            tracing::info!(
+                from = %toml_path.display(),
+                to = %migrated_path.display(),
+                servers = config.servers.len(),
+                "migrated config from TOML to SQLite"
+            );
+        }
 
         Ok(true)
     }

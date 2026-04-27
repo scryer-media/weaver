@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::JobHistoryRow;
 
+use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
     Attribute, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobStatusGql, ParsedRelease, QueueAttention,
     QueueFilterInput, QueueItemState, matches_attribute_filter,
@@ -47,6 +48,14 @@ pub struct JobEvent {
     pub file_id: Option<String>,
     pub message: String,
     pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct JobDetailSnapshot {
+    pub queue_item: Option<crate::jobs::types::QueueItem>,
+    pub history_item: Option<HistoryItem>,
+    pub job_timeline: Option<JobTimeline>,
+    pub job_events: Vec<JobEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,14 +262,11 @@ pub fn history_item_from_row(row: &JobHistoryRow) -> HistoryItem {
         .unwrap_or_default();
     let (client_request_id, attributes) = split_attributes(&metadata_pairs);
     let state = history_state_from_row(row);
-    let original_title =
-        weaver_server_core::ingest::original_release_title(&row.name, &metadata_pairs);
-    let display_title =
-        weaver_server_core::ingest::derive_release_name(Some(&original_title), Some(&row.name));
-    let parsed_release = ParsedRelease::from(weaver_server_core::ingest::parse_job_release(
-        &row.name,
-        &metadata_pairs,
-    ));
+    let display = release_display_info(ReleaseDisplayInput {
+        job_name: &row.name,
+        metadata: &metadata_pairs,
+        category: row.category.as_deref(),
+    });
     let progress_percent = if row.total_bytes == 0 {
         0.0
     } else {
@@ -269,9 +275,9 @@ pub fn history_item_from_row(row: &JobHistoryRow) -> HistoryItem {
     HistoryItem {
         id: row.job_id,
         name: row.name.clone(),
-        display_title,
-        original_title,
-        parsed_release,
+        display_title: display.display_title,
+        original_title: display.original_title,
+        parsed_release: display.parsed_release,
         state,
         error: row.error_message.clone(),
         progress_percent,

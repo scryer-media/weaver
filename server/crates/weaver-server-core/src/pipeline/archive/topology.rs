@@ -28,6 +28,48 @@ impl RarTopologyRebuildSource {
     }
 }
 
+fn cached_rar_snapshot_conflicts_with_volume_facts(
+    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    archive: &weaver_rar::RarArchive,
+) -> bool {
+    let metadata = archive.metadata();
+
+    facts.iter().any(|(&first_volume, volume_facts)| {
+        volume_facts.members.iter().any(|member| {
+            if member.is_directory || member.split_before || !member.split_after {
+                return false;
+            }
+
+            let name = weaver_rar::sanitize_path(&member.name);
+            let mut observed_last = first_volume;
+            let mut next_volume = first_volume + 1;
+
+            while let Some(next_facts) = facts.get(&next_volume) {
+                let Some(next_member) = next_facts.members.iter().find(|candidate| {
+                    !candidate.is_directory
+                        && candidate.split_before
+                        && weaver_rar::sanitize_path(&candidate.name) == name
+                }) else {
+                    break;
+                };
+
+                observed_last = next_volume;
+                if !next_member.split_after {
+                    break;
+                }
+                next_volume += 1;
+            }
+
+            observed_last > first_volume
+                && !metadata.members.iter().any(|candidate| {
+                    candidate.name == name
+                        && candidate.volumes.first_volume as u32 == first_volume
+                        && candidate.volumes.last_volume as u32 >= observed_last
+                })
+        })
+    })
+}
+
 impl Pipeline {
     fn register_rar_volume_file(state: &mut RarSetState, logical_volume: u32, filename: String) {
         state.volume_files.retain(|volume, existing_filename| {
@@ -312,17 +354,37 @@ impl Pipeline {
             .cloned()
             .unwrap_or_default();
         let facts = existing.facts.clone();
+        let verified_suspect_volumes = existing.verified_suspect_volumes.clone();
         let worker_active = existing.active_workers > 0;
         let cached_headers = self.load_rar_snapshot(job_id, set_name);
         let set_name_owned = set_name.to_string();
 
         let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let open_from_volume_zero = || -> Result<weaver_rar::RarArchive, String> {
+                let first_path = volume_paths.get(&0).ok_or_else(|| {
+                    format!(
+                        "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
+                    )
+                })?;
+                let first_file = std::fs::File::open(first_path).map_err(|e| {
+                    format!("failed to open RAR volume 0 for set '{set_name_owned}': {e}")
+                })?;
+                if let Some(password) = password.as_deref() {
+                    weaver_rar::RarArchive::open_with_password(first_file, password)
+                } else {
+                    weaver_rar::RarArchive::open(first_file)
+                }
+                .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}"))
+            };
+
             let mut rebuild_source = if cached_headers.is_some() {
                 RarTopologyRebuildSource::CachedHeaders
             } else {
                 RarTopologyRebuildSource::VolumeZero
             };
             let has_cached_headers = cached_headers.is_some();
+            let mut using_cached_headers = has_cached_headers;
+            let mut force_refresh_all_volumes = false;
             let mut archive = match cached_headers {
                 Some(headers) => match weaver_rar::RarArchive::deserialize_headers_with_password(
                     &headers,
@@ -336,45 +398,37 @@ impl Pipeline {
                             "failed to deserialize cached RAR headers during plan rebuild, falling back to volume 0"
                         );
                         rebuild_source = RarTopologyRebuildSource::VolumeZero;
-                        let first_path = volume_paths.get(&0).ok_or_else(|| {
-                            format!(
-                                "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
-                            )
-                        })?;
-                        let first_file = std::fs::File::open(first_path).map_err(|e| {
-                            format!(
-                                "failed to open RAR volume 0 for set '{set_name_owned}': {e}"
-                            )
-                        })?;
-                        if let Some(password) = password.as_deref() {
-                            weaver_rar::RarArchive::open_with_password(first_file, password)
-                        } else {
-                            weaver_rar::RarArchive::open(first_file)
-                        }
-                        .map_err(|e| {
-                            format!(
-                                "failed to parse RAR volume 0 for set '{set_name_owned}': {e}"
-                            )
-                        })?
+                        open_from_volume_zero()?
                     }
                 },
-                None => {
-                    let first_path = volume_paths.get(&0).ok_or_else(|| {
-                        format!("RAR set '{set_name_owned}' cannot be rebuilt without volume 0")
-                    })?;
-                    let first_file = std::fs::File::open(first_path).map_err(|e| {
-                        format!("failed to open RAR volume 0 for set '{set_name_owned}': {e}")
-                    })?;
-                    if let Some(password) = password.as_deref() {
-                        weaver_rar::RarArchive::open_with_password(first_file, password)
-                    } else {
-                        weaver_rar::RarArchive::open(first_file)
-                    }
-                    .map_err(|e| {
-                        format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}")
-                    })?
-                }
+                None => open_from_volume_zero()?,
             };
+
+            if using_cached_headers
+                && verified_suspect_volumes.iter().any(|volume| {
+                    volume_paths.contains_key(volume) && !archive.has_volume(*volume as usize)
+                })
+                && volume_paths.contains_key(&0)
+            {
+                archive = open_from_volume_zero()?;
+                rebuild_source = RarTopologyRebuildSource::VolumeZero;
+                using_cached_headers = false;
+            }
+
+            if using_cached_headers
+                && cached_rar_snapshot_conflicts_with_volume_facts(&facts, &archive)
+            {
+                force_refresh_all_volumes = true;
+                warn!(
+                    set_name = %set_name_owned,
+                    "cached RAR headers contradicted per-volume facts; forcing registered volume refresh"
+                );
+                if volume_paths.contains_key(&0) {
+                    archive = open_from_volume_zero()?;
+                    rebuild_source = RarTopologyRebuildSource::VolumeZero;
+                    using_cached_headers = false;
+                }
+            }
 
             for (volume_number, path) in &volume_paths {
                 let volume_file = match std::fs::File::open(path) {
@@ -390,7 +444,21 @@ impl Pipeline {
                         ));
                     }
                 };
-                if archive.has_volume(*volume_number as usize) {
+                let volume_needs_refresh = force_refresh_all_volumes
+                    || !facts.contains_key(volume_number)
+                    || verified_suspect_volumes.contains(volume_number);
+                if using_cached_headers
+                    && volume_needs_refresh
+                    && archive.has_volume(*volume_number as usize)
+                {
+                    archive
+                        .refresh_volume(*volume_number as usize, Box::new(volume_file))
+                        .map_err(|e| {
+                            format!(
+                                "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                            )
+                        })?;
+                } else if archive.has_volume(*volume_number as usize) {
                     archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
                 } else {
                     archive
@@ -837,6 +905,11 @@ impl Pipeline {
                 state.spec.password.clone(),
             )
         };
+
+        #[cfg(test)]
+        {
+            self.try_update_archive_topology_calls += 1;
+        }
 
         match Self::parse_rar_volume_facts_from_path(path, password).await {
             Ok(facts) => {

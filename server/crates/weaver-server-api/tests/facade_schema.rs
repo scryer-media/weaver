@@ -22,10 +22,22 @@ async fn public_facade_schema_exposes_core_surface() {
         "queueItems query should be present"
     );
     assert!(
+        sdl.contains("queueSnapshot(filter: QueueFilterInput): QueueSnapshot!"),
+        "queueSnapshot query should be present"
+    );
+    assert!(
+        sdl.contains("latestQueueCursor: String!"),
+        "latestQueueCursor query should be present"
+    );
+    assert!(
         sdl.contains(
             "historyItems(filter: QueueFilterInput, first: Int, after: String): [HistoryItem!]!"
         ),
         "historyItems query should be present"
+    );
+    assert!(
+        sdl.contains("jobDetailSnapshot(jobId: Int!): JobDetailSnapshot!"),
+        "jobDetailSnapshot query should be present"
     );
     assert!(
         sdl.contains("metricsHistory(minutes: Int!, metrics: [String!]!): MetricsHistoryResult!"),
@@ -46,6 +58,14 @@ async fn public_facade_schema_exposes_core_surface() {
     assert!(
         sdl.contains("queueEvents(after: String, filter: QueueFilterInput): QueueEvent!"),
         "queueEvents subscription should be present"
+    );
+    assert!(
+        sdl.contains("jobDetailUpdates(jobId: Int!): JobDetailSnapshot!"),
+        "jobDetailUpdates subscription should be present"
+    );
+    assert!(
+        sdl.contains("systemMetricsUpdates: SystemMetricsSnapshot!"),
+        "systemMetricsUpdates subscription should be present"
     );
     assert!(
         sdl.contains("attributeEquals: AttributeInput"),

@@ -52,7 +52,7 @@ The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call t
 ## Runtime expectations
 
 - Release takes several minutes. Stream its output to a file or background process so your shell/timeout doesn't kill it partway through.
-- Only one Cargo invocation may run against the weaver workspace at a time. Do not start a parallel `cargo build`/`check`/`test` while release is running.
+- Pass `--locked` to any Cargo invocations you run alongside release work; the release task already does this internally.
 
 ## Failure handling
 

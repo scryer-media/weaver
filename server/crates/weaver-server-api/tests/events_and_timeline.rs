@@ -97,3 +97,22 @@ async fn job_timeline_nonexistent() {
         "timeline should be null for a nonexistent job"
     );
 }
+
+#[tokio::test]
+async fn job_detail_snapshot_query_returns_live_job_data() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("job-detail-snapshot").await;
+
+    let resp = h
+        .execute(&format!(
+            r#"{{ jobDetailSnapshot(jobId: {job_id}) {{ queueItem {{ id state }} historyItem {{ id }} jobTimeline {{ outcome }} jobEvents {{ kind }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["jobDetailSnapshot"]["queueItem"]["id"].as_u64(), Some(job_id));
+    assert_eq!(data["jobDetailSnapshot"]["queueItem"]["state"].as_str(), Some("QUEUED"));
+    assert!(data["jobDetailSnapshot"]["historyItem"].is_null());
+    assert!(!data["jobDetailSnapshot"]["jobTimeline"].is_null());
+    assert!(data["jobDetailSnapshot"]["jobEvents"].as_array().is_some());
+}

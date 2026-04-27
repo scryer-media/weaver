@@ -6,6 +6,21 @@ use std::path::PathBuf;
 use std::collections::BTreeMap;
 
 impl Pipeline {
+    pub(crate) fn purge_empty_rar_set_if_idle(&mut self, job_id: JobId, set_name: &str) {
+        let set_key = (job_id, set_name.to_string());
+        let should_remove = self.rar_sets.get(&set_key).is_some_and(|state| {
+            state.volume_files.is_empty()
+                && state.active_workers == 0
+                && state.in_flight_members.is_empty()
+        });
+        if !should_remove {
+            return;
+        }
+
+        self.rar_sets.remove(&set_key);
+        self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
+    }
+
     pub(crate) fn invalidate_archive_set_for_identity_rebind(
         &mut self,
         job_id: JobId,
@@ -27,26 +42,40 @@ impl Pipeline {
             })
             .unwrap_or_default();
 
+        let mut persisted_suspect_volumes = None;
+
         let remove_empty_set = if let Some(state) = self.rar_sets.get_mut(&set_key) {
             state
                 .volume_files
                 .retain(|_, filename| !touched_filenames.contains(filename));
             for volume in &affected_volumes {
                 state.facts.remove(volume);
-                state.verified_suspect_volumes.remove(volume);
+                // Keep touched swap volumes suspect until the next cached-header
+                // rebuild refreshes them from the corrected on-disk bytes.
+                state.verified_suspect_volumes.insert(*volume);
             }
-            state.in_flight_members.clear();
+            persisted_suspect_volumes = Some(state.verified_suspect_volumes.clone());
             state.plan = None;
-            state.active_workers = 0;
-            state.facts.is_empty() && state.volume_files.is_empty()
+            state.volume_files.is_empty()
+                && state.active_workers == 0
+                && state.in_flight_members.is_empty()
         } else {
             false
         };
 
         if remove_empty_set {
             self.rar_sets.remove(&set_key);
+            persisted_suspect_volumes = Some(HashSet::new());
         } else if let Some(state) = self.rar_sets.get_mut(&set_key) {
-            state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
+            state.phase = if state.active_workers > 0 || !state.in_flight_members.is_empty() {
+                crate::pipeline::archive::rar_state::RarSetPhase::Extracting
+            } else {
+                crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+            };
+        }
+
+        if let Some(suspect_volumes) = persisted_suspect_volumes {
+            self.persist_verified_suspect_volumes(job_id, set_name, &suspect_volumes);
         }
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
@@ -61,6 +90,37 @@ impl Pipeline {
                 "failed to clear archive-set identity rebind extraction state"
             );
         }
+    }
+
+    pub(crate) fn clear_archive_set_if_unreferenced_and_idle(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        let set_key = (job_id, set_name.to_string());
+        let busy = self.rar_sets.get(&set_key).is_some_and(|state| {
+            state.active_workers > 0 || !state.in_flight_members.is_empty()
+        });
+        if busy {
+            return;
+        }
+
+        let still_referenced = self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.files().any(|file| {
+                matches!(
+                    self.classified_role_for_file(job_id, file),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                ) && self
+                    .classified_archive_set_name_for_file(job_id, file)
+                    .as_deref()
+                    == Some(set_name)
+            })
+        });
+        if still_referenced {
+            return;
+        }
+
+        self.clear_archive_set_for_source_retry(job_id, set_name);
     }
 
     pub(crate) fn clear_archive_set_for_source_retry(&mut self, job_id: JobId, set_name: &str) {
@@ -347,12 +407,18 @@ impl Pipeline {
         self.rar_set_names_for_job(job_id).iter().any(|set_name| {
             self.rar_sets
                 .get(&(job_id, set_name.clone()))
-                .is_some_and(|state| state.active_workers > 0)
+                .is_some_and(|state| {
+                    state.active_workers > 0 || !state.in_flight_members.is_empty()
+                })
         })
     }
 
     fn placement_normalization_map(plan: &weaver_par2::PlacementPlan) -> HashMap<String, String> {
         let mut normalized_files = HashMap::new();
+        for (left, right) in &plan.swaps {
+            normalized_files.insert(left.current_name.clone(), left.correct_name.clone());
+            normalized_files.insert(right.current_name.clone(), right.correct_name.clone());
+        }
         for entry in &plan.renames {
             normalized_files.insert(entry.current_name.clone(), entry.correct_name.clone());
         }
@@ -697,6 +763,25 @@ impl Pipeline {
         set_names
     }
 
+    fn all_rar_sets_complete(&self, job_id: JobId) -> bool {
+        let set_names = self.rar_set_names_for_job(job_id);
+        if set_names.is_empty() {
+            return false;
+        }
+
+        set_names.into_iter().all(|set_name| {
+            let Some(set_state) = self.rar_sets.get(&(job_id, set_name)) else {
+                return false;
+            };
+            let phase = set_state
+                .plan
+                .as_ref()
+                .map(|plan| plan.phase)
+                .unwrap_or(set_state.phase);
+            phase == crate::pipeline::archive::rar_state::RarSetPhase::Complete
+        })
+    }
+
     pub(super) async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
         if self
             .reconcile_extracted_outputs_for_completion(job_id)
@@ -795,7 +880,7 @@ impl Pipeline {
     }
 
     pub(super) async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {
-        self.transition_post_state(job_id, crate::jobs::model::PostState::Idle);
+        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
         if self.job_has_only_rar_archives(job_id) {
             let set_names: Vec<String> = self
@@ -808,6 +893,10 @@ impl Pipeline {
                 let _ = self.recompute_rar_set_state(job_id, &set_name).await;
             }
             self.reconcile_job_progress(job_id).await;
+            if self.all_rar_sets_complete(job_id) {
+                self.finalize_completed_archive_job(job_id).await;
+                return;
+            }
             self.try_rar_extraction(job_id).await;
             return;
         }
@@ -925,6 +1014,49 @@ impl Pipeline {
                 }
 
                 if matched_member {
+                    continue;
+                }
+
+                let mut matched_runtime_rar_set = false;
+                for ((rar_job_id, set_name), rar_state) in &self.rar_sets {
+                    if *rar_job_id != job_id {
+                        continue;
+                    }
+
+                    let plan = rar_state.plan.as_ref();
+                    let failed_is_set = set_name == failed;
+                    let failed_is_member = plan.is_some_and(|plan| {
+                        plan.member_names.iter().any(|member| member == failed)
+                            || plan
+                                .topology
+                                .members
+                                .iter()
+                                .any(|member| member.name == *failed)
+                    });
+                    if !failed_is_set && !failed_is_member {
+                        continue;
+                    }
+
+                    matched_runtime_rar_set = true;
+                    retry_sets.insert(set_name.clone());
+                    if let Some(plan) = plan {
+                        retry_members.extend(plan.member_names.iter().cloned());
+                    }
+
+                    for filename in rar_state.volume_files.values() {
+                        if let Some((index, _)) = state
+                            .spec
+                            .files
+                            .iter()
+                            .enumerate()
+                            .find(|(_, file)| file.filename == *filename)
+                        {
+                            file_indices.insert(index as u32);
+                        }
+                    }
+                }
+
+                if matched_runtime_rar_set {
                     continue;
                 }
 
@@ -1090,12 +1222,7 @@ impl Pipeline {
             "re-queueing archive source files after extraction failure without PAR2"
         );
 
-        self.transition_runtime_state(
-            job_id,
-            crate::jobs::model::DownloadState::Downloading,
-            crate::jobs::model::PostState::Idle,
-            crate::jobs::model::RunState::Active,
-        );
+        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
         Ok(true)
     }
 }

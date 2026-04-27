@@ -207,6 +207,8 @@ impl Pipeline {
 
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
+        let mut touched_complete_rar_sets = HashSet::<String>::new();
+        let mut stale_rar_sets = HashSet::<String>::new();
         let mut rebound = 0usize;
 
         for desc in par2_set.files.values() {
@@ -245,39 +247,67 @@ impl Pipeline {
                 )
                 .then(|| classification.set_name.clone())
             });
-            if filename_changed {
-                let old_path = working_dir.join(&old_current);
-                let new_path = working_dir.join(&canonical_filename);
-                if old_path.exists() {
-                    std::fs::rename(&old_path, &new_path).map_err(|error| {
-                        format!(
-                            "failed to rename {} to {} from PAR2 metadata: {error}",
-                            old_path.display(),
-                            new_path.display()
-                        )
-                    })?;
-                }
-            }
+            let old_path = working_dir.join(&old_current);
+            let new_path = working_dir.join(&canonical_filename);
+            let canonical_path_exists = new_path.exists();
+            let renamed_to_canonical = if filename_changed && is_complete && old_path.exists() {
+                std::fs::rename(&old_path, &new_path).map_err(|error| {
+                    format!(
+                        "failed to rename {} to {} from PAR2 metadata: {error}",
+                        old_path.display(),
+                        new_path.display()
+                    )
+                })?;
+                true
+            } else {
+                false
+            };
+            let canonical_is_current =
+                !filename_changed || renamed_to_canonical || canonical_path_exists;
 
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
                     .or(identity.classification.clone());
-            if filename_changed && let Some(set_name) = old_rar_set_name {
-                touched_rar_files
-                    .entry(set_name)
-                    .or_default()
-                    .insert(old_current.clone());
+            let new_rar_set_name = classification.as_ref().and_then(|classification| {
+                matches!(
+                    classification.kind,
+                    crate::jobs::assembly::DetectedArchiveKind::Rar
+                )
+                .then(|| classification.set_name.clone())
+            });
+            if canonical_is_current && let Some(set_name) = old_rar_set_name.as_ref() {
+                let set_changed = old_rar_set_name != new_rar_set_name;
+                if filename_changed || set_changed {
+                    let touched = touched_rar_files.entry(set_name.clone()).or_default();
+                    touched.insert(old_current.clone());
+                    if set_changed {
+                        touched.insert(identity.source_filename.clone());
+                        if let Some(canonical) = identity.canonical_filename.as_ref() {
+                            touched.insert(canonical.clone());
+                        }
+                        stale_rar_sets.insert(set_name.clone());
+                    }
+                }
             }
 
-            let mut rebound_identity = identity;
-            rebound_identity.current_filename = canonical_filename.clone();
-            rebound_identity.canonical_filename = Some(canonical_filename);
+            let mut rebound_identity = identity.clone();
+            if canonical_is_current {
+                rebound_identity.current_filename = canonical_filename.clone();
+            }
+            rebound_identity.canonical_filename = Some(canonical_filename.clone());
             rebound_identity.classification = classification;
             rebound_identity.classification_source = FileIdentitySource::Par2;
+            let classification_changed = rebound_identity.classification != identity.classification;
+            if rebound_identity == identity {
+                continue;
+            }
             self.set_file_identity(job_id, rebound_identity)?;
 
-            if is_complete && filename_changed {
+            if is_complete && canonical_is_current && (filename_changed || classification_changed) {
                 touched_files.push(file_id);
+                if let Some(set_name) = new_rar_set_name.clone() {
+                    touched_complete_rar_sets.insert(set_name);
+                }
             }
             rebound += 1;
         }
@@ -289,6 +319,24 @@ impl Pipeline {
         for file_id in touched_files {
             self.refresh_archive_state_for_completed_file(job_id, file_id, false)
                 .await;
+        }
+
+        for set_name in touched_complete_rar_sets {
+            if !self.rar_sets.contains_key(&(job_id, set_name.clone())) {
+                continue;
+            }
+            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error,
+                    "failed to stabilize RAR state after PAR2 canonical rebind"
+                );
+            }
+        }
+
+        for set_name in stale_rar_sets {
+            self.clear_archive_set_if_unreferenced_and_idle(job_id, &set_name);
         }
 
         if rebound > 0 {
@@ -949,6 +997,13 @@ impl Pipeline {
             } else {
                 ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
             };
+            let (mut download_state, post_state, run_state) =
+                crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
+            if matches!(download_state, crate::jobs::model::DownloadState::Complete)
+                && self.job_has_pending_download_pipeline_work(state.job_id)
+            {
+                download_state = crate::jobs::model::DownloadState::Downloading;
+            }
             list.push(JobInfo {
                 job_id: state.job_id,
                 name: state.spec.name.clone(),
@@ -958,9 +1013,9 @@ impl Pipeline {
                     None
                 },
                 status: state.status.clone(),
-                download_state: state.download_state,
-                post_state: state.post_state,
-                run_state: state.run_state,
+                download_state,
+                post_state,
+                run_state,
                 progress: Self::effective_progress(state),
                 total_bytes: total,
                 downloaded_bytes: Self::effective_downloaded_bytes(state),

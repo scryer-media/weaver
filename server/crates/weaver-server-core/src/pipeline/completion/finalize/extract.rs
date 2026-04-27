@@ -410,6 +410,8 @@ impl Pipeline {
         let output_dir = self.extraction_staging_dir(job_id);
         let set_name_for_result = set_name_owned.clone();
         let pp_pool = self.pp_pool.clone();
+        let refresh_cached_headers =
+            self.rar_volume_paths_need_header_refresh(job_id, set_name, &volume_paths);
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 if volume_paths.is_empty() {
@@ -421,6 +423,7 @@ impl Pipeline {
                     volume_paths.clone(),
                     password.clone(),
                     cached_headers,
+                    refresh_cached_headers,
                 )?;
 
                 let meta = archive.metadata();
@@ -885,6 +888,18 @@ impl Pipeline {
     /// Persist RAR volume eligibility without deleting source volumes.
     pub(crate) fn try_delete_volumes(&mut self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
+        if self
+            .rar_sets
+            .get(&key)
+            .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty())
+        {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "RAR eager delete deferred while extraction workers are active"
+            );
+            return;
+        }
         let Some(plan) = self.rar_sets.get(&key).and_then(|state| state.plan.clone()) else {
             return;
         };
@@ -901,6 +916,11 @@ impl Pipeline {
             .get(&key)
             .map(|state| state.verified_suspect_volumes.clone())
             .unwrap_or_default();
+        let par2_verification_pending = self.jobs.get(&job_id).is_some_and(|state| {
+            state.spec.par2_bytes() > 0
+                && !self.par2_bypassed.contains(&job_id)
+                && !self.par2_verified.contains(&job_id)
+        });
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 
@@ -919,7 +939,8 @@ impl Pipeline {
             };
 
             let claim_clean = Self::claim_clean_rar_volume(decision);
-            let verification_blocked = verified_suspect.contains(&volume);
+            let verification_blocked =
+                par2_verification_pending || verified_suspect.contains(&volume);
             let solid_blocked = plan.is_solid;
             let waiting_on_retry = plan.waiting_on_volumes.contains(&volume);
             let failed_member_claim = !decision.failed_owners.is_empty();
@@ -999,8 +1020,11 @@ impl Pipeline {
                 if !claim_clean {
                     reasons.push("claims_not_clean".to_string());
                 }
-                if verification_blocked {
+                if verified_suspect.contains(&volume) {
                     reasons.push("verified_suspect".to_string());
+                }
+                if par2_verification_pending {
+                    reasons.push("par2_verification_pending".to_string());
                 }
                 if already_deleted {
                     reasons.push("already_deleted".to_string());

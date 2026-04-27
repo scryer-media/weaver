@@ -13,6 +13,44 @@ use crate::persistence::Database;
 use super::repository::db_err;
 
 impl Database {
+    pub fn load_complete_file_hashes(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT file_index, md5
+                 FROM active_files
+                 WHERE job_id = ?1",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([job_id.0 as i64], |row| {
+                let file_index: u32 = row.get(0)?;
+                let md5: Vec<u8> = row.get(1)?;
+                let md5: [u8; 16] = md5.try_into().map_err(|value: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid MD5 length: {}", value.len()),
+                        )),
+                    )
+                })?;
+                Ok((file_index, md5))
+            })
+            .map_err(db_err)?;
+
+        let mut hashes = HashMap::new();
+        for row in rows {
+            let (file_index, md5) = row.map_err(db_err)?;
+            hashes.insert(file_index, md5);
+        }
+        Ok(hashes)
+    }
+
     pub fn load_par2_files(
         &self,
         job_id: JobId,

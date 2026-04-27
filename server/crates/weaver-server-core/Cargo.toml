@@ -23,7 +23,6 @@ crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-scryer-release-parser = { workspace = true }
 rayon = { workspace = true }
 libc = { workspace = true }
 chrono = { workspace = true }

@@ -113,6 +113,10 @@ fn complete_file_and_load() {
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
     assert_eq!(jobs[&JobId(1)].file_progress.get(&0), None);
+
+    let hashes = db.load_complete_file_hashes(JobId(1)).unwrap();
+    assert_eq!(hashes[&0], [0x11; 16]);
+    assert_eq!(hashes[&1], [0x22; 16]);
 }
 
 #[test]

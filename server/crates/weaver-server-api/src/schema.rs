@@ -15,7 +15,7 @@ use crate::auth::types::{ApiKey, ApiKeyScope};
 use crate::auth::{AdminGuard, ReadGuard, graphql_error};
 use crate::categories::types::Category;
 use crate::history::timeline::build_job_timeline;
-use crate::history::types::{EventKind, HistoryItem, JobEvent, JobTimeline};
+use crate::history::types::{EventKind, HistoryItem, JobDetailSnapshot, JobEvent, JobTimeline};
 use crate::history::types::{history_item_from_row, matches_history_filter};
 use crate::jobs::types::{
     GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, PersistedQueueEvent,
@@ -32,7 +32,7 @@ use crate::settings::types::GeneralSettings;
 use crate::system::metrics_history::build_metrics_history;
 use crate::system::types::{
     DirectoryBrowseEntry, DirectoryBrowseResult, MetricsHistoryResult, ServiceLogsPayload,
-    SystemStatus,
+    SystemMetricsSnapshot, SystemStatus,
 };
 use crate::system::types::{DownloadBlock, Metrics, PipelineEventGql};
 

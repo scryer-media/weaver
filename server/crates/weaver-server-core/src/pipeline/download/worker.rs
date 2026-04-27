@@ -1,6 +1,20 @@
 use super::*;
 
 impl Pipeline {
+    fn status_allows_download_dispatch(status: &JobStatus) -> bool {
+        matches!(
+            status,
+            JobStatus::Queued
+                | JobStatus::Downloading
+                | JobStatus::Checking
+                | JobStatus::Verifying
+                | JobStatus::QueuedRepair
+                | JobStatus::Repairing
+                | JobStatus::QueuedExtract
+                | JobStatus::Extracting
+        )
+    }
+
     pub(crate) fn note_retry_scheduled(&mut self, job_id: JobId) {
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
     }
@@ -23,13 +37,14 @@ impl Pipeline {
     fn mark_download_pass_started(&mut self, job_id: JobId) {
         // Transition Queued → Downloading when the first segment is dispatched.
         if let Some(state) = self.jobs.get_mut(&job_id)
-            && matches!(
-                state.download_state,
-                crate::jobs::model::DownloadState::Queued
-            )
+            && matches!(state.status, JobStatus::Queued)
         {
             let _ = state;
-            self.transition_download_state(job_id, crate::jobs::model::DownloadState::Downloading);
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
         }
         self.note_download_activity(job_id);
         if self.active_download_passes.insert(job_id) {
@@ -255,12 +270,7 @@ impl Pipeline {
         let active_probes = self
             .jobs
             .values()
-            .filter(|s| {
-                matches!(
-                    s.download_state,
-                    crate::jobs::model::DownloadState::Checking
-                )
-            })
+            .filter(|s| matches!(s.status, JobStatus::Checking))
             .count();
         let max = tuner_max
             .min(self.connection_ramp)
@@ -278,15 +288,7 @@ impl Pipeline {
             .iter()
             .filter(|id| {
                 self.jobs.get(id).is_some_and(|s| {
-                    matches!(s.run_state, crate::jobs::model::RunState::Active)
-                        && !s.download_queue.is_empty()
-                        && !matches!(s.download_state, crate::jobs::model::DownloadState::Failed)
-                        && !matches!(
-                            s.post_state,
-                            crate::jobs::model::PostState::Finalizing
-                                | crate::jobs::model::PostState::Completed
-                                | crate::jobs::model::PostState::Failed
-                        )
+                    !s.download_queue.is_empty() && Self::status_allows_download_dispatch(&s.status)
                 })
             })
             .copied()
@@ -302,6 +304,9 @@ impl Pipeline {
                         status = ?s.status,
                         queue_len = s.download_queue.len(),
                         recovery_len = s.recovery_queue.len(),
+                        parked_recovery_only =
+                            s.download_queue.is_empty() && !s.recovery_queue.is_empty(),
+                        status_allows_dispatch = Self::status_allows_download_dispatch(&s.status),
                         "dispatch stall: job not eligible"
                     );
                 }

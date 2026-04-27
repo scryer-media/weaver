@@ -1,5 +1,6 @@
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_graphql::Request;
@@ -106,6 +107,90 @@ async fn queue_snapshots_reflect_pause_state() {
 }
 
 #[tokio::test]
+async fn queue_snapshots_reflect_paused_job_item_state() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("pause-job-snapshot").await;
+
+    let pause = h
+        .execute(&format!("mutation {{ pauseJob(id: {job_id}) }}"))
+        .await;
+    assert!(pause.errors.is_empty());
+
+    let request = Request::new("subscription { queueSnapshots { items { id state } } }")
+        .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
+    assert!(item.is_ok());
+    let response = item.unwrap().unwrap();
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    let items = data["queueSnapshots"]["items"].as_array().unwrap();
+    let paused_item = items
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("queueSnapshots should include the paused job");
+    assert_eq!(paused_item["state"].as_str().unwrap(), "PAUSED");
+}
+
+#[tokio::test]
+async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("speed-cache-snapshot").await;
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+    h.shared_state.refresh_metrics_snapshot();
+    let expected_speed = h.handle.get_metrics().current_download_speed;
+    assert!(expected_speed > 0);
+
+    let request = Request::new(
+        "subscription { queueSnapshots { items { id state } summary { currentDownloadSpeed } } }",
+    )
+    .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit an initial snapshot")
+        .expect("stream should stay open");
+    assert!(first.errors.is_empty());
+    let first_data = first.data.into_json().unwrap();
+    assert_eq!(
+        first_data["queueSnapshots"]["summary"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap(),
+        expected_speed
+    );
+
+    let pause = h
+        .execute(&format!("mutation {{ pauseJob(id: {job_id}) }}"))
+        .await;
+    assert!(pause.errors.is_empty());
+
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit after pause")
+        .expect("stream should stay open");
+    assert!(second.errors.is_empty());
+    let second_data = second.data.into_json().unwrap();
+    assert_eq!(
+        second_data["queueSnapshots"]["summary"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap(),
+        expected_speed
+    );
+    let items = second_data["queueSnapshots"]["items"].as_array().unwrap();
+    let paused_item = items
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("queueSnapshots should include the paused job");
+    assert_eq!(paused_item["state"].as_str().unwrap(), "PAUSED");
+}
+
+#[tokio::test]
 async fn queue_snapshots_drop_cancelled_job_while_globally_paused() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("cancel-paused-subscription").await;
@@ -163,6 +248,106 @@ async fn queue_snapshots_drop_cancelled_job_while_globally_paused() {
 }
 
 #[tokio::test]
+async fn queue_snapshot_query_returns_items_and_cursor_together() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("queue-snapshot-query").await;
+
+    let response = h
+        .execute_as(
+            "query { queueSnapshot { items { id state } latestCursor globalState { isPaused } } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    let items = data["queueSnapshot"]["items"].as_array().unwrap();
+    let item = items
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("queueSnapshot query should include the submitted job");
+    assert_eq!(item["state"].as_str().unwrap(), "QUEUED");
+    assert!(
+        data["queueSnapshot"]["latestCursor"].as_str().is_some(),
+        "queueSnapshot should include the replay cursor"
+    );
+    assert_eq!(
+        data["queueSnapshot"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap(),
+        false
+    );
+}
+
+#[tokio::test]
+async fn latest_queue_cursor_query_returns_encoded_cursor() {
+    let h = TestHarness::new().await;
+
+    let response = h
+        .execute_as("query { latestQueueCursor }", CallerScope::Read)
+        .await;
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    assert!(
+        data["latestQueueCursor"].as_str().is_some(),
+        "latestQueueCursor should be encoded as a string"
+    );
+}
+
+#[tokio::test]
+async fn system_metrics_updates_emit_metrics_and_global_state() {
+    let h = TestHarness::new().await;
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+    h.shared_state.refresh_metrics_snapshot();
+    let expected_speed = h.handle.get_metrics().current_download_speed;
+    assert!(expected_speed > 0);
+
+    let request = Request::new(
+        "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } globalState { isPaused } } }",
+    )
+    .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("metrics subscription should emit an initial snapshot")
+        .expect("stream should stay open");
+    assert!(first.errors.is_empty());
+    let first_data = first.data.into_json().unwrap();
+    assert_eq!(
+        first_data["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap(),
+        expected_speed
+    );
+    assert_eq!(
+        first_data["systemMetricsUpdates"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap(),
+        false
+    );
+
+    let pause = h.execute("mutation { pauseQueue { success } }").await;
+    assert!(pause.errors.is_empty());
+
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("metrics subscription should emit after cadence tick")
+        .expect("stream should stay open");
+    assert!(second.errors.is_empty());
+    let second_data = second.data.into_json().unwrap();
+    assert_eq!(
+        second_data["systemMetricsUpdates"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap(),
+        true
+    );
+}
+
+#[tokio::test]
 async fn queue_events_replay_from_cursor_then_tail() {
     let h = TestHarness::new().await;
     let item_id = h.submit_test_nzb("event-test").await;
@@ -208,5 +393,49 @@ async fn queue_events_replay_from_cursor_then_tail() {
     assert_eq!(
         data["queueEvents"]["state"].as_str().unwrap(),
         "DOWNLOADING"
+    );
+}
+
+#[tokio::test]
+async fn job_detail_updates_emit_live_state_changes() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("job-detail-updates").await;
+
+    let request = Request::new(format!(
+        "subscription {{ jobDetailUpdates(jobId: {job_id}) {{ queueItem {{ id state }} jobTimeline {{ outcome }} jobEvents {{ kind }} }} }}"
+    ))
+    .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit an initial snapshot")
+        .expect("stream should stay open");
+    assert!(first.errors.is_empty());
+    let first_data = first.data.into_json().unwrap();
+    assert_eq!(
+        first_data["jobDetailUpdates"]["queueItem"]["id"].as_u64(),
+        Some(job_id)
+    );
+    assert_eq!(
+        first_data["jobDetailUpdates"]["queueItem"]["state"].as_str(),
+        Some("QUEUED")
+    );
+    assert!(first_data["jobDetailUpdates"]["jobEvents"].as_array().is_some());
+
+    let pause = h
+        .execute(&format!("mutation {{ pauseJob(id: {job_id}) }}"))
+        .await;
+    assert!(pause.errors.is_empty());
+
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should emit after pause")
+        .expect("stream should stay open");
+    assert!(second.errors.is_empty());
+    let second_data = second.data.into_json().unwrap();
+    assert_eq!(
+        second_data["jobDetailUpdates"]["queueItem"]["state"].as_str(),
+        Some("PAUSED")
     );
 }

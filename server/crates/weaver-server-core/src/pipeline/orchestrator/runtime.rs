@@ -1,6 +1,7 @@
 use super::*;
 
 impl Pipeline {
+    const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Create a new pipeline.
@@ -72,6 +73,10 @@ impl Pipeline {
             segment_batch: Vec::new(),
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
+            file_hash_states: HashMap::new(),
+            file_hash_reread_required: HashSet::new(),
+            #[cfg(test)]
+            try_update_archive_topology_calls: 0,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             download_done_tx,
@@ -208,6 +213,10 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.persisted_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
+        self.file_hash_states
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.file_hash_reread_required
+            .retain(|file_id| file_id.job_id != job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -251,11 +260,7 @@ impl Pipeline {
             .jobs
             .iter()
             .filter_map(|(job_id, state)| {
-                if !matches!(
-                    state.download_state,
-                    crate::jobs::model::DownloadState::Downloading
-                ) || state.health_probing
-                {
+                if !matches!(state.status, JobStatus::Downloading) || state.health_probing {
                     return None;
                 }
 
@@ -310,6 +315,9 @@ impl Pipeline {
     }
 
     pub async fn run(&mut self) {
+        let mut metrics_snapshot_interval =
+            tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
+        metrics_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
@@ -385,6 +393,9 @@ impl Pipeline {
                         }
                     }
                 }
+                _ = metrics_snapshot_interval.tick() => {
+                    self.shared_state.refresh_metrics_snapshot();
+                }
                 _ = rate_sleep, if !rate_delay.is_zero() => {}
                 _ = tune_interval.tick() => {
                     self.flush_quiescent_write_backlog().await;
@@ -396,7 +407,7 @@ impl Pipeline {
                         .filter(|s| s.spec.total_bytes > 0)
                         .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                         .min();
-                    info!(
+                    debug!(
                         active = self.active_downloads,
                         queue = snapshot.download_queue_depth,
                         speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),

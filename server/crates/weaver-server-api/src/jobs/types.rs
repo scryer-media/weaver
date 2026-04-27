@@ -2,10 +2,10 @@ use async_graphql::{Enum, InputObject, SimpleObject, Upload};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use weaver_server_core::ingest::{derive_release_name, original_release_title, parse_job_release};
 use weaver_server_core::jobs::handle::DownloadBlockState;
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 
+use super::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
 
 pub const CLIENT_REQUEST_ID_ATTRIBUTE_KEY: &str = "__weaver_client_request_id";
@@ -132,7 +132,9 @@ pub struct QueueItem {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    #[serde(default = "default_queue_download_state")]
     pub download_state: QueueDownloadState,
+    #[serde(default = "default_queue_post_state")]
     pub post_state: QueuePostState,
     pub wait_reason: Option<QueueWaitReason>,
     pub error: Option<String>,
@@ -150,6 +152,14 @@ pub struct QueueItem {
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub attention: Option<QueueAttention>,
+}
+
+fn default_queue_download_state() -> QueueDownloadState {
+    QueueDownloadState::Downloading
+}
+
+fn default_queue_post_state() -> QueuePostState {
+    QueuePostState::Idle
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -282,7 +292,7 @@ pub struct MetadataInput {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct ParsedEpisode {
     pub season: Option<u32>,
     pub episode_numbers: Vec<u32>,
@@ -290,18 +300,7 @@ pub struct ParsedEpisode {
     pub raw: Option<String>,
 }
 
-impl From<scryer_release_parser::ParsedEpisodeMetadata> for ParsedEpisode {
-    fn from(value: scryer_release_parser::ParsedEpisodeMetadata) -> Self {
-        Self {
-            season: value.season,
-            episode_numbers: value.episode_numbers,
-            absolute_episode: value.absolute_episode,
-            raw: value.raw,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct ParsedRelease {
     pub normalized_title: String,
     pub release_group: Option<String>,
@@ -335,43 +334,6 @@ pub struct ParsedRelease {
     pub parse_confidence: f32,
 }
 
-impl From<scryer_release_parser::ParsedReleaseMetadata> for ParsedRelease {
-    fn from(value: scryer_release_parser::ParsedReleaseMetadata) -> Self {
-        Self {
-            normalized_title: value.normalized_title,
-            release_group: value.release_group,
-            languages_audio: value.languages_audio,
-            languages_subtitles: value.languages_subtitles,
-            year: value.year,
-            quality: value.quality,
-            source: value.source,
-            video_codec: value.video_codec,
-            video_encoding: value.video_encoding,
-            audio: value.audio,
-            audio_codecs: value.audio_codecs,
-            audio_channels: value.audio_channels,
-            is_dual_audio: value.is_dual_audio,
-            is_atmos: value.is_atmos,
-            is_dolby_vision: value.is_dolby_vision,
-            detected_hdr: value.detected_hdr,
-            is_hdr10plus: value.is_hdr10plus,
-            is_hlg: value.is_hlg,
-            fps: value.fps,
-            is_proper_upload: value.is_proper_upload,
-            is_repack: value.is_repack,
-            is_remux: value.is_remux,
-            is_bd_disk: value.is_bd_disk,
-            is_ai_enhanced: value.is_ai_enhanced,
-            is_hardcoded_subs: value.is_hardcoded_subs,
-            streaming_service: value.streaming_service,
-            edition: value.edition,
-            anime_version: value.anime_version,
-            episode: value.episode.map(ParsedEpisode::from),
-            parse_confidence: value.parse_confidence,
-        }
-    }
-}
-
 #[derive(Debug, Clone, SimpleObject)]
 pub struct Job {
     pub id: u64,
@@ -397,16 +359,18 @@ pub struct Job {
 
 impl From<&weaver_server_core::JobInfo> for Job {
     fn from(info: &weaver_server_core::JobInfo) -> Self {
-        let original_title = original_release_title(&info.name, &info.metadata);
-        let display_title = derive_release_name(Some(&original_title), Some(&info.name));
-        let parsed_release = ParsedRelease::from(parse_job_release(&info.name, &info.metadata));
+        let display = release_display_info(ReleaseDisplayInput {
+            job_name: &info.name,
+            metadata: &info.metadata,
+            category: info.category.as_deref(),
+        });
 
         Self {
             id: info.job_id.0,
             name: info.name.clone(),
-            display_title,
-            original_title,
-            parsed_release,
+            display_title: display.display_title,
+            original_title: display.original_title,
+            parsed_release: display.parsed_release,
             status: JobStatusGql::from(&info.status),
             error: info.error.clone(),
             progress: info.progress,
@@ -532,16 +496,18 @@ pub fn submit_metadata(
 
 pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&info.metadata);
-    let state = QueueItemState::from(&info.status);
-    let original_title = original_release_title(&info.name, &info.metadata);
-    let display_title = derive_release_name(Some(&original_title), Some(&info.name));
-    let parsed_release = ParsedRelease::from(parse_job_release(&info.name, &info.metadata));
+    let state = queue_item_state_from_job_info(info);
+    let display = release_display_info(ReleaseDisplayInput {
+        job_name: &info.name,
+        metadata: &info.metadata,
+        category: info.category.as_deref(),
+    });
     QueueItem {
         id: info.job_id.0,
         name: info.name.clone(),
-        display_title,
-        original_title,
-        parsed_release,
+        display_title: display.display_title,
+        original_title: display.original_title,
+        parsed_release: display.parsed_release,
         state,
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
@@ -568,18 +534,17 @@ pub fn queue_item_from_submission(
     submitted: &weaver_server_core::ingest::SubmittedJob,
 ) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&submitted.spec.metadata);
-    let original_title = original_release_title(&submitted.spec.name, &submitted.spec.metadata);
-    let display_title = derive_release_name(Some(&original_title), Some(&submitted.spec.name));
-    let parsed_release = ParsedRelease::from(parse_job_release(
-        &submitted.spec.name,
-        &submitted.spec.metadata,
-    ));
+    let display = release_display_info(ReleaseDisplayInput {
+        job_name: &submitted.spec.name,
+        metadata: &submitted.spec.metadata,
+        category: submitted.spec.category.as_deref(),
+    });
     QueueItem {
         id: submitted.job_id.0,
         name: submitted.spec.name.clone(),
-        display_title,
-        original_title,
-        parsed_release,
+        display_title: display.display_title,
+        original_title: display.original_title,
+        parsed_release: display.parsed_release,
         state: QueueItemState::Queued,
         download_state: QueueDownloadState::Queued,
         post_state: QueuePostState::Idle,
@@ -818,6 +783,39 @@ fn wait_reason_for_post_state(
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
         _ => None,
+    }
+}
+
+fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
+    match &info.status {
+        weaver_server_core::JobStatus::Paused => return QueueItemState::Paused,
+        weaver_server_core::JobStatus::Failed { .. } => return QueueItemState::Failed,
+        weaver_server_core::JobStatus::Complete => return QueueItemState::Completed,
+        weaver_server_core::JobStatus::Moving => return QueueItemState::Finalizing,
+        _ => {}
+    }
+
+    match info.download_state {
+        weaver_server_core::DownloadState::Downloading => return QueueItemState::Downloading,
+        weaver_server_core::DownloadState::Checking => return QueueItemState::Verifying,
+        weaver_server_core::DownloadState::Queued => return QueueItemState::Queued,
+        weaver_server_core::DownloadState::Failed => return QueueItemState::Failed,
+        weaver_server_core::DownloadState::Complete => {}
+    }
+
+    match info.post_state {
+        weaver_server_core::PostState::Verifying
+        | weaver_server_core::PostState::AwaitingRepair => QueueItemState::Verifying,
+        weaver_server_core::PostState::Repairing => QueueItemState::Repairing,
+        weaver_server_core::PostState::Extracting => QueueItemState::Extracting,
+        weaver_server_core::PostState::Finalizing => QueueItemState::Finalizing,
+        weaver_server_core::PostState::Completed => QueueItemState::Completed,
+        weaver_server_core::PostState::Failed => QueueItemState::Failed,
+        weaver_server_core::PostState::QueuedRepair
+        | weaver_server_core::PostState::QueuedExtract => QueueItemState::Queued,
+        weaver_server_core::PostState::Idle | weaver_server_core::PostState::WaitingForVolumes => {
+            QueueItemState::from(&info.status)
+        }
     }
 }
 

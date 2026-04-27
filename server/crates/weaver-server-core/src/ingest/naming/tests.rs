@@ -1,6 +1,4 @@
-use scryer_release_parser::parse_release_metadata;
-
-use super::{MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME, derive_release_name};
+use super::derive_release_name;
 
 #[test]
 fn prefers_parsed_release_title() {
@@ -36,9 +34,6 @@ fn display_title_movie_no_episode_suffix() {
 #[test]
 fn low_confidence_parse_falls_back_to_basic_cleanup() {
     let raw = "ubuntu-24.04.2-live-server-amd64";
-    let parsed = parse_release_metadata(raw);
-
-    assert!(parsed.parse_confidence < MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME);
     assert_eq!(
         derive_release_name(Some(raw), None),
         "ubuntu-24 04 2-live-server-amd64"

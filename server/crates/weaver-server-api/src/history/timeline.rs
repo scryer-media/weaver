@@ -29,6 +29,7 @@ pub(crate) fn build_job_timeline(
     let current_attempt_started_at = history
         .map(|row| row.created_at as f64 * 1000.0)
         .unwrap_or(job.created_at_epoch_ms);
+    let events = events_for_current_attempt(events, current_attempt_started_at);
     let started_at = events
         .first()
         .map(|event| (event.timestamp as f64).min(current_attempt_started_at))
@@ -51,7 +52,11 @@ pub(crate) fn build_job_timeline(
         })
     });
 
-    let download_spans = collect_download_spans(events);
+    let download_spans = synthesize_active_download_span(
+        collect_download_spans(events),
+        job,
+        started_at,
+    );
     let pause_spans = collect_pause_spans(events);
     let verify_spans = collect_job_spans(
         events,
@@ -132,6 +137,38 @@ pub(crate) fn build_job_timeline(
         lanes,
         extraction_groups,
     }
+}
+
+fn events_for_current_attempt(
+    events: &[StoredJobEvent],
+    current_attempt_started_at: f64,
+) -> &[StoredJobEvent] {
+    let mut start_index = None;
+    let mut terminal_seen = false;
+
+    for (index, event) in events.iter().enumerate() {
+        let Ok(kind) = event.kind.parse::<EventKind>() else {
+            continue;
+        };
+
+        match kind {
+            EventKind::JobCreated => {
+                if event.timestamp as f64 >= current_attempt_started_at || terminal_seen {
+                    start_index = Some(index);
+                }
+                terminal_seen = false;
+            }
+            EventKind::JobResumed => {
+                terminal_seen = false;
+            }
+            EventKind::JobFailed | EventKind::JobCancelled | EventKind::JobCompleted => {
+                terminal_seen = true;
+            }
+            _ => {}
+        }
+    }
+
+    start_index.map(|index| &events[index..]).unwrap_or(events)
 }
 
 fn collect_job_spans(
@@ -372,6 +409,30 @@ fn close_open_job_spans(
             }
         }
     }
+    spans
+}
+
+fn synthesize_active_download_span(
+    mut spans: Vec<JobTimelineSpan>,
+    job: &JobInfo,
+    started_at: f64,
+) -> Vec<JobTimelineSpan> {
+    if spans.iter().any(|span| span.ended_at.is_none()) {
+        return spans;
+    }
+
+    if spans.is_empty()
+        && matches!(job.status, weaver_server_core::JobStatus::Downloading)
+        && matches!(job.run_state, weaver_server_core::RunState::Active)
+    {
+        spans.push(JobTimelineSpan {
+            started_at,
+            ended_at: None,
+            state: TimelineSpanState::Running,
+            label: None,
+        });
+    }
+
     spans
 }
 

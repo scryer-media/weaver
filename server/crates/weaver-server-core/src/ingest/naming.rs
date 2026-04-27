@@ -1,6 +1,3 @@
-use scryer_release_parser::{ParsedEpisodeMetadata, ParsedReleaseMetadata, parse_release_metadata};
-const MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME: f32 = 0.4;
-
 pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> String {
     for candidate in [primary, secondary].into_iter().flatten() {
         let trimmed = candidate.trim();
@@ -8,19 +5,9 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
             continue;
         }
 
-        let parsed = parse_release_metadata(trimmed);
-        if parsed.parse_confidence >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME {
-            let extracted = extract_title_from_candidate(trimmed, &parsed);
-            if !extracted.is_empty() {
-                let name = finalize_release_name(extracted);
-                return append_episode_suffix(name, parsed.episode.as_ref());
-            }
-
-            let normalized = basic_release_name(parsed.normalized_title.trim());
-            if !normalized.is_empty() {
-                let name = finalize_release_name(normalized);
-                return append_episode_suffix(name, parsed.episode.as_ref());
-            }
+        if let Some(extracted) = extract_title_from_candidate(trimmed) {
+            let name = finalize_release_name(extracted.name);
+            return append_episode_suffix(name, extracted.episode);
         }
 
         let fallback = basic_release_name(trimmed);
@@ -32,77 +19,70 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
     "Untitled".to_string()
 }
 
-/// Append a human-readable episode suffix (e.g. " — S04E29") when episode
-/// metadata is available from the release parser.
-fn append_episode_suffix(name: String, episode: Option<&ParsedEpisodeMetadata>) -> String {
-    let Some(ep) = episode else {
+#[derive(Debug, Clone, Copy)]
+struct EpisodeSuffix {
+    season: Option<u32>,
+    episode: Option<u32>,
+    absolute: Option<u32>,
+}
+
+struct TitleExtraction {
+    name: String,
+    episode: Option<EpisodeSuffix>,
+}
+
+fn extract_title_from_candidate(raw: &str) -> Option<TitleExtraction> {
+    let raw = strip_nzb_suffix(raw.trim());
+    let tokens = split_release_tokens(raw);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let boundary = tokens
+        .iter()
+        .enumerate()
+        .find_map(|(index, token)| metadata_boundary(token).map(|episode| (index, episode)))?;
+
+    if boundary.0 == 0 {
+        return None;
+    }
+
+    let name = basic_release_name(&tokens[..boundary.0].join(" "));
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(TitleExtraction {
+        name,
+        episode: boundary.1,
+    })
+}
+
+fn append_episode_suffix(name: String, episode: Option<EpisodeSuffix>) -> String {
+    let Some(episode) = episode else {
         return name;
     };
 
-    if let Some(season) = ep.season {
-        if !ep.episode_numbers.is_empty() {
-            let episodes: String = ep
-                .episode_numbers
-                .iter()
-                .map(|e| format!("E{e:02}"))
-                .collect::<Vec<_>>()
-                .join("-");
-            return format!("{name} — S{season:02}{episodes}");
-        }
-        return format!("{name} — S{season:02}");
+    if let (Some(season), Some(episode)) = (episode.season, episode.episode) {
+        return format!("{name} — S{season:02}E{episode:02}");
     }
 
-    if let Some(abs) = ep.absolute_episode {
+    if let Some(abs) = episode.absolute {
         return format!("{name} — {abs:03}");
     }
 
     name
 }
 
-fn extract_title_from_candidate(raw: &str, parsed: &ParsedReleaseMetadata) -> String {
-    let raw = raw.trim().trim_end_matches(".nzb").trim_end_matches(".NZB");
-    let tokens = split_release_tokens(raw);
-    if tokens.is_empty() {
-        return String::new();
+fn metadata_boundary(token: &str) -> Option<Option<EpisodeSuffix>> {
+    let upper = token.to_ascii_uppercase();
+    if let Some(episode) = parse_standard_episode_token(&upper) {
+        return Some(Some(episode));
     }
 
-    let stop_index = tokens
-        .iter()
-        .position(|token| is_metadata_boundary(token, parsed))
-        .unwrap_or(tokens.len());
-
-    basic_release_name(&tokens[..stop_index].join(" "))
-}
-
-fn split_release_tokens(raw: &str) -> Vec<String> {
-    raw.split(|ch: char| {
-        matches!(
-            ch,
-            '.' | '_' | '-' | '[' | ']' | '(' | ')' | '{' | '}' | ' '
-        )
-    })
-    .filter(|token| !token.is_empty())
-    .map(ToString::to_string)
-    .collect()
-}
-
-fn is_metadata_boundary(token: &str, parsed: &ParsedReleaseMetadata) -> bool {
-    let upper = token.to_ascii_uppercase();
-
-    matches_release_value(&upper, parsed.quality.as_deref())
-        || matches_release_value(&upper, parsed.source.as_deref())
-        || matches_release_value(&upper, parsed.video_codec.as_deref())
-        || matches_release_value(&upper, parsed.video_encoding.as_deref())
-        || matches_release_value(&upper, parsed.audio.as_deref())
-        || matches_release_value(&upper, parsed.audio_channels.as_deref())
-        || matches_release_value(&upper, parsed.streaming_service.as_deref())
-        || matches_release_value(&upper, parsed.edition.as_deref())
-        || matches_release_value(&upper, parsed.release_group.as_deref())
-        || parsed.year.is_some_and(|year| upper == year.to_string())
-        || parsed
-            .episode
-            .as_ref()
-            .is_some_and(|episode| matches_episode_token(&upper, episode))
+    if is_generic_season_token(&upper)
+        || is_plausible_year(&upper)
+        || is_quality_token(&upper)
         || matches!(
             upper.as_str(),
             "PROPER"
@@ -120,52 +100,72 @@ fn is_metadata_boundary(token: &str, parsed: &ParsedReleaseMetadata) -> bool {
                 | "TRUEHD"
                 | "ATMOS"
                 | "WEB"
+                | "WEBRIP"
+                | "WEBDL"
+                | "WEB-DL"
                 | "BLURAY"
                 | "BDRIP"
+                | "BDREMUX"
                 | "BDMUX"
                 | "BDMV"
                 | "COMPLETE"
+                | "X264"
+                | "X265"
+                | "H264"
+                | "H265"
+                | "HEVC"
+                | "AVC"
+                | "AAC"
+                | "AC3"
+                | "EAC3"
+                | "DTS"
+                | "FLAC"
         )
-        || is_generic_season_token(&upper)
-}
-
-fn matches_release_value(token: &str, value: Option<&str>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-
-    let normalized = value.to_ascii_uppercase().replace(['.', '-', ' '], "");
-    let token_normalized = token.replace(['.', '-', ' '], "");
-    token_normalized == normalized
-}
-
-fn matches_episode_token(token: &str, episode: &ParsedEpisodeMetadata) -> bool {
-    if let Some(raw) = episode.raw.as_deref() {
-        let normalized = raw.to_ascii_uppercase().replace(['.', '-', ' '], "");
-        let token_normalized = token.replace(['.', '-', ' '], "");
-        if token_normalized == normalized {
-            return true;
-        }
-    }
-
-    if let Some(season) = episode.season
-        && (token == format!("S{season:02}") || token == format!("SEASON{season}"))
     {
-        return true;
+        return Some(None);
     }
 
-    false
+    None
 }
 
-fn basic_release_name(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(".nzb")
-        .trim_end_matches(".NZB")
+fn parse_standard_episode_token(token: &str) -> Option<EpisodeSuffix> {
+    let rest = token.strip_prefix('S')?;
+    let split = rest.find('E')?;
+    let season = rest[..split].parse::<u32>().ok()?;
+    let episode = rest[split + 1..].parse::<u32>().ok()?;
+    Some(EpisodeSuffix {
+        season: Some(season),
+        episode: Some(episode),
+        absolute: None,
+    })
+}
+
+pub(crate) fn split_release_tokens(raw: &str) -> Vec<String> {
+    raw.split(|ch: char| {
+        matches!(
+            ch,
+            '.' | '_' | '-' | '[' | ']' | '(' | ')' | '{' | '}' | ' '
+        )
+    })
+    .filter(|token| !token.is_empty())
+    .map(ToString::to_string)
+    .collect()
+}
+
+pub(crate) fn basic_release_name(raw: &str) -> String {
+    strip_nzb_suffix(raw)
         .trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | '{' | '}'))
         .replace(['.', '_'], " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn strip_nzb_suffix(raw: &str) -> &str {
+    raw.trim()
+        .trim_end_matches(".nzb")
+        .trim_end_matches(".NZB")
+        .trim()
 }
 
 fn is_generic_season_token(token: &str) -> bool {
@@ -180,6 +180,20 @@ fn is_generic_season_token(token: &str) -> bool {
     }
 
     false
+}
+
+fn is_quality_token(token: &str) -> bool {
+    let Some(resolution) = token.strip_suffix('P') else {
+        return false;
+    };
+    matches!(resolution, "480" | "576" | "720" | "1080" | "2160" | "4320")
+}
+
+fn is_plausible_year(token: &str) -> bool {
+    let Ok(year) = token.parse::<u32>() else {
+        return false;
+    };
+    (1900..=2100).contains(&year)
 }
 
 fn finalize_release_name(name: String) -> String {

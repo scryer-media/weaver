@@ -1,7 +1,138 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanPar2IntegrityGate {
+    None,
+    WeakTransform,
+    StrongDecode,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PromotedRecoveryPipelineState {
+    download_queue_len: usize,
+    download_queue_has_recovery: bool,
+    recovery_queue_len: usize,
+    promoted_par2_files: usize,
+    incomplete_promoted_par2_files: usize,
+    active_downloads_for_job: usize,
+    active_recovery_global: usize,
+    pending_promoted_decode: usize,
+}
+
+impl PromotedRecoveryPipelineState {
+    fn has_inflight_promoted_recovery(self) -> bool {
+        self.promoted_par2_files > 0
+            && self.active_recovery_global > 0
+            && self.active_downloads_for_job > 0
+    }
+
+    fn has_pending_work(self) -> bool {
+        self.download_queue_has_recovery
+            || self.incomplete_promoted_par2_files > 0
+            || self.has_inflight_promoted_recovery()
+            || self.pending_promoted_decode > 0
+    }
+}
+
+fn summarize_rar_set_phase(
+    set_name: &str,
+    set_state: &crate::pipeline::archive::rar_state::RarSetState,
+) -> String {
+    let phase = set_state
+        .plan
+        .as_ref()
+        .map(|plan| plan.phase)
+        .unwrap_or(set_state.phase);
+    let mut ready_members = set_state
+        .plan
+        .as_ref()
+        .map(|plan| {
+            plan.ready_members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ready_members.sort();
+    let waiting_on_volumes = set_state
+        .plan
+        .as_ref()
+        .map(|plan| {
+            let mut waiting = plan.waiting_on_volumes.iter().copied().collect::<Vec<_>>();
+            waiting.sort_unstable();
+            waiting
+        })
+        .unwrap_or_default();
+    let mut in_flight_members = set_state.in_flight_members.iter().cloned().collect::<Vec<_>>();
+    in_flight_members.sort();
+    let mut suspect_volumes = set_state
+        .verified_suspect_volumes
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    suspect_volumes.sort_unstable();
+
+    format!(
+        "{set_name}: phase={phase:?} workers={} ready={ready_members:?} waiting={waiting_on_volumes:?} inflight={in_flight_members:?} suspect={suspect_volumes:?}",
+        set_state.active_workers,
+    )
+}
+
 impl Pipeline {
+    fn current_rar_set_names_for_job(&self, job_id: JobId) -> HashSet<String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return HashSet::new();
+        };
+
+        let mut set_names: HashSet<String> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                self.effective_file_identity(job_id, file.file_id())
+                    .and_then(|identity| identity.classification)
+                    .and_then(|classification| {
+                        matches!(
+                            classification.kind,
+                            crate::jobs::assembly::DetectedArchiveKind::Rar
+                        )
+                        .then_some(classification.set_name)
+                    })
+            })
+            .collect();
+
+        if set_names.is_empty() {
+            set_names.extend(
+                state
+                    .assembly
+                    .archive_topologies()
+                    .iter()
+                    .filter_map(|(set_name, topology)| {
+                        matches!(topology.archive_type, crate::jobs::assembly::ArchiveType::Rar)
+                            .then_some(set_name.clone())
+                    }),
+            );
+        }
+
+        set_names
+    }
+
+    pub(crate) fn job_has_live_rar_waiting_for_missing_volumes(&self, job_id: JobId) -> bool {
+        let current_set_names = self.current_rar_set_names_for_job(job_id);
+
+        self.rar_sets.iter().any(|((rar_job_id, set_name), set_state)| {
+            *rar_job_id == job_id
+                && (current_set_names.is_empty() || current_set_names.contains(set_name))
+                && set_state.plan.as_ref().is_some_and(|plan| {
+                    matches!(
+                        plan.phase,
+                        crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+                            | crate::pipeline::archive::rar_state::RarSetPhase::AwaitingRepair
+                    )
+                })
+        })
+    }
+
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
         let has_queued_work = self
             .jobs
@@ -42,27 +173,136 @@ impl Pipeline {
             || has_buffered_segments
     }
 
-    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId) -> bool {
-        let has_queued_recovery = self.jobs.get(&job_id).is_some_and(|state| {
-            state.download_queue.has_recovery_work() || !state.recovery_queue.is_empty()
-        });
-        let has_inflight_recovery =
-            self.active_recovery > 0 && self.active_downloads_by_job.contains_key(&job_id);
-        let has_pending_recovery_decode = self.pending_decode.iter().any(|work| {
-            work.segment_id.file_id.job_id == job_id
-                && self.par2_runtime(job_id).is_some_and(|runtime| {
-                    runtime
-                        .files
-                        .get(&work.segment_id.file_id.file_index)
-                        .is_some_and(|file| file.promoted)
-                })
-        });
+    fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {
+        let (download_queue_len, download_queue_has_recovery, recovery_queue_len) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                (
+                    state.download_queue.len(),
+                    state.download_queue.has_recovery_work(),
+                    state.recovery_queue.len(),
+                )
+            })
+            .unwrap_or((0, false, 0));
+        let promoted_files: HashSet<u32> = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| file.promoted.then_some(file_index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let incomplete_promoted_par2_files = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                promoted_files
+                    .iter()
+                    .filter(|file_index| {
+                        state
+                            .assembly
+                            .file(NzbFileId {
+                                job_id,
+                                file_index: **file_index,
+                            })
+                            .is_none_or(|file| !file.is_complete())
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let pending_promoted_decode = self
+            .pending_decode
+            .iter()
+            .filter(|work| {
+                work.segment_id.file_id.job_id == job_id
+                    && promoted_files.contains(&work.segment_id.file_id.file_index)
+            })
+            .count();
 
-        has_queued_recovery || has_inflight_recovery || has_pending_recovery_decode
+        PromotedRecoveryPipelineState {
+            download_queue_len,
+            download_queue_has_recovery,
+            recovery_queue_len,
+            promoted_par2_files: promoted_files.len(),
+            incomplete_promoted_par2_files,
+            active_downloads_for_job: self
+                .active_downloads_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            active_recovery_global: self.active_recovery,
+            pending_promoted_decode,
+        }
+    }
+
+    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId) -> bool {
+        self.promoted_recovery_pipeline_state(job_id)
+            .has_pending_work()
     }
 }
 
 impl Pipeline {
+    fn clean_par2_integrity_gate(&self, job_id: JobId) -> CleanPar2IntegrityGate {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return CleanPar2IntegrityGate::None;
+        };
+
+        let mut gate = CleanPar2IntegrityGate::None;
+        for topology in state.assembly.archive_topologies().values() {
+            let topology_gate = match topology.archive_type {
+                crate::jobs::assembly::ArchiveType::Split
+                | crate::jobs::assembly::ArchiveType::Tar => CleanPar2IntegrityGate::WeakTransform,
+                crate::jobs::assembly::ArchiveType::SevenZip => {
+                    if topology.volume_map.len() <= 1 {
+                        CleanPar2IntegrityGate::WeakTransform
+                    } else {
+                        CleanPar2IntegrityGate::StrongDecode
+                    }
+                }
+                crate::jobs::assembly::ArchiveType::Rar
+                | crate::jobs::assembly::ArchiveType::Zip
+                | crate::jobs::assembly::ArchiveType::TarGz
+                | crate::jobs::assembly::ArchiveType::TarBz2
+                | crate::jobs::assembly::ArchiveType::Gz
+                | crate::jobs::assembly::ArchiveType::Deflate
+                | crate::jobs::assembly::ArchiveType::Brotli
+                | crate::jobs::assembly::ArchiveType::Zstd
+                | crate::jobs::assembly::ArchiveType::Bzip2 => CleanPar2IntegrityGate::StrongDecode,
+            };
+            gate = match (gate, topology_gate) {
+                (CleanPar2IntegrityGate::StrongDecode, _)
+                | (_, CleanPar2IntegrityGate::StrongDecode) => CleanPar2IntegrityGate::StrongDecode,
+                (CleanPar2IntegrityGate::WeakTransform, _)
+                | (_, CleanPar2IntegrityGate::WeakTransform) => CleanPar2IntegrityGate::WeakTransform,
+                _ => CleanPar2IntegrityGate::None,
+            };
+        }
+
+        gate
+    }
+
+    async fn load_existing_complete_file_hashes(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<u32, [u8; 16]>, String> {
+        self.db_blocking(move |db| db.load_complete_file_hashes(job_id))
+            .await
+            .map_err(|error| format!("failed to load completed-file hashes: {error}"))
+    }
+
+    fn expected_hash_for_verified_file(
+        file_id: NzbFileId,
+        existing_hashes: &HashMap<u32, [u8; 16]>,
+    ) -> [u8; 16] {
+        existing_hashes
+            .get(&file_id.file_index)
+            .copied()
+            .unwrap_or([0u8; 16])
+    }
+
     async fn try_deobfuscate_files_with_par2(&mut self, job_id: JobId) -> usize {
         let Some(par2) = self.par2_set(job_id).cloned() else {
             return 0;
@@ -127,9 +367,7 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
-            if old
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
+            if old.file_name().map(|name| name.to_string_lossy().to_string())
                 == Some(suggestion.correct_name.clone())
             {
                 continue;
@@ -307,11 +545,175 @@ impl Pipeline {
         Ok((verification, placement_plan))
     }
 
+    async fn quick_verify_par2_with_placement(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<weaver_par2::Par2FileSet>,
+        _working_dir: std::path::PathBuf,
+    ) -> Result<Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)>, String>
+    {
+        let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Ok(None);
+        };
+
+        let mut current_hashes_by_name = HashMap::<String, [u8; 16]>::new();
+        for file in state.assembly.files() {
+            if !file.is_complete() {
+                continue;
+            }
+
+            let file_id = file.file_id();
+            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
+                return Ok(None);
+            };
+            let identity = self.effective_file_identity(job_id, file_id);
+            let current_filename = identity
+                .as_ref()
+                .map(|value| value.current_filename.as_str())
+                .unwrap_or_else(|| file.filename());
+            current_hashes_by_name.insert(current_filename.to_string(), file_hash);
+        }
+
+        let mut all_file_ids: Vec<weaver_par2::FileId> = par2_set
+            .recovery_file_ids
+            .iter()
+            .chain(par2_set.non_recovery_file_ids.iter())
+            .copied()
+            .collect();
+        all_file_ids.sort_unstable_by_key(|file_id| *file_id.as_bytes());
+        all_file_ids.dedup();
+
+        let mut hash_lookup = HashMap::<[u8; 16], Vec<(weaver_par2::FileId, String)>>::new();
+        for file_id in &all_file_ids {
+            let Some(desc) = par2_set.file_description(file_id) else {
+                continue;
+            };
+            hash_lookup
+                .entry(desc.hash_full)
+                .or_default()
+                .push((*file_id, desc.filename.clone()));
+        }
+
+        let mut matches = HashMap::<String, (weaver_par2::FileId, String)>::new();
+        let mut match_counts = HashMap::<weaver_par2::FileId, u32>::new();
+        for (current_name, file_hash) in current_hashes_by_name {
+            let Some(candidates) = hash_lookup.get(&file_hash) else {
+                continue;
+            };
+
+            for (file_id, correct_name) in candidates {
+                matches.insert(current_name.clone(), (*file_id, correct_name.clone()));
+                *match_counts.entry(*file_id).or_default() += 1;
+                break;
+            }
+        }
+
+        let conflict_ids: HashSet<weaver_par2::FileId> = match_counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(file_id, _)| *file_id)
+            .collect();
+        matches.retain(|_, (file_id, _)| !conflict_ids.contains(file_id));
+
+        let mut id_to_disk = HashMap::<weaver_par2::FileId, String>::new();
+        for (disk_name, (file_id, _)) in &matches {
+            id_to_disk.insert(*file_id, disk_name.clone());
+        }
+
+        let mut files = Vec::new();
+        let mut exact = Vec::new();
+        let mut swaps = Vec::new();
+        let mut renames = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut seen_swap = HashSet::<weaver_par2::FileId>::new();
+        for file_id in all_file_ids.iter().copied() {
+            let Some(desc) = par2_set.file_description(&file_id).cloned() else {
+                continue;
+            };
+
+            if conflict_ids.contains(&file_id) {
+                continue;
+            }
+
+            let Some(disk_name) = id_to_disk.get(&file_id).cloned() else {
+                unresolved.push(file_id);
+                continue;
+            };
+
+            if disk_name == desc.filename {
+                exact.push(file_id);
+            } else if !seen_swap.contains(&file_id) {
+                let other_file_id = matches.get(desc.filename.as_str()).map(|(id, _)| *id);
+                if let Some(other_id) = other_file_id
+                    && other_id != file_id
+                    && id_to_disk
+                        .get(&other_id)
+                        .is_some_and(|name| name == &desc.filename)
+                {
+                    let Some(other_desc) = par2_set.file_description(&other_id) else {
+                        return Ok(None);
+                    };
+                    swaps.push((
+                        weaver_par2::PlacementEntry {
+                            file_id,
+                            current_name: disk_name.clone(),
+                            correct_name: desc.filename.clone(),
+                        },
+                        weaver_par2::PlacementEntry {
+                            file_id: other_id,
+                            current_name: desc.filename.clone(),
+                            correct_name: other_desc.filename.clone(),
+                        },
+                    ));
+                    seen_swap.insert(file_id);
+                    seen_swap.insert(other_id);
+                } else {
+                    renames.push(weaver_par2::PlacementEntry {
+                        file_id,
+                        current_name: disk_name.clone(),
+                        correct_name: desc.filename.clone(),
+                    });
+                }
+            }
+
+            let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
+            files.push(weaver_par2::verify::FileVerification {
+                file_id,
+                filename: desc.filename,
+                status: weaver_par2::verify::FileStatus::Complete,
+                valid_slices: vec![true; slice_count],
+                missing_slice_count: 0,
+            });
+        }
+
+        if !conflict_ids.is_empty() || !unresolved.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            weaver_par2::VerificationResult {
+                files,
+                recovery_blocks_available: par2_set.recovery_block_count(),
+                total_missing_blocks: 0,
+                repairable: weaver_par2::verify::Repairability::NotNeeded,
+            },
+            weaver_par2::PlacementPlan {
+                exact,
+                swaps,
+                renames,
+                unresolved,
+                conflicts: conflict_ids.into_iter().collect(),
+            },
+        )))
+    }
+
     async fn reconcile_verified_par2_files(
         &mut self,
         job_id: JobId,
         verification: &weaver_par2::VerificationResult,
     ) -> Result<usize, String> {
+        let existing_hashes = self.load_existing_complete_file_hashes(job_id).await?;
         let files_to_complete: Vec<(NzbFileId, String, u64)> = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return Ok(0);
@@ -406,8 +808,9 @@ impl Pipeline {
             self.note_file_progress_floor(*file_id, *total_bytes, true);
             let file_index = file_id.file_index;
             let current_filename = filename.clone();
+            let current_hash = Self::expected_hash_for_verified_file(*file_id, &existing_hashes);
             self.db_blocking(move |db| {
-                db.complete_file(job_id, file_index, &current_filename, &[0u8; 16])
+                db.complete_file(job_id, file_index, &current_filename, &current_hash)
             })
             .await
             .map_err(|error| {
@@ -418,6 +821,8 @@ impl Pipeline {
             })?;
             self.pending_file_progress.remove(file_id);
             self.persisted_file_progress.remove(file_id);
+            self.file_hash_states.remove(file_id);
+            self.file_hash_reread_required.remove(file_id);
             self.refresh_archive_state_for_completed_file(job_id, *file_id, true)
                 .await;
         }
@@ -431,16 +836,17 @@ impl Pipeline {
             return;
         }
 
-        let has_active_worker = set_names.iter().any(|set_name| {
-            self.rar_sets
-                .get(&(job_id, set_name.clone()))
-                .is_some_and(|state| state.active_workers > 0)
-        });
-        if has_active_worker {
-            if self.jobs.get(&job_id).is_some_and(|state| {
-                !matches!(state.post_state, crate::jobs::model::PostState::Extracting)
-            }) {
-                self.transition_post_state(job_id, crate::jobs::model::PostState::Extracting);
+        if self.has_active_rar_workers(job_id) {
+            if self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !matches!(state.status, JobStatus::Extracting))
+            {
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Extracting,
+                    Some("extracting"),
+                );
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::ExtractionReady { job_id });
@@ -494,7 +900,9 @@ impl Pipeline {
                         crate::pipeline::archive::rar_state::RarSetPhase::FallbackFullSet
                     ) {
                         fallback_sets.push(set_name.clone());
-                    } else if !plan.ready_members.is_empty() {
+                    } else if plan.ready_members.iter().any(|ready_member| {
+                        self.rar_member_can_start_extraction(job_id, set_name, &ready_member.name)
+                    }) {
                         has_ready_incremental_work = true;
                     } else if plan.waiting_on_volumes.is_empty() {
                         impossible_sets.push(set_name.clone());
@@ -563,7 +971,6 @@ impl Pipeline {
                 return;
             }
 
-            self.reconcile_job_progress(job_id).await;
             return;
         }
 
@@ -661,31 +1068,19 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            if matches!(state.run_state, crate::jobs::model::RunState::Paused)
-                || matches!(
-                    state.download_state,
-                    crate::jobs::model::DownloadState::Checking
-                        | crate::jobs::model::DownloadState::Failed
-                )
-                || matches!(
-                    state.post_state,
-                    crate::jobs::model::PostState::Finalizing
-                        | crate::jobs::model::PostState::Completed
-                        | crate::jobs::model::PostState::Failed
-                )
-            {
+            if matches!(
+                state.status,
+                JobStatus::Paused
+                    | JobStatus::Checking
+                    | JobStatus::Moving
+                    | JobStatus::Complete
+                    | JobStatus::Failed { .. }
+            ) {
                 return;
             }
             // If no data files registered yet but there are still segments queued,
             // downloads haven't really started — don't prematurely leave Downloading.
-            if total_data_files == 0
-                && matches!(
-                    state.download_state,
-                    crate::jobs::model::DownloadState::Queued
-                        | crate::jobs::model::DownloadState::Downloading
-                )
-                && queued_downloads
-            {
+            if total_data_files == 0 && queued_downloads {
                 return;
             }
         }
@@ -698,30 +1093,100 @@ impl Pipeline {
         }
 
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
+        let par2_loaded = self.par2_set(job_id).is_some();
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
-        let par2_validation_needed = self.par2_set(job_id).is_some()
+        let only_rar_archives = self.job_has_only_rar_archives(job_id);
+        let par2_validation_needed = par2_loaded
             && !par2_bypassed
             && !self.par2_verified.contains(&job_id)
             && download_pipeline_exhausted
             && !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
-            && self.job_has_only_rar_archives(job_id)
-            && self.jobs.get(&job_id).is_some_and(|state| {
-                matches!(
-                    state.post_state,
-                    crate::jobs::model::PostState::WaitingForVolumes
-                )
-            });
+            && only_rar_archives
+            && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
 
         // Step 2: Check for CRC failures that need PAR2 repair.
         let has_crc_failures = self
             .failed_extractions
             .get(&job_id)
             .is_some_and(|f| !f.is_empty());
+        let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
+        let archive_extraction_applicable =
+            self.extraction_readiness_for_job(job_id) != ExtractionReadiness::NotApplicable
+                || only_rar_archives;
+        let authoritative_par2_verification_needed = par2_validation_needed
+            && (has_crc_failures
+                || (has_incomplete_data_files && download_pipeline_exhausted)
+                || rar_waiting_for_missing_volumes
+                || matches!(current_status, JobStatus::Repairing));
+        let quick_par2_verification_allowed = par2_validation_needed
+            && !matches!(current_status, JobStatus::Repairing)
+            && !(has_incomplete_data_files && download_pipeline_exhausted)
+            && match clean_par2_integrity_gate {
+                CleanPar2IntegrityGate::StrongDecode => {
+                    only_rar_archives && (has_crc_failures || rar_waiting_for_missing_volumes)
+                }
+                CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None => true,
+            };
         let needs_completion_repair_evaluation = has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
             || par2_validation_needed;
+
+        if download_pipeline_exhausted && only_rar_archives {
+            let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+            let inflight_extractions = self
+                .inflight_extractions
+                .get(&job_id)
+                .map_or(0, HashSet::len);
+            let has_active_rar_workers = self.has_active_rar_workers(job_id);
+            let has_active_extraction_tasks =
+                has_active_rar_workers || inflight_extractions > 0;
+            let only_archive_residuals =
+                self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
+            let mut rar_set_state = self
+                .rar_sets
+                .iter()
+                .filter(|((rar_job_id, _), _)| *rar_job_id == job_id)
+                .map(|((_, set_name), set_state)| summarize_rar_set_phase(set_name, set_state))
+                .collect::<Vec<_>>();
+            rar_set_state.sort();
+            let mut failed_extractions = self
+                .failed_extractions
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            failed_extractions.sort();
+
+            info!(
+                job_id = job_id.0,
+                status = ?current_status,
+                complete_data_files,
+                total_data_files,
+                failed_bytes,
+                par2_loaded,
+                has_crc_failures,
+                rar_waiting_for_missing_volumes,
+                has_active_rar_workers,
+                inflight_extractions,
+                has_active_extraction_tasks,
+                only_archive_residuals,
+                queued_downloads = promoted_recovery.download_queue_len,
+                queued_promoted_recovery = promoted_recovery.download_queue_has_recovery,
+                parked_recovery = promoted_recovery.recovery_queue_len,
+                promoted_par2_files = promoted_recovery.promoted_par2_files,
+                incomplete_promoted_par2_files = promoted_recovery.incomplete_promoted_par2_files,
+                active_downloads_for_job = promoted_recovery.active_downloads_for_job,
+                active_recovery_global = promoted_recovery.active_recovery_global,
+                pending_promoted_decode = promoted_recovery.pending_promoted_decode,
+                promoted_recovery_pending = promoted_recovery.has_pending_work(),
+                failed_extractions = ?failed_extractions,
+                rar_set_state = ?rar_set_state,
+                "RAR completion checkpoint"
+            );
+        }
 
         if has_incomplete_data_files
             && !download_pipeline_exhausted
@@ -751,6 +1216,14 @@ impl Pipeline {
         }
 
         if needs_completion_repair_evaluation && !par2_bypassed {
+            if self.job_has_promoted_recovery_pipeline_work(job_id) {
+                debug!(
+                    job_id = job_id.0,
+                    "deferring verify — promoted PAR2 recovery work is pending"
+                );
+                return;
+            }
+
             if self.has_active_rar_workers(job_id) {
                 info!(
                     job_id = job_id.0,
@@ -760,6 +1233,155 @@ impl Pipeline {
             }
 
             let par2_set = self.par2_set(job_id).cloned();
+            if quick_par2_verification_allowed {
+                if let Some(par2_set) = par2_set.as_ref() {
+                    let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                    match self
+                        .quick_verify_par2_with_placement(
+                            job_id,
+                            Arc::clone(par2_set),
+                            working_dir.clone(),
+                        )
+                        .await
+                    {
+                        Ok(Some((verification, placement_plan))) => {
+                            info!(
+                                job_id = job_id.0,
+                                "quick PAR2 verification passed for clean exhausted job"
+                            );
+                            Self::log_placement_plan(job_id, &placement_plan);
+
+                            self.try_deobfuscate_files_with_par2(job_id).await;
+                            if let Err(error) = self
+                                .apply_placement_plan_for_retry_or_repair(
+                                    job_id,
+                                    working_dir.clone(),
+                                    &placement_plan,
+                                )
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
+                            self.retry_par2_authoritative_identity(job_id).await;
+                            if let Err(error) = self
+                                .reconcile_verified_par2_files(job_id, &verification)
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
+
+                            let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
+                                state.assembly.complete_data_file_count()
+                                    < state.assembly.data_file_count()
+                            });
+                            if still_incomplete && !has_crc_failures {
+                                let msg = "clean PAR2 quick verification but job still has incomplete data files after reconciliation".to_string();
+                                warn!(job_id = job_id.0, error = %msg);
+                                self.fail_job(job_id, msg);
+                                return;
+                            }
+
+                            self.par2_verified.insert(job_id);
+
+                            if has_crc_failures {
+                                if self.normalization_retried.contains(&job_id) {
+                                    let msg =
+                                        "clean PAR2 verification but extraction still failing after retry"
+                                            .to_string();
+                                    warn!(job_id = job_id.0, error = %msg);
+                                    self.fail_job(job_id, msg);
+                                    return;
+                                }
+
+                                self.set_normalization_retried_state(job_id, true);
+                                let failed_members = self
+                                    .failed_extractions
+                                    .get(&job_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                self.replace_failed_extraction_members(job_id, HashSet::new());
+                                let cleared = failed_members.len();
+                                self.recompute_rar_retry_frontier(job_id).await;
+                                if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id)
+                                {
+                                    if !failed_members.is_empty() {
+                                        self.replace_failed_extraction_members(
+                                            job_id,
+                                            failed_members,
+                                        );
+                                    }
+                                    let msg = format!(
+                                        "invalid RAR retry frontier after placement correction: {reason}"
+                                    );
+                                    warn!(job_id = job_id.0, error = %msg);
+                                    self.fail_job(job_id, msg);
+                                    return;
+                                }
+
+                                info!(
+                                    job_id = job_id.0,
+                                    cleared,
+                                    "cleared failed extractions after quick verify — retrying"
+                                );
+
+                                self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                    .await;
+                                return;
+                            }
+
+                            if archive_extraction_applicable {
+                                self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                    .await;
+                                return;
+                            }
+
+                            self.reconcile_job_progress(job_id).await;
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
+                        Ok(None) => {
+                            info!(
+                                job_id = job_id.0,
+                                "quick PAR2 verification was inconclusive — falling back to authoritative verify"
+                            );
+                        }
+                        Err(message) => {
+                            warn!(job_id = job_id.0, error = %message);
+                            self.fail_job(job_id, message);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if par2_validation_needed && !authoritative_par2_verification_needed {
+                match clean_par2_integrity_gate {
+                    CleanPar2IntegrityGate::StrongDecode => {
+                        info!(
+                            job_id = job_id.0,
+                            "skipping authoritative PAR2 verify for clean exhausted strong-decode job"
+                        );
+
+                        self.try_deobfuscate_files_with_par2(job_id).await;
+                        self.retry_par2_authoritative_identity(job_id).await;
+                        self.par2_verified.insert(job_id);
+
+                        if archive_extraction_applicable {
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
+                            return;
+                        }
+
+                        self.reconcile_job_progress(job_id).await;
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
+                    CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None => {}
+                }
+            }
+
             if let Some(par2_set) = par2_set {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 let (verification, placement_plan) = match self
@@ -853,12 +1475,22 @@ impl Pipeline {
                             self.fail_job(job_id, msg);
                             return;
                         }
+
                         info!(
                             job_id = job_id.0,
                             cleared,
                             "cleared failed extractions after authoritative verify — retrying"
                         );
 
+                        self.retry_archive_extraction_after_verify_or_repair(job_id)
+                            .await;
+                        return;
+                    }
+
+                    if self.extraction_readiness_for_job(job_id)
+                        != ExtractionReadiness::NotApplicable
+                        || self.job_has_only_rar_archives(job_id)
+                    {
                         self.retry_archive_extraction_after_verify_or_repair(job_id)
                             .await;
                         return;
@@ -923,11 +1555,10 @@ impl Pipeline {
                             promoted_blocks = promoted,
                             "waiting for targeted recovery downloads before repair"
                         );
-                        self.transition_runtime_state(
+                        self.transition_postprocessing_status(
                             job_id,
-                            crate::jobs::model::DownloadState::Downloading,
-                            crate::jobs::model::PostState::AwaitingRepair,
-                            crate::jobs::model::RunState::Active,
+                            JobStatus::Downloading,
+                            Some("downloading"),
                         );
                         return;
                     }
@@ -1031,6 +1662,11 @@ impl Pipeline {
                                 return;
                             }
                             self.par2_verified.insert(job_id);
+                            self.transition_postprocessing_status(
+                                job_id,
+                                JobStatus::Downloading,
+                                Some("downloading"),
+                            );
 
                             if has_crc_failures {
                                 let cleared =
@@ -1072,6 +1708,16 @@ impl Pipeline {
                     self.fail_job(job_id, msg);
                     return;
                 }
+                if has_crc_failures {
+                    match self.retry_failed_archive_sources_without_par2(job_id).await {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
+                    }
+                }
                 if rar_waiting_for_missing_volumes {
                     let reason = self.invalid_rar_retry_frontier_reason(job_id).unwrap_or_else(|| {
                         "RAR extraction stalled waiting for missing volumes after downloads finished"
@@ -1082,12 +1728,14 @@ impl Pipeline {
                     self.fail_job(job_id, msg);
                     return;
                 }
-                match self.retry_failed_archive_sources_without_par2(job_id).await {
-                    Ok(true) => return,
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.fail_job(job_id, error);
-                        return;
+                if !has_crc_failures {
+                    match self.retry_failed_archive_sources_without_par2(job_id).await {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
                     }
                 }
 
@@ -1105,6 +1753,9 @@ impl Pipeline {
                 return;
             }
         } else if has_incomplete_data_files {
+            if !download_pipeline_exhausted || self.job_has_active_extraction_tasks(job_id) {
+                return;
+            }
             let repair_context = if par2_bypassed {
                 "PAR2 recovery is bypassed"
             } else if self.par2_set(job_id).is_some() {
@@ -1125,8 +1776,16 @@ impl Pipeline {
             return;
         }
 
-        if self.job_has_only_rar_archives(job_id) {
+        if only_rar_archives {
             self.check_rar_job_completion(job_id).await;
+            return;
+        }
+
+        if self.job_has_promoted_recovery_pipeline_work(job_id) {
+            debug!(
+                job_id = job_id.0,
+                "deferring extraction — promoted PAR2 recovery work is pending"
+            );
             return;
         }
 
@@ -1138,9 +1797,7 @@ impl Pipeline {
                 // promoted PAR2 recovery segments in flight. Do not let stale
                 // completion checks finalize damaged direct/gzip/etc. payloads
                 // before those recovery files are decoded and repaired.
-                if !download_pipeline_exhausted
-                    && self.job_has_promoted_recovery_pipeline_work(job_id)
-                {
+                if self.job_has_promoted_recovery_pipeline_work(job_id) {
                     debug!(
                         job_id = job_id.0,
                         "deferring completion — pending download pipeline work"
