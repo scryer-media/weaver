@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use weaver_rar::ArchiveFormat;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::args().nth(1).ok_or("usage: probe_volumes <dir>")?;
+    let dir = std::env::args()
+        .nth(1)
+        .ok_or("usage: probe_volumes <dir>")?;
     let password = std::env::args().nth(2);
 
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
@@ -40,7 +42,9 @@ fn print_volume(
             let parsed = weaver_rar::header::parse_all_headers(file, password)?;
             println!(
                 "{} format=rar5 vol={:?} files={}",
-                path.file_name().and_then(|name| name.to_str()).unwrap_or("?"),
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?"),
                 parsed.main.as_ref().and_then(|main| main.volume_number),
                 parsed.files.len(),
             );
@@ -63,18 +67,16 @@ fn print_volume(
             let parsed = weaver_rar::rar4::parse_rar4_headers(file, password)?;
             println!(
                 "{} format=rar4 vol={:?} files={}",
-                path.file_name().and_then(|name| name.to_str()).unwrap_or("?"),
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?"),
                 parsed.end.as_ref().and_then(|end| end.volume_number),
                 parsed.files.len(),
             );
             for (index, entry) in parsed.files.iter().enumerate() {
                 println!(
                     "  [{}] split_before={} split_after={} encrypted={} name={}",
-                    index,
-                    entry.split_before,
-                    entry.split_after,
-                    entry.is_encrypted,
-                    entry.name,
+                    index, entry.split_before, entry.split_after, entry.is_encrypted, entry.name,
                 );
             }
         }

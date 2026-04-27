@@ -43,7 +43,10 @@ impl HistorySubscription {
         ))
         .map(|_| JobDetailTrigger::Heartbeat);
         let initial = tokio_stream::once(JobDetailTrigger::Initial);
-        let triggers = throttle(initial.merge(event_stream).merge(heartbeat), JOB_DETAIL_THROTTLE);
+        let triggers = throttle(
+            initial.merge(event_stream).merge(heartbeat),
+            JOB_DETAIL_THROTTLE,
+        );
 
         Ok(async_stream::stream! {
             tokio::pin!(triggers);

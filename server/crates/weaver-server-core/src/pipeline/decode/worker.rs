@@ -19,7 +19,12 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn note_file_hash_chunk(&mut self, file_id: NzbFileId, file_offset: u64, data: &[u8]) {
+    pub(crate) fn note_file_hash_chunk(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: &[u8],
+    ) {
         if self.file_hash_reread_required.contains(&file_id) {
             return;
         }
@@ -34,7 +39,10 @@ impl Pipeline {
             return;
         }
 
-        self.file_hash_states.entry(file_id).or_default().update(data);
+        self.file_hash_states
+            .entry(file_id)
+            .or_default()
+            .update(data);
     }
 
     pub(crate) fn mark_file_hash_reread_required(&mut self, file_id: NzbFileId) {

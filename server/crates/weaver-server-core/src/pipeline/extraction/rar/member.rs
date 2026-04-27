@@ -355,10 +355,12 @@ impl Pipeline {
             let _ = std::fs::remove_file(&partial_path);
             format!("failed to extract {member_name}: {error}")
         })?;
-        let chunk_total = chunk_records.iter().map(|(_, bytes_written)| *bytes_written).sum::<u64>();
-        let partial_size_after_extract = std::fs::metadata(&partial_path)
-            .ok()
-            .map(|meta| meta.len());
+        let chunk_total = chunk_records
+            .iter()
+            .map(|(_, bytes_written)| *bytes_written)
+            .sum::<u64>();
+        let partial_size_after_extract =
+            std::fs::metadata(&partial_path).ok().map(|meta| meta.len());
         info!(
             job_id = job_id.0,
             set_name,

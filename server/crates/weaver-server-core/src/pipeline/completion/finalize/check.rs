@@ -64,7 +64,11 @@ fn summarize_rar_set_phase(
             waiting
         })
         .unwrap_or_default();
-    let mut in_flight_members = set_state.in_flight_members.iter().cloned().collect::<Vec<_>>();
+    let mut in_flight_members = set_state
+        .in_flight_members
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     in_flight_members.sort();
     let mut suspect_volumes = set_state
         .verified_suspect_volumes
@@ -102,16 +106,15 @@ impl Pipeline {
             .collect();
 
         if set_names.is_empty() {
-            set_names.extend(
-                state
-                    .assembly
-                    .archive_topologies()
-                    .iter()
-                    .filter_map(|(set_name, topology)| {
-                        matches!(topology.archive_type, crate::jobs::assembly::ArchiveType::Rar)
-                            .then_some(set_name.clone())
-                    }),
-            );
+            set_names.extend(state.assembly.archive_topologies().iter().filter_map(
+                |(set_name, topology)| {
+                    matches!(
+                        topology.archive_type,
+                        crate::jobs::assembly::ArchiveType::Rar
+                    )
+                    .then_some(set_name.clone())
+                },
+            ));
         }
 
         set_names
@@ -120,17 +123,19 @@ impl Pipeline {
     pub(crate) fn job_has_live_rar_waiting_for_missing_volumes(&self, job_id: JobId) -> bool {
         let current_set_names = self.current_rar_set_names_for_job(job_id);
 
-        self.rar_sets.iter().any(|((rar_job_id, set_name), set_state)| {
-            *rar_job_id == job_id
-                && (current_set_names.is_empty() || current_set_names.contains(set_name))
-                && set_state.plan.as_ref().is_some_and(|plan| {
-                    matches!(
-                        plan.phase,
-                        crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
-                            | crate::pipeline::archive::rar_state::RarSetPhase::AwaitingRepair
-                    )
-                })
-        })
+        self.rar_sets
+            .iter()
+            .any(|((rar_job_id, set_name), set_state)| {
+                *rar_job_id == job_id
+                    && (current_set_names.is_empty() || current_set_names.contains(set_name))
+                    && set_state.plan.as_ref().is_some_and(|plan| {
+                        matches!(
+                            plan.phase,
+                            crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+                                | crate::pipeline::archive::rar_state::RarSetPhase::AwaitingRepair
+                        )
+                    })
+            })
     }
 
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
@@ -276,7 +281,9 @@ impl Pipeline {
                 (CleanPar2IntegrityGate::StrongDecode, _)
                 | (_, CleanPar2IntegrityGate::StrongDecode) => CleanPar2IntegrityGate::StrongDecode,
                 (CleanPar2IntegrityGate::WeakTransform, _)
-                | (_, CleanPar2IntegrityGate::WeakTransform) => CleanPar2IntegrityGate::WeakTransform,
+                | (_, CleanPar2IntegrityGate::WeakTransform) => {
+                    CleanPar2IntegrityGate::WeakTransform
+                }
                 _ => CleanPar2IntegrityGate::None,
             };
         }
@@ -367,7 +374,9 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
-            if old.file_name().map(|name| name.to_string_lossy().to_string())
+            if old
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
                 == Some(suggestion.correct_name.clone())
             {
                 continue;
@@ -550,8 +559,7 @@ impl Pipeline {
         job_id: JobId,
         par2_set: Arc<weaver_par2::Par2FileSet>,
         _working_dir: std::path::PathBuf,
-    ) -> Result<Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)>, String>
-    {
+    ) -> Result<Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)>, String> {
         let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(None);
@@ -1110,9 +1118,9 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|f| !f.is_empty());
         let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
-        let archive_extraction_applicable =
-            self.extraction_readiness_for_job(job_id) != ExtractionReadiness::NotApplicable
-                || only_rar_archives;
+        let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
+            != ExtractionReadiness::NotApplicable
+            || only_rar_archives;
         let authoritative_par2_verification_needed = par2_validation_needed
             && (has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
@@ -1139,8 +1147,7 @@ impl Pipeline {
                 .get(&job_id)
                 .map_or(0, HashSet::len);
             let has_active_rar_workers = self.has_active_rar_workers(job_id);
-            let has_active_extraction_tasks =
-                has_active_rar_workers || inflight_extractions > 0;
+            let has_active_extraction_tasks = has_active_rar_workers || inflight_extractions > 0;
             let only_archive_residuals =
                 self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
             let mut rar_set_state = self
@@ -1232,9 +1239,7 @@ impl Pipeline {
             }
 
             let par2_set = self.par2_set(job_id).cloned();
-            if quick_par2_verification_allowed
-                && let Some(par2_set) = par2_set.as_ref()
-            {
+            if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 match self
                     .quick_verify_par2_with_placement(
@@ -1318,8 +1323,7 @@ impl Pipeline {
 
                             info!(
                                 job_id = job_id.0,
-                                cleared,
-                                "cleared failed extractions after quick verify — retrying"
+                                cleared, "cleared failed extractions after quick verify — retrying"
                             );
 
                             self.retry_archive_extraction_after_verify_or_repair(job_id)

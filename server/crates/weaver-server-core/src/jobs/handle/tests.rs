@@ -143,7 +143,10 @@ fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
     for _ in 0..24 {
         std::thread::sleep(Duration::from_millis(60));
         let cached = shared_state.metrics_snapshot();
-        assert_eq!(cached.current_download_speed, initial.current_download_speed);
+        assert_eq!(
+            cached.current_download_speed,
+            initial.current_download_speed
+        );
     }
 
     shared_state.refresh_metrics_snapshot();

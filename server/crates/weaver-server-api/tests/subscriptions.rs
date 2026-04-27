@@ -418,7 +418,11 @@ async fn job_detail_updates_emit_live_state_changes() {
         first_data["jobDetailUpdates"]["queueItem"]["state"].as_str(),
         Some("QUEUED")
     );
-    assert!(first_data["jobDetailUpdates"]["jobEvents"].as_array().is_some());
+    assert!(
+        first_data["jobDetailUpdates"]["jobEvents"]
+            .as_array()
+            .is_some()
+    );
 
     let pause = h
         .execute(&format!("mutation {{ pauseJob(id: {job_id}) }}"))

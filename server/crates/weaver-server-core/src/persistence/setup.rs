@@ -6,7 +6,9 @@ use crate::Database;
 use crate::settings::Config;
 
 fn is_explicit_config_file(config_path: &Path) -> bool {
-    config_path.extension().is_some_and(|extension| extension == "toml")
+    config_path
+        .extension()
+        .is_some_and(|extension| extension == "toml")
         || config_path
             .file_name()
             .and_then(|name| name.to_str())

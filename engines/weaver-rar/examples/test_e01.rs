@@ -6,17 +6,19 @@ use weaver_rar::{ExtractOptions, RarArchive, StaticVolumeProvider};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args().nth(1).ok_or("usage: test-e01 <dir>")?;
-    let password = std::env::args().nth(2).ok_or("usage: test-e01 <dir> <password>")?;
-    let mode = std::env::args().nth(3).unwrap_or_else(|| "streaming".into());
-    let member_idx: usize = std::env::args().nth(4).unwrap_or_else(|| "0".into()).parse()?;
+    let password = std::env::args()
+        .nth(2)
+        .ok_or("usage: test-e01 <dir> <password>")?;
+    let mode = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "streaming".into());
+    let member_idx: usize = std::env::args()
+        .nth(4)
+        .unwrap_or_else(|| "0".into())
+        .parse()?;
 
     let mut paths: Vec<PathBuf> = (1..=99)
-        .map(|n| {
-            PathBuf::from(&dir).join(format!(
-                "6OLN1UG33OBhAM9rAfSUdX.part{:03}.rar",
-                n
-            ))
-        })
+        .map(|n| PathBuf::from(&dir).join(format!("6OLN1UG33OBhAM9rAfSUdX.part{:03}.rar", n)))
         .collect();
     paths.sort();
 

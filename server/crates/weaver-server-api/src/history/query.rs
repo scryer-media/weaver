@@ -185,7 +185,10 @@ pub(crate) async fn load_job_detail_snapshot(
     let job_events = events
         .into_iter()
         .map(|event| JobEvent {
-            kind: event.kind.parse::<EventKind>().unwrap_or(EventKind::JobCreated),
+            kind: event
+                .kind
+                .parse::<EventKind>()
+                .unwrap_or(EventKind::JobCreated),
             job_id: event.job_id,
             file_id: event.file_id,
             message: event.message,

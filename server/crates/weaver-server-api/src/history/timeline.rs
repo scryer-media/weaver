@@ -52,11 +52,8 @@ pub(crate) fn build_job_timeline(
         })
     });
 
-    let download_spans = synthesize_active_download_span(
-        collect_download_spans(events),
-        job,
-        started_at,
-    );
+    let download_spans =
+        synthesize_active_download_span(collect_download_spans(events), job, started_at);
     let pause_spans = collect_pause_spans(events);
     let verify_spans = collect_job_spans(
         events,

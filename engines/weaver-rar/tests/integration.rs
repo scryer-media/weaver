@@ -1298,9 +1298,8 @@ fn streaming_prefix_len_with_available_volumes(
     }
 
     let paths: Vec<_> = filenames.iter().map(|name| fixture(dir, name)).collect();
-    let provider = weaver_rar::StaticVolumeProvider::from_ordered(
-        paths[..available_volumes].to_vec(),
-    );
+    let provider =
+        weaver_rar::StaticVolumeProvider::from_ordered(paths[..available_volumes].to_vec());
     let options = weaver_rar::ExtractOptions {
         verify: false,
         password: password.map(str::to_owned),

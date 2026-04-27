@@ -98,9 +98,10 @@ impl Pipeline {
         set_name: &str,
     ) {
         let set_key = (job_id, set_name.to_string());
-        let busy = self.rar_sets.get(&set_key).is_some_and(|state| {
-            state.active_workers > 0 || !state.in_flight_members.is_empty()
-        });
+        let busy = self
+            .rar_sets
+            .get(&set_key)
+            .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty());
         if busy {
             return;
         }

@@ -315,8 +315,7 @@ impl Pipeline {
     }
 
     pub async fn run(&mut self) {
-        let mut metrics_snapshot_interval =
-            tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
+        let mut metrics_snapshot_interval = tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
         metrics_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

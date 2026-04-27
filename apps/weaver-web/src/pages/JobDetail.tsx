@@ -41,14 +41,6 @@ import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 
-interface EventEntry {
-  kind: string;
-  jobId: number | null;
-  fileId: string | null;
-  message: string;
-  timestamp: number;
-}
-
 interface JobDetailSnapshotData {
   queueItem?: GraphqlJobData | null;
   historyItem?: GraphqlJobData | null;

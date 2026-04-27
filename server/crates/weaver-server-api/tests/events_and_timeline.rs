@@ -110,8 +110,14 @@ async fn job_detail_snapshot_query_returns_live_job_data() {
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
-    assert_eq!(data["jobDetailSnapshot"]["queueItem"]["id"].as_u64(), Some(job_id));
-    assert_eq!(data["jobDetailSnapshot"]["queueItem"]["state"].as_str(), Some("QUEUED"));
+    assert_eq!(
+        data["jobDetailSnapshot"]["queueItem"]["id"].as_u64(),
+        Some(job_id)
+    );
+    assert_eq!(
+        data["jobDetailSnapshot"]["queueItem"]["state"].as_str(),
+        Some("QUEUED")
+    );
     assert!(data["jobDetailSnapshot"]["historyItem"].is_null());
     assert!(!data["jobDetailSnapshot"]["jobTimeline"].is_null());
     assert!(data["jobDetailSnapshot"]["jobEvents"].as_array().is_some());

@@ -67,7 +67,9 @@ impl Pipeline {
         }
     }
 
-    fn normalize_paused_resume_status(paused_resume_status: Option<JobStatus>) -> Option<JobStatus> {
+    fn normalize_paused_resume_status(
+        paused_resume_status: Option<JobStatus>,
+    ) -> Option<JobStatus> {
         paused_resume_status.map(|status| match status {
             JobStatus::Queued => JobStatus::Queued,
             _ => JobStatus::Downloading,
@@ -108,8 +110,7 @@ impl Pipeline {
                     crate::jobs::assembly::DetectedArchiveKind::Rar
                 )
                 .then(|| classification.set_name.clone())
-            })
-                && canonical_classification.set_name != set_name
+            }) && canonical_classification.set_name != set_name
             {
                 stale_rar_sets.insert(set_name);
             }
@@ -977,16 +978,16 @@ impl Pipeline {
         let paused_resume_status = matches!(status, JobStatus::Paused)
             .then(|| {
                 paused_resume_status.clone().or_else(|| {
-                    paused_resume_download_state.zip(paused_resume_post_state).map(
-                        |(download_state, post_state)| {
+                    paused_resume_download_state
+                        .zip(paused_resume_post_state)
+                        .map(|(download_state, post_state)| {
                             crate::jobs::model::derive_legacy_job_status(
                                 download_state,
                                 post_state,
                                 crate::jobs::model::RunState::Active,
                                 None,
                             )
-                        },
-                    )
+                        })
                 })
             })
             .flatten();

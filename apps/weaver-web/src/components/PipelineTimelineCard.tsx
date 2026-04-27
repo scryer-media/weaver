@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -572,7 +572,27 @@ export function PipelineTimelineCard({
 }) {
   const t = useTranslate();
   const [membersExpanded, setMembersExpanded] = useState(false);
-  const axisEnd = timeline?.endedAt ?? Date.now();
+  const [axisEnd, setAxisEnd] = useState(() => timeline?.endedAt ?? Date.now());
+  const hasTimeline = timeline !== null && timeline !== undefined;
+  const timelineEndedAt = timeline?.endedAt;
+  const timelineStartedAt = timeline?.startedAt;
+
+  useEffect(() => {
+    if (!hasTimeline) {
+      return undefined;
+    }
+    if (timelineEndedAt !== null && timelineEndedAt !== undefined) {
+      setAxisEnd(timelineEndedAt);
+      return undefined;
+    }
+
+    setAxisEnd(Date.now());
+    const timerId = window.setInterval(() => {
+      setAxisEnd(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(timerId);
+  }, [hasTimeline, timelineEndedAt, timelineStartedAt]);
 
   if (!timeline || (timeline.lanes.length === 0 && timeline.extractionGroups.length === 0)) {
     return (
