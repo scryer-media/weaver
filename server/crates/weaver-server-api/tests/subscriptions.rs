@@ -270,11 +270,10 @@ async fn queue_snapshot_query_returns_items_and_cursor_together() {
         data["queueSnapshot"]["latestCursor"].as_str().is_some(),
         "queueSnapshot should include the replay cursor"
     );
-    assert_eq!(
-        data["queueSnapshot"]["globalState"]["isPaused"]
+    assert!(
+        !data["queueSnapshot"]["globalState"]["isPaused"]
             .as_bool()
-            .unwrap(),
-        false
+            .unwrap()
     );
 }
 
@@ -323,11 +322,10 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
             .unwrap(),
         expected_speed
     );
-    assert_eq!(
-        first_data["systemMetricsUpdates"]["globalState"]["isPaused"]
+    assert!(
+        !first_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
-            .unwrap(),
-        false
+            .unwrap()
     );
 
     let pause = h.execute("mutation { pauseQueue { success } }").await;
@@ -339,11 +337,10 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         .expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
-    assert_eq!(
+    assert!(
         second_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
-            .unwrap(),
-        true
+            .unwrap()
     );
 }
 

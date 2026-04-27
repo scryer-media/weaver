@@ -602,10 +602,9 @@ impl Pipeline {
                 continue;
             };
 
-            for (file_id, correct_name) in candidates {
+            if let Some((file_id, correct_name)) = candidates.first() {
                 matches.insert(current_name.clone(), (*file_id, correct_name.clone()));
                 *match_counts.entry(*file_id).or_default() += 1;
-                break;
             }
         }
 
@@ -1233,125 +1232,121 @@ impl Pipeline {
             }
 
             let par2_set = self.par2_set(job_id).cloned();
-            if quick_par2_verification_allowed {
-                if let Some(par2_set) = par2_set.as_ref() {
-                    let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
-                    match self
-                        .quick_verify_par2_with_placement(
-                            job_id,
-                            Arc::clone(par2_set),
-                            working_dir.clone(),
-                        )
-                        .await
-                    {
-                        Ok(Some((verification, placement_plan))) => {
-                            info!(
-                                job_id = job_id.0,
-                                "quick PAR2 verification passed for clean exhausted job"
-                            );
-                            Self::log_placement_plan(job_id, &placement_plan);
+            if quick_par2_verification_allowed
+                && let Some(par2_set) = par2_set.as_ref()
+            {
+                let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                match self
+                    .quick_verify_par2_with_placement(
+                        job_id,
+                        Arc::clone(par2_set),
+                        working_dir.clone(),
+                    )
+                    .await
+                {
+                    Ok(Some((verification, placement_plan))) => {
+                        info!(
+                            job_id = job_id.0,
+                            "quick PAR2 verification passed for clean exhausted job"
+                        );
+                        Self::log_placement_plan(job_id, &placement_plan);
 
-                            self.try_deobfuscate_files_with_par2(job_id).await;
-                            if let Err(error) = self
-                                .apply_placement_plan_for_retry_or_repair(
-                                    job_id,
-                                    working_dir.clone(),
-                                    &placement_plan,
-                                )
-                                .await
-                            {
-                                self.fail_job(job_id, error);
-                                return;
-                            }
-                            self.retry_par2_authoritative_identity(job_id).await;
-                            if let Err(error) = self
-                                .reconcile_verified_par2_files(job_id, &verification)
-                                .await
-                            {
-                                self.fail_job(job_id, error);
-                                return;
-                            }
+                        self.try_deobfuscate_files_with_par2(job_id).await;
+                        if let Err(error) = self
+                            .apply_placement_plan_for_retry_or_repair(
+                                job_id,
+                                working_dir.clone(),
+                                &placement_plan,
+                            )
+                            .await
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
+                        self.retry_par2_authoritative_identity(job_id).await;
+                        if let Err(error) = self
+                            .reconcile_verified_par2_files(job_id, &verification)
+                            .await
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
 
-                            let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
-                                state.assembly.complete_data_file_count()
-                                    < state.assembly.data_file_count()
-                            });
-                            if still_incomplete && !has_crc_failures {
-                                let msg = "clean PAR2 quick verification but job still has incomplete data files after reconciliation".to_string();
+                        let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
+                            state.assembly.complete_data_file_count()
+                                < state.assembly.data_file_count()
+                        });
+                        if still_incomplete && !has_crc_failures {
+                            let msg = "clean PAR2 quick verification but job still has incomplete data files after reconciliation".to_string();
+                            warn!(job_id = job_id.0, error = %msg);
+                            self.fail_job(job_id, msg);
+                            return;
+                        }
+
+                        self.par2_verified.insert(job_id);
+
+                        if has_crc_failures {
+                            if self.normalization_retried.contains(&job_id) {
+                                let msg =
+                                    "clean PAR2 verification but extraction still failing after retry"
+                                        .to_string();
                                 warn!(job_id = job_id.0, error = %msg);
                                 self.fail_job(job_id, msg);
                                 return;
                             }
 
-                            self.par2_verified.insert(job_id);
-
-                            if has_crc_failures {
-                                if self.normalization_retried.contains(&job_id) {
-                                    let msg =
-                                        "clean PAR2 verification but extraction still failing after retry"
-                                            .to_string();
-                                    warn!(job_id = job_id.0, error = %msg);
-                                    self.fail_job(job_id, msg);
-                                    return;
+                            self.set_normalization_retried_state(job_id, true);
+                            let failed_members = self
+                                .failed_extractions
+                                .get(&job_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.replace_failed_extraction_members(job_id, HashSet::new());
+                            let cleared = failed_members.len();
+                            self.recompute_rar_retry_frontier(job_id).await;
+                            if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
+                                if !failed_members.is_empty() {
+                                    self.replace_failed_extraction_members(job_id, failed_members);
                                 }
-
-                                self.set_normalization_retried_state(job_id, true);
-                                let failed_members = self
-                                    .failed_extractions
-                                    .get(&job_id)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                self.replace_failed_extraction_members(job_id, HashSet::new());
-                                let cleared = failed_members.len();
-                                self.recompute_rar_retry_frontier(job_id).await;
-                                if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id)
-                                {
-                                    if !failed_members.is_empty() {
-                                        self.replace_failed_extraction_members(
-                                            job_id,
-                                            failed_members,
-                                        );
-                                    }
-                                    let msg = format!(
-                                        "invalid RAR retry frontier after placement correction: {reason}"
-                                    );
-                                    warn!(job_id = job_id.0, error = %msg);
-                                    self.fail_job(job_id, msg);
-                                    return;
-                                }
-
-                                info!(
-                                    job_id = job_id.0,
-                                    cleared,
-                                    "cleared failed extractions after quick verify — retrying"
+                                let msg = format!(
+                                    "invalid RAR retry frontier after placement correction: {reason}"
                                 );
-
-                                self.retry_archive_extraction_after_verify_or_repair(job_id)
-                                    .await;
+                                warn!(job_id = job_id.0, error = %msg);
+                                self.fail_job(job_id, msg);
                                 return;
                             }
 
-                            if archive_extraction_applicable {
-                                self.retry_archive_extraction_after_verify_or_repair(job_id)
-                                    .await;
-                                return;
-                            }
-
-                            self.reconcile_job_progress(job_id).await;
-                            self.schedule_job_completion_check(job_id);
-                            return;
-                        }
-                        Ok(None) => {
                             info!(
                                 job_id = job_id.0,
-                                "quick PAR2 verification was inconclusive — falling back to authoritative verify"
+                                cleared,
+                                "cleared failed extractions after quick verify — retrying"
                             );
-                        }
-                        Err(message) => {
-                            warn!(job_id = job_id.0, error = %message);
-                            self.fail_job(job_id, message);
+
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
                             return;
                         }
+
+                        if archive_extraction_applicable {
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
+                            return;
+                        }
+
+                        self.reconcile_job_progress(job_id).await;
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
+                    Ok(None) => {
+                        info!(
+                            job_id = job_id.0,
+                            "quick PAR2 verification was inconclusive — falling back to authoritative verify"
+                        );
+                    }
+                    Err(message) => {
+                        warn!(job_id = job_id.0, error = %message);
+                        self.fail_job(job_id, message);
+                        return;
                     }
                 }
             }

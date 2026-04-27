@@ -3087,7 +3087,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_remaining_download
 }
 
 #[tokio::test]
-async fn list_jobs_projects_waiting_for_volumes_from_rar_phase() {
+async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20009);
@@ -3121,11 +3121,11 @@ async fn list_jobs_projects_waiting_for_volumes_from_rar_phase() {
         .expect("job should be listed");
 
     assert_eq!(info.status, JobStatus::Downloading);
-    assert_eq!(info.download_state, crate::jobs::model::DownloadState::Complete);
     assert_eq!(
-        info.post_state,
-        crate::jobs::model::PostState::WaitingForVolumes
+        info.download_state,
+        crate::jobs::model::DownloadState::Downloading
     );
+    assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }
 
 #[tokio::test]

@@ -2693,6 +2693,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scryer-release-parser"
 version = "0.12.0"
+source = "git+https://github.com/scryer-media/scryer?tag=scryer-v0.12.0#dc5ef9f71043b992bb937becdbc842cd713f5f98"
 dependencies = [
  "aho-corasick",
  "chrono",

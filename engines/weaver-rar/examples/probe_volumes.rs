@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use weaver_rar::ArchiveFormat;
 
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_volume(
-    path: &PathBuf,
+    path: &Path,
     file: &mut File,
     password: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {

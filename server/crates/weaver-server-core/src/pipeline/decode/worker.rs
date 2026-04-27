@@ -658,7 +658,6 @@ impl Pipeline {
                     {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
-                        let file_hash = file_hash;
                         if let Err(e) = self
                             .db_blocking(move |db| {
                                 db.complete_file(job_id, file_index, &fname, &file_hash)
