@@ -1,6 +1,22 @@
 use super::*;
 
 impl Pipeline {
+    pub(crate) fn health_probe_sample_indices(total_segs: usize, probe_round: u32) -> Vec<usize> {
+        if total_segs == 0 {
+            return Vec::new();
+        }
+
+        let probe_count = (total_segs * 8 / 100).max(10).min(total_segs);
+        let stride = (total_segs / probe_count).max(1);
+        let offset = if stride > 1 {
+            probe_round as usize % stride
+        } else {
+            0
+        };
+
+        (offset..total_segs).step_by(stride).collect()
+    }
+
     /// Check job health and abort if below critical threshold.
     ///
     /// Health = (total_bytes - failed_bytes) / total_bytes × 1000.
@@ -233,12 +249,15 @@ impl Pipeline {
     /// is failed immediately.
     pub(super) fn activate_health_probes(&mut self, job_id: JobId) {
         // Set the flag and status, then collect probes separately to avoid borrow conflicts.
-        match self.jobs.get_mut(&job_id) {
+        let probe_round = match self.jobs.get_mut(&job_id) {
             Some(s) => {
                 s.health_probing = true;
+                let probe_round = s.health_probe_round;
+                s.health_probe_round = s.health_probe_round.wrapping_add(1);
+                probe_round
             }
             None => return,
-        }
+        };
         self.transition_postprocessing_status(job_id, JobStatus::Checking, Some("checking"));
 
         // Pull this job's segments out of its queues so the dispatcher skips it
@@ -278,13 +297,13 @@ impl Pipeline {
             return;
         }
 
-        // Sample 8% of segments evenly strided across the NZB.
-        let probe_count = (total_segs * 8 / 100).max(10).min(total_segs);
-        let stride = (total_segs / probe_count).max(1);
+        // Rotate evenly strided samples across rounds so repeat probes widen
+        // coverage instead of re-checking the same optimistic slice forever.
+        let probe_indexes = Self::health_probe_sample_indices(total_segs, probe_round);
 
         // Collect (segment_id, message_id, byte_estimate) for each probe.
-        let probes: Vec<(SegmentId, String, u32)> = (0..total_segs)
-            .step_by(stride)
+        let probes: Vec<(SegmentId, String, u32)> = probe_indexes
+            .into_iter()
             .map(|i| {
                 let (file_index, seg_idx) = all_segments[i];
                 let file_spec = &state.spec.files[file_index as usize];
@@ -303,6 +322,7 @@ impl Pipeline {
 
         info!(
             job_id = job_id.0,
+            probe_round,
             probes = probe_count,
             total_segments = total_segs,
             "health probe activated — batched STAT sampling"
@@ -314,6 +334,7 @@ impl Pipeline {
         tokio::spawn(async move {
             info!(
                 job_id = job_id.0,
+                probe_round,
                 probes = probe_count,
                 "health probe starting"
             );

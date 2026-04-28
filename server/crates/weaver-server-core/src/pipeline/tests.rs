@@ -169,6 +169,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         failed_bytes: 0,
         par2_bytes: 0,
         health_probing: false,
+        health_probe_round: 0,
         last_health_probe_failed_bytes: 0,
         detected_archives: HashMap::new(),
         file_identities: HashMap::new(),
@@ -1213,6 +1214,7 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
             failed_bytes: 0,
             par2_bytes,
             health_probing: false,
+            health_probe_round: 0,
             last_health_probe_failed_bytes: 0,
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
@@ -9760,6 +9762,17 @@ async fn probe_completion_clears_health_probing_and_restores_queues() {
     assert!(state.held_segments.is_empty());
     assert_eq!(state.download_queue.len(), 3);
     assert_eq!(state.recovery_queue.len(), 0);
+}
+
+#[test]
+fn health_probe_samples_rotate_across_rounds() {
+    let first = Pipeline::health_probe_sample_indices(120, 0);
+    let second = Pipeline::health_probe_sample_indices(120, 1);
+
+    assert_eq!(first.len(), second.len());
+    assert_ne!(first, second);
+    assert_eq!(first.first().copied(), Some(0));
+    assert_eq!(second.first().copied(), Some(1));
 }
 
 #[tokio::test]

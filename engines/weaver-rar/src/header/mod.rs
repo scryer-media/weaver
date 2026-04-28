@@ -222,6 +222,16 @@ fn parse_encrypted_headers<R: Read + Seek>(
             break;
         }
 
+        if header_size > common::MAX_HEADER_BODY {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "encrypted header size {} exceeds maximum {}",
+                    header_size,
+                    common::MAX_HEADER_BODY
+                ),
+            });
+        }
+
         // Total header bytes = CRC(4) + vint_len + body(header_size).
         let total = 4 + vint_len + header_size as usize;
         let aligned = (total + 15) & !15;
@@ -415,5 +425,56 @@ pub fn parse_file_extra_records(raw: &RawHeader) -> RarResult<Vec<extra::ExtraRe
         extra::parse_extra_area(ea_bytes)
     } else {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes256;
+
+    fn encrypt_first_cbc_block(key: &[u8; 32], iv: &[u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
+        let cipher = Aes256::new(key.into());
+        let mut block = plaintext;
+        for (byte, iv_byte) in block.iter_mut().zip(iv.iter()) {
+            *byte ^= iv_byte;
+        }
+        let block_ref = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block);
+        cipher.encrypt_block(block_ref);
+        block
+    }
+
+    #[test]
+    fn encrypted_header_size_above_cap_is_rejected() {
+        let oversized = common::MAX_HEADER_BODY + 1;
+        let size_vint = vint::encode_vint(oversized);
+
+        let mut decrypted = [0u8; 16];
+        decrypted[4..4 + size_vint.len()].copy_from_slice(&size_vint);
+
+        let key = [0u8; 32];
+        let iv = [0u8; 16];
+        let ciphertext = encrypt_first_cbc_block(&key, &iv, decrypted);
+
+        let mut payload = Vec::with_capacity(32);
+        payload.extend_from_slice(&iv);
+        payload.extend_from_slice(&ciphertext);
+
+        let mut cursor = std::io::Cursor::new(payload);
+        let mut parsed = ParsedHeaders {
+            main: None,
+            files: Vec::new(),
+            services: Vec::new(),
+            encryption: None,
+            end: None,
+            is_encrypted: true,
+        };
+
+        let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed);
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("exceeds maximum")),
+            "expected oversize encrypted header to be rejected, got: {result:?}"
+        );
     }
 }

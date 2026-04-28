@@ -15,6 +15,13 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::error::{RarError, RarResult};
 use crate::vint;
 
+/// Maximum header body size accepted by the RAR5 parser.
+///
+/// Legitimate RAR5 headers are much smaller than this. Keeping a hard cap
+/// prevents malformed header sizes from turning into large allocations before
+/// the parser can reject the archive as corrupt.
+pub(crate) const MAX_HEADER_BODY: u64 = 16 * 1024 * 1024;
+
 /// Common header flags shared by all header types.
 pub mod flags {
     /// Extra area is present after type-specific fields.
@@ -123,9 +130,6 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
         });
     }
 
-    // Cap header body allocation to prevent resource exhaustion.
-    // 16 MB is far larger than any legitimate RAR5 header.
-    const MAX_HEADER_BODY: u64 = 16 * 1024 * 1024;
     if header_size > MAX_HEADER_BODY {
         return Err(RarError::CorruptArchive {
             detail: format!(

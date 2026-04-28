@@ -256,17 +256,15 @@ export function JobDetail() {
       {/* Progress & stats */}
       <Card>
         <CardHeader>
-          <div className="flex flex-wrap items-center gap-3">
-            <JobStatusBadge status={job.status} />
-            {job.hasPassword ? (
-              <span className="text-xs text-amber-500">{t("job.passwordProtected")}</span>
-            ) : null}
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          {showEta ? (
-            <div className="flex justify-end">
-              <div className="text-right">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
+              <JobStatusBadge status={job.status} />
+              {job.hasPassword ? (
+                <span className="text-xs text-amber-500">{t("job.passwordProtected")}</span>
+              ) : null}
+            </div>
+            {showEta ? (
+              <div className="shrink-0 text-right">
                 <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
                   {t("table.eta")}
                 </div>
@@ -274,8 +272,10 @@ export function JobDetail() {
                   {eta}
                 </div>
               </div>
-            </div>
-          ) : null}
+            ) : null}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-5">
           <JobProgress
             progress={job.progress}
             status={job.status}

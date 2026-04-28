@@ -393,6 +393,8 @@ pub struct JobState {
     pub par2_bytes: u64,
     /// Whether health probes have been dispatched for this job.
     pub health_probing: bool,
+    /// Probe activation counter used to rotate sampled segments across rounds.
+    pub health_probe_round: u32,
     /// Highest failed-byte watermark that has already been health-probed.
     pub last_health_probe_failed_bytes: u64,
     /// Persisted probe facts used for pre-extraction classification.
