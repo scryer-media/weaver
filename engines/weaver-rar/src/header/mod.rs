@@ -431,8 +431,8 @@ pub fn parse_file_extra_records(raw: &RawHeader) -> RarResult<Vec<extra::ExtraRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::{BlockEncrypt, KeyInit};
     use aes::Aes256;
+    use aes::cipher::{BlockEncrypt, KeyInit};
 
     fn encrypt_first_cbc_block(key: &[u8; 32], iv: &[u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
         let cipher = Aes256::new(key.into());

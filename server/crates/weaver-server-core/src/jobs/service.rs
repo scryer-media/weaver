@@ -576,52 +576,51 @@ impl Pipeline {
             }
         } else {
             let history_row = self.load_history_row(job_id).await?;
-            let (nzb_path, category, metadata, output_dir, downloaded_bytes) =
-                if let Some(row) = history_row.as_ref() {
-                    let status = crate::job_status_from_persisted_str(
-                        &row.status,
-                        row.error_message.as_deref(),
-                    );
-                    if !Self::is_restartable_terminal_status(&status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
+            let (nzb_path, category, metadata, output_dir, downloaded_bytes) = if let Some(row) =
+                history_row.as_ref()
+            {
+                let status =
+                    crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+                if !Self::is_restartable_terminal_status(&status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
 
-                    let metadata = row
-                        .metadata
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                        .unwrap_or_default();
+                let metadata = row
+                    .metadata
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
+                    .unwrap_or_default();
 
-                    (
-                        self.persisted_nzb_path_for_job(job_id, Some(row)),
-                        row.category.clone(),
-                        metadata,
-                        row.output_dir.clone(),
-                        row.downloaded_bytes,
-                    )
-                } else {
-                    let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
-                    let Some(info) = history_entry else {
-                        return Err(crate::SchedulerError::JobNotFound(job_id));
-                    };
-                    if !Self::is_restartable_terminal_status(&info.status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
-
-                    (
-                        self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
-                        info.category.clone(),
-                        info.metadata.clone(),
-                        info.output_dir.clone(),
-                        info.downloaded_bytes,
-                    )
+                (
+                    self.persisted_nzb_path_for_job(job_id, Some(row)),
+                    row.category.clone(),
+                    metadata,
+                    row.output_dir.clone(),
+                    row.downloaded_bytes,
+                )
+            } else {
+                let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
+                let Some(info) = history_entry else {
+                    return Err(crate::SchedulerError::JobNotFound(job_id));
                 };
+                if !Self::is_restartable_terminal_status(&info.status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
+
+                (
+                    self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
+                    info.category.clone(),
+                    info.metadata.clone(),
+                    info.output_dir.clone(),
+                    info.downloaded_bytes,
+                )
+            };
 
             let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
 
@@ -770,10 +769,8 @@ impl Pipeline {
 
         let history_row = self.load_history_row(job_id).await?;
         if let Some(row) = history_row.as_ref() {
-            let status = crate::job_status_from_persisted_str(
-                &row.status,
-                row.error_message.as_deref(),
-            );
+            let status =
+                crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
             if !Self::is_restartable_terminal_status(&status) {
                 return Err(crate::SchedulerError::Conflict(format!(
                     "job {} is not complete or failed",

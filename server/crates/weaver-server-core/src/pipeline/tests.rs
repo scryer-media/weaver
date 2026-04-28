@@ -5547,7 +5547,9 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
     tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
     tokio::fs::create_dir_all(&staging_dir).await.unwrap();
-    tokio::fs::create_dir_all(working_dir.join("subs")).await.unwrap();
+    tokio::fs::create_dir_all(working_dir.join("subs"))
+        .await
+        .unwrap();
     tokio::fs::write(working_dir.join("episode.mkv"), b"complete")
         .await
         .unwrap();
