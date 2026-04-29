@@ -12,9 +12,8 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 9090
 
-RUN mkdir -p /config /data
+RUN mkdir -p /config
 VOLUME /config
-VOLUME /data
 
 ENV PUID=1000
 ENV PGID=1000

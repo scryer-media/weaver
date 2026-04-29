@@ -24,7 +24,7 @@ pub(crate) fn reset_login_if_requested(db: &mut Database) {
 pub(crate) fn default_data_dir_from_config_path(config_path: &Path, config: &mut Config) {
     // When --config points to a directory and data_dir is unset (fresh DB),
     // default data_dir to that directory. This is the common Docker pattern:
-    //   weaver --config /data serve
+    //   weaver --config /config serve
     if config.data_dir.is_empty() && config_path.extension().is_none_or(|e| e != "toml") {
         let dir = config_path.to_string_lossy().to_string();
         info!(data_dir = %dir, "defaulting data_dir to --config directory");
