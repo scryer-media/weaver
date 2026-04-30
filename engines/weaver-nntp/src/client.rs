@@ -121,7 +121,6 @@ impl NntpClient {
         let mut found = vec![false; message_ids.len()];
         let mut remaining: Vec<usize> = (0..message_ids.len()).collect();
         let mut had_success = false;
-        let mut had_transient = false;
         let mut last_error: Option<NntpError> = None;
 
         for idx in order {
@@ -154,18 +153,17 @@ impl NntpClient {
                     self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                 }
-                Err(e) if is_transient(&e) => {
-                    if let Some(reason) = cooldown_reason(&e) {
+                Err(e) if is_retryable_stat_error(&e) => {
+                    if let Some(reason) = stat_cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    had_transient = true;
                     last_error = Some(e);
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        if remaining.is_empty() || (had_success && !had_transient) {
+        if remaining.is_empty() || had_success {
             Ok(found)
         } else {
             Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
@@ -764,8 +762,8 @@ impl NntpClient {
                 };
 
             match group_result {
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
+                Err(e) if is_retryable_stat_error(&e) => {
+                    if should_discard_stat_connection(&e) {
                         self.discard_connection_error(server.0, conn).await;
                     }
                     if attempts < self.max_retries_per_server {
@@ -1022,8 +1020,8 @@ impl NntpClient {
 
             match result {
                 Ok(results) => return Ok(results),
-                Err(e) if is_transient(&e) => {
-                    if is_connection_error(&e) {
+                Err(e) if is_retryable_stat_error(&e) => {
+                    if should_discard_stat_connection(&e) {
                         self.discard_connection_error(server.0, conn).await;
                     }
                     if attempts < self.max_retries_per_server {
@@ -1038,14 +1036,14 @@ impl NntpClient {
                             attempt = attempts,
                             error = %e,
                             batch_size = message_ids.len(),
-                            "transient error during STAT batch, retrying on same server"
+                            "retryable error during STAT batch, retrying on same server"
                         );
                         continue;
                     }
                     return Err(e);
                 }
                 Err(e) => {
-                    if is_connection_error(&e) {
+                    if should_discard_stat_connection(&e) {
                         self.discard_connection_error(server.0, conn).await;
                     }
                     return Err(e);
@@ -1150,6 +1148,10 @@ fn is_transient(err: &NntpError) -> bool {
     )
 }
 
+fn is_retryable_stat_error(err: &NntpError) -> bool {
+    is_transient(err) || matches!(err, NntpError::MalformedResponse(_))
+}
+
 fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
     match err {
         NntpError::Io(_)
@@ -1164,6 +1166,12 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         NntpError::PoolExhausted => None,
         _ => None,
     }
+}
+
+fn stat_cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
+    cooldown_reason(err).or_else(|| {
+        matches!(err, NntpError::MalformedResponse(_)).then_some(CooldownReason::Transport)
+    })
 }
 
 /// Returns true if the error indicates the connection itself is bad
@@ -1183,9 +1191,73 @@ fn is_connection_error(err: &NntpError) -> bool {
     )
 }
 
+fn should_discard_stat_connection(err: &NntpError) -> bool {
+    is_connection_error(err) || matches!(err, NntpError::MalformedResponse(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct ScriptStep {
+        expect_prefix: Option<&'static str>,
+        response: &'static [u8],
+    }
+
+    async fn read_command_line(socket: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = socket.read(&mut byte).await.unwrap();
+            assert!(n > 0, "client closed connection before command completed");
+            buf.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for step in steps {
+                if let Some(prefix) = step.expect_prefix {
+                    let line = read_command_line(&mut socket).await;
+                    assert!(
+                        line.starts_with(prefix),
+                        "expected command starting with {prefix:?}, got {line:?}"
+                    );
+                }
+                if !step.response.is_empty() {
+                    socket.write_all(step.response).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+            }
+        });
+
+        port
+    }
+
+    fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
+        ServerPoolConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                connect_timeout: Duration::from_secs(1),
+                command_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+            max_connections: 2,
+            group: group as u32,
+        }
+    }
 
     #[test]
     fn fetch_kind_is_copy() {
@@ -1214,6 +1286,7 @@ mod tests {
         assert!(!is_transient(&NntpError::AccessDenied));
         assert!(!is_transient(&NntpError::PoolShutdown));
         assert!(!is_transient(&NntpError::ArticleNotFound));
+        assert!(!is_transient(&NntpError::MalformedResponse("bad".into())));
     }
 
     #[test]
@@ -1229,6 +1302,14 @@ mod tests {
         assert!(is_connection_error(&NntpError::AccessDenied));
         assert!(!is_connection_error(&NntpError::ArticleNotFound));
         assert!(!is_connection_error(&NntpError::AuthenticationFailed));
+    }
+
+    #[test]
+    fn malformed_stat_response_is_retryable_transport_fault() {
+        let err = NntpError::MalformedResponse("2\u{fffd}3".into());
+        assert!(is_retryable_stat_error(&err));
+        assert!(should_discard_stat_connection(&err));
+        assert_eq!(stat_cooldown_reason(&err), Some(CooldownReason::Transport));
     }
 
     #[test]
@@ -1611,5 +1692,64 @@ mod tests {
 
         let order = client.build_server_order(&[]).await;
         assert_eq!(order, vec![1, 0]);
+    }
+
+    #[tokio::test]
+    async fn stat_many_fails_over_after_malformed_pipelined_response() {
+        let primary_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"2\xff3 malformed\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"430 No such article\r\n",
+            },
+        ])
+        .await;
+
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"223 0 <exists@example.com>\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"430 No such article\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let results = client
+            .stat_many(&["<exists@example.com>", "<missing@example.com>"])
+            .await
+            .expect("stat_many should fail over");
+        assert_eq!(results, vec![true, false]);
     }
 }

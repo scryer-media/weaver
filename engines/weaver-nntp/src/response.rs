@@ -8,22 +8,37 @@ use crate::types::{MultiLineResponse, Response, StatusCode};
 /// Expected format: `xyz message text` where `xyz` is a 3-digit status code
 /// followed by a space (or end of line) and optional message text.
 pub fn parse_response(line: &str) -> Result<Response, NntpError> {
-    if line.len() < 3 {
+    let bytes = line.as_bytes();
+    if bytes.len() < 3 {
         return Err(NntpError::MalformedResponse(format!(
             "response too short: {line:?}"
         )));
     }
 
-    let code_str = &line[..3];
-    let code_val: u16 = code_str
-        .parse()
-        .map_err(|_| NntpError::MalformedResponse(format!("invalid status code: {code_str:?}")))?;
+    let code_bytes = &bytes[..3];
+    if !code_bytes.iter().all(u8::is_ascii_digit) {
+        let prefix = line.chars().take(3).collect::<String>();
+        return Err(NntpError::MalformedResponse(format!(
+            "invalid status code: {prefix:?}"
+        )));
+    }
+    let code_val = ((code_bytes[0] - b'0') as u16 * 100)
+        + ((code_bytes[1] - b'0') as u16 * 10)
+        + (code_bytes[2] - b'0') as u16;
 
     let code = StatusCode::from_u16(code_val).ok_or_else(|| {
         NntpError::MalformedResponse(format!("status code out of range: {code_val}"))
     })?;
 
-    let message = if line.len() > 4 { &line[4..] } else { "" };
+    let message = match bytes.get(3) {
+        None => "",
+        Some(b' ') => line.get(4..).unwrap_or(""),
+        Some(_) => {
+            return Err(NntpError::MalformedResponse(format!(
+                "expected space after status code: {line:?}"
+            )));
+        }
+    };
 
     Ok(Response {
         code,
@@ -109,6 +124,7 @@ mod tests {
 
     #[test]
     fn parse_too_short() {
+        assert!(parse_response("22").is_err());
         assert!(parse_response("20").is_err());
         assert!(parse_response("").is_err());
     }
@@ -116,6 +132,13 @@ mod tests {
     #[test]
     fn parse_non_numeric() {
         assert!(parse_response("abc hello").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_utf8_lossy_prefix_without_panicking() {
+        let line = String::from_utf8_lossy(b"2\xff3 malformed").into_owned();
+        let err = parse_response(&line).unwrap_err();
+        assert!(matches!(err, NntpError::MalformedResponse(_)));
     }
 
     #[test]
