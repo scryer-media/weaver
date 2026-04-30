@@ -1,3 +1,9 @@
 engines/weaver-rar/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable
-engines/weaver-par2/tests/fixtures/rar5_heavy_damage/*.rar filter=lfs diff=lfs merge=lfs -text
-engines/weaver-par2/tests/fixtures/rar5_heavy_damage/*.par2 filter=lfs diff=lfs merge=lfs -text
+engines/weaver-rar/tests/fixtures/originals/*.mkv filter=lfs diff=lfs merge=lfs -text
+engines/weaver-rar/tests/fixtures/originals/*.bin filter=lfs diff=lfs merge=lfs -text
+engines/weaver-par2/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text
+engines/weaver-par2/tests/fixtures/**/*.par2 filter=lfs diff=lfs merge=lfs -text
+engines/weaver-par2/tests/fixtures/source/*.mkv filter=lfs diff=lfs merge=lfs -text
+server/crates/weaver-server-core/tests/fixtures/**/*.7z filter=lfs diff=lfs merge=lfs -text
+server/crates/weaver-server-core/tests/fixtures/**/*.7z.* filter=lfs diff=lfs merge=lfs -text
+server/crates/weaver-server-core/tests/fixtures/**/*.mkv filter=lfs diff=lfs merge=lfs -text

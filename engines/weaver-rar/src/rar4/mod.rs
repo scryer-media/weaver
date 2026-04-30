@@ -394,9 +394,9 @@ mod tests {
 
     #[test]
     fn test_parse_rar4_hp_encrypted_headers() {
-        // Test against a real RAR4 -hp archive from e2e fixtures.
+        // Test against a real RAR4 -hp archive from local Weaver fixtures.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../e2e/testdata/rar4-encrypted/archive.rar");
+            .join("../../tests/fixtures/rar4/rar4_hp_large.rar");
         if !path.exists() {
             eprintln!("skipping test: e2e fixture not found at {}", path.display());
             return;
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn test_parse_rar4_hp_no_password_returns_error() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../e2e/testdata/rar4-encrypted/archive.rar");
+            .join("../../tests/fixtures/rar4/rar4_hp_large.rar");
         if !path.exists() {
             return;
         }
