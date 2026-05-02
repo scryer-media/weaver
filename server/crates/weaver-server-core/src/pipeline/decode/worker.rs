@@ -217,6 +217,7 @@ impl Pipeline {
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 let file_idx = segment_id.file_id.file_index as usize;
                 if let Some(file_spec) = state.spec.files.get(file_idx)
+                    && file_spec.role.counts_toward_health()
                     && let Some(seg_spec) = file_spec
                         .segments
                         .iter()

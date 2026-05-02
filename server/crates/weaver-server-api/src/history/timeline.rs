@@ -239,12 +239,11 @@ fn collect_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
                 reopen_after_pause = false;
             }
-            EventKind::JobPaused => {
-                if open.is_some() {
-                    close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
-                    reopen_after_pause = true;
-                }
+            EventKind::JobPaused if open.is_some() => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                reopen_after_pause = true;
             }
+            EventKind::JobPaused => {}
             EventKind::JobResumed => {
                 if reopen_after_pause && open.is_none() {
                     spans.push(JobTimelineSpan {

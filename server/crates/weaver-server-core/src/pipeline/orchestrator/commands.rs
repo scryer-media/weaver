@@ -51,11 +51,7 @@ impl Pipeline {
                     let total = state.spec.total_bytes;
                     let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
                         state.assembly.optional_recovery_bytes();
-                    let health = if total == 0 {
-                        1000
-                    } else {
-                        ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
-                    };
+                    let health = health_milli(total, state.failed_bytes);
                     let row = crate::JobHistoryRow {
                         job_id: job_id.0,
                         name: state.spec.name.clone(),

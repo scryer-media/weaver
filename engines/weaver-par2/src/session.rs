@@ -233,13 +233,11 @@ impl VerificationSession {
         state.feed_slice_data(offset, data);
 
         // Try to finalize the slice that was just fed.
-        if par2_set.slice_size > 0 {
-            let slice_index = (offset / par2_set.slice_size) as usize;
-            if let Some(checksums) = par2_set.file_checksums(file_id)
-                && slice_index < checksums.len()
-            {
-                state.try_finalize_slice(slice_index, &checksums[slice_index]);
-            }
+        if let Some(slice_index) = offset.checked_div(par2_set.slice_size).map(|v| v as usize)
+            && let Some(checksums) = par2_set.file_checksums(file_id)
+            && slice_index < checksums.len()
+        {
+            state.try_finalize_slice(slice_index, &checksums[slice_index]);
         }
     }
 

@@ -74,6 +74,13 @@ pub enum DecodedBodyError {
     Decode { raw_size: u32, error: YencError },
 }
 
+/// Existence results used by the health probe pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeBatchResult {
+    pub exists: Vec<bool>,
+    pub inconclusive: bool,
+}
+
 impl NntpClient {
     /// Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
@@ -137,7 +144,7 @@ impl NntpClient {
                     self.record_server_success(idx, start.elapsed()).await;
 
                     let mut next_remaining = Vec::with_capacity(remaining.len());
-                    for (original_idx, exists) in remaining.iter().copied().zip(results.into_iter())
+                    for (original_idx, exists) in remaining.iter().copied().zip(results)
                     {
                         if exists {
                             found[original_idx] = true;
@@ -167,6 +174,58 @@ impl NntpClient {
             Ok(found)
         } else {
             Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
+        }
+    }
+
+    /// Confirm article existence for health probes.
+    ///
+    /// The fast path uses batched pipelined STAT checks. Any article that STAT
+    /// reports missing is re-checked with a non-pipelined HEAD before the
+    /// result is treated as authoritative. Transport or probe errors during
+    /// confirmation mark the entire batch inconclusive so callers can unwind
+    /// without applying projected health damage.
+    pub async fn confirm_exists_for_probe(&self, message_ids: &[&str]) -> ProbeBatchResult {
+        if message_ids.is_empty() {
+            return ProbeBatchResult {
+                exists: Vec::new(),
+                inconclusive: false,
+            };
+        }
+
+        let mut exists = match self.stat_many(message_ids).await {
+            Ok(results) => results,
+            Err(_) => {
+                return ProbeBatchResult {
+                    exists: vec![false; message_ids.len()],
+                    inconclusive: true,
+                };
+            }
+        };
+
+        for (idx, message_id) in message_ids.iter().enumerate() {
+            if exists[idx] {
+                continue;
+            }
+
+            match self.fetch_head(message_id).await {
+                Ok(_) => exists[idx] = true,
+                Err(
+                    NntpError::ArticleNotFound
+                    | NntpError::NoSuchArticle { .. }
+                    | NntpError::NoArticleWithNumber,
+                ) => {}
+                Err(_) => {
+                    return ProbeBatchResult {
+                        exists,
+                        inconclusive: true,
+                    };
+                }
+            }
+        }
+
+        ProbeBatchResult {
+            exists,
+            inconclusive: false,
         }
     }
 
@@ -1244,6 +1303,74 @@ mod tests {
         port
     }
 
+    async fn try_read_command_line(socket: &mut TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = socket.read(&mut byte).await.unwrap();
+            if n == 0 {
+                if buf.is_empty() {
+                    return None;
+                }
+                panic!("client closed connection before command completed");
+            }
+            buf.push(byte[0]);
+            if byte[0] == b'\n' {
+                return Some(String::from_utf8(buf).unwrap());
+            }
+        }
+    }
+
+    async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let accept = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+                let Ok(Ok((mut socket, _))) = accept else {
+                    return;
+                };
+
+                tokio::spawn(async move {
+                    socket.write_all(b"200 ready\r\n").await.unwrap();
+                    socket.flush().await.unwrap();
+
+                    while let Some(line) = try_read_command_line(&mut socket).await {
+                        if line.starts_with("CAPABILITIES") {
+                            socket
+                                .write_all(
+                                    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+                                )
+                                .await
+                                .unwrap();
+                            socket.flush().await.unwrap();
+                            continue;
+                        }
+
+                        if line.starts_with("STAT ") {
+                            socket.write_all(b"430 No such article\r\n").await.unwrap();
+                            socket.flush().await.unwrap();
+                            continue;
+                        }
+
+                        if line.starts_with("HEAD ") {
+                            if !head_response.is_empty() {
+                                socket.write_all(head_response).await.unwrap();
+                                socket.flush().await.unwrap();
+                            }
+                            break;
+                        }
+
+                        panic!("unexpected command line: {line:?}");
+                    }
+                });
+            }
+        });
+
+        port
+    }
+
     fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
         ServerPoolConfig {
             server: ServerConfig {
@@ -1751,5 +1878,54 @@ mod tests {
             .await
             .expect("stat_many should fail over");
         assert_eq!(results, vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn confirm_exists_for_probe_recovers_false_stat_with_head_success() {
+        let port = spawn_probe_confirmation_server(
+            b"221 0 <exists@example.com> Headers follow\r\nSubject: still here\r\n.\r\n",
+        )
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let result = client
+            .confirm_exists_for_probe(&["<exists@example.com>"])
+            .await;
+        assert_eq!(
+            result,
+            ProbeBatchResult {
+                exists: vec![true],
+                inconclusive: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_exists_for_probe_marks_head_transport_failure_inconclusive() {
+        let port = spawn_probe_confirmation_server(b"").await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let result = client
+            .confirm_exists_for_probe(&["<exists@example.com>"])
+            .await;
+        assert_eq!(
+            result,
+            ProbeBatchResult {
+                exists: vec![false],
+                inconclusive: true,
+            }
+        );
     }
 }

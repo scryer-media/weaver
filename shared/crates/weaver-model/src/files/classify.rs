@@ -157,6 +157,11 @@ impl FileRole {
             }
         )
     }
+
+    /// Whether missing segments for this file should reduce computed job health.
+    pub fn counts_toward_health(&self) -> bool {
+        !matches!(self, FileRole::Par2 { .. })
+    }
 }
 
 fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {

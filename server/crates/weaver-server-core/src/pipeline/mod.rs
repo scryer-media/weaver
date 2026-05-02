@@ -55,6 +55,14 @@ const FILE_PROGRESS_FLUSH_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALLED_DOWNLOAD_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+fn health_milli(total: u64, failed_bytes: u64) -> u32 {
+    total
+        .saturating_sub(failed_bytes)
+        .saturating_mul(1000)
+        .checked_div(total)
+        .unwrap_or(1000) as u32
+}
+
 /// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
@@ -90,6 +98,9 @@ pub(super) struct ProbeUpdate {
     pub(super) missed: usize,
     /// True when the probe is complete (final update).
     pub(super) done: bool,
+    /// True when probe confirmation hit a non-authoritative transport/protocol
+    /// failure and the round should be discarded.
+    pub(super) inconclusive: bool,
 }
 
 /// Result of a background extraction task.

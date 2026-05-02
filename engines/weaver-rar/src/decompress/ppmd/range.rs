@@ -114,11 +114,7 @@ impl<'a> RangeDecoder<'a> {
     /// - `freq`: frequency of this symbol
     /// - `scale`: total frequency scale
     pub fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
-        let r = if scale > 0 {
-            self.range / scale
-        } else {
-            self.range
-        };
+        let r = self.range.checked_div(scale).unwrap_or(self.range);
         self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
         self.range = freq.max(1).wrapping_mul(r);
         self.normalize();
@@ -221,11 +217,7 @@ impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
     }
 
     fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
-        let r = if scale > 0 {
-            self.range / scale
-        } else {
-            self.range
-        };
+        let r = self.range.checked_div(scale).unwrap_or(self.range);
         self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
         self.range = freq.max(1).wrapping_mul(r);
         self.normalize();

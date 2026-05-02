@@ -841,6 +841,54 @@ fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     }
 }
 
+fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: (payload_bytes + recovery_bytes + 16) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: payload_bytes,
+                    message_id: "payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "repair.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 16,
+                    message_id: "repair-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "repair.vol00+01.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 1,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: recovery_bytes,
+                    message_id: "repair-volume@example.com".to_string(),
+                }],
+            },
+        ],
+    }
+}
+
 fn minimal_par2_file_set() -> Par2FileSet {
     Par2FileSet {
         recovery_set_id: weaver_par2::RecoverySetId::from_bytes([0; 16]),
@@ -2750,6 +2798,50 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
 }
 
 #[tokio::test]
+async fn recovery_article_not_found_does_not_mark_health_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20012);
+    let spec = standalone_with_par2_job_spec("Recovery Miss", 128, 64);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 2,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::Fetch("article not found".to_string())),
+            is_recovery: true,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+}
+
+#[tokio::test]
 async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2930,6 +3022,38 @@ async fn dispatch_downloads_respects_decode_backpressure() {
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
         files.len()
     );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_leaves_unpromoted_recovery_queue_parked_when_primary_queue_is_empty() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20014);
+    let spec = standalone_with_par2_job_spec("Recovery Dispatch", 128, 64);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.connection_ramp = 1;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        assert_eq!(state.recovery_queue.len(), 1);
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_recovery, 0);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(), 1);
 }
 
 #[tokio::test]
@@ -3295,6 +3419,36 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("false")
+    );
+}
+
+#[tokio::test]
+async fn recovery_decode_failures_do_not_mark_health_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20013);
+    let spec = standalone_with_par2_job_spec("Recovery Decode Failure", 128, 64);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        segment_number: 0,
+    };
+
+    for _ in 0..=MAX_SEGMENT_RETRIES {
+        pipeline.handle_decode_failure(segment_id, "crc mismatch");
+    }
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
     );
 }
 
@@ -9756,6 +9910,7 @@ async fn probe_completion_clears_health_probing_and_restores_queues() {
         total: 1,
         missed: 0,
         done: true,
+        inconclusive: false,
     });
 
     let state = pipeline.jobs.get(&job_id).unwrap();
@@ -9764,6 +9919,130 @@ async fn probe_completion_clears_health_probing_and_restores_queues() {
     assert!(state.held_segments.is_empty());
     assert_eq!(state.download_queue.len(), 3);
     assert_eq!(state.recovery_queue.len(), 0);
+}
+
+#[tokio::test]
+async fn health_probe_candidates_skip_par2_segments() {
+    let spec = standalone_with_par2_job_spec("Probe Candidates", 128, 64);
+
+    let probes = Pipeline::health_probe_candidates(&spec);
+
+    assert_eq!(probes, vec!["payload@example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn probe_completion_inconclusive_restores_queues_without_health_damage() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30021);
+    let spec = standalone_job_spec(
+        "Probe Inconclusive",
+        &[
+            ("probe-a.bin".to_string(), 100),
+            ("probe-b.bin".to_string(), 100),
+            ("probe-c.bin".to_string(), 100),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 10;
+    }
+
+    pipeline.activate_health_probes(job_id);
+    pipeline.handle_probe_update(ProbeUpdate {
+        job_id,
+        total: 0,
+        missed: 0,
+        done: true,
+        inconclusive: true,
+    });
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(!state.health_probing);
+    assert!(matches!(state.status, JobStatus::Downloading));
+    assert_eq!(state.failed_bytes, 10);
+    assert_eq!(state.last_health_probe_failed_bytes, 10);
+    assert!(state.held_segments.is_empty());
+    assert_eq!(state.download_queue.len(), 3);
+}
+
+#[tokio::test]
+async fn probe_projection_uses_only_payload_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30022);
+    let spec = JobSpec {
+        name: "Probe Projection".to_string(),
+        password: None,
+        total_bytes: 592,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "payload-a.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "payload-a@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload-b.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "payload-b@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "repair.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 16,
+                    message_id: "repair-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "repair.vol00+01.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 1,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![SegmentSpec {
+                    number: 0,
+                    bytes: 320,
+                    message_id: "repair-volume@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.activate_health_probes(job_id);
+    pipeline.handle_probe_update(ProbeUpdate {
+        job_id,
+        total: 2,
+        missed: 1,
+        done: true,
+        inconclusive: false,
+    });
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.failed_bytes, 128);
+    assert_eq!(state.last_health_probe_failed_bytes, 128);
+    assert!(matches!(state.status, JobStatus::Downloading));
 }
 
 #[test]
@@ -10258,6 +10537,7 @@ async fn probe_completion_does_not_immediately_reenter_checking() {
         total: 1,
         missed: 0,
         done: true,
+        inconclusive: false,
     });
 
     let state = pipeline.jobs.get(&job_id).unwrap();

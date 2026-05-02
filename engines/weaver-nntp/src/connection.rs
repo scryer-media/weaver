@@ -40,11 +40,10 @@ pub struct NntpBufferProfile {
 impl NntpBufferProfile {
     pub fn adaptive(available_bytes: u64, total_connections: usize) -> Self {
         let total_budget = (available_bytes / 32).min(256 * 1024 * 1024) as usize;
-        let per_connection = if total_connections == 0 {
-            128 * 1024
-        } else {
-            (total_budget / total_connections).clamp(128 * 1024, 512 * 1024)
-        };
+        let per_connection = total_budget
+            .checked_div(total_connections)
+            .unwrap_or(128 * 1024)
+            .clamp(128 * 1024, 512 * 1024);
         Self {
             read_buf_capacity: per_connection,
             socket_read_size: per_connection.min(256 * 1024),

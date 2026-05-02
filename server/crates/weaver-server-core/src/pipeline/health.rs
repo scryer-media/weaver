@@ -1,6 +1,40 @@
 use super::*;
 
 impl Pipeline {
+    fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
+        total_bytes.saturating_sub(par2_bytes)
+    }
+
+    pub(crate) fn health_probe_candidates(spec: &crate::jobs::model::JobSpec) -> Vec<String> {
+        spec.files
+            .iter()
+            .filter(|file_spec| file_spec.role.counts_toward_health())
+            .flat_map(|file_spec| {
+                file_spec
+                    .segments
+                    .iter()
+                    .map(|segment| segment.message_id.clone())
+            })
+            .collect()
+    }
+
+    fn projected_probe_failed_bytes(
+        state: &crate::jobs::model::JobState,
+        total: usize,
+        missed: usize,
+    ) -> Option<u64> {
+        if total == 0 || missed == 0 {
+            return None;
+        }
+
+        let tracked_bytes = Self::health_tracked_bytes(state.spec.total_bytes, state.par2_bytes);
+        if tracked_bytes == 0 {
+            return None;
+        }
+
+        Some((tracked_bytes as u128 * missed as u128 / total as u128) as u64)
+    }
+
     pub(crate) fn health_probe_sample_indices(total_segs: usize, probe_round: u32) -> Vec<usize> {
         if total_segs == 0 {
             return Vec::new();
@@ -41,7 +75,7 @@ impl Pipeline {
                 return;
             }
 
-            let health = (total.saturating_sub(state.failed_bytes) * 1000 / total) as u32;
+            let health = health_milli(total, state.failed_bytes);
 
             let par2_bytes = state.par2_bytes;
 
@@ -51,11 +85,11 @@ impl Pipeline {
                 0
             } else {
                 let denom = total.saturating_sub(par2_bytes);
-                if denom == 0 {
-                    0
-                } else {
-                    ((total.saturating_sub(par2_bytes * 2)) * 1000 / denom) as u32
-                }
+                total
+                    .saturating_sub(par2_bytes * 2)
+                    .saturating_mul(1000)
+                    .checked_div(denom)
+                    .unwrap_or(0) as u32
             };
 
             let needs_probes = health < 980
@@ -91,15 +125,16 @@ impl Pipeline {
 
     /// Handle a probe update (partial or final).
     ///
-    /// Partial updates project `failed_bytes` from the running sample so the
-    /// UI shows health declining in real time. The final update additionally
-    /// restores held segments (or fails the job).
+    /// Final updates either confirm a new payload-health estimate or discard
+    /// the round if probe confirmation was inconclusive. In all cases the job's
+    /// held work is restored before resuming.
     pub(super) fn handle_probe_update(&mut self, update: ProbeUpdate) {
         let ProbeUpdate {
             job_id,
             total,
             missed,
             done,
+            inconclusive,
         } = update;
 
         if let Some(state) = self.jobs.get(&job_id) {
@@ -110,17 +145,17 @@ impl Pipeline {
             return;
         }
 
-        let miss_pct = if total > 0 { missed * 100 / total } else { 0 };
+        let miss_pct = missed.saturating_mul(100).checked_div(total).unwrap_or(0);
 
         if done {
             info!(
                 job_id = job_id.0,
-                total, missed, miss_pct, "health probe complete"
+                total, missed, miss_pct, inconclusive, "health probe complete"
             );
         }
 
         // All probes missed → release is completely gone.
-        if done && missed == total && total > 0 {
+        if done && !inconclusive && missed == total && total > 0 {
             let error = format!(
                 "health probe: all {} samples missing — release is unavailable",
                 total
@@ -130,20 +165,16 @@ impl Pipeline {
             return;
         }
 
-        // Project failed_bytes from the current sample ratio.
-        if missed > 0
-            && let Some(state) = self.jobs.get_mut(&job_id)
-        {
-            let projected = state.spec.total_bytes as u128 * missed as u128 / total as u128;
-            let projected = projected as u64;
-            if projected > state.failed_bytes {
-                state.failed_bytes = projected;
-            }
-        }
-
         if done {
             // Restore to Downloading and re-enqueue held segments into job's queues.
             if let Some(state) = self.jobs.get_mut(&job_id) {
+                if !inconclusive
+                    && let Some(projected) =
+                        Self::projected_probe_failed_bytes(state, total, missed)
+                    && projected > state.failed_bytes
+                {
+                    state.failed_bytes = projected;
+                }
                 state.last_health_probe_failed_bytes = state.failed_bytes;
                 state.health_probing = false;
                 let held = std::mem::take(&mut state.held_segments);
@@ -167,10 +198,10 @@ impl Pipeline {
                 JobStatus::Downloading,
                 Some("downloading"),
             );
+            if !inconclusive {
+                self.check_health(job_id);
+            }
         }
-
-        // Evaluate health threshold — may abort the job on partial or final.
-        self.check_health(job_id);
     }
 
     /// Mark a job as failed and purge its queued segments.
@@ -273,21 +304,21 @@ impl Pipeline {
 
         // Build probe list from the immutable job spec.
         let state = self.jobs.get(&job_id).unwrap();
-        let all_segments: Vec<(u32, usize)> = state
-            .spec
-            .files
-            .iter()
-            .enumerate()
-            .flat_map(|(file_idx, file_spec)| {
-                (0..file_spec.segments.len()).map(move |seg_idx| (file_idx as u32, seg_idx))
-            })
-            .collect();
+        let all_segments = Self::health_probe_candidates(&state.spec);
 
         let total_segs = all_segments.len();
         if total_segs == 0 {
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.last_health_probe_failed_bytes = state.failed_bytes;
                 state.health_probing = false;
+                let held = std::mem::take(&mut state.held_segments);
+                for work in held {
+                    if work.is_recovery {
+                        state.recovery_queue.push(work);
+                    } else {
+                        state.download_queue.push(work);
+                    }
+                }
             }
             self.transition_postprocessing_status(
                 job_id,
@@ -301,19 +332,10 @@ impl Pipeline {
         // coverage instead of re-checking the same optimistic slice forever.
         let probe_indexes = Self::health_probe_sample_indices(total_segs, probe_round);
 
-        // Collect (segment_id, message_id, byte_estimate) for each probe.
-        let probes: Vec<(SegmentId, String, u32)> = probe_indexes
+        // Collect the message ids for each probe.
+        let probes: Vec<String> = probe_indexes
             .into_iter()
-            .map(|i| {
-                let (file_index, seg_idx) = all_segments[i];
-                let file_spec = &state.spec.files[file_index as usize];
-                let seg = &file_spec.segments[seg_idx];
-                let segment_id = SegmentId {
-                    file_id: NzbFileId { job_id, file_index },
-                    segment_number: seg.number,
-                };
-                (segment_id, seg.message_id.clone(), seg.bytes)
-            })
+            .map(|i| all_segments[i].clone())
             .collect();
 
         let probe_count = probes.len();
@@ -346,25 +368,24 @@ impl Pipeline {
             let mut batches_since_update: usize = 0;
 
             for batch in probes.chunks(BATCH_SIZE) {
-                let msg_ids: Vec<&str> = batch.iter().map(|(_, mid, _)| mid.as_str()).collect();
+                let msg_ids: Vec<&str> = batch.iter().map(|mid| mid.as_str()).collect();
 
-                let results = match nntp.stat_many(&msg_ids).await {
-                    Ok(results) => results,
-                    Err(e) => {
-                        warn!(error = %e, "health probe: STAT batch failed, aborting probe");
-                        let _ = probe_tx
-                            .send(ProbeUpdate {
-                                job_id,
-                                total: checked,
-                                missed,
-                                done: true,
-                            })
-                            .await;
-                        return;
-                    }
-                };
+                let results = nntp.confirm_exists_for_probe(&msg_ids).await;
+                if results.inconclusive {
+                    warn!("health probe: confirmation batch inconclusive, aborting probe");
+                    let _ = probe_tx
+                        .send(ProbeUpdate {
+                            job_id,
+                            total: checked,
+                            missed,
+                            done: true,
+                            inconclusive: true,
+                        })
+                        .await;
+                    return;
+                }
 
-                for (exists, (_seg_id, _mid, _bytes)) in results.iter().zip(batch) {
+                for exists in results.exists {
                     checked += 1;
                     if !exists {
                         missed += 1;
@@ -380,6 +401,7 @@ impl Pipeline {
                             total: checked,
                             missed,
                             done: false,
+                            inconclusive: false,
                         })
                         .await;
                 }
@@ -397,6 +419,7 @@ impl Pipeline {
                     total: probe_count,
                     missed,
                     done: true,
+                    inconclusive: false,
                 })
                 .await;
         });

@@ -992,11 +992,7 @@ impl Pipeline {
             let total = state.spec.total_bytes;
             let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
                 state.assembly.optional_recovery_bytes();
-            let health = if total == 0 {
-                1000
-            } else {
-                ((total.saturating_sub(state.failed_bytes)) * 1000 / total) as u32
-            };
+            let health = health_milli(total, state.failed_bytes);
             let (mut download_state, post_state, run_state) =
                 crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
             if matches!(download_state, crate::jobs::model::DownloadState::Complete)
