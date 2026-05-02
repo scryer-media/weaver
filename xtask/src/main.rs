@@ -785,6 +785,12 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
 }
 
 fn run_weaver_rust_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Running cargo fmt --all");
+    let mut fmt_fix = ctx.command_in("cargo", &ctx.repo_root);
+    fmt_fix.args(["fmt", "--all"]);
+    run_streaming(&mut fmt_fix, prefix)?;
+    prefixed_ok(prefix, "cargo fmt complete");
+
     prefixed_step(prefix, "Running cargo fmt --all --check");
     let mut fmt = ctx.command_in("cargo", &ctx.repo_root);
     fmt.args(["fmt", "--all", "--check"]);
