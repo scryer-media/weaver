@@ -144,8 +144,7 @@ impl NntpClient {
                     self.record_server_success(idx, start.elapsed()).await;
 
                     let mut next_remaining = Vec::with_capacity(remaining.len());
-                    for (original_idx, exists) in remaining.iter().copied().zip(results)
-                    {
+                    for (original_idx, exists) in remaining.iter().copied().zip(results) {
                         if exists {
                             found[original_idx] = true;
                         } else {
