@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -26,6 +26,8 @@ const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const LSOF_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
+const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
+const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -200,6 +202,30 @@ struct GhRelease {
     tag_name: String,
     #[serde(rename = "publishedAt")]
     published_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseDryRunCache {
+    success: bool,
+    created_at: String,
+    git_commit: String,
+    branch: String,
+    worktree_clean_at_start: bool,
+    release_args: String,
+    latest_tag_seen: Option<String>,
+    next_version: String,
+    tag_name: String,
+    validated_steps: Vec<String>,
+    failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseDryRunExpectations<'a> {
+    git_commit: &'a str,
+    release_args: &'a str,
+    latest_tag_seen: Option<&'a str>,
+    next_version: &'a str,
+    tag_name: &'a str,
 }
 
 #[derive(Default)]
@@ -463,12 +489,31 @@ fn latest_weaver_tag(ctx: &TaskContext) -> Result<Option<String>> {
         .map(ToOwned::to_owned))
 }
 
+fn git_status_porcelain(ctx: &TaskContext) -> Result<String> {
+    git_capture(ctx, &["status", "--porcelain"])
+}
+
+fn git_tracked_dirty_paths(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
+    let mut command = ctx.command_in("git", &ctx.repo_root);
+    command.args(["diff", "--name-only", "HEAD", "--"]);
+    let output = run_capture(&mut command)?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| ctx.path(line))
+        .collect())
+}
+
 fn current_branch(ctx: &TaskContext) -> Result<String> {
     git_capture(ctx, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| value.trim().to_string())
 }
 
+fn current_head_commit(ctx: &TaskContext) -> Result<String> {
+    git_capture(ctx, &["rev-parse", "HEAD"]).map(|value| value.trim().to_string())
+}
+
 fn prompt_continue_if_dirty(ctx: &TaskContext) -> Result<()> {
-    let status = git_capture(ctx, &["status", "--porcelain"])?;
+    let status = git_status_porcelain(ctx)?;
     if status.trim().is_empty() {
         return Ok(());
     }
@@ -501,6 +546,49 @@ fn git_checkout_paths(ctx: &TaskContext, paths: &[PathBuf]) -> Result<()> {
     run_checked(&mut command)
 }
 
+fn git_checkout_paths_from_source(
+    ctx: &TaskContext,
+    source: Option<&str>,
+    paths: &[PathBuf],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut command = ctx.command_in("git", &ctx.repo_root);
+    command.arg("checkout");
+    if let Some(source) = source {
+        command.arg(source);
+    }
+    command.arg("--");
+    command.args(paths);
+    run_checked(&mut command)
+}
+
+fn git_stash_create_snapshot(ctx: &TaskContext) -> Result<Option<String>> {
+    let snapshot = git_capture(ctx, &["stash", "create", "xtask release dry run snapshot"])?;
+    let snapshot = snapshot.trim();
+    if snapshot.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(snapshot.to_string()))
+    }
+}
+
+fn release_args_signature(explicit: Option<&Version>, bump: VersionBump) -> String {
+    explicit.map_or_else(
+        || format!("bump:{}", version_bump_label(bump)),
+        |version| format!("version:{version}"),
+    )
+}
+
+fn version_bump_label(bump: VersionBump) -> &'static str {
+    match bump {
+        VersionBump::Patch => "patch",
+        VersionBump::Minor => "minor",
+        VersionBump::Major => "major",
+    }
+}
+
 fn parse_bump(args: &ReleaseArgs) -> Result<(VersionBump, Option<Version>)> {
     let explicit = match &args.version {
         Some(version) => Some(Version::parse(version.trim_start_matches('v'))?),
@@ -514,6 +602,113 @@ fn parse_bump(args: &ReleaseArgs) -> Result<(VersionBump, Option<Version>)> {
         VersionBump::Patch
     };
     Ok((bump, explicit))
+}
+
+fn release_dry_run_cache_path(ctx: &TaskContext) -> PathBuf {
+    ctx.path(RELEASE_DRY_RUN_CACHE_FILE)
+}
+
+fn release_dry_run_cache_dir(ctx: &TaskContext) -> PathBuf {
+    ctx.path(RELEASE_DRY_RUN_CACHE_DIR)
+}
+
+fn clear_release_dry_run_cache(ctx: &TaskContext) -> Result<()> {
+    let cache_path = release_dry_run_cache_path(ctx);
+    if cache_path.exists() {
+        fs::remove_file(&cache_path)
+            .with_context(|| format!("failed to remove {}", cache_path.display()))?;
+    }
+
+    let cache_dir = release_dry_run_cache_dir(ctx);
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir)
+            .with_context(|| format!("failed to remove {}", cache_dir.display()))?;
+    }
+
+    Ok(())
+}
+
+fn write_release_dry_run_cache(ctx: &TaskContext, cache: &ReleaseDryRunCache) -> Result<()> {
+    let path = release_dry_run_cache_path(ctx);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(cache)? + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn load_release_dry_run_cache(ctx: &TaskContext) -> Result<ReleaseDryRunCache> {
+    let path = release_dry_run_cache_path(ctx);
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn release_dry_run_cache_rejection_reason(
+    cache: &ReleaseDryRunCache,
+    expected: &ReleaseDryRunExpectations<'_>,
+) -> Option<String> {
+    if !cache.success {
+        return Some("previous dry run did not complete successfully".to_string());
+    }
+    if !cache.worktree_clean_at_start {
+        return Some("dry run started from a dirty worktree".to_string());
+    }
+    if cache.git_commit != expected.git_commit {
+        return Some("HEAD commit changed since dry run".to_string());
+    }
+    if cache.release_args != expected.release_args {
+        return Some("release arguments changed since dry run".to_string());
+    }
+    if cache.latest_tag_seen.as_deref() != expected.latest_tag_seen {
+        return Some("latest release tag changed since dry run".to_string());
+    }
+    if cache.next_version != expected.next_version {
+        return Some("computed next version changed since dry run".to_string());
+    }
+    if cache.tag_name != expected.tag_name {
+        return Some("computed release tag changed since dry run".to_string());
+    }
+    None
+}
+
+fn restore_dry_run_tracked_changes(
+    ctx: &TaskContext,
+    tracked_dirty_paths_before_validation: &[PathBuf],
+    dirty_snapshot: Option<&str>,
+) -> Result<()> {
+    let tracked_dirty_paths_after_validation = git_tracked_dirty_paths(ctx)?;
+    if tracked_dirty_paths_after_validation.is_empty() {
+        return Ok(());
+    }
+
+    let tracked_dirty_before = tracked_dirty_paths_before_validation
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let tracked_dirty_after = tracked_dirty_paths_after_validation
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    let restore_from_head = tracked_dirty_after
+        .difference(&tracked_dirty_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    let restore_from_snapshot = tracked_dirty_after
+        .intersection(&tracked_dirty_before)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    git_checkout_paths(ctx, &restore_from_head)?;
+    if !restore_from_snapshot.is_empty() {
+        let snapshot = dirty_snapshot.ok_or_else(|| {
+            anyhow!("missing dry-run snapshot for preexisting tracked worktree changes")
+        })?;
+        git_checkout_paths_from_source(ctx, Some(snapshot), &restore_from_snapshot)?;
+    }
+
+    Ok(())
 }
 
 fn next_version(current: &Version, bump: VersionBump) -> Version {
@@ -638,12 +833,13 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| Version::new(0, 0, 0));
     let (bump, explicit) = parse_bump(&args)?;
+    let release_args = release_args_signature(explicit.as_ref(), bump);
     let next_version = explicit.unwrap_or_else(|| next_version(&current_version, bump));
     let tag_name = format!("weaver-v{next_version}");
 
     println!(
         "   Latest tag : {}",
-        latest_tag.unwrap_or_else(|| "none".to_string())
+        latest_tag.as_deref().unwrap_or("none")
     );
     println!("   Next tag   : {tag_name}");
     if args.dry_run {
@@ -656,65 +852,163 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         bail!("Tag {tag_name} already exists");
     }
     let branch = current_branch(ctx)?;
+    let git_commit = current_head_commit(ctx)?;
     println!("   Branch : {branch}");
-    prompt_continue_if_dirty(ctx)?;
+    let worktree_clean_at_start = git_status_porcelain(ctx)?.trim().is_empty();
+    if !worktree_clean_at_start {
+        prompt_continue_if_dirty(ctx)?;
+    }
     require_command("gh")?;
     ok("Pre-flight OK");
 
-    step("Running web and Rust validation in parallel");
-    let web_ctx = ctx.clone();
-    let rust_ctx = ctx.clone();
-    let web = thread::spawn(move || run_weaver_web_validation(&web_ctx, "[web] "));
-    let rust = thread::spawn(move || run_weaver_rust_validation(&rust_ctx, "[rust] "));
-    let web_result = web
-        .join()
-        .map_err(|_| anyhow!("web validation thread panicked"))?;
-    let rust_result = rust
-        .join()
-        .map_err(|_| anyhow!("rust validation thread panicked"))?;
-    if let Err(error) = &web_result {
-        warn(format!("Web validation failed: {error:#}"));
+    let cache_path = release_dry_run_cache_path(ctx);
+    let mut reused_dry_run_cache = false;
+    if args.dry_run {
+        clear_release_dry_run_cache(ctx)?;
+        write_release_dry_run_cache(
+            ctx,
+            &ReleaseDryRunCache {
+                success: false,
+                created_at: Utc::now().to_rfc3339(),
+                git_commit: git_commit.clone(),
+                branch: branch.clone(),
+                worktree_clean_at_start,
+                release_args: release_args.clone(),
+                latest_tag_seen: latest_tag.clone(),
+                next_version: next_version.to_string(),
+                tag_name: tag_name.clone(),
+                validated_steps: Vec::new(),
+                failure_message: Some("dry run did not complete".to_string()),
+            },
+        )?;
+    } else if worktree_clean_at_start && cache_path.is_file() {
+        match load_release_dry_run_cache(ctx) {
+            Ok(cache) => {
+                let next_version_text = next_version.to_string();
+                let expected = ReleaseDryRunExpectations {
+                    git_commit: &git_commit,
+                    release_args: &release_args,
+                    latest_tag_seen: latest_tag.as_deref(),
+                    next_version: &next_version_text,
+                    tag_name: &tag_name,
+                };
+                if let Some(reason) = release_dry_run_cache_rejection_reason(&cache, &expected) {
+                    println!("   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}");
+                } else {
+                    ok("Reused dry-run cache; skipping validations");
+                    reused_dry_run_cache = true;
+                }
+            }
+            Err(error) => {
+                println!("   {YELLOW}Skipping dry-run cache reuse: {error:#}{RESET}");
+            }
+        }
     }
-    if let Err(error) = &rust_result {
-        warn(format!("Rust validation failed: {error:#}"));
-    }
-    web_result?;
-    rust_result?;
-    ok("Parallel validation passed");
 
-    step(format!("Updating workspace version to {next_version}"));
+    let tracked_dirty_paths_before_validation = if args.dry_run && !reused_dry_run_cache {
+        git_tracked_dirty_paths(ctx)?
+    } else {
+        Vec::new()
+    };
+    let dirty_snapshot = if args.dry_run && !tracked_dirty_paths_before_validation.is_empty() {
+        git_stash_create_snapshot(ctx)?
+    } else {
+        None
+    };
+
+    if !reused_dry_run_cache {
+        let validation_result = {
+            step("Running web and Rust validation in parallel");
+            let web_ctx = ctx.clone();
+            let rust_ctx = ctx.clone();
+            let web = thread::spawn(move || run_weaver_web_validation(&web_ctx, "[web] "));
+            let rust = thread::spawn(move || run_weaver_rust_validation(&rust_ctx, "[rust] "));
+            let web_result = web
+                .join()
+                .map_err(|_| anyhow!("web validation thread panicked"))?;
+            let rust_result = rust
+                .join()
+                .map_err(|_| anyhow!("rust validation thread panicked"))?;
+            if let Err(error) = &web_result {
+                warn(format!("Web validation failed: {error:#}"));
+            }
+            if let Err(error) = &rust_result {
+                warn(format!("Rust validation failed: {error:#}"));
+            }
+            web_result?;
+            rust_result?;
+            ok("Parallel validation passed");
+            Ok::<Vec<String>, anyhow::Error>(vec![
+                "web_validation".to_string(),
+                "rust_validation".to_string(),
+            ])
+        };
+
+        if args.dry_run {
+            let restore_result = restore_dry_run_tracked_changes(
+                ctx,
+                &tracked_dirty_paths_before_validation,
+                dirty_snapshot.as_deref(),
+            );
+
+            match validation_result {
+                Ok(validated_steps) => {
+                    restore_result?;
+                    write_release_dry_run_cache(
+                        ctx,
+                        &ReleaseDryRunCache {
+                            success: true,
+                            created_at: Utc::now().to_rfc3339(),
+                            git_commit: git_commit.clone(),
+                            branch: branch.clone(),
+                            worktree_clean_at_start,
+                            release_args: release_args.clone(),
+                            latest_tag_seen: latest_tag.clone(),
+                            next_version: next_version.to_string(),
+                            tag_name: tag_name.clone(),
+                            validated_steps,
+                            failure_message: None,
+                        },
+                    )?;
+                    println!(
+                        "\n{YELLOW}{BOLD}Dry run complete — stopping before commit/tag/push.{RESET}"
+                    );
+                    println!("  Version {next_version} validated OK.");
+                    println!("  Dry-run cache: {}", cache_path.display());
+                    return Ok(());
+                }
+                Err(error) => {
+                    restore_result?;
+                    return Err(error);
+                }
+            }
+        }
+
+        validation_result?;
+    }
+
     let cargo_toml = ctx.path("Cargo.toml");
+    step(format!("Updating workspace version to {next_version}"));
     write_workspace_version(&cargo_toml, &next_version)?;
     ok(format!("Workspace version updated to {next_version}"));
 
-    step("Running cargo check after version bump");
-    let mut cargo_check = ctx.command_in("cargo", &ctx.repo_root);
-    cargo_check.arg("check");
-    run_checked(&mut cargo_check)?;
-    ok("cargo check passed");
-
-    let cargo_lock = ctx.path("Cargo.lock");
-    let npm_lock = ctx.path("apps/weaver-web/package-lock.json");
-    if args.dry_run {
-        println!("\n{YELLOW}{BOLD}Dry run complete — stopping before commit/tag/push.{RESET}");
-        println!("  Version {next_version} validated OK.");
-        let mut restore = vec![cargo_toml];
-        if cargo_lock.exists() {
-            restore.push(cargo_lock);
-        }
-        if npm_lock.exists() {
-            restore.push(npm_lock);
-        }
-        git_checkout_paths(ctx, &restore)?;
-        return Ok(());
+    if reused_dry_run_cache {
+        ok("Skipped post-bump cargo check via dry-run cache reuse");
+    } else {
+        step("Running cargo check after version bump");
+        let mut cargo_check = ctx.command_in("cargo", &ctx.repo_root);
+        cargo_check.arg("check");
+        run_checked(&mut cargo_check)?;
+        ok("cargo check passed");
     }
 
     step("Committing version bump");
     let mut changed = Vec::new();
-    let cargo_toml = ctx.path("Cargo.toml");
     if changed_file(ctx, &cargo_toml)? {
         changed.push(cargo_toml.clone());
     }
+    let cargo_lock = ctx.path("Cargo.lock");
+    let npm_lock = ctx.path("apps/weaver-web/package-lock.json");
     if cargo_lock.exists() && changed_file(ctx, &cargo_lock)? {
         changed.push(cargo_lock.clone());
     }
@@ -1425,4 +1719,137 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         println!("{preview}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_release_dry_run_cache() -> ReleaseDryRunCache {
+        ReleaseDryRunCache {
+            success: true,
+            created_at: "2026-05-02T00:00:00Z".to_string(),
+            git_commit: "abc123".to_string(),
+            branch: "main".to_string(),
+            worktree_clean_at_start: true,
+            release_args: "bump:patch".to_string(),
+            latest_tag_seen: Some("weaver-v0.2.7".to_string()),
+            next_version: "0.2.8".to_string(),
+            tag_name: "weaver-v0.2.8".to_string(),
+            validated_steps: vec!["web_validation".to_string(), "rust_validation".to_string()],
+            failure_message: None,
+        }
+    }
+
+    fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
+        ReleaseDryRunExpectations {
+            git_commit: "abc123",
+            release_args: "bump:patch",
+            latest_tag_seen: Some("weaver-v0.2.7"),
+            next_version: "0.2.8",
+            tag_name: "weaver-v0.2.8",
+        }
+    }
+
+    #[test]
+    fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
+        assert_eq!(
+            release_args_signature(None, VersionBump::Minor),
+            "bump:minor"
+        );
+    }
+
+    #[test]
+    fn release_args_signature_uses_explicit_version_when_present() {
+        let version = Version::parse("1.2.3").unwrap();
+        assert_eq!(
+            release_args_signature(Some(&version), VersionBump::Patch),
+            "version:1.2.3"
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_round_trips_through_json() {
+        let cache = sample_release_dry_run_cache();
+        let json = serde_json::to_string(&cache).unwrap();
+        let decoded: ReleaseDryRunCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, cache);
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_unsuccessful_prior_run() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.success = false;
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("previous dry run did not complete successfully")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_dirty_start() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.worktree_clean_at_start = false;
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("dry run started from a dirty worktree")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_commit_mismatch() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.git_commit = "def456".to_string();
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(reason.as_deref(), Some("HEAD commit changed since dry run"));
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_args_mismatch() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.release_args = "bump:minor".to_string();
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("release arguments changed since dry run")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_latest_tag_mismatch() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.latest_tag_seen = Some("weaver-v0.2.6".to_string());
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("latest release tag changed since dry run")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_rejects_next_tag_mismatch() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.tag_name = "weaver-v0.2.9".to_string();
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("computed release tag changed since dry run")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_accepts_matching_inputs() {
+        let cache = sample_release_dry_run_cache();
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert!(reason.is_none());
+    }
 }

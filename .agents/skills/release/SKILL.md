@@ -24,7 +24,7 @@ cargo xtask release              # patch bump (default)
 cargo xtask release --minor
 cargo xtask release --major
 cargo xtask release 0.2.7        # explicit version
-cargo xtask release --dry-run    # validate without committing/tagging/pushing
+cargo xtask release --dry-run    # full release rehearsal without version bump/commit/tag/push
 ```
 
 The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call the xtask command directly.
@@ -38,11 +38,10 @@ The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call t
 
 ## What the task does
 
-1. Runs web and Rust validation in parallel (clippy, workspace tests, `cargo check`, web lint/build, npm audit fix).
-2. Bumps `[workspace.package].version` in the root `Cargo.toml`.
-3. Re-runs `cargo check` to refresh `Cargo.lock`.
-4. On `--dry-run`: restores `Cargo.toml`, `Cargo.lock`, and `apps/weaver-web/package-lock.json`, then exits.
-5. Otherwise: commits `release: bump weaver to <version>`, prunes old GitHub releases and GHCR images (keeps 4 most recent), creates a **signed** `weaver-v<version>` tag, pushes the branch and tag to `origin`.
+1. Runs the full mutating release-validation stack in parallel, including web `npm audit fix`/lint/build and Rust `cargo fmt --all`, `cargo update`, audit, tests, and clippy.
+2. On `--dry-run`: does **not** bump `[workspace.package].version`, restores tracked files changed by release validation before exit, and writes a reusable marker to `tmp/xtask-release-dry-run.json`.
+3. On a later real `cargo xtask release`, if the worktree is clean and the dry-run marker still matches the current commit, release args, and next-tag math, the task may skip re-running validation and go straight to version bump, commit, signed tag, push, and release pruning.
+4. Without a valid matching dry-run marker: bumps `[workspace.package].version` in the root `Cargo.toml`, re-runs `cargo check`, then commits `release: bump weaver to <version>`, prunes old GitHub releases and GHCR images (keeps 4 most recent), creates a **signed** `weaver-v<version>` tag, and pushes the branch and tag to `origin`.
 
 ## Pre-release expectations you are responsible for
 
@@ -53,10 +52,13 @@ The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call t
 
 - Release takes several minutes. Stream its output to a file or background process so your shell/timeout doesn't kill it partway through.
 - Pass `--locked` to any Cargo invocations you run alongside release work; the release task already does this internally.
+- Always run `cargo xtask release --dry-run` first. Only move on to the real release command after a successful dry run on the same clean commit.
 
 ## Failure handling
 
 If validation fails, read the failure reason, fix it at its root cause, commit the fix, and rerun `cargo xtask release` with the same args. Cap this loop at ~3 attempts — if you can't get it green, stop and report what's failing.
+
+If a real release says it is skipping dry-run cache reuse, trust that signal. The usual causes are a dirty worktree, a changed commit, different release args, or a newer release tag changing the computed next version/tag.
 
 Do not:
 - Skip validation steps or pass flags that weaken them.
