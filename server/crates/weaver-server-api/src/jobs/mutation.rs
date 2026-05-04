@@ -7,7 +7,8 @@ use crate::auth::{ControlGuard, graphql_error};
 use crate::history::types::{HistoryCommandResult, HistoryItem, history_item_from_row};
 use crate::jobs::types::{
     PersistedQueueEvent, QueueCommandResult, QueueEventKind, SubmissionResult, SubmitNzbInput,
-    global_queue_state, queue_item_from_job, queue_item_from_submission, submit_metadata,
+    PRIORITY_ATTRIBUTE_KEY, global_queue_state, normalize_priority_value, queue_item_from_job,
+    queue_item_from_submission, submit_metadata,
 };
 use weaver_server_core::ingest::{
     SubmitNzbError, SubmittedJob, fetch_nzb_from_url, submit_nzb_bytes, submit_uploaded_nzb_reader,
@@ -20,6 +21,29 @@ use weaver_server_core::{
 
 #[derive(Default)]
 pub(crate) struct JobsMutation;
+
+fn upsert_metadata_entry(metadata: &mut Vec<(String, String)>, key: &str, value: String) {
+    let canonical_key = key.to_string();
+    let mut updated = Vec::with_capacity(metadata.len() + 1);
+    let mut replaced = false;
+
+    for (existing_key, existing_value) in metadata.drain(..) {
+        if existing_key.eq_ignore_ascii_case(key) {
+            if !replaced {
+                updated.push((canonical_key.clone(), value.clone()));
+                replaced = true;
+            }
+        } else {
+            updated.push((existing_key, existing_value));
+        }
+    }
+
+    if !replaced {
+        updated.push((canonical_key, value));
+    }
+
+    *metadata = updated;
+}
 
 #[Object]
 impl JobsMutation {
@@ -118,18 +142,29 @@ impl JobsMutation {
         priority: Option<String>,
     ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let mut update = JobUpdate::default();
+        let mut base_update = JobUpdate::default();
         if let Some(category) = category {
-            update.category = if category.is_empty() {
+            base_update.category = if category.is_empty() {
                 FieldUpdate::Clear
             } else {
                 FieldUpdate::Set(category)
             };
         }
-        if let Some(priority) = priority {
-            update.metadata = FieldUpdate::Set(vec![("priority".to_string(), priority)]);
-        }
+
+        let normalized_priority = priority
+            .map(|value| {
+                normalize_priority_value(&value)
+                    .map_err(|message| graphql_error("INVALID_INPUT", message))
+            })
+            .transpose()?;
+
         for &id in &ids {
+            let mut update = base_update.clone();
+            if let Some(priority) = normalized_priority.as_ref() {
+                let mut metadata = map_scheduler_result(handle.get_job(JobId(id)))?.metadata;
+                upsert_metadata_entry(&mut metadata, PRIORITY_ATTRIBUTE_KEY, priority.clone());
+                update.metadata = FieldUpdate::Set(metadata);
+            }
             handle.update_job(JobId(id), update.clone()).await?;
         }
         Ok(true)
@@ -405,7 +440,8 @@ async fn submit_from_facade_input(
 
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
-    let metadata = submit_metadata(input.attributes, input.client_request_id.clone());
+    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+        .map_err(|message| graphql_error("INVALID_INPUT", message))?;
 
     let submitted = if let Some(upload) = upload {
         submit_uploaded_nzb(

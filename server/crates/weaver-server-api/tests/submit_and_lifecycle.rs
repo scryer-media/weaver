@@ -364,6 +364,27 @@ async fn submit_with_attributes_and_client_request_id() {
 }
 
 #[tokio::test]
+async fn submit_rejects_invalid_priority_attribute() {
+    let h = TestHarness::new().await;
+    let nzb_b64 = encode_nzb(&minimal_nzb("invalid-priority"));
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                submitNzb(input: {{
+                    nzbBase64: \"{nzb_b64}\",
+                    attributes: [{{ key: \"priority\", value: \"urgent\" }}]
+                }}) {{
+                    accepted
+                }}
+            }}"#
+        ))
+        .await;
+
+    assert_has_errors(&resp);
+}
+
+#[tokio::test]
 async fn submit_invalid_base64() {
     let h = TestHarness::new().await;
 

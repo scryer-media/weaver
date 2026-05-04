@@ -3406,6 +3406,155 @@ async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
 }
 
 #[tokio::test]
+async fn dispatch_downloads_shares_slots_within_priority_band_after_top_pick() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+
+    let earlier_job_id = JobId(20019);
+    let later_job_id = JobId(20020);
+
+    insert_active_job(
+        &mut pipeline,
+        earlier_job_id,
+        with_priority(
+            standalone_job_spec("Earlier Normal Fair Share", &[("earlier.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        later_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Later More Progress Fair Share",
+                &[
+                    ("later-0.bin".to_string(), 512u32),
+                    ("later-1.bin".to_string(), 512u32),
+                    ("later-2.bin".to_string(), 512u32),
+                ],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    {
+        let state = pipeline.jobs.get_mut(&later_job_id).unwrap();
+        let _ = state
+            .download_queue
+            .pop()
+            .expect("later job should have one completed segment removed from queue");
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id: later_job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, 512)
+            .unwrap();
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.jobs.get(&earlier_job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(pipeline.jobs.get(&later_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(pipeline.active_downloads_by_job.get(&earlier_job_id), Some(&1));
+    assert_eq!(pipeline.active_downloads_by_job.get(&later_job_id), Some(&1));
+}
+
+#[tokio::test]
+async fn dispatch_downloads_reorders_after_priority_metadata_change() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.connection_ramp = 1;
+
+    let leading_job_id = JobId(20021);
+    let promoted_job_id = JobId(20022);
+
+    insert_active_job(
+        &mut pipeline,
+        leading_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Leading Low Priority",
+                &[
+                    ("lead-0.bin".to_string(), 512u32),
+                    ("lead-1.bin".to_string(), 512u32),
+                    ("lead-2.bin".to_string(), 512u32),
+                ],
+            ),
+            "LOW",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        promoted_job_id,
+        with_priority(
+            standalone_job_spec("Promoted Priority", &[("promoted.bin".to_string(), 512u32)]),
+            "LOW",
+        ),
+    )
+    .await;
+
+    {
+        let state = pipeline.jobs.get_mut(&leading_job_id).unwrap();
+        let _ = state
+            .download_queue
+            .pop()
+            .expect("leading low-priority job should have one completed segment removed from queue");
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id: leading_job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, 512)
+            .unwrap();
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.jobs.get(&leading_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(pipeline.jobs.get(&promoted_job_id).unwrap().download_queue.len(), 1);
+
+    pipeline.active_downloads = 0;
+    pipeline.active_downloads_by_job.clear();
+    pipeline.active_download_passes.clear();
+    pipeline.jobs.get_mut(&promoted_job_id).unwrap().spec.metadata = vec![
+        ("priority".to_string(), "NORMAL".to_string()),
+    ];
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.jobs.get(&leading_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(pipeline.jobs.get(&promoted_job_id).unwrap().download_queue.len(), 0);
+}
+
+#[tokio::test]
 async fn list_jobs_projects_downloading_while_extracting_with_remaining_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(

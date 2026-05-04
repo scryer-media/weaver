@@ -1,5 +1,11 @@
 use super::*;
 
+enum DispatchAttempt {
+    Dispatched,
+    NoWork,
+    StopAll,
+}
+
 impl Pipeline {
     fn status_allows_download_dispatch(status: &JobStatus) -> bool {
         matches!(
@@ -58,6 +64,53 @@ impl Pipeline {
     fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
         let decoded = decoded_bytes as u64;
         decoded.saturating_add(decoded / 16).saturating_add(1024)
+    }
+
+    fn try_dispatch_download_for_job(&mut self, job_id: JobId) -> DispatchAttempt {
+        let Some(work) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.download_queue.pop())
+        else {
+            return DispatchAttempt::NoWork;
+        };
+
+        let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
+        match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(work);
+                }
+                // Remaining bytes are non-zero but too small for any
+                // segment — force the UI to show the cap as the blocker.
+                if self.bandwidth_cap.cap_enabled() {
+                    use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
+                    self.shared_state.set_download_block(DownloadBlockState {
+                        kind: DownloadBlockKind::IspCap,
+                        ..self
+                            .bandwidth_cap
+                            .to_download_block_state(self.global_paused)
+                    });
+                }
+                self.update_queue_metrics();
+                return DispatchAttempt::StopAll;
+            }
+            Err(error) => {
+                error!(error = %error, "failed to reserve ISP bandwidth for dispatch");
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(work);
+                }
+                self.update_queue_metrics();
+                return DispatchAttempt::StopAll;
+            }
+        }
+
+        let estimate = work.byte_estimate as u64;
+        let is_recovery = work.is_recovery;
+        self.spawn_download(work, is_recovery);
+        self.rate_limiter.consume(estimate);
+        DispatchAttempt::Dispatched
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -243,8 +296,10 @@ impl Pipeline {
     ///
     /// This lets a newly submitted higher-priority job take newly freed slots
     /// immediately while preserving already in-flight work on lower-priority
-    /// jobs. Within the same priority band, the most-progressed job keeps those
-    /// newly freed slots first.
+    /// jobs. Within the same priority band, the most-progressed job gets the
+    /// next slot first, but each dispatch sweep only assigns one segment per job
+    /// before looping back, preventing one same-band job from monopolizing all
+    /// newly freed capacity.
     ///
     /// A job is eligible if it is `Downloading` with queued segments, or in a
     /// post-processing state (`QueuedExtract`/`Extracting`/`Verifying`/
@@ -317,29 +372,25 @@ impl Pipeline {
         // Prefer higher submitted priority first. Within the same priority
         // band, keep advancing the most-progressed job before falling back to
         // FIFO submission order.
-        let mut eligible: Vec<(u8, std::cmp::Reverse<u64>, usize, JobId)> = self
+        let mut eligible = self
             .job_order
             .iter()
             .enumerate()
-            .filter(|id| {
-                self.jobs.get(id.1).is_some_and(|s| {
-                    !s.download_queue.is_empty()
-                        && Self::status_allows_download_dispatch(&s.status)
-                })
-            })
-            .map(|(index, id)| {
-                let state = self
-                    .jobs
-                    .get(id)
-                    .expect("eligible job should still exist during dispatch ranking");
-                (
+            .filter_map(|(index, id)| {
+                let state = self.jobs.get(id)?;
+                if state.download_queue.is_empty()
+                    || !Self::status_allows_download_dispatch(&state.status)
+                {
+                    return None;
+                }
+                Some((
                     Self::job_dispatch_priority(state),
                     std::cmp::Reverse(Self::job_downloaded_segment_count(state)),
                     index,
                     *id,
-                )
+                ))
             })
-            .collect();
+            .collect::<Vec<_>>();
         eligible.sort_unstable();
         if cap_tight {
             eligible.truncate(1);
@@ -374,57 +425,52 @@ impl Pipeline {
             );
         }
 
-        for (_, _, _, job_id) in eligible {
-            if self.active_downloads >= max || self.rate_limiter.should_wait() {
-                break;
+        if cap_tight {
+            if let Some((_, _, _, job_id)) = eligible.first().copied() {
+                while self.active_downloads < max && !self.rate_limiter.should_wait() {
+                    match self.try_dispatch_download_for_job(job_id) {
+                        DispatchAttempt::Dispatched => {}
+                        DispatchAttempt::NoWork => break,
+                        DispatchAttempt::StopAll => return,
+                    }
+                }
             }
-
-            while self.active_downloads < max {
+        } else {
+            let mut group_start = 0;
+            while group_start < eligible.len() && self.active_downloads < max {
                 if self.rate_limiter.should_wait() {
                     break;
                 }
-                let Some(work) = self
-                    .jobs
-                    .get_mut(&job_id)
-                    .and_then(|state| state.download_queue.pop())
-                else {
-                    break;
-                };
-                let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
-                match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Some(state) = self.jobs.get_mut(&job_id) {
-                            state.download_queue.push(work);
+
+                let group_priority = eligible[group_start].0;
+                let mut group_end = group_start + 1;
+                while group_end < eligible.len() && eligible[group_end].0 == group_priority {
+                    group_end += 1;
+                }
+
+                loop {
+                    let mut dispatched_in_round = false;
+                    for (_, _, _, job_id) in &eligible[group_start..group_end] {
+                        if self.active_downloads >= max || self.rate_limiter.should_wait() {
+                            break;
                         }
-                        // Remaining bytes are non-zero but too small for any
-                        // segment — force the UI to show the cap as the blocker.
-                        if self.bandwidth_cap.cap_enabled() {
-                            use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
-                            self.shared_state.set_download_block(DownloadBlockState {
-                                kind: DownloadBlockKind::IspCap,
-                                ..self
-                                    .bandwidth_cap
-                                    .to_download_block_state(self.global_paused)
-                            });
+
+                        match self.try_dispatch_download_for_job(*job_id) {
+                            DispatchAttempt::Dispatched => dispatched_in_round = true,
+                            DispatchAttempt::NoWork => {}
+                            DispatchAttempt::StopAll => return,
                         }
-                        // Bandwidth cap is the bottleneck — stop all dispatch.
-                        self.update_queue_metrics();
-                        return;
                     }
-                    Err(error) => {
-                        error!(error = %error, "failed to reserve ISP bandwidth for dispatch");
-                        if let Some(state) = self.jobs.get_mut(&job_id) {
-                            state.download_queue.push(work);
-                        }
-                        self.update_queue_metrics();
-                        return;
+
+                    if !dispatched_in_round
+                        || self.active_downloads >= max
+                        || self.rate_limiter.should_wait()
+                    {
+                        break;
                     }
                 }
-                let estimate = work.byte_estimate as u64;
-                let is_recovery = work.is_recovery;
-                self.spawn_download(work, is_recovery);
-                self.rate_limiter.consume(estimate);
+
+                group_start = group_end;
             }
         }
 

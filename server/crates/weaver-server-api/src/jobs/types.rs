@@ -476,22 +476,48 @@ pub fn encode_offset_cursor(offset: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
 }
 
+pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
+
+pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("high") {
+        return Ok("HIGH".to_string());
+    }
+    if trimmed.eq_ignore_ascii_case("normal") {
+        return Ok("NORMAL".to_string());
+    }
+    if trimmed.eq_ignore_ascii_case("low") {
+        return Ok("LOW".to_string());
+    }
+
+    Err(format!(
+        "invalid priority '{trimmed}'; expected HIGH, NORMAL, or LOW"
+    ))
+}
+
 pub fn submit_metadata(
     attributes: Option<Vec<AttributeInput>>,
     client_request_id: Option<String>,
-) -> Vec<(String, String)> {
-    let mut metadata: Vec<(String, String)> = attributes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|entry| (entry.key, entry.value))
-        .collect();
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut metadata: Vec<(String, String)> = Vec::new();
+    for entry in attributes.unwrap_or_default() {
+        if entry.key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
+            metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
+            metadata.push((
+                PRIORITY_ATTRIBUTE_KEY.to_string(),
+                normalize_priority_value(&entry.value)?,
+            ));
+        } else {
+            metadata.push((entry.key, entry.value));
+        }
+    }
     if let Some(client_request_id) = client_request_id.filter(|value| !value.trim().is_empty()) {
         metadata.push((
             CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
             client_request_id.trim().to_string(),
         ));
     }
-    metadata
+    Ok(metadata)
 }
 
 pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {

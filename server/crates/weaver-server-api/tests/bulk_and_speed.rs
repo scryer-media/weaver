@@ -94,6 +94,55 @@ async fn update_jobs_clear_category() {
 }
 
 #[tokio::test]
+async fn update_jobs_priority_preserves_existing_attributes() {
+    let h = TestHarness::new().await;
+
+    let id = h
+        .submit_test_nzb_with_options("bulk-priority-merge", None, None, &[("source", "api")])
+        .await;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ updateJobs(ids: [{id}], priority: "high") }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+
+    let resp = h
+        .execute(&format!(
+            r#"{{ job(id: {id}) {{ metadata {{ key value }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let attributes = data["job"]["metadata"].as_array().unwrap();
+
+    assert!(
+        attributes
+            .iter()
+            .any(|entry| entry["key"] == "source" && entry["value"] == "api")
+    );
+    assert!(
+        attributes
+            .iter()
+            .any(|entry| entry["key"] == "priority" && entry["value"] == "HIGH")
+    );
+}
+
+#[tokio::test]
+async fn update_jobs_rejects_invalid_priority() {
+    let h = TestHarness::new().await;
+    let id = h.submit_test_nzb("invalid-priority").await;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ updateJobs(ids: [{id}], priority: "urgent") }}"#
+        ))
+        .await;
+    assert_has_errors(&resp);
+}
+
+#[tokio::test]
 async fn update_jobs_nonexistent() {
     let h = TestHarness::new().await;
 
