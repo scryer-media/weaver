@@ -235,6 +235,7 @@ export function JobDetail() {
       ? t("job.savedBandwidthSkipped")
       : t("job.savedBandwidthUsedAll");
   const originalNzbTitle = job.originalTitle.trim() || job.name;
+  const defaultNzbFilename = `${originalNzbTitle || job.displayTitle}.nzb`;
   const jobNzbDownloadHref = new URL(`api/jobs/${job.id}/nzb`, document.baseURI).href;
 
   async function downloadNzb() {
@@ -265,7 +266,7 @@ export function JobDetail() {
       link.href = objectUrl;
       link.download =
         filenameFromContentDisposition(response.headers.get("content-disposition"))
-        ?? `${originalNzbTitle || job.displayTitle}.nzb`;
+        ?? defaultNzbFilename;
       document.body.appendChild(link);
       link.click();
       link.remove();
