@@ -1567,7 +1567,6 @@ fn terminate_backend(backend: &mut Child) {
         }
         let _ = signal_process_group(process_id, libc::SIGKILL);
         let _ = backend.wait();
-        return;
     }
 
     #[cfg(not(unix))]
