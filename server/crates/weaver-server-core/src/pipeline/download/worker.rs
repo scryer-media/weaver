@@ -15,6 +15,32 @@ impl Pipeline {
         )
     }
 
+    fn job_dispatch_priority(state: &JobState) -> u8 {
+        state
+            .spec
+            .metadata
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
+            .map(|(_, value)| {
+                if value.eq_ignore_ascii_case("high") {
+                    0
+                } else if value.eq_ignore_ascii_case("low") {
+                    2
+                } else {
+                    1
+                }
+            })
+            .unwrap_or(1)
+    }
+
+    fn job_downloaded_segment_count(state: &JobState) -> u64 {
+        state
+            .assembly
+            .files()
+            .map(|file| (file.total_segments() - file.missing_count()) as u64)
+            .sum()
+    }
+
     pub(crate) fn note_retry_scheduled(&mut self, job_id: JobId) {
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
     }
@@ -209,10 +235,17 @@ impl Pipeline {
         self.pending_decode = remaining;
     }
 
-    /// Dispatch downloads across eligible jobs with FIFO priority.
+    /// Dispatch downloads across eligible jobs with job priority and progress ordering.
     ///
-    /// Iterates `job_order` and fills connections greedily: the first eligible
-    /// job gets first pick of connections, the next job fills the remainder, etc.
+    /// Eligible jobs are ranked by submitted priority metadata (`HIGH`,
+    /// `NORMAL`, `LOW`), then by completed segment count within the same
+    /// priority band, with FIFO submission order as a final tie-breaker.
+    ///
+    /// This lets a newly submitted higher-priority job take newly freed slots
+    /// immediately while preserving already in-flight work on lower-priority
+    /// jobs. Within the same priority band, the most-progressed job keeps those
+    /// newly freed slots first.
+    ///
     /// A job is eligible if it is `Downloading` with queued segments, or in a
     /// post-processing state (`QueuedExtract`/`Extracting`/`Verifying`/
     /// `QueuedRepair`/`Repairing`) with promoted recovery segments in its
@@ -281,19 +314,36 @@ impl Pipeline {
         let cap_tight = self.bandwidth_cap.cap_enabled()
             && self.bandwidth_cap.remaining_bytes() <= self.bandwidth_cap.limit_bytes() * 15 / 100;
 
-        // Collect eligible jobs in FIFO order. Earlier jobs get first pick of
-        // connections; later jobs fill whatever remains.
-        let eligible: Vec<JobId> = self
+        // Prefer higher submitted priority first. Within the same priority
+        // band, keep advancing the most-progressed job before falling back to
+        // FIFO submission order.
+        let mut eligible: Vec<(u8, std::cmp::Reverse<u64>, usize, JobId)> = self
             .job_order
             .iter()
+            .enumerate()
             .filter(|id| {
-                self.jobs.get(id).is_some_and(|s| {
-                    !s.download_queue.is_empty() && Self::status_allows_download_dispatch(&s.status)
+                self.jobs.get(id.1).is_some_and(|s| {
+                    !s.download_queue.is_empty()
+                        && Self::status_allows_download_dispatch(&s.status)
                 })
             })
-            .copied()
-            .take(if cap_tight { 1 } else { usize::MAX })
+            .map(|(index, id)| {
+                let state = self
+                    .jobs
+                    .get(id)
+                    .expect("eligible job should still exist during dispatch ranking");
+                (
+                    Self::job_dispatch_priority(state),
+                    std::cmp::Reverse(Self::job_downloaded_segment_count(state)),
+                    index,
+                    *id,
+                )
+            })
             .collect();
+        eligible.sort_unstable();
+        if cap_tight {
+            eligible.truncate(1);
+        }
 
         if eligible.is_empty() && self.active_downloads == 0 {
             for (i, jid) in self.job_order.iter().enumerate() {
@@ -324,7 +374,7 @@ impl Pipeline {
             );
         }
 
-        for job_id in eligible {
+        for (_, _, _, job_id) in eligible {
             if self.active_downloads >= max || self.rate_limiter.should_wait() {
                 break;
             }

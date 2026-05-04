@@ -1227,6 +1227,11 @@ fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobS
     }
 }
 
+fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
+    spec.metadata = vec![("priority".to_string(), priority.to_string())];
+    spec
+}
+
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
     let dir_name = crate::jobs::working_dir::sanitize_dirname(&spec.name);
     let candidate = pipeline.intermediate_dir.join(&dir_name);
@@ -3268,6 +3273,136 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
         assert_eq!(state.download_queue.len(), 0);
         assert!(pipeline.active_download_passes.contains(job_id));
     }
+}
+
+#[tokio::test]
+async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segments() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+
+    let low_job_id = JobId(20015);
+    let high_job_id = JobId(20016);
+
+    insert_active_job(
+        &mut pipeline,
+        low_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Low Priority Active",
+                &[
+                    ("low-0.bin".to_string(), 512u32),
+                    ("low-1.bin".to_string(), 512u32),
+                ],
+            ),
+            "LOW",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        high_job_id,
+        with_priority(
+            standalone_job_spec("High Priority New", &[("high-0.bin".to_string(), 512u32)]),
+            "HIGH",
+        ),
+    )
+    .await;
+
+    {
+        let state = pipeline.jobs.get_mut(&low_job_id).unwrap();
+        let _ = state
+            .download_queue
+            .pop()
+            .expect("low-priority job should have an in-flight segment to drain");
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(low_job_id, 1);
+    pipeline.active_download_passes.insert(low_job_id);
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(pipeline.jobs.get(&high_job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(pipeline.active_downloads_by_job.get(&low_job_id), Some(&1));
+    assert_eq!(pipeline.active_downloads_by_job.get(&high_job_id), Some(&1));
+}
+
+#[tokio::test]
+async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.connection_ramp = 1;
+
+    let earlier_job_id = JobId(20017);
+    let later_job_id = JobId(20018);
+
+    insert_active_job(
+        &mut pipeline,
+        earlier_job_id,
+        with_priority(
+            standalone_job_spec("Earlier Normal", &[("earlier.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        later_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Later More Progress",
+                &[
+                    ("later-0.bin".to_string(), 512u32),
+                    ("later-1.bin".to_string(), 512u32),
+                ],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    {
+        let state = pipeline.jobs.get_mut(&later_job_id).unwrap();
+        let _ = state
+            .download_queue
+            .pop()
+            .expect("later job should have one completed segment removed from queue");
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id: later_job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, 512)
+            .unwrap();
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.jobs.get(&earlier_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(pipeline.jobs.get(&later_job_id).unwrap().download_queue.len(), 0);
 }
 
 #[tokio::test]
