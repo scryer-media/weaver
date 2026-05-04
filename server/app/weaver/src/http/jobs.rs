@@ -83,19 +83,16 @@ pub(super) async fn job_nzb_download_handler(
 
 pub(super) async fn job_output_file_download_handler(
     Path(job_id): Path<u64>,
-    Extension(db): Extension<Database>,
     Extension(handle): Extension<SchedulerHandle>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
     headers: HeaderMap,
     Form(request): Form<JobOutputFileDownloadRequest>,
 ) -> Response {
     if let Err(status) = require_read_with_optional_token(
-        &db,
-        &auth_cache,
-        &api_key_cache,
-        &session_token,
+        &request_auth.db,
+        &request_auth.auth_cache,
+        &request_auth.api_key_cache,
+        request_auth.session_token.0.as_str(),
         &headers,
         request.token.as_deref(),
     )
@@ -104,7 +101,7 @@ pub(super) async fn job_output_file_download_handler(
         return status.into_response();
     }
 
-    let output_dir = match load_job_output_dir(&db, &handle, job_id).await {
+    let output_dir = match load_job_output_dir(&request_auth.db, &handle, job_id).await {
         Ok(Some(path)) => path,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),

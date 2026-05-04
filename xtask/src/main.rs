@@ -209,6 +209,8 @@ struct ReleaseDryRunCache {
     success: bool,
     created_at: String,
     git_commit: String,
+    #[serde(default)]
+    validated_tree: Option<String>,
     branch: String,
     worktree_clean_at_start: bool,
     release_args: String,
@@ -221,7 +223,7 @@ struct ReleaseDryRunCache {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseDryRunExpectations<'a> {
-    git_commit: &'a str,
+    validated_tree: &'a str,
     release_args: &'a str,
     latest_tag_seen: Option<&'a str>,
     next_version: &'a str,
@@ -536,6 +538,55 @@ fn changed_file(ctx: &TaskContext, path: &Path) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
+fn current_tracked_tree(ctx: &TaskContext) -> Result<String> {
+    if git_status_porcelain(ctx)?.trim().is_empty() {
+        return git_capture(ctx, &["rev-parse", "HEAD^{tree}"])
+            .map(|value| value.trim().to_string());
+    }
+
+    let snapshot = git_stash_create_snapshot(ctx)?
+        .ok_or_else(|| anyhow!("failed to snapshot tracked worktree state"))?;
+    git_capture(ctx, &["rev-parse", &format!("{snapshot}^{{tree}}")])
+        .map(|value| value.trim().to_string())
+}
+
+fn new_tracked_dirty_paths(
+    ctx: &TaskContext,
+    tracked_dirty_paths_before: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let tracked_dirty_before = tracked_dirty_paths_before
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let tracked_dirty_after = git_tracked_dirty_paths(ctx)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    Ok(tracked_dirty_after
+        .difference(&tracked_dirty_before)
+        .cloned()
+        .collect())
+}
+
+fn commit_release_generated_changes(
+    ctx: &TaskContext,
+    paths: &[PathBuf],
+    message: &str,
+) -> Result<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+
+    let mut add = ctx.command_in("git", &ctx.repo_root);
+    add.arg("add");
+    add.args(paths);
+    run_checked(&mut add)?;
+
+    let mut commit = ctx.command_in("git", &ctx.repo_root);
+    commit.args(["commit", "-m", message]);
+    run_checked(&mut commit)?;
+    Ok(true)
+}
+
 fn git_checkout_paths(ctx: &TaskContext, paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -655,8 +706,8 @@ fn release_dry_run_cache_rejection_reason(
     if !cache.worktree_clean_at_start {
         return Some("dry run started from a dirty worktree".to_string());
     }
-    if cache.git_commit != expected.git_commit {
-        return Some("HEAD commit changed since dry run".to_string());
+    if cache.validated_tree.as_deref() != Some(expected.validated_tree) {
+        return Some("prepared tracked tree changed since dry run".to_string());
     }
     if cache.release_args != expected.release_args {
         return Some("release arguments changed since dry run".to_string());
@@ -871,6 +922,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 success: false,
                 created_at: Utc::now().to_rfc3339(),
                 git_commit: git_commit.clone(),
+                validated_tree: None,
                 branch: branch.clone(),
                 worktree_clean_at_start,
                 release_args: release_args.clone(),
@@ -881,31 +933,9 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 failure_message: Some("dry run did not complete".to_string()),
             },
         )?;
-    } else if worktree_clean_at_start && cache_path.is_file() {
-        match load_release_dry_run_cache(ctx) {
-            Ok(cache) => {
-                let next_version_text = next_version.to_string();
-                let expected = ReleaseDryRunExpectations {
-                    git_commit: &git_commit,
-                    release_args: &release_args,
-                    latest_tag_seen: latest_tag.as_deref(),
-                    next_version: &next_version_text,
-                    tag_name: &tag_name,
-                };
-                if let Some(reason) = release_dry_run_cache_rejection_reason(&cache, &expected) {
-                    println!("   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}");
-                } else {
-                    ok("Reused dry-run cache; skipping validations");
-                    reused_dry_run_cache = true;
-                }
-            }
-            Err(error) => {
-                println!("   {YELLOW}Skipping dry-run cache reuse: {error:#}{RESET}");
-            }
-        }
     }
 
-    let tracked_dirty_paths_before_validation = if args.dry_run && !reused_dry_run_cache {
+    let tracked_dirty_paths_before_validation = if args.dry_run || !reused_dry_run_cache {
         git_tracked_dirty_paths(ctx)?
     } else {
         Vec::new()
@@ -917,32 +947,76 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     };
 
     if !reused_dry_run_cache {
-        let validation_result = {
-            step("Running web and Rust validation in parallel");
-            let web_ctx = ctx.clone();
-            let rust_ctx = ctx.clone();
-            let web = thread::spawn(move || run_weaver_web_validation(&web_ctx, "[web] "));
-            let rust = thread::spawn(move || run_weaver_rust_validation(&rust_ctx, "[rust] "));
-            let web_result = web
-                .join()
-                .map_err(|_| anyhow!("web validation thread panicked"))?;
-            let rust_result = rust
-                .join()
-                .map_err(|_| anyhow!("rust validation thread panicked"))?;
-            if let Err(error) = &web_result {
-                warn(format!("Web validation failed: {error:#}"));
+        step("Running release prep validation");
+        let prep_result = run_weaver_release_prep(ctx, "[prep] ");
+        if let Err(error) = &prep_result {
+            warn(format!("Release prep validation failed: {error:#}"));
+        }
+
+        let validation_result = (|| {
+            prep_result?;
+            ok("Release prep validation passed");
+
+            let prepared_tree = current_tracked_tree(ctx)?;
+            let prep_generated_paths = new_tracked_dirty_paths(ctx, &tracked_dirty_paths_before_validation)?;
+
+            if !args.dry_run {
+                step("Committing prep-generated changes");
+                if commit_release_generated_changes(ctx, &prep_generated_paths, "chore: fmt")? {
+                    ok("Committed prep-generated changes");
+                } else {
+                    ok("No prep-generated changes to commit");
+                }
             }
-            if let Err(error) = &rust_result {
-                warn(format!("Rust validation failed: {error:#}"));
+
+            if !args.dry_run && worktree_clean_at_start && cache_path.is_file() {
+                match load_release_dry_run_cache(ctx) {
+                    Ok(cache) => {
+                        let next_version_text = next_version.to_string();
+                        let expected = ReleaseDryRunExpectations {
+                            validated_tree: &prepared_tree,
+                            release_args: &release_args,
+                            latest_tag_seen: latest_tag.as_deref(),
+                            next_version: &next_version_text,
+                            tag_name: &tag_name,
+                        };
+                        if let Some(reason) =
+                            release_dry_run_cache_rejection_reason(&cache, &expected)
+                        {
+                            println!(
+                                "   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}"
+                            );
+                        } else {
+                            ok("Reused dry-run cache; skipping nextest and ci-clippy");
+                            reused_dry_run_cache = true;
+                        }
+                    }
+                    Err(error) => {
+                        println!("   {YELLOW}Skipping dry-run cache reuse: {error:#}{RESET}");
+                    }
+                }
             }
-            web_result?;
-            rust_result?;
-            ok("Parallel validation passed");
-            Ok::<Vec<String>, anyhow::Error>(vec![
-                "web_validation".to_string(),
-                "rust_validation".to_string(),
-            ])
-        };
+
+            if !reused_dry_run_cache {
+                step("Running Rust validation");
+                let rust_result = run_weaver_rust_heavy_validation(ctx, "[rust] ");
+                if let Err(error) = &rust_result {
+                    warn(format!("Rust validation failed: {error:#}"));
+                }
+                rust_result?;
+                ok("Rust validation passed");
+            }
+
+            Ok::<(Vec<String>, String), anyhow::Error>(
+                (
+                    vec![
+                        "release_prep_validation".to_string(),
+                        "rust_validation".to_string(),
+                    ],
+                    prepared_tree,
+                ),
+            )
+        })();
 
         if args.dry_run {
             let restore_result = restore_dry_run_tracked_changes(
@@ -952,7 +1026,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
             );
 
             match validation_result {
-                Ok(validated_steps) => {
+                Ok((validated_steps, prepared_tree)) => {
                     restore_result?;
                     write_release_dry_run_cache(
                         ctx,
@@ -960,6 +1034,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                             success: true,
                             created_at: Utc::now().to_rfc3339(),
                             git_commit: git_commit.clone(),
+                            validated_tree: Some(prepared_tree),
                             branch: branch.clone(),
                             worktree_clean_at_start,
                             release_args: release_args.clone(),
@@ -1056,6 +1131,11 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    run_weaver_web_validation(ctx, prefix)?;
+    run_weaver_rust_prep_validation(ctx, prefix)
+}
+
 fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     let web_dir = ctx.path("apps/weaver-web");
     prefixed_step(prefix, "Running npm audit fix");
@@ -1078,7 +1158,7 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
     Ok(())
 }
 
-fn run_weaver_rust_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     prefixed_step(prefix, "Running cargo fmt --all");
     let mut fmt_fix = ctx.command_in("cargo", &ctx.repo_root);
     fmt_fix.args(["fmt", "--all"]);
@@ -1109,22 +1189,73 @@ fn run_weaver_rust_validation(ctx: &TaskContext, prefix: &'static str) -> Result
     run_streaming(&mut audit, prefix)?;
     prefixed_ok(prefix, "cargo audit passed");
 
-    prefixed_step(
-        prefix,
-        "Running Rust tests (cargo nextest run --workspace --locked)",
-    );
+    Ok(())
+}
+
+fn run_weaver_rust_heavy_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    ensure_cargo_nextest(ctx, prefix)?;
+
+    prefixed_step(prefix, "Running cargo nextest and ci-clippy in parallel");
+    let nextest_ctx = ctx.clone();
+    let clippy_ctx = ctx.clone();
+    let nextest =
+        thread::spawn(move || run_weaver_nextest_validation(&nextest_ctx, "[nextest] "));
+    let clippy =
+        thread::spawn(move || run_weaver_ci_clippy_validation(&clippy_ctx, "[clippy] "));
+
+    let nextest_result = nextest
+        .join()
+        .map_err(|_| anyhow!("nextest validation thread panicked"))?;
+    let clippy_result = clippy
+        .join()
+        .map_err(|_| anyhow!("ci-clippy validation thread panicked"))?;
+
+    if let Err(error) = &nextest_result {
+        warn(format!("Rust nextest failed: {error:#}"));
+    }
+    if let Err(error) = &clippy_result {
+        warn(format!("Rust ci-clippy failed: {error:#}"));
+    }
+
+    match (nextest_result, clippy_result) {
+        (Ok(()), Ok(())) => {
+            prefixed_ok(prefix, "Parallel nextest + ci-clippy passed");
+            Ok(())
+        }
+        (nextest_result, clippy_result) => {
+            let mut failures = Vec::new();
+            if let Err(error) = nextest_result {
+                failures.push(format!("nextest failed: {error:#}"));
+            }
+            if let Err(error) = clippy_result {
+                failures.push(format!("ci-clippy failed: {error:#}"));
+            }
+            bail!(failures.join("\n"));
+        }
+    }
+}
+
+fn ensure_cargo_nextest(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     if !command_available("cargo-nextest")? {
         warn("cargo-nextest not installed — installing");
         let mut install = ctx.command_in("cargo", &ctx.repo_root);
         install.args(["install", "--locked", "cargo-nextest"]);
         run_streaming(&mut install, prefix)?;
     }
+    Ok(())
+}
+
+fn run_weaver_nextest_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Running cargo nextest run --workspace --locked");
     let mut nextest = ctx.command_in("cargo", &ctx.repo_root);
     nextest.args(["nextest", "run", "--workspace", "--locked"]);
     run_streaming(&mut nextest, prefix)?;
     prefixed_ok(prefix, "Rust tests passed");
+    Ok(())
+}
 
-    prefixed_step(prefix, "Running cargo clippy (linux ci target)");
+fn run_weaver_ci_clippy_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Running cargo xtask ci clippy --linux-only");
     let mut clippy = ctx.command_in("cargo", &ctx.repo_root);
     clippy.args(["xtask", "ci", "clippy", "--linux-only"]);
     run_streaming(&mut clippy, prefix)?;
@@ -1730,20 +1861,24 @@ mod tests {
             success: true,
             created_at: "2026-05-02T00:00:00Z".to_string(),
             git_commit: "abc123".to_string(),
+            validated_tree: Some("tree123".to_string()),
             branch: "main".to_string(),
             worktree_clean_at_start: true,
             release_args: "bump:patch".to_string(),
             latest_tag_seen: Some("weaver-v0.2.7".to_string()),
             next_version: "0.2.8".to_string(),
             tag_name: "weaver-v0.2.8".to_string(),
-            validated_steps: vec!["web_validation".to_string(), "rust_validation".to_string()],
+            validated_steps: vec![
+                "release_prep_validation".to_string(),
+                "rust_validation".to_string(),
+            ],
             failure_message: None,
         }
     }
 
     fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
         ReleaseDryRunExpectations {
-            git_commit: "abc123",
+            validated_tree: "tree123",
             release_args: "bump:patch",
             latest_tag_seen: Some("weaver-v0.2.7"),
             next_version: "0.2.8",
@@ -1801,12 +1936,24 @@ mod tests {
     }
 
     #[test]
-    fn release_dry_run_cache_rejects_commit_mismatch() {
+    fn release_dry_run_cache_rejects_prepared_tree_mismatch() {
+        let mut cache = sample_release_dry_run_cache();
+        cache.validated_tree = Some("tree456".to_string());
+        let reason =
+            release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
+        assert_eq!(
+            reason.as_deref(),
+            Some("prepared tracked tree changed since dry run")
+        );
+    }
+
+    #[test]
+    fn release_dry_run_cache_accepts_commit_mismatch_when_tree_matches() {
         let mut cache = sample_release_dry_run_cache();
         cache.git_commit = "def456".to_string();
         let reason =
             release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
-        assert_eq!(reason.as_deref(), Some("HEAD commit changed since dry run"));
+        assert!(reason.is_none());
     }
 
     #[test]

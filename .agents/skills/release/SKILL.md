@@ -38,9 +38,9 @@ The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call t
 
 ## What the task does
 
-1. Runs the full mutating release-validation stack in parallel, including web `npm audit fix`/lint/build and Rust `cargo fmt --all`, `cargo update`, audit, tests, and clippy.
+1. Runs web validation first (`npm audit fix`, lint, build), then runs Rust prep validation. The prep stage keeps shared Rust prep steps (`cargo fmt --all`, `cargo update`, `cargo audit`) serial, gathers any tracked file changes those steps produced, and on a real release commits just those generated changes as `chore: fmt` before the heavy Rust validation starts.
 2. On `--dry-run`: does **not** bump `[workspace.package].version`, restores tracked files changed by release validation before exit, and writes a reusable marker to `tmp/xtask-release-dry-run.json`.
-3. On a later real `cargo xtask release`, if the worktree is clean and the dry-run marker still matches the current commit, release args, and next-tag math, the task may skip re-running validation and go straight to version bump, commit, signed tag, push, and release pruning.
+3. On a later real `cargo xtask release`, if the worktree is clean and the dry-run marker still matches the prepared tracked tree, release args, and next-tag math, the task may skip re-running `cargo nextest` and `cargo xtask ci clippy --linux-only`, then go straight to version bump, commit, signed tag, push, and release pruning. A prep-only `chore: fmt` commit does not invalidate that cache by itself.
 4. Without a valid matching dry-run marker: bumps `[workspace.package].version` in the root `Cargo.toml`, re-runs `cargo check`, then commits `release: bump weaver to <version>`, prunes old GitHub releases and GHCR images (keeps 4 most recent), creates a **signed** `weaver-v<version>` tag, and pushes the branch and tag to `origin`.
 
 ## Pre-release expectations you are responsible for
@@ -58,7 +58,7 @@ The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call t
 
 If validation fails, read the failure reason, fix it at its root cause, commit the fix, and rerun `cargo xtask release` with the same args. Cap this loop at ~3 attempts — if you can't get it green, stop and report what's failing.
 
-If a real release says it is skipping dry-run cache reuse, trust that signal. The usual causes are a dirty worktree, a changed commit, different release args, or a newer release tag changing the computed next version/tag.
+If a real release says it is skipping dry-run cache reuse, trust that signal. The usual causes are a dirty worktree, a changed prepared tracked tree after the prep stage, different release args, or a newer release tag changing the computed next version/tag.
 
 Do not:
 - Skip validation steps or pass flags that weaken them.
