@@ -958,7 +958,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
             ok("Release prep validation passed");
 
             let prepared_tree = current_tracked_tree(ctx)?;
-            let prep_generated_paths = new_tracked_dirty_paths(ctx, &tracked_dirty_paths_before_validation)?;
+            let prep_generated_paths =
+                new_tracked_dirty_paths(ctx, &tracked_dirty_paths_before_validation)?;
 
             if !args.dry_run {
                 step("Committing prep-generated changes");
@@ -983,9 +984,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                         if let Some(reason) =
                             release_dry_run_cache_rejection_reason(&cache, &expected)
                         {
-                            println!(
-                                "   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}"
-                            );
+                            println!("   {YELLOW}Skipping dry-run cache reuse: {reason}{RESET}");
                         } else {
                             ok("Reused dry-run cache; skipping nextest and ci-clippy");
                             reused_dry_run_cache = true;
@@ -1007,15 +1006,13 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 ok("Rust validation passed");
             }
 
-            Ok::<(Vec<String>, String), anyhow::Error>(
-                (
-                    vec![
-                        "release_prep_validation".to_string(),
-                        "rust_validation".to_string(),
-                    ],
-                    prepared_tree,
-                ),
-            )
+            Ok::<(Vec<String>, String), anyhow::Error>((
+                vec![
+                    "release_prep_validation".to_string(),
+                    "rust_validation".to_string(),
+                ],
+                prepared_tree,
+            ))
         })();
 
         if args.dry_run {
@@ -1198,10 +1195,8 @@ fn run_weaver_rust_heavy_validation(ctx: &TaskContext, prefix: &'static str) -> 
     prefixed_step(prefix, "Running cargo nextest and ci-clippy in parallel");
     let nextest_ctx = ctx.clone();
     let clippy_ctx = ctx.clone();
-    let nextest =
-        thread::spawn(move || run_weaver_nextest_validation(&nextest_ctx, "[nextest] "));
-    let clippy =
-        thread::spawn(move || run_weaver_ci_clippy_validation(&clippy_ctx, "[clippy] "));
+    let nextest = thread::spawn(move || run_weaver_nextest_validation(&nextest_ctx, "[nextest] "));
+    let clippy = thread::spawn(move || run_weaver_ci_clippy_validation(&clippy_ctx, "[clippy] "));
 
     let nextest_result = nextest
         .join()
