@@ -39,6 +39,16 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 }
 
 fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let session_token = SessionToken(Arc::new("session-token".to_string()));
+    let request_auth = RequestAuthContext {
+        db: db.clone(),
+        auth_cache: auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        session_token: session_token.clone(),
+    };
+
     Router::new()
         .route(
             "/api/jobs/{job_id}/nzb",
@@ -50,11 +60,10 @@ fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
         )
         .layer(Extension(handle))
         .layer(Extension(db))
-        .layer(Extension(LoginAuthCache::default()))
-        .layer(Extension(ApiKeyCache::default()))
-        .layer(Extension(SessionToken(Arc::new(
-            "session-token".to_string(),
-        ))))
+        .layer(Extension(auth_cache))
+        .layer(Extension(api_key_cache))
+        .layer(Extension(request_auth))
+        .layer(Extension(session_token))
 }
 
 fn minimal_nzb(name: &str) -> String {
