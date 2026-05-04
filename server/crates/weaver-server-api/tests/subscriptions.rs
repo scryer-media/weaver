@@ -348,11 +348,11 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
 async fn queue_events_replay_buffered_state_change_after_cursor() {
     let h = TestHarness::new().await;
     let item_id = h.submit_test_nzb("event-test").await;
-    assert!(h
-        .db
-        .list_integration_events_after(None, None, None)
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.db.list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty()
+    );
 
     let cursor_before = latest_queue_cursor(&h).await;
 
@@ -382,7 +382,10 @@ async fn queue_events_replay_buffered_state_change_after_cursor() {
     let mut stream = h.schema.execute_stream(request);
 
     let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
-    assert!(item.is_ok(), "queueEvents should replay the buffered state change");
+    assert!(
+        item.is_ok(),
+        "queueEvents should replay the buffered state change"
+    );
     let response = item.unwrap().unwrap();
     assert!(response.errors.is_empty());
     let data = response.data.into_json().unwrap();
@@ -396,11 +399,11 @@ async fn queue_events_replay_buffered_state_change_after_cursor() {
         data["queueEvents"]["cursor"].as_str(),
         Some(expected_cursor.as_str())
     );
-    assert!(h
-        .db
-        .list_integration_events_after(None, None, None)
-        .unwrap()
-        .is_empty());
+    assert!(
+        h.db.list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

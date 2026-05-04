@@ -128,10 +128,12 @@ fn export_and_import_stable_state_roundtrip() {
     let info = src.export_stable_state(temp.path()).unwrap();
     assert_eq!(info.schema_version, src.schema_version().unwrap());
     assert!(info.included_tables.iter().any(|t| t == "settings"));
-    assert!(!info
-        .included_tables
-        .iter()
-        .any(|t| t == "integration_events"));
+    assert!(
+        !info
+            .included_tables
+            .iter()
+            .any(|t| t == "integration_events")
+    );
 
     let export_conn = Connection::open(temp.path()).unwrap();
     let integration_events_tables: i64 = export_conn
@@ -160,10 +162,11 @@ fn export_and_import_stable_state_roundtrip() {
     assert_eq!(dest.list_rss_feeds().unwrap().len(), 1);
     assert_eq!(dest.list_rss_rules(1).unwrap().len(), 1);
     assert!(dest.rss_seen_item_exists(1, "guid-1").unwrap());
-    assert!(dest
-        .list_integration_events_after(None, None, None)
-        .unwrap()
-        .is_empty());
+    assert!(
+        dest.list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -226,8 +229,9 @@ fn import_stable_state_ignores_legacy_integration_events_table() {
 
     let restored = dest.load_config().unwrap();
     assert_eq!(restored.data_dir, "/old/data");
-    assert!(dest
-        .list_integration_events_after(None, None, None)
-        .unwrap()
-        .is_empty());
+    assert!(
+        dest.list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty()
+    );
 }

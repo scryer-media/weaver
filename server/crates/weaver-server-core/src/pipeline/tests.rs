@@ -1214,10 +1214,12 @@ fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobS
             segments: segment_sizes
                 .iter()
                 .enumerate()
-                .map(|(index, bytes)| segment_spec! {
-                    number: index as u32,
-                    bytes: *bytes,
-                    message_id: format!("segment-{index}@example.com"),
+                .map(|(index, bytes)| {
+                    segment_spec! {
+                        number: index as u32,
+                        bytes: *bytes,
+                        message_id: format!("segment-{index}@example.com"),
+                    }
                 })
                 .collect(),
         }],
@@ -2656,10 +2658,12 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
             segments: (0..segment_count)
-                .map(|number| segment_spec! {
-                    number: number,
-                    bytes: payload_size,
-                    message_id: format!("cursor-{number}@example.com"),
+                .map(|number| {
+                    segment_spec! {
+                        number: number,
+                        bytes: payload_size,
+                        message_id: format!("cursor-{number}@example.com"),
+                    }
                 })
                 .collect(),
         }],

@@ -34,7 +34,10 @@ fn nzb_to_submission_spec_uses_dense_ordinals_for_sparse_segments() {
     let segments = &spec.files[0].segments;
 
     assert_eq!(
-        segments.iter().map(|segment| segment.ordinal).collect::<Vec<_>>(),
+        segments
+            .iter()
+            .map(|segment| segment.ordinal)
+            .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
     assert_eq!(

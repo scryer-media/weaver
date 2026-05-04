@@ -1352,12 +1352,14 @@ mod tests {
 
         assert!(download_queue.pop().is_none());
         assert!(recovery_queue.is_empty());
-        assert!(assembly
-            .file(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .unwrap()
-            .is_complete());
+        assert!(
+            assembly
+                .file(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
+                .unwrap()
+                .is_complete()
+        );
     }
 }
