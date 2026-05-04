@@ -42,7 +42,7 @@ import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 
 function filenameFromContentDisposition(value: string | null): string | null {
-  return value ? /filename="?([^\"]+)"?/i.exec(value)?.[1] ?? null : null;
+  return value ? /filename="?([^"]+)"?/i.exec(value)?.[1] ?? null : null;
 }
 
 function submitStreamingDownload(action: string, fields: Record<string, string>) {
