@@ -2895,9 +2895,9 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "siphasher"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3702,14 +3702,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "bytes",
  "criterion",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3740,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "aes",
  "blake2",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3868,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "crc32fast",
  "memchr",
