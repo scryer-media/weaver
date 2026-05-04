@@ -118,3 +118,12 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
     metadata: job.metadata ?? job.attributes ?? [],
   };
 }
+
+export function formatJobReleaseName(job: Pick<JobData, "originalTitle" | "displayTitle">): string {
+  const releaseName = job.originalTitle.trim();
+  if (!releaseName) {
+    return job.displayTitle;
+  }
+
+  return releaseName.replaceAll(".", " ").replace(/\s+/g, " ").trim();
+}

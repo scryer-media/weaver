@@ -2,6 +2,7 @@ mod assets;
 mod auth;
 mod backup;
 mod graphql;
+mod jobs;
 mod metrics;
 mod routes;
 

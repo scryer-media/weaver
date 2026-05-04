@@ -1,8 +1,53 @@
 use super::*;
 
+const HEALTH_PROBE_REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
+const HEALTH_PROBE_REARM_PAYLOAD_DIVISOR: u64 = 200;
+
 impl Pipeline {
     fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
         total_bytes.saturating_sub(par2_bytes)
+    }
+
+    fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
+        if par2_bytes == 0 {
+            850
+        } else if par2_bytes * 2 > total {
+            0
+        } else {
+            let denom = total.saturating_sub(par2_bytes);
+            total
+                .saturating_sub(par2_bytes * 2)
+                .saturating_mul(1000)
+                .checked_div(denom)
+                .unwrap_or(0) as u32
+        }
+    }
+
+    fn next_health_probe_failed_bytes(
+        state: &crate::jobs::model::JobState,
+        missed: usize,
+        inconclusive: bool,
+    ) -> u64 {
+        let immediate_rearm = state.failed_bytes.saturating_add(1);
+        if inconclusive || missed > 0 {
+            return immediate_rearm;
+        }
+
+        let tracked_bytes = Self::health_tracked_bytes(state.spec.total_bytes, state.par2_bytes);
+        let rearm_delta = (tracked_bytes / HEALTH_PROBE_REARM_PAYLOAD_DIVISOR)
+            .max(HEALTH_PROBE_REARM_MIN_BYTES)
+            .max(1);
+        let critical = Self::critical_health_milli(state.spec.total_bytes, state.par2_bytes);
+        let critical_failed_bytes = state.spec.total_bytes.saturating_sub(
+            ((state.spec.total_bytes as u128 * critical as u128) / 1000) as u64,
+        );
+        let critical_rearm = critical_failed_bytes.saturating_add(1);
+
+        state
+            .failed_bytes
+            .saturating_add(rearm_delta)
+            .min(critical_rearm)
+            .max(immediate_rearm)
     }
 
     pub(crate) fn health_probe_candidates(spec: &crate::jobs::model::JobSpec) -> Vec<String> {
@@ -79,22 +124,11 @@ impl Pipeline {
 
             let par2_bytes = state.par2_bytes;
 
-            let critical = if par2_bytes == 0 {
-                850
-            } else if par2_bytes * 2 > total {
-                0
-            } else {
-                let denom = total.saturating_sub(par2_bytes);
-                total
-                    .saturating_sub(par2_bytes * 2)
-                    .saturating_mul(1000)
-                    .checked_div(denom)
-                    .unwrap_or(0) as u32
-            };
+            let critical = Self::critical_health_milli(total, par2_bytes);
 
             let needs_probes = health < 980
                 && !state.health_probing
-                && state.failed_bytes > state.last_health_probe_failed_bytes;
+                && state.failed_bytes >= state.next_health_probe_failed_bytes;
             (health, critical, state.failed_bytes, total, needs_probes)
         };
 
@@ -126,8 +160,8 @@ impl Pipeline {
     /// Handle a probe update (partial or final).
     ///
     /// Final updates either confirm a new payload-health estimate or discard
-    /// the round if probe confirmation was inconclusive. In all cases the job's
-    /// held work is restored before resuming.
+    /// the round if probe confirmation was inconclusive. If probe activation
+    /// parked work for a given job, it is restored before resuming.
     pub(super) fn handle_probe_update(&mut self, update: ProbeUpdate) {
         let ProbeUpdate {
             job_id,
@@ -176,6 +210,8 @@ impl Pipeline {
                     state.failed_bytes = projected;
                 }
                 state.last_health_probe_failed_bytes = state.failed_bytes;
+                state.next_health_probe_failed_bytes =
+                    Self::next_health_probe_failed_bytes(state, missed, inconclusive);
                 state.health_probing = false;
                 let held = std::mem::take(&mut state.held_segments);
                 if !held.is_empty() {
@@ -200,6 +236,10 @@ impl Pipeline {
             );
             if !inconclusive {
                 self.check_health(job_id);
+            }
+            if self.jobs.contains_key(&job_id) && !self.job_has_pending_download_pipeline_work(job_id)
+            {
+                self.schedule_job_completion_check(job_id);
             }
         }
     }
@@ -291,17 +331,6 @@ impl Pipeline {
         };
         self.transition_postprocessing_status(job_id, JobStatus::Checking, Some("checking"));
 
-        // Pull this job's segments out of its queues so the dispatcher skips it
-        // and connections are freed for other jobs. Segments are restored (or
-        // dropped) in handle_probe_update.
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            let mut held = state.download_queue.drain_all();
-            held.append(&mut state.recovery_queue.drain_all());
-            let held_count = held.len();
-            state.held_segments = held;
-            info!(job_id = job_id.0, held_count, "held segments during probe");
-        }
-
         // Build probe list from the immutable job spec.
         let state = self.jobs.get(&job_id).unwrap();
         let all_segments = Self::health_probe_candidates(&state.spec);
@@ -310,6 +339,7 @@ impl Pipeline {
         if total_segs == 0 {
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.last_health_probe_failed_bytes = state.failed_bytes;
+                state.next_health_probe_failed_bytes = state.failed_bytes.saturating_add(1);
                 state.health_probing = false;
                 let held = std::mem::take(&mut state.held_segments);
                 for work in held {
@@ -325,6 +355,9 @@ impl Pipeline {
                 JobStatus::Downloading,
                 Some("downloading"),
             );
+            if !self.job_has_pending_download_pipeline_work(job_id) {
+                self.schedule_job_completion_check(job_id);
+            }
             return;
         }
 

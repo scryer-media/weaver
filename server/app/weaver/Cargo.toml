@@ -36,6 +36,7 @@ libc = { workspace = true }
 rayon = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 zstd = { workspace = true }
 sevenz-rust2 = { workspace = true }
 zip = { workspace = true }

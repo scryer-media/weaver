@@ -31,7 +31,7 @@ import {
   REPROCESS_JOB_MUTATION,
 } from "@/graphql/queries";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
-import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
+import { formatJobReleaseName, normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 
@@ -561,55 +561,58 @@ export function History() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredJobs.map((job) => (
-                    <TableRow
-                      key={job.id}
-                      className={cn("text-[11px]", selectedIds.has(job.id) && "bg-muted/50")}
-                    >
-                      <TableCell className="px-2 py-1.5">
-                        <Checkbox
-                          checked={selectedIds.has(job.id)}
-                          onCheckedChange={() => toggleSelect(job.id)}
-                          aria-label={`Select ${job.displayTitle}`}
-                        />
-                      </TableCell>
-                      <TableCell className="min-w-0 px-2 py-1.5">
-                        <Link
-                          to={`/jobs/${job.id}`}
-                          title={job.originalTitle}
-                          className="block min-w-0 truncate text-[11px] font-medium leading-tight text-foreground transition hover:text-primary"
-                        >
-                          {job.displayTitle}
-                        </Link>
-                        {job.hasPassword ? (
-                          <span className="ml-2 shrink-0 text-[9px] text-amber-500">
-                            {t("jobs.passwordProtected")}
-                          </span>
-                        ) : null}
-                      </TableCell>
-                      <TableCell className="overflow-hidden px-2 py-1.5">
-                        <JobStatusBadge status={job.status} compact className="px-1.5" />
-                      </TableCell>
-                      <TableCell
-                        className="px-2 py-1.5 text-[10px] text-muted-foreground"
-                        title={formatHistoryTimestamp(job.createdAt ?? null)}
+                  {filteredJobs.map((job) => {
+                    const displayName = formatJobReleaseName(job);
+                    return (
+                      <TableRow
+                        key={job.id}
+                        className={cn("text-[11px]", selectedIds.has(job.id) && "bg-muted/50")}
                       >
-                        {formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}
-                      </TableCell>
-                      <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
-                        {(job.health / 10).toFixed(1)}%
-                      </TableCell>
-                      <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
-                        {formatBytes(job.totalBytes)}
-                      </TableCell>
-                      <TableCell className="truncate px-2 py-1.5 text-[10px] text-muted-foreground" title={job.category ?? "\u2014"}>
-                        {job.category ?? "\u2014"}
-                      </TableCell>
-                      <TableCell className="px-2 py-1.5">
-                        {renderActions(job, "size-6", "size-3.5")}
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                        <TableCell className="px-2 py-1.5">
+                          <Checkbox
+                            checked={selectedIds.has(job.id)}
+                            onCheckedChange={() => toggleSelect(job.id)}
+                            aria-label={`Select ${displayName}`}
+                          />
+                        </TableCell>
+                        <TableCell className="min-w-0 px-2 py-1.5">
+                          <Link
+                            to={`/jobs/${job.id}`}
+                            title={displayName}
+                            className="block min-w-0 truncate text-[11px] font-medium leading-tight text-foreground transition hover:text-primary"
+                          >
+                            {displayName}
+                          </Link>
+                          {job.hasPassword ? (
+                            <span className="ml-2 shrink-0 text-[9px] text-amber-500">
+                              {t("jobs.passwordProtected")}
+                            </span>
+                          ) : null}
+                        </TableCell>
+                        <TableCell className="overflow-hidden px-2 py-1.5">
+                          <JobStatusBadge status={job.status} compact className="px-1.5" />
+                        </TableCell>
+                        <TableCell
+                          className="px-2 py-1.5 text-[10px] text-muted-foreground"
+                          title={formatHistoryTimestamp(job.createdAt ?? null)}
+                        >
+                          {formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}
+                        </TableCell>
+                        <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
+                          {(job.health / 10).toFixed(1)}%
+                        </TableCell>
+                        <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
+                          {formatBytes(job.totalBytes)}
+                        </TableCell>
+                        <TableCell className="truncate px-2 py-1.5 text-[10px] text-muted-foreground" title={job.category ?? "\u2014"}>
+                          {job.category ?? "\u2014"}
+                        </TableCell>
+                        <TableCell className="px-2 py-1.5">
+                          {renderActions(job, "size-6", "size-3.5")}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                   {hasMore ? (
                     <tr>
                       <td colSpan={8}>
@@ -625,37 +628,41 @@ export function History() {
           </Card>
 
           <div className="space-y-3 lg:hidden">
-            {filteredJobs.map((job) => (
-              <Card key={job.id} className={cn(selectedIds.has(job.id) && "ring-1 ring-primary/40")}>
-                <CardContent className="space-y-3">
-                  <div className="flex items-start gap-3">
-                    <Checkbox
-                      checked={selectedIds.has(job.id)}
-                      onCheckedChange={() => toggleSelect(job.id)}
-                      className="mt-1"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-start justify-between gap-3">
-                        <Link
-                          to={`/jobs/${job.id}`}
-                          className="block truncate font-medium text-foreground transition hover:text-primary"
-                        >
-                          {job.displayTitle}
-                        </Link>
-                        <JobStatusBadge status={job.status} compact />
-                      </div>
-                      <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                        <span>{formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}</span>
-                        <span>{formatBytes(job.totalBytes)}</span>
-                        <span>Health {(job.health / 10).toFixed(1)}%</span>
-                        {job.category ? <span>{job.category}</span> : null}
+            {filteredJobs.map((job) => {
+              const displayName = formatJobReleaseName(job);
+              return (
+                <Card key={job.id} className={cn(selectedIds.has(job.id) && "ring-1 ring-primary/40")}>
+                  <CardContent className="space-y-3">
+                    <div className="flex items-start gap-3">
+                      <Checkbox
+                        checked={selectedIds.has(job.id)}
+                        onCheckedChange={() => toggleSelect(job.id)}
+                        className="mt-1"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-start justify-between gap-3">
+                          <Link
+                            to={`/jobs/${job.id}`}
+                            title={displayName}
+                            className="block truncate font-medium text-foreground transition hover:text-primary"
+                          >
+                            {displayName}
+                          </Link>
+                          <JobStatusBadge status={job.status} compact />
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                          <span>{formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}</span>
+                          <span>{formatBytes(job.totalBytes)}</span>
+                          <span>Health {(job.health / 10).toFixed(1)}%</span>
+                          {job.category ? <span>{job.category}</span> : null}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  {renderActions(job, "size-7", "size-4")}
-                </CardContent>
-              </Card>
-            ))}
+                    {renderActions(job, "size-7", "size-4")}
+                  </CardContent>
+                </Card>
+              );
+            })}
             {hasMore ? (
               <div ref={mobileSentinelRef} className="flex justify-center py-3 text-xs text-muted-foreground">
                 {loadingMore ? t("label.loading") : null}

@@ -25,6 +25,7 @@ import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
+import { formatJobReleaseName } from "@/lib/job-types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -418,7 +419,7 @@ export function JobList() {
                 <TableBody>
                   {jobs.map((job) => {
                       const priority = getJobPriority(job);
-                      const displayName = job.displayTitle;
+                      const displayName = formatJobReleaseName(job);
                       const expanded = expandedJobIds.has(job.id);
                       const displayProgress = getDisplayedJobProgress({
                         progress: job.progress,
@@ -454,7 +455,7 @@ export function JobList() {
                               </Button>
                               <Link
                                 to={`/jobs/${job.id}`}
-                                title={job.originalTitle}
+                                title={displayName}
                                 className="block min-w-0 truncate text-xs font-medium leading-tight transition hover:text-primary"
                               >
                                 {displayName}
@@ -565,7 +566,7 @@ export function JobList() {
           <div className="space-y-3 lg:hidden">
             {jobs.map((job) => {
               const priority = getJobPriority(job);
-              const displayName = job.displayTitle;
+              const displayName = formatJobReleaseName(job);
               const expanded = expandedJobIds.has(job.id);
               return (
                 <Card key={job.id}>
@@ -591,7 +592,7 @@ export function JobList() {
                           </Button>
                           <Link
                             to={`/jobs/${job.id}`}
-                            title={job.originalTitle}
+                            title={displayName}
                             className="block min-w-0 truncate font-medium transition hover:text-primary"
                           >
                             {displayName}

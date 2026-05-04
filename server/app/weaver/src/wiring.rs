@@ -5,13 +5,13 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use weaver_nntp::client::NntpClient;
-use weaver_server_core::Database;
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::events::publish::should_record_job_event;
 use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
 use weaver_server_core::runtime::system_profile::SystemProfile;
 use weaver_server_core::servers::{ServerConfig, ServerConnectivityResult};
 use weaver_server_core::settings::Config;
+use weaver_server_core::Database;
 
 pub(crate) struct RuntimeContext {
     pub profile: SystemProfile,
@@ -149,7 +149,10 @@ pub(crate) fn spawn_event_persistence_task(
     });
 }
 
-async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database) {
+async fn persist_events(
+    mut rx: broadcast::Receiver<PipelineEvent>,
+    db: Database,
+) {
     use weaver_server_api::PipelineEventGql;
 
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
@@ -244,10 +247,9 @@ mod tests {
 
         let job_events = db.get_job_events(7).unwrap();
         assert_eq!(job_events.len(), 2);
-        assert!(
-            db.list_integration_events_after(None, None, None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(db
+            .list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty());
     }
 }

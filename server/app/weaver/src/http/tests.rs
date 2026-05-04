@@ -7,7 +7,9 @@ use axum::routing::{get, post};
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+use std::sync::Arc;
 use std::io::Write;
+use tokio::sync::{broadcast, mpsc};
 use tower::ServiceExt;
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
@@ -17,7 +19,8 @@ use weaver_server_core::auth::{
 };
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot};
+use weaver_server_core::operations::metrics::PipelineMetrics;
+use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SharedPipelineState};
 
 fn legacy_scrypt_hash(password: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
@@ -33,6 +36,39 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
         .route("/api/auth/status", get(auth::auth_status_handler))
         .layer(Extension(db))
         .layer(Extension(auth_cache))
+}
+
+fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
+    Router::new()
+        .route("/api/jobs/{job_id}/nzb", get(jobs::job_nzb_download_handler))
+        .route(
+            "/api/jobs/{job_id}/output-file",
+            post(jobs::job_output_file_download_handler),
+        )
+        .layer(Extension(handle))
+        .layer(Extension(db))
+        .layer(Extension(LoginAuthCache::default()))
+        .layer(Extension(ApiKeyCache::default()))
+        .layer(Extension(SessionToken(Arc::new("session-token".to_string()))))
+}
+
+fn minimal_nzb(name: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1234567890" subject="{name} - &quot;file.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500000" number="1">{name}-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+    )
+}
+
+fn test_scheduler_handle() -> SchedulerHandle {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+    let (event_tx, _) = broadcast::channel(1);
+    let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    SchedulerHandle::new(cmd_tx, event_tx, shared_state)
 }
 
 #[tokio::test]
@@ -228,6 +264,130 @@ async fn auth_status_handler_uses_cached_auth_state() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["enabled"], true);
     assert_eq!(payload["authenticated"], true);
+}
+
+#[tokio::test]
+async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = test_scheduler_handle();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nzb_path = temp_dir.path().join("10000.nzb");
+    let xml = minimal_nzb("Friends.S05.720p.BluRay.DD5.1.x264-NTb");
+    weaver_server_core::ingest::write_compressed_nzb(&nzb_path, xml.as_bytes()).unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 10_000,
+        name: "Friends".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".to_string()),
+        output_dir: None,
+        nzb_path: Some(nzb_path.display().to_string()),
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(
+            serde_json::to_string(&vec![(
+                weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+                "Friends.S05.720p.BluRay.DD5.1.x264-NTb".to_string(),
+            )])
+            .unwrap(),
+        ),
+    })
+    .unwrap();
+    let app = job_nzb_test_router(db, handle);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/jobs/10000/nzb")
+                .header(header::AUTHORIZATION, "Bearer session-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-nzb")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb\"")
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, Bytes::from(xml));
+}
+
+#[tokio::test]
+async fn job_output_file_download_handler_streams_history_file() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = test_scheduler_handle();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output_dir = temp_dir.path().join("job-output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let file_path = output_dir.join("episode-01.mkv");
+    std::fs::write(&file_path, b"video-bytes").unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 10_001,
+        name: "Friends".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".to_string()),
+        output_dir: Some(output_dir.display().to_string()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: None,
+    })
+    .unwrap();
+    let app = job_nzb_test_router(db, handle);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/jobs/10001/output-file")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "path={}&token=session-token",
+                    file_path.display()
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"episode-01.mkv\"")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, Bytes::from_static(b"video-bytes"));
 }
 
 #[test]

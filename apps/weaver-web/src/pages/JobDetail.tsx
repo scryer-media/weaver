@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JobProgress } from "@/components/JobProgress";
@@ -32,7 +32,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { requestGraphqlClientRestart } from "@/graphql/client";
+import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
 import { useLiveData } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
@@ -40,6 +40,37 @@ import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
+
+function filenameFromContentDisposition(value: string | null): string | null {
+  return value ? /filename="?([^\"]+)"?/i.exec(value)?.[1] ?? null : null;
+}
+
+function submitStreamingDownload(action: string, fields: Record<string, string>) {
+  const frameName = `download-frame-${Math.random().toString(36).slice(2)}`;
+  const frame = document.createElement("iframe");
+  frame.name = frameName;
+  frame.style.display = "none";
+  document.body.appendChild(frame);
+
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = action;
+  form.target = frameName;
+  form.style.display = "none";
+
+  for (const [name, value] of Object.entries(fields)) {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+
+  document.body.appendChild(form);
+  form.submit();
+  form.remove();
+  window.setTimeout(() => frame.remove(), 60_000);
+}
 
 interface JobDetailSnapshotData {
   queueItem?: GraphqlJobData | null;
@@ -90,6 +121,8 @@ export function JobDetail() {
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
+  const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
+  const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
   const liveJob = liveJobs.find((candidate) => candidate.id === jobId) ?? null;
   const jobQueryData =
     polledData?.jobDetailSnapshot
@@ -117,6 +150,7 @@ export function JobDetail() {
   useEffect(() => {
     setLastLiveJob(null);
     setPolledData(undefined);
+    setNzbDownloadError(null);
   }, [jobId]);
 
   useEffect(() => {
@@ -200,6 +234,48 @@ export function JobDetail() {
     savedBandwidthBytes > 0
       ? t("job.savedBandwidthSkipped")
       : t("job.savedBandwidthUsedAll");
+  const originalNzbTitle = job.originalTitle.trim() || job.name;
+  const jobNzbDownloadHref = new URL(`api/jobs/${job.id}/nzb`, document.baseURI).href;
+
+  async function downloadNzb() {
+    setIsDownloadingNzb(true);
+    setNzbDownloadError(null);
+
+    try {
+      const response = await fetch(jobNzbDownloadHref, {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        let message = "Failed to download NZB.";
+        try {
+          const body = await response.json() as { error?: string };
+          if (body.error) {
+            message = body.error;
+          }
+        } catch {
+          // Ignore non-JSON error bodies and fall back to a generic message.
+        }
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download =
+        filenameFromContentDisposition(response.headers.get("content-disposition"))
+        ?? `${originalNzbTitle || job.displayTitle}.nzb`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setNzbDownloadError(error instanceof Error ? error.message : "Failed to download NZB.");
+    } finally {
+      setIsDownloadingNzb(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -212,7 +288,26 @@ export function JobDetail() {
       <PageHeader
         title={job.displayTitle}
         description={
-          job.originalTitle !== job.displayTitle ? `Original NZB title: ${job.originalTitle}` : undefined
+          <div className="space-y-1.5">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="truncate">{originalNzbTitle}</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0 text-muted-foreground hover:text-foreground"
+                onClick={() => void downloadNzb()}
+                disabled={isDownloadingNzb}
+                aria-label={`Download NZB for ${originalNzbTitle}`}
+                title={isDownloadingNzb ? "Preparing NZB..." : "Download NZB"}
+              >
+                <Download className="size-4" />
+              </Button>
+            </div>
+            {nzbDownloadError ? (
+              <p className="text-xs text-destructive">{nzbDownloadError}</p>
+            ) : null}
+          </div>
         }
         actions={
           <>
@@ -519,6 +614,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   if (!isTerminal) return null;
 
   const result = data?.jobOutputFiles;
+  const authToken = authHeaders().Authorization?.replace(/^Bearer\s+/i, "") ?? "";
 
   if (fetching) {
     return (
@@ -568,6 +664,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
             <TableRow className="hover:bg-transparent">
               <TableHead className="text-xs">Name</TableHead>
               <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
+                <TableHead className="w-[52px] text-right text-xs">&nbsp;</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -577,6 +674,26 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
                 <TableCell className="text-right text-xs text-muted-foreground">
                   {formatBytes(file.sizeBytes)}
                 </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-8 text-muted-foreground hover:text-foreground"
+                      title={`Download ${file.name}`}
+                      aria-label={`Download ${file.name}`}
+                      onClick={() => {
+                        const action = new URL(`api/jobs/${jobId}/output-file`, document.baseURI).href;
+                        const fields: Record<string, string> = { path: file.path };
+                        if (authToken) {
+                          fields.token = authToken;
+                        }
+                        submitStreamingDownload(action, fields);
+                      }}
+                    >
+                      <Download className="size-4" />
+                    </Button>
+                  </TableCell>
               </TableRow>
             ))}
           </TableBody>

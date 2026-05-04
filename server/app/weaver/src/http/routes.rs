@@ -31,6 +31,14 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
         .route(
+            "/api/jobs/{job_id}/nzb",
+            get(super::jobs::job_nzb_download_handler),
+        )
+        .route(
+            "/api/jobs/{job_id}/output-file",
+            post(super::jobs::job_output_file_download_handler),
+        )
+        .route(
             "/api/backup/status",
             get(super::backup::backup_status_handler),
         )

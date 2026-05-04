@@ -500,11 +500,11 @@ async fn cancel_queue_item_history_events_replay_removed_item() {
         ))
         .await;
     assert_no_errors(&resp);
-    assert!(
-        h.db.list_integration_events_after(None, None, None)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(h
+        .db
+        .list_integration_events_after(None, None, None)
+        .unwrap()
+        .is_empty());
 
     let resp = h
         .execute(&format!(
