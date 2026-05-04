@@ -38,9 +38,10 @@ impl Pipeline {
             .max(HEALTH_PROBE_REARM_MIN_BYTES)
             .max(1);
         let critical = Self::critical_health_milli(state.spec.total_bytes, state.par2_bytes);
-        let critical_failed_bytes = state.spec.total_bytes.saturating_sub(
-            ((state.spec.total_bytes as u128 * critical as u128) / 1000) as u64,
-        );
+        let critical_failed_bytes = state
+            .spec
+            .total_bytes
+            .saturating_sub(((state.spec.total_bytes as u128 * critical as u128) / 1000) as u64);
         let critical_rearm = critical_failed_bytes.saturating_add(1);
 
         state
@@ -237,7 +238,8 @@ impl Pipeline {
             if !inconclusive {
                 self.check_health(job_id);
             }
-            if self.jobs.contains_key(&job_id) && !self.job_has_pending_download_pipeline_work(job_id)
+            if self.jobs.contains_key(&job_id)
+                && !self.job_has_pending_download_pipeline_work(job_id)
             {
                 self.schedule_job_completion_check(job_id);
             }

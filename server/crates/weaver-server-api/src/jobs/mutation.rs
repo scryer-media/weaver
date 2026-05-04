@@ -6,18 +6,16 @@ use base64::Engine;
 use crate::auth::{ControlGuard, graphql_error};
 use crate::history::types::{HistoryCommandResult, HistoryItem, history_item_from_row};
 use crate::jobs::types::{
-    PersistedQueueEvent, QueueCommandResult, QueueEventKind, SubmissionResult, SubmitNzbInput,
-    PRIORITY_ATTRIBUTE_KEY, global_queue_state, normalize_priority_value, queue_item_from_job,
-    queue_item_from_submission, submit_metadata,
+    PRIORITY_ATTRIBUTE_KEY, PersistedQueueEvent, QueueCommandResult, QueueEventKind,
+    SubmissionResult, SubmitNzbInput, global_queue_state, normalize_priority_value,
+    queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
 use weaver_server_core::ingest::{
     SubmitNzbError, SubmittedJob, fetch_nzb_from_url, submit_nzb_bytes, submit_uploaded_nzb_reader,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::settings::SharedConfig;
-use weaver_server_core::{
-    Database, FieldUpdate, JobUpdate, SchedulerError, SchedulerHandle,
-};
+use weaver_server_core::{Database, FieldUpdate, JobUpdate, SchedulerError, SchedulerHandle};
 
 #[derive(Default)]
 pub(crate) struct JobsMutation;
@@ -229,7 +227,10 @@ impl JobsMutation {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         // Capture the pre-cancel item so the compatibility ITEM_REMOVED event
         // lands after any final pipeline-driven state changes emitted by cancel_job.
-        let previous_item = handle.get_job(JobId(id)).ok().map(|info| queue_item_from_job(&info));
+        let previous_item = handle
+            .get_job(JobId(id))
+            .ok()
+            .map(|info| queue_item_from_job(&info));
         map_scheduler_result(handle.cancel_job(JobId(id)).await)?;
         replay
             .append(PersistedQueueEvent {
@@ -239,7 +240,9 @@ impl JobsMutation {
                 item: previous_item.clone(),
                 state: None,
                 previous_state: previous_item.as_ref().map(|item| item.state),
-                attention: previous_item.as_ref().and_then(|item| item.attention.clone()),
+                attention: previous_item
+                    .as_ref()
+                    .and_then(|item| item.attention.clone()),
                 global_state: None,
             })
             .await;

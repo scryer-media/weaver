@@ -70,12 +70,15 @@ fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, StateError> 
 }
 
 fn file_size_bytes(path: Option<&Path>) -> Option<u64> {
-    path.and_then(|value| fs::metadata(value).ok()).map(|meta| meta.len())
+    path.and_then(|value| fs::metadata(value).ok())
+        .map(|meta| meta.len())
 }
 
 fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateError> {
     let integration_event_rows_deleted: i64 = conn
-        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
+            row.get(0)
+        })
         .map_err(|e| StateError::Database(e.to_string()))?;
     let metrics_cutoff_epoch_sec = current_epoch_sec() - METRICS_RETENTION_SECS;
     let db_path = main_database_path(conn)?;
@@ -520,7 +523,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(2) | Some(3) => {
                 // v2/v3→v11: append/priorities are added here; newer tables/columns are handled below.
@@ -533,7 +536,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(4) => {
                 // v4→v11: append/priorities are added here; newer tables/columns are handled below.
@@ -546,7 +549,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(5) => {
                 // v5→v11: server priority is added here; newer tables/columns are handled below.
@@ -558,7 +561,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(6) => {
                 // v6→v11: RSS + categories + RAR facts + PAR2 file tables are created above.
@@ -566,7 +569,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(7) => {
                 // v7→v11: categories + RAR facts + PAR2 file tables created above via IF NOT EXISTS.
@@ -574,7 +577,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(8) => {
                 // v8→v11: RAR volume facts + PAR2 file tables created above via IF NOT EXISTS.
@@ -582,7 +585,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(9) => {
                 // v9→v11: PAR2 file table created above via IF NOT EXISTS.
@@ -590,7 +593,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(10) => {
                 // v10→v12: newer active-state tables and history columns are created above.
@@ -598,7 +601,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(11) => {
                 // v11→v12: active job normalization flag is added below; new active-state tables
@@ -607,7 +610,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(12) => {
                 // v12→v13: bandwidth usage ledger is created above via IF NOT EXISTS.
@@ -615,7 +618,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(13) => {
                 // v13→v14: public integration event log is created above via IF NOT EXISTS.
@@ -623,7 +626,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(14) => {
                 // v14→v15: compressed metrics scrape storage is created above via IF NOT EXISTS.
@@ -631,7 +634,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(15) => {
                 // v15→v16: active file progress floors are created above via IF NOT EXISTS.
@@ -639,7 +642,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(16) => {
                 // v16→v17: active runtime restore columns are added below via ensure_column.
@@ -647,7 +650,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(17) => {
                 // v17→v18: active file identity state is created above via IF NOT EXISTS.
@@ -655,7 +658,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(18) => {
                 // v18→v19: two-lane runtime columns are added below via ensure_column.
@@ -663,7 +666,7 @@ impl Database {
                     "UPDATE schema_version SET version = ?1",
                     [LEGACY_SCHEMA_VERSION],
                 )
-                    .map_err(|e| StateError::Database(e.to_string()))?;
+                .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(19) => {}
             Some(v) if v == SCHEMA_VERSION => {}

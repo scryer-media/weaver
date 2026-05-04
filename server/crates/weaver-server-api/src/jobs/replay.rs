@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::jobs::types::{
-    PersistedQueueEvent, QueueDownloadState, QueueEvent, QueueEventKind,
-    QueueItem, QueueItemState, QueuePostState, QueueWaitReason, encode_event_cursor,
-    global_queue_state, queue_event_from_record, queue_item_from_job,
+    PersistedQueueEvent, QueueDownloadState, QueueEvent, QueueEventKind, QueueItem, QueueItemState,
+    QueuePostState, QueueWaitReason, encode_event_cursor, global_queue_state,
+    queue_event_from_record, queue_item_from_job,
 };
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::events::model::PipelineEvent;
@@ -274,7 +274,10 @@ async fn queue_event_records_from_pipeline_event(
     let occurred_at_ms = chrono::Utc::now().timestamp_millis();
     let mut queue_events = Vec::new();
 
-    if matches!(event, PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed) {
+    if matches!(
+        event,
+        PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed
+    ) {
         let cfg = config.read().await;
         queue_events.push(PersistedQueueEvent {
             occurred_at_ms,
@@ -349,7 +352,9 @@ async fn queue_event_records_from_pipeline_event(
     let previous_state = previous_item.as_ref().map(|value| value.state);
     let previous_detail = caches.last_item_details.insert(job_id, detail_signature);
     let previous_progress = caches.last_progress_buckets.insert(job_id, progress_bucket);
-    let previous_attention = caches.last_attention.insert(job_id, attention_signature.clone());
+    let previous_attention = caches
+        .last_attention
+        .insert(job_id, attention_signature.clone());
 
     if matches!(event, PipelineEvent::JobCreated { .. }) {
         queue_events.push(PersistedQueueEvent {
@@ -414,7 +419,10 @@ async fn queue_event_records_from_pipeline_event(
         });
     }
 
-    if matches!(item.state, QueueItemState::Completed | QueueItemState::Failed) {
+    if matches!(
+        item.state,
+        QueueItemState::Completed | QueueItemState::Failed
+    ) {
         caches.evict(job_id);
     }
 

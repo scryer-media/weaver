@@ -7,8 +7,8 @@ use axum::routing::{get, post};
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
-use std::sync::Arc;
 use std::io::Write;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tower::ServiceExt;
 use weaver_server_core::Database;
@@ -40,7 +40,10 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 
 fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
     Router::new()
-        .route("/api/jobs/{job_id}/nzb", get(jobs::job_nzb_download_handler))
+        .route(
+            "/api/jobs/{job_id}/nzb",
+            get(jobs::job_nzb_download_handler),
+        )
         .route(
             "/api/jobs/{job_id}/output-file",
             post(jobs::job_output_file_download_handler),
@@ -49,7 +52,9 @@ fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
         .layer(Extension(db))
         .layer(Extension(LoginAuthCache::default()))
         .layer(Extension(ApiKeyCache::default()))
-        .layer(Extension(SessionToken(Arc::new("session-token".to_string()))))
+        .layer(Extension(SessionToken(Arc::new(
+            "session-token".to_string(),
+        ))))
 }
 
 fn minimal_nzb(name: &str) -> String {

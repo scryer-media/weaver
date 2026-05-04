@@ -53,7 +53,9 @@ pub(super) async fn job_nzb_download_handler(
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(status) = require_read(&db, &auth_cache, &api_key_cache, &session_token, &headers).await {
+    if let Err(status) =
+        require_read(&db, &auth_cache, &api_key_cache, &session_token, &headers).await
+    {
         return status.into_response();
     }
 
@@ -132,12 +134,19 @@ async fn require_read_with_optional_token(
         && let Some(token) = token.filter(|value| !value.trim().is_empty())
     {
         let value = format!("Bearer {}", token.trim());
-        let header_value = axum::http::HeaderValue::from_str(&value)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let header_value =
+            axum::http::HeaderValue::from_str(&value).map_err(|_| StatusCode::BAD_REQUEST)?;
         effective_headers.insert(header::AUTHORIZATION, header_value);
     }
 
-    require_read(db, auth_cache, api_key_cache, session_token, &effective_headers).await
+    require_read(
+        db,
+        auth_cache,
+        api_key_cache,
+        session_token,
+        &effective_headers,
+    )
+    .await
 }
 
 async fn load_job_nzb_download(
@@ -203,7 +212,10 @@ async fn load_job_output_dir(
     Ok(history.and_then(|row| row.output_dir).map(PathBuf::from))
 }
 
-async fn resolve_output_file_path(output_dir: &FsPath, requested_path: &str) -> Result<PathBuf, StatusCode> {
+async fn resolve_output_file_path(
+    output_dir: &FsPath,
+    requested_path: &str,
+) -> Result<PathBuf, StatusCode> {
     let requested_path = requested_path.trim();
     if requested_path.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -218,20 +230,27 @@ async fn resolve_output_file_path(output_dir: &FsPath, requested_path: &str) -> 
     } else {
         canonical_output_dir.join(requested_path)
     };
-    let canonical_candidate = tokio::fs::canonicalize(candidate).await.map_err(io_status)?;
+    let canonical_candidate = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(io_status)?;
 
     if !canonical_candidate.starts_with(&canonical_output_dir) {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let Some(file_name) = canonical_candidate.file_name().and_then(|value| value.to_str()) else {
+    let Some(file_name) = canonical_candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
         return Err(StatusCode::NOT_FOUND);
     };
     if file_name == INTERNAL_OUTPUT_MARKER_NAME {
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let metadata = tokio::fs::metadata(&canonical_candidate).await.map_err(io_status)?;
+    let metadata = tokio::fs::metadata(&canonical_candidate)
+        .await
+        .map_err(io_status)?;
     if !metadata.is_file() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -283,7 +302,10 @@ fn io_status(error: std::io::Error) -> StatusCode {
 }
 
 fn download_filename(title: &str) -> String {
-    let trimmed = title.trim().trim_end_matches(".nzb").trim_end_matches(".NZB");
+    let trimmed = title
+        .trim()
+        .trim_end_matches(".nzb")
+        .trim_end_matches(".NZB");
     let safe = trimmed
         .chars()
         .map(|ch| match ch {
@@ -325,7 +347,10 @@ mod tests {
 
     #[test]
     fn download_filename_preserves_release_name_and_appends_suffix() {
-        assert_eq!(download_filename("Friends.S05.720p.BluRay"), "Friends.S05.720p.BluRay.nzb");
+        assert_eq!(
+            download_filename("Friends.S05.720p.BluRay"),
+            "Friends.S05.720p.BluRay.nzb"
+        );
         assert_eq!(download_filename("already.nzb"), "already.nzb");
         assert_eq!(download_filename("  "), "job.nzb");
     }

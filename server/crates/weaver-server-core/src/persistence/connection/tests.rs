@@ -1,6 +1,6 @@
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
 
@@ -490,13 +490,23 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
     conn.execute(
         "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![now * 1000, "ITEM_CREATED", 7_i64, "{\"kind\":\"ITEM_CREATED\"}"],
+        rusqlite::params![
+            now * 1000,
+            "ITEM_CREATED",
+            7_i64,
+            "{\"kind\":\"ITEM_CREATED\"}"
+        ],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![now * 1000 + 1, "ITEM_PROGRESS", 7_i64, "{\"kind\":\"ITEM_PROGRESS\"}"],
+        rusqlite::params![
+            now * 1000 + 1,
+            "ITEM_PROGRESS",
+            7_i64,
+            "{\"kind\":\"ITEM_PROGRESS\"}"
+        ],
     )
     .unwrap();
     conn.execute(
@@ -536,7 +546,9 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
     assert_eq!(version, SCHEMA_VERSION);
 
     let integration_events: i64 = conn
-        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(integration_events, 0);
 
@@ -559,7 +571,11 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
     assert_eq!(stale_metrics, 0);
 
     let preserved_history: i64 = conn
-        .query_row("SELECT COUNT(*) FROM job_history WHERE job_id = 42", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM job_history WHERE job_id = 42",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(preserved_history, 1);
 

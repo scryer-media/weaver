@@ -3332,8 +3332,19 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 2);
-    assert_eq!(pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(), 1);
-    assert_eq!(pipeline.jobs.get(&high_job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&high_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
     assert_eq!(pipeline.active_downloads_by_job.get(&low_job_id), Some(&1));
     assert_eq!(pipeline.active_downloads_by_job.get(&high_job_id), Some(&1));
 }
@@ -3401,8 +3412,24 @@ async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.jobs.get(&earlier_job_id).unwrap().download_queue.len(), 1);
-    assert_eq!(pipeline.jobs.get(&later_job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&earlier_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&later_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -3427,7 +3454,10 @@ async fn dispatch_downloads_shares_slots_within_priority_band_after_top_pick() {
         &mut pipeline,
         earlier_job_id,
         with_priority(
-            standalone_job_spec("Earlier Normal Fair Share", &[("earlier.bin".to_string(), 512u32)]),
+            standalone_job_spec(
+                "Earlier Normal Fair Share",
+                &[("earlier.bin".to_string(), 512u32)],
+            ),
             "NORMAL",
         ),
     )
@@ -3469,10 +3499,32 @@ async fn dispatch_downloads_shares_slots_within_priority_band_after_top_pick() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 2);
-    assert_eq!(pipeline.jobs.get(&earlier_job_id).unwrap().download_queue.len(), 0);
-    assert_eq!(pipeline.jobs.get(&later_job_id).unwrap().download_queue.len(), 1);
-    assert_eq!(pipeline.active_downloads_by_job.get(&earlier_job_id), Some(&1));
-    assert_eq!(pipeline.active_downloads_by_job.get(&later_job_id), Some(&1));
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&earlier_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&later_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&earlier_job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&later_job_id),
+        Some(&1)
+    );
 }
 
 #[tokio::test]
@@ -3521,10 +3573,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     {
         let state = pipeline.jobs.get_mut(&leading_job_id).unwrap();
-        let _ = state
-            .download_queue
-            .pop()
-            .expect("leading low-priority job should have one completed segment removed from queue");
+        let _ = state.download_queue.pop().expect(
+            "leading low-priority job should have one completed segment removed from queue",
+        );
         state
             .assembly
             .file_mut(NzbFileId {
@@ -3538,20 +3589,55 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.jobs.get(&leading_job_id).unwrap().download_queue.len(), 1);
-    assert_eq!(pipeline.jobs.get(&promoted_job_id).unwrap().download_queue.len(), 1);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&leading_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&promoted_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
 
     pipeline.active_downloads = 0;
     pipeline.active_downloads_by_job.clear();
     pipeline.active_download_passes.clear();
-    pipeline.jobs.get_mut(&promoted_job_id).unwrap().spec.metadata = vec![
-        ("priority".to_string(), "NORMAL".to_string()),
-    ];
+    pipeline
+        .jobs
+        .get_mut(&promoted_job_id)
+        .unwrap()
+        .spec
+        .metadata = vec![("priority".to_string(), "NORMAL".to_string())];
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.jobs.get(&leading_job_id).unwrap().download_queue.len(), 1);
-    assert_eq!(pipeline.jobs.get(&promoted_job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&leading_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&promoted_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
