@@ -1083,7 +1083,7 @@ impl Pipeline {
                         .map(|segment| DownloadWork {
                             segment_id: SegmentId {
                                 file_id,
-                                segment_number: segment.number,
+                                segment_number: segment.ordinal,
                             },
                             message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                             groups: file.groups.clone(),

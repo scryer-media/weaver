@@ -6,6 +6,7 @@ use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
 
 use crate::auth::LoginAuthCache;
+use crate::jobs::replay::QueueEventReplay;
 use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 
@@ -23,6 +24,9 @@ pub struct SchemaContext {
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
+    let replay = QueueEventReplay::default();
+    replay.spawn_producer(context.handle.clone(), context.config.clone());
+
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("weaver/0.1")
@@ -48,5 +52,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)
+    .data(replay)
     .finish()
 }

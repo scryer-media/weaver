@@ -7,40 +7,32 @@ use async_graphql::Request;
 use common::TestHarness;
 use tokio_stream::StreamExt;
 use weaver_server_api::auth::CallerScope;
-use weaver_server_api::{
-    PersistedQueueEvent, QueueEventKind, QueueItemState, encode_event_cursor, queue_item_from_job,
-};
-use weaver_server_core::IntegrationEventRow;
-use weaver_server_core::jobs::ids::JobId;
+use weaver_server_api::encode_event_cursor;
 
-fn persist_event(
-    h: &TestHarness,
-    item_id: u64,
-    kind: QueueEventKind,
-    state: QueueItemState,
-) -> String {
-    let info = h.handle.get_job(JobId(item_id)).expect("job should exist");
-    let occurred_at_ms = chrono::Utc::now().timestamp_millis();
-    let payload = PersistedQueueEvent {
-        occurred_at_ms,
-        kind,
-        item_id: Some(item_id),
-        item: Some(queue_item_from_job(&info)),
-        state: Some(state),
-        previous_state: None,
-        attention: None,
-        global_state: None,
-    };
-    h.db.insert_integration_events(&[IntegrationEventRow {
-        id: 0,
-        timestamp: occurred_at_ms,
-        kind: format!("{kind:?}"),
-        item_id: Some(item_id),
-        payload_json: serde_json::to_string(&payload).unwrap(),
-    }])
-    .unwrap();
-    let latest = h.db.latest_integration_event_id().unwrap().unwrap();
-    encode_event_cursor(latest)
+async fn latest_queue_cursor(harness: &TestHarness) -> String {
+    let response = harness
+        .execute_as("query { latestQueueCursor }", CallerScope::Read)
+        .await;
+    assert!(response.errors.is_empty());
+    response.data.into_json().unwrap()["latestQueueCursor"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn wait_for_queue_cursor_change(harness: &TestHarness, previous: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let cursor = latest_queue_cursor(harness).await;
+        if cursor != previous {
+            return cursor;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "queue replay cursor should advance within 3 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -254,7 +246,7 @@ async fn queue_snapshot_query_returns_items_and_cursor_together() {
 
     let response = h
         .execute_as(
-            "query { queueSnapshot { items { id state } latestCursor globalState { isPaused } } }",
+            "query { queueSnapshot { items { id state } latestCursor globalState { isPaused } } latestQueueCursor }",
             CallerScope::Read,
         )
         .await;
@@ -269,6 +261,10 @@ async fn queue_snapshot_query_returns_items_and_cursor_together() {
     assert!(
         data["queueSnapshot"]["latestCursor"].as_str().is_some(),
         "queueSnapshot should include the replay cursor"
+    );
+    assert_eq!(
+        data["queueSnapshot"]["latestCursor"].as_str(),
+        data["latestQueueCursor"].as_str()
     );
     assert!(
         !data["queueSnapshot"]["globalState"]["isPaused"]
@@ -289,6 +285,10 @@ async fn latest_queue_cursor_query_returns_encoded_cursor() {
     assert!(
         data["latestQueueCursor"].as_str().is_some(),
         "latestQueueCursor should be encoded as a string"
+    );
+    assert_eq!(
+        data["latestQueueCursor"].as_str(),
+        Some(encode_event_cursor(0).as_str())
     );
 }
 
@@ -345,40 +345,44 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
 }
 
 #[tokio::test]
-async fn queue_events_replay_from_cursor_then_tail() {
+async fn queue_events_replay_buffered_state_change_after_cursor() {
     let h = TestHarness::new().await;
     let item_id = h.submit_test_nzb("event-test").await;
+    assert!(h
+        .db
+        .list_integration_events_after(None, None, None)
+        .unwrap()
+        .is_empty());
 
-    let after = persist_event(
-        &h,
-        item_id,
-        QueueEventKind::ItemCreated,
-        QueueItemState::Queued,
-    );
-    persist_event(
-        &h,
-        item_id,
-        QueueEventKind::ItemStateChanged,
-        QueueItemState::Downloading,
-    );
+    let cursor_before = latest_queue_cursor(&h).await;
+
+    let pause = h
+        .execute(&format!(
+            "mutation {{ pauseQueueItem(id: {item_id}) {{ success }} }}"
+        ))
+        .await;
+    assert!(pause.errors.is_empty());
+
+    let expected_cursor = wait_for_queue_cursor_change(&h, &cursor_before).await;
 
     let request = Request::new(format!(
         r#"subscription {{
-            queueEvents(after: "{after}") {{
+            queueEvents(after: "{}") {{
                 cursor
                 kind
                 itemId
                 state
                 item {{ id state }}
             }}
-        }}"#
+        }}"#,
+        cursor_before
     ))
     .data(CallerScope::Read);
 
     let mut stream = h.schema.execute_stream(request);
 
     let item = tokio::time::timeout(Duration::from_secs(3), stream.next()).await;
-    assert!(item.is_ok(), "queueEvents should replay after cursor");
+    assert!(item.is_ok(), "queueEvents should replay the buffered state change");
     let response = item.unwrap().unwrap();
     assert!(response.errors.is_empty());
     let data = response.data.into_json().unwrap();
@@ -387,10 +391,46 @@ async fn queue_events_replay_from_cursor_then_tail() {
         "ITEM_STATE_CHANGED"
     );
     assert_eq!(data["queueEvents"]["itemId"].as_u64().unwrap(), item_id);
+    assert_eq!(data["queueEvents"]["state"].as_str().unwrap(), "PAUSED");
     assert_eq!(
-        data["queueEvents"]["state"].as_str().unwrap(),
-        "DOWNLOADING"
+        data["queueEvents"]["cursor"].as_str(),
+        Some(expected_cursor.as_str())
     );
+    assert!(h
+        .db
+        .list_integration_events_after(None, None, None)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn queue_events_reject_malformed_cursor() {
+    let h = TestHarness::new().await;
+
+    let request = Request::new(
+        r#"subscription {
+            queueEvents(after: "not-base64") {
+                kind
+            }
+        }"#,
+    )
+    .data(CallerScope::Read);
+
+    let mut stream = h.schema.execute_stream(request);
+    let response = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("subscription should fail immediately")
+        .expect("stream should yield an error response");
+
+    assert!(!response.errors.is_empty());
+    let code = response.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get("code"));
+    assert!(matches!(
+        code,
+        Some(async_graphql::Value::String(value)) if value.as_str() == "CURSOR_INVALID"
+    ));
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ use base64::Engine;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use serde_json::json;
 use weaver_server_api::auth::CallerScope;
+use weaver_server_api::encode_event_cursor;
 
 fn encode_nzb(xml: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(xml.as_bytes())
@@ -485,7 +486,7 @@ async fn pause_queue_item_not_found_uses_not_found_error_code() {
 }
 
 #[tokio::test]
-async fn cancel_queue_item_persists_item_removed_event() {
+async fn cancel_queue_item_history_events_replay_removed_item() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("removed-event").await;
 
@@ -499,6 +500,11 @@ async fn cancel_queue_item_persists_item_removed_event() {
         ))
         .await;
     assert_no_errors(&resp);
+    assert!(h
+        .db
+        .list_integration_events_after(None, None, None)
+        .unwrap()
+        .is_empty());
 
     let resp = h
         .execute(&format!(
@@ -514,11 +520,54 @@ async fn cancel_queue_item_persists_item_removed_event() {
     let data = response_data(&resp);
     let events = data["historyEvents"].as_array().unwrap();
     assert!(
-        events.iter().any(|event| {
-            event["kind"].as_str() == Some("ITEM_REMOVED")
-                && event["itemId"].as_u64() == Some(job_id)
-        }),
-        "expected ITEM_REMOVED event for cancelled queue item",
+        !events.is_empty(),
+        "expected recent in-memory queue history for the cancelled item"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"].as_str() == Some("ITEM_REMOVED"))
+            .count(),
+        1,
+        "expected exactly one in-memory removal event"
+    );
+    let last_event = events.last().unwrap();
+    assert_eq!(last_event["kind"].as_str(), Some("ITEM_REMOVED"));
+    assert_eq!(last_event["itemId"].as_u64(), Some(job_id));
+}
+
+#[tokio::test]
+async fn history_events_stale_cursor_are_empty_for_compat() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("stale-history-cursor").await;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                cancelQueueItem(id: {job_id}) {{
+                    success
+                }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+
+    let resp = h
+        .execute(&format!(
+            r#"{{
+                historyEvents(itemId: {job_id}, after: "{}") {{
+                    kind
+                }}
+            }}"#,
+            encode_event_cursor(-1)
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let events = data["historyEvents"].as_array().unwrap();
+    assert!(
+        events.is_empty(),
+        "stale history cursors should degrade to an empty compatibility response"
     );
 }
 

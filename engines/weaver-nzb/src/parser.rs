@@ -352,6 +352,39 @@ mod tests {
         assert_eq!(f1.segments.len(), 1);
     }
 
+        #[test]
+        fn sparse_segment_numbers_are_sorted_and_preserved() {
+                let nzb = parse_nzb(
+                        br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+    <file poster="user@example.com" date="1234567890" subject="test file - &quot;movie.part01.rar&quot; yEnc (1/3)">
+        <groups>
+            <group>alt.binaries.test</group>
+        </groups>
+        <segments>
+            <segment bytes="30" number="6">six@example.com</segment>
+            <segment bytes="10" number="1">one@example.com</segment>
+            <segment bytes="20" number="4">four@example.com</segment>
+        </segments>
+    </file>
+</nzb>"#,
+                )
+                .unwrap();
+
+                let segments = &nzb.files[0].segments;
+                assert_eq!(
+                        segments.iter().map(|segment| segment.number).collect::<Vec<_>>(),
+                        vec![1, 4, 6]
+                );
+                assert_eq!(
+                        segments
+                                .iter()
+                                .map(|segment| segment.message_id.as_str())
+                                .collect::<Vec<_>>(),
+                        vec!["one@example.com", "four@example.com", "six@example.com"]
+                );
+        }
+
     // 4. Filename extraction from various subject patterns
     #[test]
     fn filename_from_quoted_subject() {

@@ -18,11 +18,23 @@ async fn browse_specific_path() {
 
 #[tokio::test]
 async fn browse_nonexistent_path() {
+    let tempdir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let missing_child = tempdir.path().join("missing").join("nested");
+
     let h = TestHarness::new().await;
     let resp = h
-        .execute(r#"{ browseDirectories(path: "/nonexistent_weaver_test_path") { currentPath } }"#)
+        .execute(&format!(
+            r#"{{ browseDirectories(path: "{}") {{ currentPath parentPath }} }}"#,
+            missing_child.to_string_lossy()
+        ))
         .await;
-    assert_has_errors(&resp);
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["browseDirectories"]["currentPath"].as_str().unwrap(),
+        tempdir.path().to_string_lossy().as_ref()
+    );
 }
 
 #[tokio::test]

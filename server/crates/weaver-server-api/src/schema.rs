@@ -18,13 +18,12 @@ use crate::history::timeline::build_job_timeline;
 use crate::history::types::{EventKind, HistoryItem, JobDetailSnapshot, JobEvent, JobTimeline};
 use crate::history::types::{history_item_from_row, matches_history_filter};
 use crate::jobs::types::{
-    GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, PersistedQueueEvent,
-    QueueEvent, QueueFilterInput, QueueItem, QueueSnapshot, QueueSummary,
+    GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, QueueEvent,
+    QueueFilterInput, QueueItem, QueueSnapshot, QueueSummary,
 };
 use crate::jobs::types::{
-    decode_event_cursor, decode_offset_cursor, encode_event_cursor, global_queue_state,
-    matches_queue_event_filter, matches_queue_filter, metrics_from_snapshot,
-    queue_event_from_record, queue_item_from_job, queue_summary,
+    decode_event_cursor, decode_offset_cursor, global_queue_state, matches_queue_event_filter,
+    matches_queue_filter, metrics_from_snapshot, queue_item_from_job, queue_summary,
 };
 use crate::rss::types::{RssFeed, RssSeenItem};
 use crate::servers::types::Server;

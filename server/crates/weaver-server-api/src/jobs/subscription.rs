@@ -52,10 +52,10 @@ impl JobsSubscription {
         filter: Option<QueueFilterInput>,
     ) -> Result<impl Stream<Item = QueueSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let db = ctx.data::<weaver_server_core::Database>()?.clone();
         let config = ctx
             .data::<weaver_server_core::settings::SharedConfig>()?
             .clone();
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let event_rx = handle.subscribe_events();
 
         let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
@@ -69,8 +69,8 @@ impl JobsSubscription {
 
         let stream = throttled.then(move |_| {
             let handle = handle.clone();
-            let db = db.clone();
             let config = config.clone();
+            let replay = replay.clone();
             let filter = filter.clone();
             async move {
                 let items: Vec<QueueItem> = handle
@@ -87,14 +87,7 @@ impl JobsSubscription {
                     .filter(|item| matches_queue_filter(item, filter.as_ref()))
                     .collect();
                 let metrics = handle.get_metrics();
-                let latest_cursor =
-                    tokio::task::spawn_blocking(move || db.latest_integration_event_id())
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .flatten()
-                        .map(encode_event_cursor)
-                        .unwrap_or_else(|| encode_event_cursor(0));
+                let latest_cursor = replay.latest_cursor().await;
                 let cfg = config.read().await;
                 QueueSnapshot {
                     summary: queue_summary(&items, &metrics),
@@ -113,7 +106,10 @@ impl JobsSubscription {
 
         Ok(stream)
     }
-    /// Subscribe to replayable public queue events.
+    /// Subscribe to live public queue events.
+    ///
+    /// Replays recent in-memory queue events after `after`, then continues
+    /// streaming live events from the same bounded replay buffer.
     #[graphql(guard = "ReadGuard")]
     async fn queue_events(
         &self,
@@ -121,52 +117,67 @@ impl JobsSubscription {
         after: Option<String>,
         filter: Option<QueueFilterInput>,
     ) -> Result<impl Stream<Item = QueueEvent>> {
-        let mut cursor = decode_event_cursor(after.as_deref())
+        let after = decode_event_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let db = ctx.data::<weaver_server_core::Database>()?.clone();
-        let mut rx = handle.subscribe_events();
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let mut rx = replay.subscribe();
+        let initial = replay
+            .replay_after(after)
+            .await
+            .map_err(|error| graphql_error("CURSOR_EXPIRED", error.to_string()))?;
         let filter_for_stream = filter.clone();
 
         Ok(async_stream::stream! {
-            loop {
-                let rows = match db.list_integration_events_after(cursor, None, Some(256)) {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "failed to read integration events for subscription replay");
-                        Vec::new()
-                    }
-                };
+            let mut last_seen = after.unwrap_or(0);
 
-                let mut emitted_any = false;
-                for row in rows {
-                    cursor = Some(row.id);
-                    let Ok(record) = serde_json::from_str::<PersistedQueueEvent>(&row.payload_json) else {
-                        tracing::warn!(cursor = row.id, "failed to decode persisted integration event payload");
-                        continue;
-                    };
-                    let event = queue_event_from_record(row.id, record);
-                    if matches_queue_event_filter(&event, filter_for_stream.as_ref()) {
-                        emitted_any = true;
-                        yield event;
-                    }
-                }
-
-                if emitted_any {
+            for notification in initial {
+                if notification.id <= last_seen {
                     continue;
                 }
+                last_seen = notification.id;
+                if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                    yield notification.event;
+                }
+            }
 
-                tokio::select! {
-                    result = rx.recv() => {
-                        match result {
-                            Ok(_) => {
-                                tokio::time::sleep(EVENT_REPLAY_SETTLE_DELAY).await;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            loop {
+                match rx.recv().await {
+                    Ok(notification) => {
+                        if notification.id <= last_seen {
+                            continue;
+                        }
+                        last_seen = notification.id;
+                        if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                            yield notification.event;
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(
+                            skipped,
+                            "queue event subscription lagged; replaying from bounded buffer"
+                        );
+                        match replay.replay_after(Some(last_seen)).await {
+                            Ok(notifications) => {
+                                for notification in notifications {
+                                    if notification.id <= last_seen {
+                                        continue;
+                                    }
+                                    last_seen = notification.id;
+                                    if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                                        yield notification.event;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "queue event subscription cursor expired while recovering from lag"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
@@ -181,7 +192,6 @@ enum SnapshotTrigger {
 
 const SNAPSHOT_HEARTBEAT: Duration = Duration::from_secs(2);
 const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(100);
-const EVENT_REPLAY_SETTLE_DELAY: Duration = Duration::from_millis(25);
 
 fn throttle<S, T>(stream: S, period: Duration) -> impl Stream<Item = T>
 where

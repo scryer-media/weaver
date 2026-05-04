@@ -2,7 +2,7 @@ use crate::StateError;
 use crate::persistence::Database;
 
 const METRICS_SCRAPE_COMPRESSION_LEVEL: i32 = 3;
-const METRICS_RETENTION_SECS: i64 = 24 * 60 * 60;
+pub(crate) const METRICS_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsScrapeRow {

@@ -528,7 +528,7 @@ impl Pipeline {
                             && let Some(seg_spec) = file_spec
                                 .segments
                                 .iter()
-                                .find(|s| s.number == seg_id.segment_number)
+                                .find(|s| s.ordinal == seg_id.segment_number)
                         {
                             state.failed_bytes += seg_spec.bytes as u64;
                         }
@@ -557,7 +557,7 @@ impl Pipeline {
                                 && let Some(seg_spec) = file_spec
                                     .segments
                                     .iter()
-                                    .find(|s| s.number == seg_id.segment_number)
+                                    .find(|s| s.ordinal == seg_id.segment_number)
                             {
                                 state.failed_bytes += seg_spec.bytes as u64;
                             }
@@ -569,7 +569,7 @@ impl Pipeline {
                             && let Some(seg_spec) = file_spec
                                 .segments
                                 .iter()
-                                .find(|s| s.number == seg_id.segment_number)
+                                .find(|s| s.ordinal == seg_id.segment_number)
                         {
                             let priority = file_spec.role.download_priority();
                             let work = DownloadWork {

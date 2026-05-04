@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { compression } from "vite-plugin-compression2";
 import path from "path";
 
-const BACKEND_ORIGIN = "http://localhost:6789";
+const BACKEND_ORIGIN = "http://127.0.0.1:9090";
 const PWA_CACHE_PREFIX = "weaver-shell";
 const PUBLIC_PWA_ASSETS = [
   "/manifest.webmanifest",

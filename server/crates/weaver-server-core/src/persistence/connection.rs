@@ -1,5 +1,7 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
@@ -11,10 +13,12 @@ pub use crate::jobs::{
     ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
     ExtractionChunk, RecoveredJob,
 };
+use crate::operations::metrics_store::METRICS_RETENTION_SECS;
 pub use crate::operations::{MetricsScrapeRow, StableStateExport};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
+const LEGACY_SCHEMA_VERSION: i64 = 19;
 
 fn ensure_column(
     conn: &Connection,
@@ -35,6 +39,95 @@ fn ensure_column(
         ))
         .map_err(|e| StateError::Database(e.to_string()))?;
     }
+    Ok(())
+}
+
+fn current_epoch_sec() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, StateError> {
+    let mut stmt = conn
+        .prepare("PRAGMA database_list")
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    for row in rows {
+        let (name, path) = row.map_err(|e| StateError::Database(e.to_string()))?;
+        if name == "main" && !path.is_empty() {
+            return Ok(Some(PathBuf::from(path)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn file_size_bytes(path: Option<&Path>) -> Option<u64> {
+    path.and_then(|value| fs::metadata(value).ok()).map(|meta| meta.len())
+}
+
+fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateError> {
+    let integration_event_rows_deleted: i64 = conn
+        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| row.get(0))
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let metrics_cutoff_epoch_sec = current_epoch_sec() - METRICS_RETENTION_SECS;
+    let db_path = main_database_path(conn)?;
+    let db_size_before_bytes = file_size_bytes(db_path.as_deref());
+
+    conn.execute("DELETE FROM integration_events", [])
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'integration_events'",
+        [],
+    )
+    .map_err(|e| StateError::Database(e.to_string()))?;
+    let metrics_rows_deleted = conn
+        .execute(
+            "DELETE FROM metrics_scrapes WHERE scraped_at_epoch_sec < ?1",
+            [metrics_cutoff_epoch_sec],
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    let vacuum_succeeded = match conn.execute_batch("VACUUM") {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to vacuum database during schema v20 cleanup");
+            false
+        }
+    };
+
+    if let Err(error) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    }) {
+        tracing::warn!(error = %error, "failed to truncate WAL during schema v20 cleanup");
+    }
+
+    let db_size_after_bytes = file_size_bytes(db_path.as_deref());
+
+    conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    tracing::info!(
+        integration_event_rows_deleted,
+        metrics_rows_deleted,
+        db_size_before_bytes,
+        db_size_after_bytes,
+        vacuum_succeeded,
+        metrics_cutoff_epoch_sec,
+        "migrated schema v20 and purged deprecated queue-event storage"
+    );
+
     Ok(())
 }
 
@@ -408,6 +501,8 @@ impl Database {
             })
             .ok();
 
+        let needs_v20_cleanup = matches!(version, Some(v) if v < SCHEMA_VERSION);
+
         match version {
             None => {
                 conn.execute(
@@ -421,7 +516,10 @@ impl Database {
                 // VACUUM to enable auto_vacuum=INCREMENTAL retroactively.
                 conn.execute_batch("VACUUM")
                     .map_err(|e| StateError::Database(e.to_string()))?;
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(2) | Some(3) => {
@@ -431,7 +529,10 @@ impl Database {
                      ALTER TABLE servers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(4) => {
@@ -441,7 +542,10 @@ impl Database {
                      ALTER TABLE servers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;",
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(5) => {
@@ -450,75 +554,118 @@ impl Database {
                     "ALTER TABLE servers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(6) => {
                 // v6→v11: RSS + categories + RAR facts + PAR2 file tables are created above.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(7) => {
                 // v7→v11: categories + RAR facts + PAR2 file tables created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(8) => {
                 // v8→v11: RAR volume facts + PAR2 file tables created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(9) => {
                 // v9→v11: PAR2 file table created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(10) => {
                 // v10→v12: newer active-state tables and history columns are created above.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(11) => {
                 // v11→v12: active job normalization flag is added below; new active-state tables
                 // are created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(12) => {
                 // v12→v13: bandwidth usage ledger is created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(13) => {
                 // v13→v14: public integration event log is created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(14) => {
                 // v14→v15: compressed metrics scrape storage is created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(15) => {
                 // v15→v16: active file progress floors are created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(16) => {
                 // v16→v17: active runtime restore columns are added below via ensure_column.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(17) => {
                 // v17→v18: active file identity state is created above via IF NOT EXISTS.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
             Some(18) => {
                 // v18→v19: two-lane runtime columns are added below via ensure_column.
-                conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                conn.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    [LEGACY_SCHEMA_VERSION],
+                )
                     .map_err(|e| StateError::Database(e.to_string()))?;
             }
+            Some(19) => {}
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -566,6 +713,10 @@ impl Database {
         ensure_column(&conn, "active_jobs", "paused_resume_download_state", "TEXT")?;
         ensure_column(&conn, "active_jobs", "paused_resume_post_state", "TEXT")?;
         ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
+
+        if needs_v20_cleanup {
+            cleanup_legacy_queue_event_storage(&conn)?;
+        }
 
         Ok(())
     }

@@ -221,7 +221,7 @@ impl Pipeline {
                     && let Some(seg_spec) = file_spec
                         .segments
                         .iter()
-                        .find(|s| s.number == segment_id.segment_number)
+                        .find(|s| s.ordinal == segment_id.segment_number)
                 {
                     state.failed_bytes += seg_spec.bytes as u64;
                 }
@@ -237,7 +237,7 @@ impl Pipeline {
                 && let Some(seg_spec) = file_spec
                     .segments
                     .iter()
-                    .find(|s| s.number == segment_id.segment_number)
+                    .find(|s| s.ordinal == segment_id.segment_number)
             {
                 // Exclude servers that have already returned bad data for this
                 // segment. On decode retry N, exclude the first N servers in

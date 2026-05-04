@@ -104,12 +104,7 @@ pub(crate) async fn run(
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
     {
-        wiring::spawn_event_persistence_task(
-            event_tx.subscribe(),
-            db.clone(),
-            handle.clone(),
-            pipeline_config.clone(),
-        );
+        wiring::spawn_event_persistence_task(event_tx.subscribe(), db.clone());
     }
 
     // Create and start the pipeline.

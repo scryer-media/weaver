@@ -1432,7 +1432,7 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
     let backend_port = std::env::var("WEAVER_DEV_BACKEND_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(6789);
+        .unwrap_or(9090);
     let frontend_port = std::env::var("WEAVER_DEV_FRONTEND_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())

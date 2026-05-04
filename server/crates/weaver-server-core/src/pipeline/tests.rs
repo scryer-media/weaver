@@ -20,6 +20,25 @@ use tokio::sync::{RwLock, oneshot};
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 
+macro_rules! segment_spec {
+    (number: $number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
+        SegmentSpec {
+            ordinal: $number,
+            article_number: $number,
+            bytes: $bytes,
+            message_id: $message_id,
+        }
+    };
+    (ordinal: $ordinal:expr, article_number: $article_number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
+        SegmentSpec {
+            ordinal: $ordinal,
+            article_number: $article_number,
+            bytes: $bytes,
+            message_id: $message_id,
+        }
+    };
+}
+
 struct TestHarness {
     _temp_dir: TempDir,
     data_dir: PathBuf,
@@ -807,7 +826,7 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
                 filename: filename.clone(),
                 role: FileRole::from_filename(filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: bytes.len() as u32,
                     message_id: format!("rar-{index}@example.com"),
@@ -831,7 +850,7 @@ fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
                 filename: filename.clone(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: *bytes,
                     message_id: format!("segment-{index}@example.com"),
@@ -853,7 +872,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                 filename: "payload.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: payload_bytes,
                     message_id: "payload@example.com".to_string(),
@@ -866,7 +885,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
                     message_id: "repair-index@example.com".to_string(),
@@ -879,7 +898,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes,
                     message_id: "repair-volume@example.com".to_string(),
@@ -1164,9 +1183,9 @@ fn par2_only_job_spec(name: &str, filename: &str, bytes: u32) -> JobSpec {
             filename: filename.to_string(),
             role: FileRole::from_filename(filename),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
-                bytes,
+                bytes: bytes,
                 message_id: "par2-0@example.com".to_string(),
             }],
         }],
@@ -1195,7 +1214,7 @@ fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobS
             segments: segment_sizes
                 .iter()
                 .enumerate()
-                .map(|(index, bytes)| SegmentSpec {
+                .map(|(index, bytes)| segment_spec! {
                     number: index as u32,
                     bytes: *bytes,
                     message_id: format!("segment-{index}@example.com"),
@@ -2637,8 +2656,8 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
             segments: (0..segment_count)
-                .map(|number| SegmentSpec {
-                    number,
+                .map(|number| segment_spec! {
+                    number: number,
                     bytes: payload_size,
                     message_id: format!("cursor-{number}@example.com"),
                 })
@@ -2688,6 +2707,89 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
     assert_eq!(
         pipeline.metrics.segments_committed.load(Ordering::Relaxed),
         segment_count as u64
+    );
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+}
+
+#[tokio::test]
+async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20009);
+    let filename = "sparse.bin";
+    let payload_size = 128u32;
+    let total_size = payload_size as u64 * 3;
+    let spec = JobSpec {
+        name: "Sparse Segment Ordinals".to_string(),
+        password: None,
+        total_bytes: total_size,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![
+                segment_spec! {
+                    ordinal: 0,
+                    article_number: 1,
+                    bytes: payload_size,
+                    message_id: "sparse-0@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 1,
+                    article_number: 4,
+                    bytes: payload_size,
+                    message_id: "sparse-1@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 2,
+                    article_number: 6,
+                    bytes: payload_size,
+                    message_id: "sparse-2@example.com".to_string(),
+                },
+            ],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for segment_number in 0..3u32 {
+        let payload = vec![segment_number as u8 + 1; payload_size as usize];
+        let raw = encode_article_part(
+            filename,
+            &payload,
+            segment_number + 1,
+            3,
+            segment_number as u64 * payload_size as u64 + 1,
+            total_size,
+        );
+
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                    segment_number,
+                },
+                data: Ok(DownloadPayload::Raw(raw)),
+                is_recovery: false,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+            })
+            .await;
+    }
+
+    drain_decode_results(&mut pipeline, 3).await;
+
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        3
     );
     assert!(matches!(
         job_status_for_assert(&pipeline, job_id),
@@ -3690,7 +3792,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                 filename: "episode.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
                     message_id: "data@example.com".to_string(),
@@ -3703,7 +3805,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
                     message_id: "index@example.com".to_string(),
@@ -3716,7 +3818,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
                     message_id: "repair@example.com".to_string(),
@@ -3891,7 +3993,7 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
             recovery_block_count: 0,
         },
         groups: vec!["alt.binaries.test".to_string()],
-        segments: vec![SegmentSpec {
+        segments: vec![segment_spec! {
             number: 0,
             bytes: par2_bytes.len() as u32,
             message_id: "rar-par2-index@example.com".to_string(),
@@ -4240,7 +4342,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
                         filename: par2_filename.to_string(),
                         role: FileRole::from_filename(par2_filename),
                         groups: vec!["alt.binaries.test".to_string()],
-                        segments: vec![SegmentSpec {
+                        segments: vec![segment_spec! {
                             number: 0,
                             bytes: par2_bytes.len() as u32,
                             message_id: "par2-0@example.com".to_string(),
@@ -4293,7 +4395,7 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
                 filename: obfuscated_filename.to_string(),
                 role: FileRole::from_filename(obfuscated_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: rar_bytes.len() as u32,
                     message_id: "rar-obfuscated@example.com".to_string(),
@@ -4303,7 +4405,7 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
                 filename: par2_filename.to_string(),
                 role: FileRole::from_filename(par2_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "repair-index@example.com".to_string(),
@@ -4385,7 +4487,7 @@ async fn par2_metadata_records_canonical_name_without_phantom_current_path() {
             filename: source_filename.to_string(),
             role: FileRole::from_filename(source_filename),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
                 bytes: rar_bytes.len() as u32,
                 message_id: "rar-before-complete@example.com".to_string(),
@@ -4682,7 +4784,7 @@ async fn yenc_source_name_is_treated_as_expected_after_par2_rebind() {
             filename: source_filename.to_string(),
             role: FileRole::from_filename(source_filename),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
                 bytes: rar_bytes.len() as u32,
                 message_id: "rar-source-name@example.com".to_string(),
@@ -5817,7 +5919,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "par2-index@example.com".to_string(),
@@ -5827,7 +5929,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
                     message_id: "par2-recovery@example.com".to_string(),
@@ -7482,7 +7584,7 @@ async fn no_par2_full_set_failure_requeues_archive_source() {
             filename: "archive.zip".to_string(),
             role: FileRole::from_filename("archive.zip"),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
                 message_id: "zip-0@example.com".to_string(),
@@ -7549,7 +7651,7 @@ async fn no_par2_single_file_retry_marks_zip_volume_complete_after_redownload() 
             filename: "archive.zip".to_string(),
             role: FileRole::from_filename("archive.zip"),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
                 message_id: "zip-refresh-0@example.com".to_string(),
@@ -7638,7 +7740,7 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
             filename: "archive.7z".to_string(),
             role: FileRole::from_filename("archive.7z"),
             groups: vec!["alt.binaries.test".to_string()],
-            segments: vec![SegmentSpec {
+            segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
                 message_id: "7z-refresh-0@example.com".to_string(),
@@ -7739,12 +7841,12 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
                 segments: vec![
-                    SegmentSpec {
+                    segment_spec! {
                         number: 0,
                         bytes: 64,
                         message_id: "payload-0@example.com".to_string(),
                     },
-                    SegmentSpec {
+                    segment_spec! {
                         number: 1,
                         bytes: 64,
                         message_id: "payload-1@example.com".to_string(),
@@ -7755,7 +7857,7 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "payload-index@example.com".to_string(),
@@ -7765,7 +7867,7 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
                     message_id: "payload-recovery@example.com".to_string(),
@@ -7850,12 +7952,12 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
                 segments: vec![
-                    SegmentSpec {
+                    segment_spec! {
                         number: 0,
                         bytes: 64,
                         message_id: "complete-payload-0@example.com".to_string(),
                     },
-                    SegmentSpec {
+                    segment_spec! {
                         number: 1,
                         bytes: 64,
                         message_id: "complete-payload-1@example.com".to_string(),
@@ -7866,7 +7968,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "complete-payload-index@example.com".to_string(),
@@ -7876,7 +7978,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
                     message_id: "complete-payload-recovery@example.com".to_string(),
@@ -8059,7 +8161,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
                 filename: archive_filename.to_string(),
                 role: FileRole::from_filename(archive_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
                     message_id: "pending-recovery-archive@example.com".to_string(),
@@ -8069,7 +8171,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
                     message_id: "pending-recovery-archive-volume@example.com".to_string(),
@@ -8161,12 +8263,12 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
                 segments: vec![
-                    SegmentSpec {
+                    segment_spec! {
                         number: 0,
                         bytes: 64,
                         message_id: "pending-recovery-payload-0@example.com".to_string(),
                     },
-                    SegmentSpec {
+                    segment_spec! {
                         number: 1,
                         bytes: 64,
                         message_id: "pending-recovery-payload-1@example.com".to_string(),
@@ -8177,7 +8279,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "pending-recovery-index@example.com".to_string(),
@@ -8187,7 +8289,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
                     message_id: "pending-recovery-volume@example.com".to_string(),
@@ -8271,12 +8373,12 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
                 segments: vec![
-                    SegmentSpec {
+                    segment_spec! {
                         number: 0,
                         bytes: 64,
                         message_id: "payload-fail-0@example.com".to_string(),
                     },
-                    SegmentSpec {
+                    segment_spec! {
                         number: 1,
                         bytes: 64,
                         message_id: "payload-fail-1@example.com".to_string(),
@@ -8287,7 +8389,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
                     message_id: "payload-fail-index@example.com".to_string(),
@@ -8297,7 +8399,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
                     message_id: "payload-fail-recovery@example.com".to_string(),
@@ -8371,7 +8473,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: payload_filename.to_string(),
                     role: FileRole::from_filename(payload_filename),
                     groups: vec!["alt.binaries.test".to_string()],
-                    segments: vec![SegmentSpec {
+                    segments: vec![segment_spec! {
                         number: 0,
                         bytes: original_payload.len() as u32,
                         message_id: format!("archive-{}-0@example.com", job_id.0),
@@ -8381,7 +8483,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: index_filename.to_string(),
                     role: FileRole::from_filename(index_filename),
                     groups: vec!["alt.binaries.test".to_string()],
-                    segments: vec![SegmentSpec {
+                    segments: vec![segment_spec! {
                         number: 0,
                         bytes: par2_bytes.len() as u32,
                         message_id: format!("archive-{}-index@example.com", job_id.0),
@@ -8391,7 +8493,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: recovery_filename.to_string(),
                     role: FileRole::from_filename(recovery_filename),
                     groups: vec!["alt.binaries.test".to_string()],
-                    segments: vec![SegmentSpec {
+                    segments: vec![segment_spec! {
                         number: 0,
                         bytes: recovery_bytes.len() as u32,
                         message_id: format!("archive-{}-recovery@example.com", job_id.0),
@@ -8461,7 +8563,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         filename: "repair.par2".to_string(),
         role: FileRole::from_filename("repair.par2"),
         groups: vec!["alt.binaries.test".to_string()],
-        segments: vec![SegmentSpec {
+        segments: vec![segment_spec! {
             number: 0,
             bytes: 64,
             message_id: "rar-finalize-par2-index@example.com".to_string(),
@@ -8471,7 +8573,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         filename: "repair.vol00+01.par2".to_string(),
         role: FileRole::from_filename("repair.vol00+01.par2"),
         groups: vec!["alt.binaries.test".to_string()],
-        segments: vec![SegmentSpec {
+        segments: vec![segment_spec! {
             number: 0,
             bytes: 64,
             message_id: "rar-finalize-par2-recovery@example.com".to_string(),
@@ -8718,7 +8820,7 @@ async fn split_files_register_topology_when_completed() {
                 filename: filename.clone(),
                 role: FileRole::from_filename(filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: bytes.len() as u32,
                     message_id: format!("split-register-{index}@example.com"),
@@ -9984,7 +10086,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                 filename: "payload-a.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
                     message_id: "payload-a@example.com".to_string(),
@@ -9994,7 +10096,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                 filename: "payload-b.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
                     message_id: "payload-b@example.com".to_string(),
@@ -10007,7 +10109,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
                     message_id: "repair-index@example.com".to_string(),
@@ -10020,7 +10122,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 320,
                     message_id: "repair-volume@example.com".to_string(),
@@ -10363,12 +10465,12 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
                 segments: vec![
-                    SegmentSpec {
+                    segment_spec! {
                         number: 0,
                         bytes: 128,
                         message_id: "active-extract-payload-0@example.com".to_string(),
                     },
-                    SegmentSpec {
+                    segment_spec! {
                         number: 1,
                         bytes: 128,
                         message_id: "active-extract-payload-1@example.com".to_string(),
@@ -10379,7 +10481,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
                     message_id: "active-extract-index@example.com".to_string(),
@@ -10389,7 +10491,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
-                segments: vec![SegmentSpec {
+                segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
                     message_id: "active-extract-recovery@example.com".to_string(),

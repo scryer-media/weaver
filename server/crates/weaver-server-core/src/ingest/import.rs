@@ -65,8 +65,10 @@ pub fn nzb_to_spec(
         let segments: Vec<SegmentSpec> = nzb_file
             .segments
             .iter()
-            .map(|segment| SegmentSpec {
-                number: segment.number.saturating_sub(1),
+            .enumerate()
+            .map(|(ordinal, segment)| SegmentSpec {
+                ordinal: ordinal as u32,
+                article_number: segment.number,
                 bytes: segment.bytes,
                 message_id: segment.message_id.clone(),
             })

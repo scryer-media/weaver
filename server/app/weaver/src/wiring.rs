@@ -6,12 +6,12 @@ use tracing::{error, info};
 
 use weaver_nntp::client::NntpClient;
 use weaver_server_core::events::model::PipelineEvent;
-use weaver_server_core::events::publish::{pipeline_job_id, should_record_job_event};
+use weaver_server_core::events::publish::should_record_job_event;
 use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
 use weaver_server_core::runtime::system_profile::SystemProfile;
 use weaver_server_core::servers::{ServerConfig, ServerConnectivityResult};
-use weaver_server_core::settings::{Config, SharedConfig};
-use weaver_server_core::{Database, SchedulerHandle};
+use weaver_server_core::settings::Config;
+use weaver_server_core::Database;
 
 pub(crate) struct RuntimeContext {
     pub profile: SystemProfile,
@@ -138,11 +138,9 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
 pub(crate) fn spawn_event_persistence_task(
     event_rx: broadcast::Receiver<PipelineEvent>,
     db: Database,
-    handle: SchedulerHandle,
-    config: SharedConfig,
 ) {
     tokio::spawn(async move {
-        if let Err(panic) = tokio::spawn(persist_events(event_rx, db, handle, config)).await {
+        if let Err(panic) = tokio::spawn(persist_events(event_rx, db)).await {
             tracing::error!(
                 error = %panic,
                 "CRITICAL: event persistence task panicked - events will not be recorded"
@@ -154,35 +152,14 @@ pub(crate) fn spawn_event_persistence_task(
 async fn persist_events(
     mut rx: broadcast::Receiver<PipelineEvent>,
     db: Database,
-    handle: SchedulerHandle,
-    config: SharedConfig,
 ) {
-    use weaver_server_api::{
-        PersistedQueueEvent, PipelineEventGql, QueueDownloadState, QueueEventKind, QueueItemState,
-        QueuePostState, QueueWaitReason, global_queue_state, queue_item_from_job,
-    };
+    use weaver_server_api::PipelineEventGql;
 
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
-    let mut last_states: std::collections::HashMap<u64, QueueItemState> =
-        std::collections::HashMap::new();
-    let mut last_item_details: std::collections::HashMap<
-        u64,
-        (
-            QueueItemState,
-            QueueDownloadState,
-            QueuePostState,
-            Option<QueueWaitReason>,
-        ),
-    > = std::collections::HashMap::new();
-    let mut last_progress_buckets: std::collections::HashMap<u64, u8> =
-        std::collections::HashMap::new();
-    let mut last_attention: std::collections::HashMap<u64, Option<(String, String)>> =
-        std::collections::HashMap::new();
-    let mut integration_batch: Vec<weaver_server_core::IntegrationEventRow> = Vec::new();
     let flush_interval = tokio::time::Duration::from_secs(1);
 
     loop {
-        let recv = if batch.is_empty() && integration_batch.is_empty() {
+        let recv = if batch.is_empty() {
             tokio::select! {
                 result = rx.recv() => result,
             }
@@ -191,14 +168,10 @@ async fn persist_events(
                 result = rx.recv() => result,
                 _ = tokio::time::sleep(flush_interval) => {
                     let events = std::mem::take(&mut batch);
-                    let integration_events = std::mem::take(&mut integration_batch);
                     let db = db.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.insert_job_events(&events) {
                             tracing::warn!(error = %e, "failed to persist job events");
-                        }
-                        if let Err(e) = db.insert_integration_events(&integration_events) {
-                            tracing::warn!(error = %e, "failed to persist integration events");
                         }
                     });
                     continue;
@@ -225,162 +198,12 @@ async fn persist_events(
                     }
                 }
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-
-                if matches!(
-                    event,
-                    PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed
-                ) {
-                    let cfg = config.read().await;
-                    let global_state = global_queue_state(
-                        handle.is_globally_paused(),
-                        &handle.get_download_block(),
-                        cfg.max_download_speed.unwrap_or(0),
-                    );
-                    let record = PersistedQueueEvent {
-                        occurred_at_ms: now,
-                        kind: QueueEventKind::GlobalStateChanged,
-                        item_id: None,
-                        item: None,
-                        state: None,
-                        previous_state: None,
-                        attention: None,
-                        global_state: Some(global_state),
-                    };
-                    if let Ok(payload_json) = serde_json::to_string(&record) {
-                        integration_batch.push(weaver_server_core::IntegrationEventRow {
-                            id: 0,
-                            timestamp: now,
-                            kind: "GLOBAL_STATE_CHANGED".to_string(),
-                            item_id: None,
-                            payload_json,
-                        });
-                    }
-                }
-
-                if let Some(job_id) = pipeline_job_id(&event)
-                    && let Ok(info) = handle.get_job(weaver_server_core::jobs::ids::JobId(job_id))
-                {
-                    let item = queue_item_from_job(&info);
-                    let should_evict = matches!(
-                        item.state,
-                        QueueItemState::Completed | QueueItemState::Failed
-                    );
-                    let detail_signature = (
-                        item.state,
-                        item.download_state,
-                        item.post_state,
-                        item.wait_reason,
-                    );
-                    let previous_state = last_states.insert(job_id, item.state);
-                    let previous_detail = last_item_details.insert(job_id, detail_signature);
-                    let progress_bucket = item.progress_percent.floor() as u8;
-                    let previous_progress = last_progress_buckets.insert(job_id, progress_bucket);
-                    let attention_signature = item
-                        .attention
-                        .as_ref()
-                        .map(|value| (value.code.clone(), value.message.clone()));
-                    let previous_attention =
-                        last_attention.insert(job_id, attention_signature.clone());
-
-                    let mut records: Vec<PersistedQueueEvent> = Vec::new();
-                    if matches!(event, PipelineEvent::JobCreated { .. }) {
-                        records.push(PersistedQueueEvent {
-                            occurred_at_ms: now,
-                            kind: QueueEventKind::ItemCreated,
-                            item_id: Some(job_id),
-                            item: Some(item.clone()),
-                            state: Some(item.state),
-                            previous_state,
-                            attention: item.attention.clone(),
-                            global_state: None,
-                        });
-                    }
-
-                    if let Some(previous_detail) = previous_detail
-                        && previous_detail != detail_signature
-                    {
-                        records.push(PersistedQueueEvent {
-                            occurred_at_ms: now,
-                            kind: if item.state == QueueItemState::Completed {
-                                QueueEventKind::ItemCompleted
-                            } else {
-                                QueueEventKind::ItemStateChanged
-                            },
-                            item_id: Some(job_id),
-                            item: Some(item.clone()),
-                            state: Some(item.state),
-                            previous_state: previous_state.or(Some(previous_detail.0)),
-                            attention: item.attention.clone(),
-                            global_state: None,
-                        });
-                    }
-
-                    if item.state != QueueItemState::Completed
-                        && item.state != QueueItemState::Failed
-                        && progress_bucket > 0
-                        && previous_progress.is_none_or(|value| progress_bucket > value)
-                    {
-                        records.push(PersistedQueueEvent {
-                            occurred_at_ms: now,
-                            kind: QueueEventKind::ItemProgress,
-                            item_id: Some(job_id),
-                            item: Some(item.clone()),
-                            state: Some(item.state),
-                            previous_state: None,
-                            attention: None,
-                            global_state: None,
-                        });
-                    }
-
-                    if attention_signature.is_some()
-                        && attention_signature != previous_attention.flatten()
-                    {
-                        records.push(PersistedQueueEvent {
-                            occurred_at_ms: now,
-                            kind: QueueEventKind::ItemAttention,
-                            item_id: Some(job_id),
-                            item: Some(item.clone()),
-                            state: Some(item.state),
-                            previous_state: None,
-                            attention: item.attention.clone(),
-                            global_state: None,
-                        });
-                    }
-
-                    for record in records {
-                        if let Ok(payload_json) = serde_json::to_string(&record) {
-                            integration_batch.push(weaver_server_core::IntegrationEventRow {
-                                id: 0,
-                                timestamp: now,
-                                kind: format!("{:?}", record.kind),
-                                item_id: record.item_id,
-                                payload_json,
-                            });
-                        }
-                    }
-
-                    if should_evict {
-                        last_states.remove(&job_id);
-                        last_item_details.remove(&job_id);
-                        last_progress_buckets.remove(&job_id);
-                        last_attention.remove(&job_id);
-                    }
-                }
-
-                if batch.len() >= 50 || integration_batch.len() >= 50 {
+                if batch.len() >= 50 {
                     let events = std::mem::take(&mut batch);
-                    let integration_events = std::mem::take(&mut integration_batch);
                     let db = db.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = db.insert_job_events(&events) {
                             tracing::warn!(error = %e, "failed to persist job events");
-                        }
-                        if let Err(e) = db.insert_integration_events(&integration_events) {
-                            tracing::warn!(error = %e, "failed to persist integration events");
                         }
                     });
                 }
@@ -395,7 +218,38 @@ async fn persist_events(
     if !batch.is_empty() {
         let _ = db.insert_job_events(&batch);
     }
-    if !integration_batch.is_empty() {
-        let _ = db.insert_integration_events(&integration_batch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use weaver_server_core::jobs::ids::JobId;
+
+    #[tokio::test]
+    async fn persist_events_keeps_job_events_and_skips_integration_events() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(8);
+
+        let task = tokio::spawn(persist_events(rx, db.clone()));
+        tx.send(PipelineEvent::JobCreated {
+            job_id: JobId(7),
+            name: "test-job".to_string(),
+            total_files: 1,
+            total_bytes: 1024,
+        })
+        .unwrap();
+        tx.send(PipelineEvent::JobPaused { job_id: JobId(7) })
+            .unwrap();
+        drop(tx);
+
+        task.await.unwrap();
+
+        let job_events = db.get_job_events(7).unwrap();
+        assert_eq!(job_events.len(), 2);
+        assert!(db
+            .list_integration_events_after(None, None, None)
+            .unwrap()
+            .is_empty());
     }
 }

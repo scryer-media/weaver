@@ -95,8 +95,10 @@ pub struct FileSpec {
 /// Specification for a single segment to download.
 #[derive(Clone)]
 pub struct SegmentSpec {
-    /// 0-indexed segment number.
-    pub number: u32,
+    /// Dense 0-indexed position used for all internal indexing.
+    pub ordinal: u32,
+    /// Raw 1-indexed NZB article number preserved for diagnostics.
+    pub article_number: u32,
     /// Expected decoded size in bytes.
     pub bytes: u32,
     /// NNTP message-id (without angle brackets).

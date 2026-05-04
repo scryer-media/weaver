@@ -66,7 +66,11 @@ impl HistoryQuery {
         .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
         Ok(count)
     }
-    /// Semantic lifecycle history for a queue/history item.
+    /// Compatibility facade for recent queue lifecycle history.
+    ///
+    /// This is backed by the bounded in-memory replay window rather than
+    /// persisted queue events. Older entries fall out of the ring buffer, and
+    /// stale cursors degrade to `[]` for compatibility with the old table.
     #[graphql(guard = "ReadGuard")]
     async fn history_events(
         &self,
@@ -75,27 +79,14 @@ impl HistoryQuery {
         first: Option<u32>,
         after: Option<String>,
     ) -> Result<Vec<QueueEvent>> {
-        let cursor = decode_event_cursor(after.as_deref())
+        let after = decode_event_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let db = ctx.data::<Database>()?.clone();
-        let rows = tokio::task::spawn_blocking(move || {
-            db.list_integration_events_after(cursor, Some(item_id), first)
-        })
-        .await
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
-
-        rows.into_iter()
-            .map(|row| {
-                let record = serde_json::from_str(&row.payload_json).map_err(|e| {
-                    graphql_error(
-                        "INTERNAL",
-                        format!("invalid integration event payload: {e}"),
-                    )
-                })?;
-                Ok(queue_event_from_record(row.id, record))
-            })
-            .collect()
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let limit = (first.unwrap_or(u32::MAX) as usize).min(replay.capacity());
+        replay
+            .replay_for_item(item_id, after, limit)
+            .await
+            .or_else(|_| Ok(Vec::new()))
     }
     /// Atomic snapshot for the job detail page.
     #[graphql(guard = "ReadGuard")]

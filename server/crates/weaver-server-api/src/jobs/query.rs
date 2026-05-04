@@ -80,8 +80,8 @@ impl JobsQuery {
         filter: Option<QueueFilterInput>,
     ) -> Result<QueueSnapshot> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let db = ctx.data::<Database>()?.clone();
         let config = ctx.data::<SharedConfig>()?.clone();
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
 
         let items: Vec<QueueItem> = handle
             .list_jobs()
@@ -97,13 +97,7 @@ impl JobsQuery {
             .filter(|item| matches_queue_filter(item, filter.as_ref()))
             .collect();
         let metrics = handle.get_metrics();
-        let latest_cursor = tokio::task::spawn_blocking(move || db.latest_integration_event_id())
-            .await
-            .ok()
-            .and_then(|result| result.ok())
-            .flatten()
-            .map(encode_event_cursor)
-            .unwrap_or_else(|| encode_event_cursor(0));
+        let latest_cursor = replay.latest_cursor().await;
         let cfg = config.read().await;
 
         Ok(QueueSnapshot {
@@ -131,16 +125,11 @@ impl JobsQuery {
             cfg.max_download_speed.unwrap_or(0),
         ))
     }
-    /// Cursor for replaying queue events from a bootstrap snapshot.
+    /// Compatibility cursor for the live-only `queueEvents` stream.
     #[graphql(guard = "ReadGuard")]
     async fn latest_queue_cursor(&self, ctx: &Context<'_>) -> Result<String> {
-        let db = ctx.data::<Database>()?.clone();
-        let latest = tokio::task::spawn_blocking(move || db.latest_integration_event_id())
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
-
-        Ok(encode_event_cursor(latest.unwrap_or(0)))
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        Ok(replay.latest_cursor().await)
     }
     /// List jobs, optionally filtered by status, category, or metadata key.
     /// Supports pagination via `limit` and `offset`.

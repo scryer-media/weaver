@@ -520,10 +520,10 @@ impl Pipeline {
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
-                    segment_number: seg.number,
+                    segment_number: seg.ordinal,
                 };
                 if skip.contains(&segment_id) {
-                    let _ = file_assembly.commit_segment(seg.number, seg.bytes);
+                    let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
                     target_queue.push(DownloadWork {
                         segment_id,
@@ -956,7 +956,7 @@ impl Pipeline {
             for seg in &file_spec.segments {
                 ids.insert(SegmentId {
                     file_id,
-                    segment_number: seg.number,
+                    segment_number: seg.ordinal,
                 });
             }
         }
@@ -1020,7 +1020,7 @@ impl Pipeline {
                 .filter_map(|seg| {
                     let sid = SegmentId {
                         file_id,
-                        segment_number: seg.number,
+                        segment_number: seg.ordinal,
                     };
                     committed_ref.contains(&sid).then_some(seg.bytes as u64)
                 })
@@ -1261,5 +1261,103 @@ impl Pipeline {
             self.schedule_job_completion_check(job_id);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::jobs::ids::{JobId, NzbFileId};
+    use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
+    use weaver_model::files::FileRole;
+
+    fn sparse_segment_job_spec() -> JobSpec {
+        JobSpec {
+            name: "Sparse Segments".to_string(),
+            password: None,
+            total_bytes: 60,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: "episode.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    SegmentSpec {
+                        ordinal: 0,
+                        article_number: 1,
+                        bytes: 10,
+                        message_id: "one@example.com".to_string(),
+                    },
+                    SegmentSpec {
+                        ordinal: 1,
+                        article_number: 4,
+                        bytes: 20,
+                        message_id: "four@example.com".to_string(),
+                    },
+                    SegmentSpec {
+                        ordinal: 2,
+                        article_number: 6,
+                        bytes: 30,
+                        message_id: "six@example.com".to_string(),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn sparse_article_numbers_queue_dense_ordinals() {
+        let job_id = JobId(41);
+        let spec = sparse_segment_job_spec();
+        let mut all_ids = Pipeline::all_segment_ids(job_id, &spec)
+            .into_iter()
+            .map(|segment_id| segment_id.segment_number)
+            .collect::<Vec<_>>();
+        all_ids.sort_unstable();
+        assert_eq!(all_ids, vec![0, 1, 2]);
+
+        let (assembly, mut download_queue, recovery_queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+
+        let mut queued = Vec::new();
+        while let Some(work) = download_queue.pop() {
+            queued.push(work.segment_id.segment_number);
+        }
+        queued.sort_unstable();
+
+        assert_eq!(queued, vec![0, 1, 2]);
+        assert!(recovery_queue.is_empty());
+        assert_eq!(
+            assembly
+                .file(NzbFileId {
+                    job_id,
+                    file_index: 0,
+                })
+                .unwrap()
+                .total_segments(),
+            3
+        );
+    }
+
+    #[test]
+    fn sparse_article_numbers_do_not_overflow_committed_assembly() {
+        let job_id = JobId(42);
+        let spec = sparse_segment_job_spec();
+        let committed = Pipeline::all_segment_ids(job_id, &spec);
+        let (assembly, mut download_queue, recovery_queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &committed);
+
+        assert!(download_queue.pop().is_none());
+        assert!(recovery_queue.is_empty());
+        assert!(assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .is_complete());
     }
 }

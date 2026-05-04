@@ -14,13 +14,14 @@ pub struct DirectoryBrowseListing {
 }
 
 pub fn browse_directories(path: &Path) -> Result<DirectoryBrowseListing, String> {
-    let metadata = std::fs::metadata(path)
+    let path = nearest_existing_directory(path)?;
+    let metadata = std::fs::metadata(&path)
         .map_err(|error| format!("failed to read directory metadata: {error}"))?;
     if !metadata.is_dir() {
         return Err("path is not a directory".to_string());
     }
 
-    let mut entries = std::fs::read_dir(path)
+    let mut entries = std::fs::read_dir(&path)
         .map_err(|error| format!("failed to read directory: {error}"))?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
@@ -44,7 +45,7 @@ pub fn browse_directories(path: &Path) -> Result<DirectoryBrowseListing, String>
     });
 
     let current_path = path.to_string_lossy().into_owned();
-    let parent_path = PathBuf::from(path)
+    let parent_path = PathBuf::from(&path)
         .parent()
         .map(|parent| parent.to_string_lossy().into_owned())
         .filter(|parent| parent != &current_path);
@@ -54,4 +55,25 @@ pub fn browse_directories(path: &Path) -> Result<DirectoryBrowseListing, String>
         parent_path,
         entries,
     })
+}
+
+fn nearest_existing_directory(path: &Path) -> Result<PathBuf, String> {
+    let mut candidate = path.to_path_buf();
+
+    loop {
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) => {
+                if metadata.is_dir() {
+                    return Ok(candidate);
+                }
+                return Err("path is not a directory".to_string());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !candidate.pop() {
+                    return Err(format!("failed to read directory metadata: {error}"));
+                }
+            }
+            Err(error) => return Err(format!("failed to read directory metadata: {error}")),
+        }
+    }
 }

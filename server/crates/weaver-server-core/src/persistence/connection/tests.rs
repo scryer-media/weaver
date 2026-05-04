@@ -1,5 +1,8 @@
 use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
+
+use rusqlite::OptionalExtension;
 
 #[test]
 fn open_in_memory_creates_schema() {
@@ -436,4 +439,137 @@ fn migrate_v18_adds_two_lane_runtime_columns() {
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("weaver.db");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let metrics_cutoff_epoch_sec = now - 24 * 60 * 60;
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE schema_version (version INTEGER NOT NULL);
+         INSERT INTO schema_version (version) VALUES (19);
+         CREATE TABLE integration_events (
+             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+             timestamp    INTEGER NOT NULL,
+             kind         TEXT NOT NULL,
+             item_id      INTEGER,
+             payload_json TEXT NOT NULL
+         );
+         CREATE TABLE metrics_scrapes (
+             scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
+             body_zstd            BLOB NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TABLE job_history (
+             job_id           INTEGER PRIMARY KEY NOT NULL,
+             name             TEXT NOT NULL,
+             status           TEXT NOT NULL,
+             error_message    TEXT,
+             total_bytes      INTEGER NOT NULL DEFAULT 0,
+             downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+             optional_recovery_bytes INTEGER NOT NULL DEFAULT 0,
+             optional_recovery_downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+             failed_bytes     INTEGER NOT NULL DEFAULT 0,
+             health           INTEGER NOT NULL DEFAULT 1000,
+             category         TEXT,
+             output_dir       TEXT,
+             nzb_path         TEXT,
+             created_at       INTEGER NOT NULL,
+             completed_at     INTEGER NOT NULL,
+             metadata         TEXT
+         );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![now * 1000, "ITEM_CREATED", 7_i64, "{\"kind\":\"ITEM_CREATED\"}"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![now * 1000 + 1, "ITEM_PROGRESS", 7_i64, "{\"kind\":\"ITEM_PROGRESS\"}"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?1, ?2)",
+        rusqlite::params![metrics_cutoff_epoch_sec - 60, vec![1_u8]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?1, ?2)",
+        rusqlite::params![metrics_cutoff_epoch_sec + 60, vec![2_u8]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO job_history (
+             job_id, name, status, error_message, total_bytes, downloaded_bytes,
+             optional_recovery_bytes, optional_recovery_downloaded_bytes,
+             failed_bytes, health, category, output_dir, nzb_path, created_at,
+             completed_at, metadata
+         ) VALUES (
+             ?1, ?2, ?3, NULL, 0, 0, 0, 0, 0, 1000, NULL, NULL, NULL, ?4, ?5, NULL
+         )",
+        rusqlite::params![42_i64, "retained", "complete", now - 120, now - 60],
+    )
+    .unwrap();
+    drop(conn);
+
+    let db = Database {
+        conn: Arc::new(Mutex::new(Connection::open(&db_path).unwrap())),
+        encryption_key: None,
+    };
+    db.create_schema().unwrap();
+
+    let conn = db.conn();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+
+    let integration_events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM integration_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integration_events, 0);
+
+    let retained_metrics: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM metrics_scrapes WHERE scraped_at_epoch_sec >= ?1",
+            [metrics_cutoff_epoch_sec],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_metrics, 1);
+
+    let stale_metrics: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM metrics_scrapes WHERE scraped_at_epoch_sec < ?1",
+            [metrics_cutoff_epoch_sec],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_metrics, 0);
+
+    let preserved_history: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_history WHERE job_id = 42", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(preserved_history, 1);
+
+    let integration_sequence: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'integration_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(integration_sequence.is_none());
 }

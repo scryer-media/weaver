@@ -6,9 +6,8 @@ use base64::Engine;
 use crate::auth::{ControlGuard, graphql_error};
 use crate::history::types::{HistoryCommandResult, HistoryItem, history_item_from_row};
 use crate::jobs::types::{
-    PersistedQueueEvent, QueueCommandResult, QueueEventKind, QueueItem, QueueItemState,
-    SubmissionResult, SubmitNzbInput, global_queue_state, queue_item_from_job,
-    queue_item_from_submission, submit_metadata,
+    PersistedQueueEvent, QueueCommandResult, QueueEventKind, SubmissionResult, SubmitNzbInput,
+    global_queue_state, queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
 use weaver_server_core::ingest::{
     SubmitNzbError, SubmittedJob, fetch_nzb_from_url, submit_nzb_bytes, submit_uploaded_nzb_reader,
@@ -16,7 +15,7 @@ use weaver_server_core::ingest::{
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, IntegrationEventRow, JobUpdate, SchedulerError, SchedulerHandle,
+    Database, FieldUpdate, JobUpdate, SchedulerError, SchedulerHandle,
 };
 
 #[derive(Default)]
@@ -192,18 +191,23 @@ impl JobsMutation {
     #[graphql(guard = "ControlGuard")]
     async fn cancel_queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let removed_item = handle
-            .get_job(JobId(id))
-            .ok()
-            .map(|info| queue_item_from_job(&info));
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        // Capture the pre-cancel item so the compatibility ITEM_REMOVED event
+        // lands after any final pipeline-driven state changes emitted by cancel_job.
+        let previous_item = handle.get_job(JobId(id)).ok().map(|info| queue_item_from_job(&info));
         map_scheduler_result(handle.cancel_job(JobId(id)).await)?;
-        persist_removed_event(
-            ctx,
-            id,
-            removed_item.clone(),
-            removed_item.as_ref().map(|value| value.state),
-        )
-        .await?;
+        replay
+            .append(PersistedQueueEvent {
+                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                kind: QueueEventKind::ItemRemoved,
+                item_id: Some(id),
+                item: previous_item.clone(),
+                state: None,
+                previous_state: previous_item.as_ref().map(|item| item.state),
+                attention: previous_item.as_ref().and_then(|item| item.attention.clone()),
+                global_state: None,
+            })
+            .await;
         Ok(QueueCommandResult {
             success: true,
             message: Some("item cancelled".to_string()),
@@ -256,9 +260,21 @@ impl JobsMutation {
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<HistoryCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         for id in &ids {
             map_scheduler_result(handle.delete_history(JobId(*id), delete_files).await)?;
-            persist_removed_event(ctx, *id, None, None).await?;
+            replay
+                .append(PersistedQueueEvent {
+                    occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                    kind: QueueEventKind::ItemRemoved,
+                    item_id: Some(*id),
+                    item: None,
+                    state: None,
+                    previous_state: None,
+                    attention: None,
+                    global_state: None,
+                })
+                .await;
         }
         Ok(HistoryCommandResult {
             success: true,
@@ -348,55 +364,6 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {
     result.map_err(scheduler_graphql_error)
-}
-
-async fn persist_removed_event(
-    ctx: &Context<'_>,
-    id: u64,
-    item: Option<QueueItem>,
-    state: Option<QueueItemState>,
-) -> Result<()> {
-    let db = ctx.data::<Database>()?.clone();
-    let occurred_at_ms = chrono::Utc::now().timestamp_millis();
-    let record = PersistedQueueEvent {
-        occurred_at_ms,
-        kind: QueueEventKind::ItemRemoved,
-        item_id: Some(id),
-        item,
-        state,
-        previous_state: None,
-        attention: None,
-        global_state: None,
-    };
-    let payload_json = serde_json::to_string(&record).map_err(|error| {
-        graphql_error(
-            "INTERNAL",
-            format!("failed to encode removal event: {error}"),
-        )
-    })?;
-    tokio::task::spawn_blocking(move || {
-        db.insert_integration_events(&[IntegrationEventRow {
-            id: 0,
-            timestamp: occurred_at_ms,
-            kind: "ITEM_REMOVED".to_string(),
-            item_id: Some(id),
-            payload_json,
-        }])
-    })
-    .await
-    .map_err(|error| {
-        graphql_error(
-            "INTERNAL",
-            format!("failed to persist removal event: {error}"),
-        )
-    })?
-    .map_err(|error| {
-        graphql_error(
-            "INTERNAL",
-            format!("failed to persist removal event: {error}"),
-        )
-    })?;
-    Ok(())
 }
 
 async fn submit_from_facade_input(
