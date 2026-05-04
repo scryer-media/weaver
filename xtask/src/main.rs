@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 #[cfg(unix)]

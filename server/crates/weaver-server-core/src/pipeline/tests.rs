@@ -6245,12 +6245,8 @@ async fn redownload_job_falls_back_to_canonical_persisted_nzb_when_history_path_
     .await
     .unwrap();
 
-    let mut row = history_row_with_output_dir(
-        job_id,
-        "Stale History Job",
-        "failed",
-        working_dir.clone(),
-    );
+    let mut row =
+        history_row_with_output_dir(job_id, "Stale History Job", "failed", working_dir.clone());
     row.category = Some("tv".to_string());
     row.nzb_path = Some(stale_nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
