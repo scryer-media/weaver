@@ -16,3 +16,6 @@ sha2 = "0.10"
 tempfile = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

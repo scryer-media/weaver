@@ -7,9 +7,13 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use toml_edit::{DocumentMut, value};
@@ -28,6 +32,10 @@ const LSOF_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
+const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
+
+#[cfg(unix)]
+static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,7 +55,7 @@ struct Cli {
 enum Commands {
     Release(ReleaseArgs),
     Ci(CiArgs),
-    Dev(DevArgs),
+    Serve(ServeArgs),
     Deploy(DeployArgs),
     Monitor,
     Profile(ProfileArgs),
@@ -86,9 +94,29 @@ struct ClippyArgs {
 }
 
 #[derive(Args)]
-struct DevArgs {
+struct ServeArgs {
     target: Option<String>,
 }
+
+#[cfg(unix)]
+struct SignalForwarder {
+    previous_sigint: libc::sigaction,
+    previous_sigterm: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl Drop for SignalForwarder {
+    fn drop(&mut self) {
+        SIGNAL_FORWARD_PROCESS_GROUP.store(0, Ordering::Relaxed);
+        unsafe {
+            let _ = libc::sigaction(libc::SIGINT, &self.previous_sigint, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGTERM, &self.previous_sigterm, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct SignalForwarder;
 
 #[derive(Args)]
 struct DeployArgs {
@@ -244,7 +272,7 @@ fn main() -> Result<()> {
         Commands::Ci(args) => match args.command {
             CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
         },
-        Commands::Dev(args) => run_dev(&ctx, args),
+        Commands::Serve(args) => run_serve(&ctx, args),
         Commands::Deploy(args) => match args.command {
             DeployCommand::Local(args) => run_deploy_local(&ctx, args),
         },
@@ -801,7 +829,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
         .trim()
         .to_string();
     let linux_image = std::env::var("WEAVER_LINUX_CLIPPY_IMAGE")
-        .unwrap_or_else(|_| "rust:1.94-bookworm".to_string());
+        .unwrap_or_else(|_| "rust:1.95-bookworm".to_string());
     let linux_platform =
         std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM").unwrap_or_else(|_| "linux/arm64".to_string());
 
@@ -1471,6 +1499,125 @@ fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
     )
 }
 
+#[cfg(unix)]
+fn configure_backend_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_backend_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> {
+    let process_group = i32::try_from(process_id)
+        .map_err(|_| anyhow!("process id overflow while installing signal forwarder"))?;
+    SIGNAL_FORWARD_PROCESS_GROUP.store(process_group, Ordering::Relaxed);
+
+    let action = forward_backend_sigaction();
+    let mut previous_sigint = unsafe { std::mem::zeroed() };
+    let mut previous_sigterm = unsafe { std::mem::zeroed() };
+
+    unsafe {
+        if libc::sigaction(libc::SIGINT, &action, &mut previous_sigint) != 0 {
+            return Err(io::Error::last_os_error()).context("failed to install SIGINT forwarder");
+        }
+        if libc::sigaction(libc::SIGTERM, &action, &mut previous_sigterm) != 0 {
+            let _ = libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
+            return Err(io::Error::last_os_error()).context("failed to install SIGTERM forwarder");
+        }
+    }
+
+    Ok(SignalForwarder {
+        previous_sigint,
+        previous_sigterm,
+    })
+}
+
+#[cfg(not(unix))]
+fn install_backend_signal_forwarder(_process_id: u32) -> Result<SignalForwarder> {
+    Ok(SignalForwarder)
+}
+
+fn terminate_backend(backend: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_id = backend.id();
+        let _ = signal_process_group(process_id, libc::SIGINT);
+        if wait_for_child_exit(backend, BACKEND_SHUTDOWN_GRACE_PERIOD) {
+            return;
+        }
+        let _ = signal_process_group(process_id, libc::SIGKILL);
+        let _ = backend.wait();
+        return;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = backend.kill();
+        let _ = backend.wait();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_child_exit(backend: &mut Child, timeout: StdDuration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match backend.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(StdDuration::from_millis(100));
+            }
+            Ok(None) => return false,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_id: u32, signal: i32) -> io::Result<()> {
+    let process_group = i32::try_from(process_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id overflow"))?;
+    let result = unsafe { libc::kill(-process_group, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH)) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
+extern "C" fn forward_backend_signal(signal: i32) {
+    let process_group = SIGNAL_FORWARD_PROCESS_GROUP.load(Ordering::Relaxed);
+    if process_group > 0 {
+        unsafe {
+            let _ = libc::kill(-process_group, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn forward_backend_sigaction() -> libc::sigaction {
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    action.sa_flags = 0;
+    action.sa_sigaction = forward_backend_signal as *const () as usize;
+    action
+}
+
 fn tail_file(path: &Path, lines: usize) -> Result<String> {
     let content = fs::read_to_string(path).unwrap_or_default();
     let collected = content.lines().rev().take(lines).collect::<Vec<_>>();
@@ -1552,7 +1699,7 @@ fn bootstrap_state_dir(
     Ok(())
 }
 
-fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
+fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     require_command("sqlite3")?;
     let web_dir = ctx.path("apps/weaver-web");
     let backend_port = std::env::var("WEAVER_DEV_BACKEND_PORT")
@@ -1623,6 +1770,7 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
         .open(&backend_log)?;
     let log_err = log.try_clone()?;
     let mut backend = ctx.command_in("cargo", &ctx.repo_root);
+    configure_backend_process_group(&mut backend);
     backend
         .env("RUST_LOG", &rust_log)
         .args([
@@ -1643,6 +1791,7 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
     }
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
+    let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
     wait_for_backend(backend_pid, backend_port, &backend_log)?;
 
     println!("==> Weaver backend ready");
@@ -1666,8 +1815,8 @@ fn run_dev(ctx: &TaskContext, args: DevArgs) -> Result<()> {
     ]);
     let result = run_status(&mut vite);
 
-    let _ = backend.kill();
-    let _ = backend.wait();
+    drop(backend_signal_forwarder);
+    terminate_backend(&mut backend);
     if !keep_data {
         drop(temp_dir);
     }

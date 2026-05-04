@@ -1793,7 +1793,7 @@ dependencies = [
  "bitflags",
  "libc",
  "plain",
- "redox_syscall 0.7.5",
+ "redox_syscall 0.7.4",
 ]
 
 [[package]]
@@ -2433,9 +2433,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.7.5"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
+checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
 dependencies = [
  "bitflags",
 ]
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -3703,14 +3703,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "bytes",
  "criterion",
@@ -3730,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "aes",
  "blake2",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3819,7 +3819,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3869,7 +3869,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "crc32fast",
  "memchr",
@@ -4274,6 +4274,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "libc",
  "semver",
  "serde",
  "serde_json",

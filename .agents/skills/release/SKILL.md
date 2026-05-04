@@ -27,8 +27,6 @@ cargo xtask release 0.2.7        # explicit version
 cargo xtask release --dry-run    # full release rehearsal without version bump/commit/tag/push
 ```
 
-The `scripts/release.sh` wrapper simply `exec`s `cargo xtask release` — call the xtask command directly.
-
 ## Pre-flight the task enforces
 
 1. Computes next version from the latest `weaver-v*` tag.

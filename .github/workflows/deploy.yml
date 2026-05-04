@@ -15,7 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "25"
-  RUST_TOOLCHAIN: "1.94"
+  RUST_TOOLCHAIN: "1.95"
   WEB_ARTIFACT_NAME: weaver-web-dist
 
 jobs:
