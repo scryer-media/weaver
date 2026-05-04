@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useState } from "react";
 
 export interface EtaJobInput {
   id: number;
@@ -184,16 +184,16 @@ function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, stri
 }
 
 export function useStableEtaSpeed(jobs: EtaJobInput[], instantaneousSpeed: number): number {
-  const stateRef = useRef<EtaEstimatorState>({
+  const [state] = useState<EtaEstimatorState>(() => ({
     signature: "",
     samples: [],
     smoothedSpeed: 0,
     displayedSpeed: 0,
     displayedAt: 0,
-  });
+  }));
 
   // eslint-disable-next-line react-hooks/purity -- sampling is intentionally driven by wall-clock time
-  return nextEtaSpeed(stateRef.current, jobs, instantaneousSpeed, Date.now());
+  return nextEtaSpeed(state, jobs, instantaneousSpeed, Date.now());
 }
 
 export function useStableQueueEta(jobs: EtaJobInput[], instantaneousSpeed: number): Map<number, string> {

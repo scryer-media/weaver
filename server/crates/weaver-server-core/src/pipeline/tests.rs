@@ -6228,6 +6228,46 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
 }
 
 #[tokio::test]
+async fn redownload_job_falls_back_to_canonical_persisted_nzb_when_history_path_is_stale() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30041);
+    let canonical_nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+    let stale_nzb_path = temp_dir.path().join("missing-history.nzb");
+    let working_dir = intermediate_dir.join("stale-redownload-job");
+
+    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    tokio::fs::write(
+        &canonical_nzb_path,
+        zstd::bulk::compress(&sample_nzb_bytes(), 3).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut row = history_row_with_output_dir(
+        job_id,
+        "Stale History Job",
+        "failed",
+        working_dir.clone(),
+    );
+    row.category = Some("tv".to_string());
+    row.nzb_path = Some(stale_nzb_path.display().to_string());
+    row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
+    pipeline.db.insert_job_history(&row).unwrap();
+
+    pipeline.redownload_job(job_id).await.unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.status, JobStatus::Queued);
+    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.downloaded_bytes, 0);
+    assert_eq!(state.spec.category.as_deref(), Some("tv"));
+    assert!(canonical_nzb_path.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

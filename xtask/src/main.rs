@@ -1092,6 +1092,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     write_workspace_version(&cargo_toml, &next_version)?;
     ok(format!("Workspace version updated to {next_version}"));
 
+    sync_release_workspace_lockfile(ctx)?;
+
     if reused_dry_run_cache {
         ok("Skipped post-bump cargo check via dry-run cache reuse");
     } else {
@@ -1153,6 +1155,15 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     println!(
         "\n{YELLOW}{BOLD}Reminder:{RESET} Update the weaver tag reference in Scryer's Cargo.toml to {BOLD}{tag_name}{RESET}"
     );
+    Ok(())
+}
+
+fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
+    step("Syncing Cargo.lock after version bump");
+    let mut update = ctx.command_in("cargo", &ctx.repo_root);
+    update.args(["update", "--workspace"]);
+    run_checked(&mut update)?;
+    ok("Cargo.lock synced for release version bump");
     Ok(())
 }
 

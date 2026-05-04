@@ -207,10 +207,15 @@ function buildDevSessionPlugin(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   base: "./",
   plugins: [
-    react(),
+    react({
+      babel:
+        mode === "production"
+          ? { plugins: ["babel-plugin-react-compiler"] }
+          : undefined,
+    }),
     compression({
       include: /\.(js|css|svg|webmanifest|json)$/i,
       exclude: /sw\.js$/,
@@ -220,6 +225,7 @@ export default defineConfig({
     buildDevSessionPlugin(),
   ],
   build: {
+    target: "es2022",
     rolldownOptions: {
       output: {
         manualChunks(id) {
@@ -276,4 +282,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

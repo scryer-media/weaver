@@ -175,7 +175,11 @@ jobs:
       - name: Build par2 tests (${{ matrix.name }})
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo test --package weaver-par2 --features slow-tests --no-run --locked --message-format=json 2>/dev/null | jq -r 'select(.executable != null and .profile.test == true) | .executable' | sort -u > /tmp/test-bins.txt
+        run: |
+          set -o pipefail
+          cargo test --package weaver-par2 --features slow-tests --no-run --locked --message-format=json \
+            | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
+            | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
         run: |
           while IFS= read -r bin; do

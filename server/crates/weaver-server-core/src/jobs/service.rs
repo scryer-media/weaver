@@ -152,10 +152,32 @@ impl Pipeline {
         job_id: JobId,
         history_row: Option<&crate::JobHistoryRow>,
     ) -> PathBuf {
+        let canonical_path = self.nzb_dir.join(format!("{}.nzb", job_id.0));
         history_row
             .and_then(|row| row.nzb_path.as_deref())
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.nzb_dir.join(format!("{}.nzb", job_id.0)))
+            .unwrap_or(canonical_path)
+    }
+
+    fn canonical_persisted_nzb_path(&self, job_id: JobId) -> PathBuf {
+        self.nzb_dir.join(format!("{}.nzb", job_id.0))
+    }
+
+    fn map_restart_nzb_error(
+        job_id: JobId,
+        error: crate::ingest::PersistedNzbError,
+    ) -> crate::SchedulerError {
+        match error {
+            crate::ingest::PersistedNzbError::Io(inner) => crate::SchedulerError::Io(
+                std::io::Error::new(
+                    inner.kind(),
+                    format!("failed to read NZB for job {}: {inner}", job_id.0),
+                ),
+            ),
+            crate::ingest::PersistedNzbError::Parse(inner) => crate::SchedulerError::Internal(
+                format!("failed to parse NZB for job {}: {inner}", job_id.0),
+            ),
+        }
     }
 
     fn parse_restart_nzb(
@@ -163,17 +185,43 @@ impl Pipeline {
         job_id: JobId,
         nzb_path: &std::path::Path,
     ) -> Result<weaver_nzb::Nzb, crate::SchedulerError> {
-        crate::ingest::parse_persisted_nzb(nzb_path).map_err(|error| match error {
-            crate::ingest::PersistedNzbError::Io(inner) => {
-                crate::SchedulerError::Io(std::io::Error::new(
-                    inner.kind(),
-                    format!("failed to read NZB for job {}: {inner}", job_id.0),
-                ))
+        crate::ingest::parse_persisted_nzb(nzb_path)
+            .map_err(|error| Self::map_restart_nzb_error(job_id, error))
+    }
+
+    fn load_restart_nzb(
+        &self,
+        job_id: JobId,
+        nzb_path: &std::path::Path,
+    ) -> Result<(weaver_nzb::Nzb, PathBuf), crate::SchedulerError> {
+        match crate::ingest::parse_persisted_nzb(nzb_path) {
+            Ok(nzb) => Ok((nzb, nzb_path.to_path_buf())),
+            Err(crate::ingest::PersistedNzbError::Io(inner))
+                if inner.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let canonical_nzb_path = self.canonical_persisted_nzb_path(job_id);
+                if canonical_nzb_path == nzb_path {
+                    return Err(Self::map_restart_nzb_error(
+                        job_id,
+                        crate::ingest::PersistedNzbError::Io(inner),
+                    ));
+                }
+
+                match crate::ingest::parse_persisted_nzb(&canonical_nzb_path) {
+                    Ok(nzb) => {
+                        warn!(
+                            job_id = job_id.0,
+                            recorded_nzb_path = %nzb_path.display(),
+                            fallback_nzb_path = %canonical_nzb_path.display(),
+                            "recorded history nzb path missing; falling back to canonical persisted nzb"
+                        );
+                        Ok((nzb, canonical_nzb_path))
+                    }
+                    Err(error) => Err(Self::map_restart_nzb_error(job_id, error)),
+                }
             }
-            crate::ingest::PersistedNzbError::Parse(inner) => crate::SchedulerError::Internal(
-                format!("failed to parse NZB for job {}: {inner}", job_id.0),
-            ),
-        })
+            Err(error) => Err(Self::map_restart_nzb_error(job_id, error)),
+        }
     }
 
     fn redownload_staging_dir(&self, job_id: JobId) -> PathBuf {
@@ -577,7 +625,7 @@ impl Pipeline {
             }
         } else {
             let history_row = self.load_history_row(job_id).await?;
-            let (nzb_path, category, metadata, output_dir, downloaded_bytes) = if let Some(row) =
+            let (nzb, nzb_path, category, metadata, output_dir, downloaded_bytes) = if let Some(row) =
                 history_row.as_ref()
             {
                 let status =
@@ -595,8 +643,11 @@ impl Pipeline {
                     .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
                     .unwrap_or_default();
 
+                let preferred_nzb_path = self.persisted_nzb_path_for_job(job_id, Some(row));
+                let (nzb, nzb_path) = self.load_restart_nzb(job_id, &preferred_nzb_path)?;
                 (
-                    self.persisted_nzb_path_for_job(job_id, Some(row)),
+                    nzb,
+                    nzb_path,
                     row.category.clone(),
                     metadata,
                     row.output_dir.clone(),
@@ -614,16 +665,18 @@ impl Pipeline {
                     )));
                 }
 
+                let nzb_path = self.persisted_nzb_path_for_job(job_id, history_row.as_ref());
+                let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
+
                 (
-                    self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
+                    nzb,
+                    nzb_path,
                     info.category.clone(),
                     info.metadata.clone(),
                     info.output_dir.clone(),
                     info.downloaded_bytes,
                 )
             };
-
-            let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
 
             let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
 
@@ -781,7 +834,7 @@ impl Pipeline {
             }
 
             let nzb_path = self.persisted_nzb_path_for_job(job_id, Some(row));
-            let nzb = self.parse_restart_nzb(job_id, &nzb_path)?;
+            let (nzb, nzb_path) = self.load_restart_nzb(job_id, &nzb_path)?;
             let metadata = row
                 .metadata
                 .as_deref()
