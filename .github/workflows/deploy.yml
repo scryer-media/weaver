@@ -174,10 +174,10 @@ jobs:
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build par2 tests (${{ matrix.name }})
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --features slow-tests --no-run --locked --message-format=json \
+          cargo test --package weaver-par2 --features slow-tests --no-run --locked --target x86_64-unknown-linux-gnu --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
