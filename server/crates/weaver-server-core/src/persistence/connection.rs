@@ -17,8 +17,8 @@ use crate::operations::metrics_store::METRICS_RETENTION_SECS;
 pub use crate::operations::{MetricsScrapeRow, StableStateExport};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 20;
-const LEGACY_SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 22;
+const LEGACY_SCHEMA_VERSION: i64 = 20;
 
 fn ensure_column(
     conn: &Connection,
@@ -117,9 +117,6 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
     }
 
     let db_size_after_bytes = file_size_bytes(db_path.as_deref());
-
-    conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
-        .map_err(|e| StateError::Database(e.to_string()))?;
 
     tracing::info!(
         integration_event_rows_deleted,
@@ -238,11 +235,32 @@ impl Database {
                 nzb_path         TEXT,
                 created_at       INTEGER NOT NULL,
                 completed_at     INTEGER NOT NULL,
-                metadata         TEXT
+                metadata         TEXT,
+                last_diagnostic_id TEXT,
+                last_diagnostic_uploaded_at_epoch_ms INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_job_history_completed_at
                 ON job_history(completed_at);
+
+            CREATE TABLE IF NOT EXISTS diagnostic_runs (
+                source_job_id INTEGER PRIMARY KEY NOT NULL,
+                diagnostic_job_id INTEGER NOT NULL,
+                smg_diagnostic_id TEXT,
+                stage TEXT NOT NULL,
+                include_server_hostnames INTEGER NOT NULL DEFAULT 1,
+                rerun_succeeded INTEGER,
+                error_message TEXT,
+                created_at_epoch_ms INTEGER NOT NULL,
+                updated_at_epoch_ms INTEGER NOT NULL,
+                last_activity_at_epoch_ms INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_diagnostic_runs_job
+                ON diagnostic_runs(diagnostic_job_id);
+
+            CREATE INDEX IF NOT EXISTS idx_diagnostic_runs_activity
+                ON diagnostic_runs(last_activity_at_epoch_ms, stage);
 
             CREATE TABLE IF NOT EXISTS active_jobs (
                 job_id       INTEGER PRIMARY KEY NOT NULL,
@@ -345,6 +363,35 @@ impl Database {
                 scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
                 body_zstd            BLOB NOT NULL
             ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS async_operations (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind         TEXT NOT NULL,
+                state        TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                requested_at INTEGER NOT NULL,
+                started_at   INTEGER,
+                finished_at  INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_async_operations_kind_state_requested
+                ON async_operations(kind, state, requested_at, id);
+
+            CREATE TABLE IF NOT EXISTS async_operation_targets (
+                operation_id   INTEGER NOT NULL REFERENCES async_operations(id) ON DELETE CASCADE,
+                target_kind    TEXT NOT NULL,
+                target_id      INTEGER NOT NULL,
+                state          TEXT NOT NULL,
+                error_message  TEXT,
+                sort_order     INTEGER NOT NULL,
+                PRIMARY KEY (operation_id, target_kind, target_id)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_async_operation_targets_target_state
+                ON async_operation_targets(target_kind, target_id, state);
+
+            CREATE INDEX IF NOT EXISTS idx_async_operation_targets_operation_sort
+                ON async_operation_targets(operation_id, target_kind, sort_order, target_id);
 
             CREATE TABLE IF NOT EXISTS active_extraction_chunks (
                 job_id        INTEGER NOT NULL,
@@ -504,7 +551,11 @@ impl Database {
             })
             .ok();
 
-        let needs_v20_cleanup = matches!(version, Some(v) if v < SCHEMA_VERSION);
+        // Retry the legacy v20 cleanup until we successfully advance to the
+        // current schema version so interrupted upgrades cannot strand the
+        // oversized legacy rows on disk.
+        let needs_v20_cleanup = matches!(version, Some(v) if v <= LEGACY_SCHEMA_VERSION);
+        let needs_schema_version_update = matches!(version, Some(v) if v < SCHEMA_VERSION);
 
         match version {
             None => {
@@ -668,7 +719,7 @@ impl Database {
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
             }
-            Some(19) => {}
+            Some(19) | Some(20) | Some(21) => {}
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -688,6 +739,13 @@ impl Database {
             "job_history",
             "optional_recovery_downloaded_bytes",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "job_history", "last_diagnostic_id", "TEXT")?;
+        ensure_column(
+            &conn,
+            "job_history",
+            "last_diagnostic_uploaded_at_epoch_ms",
+            "INTEGER",
         )?;
         ensure_column(
             &conn,
@@ -719,6 +777,11 @@ impl Database {
 
         if needs_v20_cleanup {
             cleanup_legacy_queue_event_storage(&conn)?;
+        }
+
+        if needs_schema_version_update {
+            conn.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])
+                .map_err(|e| StateError::Database(e.to_string()))?;
         }
 
         Ok(())

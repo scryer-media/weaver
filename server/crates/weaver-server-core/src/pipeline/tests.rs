@@ -1524,6 +1524,19 @@ fn drain_job_repair_complete(
     count
 }
 
+fn drain_job_events(
+    events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
+    job_id: JobId,
+) -> Vec<PipelineEvent> {
+    let mut drained = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if crate::events::publish::pipeline_job_id(&event) == Some(job_id.0) {
+            drained.push(event);
+        }
+    }
+    drained
+}
+
 fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -3104,6 +3117,123 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         1,
         "optional recovery files should stay parked until promoted"
     );
+}
+
+#[tokio::test]
+async fn emits_download_pipeline_drained_once_before_later_completion_events() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20011);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        JobSpec {
+            name: "Drain Pending Buffers".to_string(),
+            password: None,
+            files: vec![],
+            total_bytes: 0,
+            category: None,
+            metadata: vec![],
+        },
+    )
+    .await;
+
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.pending_decode.push_back(PendingDecodeWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+        raw: Bytes::from_static(b"pending"),
+    });
+
+    pipeline.emit_download_finished_if_active(job_id);
+    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
+
+    pipeline.pending_decode.clear();
+    pipeline.schedule_job_completion_check(job_id);
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(matches!(
+        drained_events.first(),
+        Some(PipelineEvent::DownloadFinished {
+            finalization_pending: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        drained_events
+            .iter()
+            .filter(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+            .count(),
+        1
+    );
+    let drained_idx = drained_events
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+        .expect("download pipeline drained event");
+    let next_stage_idx = drained_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                PipelineEvent::MoveToCompleteStarted { .. }
+                    | PipelineEvent::JobVerificationStarted { .. }
+                    | PipelineEvent::RepairStarted { .. }
+                    | PipelineEvent::ExtractionReady { .. }
+                    | PipelineEvent::JobCompleted { .. }
+            )
+        })
+        .expect("later completion event");
+    assert!(drained_idx < next_stage_idx, "events: {drained_events:?}");
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
+}
+
+#[tokio::test]
+async fn skips_download_pipeline_drained_when_no_post_download_work_remains() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20012);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        JobSpec {
+            name: "No Drain Gap".to_string(),
+            password: None,
+            files: vec![],
+            total_bytes: 0,
+            category: None,
+            metadata: vec![],
+        },
+    )
+    .await;
+
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.emit_download_finished_if_active(job_id);
+    pipeline.schedule_job_completion_check(job_id);
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(matches!(
+        drained_events.first(),
+        Some(PipelineEvent::DownloadFinished {
+            finalization_pending: false,
+            ..
+        })
+    ));
+    assert!(
+        drained_events
+            .iter()
+            .all(|event| !matches!(event, PipelineEvent::DownloadPipelineDrained { .. })),
+        "events: {drained_events:?}"
+    );
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
 }
 
 #[tokio::test]
@@ -10763,6 +10893,102 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
         state.download_state,
         crate::jobs::model::DownloadState::Complete
     ));
+}
+
+#[tokio::test]
+async fn restore_job_reemits_open_download_finalization_and_drains_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30094);
+    let spec = standalone_job_spec(
+        "Restore Finalizing Download",
+        &[("payload.bin".to_string(), 100)],
+    );
+    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
+    let working_dir = temp_dir.path().join("restore-finalizing-download");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    pipeline
+        .db
+        .insert_job_events(&[
+            crate::JobEvent {
+                job_id: job_id.0,
+                timestamp: 1,
+                kind: "JobCreated".to_string(),
+                message: "created".to_string(),
+                file_id: None,
+            },
+            crate::JobEvent {
+                job_id: job_id.0,
+                timestamp: 2,
+                kind: "DownloadFinished".to_string(),
+                message: "download finished".to_string(),
+                file_id: Some(
+                    crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER.to_string(),
+                ),
+            },
+        ])
+        .unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            spec,
+            committed_segments,
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: Some(crate::jobs::model::DownloadState::Complete),
+            post_state: Some(crate::jobs::model::PostState::Idle),
+            run_state: Some(crate::jobs::model::RunState::Active),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(
+        drained_events.iter().any(|event| {
+            matches!(
+                event,
+                PipelineEvent::DownloadFinished {
+                    finalization_pending: true,
+                    ..
+                }
+            )
+        }),
+        "events: {drained_events:?}"
+    );
+    let finish_idx = drained_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                PipelineEvent::DownloadFinished {
+                    finalization_pending: true,
+                    ..
+                }
+            )
+        })
+        .expect("restored download finished event");
+    let drained_idx = drained_events
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+        .expect("download pipeline drained event");
+    assert!(finish_idx < drained_idx, "events: {drained_events:?}");
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
 }
 
 #[tokio::test]

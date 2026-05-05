@@ -26,6 +26,12 @@ pub struct SchemaContext {
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     let replay = QueueEventReplay::default();
     replay.spawn_producer(context.handle.clone(), context.config.clone());
+    let history_delete_manager = crate::history::delete_ops::HistoryDeleteManager::new(
+        context.db.clone(),
+        context.handle.clone(),
+        replay.clone(),
+    );
+    history_delete_manager.spawn_worker();
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -37,6 +43,14 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .expect("http client build should succeed");
+    let diagnostic_manager = crate::history::diagnostics::DiagnosticManager::new(
+        context.db.clone(),
+        context.handle.clone(),
+        context.config.clone(),
+        context.log_buffer.clone(),
+        http_client.clone(),
+    );
+    diagnostic_manager.spawn_worker();
 
     Schema::build(
         QueryRoot::default(),
@@ -53,5 +67,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(http_client)
     .data(context.log_buffer)
     .data(replay)
+    .data(history_delete_manager)
+    .data(diagnostic_manager)
     .finish()
 }

@@ -33,6 +33,9 @@ import { LiveDataContext, type DownloadBlockState } from "@/lib/context/live-dat
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import {
+  normalizeFacadeJobProgress,
+  normalizeFacadeJobStatus,
+  normalizeGraphqlTimestamp,
   normalizeJobData,
   type GraphqlJobData,
   type JobData,
@@ -99,15 +102,176 @@ const DEFAULT_GLOBAL_STATE: Snapshot["globalState"] = {
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
 
-function mapQueueSnapshot(snapshot: QueueSnapshotPayload | undefined): Snapshot | undefined {
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameEpisode(
+  left: JobData["parsedRelease"]["episode"],
+  right: GraphqlJobData["parsedRelease"]["episode"],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return left == null && right == null;
+  }
+  return left.season === right.season
+    && left.absoluteEpisode === right.absoluteEpisode
+    && left.raw === right.raw
+    && left.episodeNumbers.length === right.episodeNumbers.length
+    && left.episodeNumbers.every((value, index) => value === right.episodeNumbers[index]);
+}
+
+function sameParsedRelease(left: JobData["parsedRelease"], right: GraphqlJobData["parsedRelease"]): boolean {
+  return left.normalizedTitle === right.normalizedTitle
+    && left.releaseGroup === right.releaseGroup
+    && sameStringArray(left.languagesAudio, right.languagesAudio)
+    && sameStringArray(left.languagesSubtitles, right.languagesSubtitles)
+    && left.year === right.year
+    && left.quality === right.quality
+    && left.source === right.source
+    && left.videoCodec === right.videoCodec
+    && left.videoEncoding === right.videoEncoding
+    && left.audio === right.audio
+    && sameStringArray(left.audioCodecs, right.audioCodecs)
+    && left.audioChannels === right.audioChannels
+    && left.isDualAudio === right.isDualAudio
+    && left.isAtmos === right.isAtmos
+    && left.isDolbyVision === right.isDolbyVision
+    && left.detectedHdr === right.detectedHdr
+    && left.isHdr10Plus === right.isHdr10Plus
+    && left.isHlg === right.isHlg
+    && left.fps === right.fps
+    && left.isProperUpload === right.isProperUpload
+    && left.isRepack === right.isRepack
+    && left.isRemux === right.isRemux
+    && left.isBdDisk === right.isBdDisk
+    && left.isAiEnhanced === right.isAiEnhanced
+    && left.isHardcodedSubs === right.isHardcodedSubs
+    && left.streamingService === right.streamingService
+    && left.edition === right.edition
+    && left.animeVersion === right.animeVersion
+    && left.parseConfidence === right.parseConfidence
+    && sameEpisode(left.episode, right.episode);
+}
+
+function sameMetadata(
+  left: { key: string; value: string }[],
+  right: { key: string; value: string }[] | undefined,
+): boolean {
+  const resolvedRight = right ?? [];
+  return left.length === resolvedRight.length
+    && left.every((entry, index) =>
+      entry.key === resolvedRight[index]?.key && entry.value === resolvedRight[index]?.value);
+}
+
+function sameDeleteOperation(
+  left: JobData["deleteOperation"],
+  right: GraphqlJobData["deleteOperation"],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return left == null && right == null;
+  }
+  return left.operationId === right.operationId
+    && left.state === right.state
+    && left.locked === right.locked
+    && left.deleteFiles === right.deleteFiles
+    && left.errorMessage === right.errorMessage;
+}
+
+function sameDownloadBlock(left: DownloadBlockState, right: DownloadBlockState): boolean {
+  return left.kind === right.kind
+    && left.capEnabled === right.capEnabled
+    && left.period === right.period
+    && left.usedBytes === right.usedBytes
+    && left.limitBytes === right.limitBytes
+    && left.remainingBytes === right.remainingBytes
+    && left.reservedBytes === right.reservedBytes
+    && left.windowStartsAtEpochMs === right.windowStartsAtEpochMs
+    && left.windowEndsAtEpochMs === right.windowEndsAtEpochMs
+    && left.timezoneName === right.timezoneName
+    && left.scheduledSpeedLimit === right.scheduledSpeedLimit;
+}
+
+function sameGlobalState(left: Snapshot["globalState"], right: QueueSnapshotPayload["globalState"]): boolean {
+  return left.isPaused === right.isPaused && sameDownloadBlock(left.downloadBlock, right.downloadBlock);
+}
+
+function matchesNormalizedJob(previous: JobData, next: GraphqlJobData): boolean {
+  return previous.id === next.id
+    && previous.name === next.name
+    && previous.displayTitle === next.displayTitle
+    && previous.originalTitle === next.originalTitle
+    && previous.parsedRelease !== undefined
+    && sameParsedRelease(previous.parsedRelease, next.parsedRelease)
+    && previous.status === normalizeFacadeJobStatus(next.status)
+    && previous.progress === normalizeFacadeJobProgress(next.progressPercent, next.progress)
+    && previous.progressPercent === (next.progressPercent ?? null)
+    && previous.totalBytes === next.totalBytes
+    && previous.downloadedBytes === next.downloadedBytes
+    && previous.optionalRecoveryBytes === next.optionalRecoveryBytes
+    && previous.optionalRecoveryDownloadedBytes === next.optionalRecoveryDownloadedBytes
+    && previous.failedBytes === next.failedBytes
+    && previous.health === next.health
+    && previous.hasPassword === next.hasPassword
+    && previous.category === next.category
+    && previous.createdAt === normalizeGraphqlTimestamp(next.createdAt)
+    && previous.completedAt === normalizeGraphqlTimestamp(next.completedAt)
+    && previous.error === (next.error ?? null)
+    && previous.outputDir === (next.outputDir ?? null)
+    && sameMetadata(previous.metadata, next.metadata ?? next.attributes)
+    && sameDeleteOperation(previous.deleteOperation ?? null, next.deleteOperation ?? null);
+}
+
+function mapQueueSnapshot(
+  snapshot: QueueSnapshotPayload | undefined,
+  previous?: Snapshot,
+): Snapshot | undefined {
   if (!snapshot) {
     return undefined;
   }
 
+  const previousJobsById = new Map(previous?.jobs.map((job) => [job.id, job]) ?? []);
+  let reusedAllJobs = Boolean(previous) && snapshot.items.length === (previous?.jobs.length ?? 0);
+  const nextJobs = snapshot.items.map((job, index) => {
+    const previousAtIndex = previous?.jobs[index];
+    const candidate = previousAtIndex?.id === job.id
+      ? previousAtIndex
+      : previousJobsById.get(job.id);
+    if (candidate && matchesNormalizedJob(candidate, job)) {
+      return candidate;
+    }
+    reusedAllJobs = false;
+    return normalizeJobData(job);
+  });
+
+  const jobs = previous && reusedAllJobs && nextJobs.every((job, index) => job === previous.jobs[index])
+    ? previous.jobs
+    : nextJobs;
+  const globalState = previous && sameGlobalState(previous.globalState, snapshot.globalState)
+    ? previous.globalState
+    : snapshot.globalState;
+  const latestCursor = previous?.latestCursor === snapshot.latestCursor
+    ? previous.latestCursor
+    : snapshot.latestCursor;
+
+  if (
+    previous
+    && jobs === previous.jobs
+    && globalState === previous.globalState
+    && latestCursor === previous.latestCursor
+  ) {
+    return previous;
+  }
+
   return {
-    latestCursor: snapshot.latestCursor,
-    globalState: snapshot.globalState,
-    jobs: (snapshot.items ?? []).map((job) => normalizeJobData(job)),
+    latestCursor,
+    globalState,
+    jobs,
   };
 }
 
@@ -253,13 +417,17 @@ export function Layout() {
     }
   }, [connectionState.status, metricsSubscriptionData]);
 
-  const snapshot = useMemo(
-    () =>
-      mapQueueSnapshot(
-        polledSnapshot ?? snapshotSubscriptionData?.queueSnapshots ?? queryData?.queueSnapshot,
-      ),
-    [polledSnapshot, queryData, snapshotSubscriptionData],
-  );
+  const rawSnapshot =
+    polledSnapshot ?? snapshotSubscriptionData?.queueSnapshots ?? queryData?.queueSnapshot;
+  const previousSnapshotRef = useRef<Snapshot | undefined>(undefined);
+  const snapshot = useMemo(() => {
+    // eslint-disable-next-line react-hooks/refs -- queue snapshots are reconciled against the previous render to preserve row identity without scheduling another update
+    const previousSnapshot = previousSnapshotRef.current;
+    const nextSnapshot = mapQueueSnapshot(rawSnapshot, previousSnapshot);
+    // eslint-disable-next-line react-hooks/refs -- cache the reconciled snapshot for the next render
+    previousSnapshotRef.current = nextSnapshot;
+    return nextSnapshot;
+  }, [rawSnapshot]);
 
   const snapshotJobs = snapshot?.jobs ?? EMPTY_JOBS;
   const metricsSnapshot =
@@ -334,7 +502,7 @@ export function Layout() {
   return (
     <LiveDataContext.Provider value={liveData}>
       <div className="min-h-screen bg-background text-foreground">
-        <div className="mx-auto w-full max-w-[1587px] px-3 py-3 sm:px-4 sm:py-4">
+        <div className="mx-auto w-full max-w-[1787px] px-3 py-3 sm:px-4 sm:py-4">
           <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
             <div className="pointer-events-none absolute inset-x-0 top-0 h-56 bg-gradient-to-br from-primary/10 via-transparent to-transparent" />
             {liveData.connection.isDisconnected ? (

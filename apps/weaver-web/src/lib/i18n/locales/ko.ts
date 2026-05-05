@@ -37,6 +37,8 @@ const ko: LocaleDictionary = {
   "action.reprocess": "재처리",
   "action.refresh": "새로고침",
   "action.clearFilters": "필터 초기화",
+  "action.previous": "이전",
+  "action.next": "다음",
 
   // Confirmation dialogs
   "confirm.cancelJob": "이 작업을 취소하시겠습니까?",
@@ -93,6 +95,7 @@ const ko: LocaleDictionary = {
   "jobs.empty": "대기열이 비어 있습니다.",
   "jobs.emptyAction": "NZB를 업로드하여",
   "jobs.emptyHint": "시작하세요.",
+  "jobs.searchPlaceholder": "이름 또는 카테고리로 대기열 필터링",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "다운로드 전송이 전역적으로 일시정지되었습니다. 대기 중 및 다운로드 중인 작업은 대기열을 재개할 때까지 위치를 유지합니다.",
   "jobs.downloadsPaused": "다운로드 일시정지됨",
@@ -117,6 +120,7 @@ const ko: LocaleDictionary = {
   // Table headers
   "table.name": "이름",
   "table.status": "상태",
+  "table.filters": "필터",
   "table.priority": "우선순위",
   "table.progress": "진행률",
   "table.size": "크기",
@@ -149,6 +153,7 @@ const ko: LocaleDictionary = {
   "timeline.noData": "타임라인 추적이 가능해진 후 처리된 작업에 대해 상세한 파이프라인 타이밍이 표시됩니다.",
   "timeline.pendingDownload": "다운로드 대기",
   "timeline.downloading": "다운로드 중",
+  "timeline.finalizingDownload": "다운로드 마무리 중",
   "timeline.paused": "일시정지",
   "timeline.verifying": "검증 중",
   "timeline.repairing": "복구 중",
@@ -254,6 +259,7 @@ const ko: LocaleDictionary = {
   "history.noMatches": "현재 필터와 일치하는 기록 작업이 없습니다.",
   "table.health": "상태",
   "table.category": "카테고리",
+  "table.rowsPerPage": "페이지당 행 수",
 
   // Servers page
   "nav.servers": "서버",
@@ -295,6 +301,8 @@ const ko: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Weaver 서버 파일시스템에서 대상 디렉토리를 선택하세요.",
   "categories.directoryBrowserLoading": "디렉토리 로딩 중...",
   "categories.directoryBrowserEmpty": "하위 디렉토리가 없습니다.",
+  "categories.createFolder": "폴더 만들기",
+  "categories.newFolderPlaceholder": "새 폴더 이름",
   "categories.currentFolder": "현재 폴더",
   "categories.useCurrentFolder": "현재 폴더 사용",
   "categories.up": "위로",

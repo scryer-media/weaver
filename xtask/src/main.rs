@@ -1168,8 +1168,8 @@ fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
 }
 
 fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
-    run_weaver_web_validation(ctx, prefix)?;
-    run_weaver_rust_prep_validation(ctx, prefix)
+    run_weaver_rust_prep_validation(ctx, prefix)?;
+    run_weaver_web_validation(ctx, prefix)
 }
 
 fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
@@ -1641,6 +1641,20 @@ fn load_state_encryption_key(path: &Path) -> Result<Option<String>> {
     Ok(Some(fs::read_to_string(path)?.replace(['\r', '\n'], "")))
 }
 
+fn ensure_frontend_dependencies(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
+    step("Syncing frontend dependencies for Vite dev server");
+    let mut install = ctx.command_in("npm", web_dir);
+    install.args(["install", "--no-fund", "--no-audit"]);
+    run_status(&mut install).with_context(|| {
+        format!(
+            "failed to install frontend dependencies in {}",
+            web_dir.display()
+        )
+    })?;
+    ok("Frontend dependencies are up to date");
+    Ok(())
+}
+
 fn seed_runtime_dirs(db_path: &Path, data_dir: &Path) -> Result<()> {
     let intermediate_dir = data_dir.join("intermediate");
     let complete_dir = data_dir.join("complete");
@@ -1710,8 +1724,10 @@ fn bootstrap_state_dir(
 }
 
 fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
+    require_command("npm")?;
     require_command("sqlite3")?;
     let web_dir = ctx.path("apps/weaver-web");
+    ensure_frontend_dependencies(ctx, &web_dir)?;
     let backend_port = std::env::var("WEAVER_DEV_BACKEND_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -1730,6 +1746,12 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     );
     let state_key_file = state_dir.join("encryption.key");
     let rust_log = build_rust_log(args.target.as_deref());
+    let backend_url = format!("http://127.0.0.1:{backend_port}");
+    let frontend_url = format!("http://127.0.0.1:{frontend_port}");
+    let vite_use_polling =
+        std::env::var("WEAVER_VITE_USE_POLLING").unwrap_or_else(|_| "true".to_string());
+    let vite_poll_interval =
+        std::env::var("WEAVER_VITE_POLL_INTERVAL_MS").unwrap_or_else(|_| "250".to_string());
 
     let keep_data = std::env::var("WEAVER_DEV_KEEP_DATA")
         .map(|value| value == "1")
@@ -1805,24 +1827,28 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     wait_for_backend(backend_pid, backend_port, &backend_log)?;
 
     println!("==> Weaver backend ready");
-    println!("    Backend:  http://127.0.0.1:{backend_port}");
-    println!("    Frontend: http://127.0.0.1:{frontend_port}");
+    println!("    Backend:  {backend_url}");
+    println!("    Frontend: {frontend_url}");
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    println!("    Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
     let mut vite = ctx.command_in("npm", &web_dir);
-    vite.args([
-        "run",
-        "dev",
-        "--",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        &frontend_port.to_string(),
-    ]);
+    vite.env("WEAVER_DEV_PROXY_TARGET", &backend_url)
+        .env("WEAVER_VITE_USE_POLLING", &vite_use_polling)
+        .env("WEAVER_VITE_POLL_INTERVAL_MS", &vite_poll_interval)
+        .args([
+            "run",
+            "dev",
+            "--",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            &frontend_port.to_string(),
+        ]);
     let result = run_status(&mut vite);
 
     drop(backend_signal_forwarder);

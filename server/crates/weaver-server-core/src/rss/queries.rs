@@ -132,8 +132,8 @@ impl Database {
                     action,
                     title_regex: row.get(5)?,
                     item_categories: decode_categories(row.get(6)?),
-                    min_size_bytes: row.get(7)?,
-                    max_size_bytes: row.get(8)?,
+                    min_size_bytes: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                    max_size_bytes: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
                     category_override: row.get(9)?,
                     metadata: decode_metadata(row.get(10)?),
                 })
@@ -168,8 +168,8 @@ impl Database {
                     action,
                     title_regex: row.get(5)?,
                     item_categories: decode_categories(row.get(6)?),
-                    min_size_bytes: row.get(7)?,
-                    max_size_bytes: row.get(8)?,
+                    min_size_bytes: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                    max_size_bytes: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
                     category_override: row.get(9)?,
                     metadata: decode_metadata(row.get(10)?),
                 })

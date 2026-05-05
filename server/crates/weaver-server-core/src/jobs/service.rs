@@ -5,15 +5,64 @@ use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
 use crate::events::model::PipelineEvent;
+use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
 use crate::pipeline::{Pipeline, check_disk_space};
-use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
+use crate::{DownloadQueue, DownloadWork, RestoreJobRequest, with_diagnostic_metadata};
 
 impl Pipeline {
+    fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
+        let events = match self.db.get_job_events(job_id.0) {
+            Ok(events) => events,
+            Err(error) => {
+                error!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load job events while restoring download finalization"
+                );
+                return false;
+            }
+        };
+
+        let mut finalization_open = false;
+        for event in events {
+            match event.kind.as_str() {
+                "JobCreated" | "JobCompleted" | "JobFailed" | "JobCancelled" => {
+                    finalization_open = false;
+                }
+                "DownloadFinished"
+                    if event.file_id.as_deref() == Some(JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER) =>
+                {
+                    finalization_open = true;
+                }
+                "DownloadPipelineDrained" => {
+                    finalization_open = false;
+                }
+                _ => {}
+            }
+        }
+
+        finalization_open
+    }
+
+    fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
+        if !self.restore_has_open_download_finalization(job_id) {
+            self.jobs_finalizing_download.remove(&job_id);
+            return false;
+        }
+
+        self.jobs_finalizing_download.insert(job_id);
+        let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+            job_id,
+            finalization_pending: true,
+        });
+        true
+    }
+
     fn normalize_restored_download_state(
         download_state: crate::jobs::model::DownloadState,
         download_queue: &DownloadQueue,
@@ -897,6 +946,125 @@ impl Pipeline {
         Ok(())
     }
 
+    pub(crate) async fn start_diagnostic_redownload(
+        &mut self,
+        source_job_id: JobId,
+        include_server_hostnames: bool,
+    ) -> Result<JobId, crate::SchedulerError> {
+        let diagnostic_job_id = crate::ingest::next_submission_job_id();
+
+        if let Some(state) = self.jobs.get(&source_job_id) {
+            if !Self::is_restartable_terminal_status(&state.status) {
+                return Err(crate::SchedulerError::Conflict(format!(
+                    "job {} is not complete or failed",
+                    source_job_id.0
+                )));
+            }
+
+            let category = state.spec.category.clone();
+            let metadata = with_diagnostic_metadata(
+                state.spec.metadata.clone(),
+                source_job_id.0,
+                include_server_hostnames,
+            );
+            let source_nzb_path = self.nzb_dir.join(format!("{}.nzb", source_job_id.0));
+            let target_nzb_path = self.nzb_dir.join(format!("{}.nzb", diagnostic_job_id.0));
+            let nzb = self.parse_restart_nzb(source_job_id, &source_nzb_path)?;
+            tokio::fs::copy(&source_nzb_path, &target_nzb_path)
+                .await
+                .map_err(crate::SchedulerError::Io)?;
+            let spec = crate::ingest::nzb_to_spec(&nzb, &target_nzb_path, category, metadata);
+
+            self.add_job(diagnostic_job_id, spec, target_nzb_path)
+                .await?;
+            self.reload_metadata_from_disk(diagnostic_job_id).await;
+            info!(
+                source_job_id = source_job_id.0,
+                diagnostic_job_id = diagnostic_job_id.0,
+                "started diagnostic re-download from terminal runtime job"
+            );
+            return Ok(diagnostic_job_id);
+        }
+
+        let history_row = self.load_history_row(source_job_id).await?;
+        if let Some(row) = history_row.as_ref() {
+            let status =
+                crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+            if !Self::is_restartable_terminal_status(&status) {
+                return Err(crate::SchedulerError::Conflict(format!(
+                    "job {} is not complete or failed",
+                    source_job_id.0
+                )));
+            }
+
+            let preferred_nzb_path = self.persisted_nzb_path_for_job(source_job_id, Some(row));
+            let (nzb, source_nzb_path) =
+                self.load_restart_nzb(source_job_id, &preferred_nzb_path)?;
+            let target_nzb_path = self.nzb_dir.join(format!("{}.nzb", diagnostic_job_id.0));
+            tokio::fs::copy(&source_nzb_path, &target_nzb_path)
+                .await
+                .map_err(crate::SchedulerError::Io)?;
+            let metadata = row
+                .metadata
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
+                .unwrap_or_default();
+            let metadata =
+                with_diagnostic_metadata(metadata, source_job_id.0, include_server_hostnames);
+            let spec =
+                crate::ingest::nzb_to_spec(&nzb, &target_nzb_path, row.category.clone(), metadata);
+
+            self.add_job(diagnostic_job_id, spec, target_nzb_path)
+                .await?;
+            self.reload_metadata_from_disk(diagnostic_job_id).await;
+            info!(
+                source_job_id = source_job_id.0,
+                diagnostic_job_id = diagnostic_job_id.0,
+                "started diagnostic re-download from history job"
+            );
+            return Ok(diagnostic_job_id);
+        }
+
+        let history_entry = self
+            .finished_jobs
+            .iter()
+            .find(|job| job.job_id == source_job_id);
+        let Some(info) = history_entry else {
+            return Err(crate::SchedulerError::JobNotFound(source_job_id));
+        };
+        if !Self::is_restartable_terminal_status(&info.status) {
+            return Err(crate::SchedulerError::Conflict(format!(
+                "job {} is not complete or failed",
+                source_job_id.0
+            )));
+        }
+
+        let source_nzb_path = self.persisted_nzb_path_for_job(source_job_id, history_row.as_ref());
+        let nzb = self.parse_restart_nzb(source_job_id, &source_nzb_path)?;
+        let target_nzb_path = self.nzb_dir.join(format!("{}.nzb", diagnostic_job_id.0));
+        tokio::fs::copy(&source_nzb_path, &target_nzb_path)
+            .await
+            .map_err(crate::SchedulerError::Io)?;
+        let metadata = with_diagnostic_metadata(
+            info.metadata.clone(),
+            source_job_id.0,
+            include_server_hostnames,
+        );
+        let spec =
+            crate::ingest::nzb_to_spec(&nzb, &target_nzb_path, info.category.clone(), metadata);
+
+        self.add_job(diagnostic_job_id, spec, target_nzb_path)
+            .await?;
+        self.reload_metadata_from_disk(diagnostic_job_id).await;
+        info!(
+            source_job_id = source_job_id.0,
+            diagnostic_job_id = diagnostic_job_id.0,
+            "started diagnostic re-download from finished job cache"
+        );
+
+        Ok(diagnostic_job_id)
+    }
+
     async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
         let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -1220,6 +1388,7 @@ impl Pipeline {
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
+        self.restore_download_finalization_runtime(job_id);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
         if let Some(state) = self.jobs.get(&job_id) {

@@ -48,6 +48,25 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     outputDir
     createdAt
     completedAt
+    lastDiagnosticId
+    lastDiagnosticUploadedAt
+    diagnosticRun {
+      sourceJobId
+      diagnosticJobId
+      smgDiagnosticId
+      stage
+      includeServerHostnames
+      rerunSucceeded
+      errorMessage
+      updatedAt
+    }
+    deleteOperation {
+      operationId
+      state
+      locked
+      deleteFiles
+      errorMessage
+    }
     metadata: attributes {
       key
       value
@@ -127,6 +146,19 @@ export const VERSION_QUERY = gql`
 export const BROWSE_DIRECTORIES_QUERY = gql`
   query BrowseDirectories($path: String) {
     browseDirectories(path: $path) {
+      currentPath
+      parentPath
+      entries {
+        name
+        path
+      }
+    }
+  }
+`;
+
+export const CREATE_DIRECTORY_MUTATION = gql`
+  mutation CreateDirectory($path: String!, $name: String!) {
+    createDirectory(path: $path, name: $name) {
       currentPath
       parentPath
       entries {
@@ -492,6 +524,20 @@ export const REDOWNLOAD_JOB_MUTATION = gql`
   }
 `;
 
+export const START_DIAGNOSTIC_REDOWNLOAD_MUTATION = gql`
+  mutation StartDiagnosticRedownload($id: Int!, $includeServerHostnames: Boolean!) {
+    startDiagnosticRedownload(
+      id: $id
+      includeServerHostnames: $includeServerHostnames
+    ) {
+      sourceJobId
+      diagnosticJobId
+      stage
+      includeServerHostnames
+    }
+  }
+`;
+
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {
     deleteHistory(id: $id, deleteFiles: $deleteFiles) {
@@ -520,6 +566,16 @@ export const DELETE_ALL_HISTORY_MUTATION = gql`
   }
   ${PARSED_RELEASE_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
+`;
+
+export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
+  mutation AcceptHistoryDelete($input: AcceptHistoryDeleteInput!) {
+    acceptHistoryDelete(input: $input) {
+      operationId
+      acceptedIds
+      totalTargets
+    }
+  }
 `;
 
 export const PAUSE_ALL_MUTATION = gql`
@@ -671,6 +727,40 @@ export const HISTORY_JOBS_QUERY = gql`
   }
   ${PARSED_RELEASE_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
+`;
+
+export const HISTORY_PAGE_QUERY = gql`
+  query HistoryPage($input: HistoryPageInput!) {
+    historyPage(input: $input) {
+      items {
+        ...FacadeHistoryItemFields
+      }
+      totalCount
+      counts {
+        all
+        success
+        failure
+      }
+    }
+  }
+  ${PARSED_RELEASE_FIELDS}
+  ${FACADE_HISTORY_ITEM_FIELDS}
+`;
+
+export const HISTORY_DELETE_OPERATIONS_QUERY = gql`
+  query HistoryDeleteOperations($activeOnly: Boolean) {
+    historyDeleteOperations(activeOnly: $activeOnly) {
+      id
+      state
+      deleteFiles
+      totalTargets
+      queuedTargets
+      runningTargets
+      completedTargets
+      failedTargets
+      requestedAt
+    }
+  }
 `;
 
 export const HISTORY_JOBS_COUNT_QUERY = gql`

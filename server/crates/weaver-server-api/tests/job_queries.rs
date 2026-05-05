@@ -1,6 +1,31 @@
 mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
+use tokio::time::{Duration, sleep};
+use weaver_server_core::JobHistoryRow;
+
+fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id,
+        name: name.to_string(),
+        status: status.to_string(),
+        error_message: (status == "failed").then(|| "simulated failure".to_string()),
+        total_bytes: 1_000_000 + job_id,
+        downloaded_bytes: 900_000 + job_id,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: if status == "failed" { 10 } else { 0 },
+        health: if status == "failed" { 640 } else { 1000 },
+        category: Some(if job_id % 2 == 0 { "tv" } else { "movies" }.to_string()),
+        output_dir: Some(format!("/downloads/{name}")),
+        nzb_path: Some(format!("/nzb/{name}.nzb")),
+        created_at: completed_at - 60,
+        completed_at,
+        metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // List Jobs
@@ -262,6 +287,163 @@ async fn job_nonexistent_returns_null() {
 }
 
 // ---------------------------------------------------------------------------
+// History Page
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn history_page_supports_search_counts_and_sorting() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        1,
+        "alpha.release",
+        "complete",
+        1_700_000_001,
+    ));
+    h.insert_history_row(&sample_history_row(
+        2,
+        "alpha.failure",
+        "failed",
+        1_700_000_002,
+    ));
+    h.insert_history_row(&sample_history_row(
+        3,
+        "bravo.release",
+        "complete",
+        1_700_000_003,
+    ));
+
+    let resp = h
+        .execute(
+            r#"{
+              historyPage(
+                input: {
+                  pageIndex: 0
+                  pageSize: 25
+                  search: "alpha"
+                  status: SUCCESS
+                  sortField: NAME
+                  sortDirection: ASC
+                }
+              ) {
+                totalCount
+                counts {
+                  all
+                  success
+                  failure
+                }
+                items {
+                  id
+                  name
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let page = &data["historyPage"];
+    assert_eq!(page["totalCount"].as_u64().unwrap(), 1);
+    assert_eq!(page["counts"]["all"].as_u64().unwrap(), 2);
+    assert_eq!(page["counts"]["success"].as_u64().unwrap(), 1);
+    assert_eq!(page["counts"]["failure"].as_u64().unwrap(), 1);
+
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"].as_str().unwrap(), "alpha.release");
+}
+
+#[tokio::test]
+async fn history_page_caps_page_size_at_five_hundred() {
+    let h = TestHarness::new().await;
+    for job_id in 1..=550 {
+        h.insert_history_row(&sample_history_row(
+            job_id,
+            &format!("bulk-{job_id}"),
+            "complete",
+            1_700_000_000 + job_id as i64,
+        ));
+    }
+
+    let resp = h
+        .execute(
+            r#"{
+              historyPage(input: { pageIndex: 0, pageSize: 600 }) {
+                totalCount
+                items {
+                  id
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let page = &data["historyPage"];
+    assert_eq!(page["totalCount"].as_u64().unwrap(), 550);
+    assert_eq!(page["items"].as_array().unwrap().len(), 500);
+}
+
+#[tokio::test]
+async fn history_page_remains_paged_after_deleting_the_first_page() {
+    let h = TestHarness::new().await;
+    for job_id in 1..=329 {
+        h.insert_history_row(&sample_history_row(
+            job_id,
+            &format!("history-{job_id}"),
+            "complete",
+            1_700_000_000 + job_id as i64,
+        ));
+    }
+
+    let page_one_resp = h
+        .execute(
+            r#"{
+              historyPage(input: { pageIndex: 0, pageSize: 100 }) {
+                items {
+                  id
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&page_one_resp);
+    let page_one = response_data(&page_one_resp);
+    let ids: Vec<String> = page_one["historyPage"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 100);
+
+    let delete_resp = h
+        .execute(&format!(
+            "mutation {{ deleteHistoryBatch(ids: [{}]) {{ id }} }}",
+            ids.join(", ")
+        ))
+        .await;
+    assert_no_errors(&delete_resp);
+
+    let second_page_resp = h
+        .execute(
+            r#"{
+              historyPage(input: { pageIndex: 1, pageSize: 100 }) {
+                totalCount
+                items {
+                  id
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&second_page_resp);
+    let second_page = response_data(&second_page_resp);
+    let page = &second_page["historyPage"];
+    assert_eq!(page["totalCount"].as_u64().unwrap(), 229);
+    assert_eq!(page["items"].as_array().unwrap().len(), 100);
+}
+
+// ---------------------------------------------------------------------------
 // History Delete
 // ---------------------------------------------------------------------------
 
@@ -297,6 +479,208 @@ async fn delete_all_history_idempotent() {
     let data = response_data(&resp2);
     let jobs = data["deleteAllHistory"].as_array().unwrap();
     assert!(jobs.is_empty());
+}
+
+#[tokio::test]
+async fn history_page_exposes_delete_operation_state() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        1,
+        "alpha.release",
+        "complete",
+        1_700_000_001,
+    ));
+    let operation_id =
+        h.db.insert_history_delete_operation(&[1], true)
+            .expect("failed to seed delete operation");
+
+    let resp = h
+        .execute(
+            r#"{
+              historyPage(input: { pageIndex: 0, pageSize: 25 }) {
+                items {
+                  id
+                  deleteOperation {
+                    operationId
+                    state
+                    locked
+                    deleteFiles
+                    errorMessage
+                  }
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let item = &data["historyPage"]["items"].as_array().unwrap()[0];
+    let delete_operation = &item["deleteOperation"];
+    assert_eq!(item["id"].as_u64().unwrap(), 1);
+    assert_eq!(
+        delete_operation["operationId"].as_u64().unwrap(),
+        operation_id
+    );
+    assert_eq!(delete_operation["state"].as_str().unwrap(), "QUEUED");
+    assert!(delete_operation["locked"].as_bool().unwrap());
+    assert!(delete_operation["deleteFiles"].as_bool().unwrap());
+    assert!(delete_operation["errorMessage"].is_null());
+}
+
+#[tokio::test]
+async fn job_detail_snapshot_exposes_history_delete_state() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        7,
+        "detail.release",
+        "failed",
+        1_700_000_007,
+    ));
+    let operation_id =
+        h.db.insert_history_delete_operation(&[7], false)
+            .expect("failed to seed delete operation");
+
+    let resp = h
+        .execute(
+            r#"{
+              jobDetailSnapshot(jobId: 7) {
+                historyItem {
+                  id
+                  deleteOperation {
+                    operationId
+                    state
+                    locked
+                    deleteFiles
+                  }
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let delete_operation = &data["jobDetailSnapshot"]["historyItem"]["deleteOperation"];
+    assert_eq!(
+        delete_operation["operationId"].as_u64().unwrap(),
+        operation_id
+    );
+    assert_eq!(delete_operation["state"].as_str().unwrap(), "QUEUED");
+    assert!(delete_operation["locked"].as_bool().unwrap());
+    assert!(!delete_operation["deleteFiles"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn accept_history_delete_queues_background_operation() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        11,
+        "batch.one",
+        "complete",
+        1_700_000_011,
+    ));
+    h.insert_history_row(&sample_history_row(
+        12,
+        "batch.two",
+        "failed",
+        1_700_000_012,
+    ));
+
+    let resp = h
+        .execute(
+            r#"mutation {
+              acceptHistoryDelete(
+                input: { mode: IDS, ids: [11, 12], deleteFiles: true }
+              ) {
+                operationId
+                acceptedIds
+                totalTargets
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let acceptance = &data["acceptHistoryDelete"];
+    assert_eq!(acceptance["acceptedIds"].as_array().unwrap().len(), 2);
+    assert_eq!(acceptance["totalTargets"].as_u64().unwrap(), 2);
+    let operation_id = acceptance["operationId"].as_u64().unwrap();
+
+    let mut completion_seen = false;
+    for _ in 0..20 {
+        let query_resp = h
+            .execute(
+                r#"{
+                  historyDeleteOperations(activeOnly: false) {
+                    id
+                    state
+                    totalTargets
+                    completedTargets
+                    failedTargets
+                  }
+                  first: historyItem(id: 11) { id }
+                  second: historyItem(id: 12) { id }
+                }"#,
+            )
+            .await;
+        assert_no_errors(&query_resp);
+        let query_data = response_data(&query_resp);
+        let operations = query_data["historyDeleteOperations"].as_array().unwrap();
+        if let Some(operation) = operations
+            .iter()
+            .find(|entry| entry["id"].as_u64() == Some(operation_id))
+        {
+            assert_eq!(operation["totalTargets"].as_u64().unwrap(), 2);
+            if operation["state"].as_str() == Some("COMPLETED")
+                && query_data["first"].is_null()
+                && query_data["second"].is_null()
+            {
+                completion_seen = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        completion_seen,
+        "expected background delete operation to complete"
+    );
+}
+
+#[tokio::test]
+async fn accept_history_delete_conflicts_with_locked_rows() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        21,
+        "locked.one",
+        "complete",
+        1_700_000_021,
+    ));
+    h.insert_history_row(&sample_history_row(
+        22,
+        "locked.two",
+        "complete",
+        1_700_000_022,
+    ));
+    h.db.insert_history_delete_operation(&[21], false)
+        .expect("failed to seed locked delete operation");
+
+    let resp = h
+        .execute(
+            r#"mutation {
+              acceptHistoryDelete(
+                input: { mode: ALL_HISTORY, deleteFiles: false }
+              ) {
+                operationId
+              }
+            }"#,
+        )
+        .await;
+
+    assert!(
+        !resp.errors.is_empty(),
+        "expected conflict when accepting delete-all with locked rows"
+    );
 }
 
 // ---------------------------------------------------------------------------

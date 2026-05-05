@@ -21,6 +21,8 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         created_at,
         completed_at,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -518,4 +520,173 @@ fn tracks_waiting_for_volume_as_distinct_member_span() {
         ExtractionMemberSpanKind::Extracting
     );
     assert_eq!(member_timeline.spans[2].started_at, 5_000.0);
+}
+
+#[test]
+fn builds_finalizing_download_lane_from_drain_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Verifying),
+        Some(&history(1, 8)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event(
+                "DownloadFinished",
+                5_000,
+                Some(crate::history::types::DOWNLOAD_FINALIZATION_MARKER.to_string()),
+                "",
+            ),
+            event("DownloadPipelineDrained", 7_000, None, ""),
+            event("JobVerificationStarted", 7_050, None, ""),
+        ],
+    );
+
+    let download_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Downloading)
+        .expect("download lane");
+    assert_eq!(download_lane.spans.len(), 1);
+    assert_eq!(download_lane.spans[0].started_at, 2_000.0);
+    assert_eq!(download_lane.spans[0].ended_at, Some(5_000.0));
+
+    let finalizing_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::FinalizingDownload)
+        .expect("finalizing download lane");
+    assert_eq!(finalizing_lane.spans.len(), 1);
+    assert_eq!(finalizing_lane.spans[0].started_at, 5_000.0);
+    assert_eq!(finalizing_lane.spans[0].ended_at, Some(7_000.0));
+    assert_eq!(finalizing_lane.spans[0].state, TimelineSpanState::Complete);
+
+    let verifying_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Verifying)
+        .expect("verifying lane");
+    assert_eq!(verifying_lane.spans[0].started_at, 7_050.0);
+}
+
+#[test]
+fn finalizing_download_lane_closes_on_terminal_boundary_without_drain_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Failed {
+            error: "disk write failed".into(),
+        }),
+        Some(&history(1, 8)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event(
+                "DownloadFinished",
+                5_000,
+                Some(crate::history::types::DOWNLOAD_FINALIZATION_MARKER.to_string()),
+                "",
+            ),
+            event("JobFailed", 6_500, None, "disk write failed"),
+        ],
+    );
+
+    let finalizing_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::FinalizingDownload)
+        .expect("finalizing download lane");
+    assert_eq!(finalizing_lane.spans.len(), 1);
+    assert_eq!(finalizing_lane.spans[0].started_at, 5_000.0);
+    assert_eq!(finalizing_lane.spans[0].ended_at, Some(6_500.0));
+    assert_eq!(finalizing_lane.spans[0].state, TimelineSpanState::Failed);
+}
+
+#[test]
+fn pause_during_finalizing_download_creates_pause_lane() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Verifying),
+        Some(&history(1, 9)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event(
+                "DownloadFinished",
+                5_000,
+                Some(crate::history::types::DOWNLOAD_FINALIZATION_MARKER.to_string()),
+                "",
+            ),
+            event("JobPaused", 6_000, None, "paused"),
+            event("JobResumed", 7_000, None, "resumed"),
+            event("DownloadPipelineDrained", 8_000, None, ""),
+            event("JobVerificationStarted", 8_100, None, ""),
+        ],
+    );
+
+    let finalizing_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::FinalizingDownload)
+        .expect("finalizing download lane");
+    assert_eq!(finalizing_lane.spans.len(), 2);
+    assert_eq!(finalizing_lane.spans[0].started_at, 5_000.0);
+    assert_eq!(finalizing_lane.spans[0].ended_at, Some(6_000.0));
+    assert_eq!(finalizing_lane.spans[1].started_at, 7_000.0);
+    assert_eq!(finalizing_lane.spans[1].ended_at, Some(8_000.0));
+
+    let paused_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Paused)
+        .expect("paused lane");
+    assert_eq!(paused_lane.spans.len(), 1);
+    assert_eq!(paused_lane.spans[0].started_at, 6_000.0);
+    assert_eq!(paused_lane.spans[0].ended_at, Some(7_000.0));
+}
+
+#[test]
+fn finalizing_download_lane_closes_on_next_stage_boundary_without_drain_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Verifying),
+        Some(&history(1, 8)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event(
+                "DownloadFinished",
+                5_000,
+                Some(crate::history::types::DOWNLOAD_FINALIZATION_MARKER.to_string()),
+                "",
+            ),
+            event("JobVerificationStarted", 6_500, None, ""),
+        ],
+    );
+
+    let finalizing_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::FinalizingDownload)
+        .expect("finalizing download lane");
+    assert_eq!(finalizing_lane.spans.len(), 1);
+    assert_eq!(finalizing_lane.spans[0].started_at, 5_000.0);
+    assert_eq!(finalizing_lane.spans[0].ended_at, Some(6_500.0));
+    assert_eq!(finalizing_lane.spans[0].state, TimelineSpanState::Complete);
+}
+
+#[test]
+fn legacy_download_finished_event_does_not_backfill_finalizing_lane() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Verifying),
+        Some(&history(1, 8)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("JobVerificationStarted", 6_000, None, ""),
+        ],
+    );
+
+    assert!(
+        timeline
+            .lanes
+            .iter()
+            .all(|lane| lane.stage != TimelineStage::FinalizingDownload)
+    );
 }

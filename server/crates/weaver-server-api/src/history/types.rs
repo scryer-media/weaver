@@ -1,7 +1,14 @@
-use async_graphql::{Enum, SimpleObject};
+use async_graphql::{Enum, InputObject, SimpleObject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use weaver_server_core::JobHistoryRow;
+use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
+use weaver_server_core::{
+    AsyncOperationState, AsyncOperationTargetState,
+    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
+    DiagnosticRunRow, DiagnosticRunStage as CoreDiagnosticRunStage,
+    HistoryDeleteOperationSummary as CoreHistoryDeleteOperationSummary,
+    HistoryDeleteRowState as CoreHistoryDeleteRowState, JobHistoryRow,
+};
 
 use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
@@ -32,7 +39,146 @@ pub struct HistoryItem {
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    pub last_diagnostic_id: Option<String>,
+    pub last_diagnostic_uploaded_at: Option<DateTime<Utc>>,
+    pub diagnostic_run: Option<HistoryDiagnosticRun>,
     pub attention: Option<QueueAttention>,
+    pub delete_operation: Option<HistoryDeleteRowState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
+pub enum HistoryDiagnosticStage {
+    Queued,
+    Running,
+    Collecting,
+    Uploading,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject, Serialize, Deserialize)]
+pub struct HistoryDiagnosticRun {
+    pub source_job_id: u64,
+    pub diagnostic_job_id: u64,
+    pub smg_diagnostic_id: Option<String>,
+    pub stage: HistoryDiagnosticStage,
+    pub include_server_hostnames: bool,
+    pub rerun_succeeded: Option<bool>,
+    pub error_message: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct DiagnosticRedownloadAcceptance {
+    pub source_job_id: u64,
+    pub diagnostic_job_id: u64,
+    pub stage: HistoryDiagnosticStage,
+    pub include_server_hostnames: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum AcceptHistoryDeleteMode {
+    Ids,
+    AllHistory,
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct AcceptHistoryDeleteInput {
+    pub mode: AcceptHistoryDeleteMode,
+    #[graphql(default)]
+    pub ids: Vec<u64>,
+    pub delete_files: bool,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct HistoryDeleteAcceptance {
+    pub operation_id: u64,
+    pub accepted_ids: Vec<u64>,
+    pub total_targets: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
+pub enum HistoryDeleteRowStateKind {
+    Queued,
+    Running,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
+pub enum HistoryDeleteOperationState {
+    Queued,
+    Running,
+    Completed,
+    CompletedWithErrors,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject, Serialize, Deserialize)]
+pub struct HistoryDeleteRowState {
+    pub operation_id: u64,
+    pub state: HistoryDeleteRowStateKind,
+    pub locked: bool,
+    pub delete_files: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct HistoryDeleteOperation {
+    pub id: u64,
+    pub state: HistoryDeleteOperationState,
+    pub delete_files: bool,
+    pub total_targets: u32,
+    pub queued_targets: u32,
+    pub running_targets: u32,
+    pub completed_targets: u32,
+    pub failed_targets: u32,
+    pub requested_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum HistoryStatusFilter {
+    All,
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum HistorySortField {
+    CompletedAt,
+    Name,
+    State,
+    Health,
+    Size,
+    Category,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum HistorySortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct HistoryPageInput {
+    pub page_index: u32,
+    pub page_size: u32,
+    pub search: Option<String>,
+    pub status: Option<HistoryStatusFilter>,
+    pub sort_field: Option<HistorySortField>,
+    pub sort_direction: Option<HistorySortDirection>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct HistoryPageCounts {
+    pub all: u32,
+    pub success: u32,
+    pub failure: u32,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct HistoryPage {
+    pub items: Vec<HistoryItem>,
+    pub total_count: u32,
+    pub counts: HistoryPageCounts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -41,7 +187,7 @@ pub struct HistoryCommandResult {
     pub removed_ids: Vec<u64>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct JobEvent {
     pub kind: EventKind,
     pub job_id: u64,
@@ -50,7 +196,7 @@ pub struct JobEvent {
     pub timestamp: f64,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct JobDetailSnapshot {
     pub queue_item: Option<crate::jobs::types::QueueItem>,
     pub history_item: Option<HistoryItem>,
@@ -83,7 +229,13 @@ pub(crate) fn decode_timeline_member_subject(value: Option<&str>) -> Option<Time
     serde_json::from_str(value?).ok()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub(crate) const DOWNLOAD_FINALIZATION_MARKER: &str = JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
+
+pub(crate) fn marks_download_finalization(value: Option<&str>) -> bool {
+    value == Some(DOWNLOAD_FINALIZATION_MARKER)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum EventKind {
     JobCreated,
     JobPaused,
@@ -93,6 +245,7 @@ pub enum EventKind {
     JobFailed,
     DownloadStarted,
     DownloadFinished,
+    DownloadPipelineDrained,
     ArticleDownloaded,
     ArticleNotFound,
     SegmentDecoded,
@@ -138,6 +291,7 @@ impl std::str::FromStr for EventKind {
             "JobFailed" => Ok(Self::JobFailed),
             "DownloadStarted" => Ok(Self::DownloadStarted),
             "DownloadFinished" => Ok(Self::DownloadFinished),
+            "DownloadPipelineDrained" => Ok(Self::DownloadPipelineDrained),
             "ArticleDownloaded" => Ok(Self::ArticleDownloaded),
             "ArticleNotFound" => Ok(Self::ArticleNotFound),
             "SegmentDecoded" => Ok(Self::SegmentDecoded),
@@ -173,10 +327,11 @@ impl std::str::FromStr for EventKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum TimelineStage {
     PendingDownload,
     Downloading,
+    FinalizingDownload,
     Paused,
     Verifying,
     Repairing,
@@ -185,14 +340,14 @@ pub enum TimelineStage {
     FinalMove,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum TimelineSpanState {
     Running,
     Complete,
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum ExtractionMemberState {
     Running,
     Interrupted,
@@ -201,14 +356,14 @@ pub enum ExtractionMemberState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum ExtractionMemberSpanKind {
     Extracting,
     WaitingForVolume,
     Appending,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct JobTimelineSpan {
     pub started_at: f64,
     pub ended_at: Option<f64>,
@@ -216,13 +371,13 @@ pub struct JobTimelineSpan {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct JobTimelineLane {
     pub stage: TimelineStage,
     pub spans: Vec<JobTimelineSpan>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct ExtractionMemberTimelineSpan {
     pub kind: ExtractionMemberSpanKind,
     pub started_at: f64,
@@ -231,7 +386,7 @@ pub struct ExtractionMemberTimelineSpan {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct ExtractionMemberTimeline {
     pub member: String,
     pub state: ExtractionMemberState,
@@ -239,13 +394,13 @@ pub struct ExtractionMemberTimeline {
     pub spans: Vec<ExtractionMemberTimelineSpan>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct ExtractionTimelineGroup {
     pub set_name: String,
     pub members: Vec<ExtractionMemberTimeline>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct JobTimeline {
     pub started_at: f64,
     pub ended_at: Option<f64>,
@@ -254,7 +409,11 @@ pub struct JobTimeline {
     pub extraction_groups: Vec<ExtractionTimelineGroup>,
 }
 
-pub fn history_item_from_row(row: &JobHistoryRow) -> HistoryItem {
+pub fn history_item_from_row(
+    row: &JobHistoryRow,
+    diagnostic_run: Option<HistoryDiagnosticRun>,
+    delete_operation: Option<HistoryDeleteRowState>,
+) -> HistoryItem {
     let metadata_pairs = row
         .metadata
         .as_deref()
@@ -294,7 +453,82 @@ pub fn history_item_from_row(row: &JobHistoryRow) -> HistoryItem {
         output_dir: row.output_dir.clone(),
         created_at: secs_to_datetime(row.created_at),
         completed_at: secs_to_datetime(row.completed_at),
+        last_diagnostic_id: row.last_diagnostic_id.clone(),
+        last_diagnostic_uploaded_at: row.last_diagnostic_uploaded_at_epoch_ms.map(ms_to_datetime),
+        diagnostic_run,
         attention: attention_for_history_row(row, state),
+        delete_operation,
+    }
+}
+
+pub fn history_diagnostic_run_from_core(row: DiagnosticRunRow) -> HistoryDiagnosticRun {
+    HistoryDiagnosticRun {
+        source_job_id: row.source_job_id,
+        diagnostic_job_id: row.diagnostic_job_id,
+        smg_diagnostic_id: row.smg_diagnostic_id,
+        stage: history_diagnostic_stage_from_core(row.stage),
+        include_server_hostnames: row.include_server_hostnames,
+        rerun_succeeded: row.rerun_succeeded,
+        error_message: row.error_message,
+        updated_at: ms_to_datetime(row.updated_at_epoch_ms),
+    }
+}
+
+pub fn history_diagnostic_stage_from_core(stage: CoreDiagnosticRunStage) -> HistoryDiagnosticStage {
+    match stage {
+        CoreDiagnosticRunStage::Queued => HistoryDiagnosticStage::Queued,
+        CoreDiagnosticRunStage::Running => HistoryDiagnosticStage::Running,
+        CoreDiagnosticRunStage::Collecting => HistoryDiagnosticStage::Collecting,
+        CoreDiagnosticRunStage::Uploading => HistoryDiagnosticStage::Uploading,
+        CoreDiagnosticRunStage::Complete => HistoryDiagnosticStage::Complete,
+        CoreDiagnosticRunStage::Failed => HistoryDiagnosticStage::Failed,
+    }
+}
+
+pub fn history_delete_row_state_from_core(row: CoreHistoryDeleteRowState) -> HistoryDeleteRowState {
+    HistoryDeleteRowState {
+        operation_id: row.operation_id,
+        state: match row.state {
+            AsyncOperationTargetState::Queued => HistoryDeleteRowStateKind::Queued,
+            AsyncOperationTargetState::Running => HistoryDeleteRowStateKind::Running,
+            AsyncOperationTargetState::Failed => HistoryDeleteRowStateKind::Failed,
+            AsyncOperationTargetState::Completed => {
+                unreachable!("completed delete rows should not be exposed on history items")
+            }
+        },
+        locked: row.locked,
+        delete_files: row.delete_files,
+        error_message: row.error_message,
+    }
+}
+
+pub fn history_delete_operation_from_core(
+    summary: CoreHistoryDeleteOperationSummary,
+) -> HistoryDeleteOperation {
+    HistoryDeleteOperation {
+        id: summary.id,
+        state: history_delete_operation_state_from_core(summary.state),
+        delete_files: summary.delete_files,
+        total_targets: summary.total_targets,
+        queued_targets: summary.queued_targets,
+        running_targets: summary.running_targets,
+        completed_targets: summary.completed_targets,
+        failed_targets: summary.failed_targets,
+        requested_at: DateTime::from_timestamp_millis(summary.requested_at_epoch_ms)
+            .unwrap_or_else(Utc::now),
+    }
+}
+
+pub fn history_delete_operation_state_from_core(
+    state: AsyncOperationState,
+) -> HistoryDeleteOperationState {
+    match state {
+        AsyncOperationState::Queued => HistoryDeleteOperationState::Queued,
+        AsyncOperationState::Running => HistoryDeleteOperationState::Running,
+        AsyncOperationState::Completed => HistoryDeleteOperationState::Completed,
+        AsyncOperationState::CompletedWithErrors => {
+            HistoryDeleteOperationState::CompletedWithErrors
+        }
     }
 }
 
@@ -329,6 +563,10 @@ fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attri
     for (key, value) in metadata {
         if key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY {
             client_request_id = Some(value.clone());
+        } else if key == DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY
+            || key == DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY
+        {
+            continue;
         } else {
             attributes.push(Attribute {
                 key: key.clone(),
@@ -341,6 +579,10 @@ fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attri
 
 fn secs_to_datetime(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, 0).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
 fn attention_for_history_row(row: &JobHistoryRow, state: QueueItemState) -> Option<QueueAttention> {

@@ -222,6 +222,8 @@ pub struct Pipeline {
     pub(super) active_recovery: usize,
     /// Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
+    /// Jobs that still have decode/write pipeline work after network downloads finished.
+    pub(super) jobs_finalizing_download: HashSet<JobId>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
     /// In-flight decode task count per job.

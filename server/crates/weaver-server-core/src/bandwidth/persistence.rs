@@ -15,7 +15,7 @@ impl Database {
              VALUES (?1, ?2)
              ON CONFLICT(bucket_epoch_minute)
              DO UPDATE SET payload_bytes = payload_bytes + excluded.payload_bytes",
-            rusqlite::params![bucket_epoch_minute, payload_bytes],
+            rusqlite::params![bucket_epoch_minute, payload_bytes as i64],
         )
         .map_err(db_err)?;
         Ok(())

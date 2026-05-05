@@ -37,6 +37,8 @@ const zh: LocaleDictionary = {
   "action.reprocess": "重新处理",
   "action.refresh": "刷新",
   "action.clearFilters": "清除筛选",
+  "action.previous": "上一页",
+  "action.next": "下一页",
 
   // Confirmation dialogs
   "confirm.cancelJob": "取消此任务？",
@@ -93,6 +95,7 @@ const zh: LocaleDictionary = {
   "jobs.empty": "队列为空。",
   "jobs.emptyAction": "上传一个 NZB",
   "jobs.emptyHint": "即可开始。",
+  "jobs.searchPlaceholder": "按名称或分类筛选队列",
   "jobs.passwordProtected": "[密码]",
   "jobs.pausedHeaderHint": "下载调度已全局暂停。排队中和下载中的任务将保持当前位置，直到您恢复队列。",
   "jobs.downloadsPaused": "下载已暂停",
@@ -117,6 +120,7 @@ const zh: LocaleDictionary = {
   // Table headers
   "table.name": "名称",
   "table.status": "状态",
+  "table.filters": "筛选",
   "table.priority": "优先级",
   "table.progress": "进度",
   "table.size": "大小",
@@ -149,6 +153,7 @@ const zh: LocaleDictionary = {
   "timeline.noData": "启用时间轴追踪后处理的任务将在此显示详细的流水线计时信息。",
   "timeline.pendingDownload": "等待下载",
   "timeline.downloading": "下载中",
+  "timeline.finalizingDownload": "正在完成下载收尾",
   "timeline.paused": "已暂停",
   "timeline.verifying": "校验中",
   "timeline.repairing": "修复中",
@@ -254,6 +259,7 @@ const zh: LocaleDictionary = {
   "history.noMatches": "没有符合当前筛选条件的历史任务。",
   "table.health": "健康度",
   "table.category": "分类",
+  "table.rowsPerPage": "每页行数",
 
   // Servers page
   "nav.servers": "服务器",
@@ -295,6 +301,8 @@ const zh: LocaleDictionary = {
   "categories.directoryBrowserDesc": "从 Weaver 服务器文件系统中选择目标目录。",
   "categories.directoryBrowserLoading": "正在加载目录...",
   "categories.directoryBrowserEmpty": "此处没有子目录。",
+  "categories.createFolder": "新建文件夹",
+  "categories.newFolderPlaceholder": "新文件夹名称",
   "categories.currentFolder": "当前文件夹",
   "categories.useCurrentFolder": "使用当前文件夹",
   "categories.up": "上级",

@@ -193,6 +193,9 @@ fn strip_ascii_case_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 fn derive_single_file_output_name<'a>(archive_name: &'a str, suffixes: &[&str]) -> &'a str {
     suffixes
         .iter()

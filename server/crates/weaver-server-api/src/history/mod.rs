@@ -1,3 +1,5 @@
+pub(crate) mod delete_ops;
+pub(crate) mod diagnostics;
 pub mod timeline;
 pub mod types;
 

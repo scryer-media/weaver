@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 export interface EtaJobInput {
   id: number;
@@ -198,5 +198,5 @@ export function useStableEtaSpeed(jobs: EtaJobInput[], instantaneousSpeed: numbe
 
 export function useStableQueueEta(jobs: EtaJobInput[], instantaneousSpeed: number): Map<number, string> {
   const etaSpeed = useStableEtaSpeed(jobs, instantaneousSpeed);
-  return buildQueueEtaById(jobs, etaSpeed);
+  return useMemo(() => buildQueueEtaById(jobs, etaSpeed), [jobs, etaSpeed]);
 }

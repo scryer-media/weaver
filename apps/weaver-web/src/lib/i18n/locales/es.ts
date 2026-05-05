@@ -37,6 +37,8 @@ const es: LocaleDictionary = {
   "action.reprocess": "Reprocesar",
   "action.refresh": "Actualizar",
   "action.clearFilters": "Limpiar filtros",
+  "action.previous": "Anterior",
+  "action.next": "Siguiente",
 
   // Confirmation dialogs
   "confirm.cancelJob": "¿Cancelar esta tarea?",
@@ -93,6 +95,7 @@ const es: LocaleDictionary = {
   "jobs.empty": "La cola está vacía.",
   "jobs.emptyAction": "Sube un NZB",
   "jobs.emptyHint": "para comenzar.",
+  "jobs.searchPlaceholder": "Filtrar cola por nombre o categoría",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "El envío de descargas está pausado globalmente. Las tareas en cola y en descarga mantienen su posición hasta que reanudes la cola.",
   "jobs.downloadsPaused": "Descargas pausadas",
@@ -117,6 +120,7 @@ const es: LocaleDictionary = {
   // Table headers
   "table.name": "Nombre",
   "table.status": "Estado",
+  "table.filters": "Filtros",
   "table.priority": "Prioridad",
   "table.progress": "Progreso",
   "table.size": "Tamaño",
@@ -149,6 +153,7 @@ const es: LocaleDictionary = {
   "timeline.noData": "Los tiempos detallados del pipeline aparecerán para las tareas procesadas después de que el seguimiento esté disponible.",
   "timeline.pendingDownload": "Descarga pendiente",
   "timeline.downloading": "Descargando",
+  "timeline.finalizingDownload": "Finalizando descarga",
   "timeline.paused": "Pausado",
   "timeline.verifying": "Verificando",
   "timeline.repairing": "Reparando",
@@ -254,6 +259,7 @@ const es: LocaleDictionary = {
   "history.noMatches": "Ninguna tarea del historial coincide con el filtro actual.",
   "table.health": "Salud",
   "table.category": "Categoría",
+  "table.rowsPerPage": "Filas por página",
 
   // Servers page
   "nav.servers": "Servidores",
@@ -295,6 +301,8 @@ const es: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Elige un directorio de destino del sistema de archivos del servidor Weaver.",
   "categories.directoryBrowserLoading": "Cargando directorios...",
   "categories.directoryBrowserEmpty": "No hay subdirectorios aquí.",
+  "categories.createFolder": "Crear carpeta",
+  "categories.newFolderPlaceholder": "Nombre de la nueva carpeta",
   "categories.currentFolder": "Carpeta actual",
   "categories.useCurrentFolder": "Usar carpeta actual",
   "categories.up": "Subir",

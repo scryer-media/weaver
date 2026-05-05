@@ -37,6 +37,8 @@ const pt: LocaleDictionary = {
   "action.reprocess": "Reprocessar",
   "action.refresh": "Atualizar",
   "action.clearFilters": "Limpar Filtros",
+  "action.previous": "Anterior",
+  "action.next": "Próximo",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Cancelar este job?",
@@ -93,6 +95,7 @@ const pt: LocaleDictionary = {
   "jobs.empty": "A fila está vazia.",
   "jobs.emptyAction": "Envie um NZB",
   "jobs.emptyHint": "para começar.",
+  "jobs.searchPlaceholder": "Filtrar fila por nome ou categoria",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "O envio de downloads está pausado globalmente. Jobs na fila e em download mantêm sua posição até que você retome a fila.",
   "jobs.downloadsPaused": "Downloads pausados",
@@ -117,6 +120,7 @@ const pt: LocaleDictionary = {
   // Table headers
   "table.name": "Nome",
   "table.status": "Status",
+  "table.filters": "Filtros",
   "table.priority": "Prioridade",
   "table.progress": "Progresso",
   "table.size": "Tamanho",
@@ -149,6 +153,7 @@ const pt: LocaleDictionary = {
   "timeline.noData": "A cronometragem detalhada do pipeline aparecerá para jobs processados após o rastreamento da linha do tempo estar disponível.",
   "timeline.pendingDownload": "Download Pendente",
   "timeline.downloading": "Baixando",
+  "timeline.finalizingDownload": "Finalizando Download",
   "timeline.paused": "Pausado",
   "timeline.verifying": "Verificando",
   "timeline.repairing": "Reparando",
@@ -254,6 +259,7 @@ const pt: LocaleDictionary = {
   "history.noMatches": "Nenhum job no histórico corresponde ao filtro atual.",
   "table.health": "Saúde",
   "table.category": "Categoria",
+  "table.rowsPerPage": "Linhas por página",
 
   // Servers page
   "nav.servers": "Servidores",
@@ -295,6 +301,8 @@ const pt: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Escolha um diretório de destino no sistema de arquivos do servidor Weaver.",
   "categories.directoryBrowserLoading": "Carregando diretórios...",
   "categories.directoryBrowserEmpty": "Nenhum subdiretório aqui.",
+  "categories.createFolder": "Criar pasta",
+  "categories.newFolderPlaceholder": "Nome da nova pasta",
   "categories.currentFolder": "Pasta Atual",
   "categories.useCurrentFolder": "Usar Pasta Atual",
   "categories.up": "Acima",

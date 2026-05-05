@@ -47,8 +47,8 @@ const defaultForm: CategoryFormValues = {
 export function Categories({ embedded = false }: { embedded?: boolean }) {
   const t = useTranslate();
   const [{ data }] = useQuery({ query: CATEGORIES_QUERY });
-  const [, addCategory] = useMutation(ADD_CATEGORY_MUTATION);
-  const [, updateCategory] = useMutation(UPDATE_CATEGORY_MUTATION);
+  const [addCategoryState, addCategory] = useMutation(ADD_CATEGORY_MUTATION);
+  const [updateCategoryState, updateCategory] = useMutation(UPDATE_CATEGORY_MUTATION);
   const [, removeCategory] = useMutation(REMOVE_CATEGORY_MUTATION);
 
   const [categories, setCategories] = useState<Category[]>([]);
@@ -61,6 +61,8 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
       setCategories(data.categories);
     }
   }, [data?.categories]);
+
+  const isSavingCategory = addCategoryState.fetching || updateCategoryState.fetching;
 
   const openAdd = () => {
     setEditingCategory(null);
@@ -135,6 +137,7 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
               : defaultForm
           }
           editing={!!editingCategory}
+          saving={isSavingCategory}
           onCancel={closeForm}
           onSave={handleSave}
         />
@@ -225,11 +228,13 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
 function CategoryFormCard({
   initialValues,
   editing,
+  saving,
   onSave,
   onCancel,
 }: {
   initialValues: CategoryFormValues;
   editing: boolean;
+  saving: boolean;
   onSave: (values: CategoryFormValues) => Promise<void>;
   onCancel: () => void;
 }) {
@@ -299,7 +304,7 @@ function CategoryFormCard({
         />
 
         <div className="flex flex-wrap gap-3">
-          <Button onClick={() => void onSave(values)} disabled={!values.name.trim()}>
+          <Button onClick={() => void onSave(values)} disabled={!values.name.trim() || saving}>
             {editing ? t("settings.save") : t("categories.addCategory")}
           </Button>
           <Button variant="ghost" onClick={onCancel}>

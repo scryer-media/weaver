@@ -15,11 +15,14 @@ use crate::auth::types::{ApiKey, ApiKeyScope};
 use crate::auth::{AdminGuard, ReadGuard, graphql_error};
 use crate::categories::types::Category;
 use crate::history::timeline::build_job_timeline;
-use crate::history::types::{EventKind, HistoryItem, JobDetailSnapshot, JobEvent, JobTimeline};
+use crate::history::types::{
+    EventKind, HistoryItem, HistoryPage, HistoryPageCounts, HistoryPageInput, HistorySortDirection,
+    HistorySortField, HistoryStatusFilter, JobDetailSnapshot, JobEvent, JobTimeline,
+};
 use crate::history::types::{history_item_from_row, matches_history_filter};
 use crate::jobs::types::{
     GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, QueueEvent,
-    QueueFilterInput, QueueItem, QueueSnapshot, QueueSummary,
+    QueueFilterInput, QueueItem, QueueItemState, QueueSnapshot, QueueSummary,
 };
 use crate::jobs::types::{
     decode_event_cursor, decode_offset_cursor, global_queue_state, matches_queue_event_filter,
@@ -30,8 +33,8 @@ use crate::servers::types::Server;
 use crate::settings::types::GeneralSettings;
 use crate::system::metrics_history::build_metrics_history;
 use crate::system::types::{
-    DirectoryBrowseEntry, DirectoryBrowseResult, MetricsHistoryResult, ServiceLogsPayload,
-    SystemMetricsSnapshot, SystemStatus,
+    DirectoryBrowseResult, MetricsHistoryResult, ServiceLogsPayload, SystemMetricsSnapshot,
+    SystemStatus,
 };
 use crate::system::types::{DownloadBlock, Metrics, PipelineEventGql};
 
@@ -63,6 +66,7 @@ pub struct MutationRoot(
     rss_mutation::RssMutation,
     servers_mutation::ServersMutation,
     settings_mutation::SettingsMutation,
+    system_mutation::SystemMutation,
 );
 
 #[derive(Default, MergedSubscription)]
@@ -113,6 +117,9 @@ pub mod servers_mutation;
 
 #[path = "settings/mutation.rs"]
 pub mod settings_mutation;
+
+#[path = "system/mutation.rs"]
+pub mod system_mutation;
 
 #[path = "history/subscription.rs"]
 pub mod history_subscription;

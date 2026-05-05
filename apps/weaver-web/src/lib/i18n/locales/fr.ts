@@ -37,6 +37,8 @@ const fr: LocaleDictionary = {
   "action.reprocess": "Retraiter",
   "action.refresh": "Actualiser",
   "action.clearFilters": "Effacer les filtres",
+  "action.previous": "Précédent",
+  "action.next": "Suivant",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Annuler ce téléchargement ?",
@@ -93,6 +95,7 @@ const fr: LocaleDictionary = {
   "jobs.empty": "La file d'attente est vide.",
   "jobs.emptyAction": "Téléversez un NZB",
   "jobs.emptyHint": "pour commencer.",
+  "jobs.searchPlaceholder": "Filtrer la file par nom ou catégorie",
   "jobs.passwordProtected": "[MDP]",
   "jobs.pausedHeaderHint": "La distribution des téléchargements est globalement en pause. Les tâches en attente et en cours conservent leur position jusqu'à la reprise.",
   "jobs.downloadsPaused": "Téléchargements en pause",
@@ -117,6 +120,7 @@ const fr: LocaleDictionary = {
   // Table headers
   "table.name": "Nom",
   "table.status": "Statut",
+  "table.filters": "Filtres",
   "table.priority": "Priorité",
   "table.progress": "Progression",
   "table.size": "Taille",
@@ -149,6 +153,7 @@ const fr: LocaleDictionary = {
   "timeline.noData": "Le chronométrage détaillé du pipeline sera affiché pour les tâches traitées après l'activation du suivi.",
   "timeline.pendingDownload": "En attente de téléchargement",
   "timeline.downloading": "Téléchargement",
+  "timeline.finalizingDownload": "Finalisation du téléchargement",
   "timeline.paused": "En pause",
   "timeline.verifying": "Vérification",
   "timeline.repairing": "Réparation",
@@ -254,6 +259,7 @@ const fr: LocaleDictionary = {
   "history.noMatches": "Aucune tâche ne correspond au filtre actuel.",
   "table.health": "Santé",
   "table.category": "Catégorie",
+  "table.rowsPerPage": "Lignes par page",
 
   // Servers page
   "nav.servers": "Serveurs",
@@ -295,6 +301,8 @@ const fr: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Choisissez un répertoire de destination depuis le système de fichiers du serveur Weaver.",
   "categories.directoryBrowserLoading": "Chargement des répertoires...",
   "categories.directoryBrowserEmpty": "Aucun sous-répertoire ici.",
+  "categories.createFolder": "Créer un dossier",
+  "categories.newFolderPlaceholder": "Nom du nouveau dossier",
   "categories.currentFolder": "Dossier actuel",
   "categories.useCurrentFolder": "Utiliser ce dossier",
   "categories.up": "Remonter",

@@ -17,6 +17,7 @@ export interface TimelineLane {
   stage:
     | "PENDING_DOWNLOAD"
     | "DOWNLOADING"
+    | "FINALIZING_DOWNLOAD"
     | "PAUSED"
     | "VERIFYING"
     | "REPAIRING"
@@ -89,6 +90,7 @@ type PlotRow = {
 const JOB_STAGE_KEYS: Record<TimelineLane["stage"], string> = {
   PENDING_DOWNLOAD: "timeline.pendingDownload",
   DOWNLOADING: "timeline.downloading",
+  FINALIZING_DOWNLOAD: "timeline.finalizingDownload",
   PAUSED: "timeline.paused",
   VERIFYING: "timeline.verifying",
   REPAIRING: "timeline.repairing",
@@ -103,6 +105,8 @@ function laneColor(stage: TimelineLane["stage"]): string {
       return "bg-slate-400/75";
     case "DOWNLOADING":
       return "bg-sky-500/90";
+    case "FINALIZING_DOWNLOAD":
+      return "bg-teal-500/90";
     case "PAUSED":
       return "bg-cyan-500/85";
     case "VERIFYING":

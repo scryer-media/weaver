@@ -14,6 +14,8 @@ interface ConfirmDialogProps {
   message: string;
   confirmLabel: string;
   cancelLabel?: string;
+  confirmDisabled?: boolean;
+  cancelDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
   children?: React.ReactNode;
@@ -25,6 +27,8 @@ export function ConfirmDialog({
   message,
   confirmLabel,
   cancelLabel,
+  confirmDisabled,
+  cancelDisabled,
   onConfirm,
   onCancel,
   children,
@@ -38,10 +42,10 @@ export function ConfirmDialog({
         </DialogHeader>
         {children}
         <DialogFooter>
-          <Button variant="ghost" onClick={onCancel}>
+          <Button variant="ghost" onClick={onCancel} disabled={cancelDisabled}>
             {cancelLabel ?? "Cancel"}
           </Button>
-          <Button variant="destructive" onClick={onConfirm}>
+          <Button variant="destructive" onClick={onConfirm} disabled={confirmDisabled}>
             {confirmLabel}
           </Button>
         </DialogFooter>

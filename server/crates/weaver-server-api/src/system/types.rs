@@ -1,8 +1,14 @@
 use async_graphql::{Enum, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
+use weaver_server_core::operations::{
+    DirectoryBrowseEntry as CoreDirectoryBrowseEntry,
+    DirectoryBrowseListing as CoreDirectoryBrowseListing,
+};
 
-use crate::history::types::{EventKind, encode_timeline_member_subject};
+use crate::history::types::{
+    DOWNLOAD_FINALIZATION_MARKER, EventKind, encode_timeline_member_subject,
+};
 use crate::jobs::types::{GlobalQueueState, QueueSummary};
 use crate::settings::types::IspBandwidthCapPeriodGql;
 
@@ -17,6 +23,25 @@ pub struct DirectoryBrowseResult {
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<DirectoryBrowseEntry>,
+}
+
+impl From<CoreDirectoryBrowseEntry> for DirectoryBrowseEntry {
+    fn from(value: CoreDirectoryBrowseEntry) -> Self {
+        Self {
+            name: value.name,
+            path: value.path,
+        }
+    }
+}
+
+impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
+    fn from(value: CoreDirectoryBrowseListing) -> Self {
+        Self {
+            current_path: value.current_path,
+            parent_path: value.parent_path,
+            entries: value.entries.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -163,7 +188,7 @@ pub struct MetricsHistoryResult {
     pub series: Vec<MetricSeries>,
 }
 
-#[derive(Debug, Clone, SimpleObject)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, SimpleObject)]
 pub struct PipelineEventGql {
     pub kind: EventKind,
     pub job_id: Option<u64>,
@@ -223,11 +248,20 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: "download started".into(),
             },
-            PipelineEvent::DownloadFinished { job_id } => Self {
+            PipelineEvent::DownloadFinished {
+                job_id,
+                finalization_pending,
+            } => Self {
                 kind: EventKind::DownloadFinished,
                 job_id: Some(job_id.0),
-                file_id: None,
+                file_id: finalization_pending.then(|| DOWNLOAD_FINALIZATION_MARKER.to_string()),
                 message: "download finished".into(),
+            },
+            PipelineEvent::DownloadPipelineDrained { job_id } => Self {
+                kind: EventKind::DownloadPipelineDrained,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "download pipeline drained".into(),
             },
             PipelineEvent::ArticleDownloaded {
                 segment_id,

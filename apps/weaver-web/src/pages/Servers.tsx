@@ -62,8 +62,8 @@ const defaultForm: ServerFormValues = {
 export function Servers({ embedded = false }: { embedded?: boolean }) {
   const t = useTranslate();
   const [{ data }] = useQuery({ query: SERVERS_QUERY });
-  const [, addServer] = useMutation(ADD_SERVER_MUTATION);
-  const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
+  const [addServerState, addServer] = useMutation(ADD_SERVER_MUTATION);
+  const [updateServerState, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
 
@@ -85,6 +85,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       setServers(data.servers);
     }
   }, [data?.servers]);
+
+  const isSavingServer = addServerState.fetching || updateServerState.fetching;
 
   const groupedServers = useMemo(() => {
     const groups = new Map<number, Server[]>();
@@ -220,6 +222,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
               : defaultForm
           }
           editing={!!editingServer}
+          saving={isSavingServer}
           testing={testing}
           saveError={saveError}
           testResult={testResult}
@@ -300,6 +303,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 function ServerFormCard({
   initialValues,
   editing,
+  saving,
   testing,
   saveError,
   testResult,
@@ -309,6 +313,7 @@ function ServerFormCard({
 }: {
   initialValues: ServerFormValues;
   editing: boolean;
+  saving: boolean;
   testing: boolean;
   saveError: string | null;
   testResult: {
@@ -443,7 +448,7 @@ function ServerFormCard({
         ) : null}
 
         <div className="flex flex-wrap gap-3">
-          <Button onClick={() => void onSave(values)} disabled={!values.host.trim()}>
+          <Button onClick={() => void onSave(values)} disabled={!values.host.trim() || saving}>
             {editing ? t("settings.save") : t("servers.addServer")}
           </Button>
           <Button variant="outline" onClick={() => void onTest(values)} disabled={!values.host.trim() || testing}>

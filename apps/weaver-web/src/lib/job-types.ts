@@ -38,6 +38,25 @@ export interface ParsedReleaseData {
   episode: ParsedEpisodeData | null;
 }
 
+export interface DeleteOperationData {
+  operationId: number;
+  state: "QUEUED" | "RUNNING" | "FAILED";
+  locked: boolean;
+  deleteFiles: boolean;
+  errorMessage?: string | null;
+}
+
+export interface DiagnosticRunData {
+  sourceJobId: number;
+  diagnosticJobId: number;
+  smgDiagnosticId?: string | null;
+  stage: "QUEUED" | "RUNNING" | "COLLECTING" | "UPLOADING" | "COMPLETE" | "FAILED";
+  includeServerHostnames: boolean;
+  rerunSucceeded?: boolean | null;
+  errorMessage?: string | null;
+  updatedAt?: number | null;
+}
+
 export interface JobData {
   id: number;
   name: string;
@@ -60,15 +79,23 @@ export interface JobData {
   error?: string | null;
   outputDir?: string | null;
   metadata: { key: string; value: string }[];
+  deleteOperation?: DeleteOperationData | null;
+  diagnosticRun?: DiagnosticRunData | null;
+  lastDiagnosticId?: string | null;
+  lastDiagnosticUploadedAt?: number | null;
 }
 
-export interface GraphqlJobData extends Omit<JobData, "progress" | "createdAt" | "completedAt" | "metadata"> {
+export interface GraphqlJobData extends Omit<JobData, "progress" | "createdAt" | "completedAt" | "metadata" | "diagnosticRun" | "lastDiagnosticUploadedAt"> {
   progress?: number | null;
   progressPercent?: number | null;
   createdAt?: string | number | null;
   completedAt?: string | number | null;
+  lastDiagnosticUploadedAt?: string | number | null;
   metadata?: { key: string; value: string }[];
   attributes?: { key: string; value: string }[];
+  diagnosticRun?: (Omit<DiagnosticRunData, "updatedAt"> & {
+    updatedAt?: string | number | null;
+  }) | null;
 }
 
 export function normalizeFacadeJobStatus(status: string): string {
@@ -115,7 +142,14 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
     progress: normalizeFacadeJobProgress(job.progressPercent, job.progress),
     createdAt: normalizeGraphqlTimestamp(job.createdAt),
     completedAt: normalizeGraphqlTimestamp(job.completedAt),
+    lastDiagnosticUploadedAt: normalizeGraphqlTimestamp(job.lastDiagnosticUploadedAt),
     metadata: job.metadata ?? job.attributes ?? [],
+    diagnosticRun: job.diagnosticRun
+      ? {
+        ...job.diagnosticRun,
+        updatedAt: normalizeGraphqlTimestamp(job.diagnosticRun.updatedAt),
+      }
+      : null,
   };
 }
 

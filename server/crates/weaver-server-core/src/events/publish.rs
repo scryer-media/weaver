@@ -29,7 +29,8 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::JobCompleted { job_id }
         | PipelineEvent::JobFailed { job_id, .. }
         | PipelineEvent::DownloadStarted { job_id }
-        | PipelineEvent::DownloadFinished { job_id }
+        | PipelineEvent::DownloadFinished { job_id, .. }
+        | PipelineEvent::DownloadPipelineDrained { job_id }
         | PipelineEvent::Par2MetadataLoaded { job_id }
         | PipelineEvent::JobVerificationStarted { job_id }
         | PipelineEvent::JobVerificationComplete { job_id, .. }

@@ -16,6 +16,8 @@ pub struct JobHistoryRow {
     pub created_at: i64,
     pub completed_at: i64,
     pub metadata: Option<String>,
+    pub last_diagnostic_id: Option<String>,
+    pub last_diagnostic_uploaded_at_epoch_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

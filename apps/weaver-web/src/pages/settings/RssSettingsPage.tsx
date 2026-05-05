@@ -174,11 +174,11 @@ export function RssSettingsPage() {
   const [{ data, fetching, error }, reexecuteQuery] = useQuery<RssSettingsData>({
     query: RSS_SETTINGS_QUERY,
   });
-  const [, addFeed] = useMutation(ADD_RSS_FEED_MUTATION);
-  const [, updateFeed] = useMutation(UPDATE_RSS_FEED_MUTATION);
+  const [addFeedState, addFeed] = useMutation(ADD_RSS_FEED_MUTATION);
+  const [updateFeedState, updateFeed] = useMutation(UPDATE_RSS_FEED_MUTATION);
   const [, deleteFeed] = useMutation(DELETE_RSS_FEED_MUTATION);
-  const [, addRule] = useMutation(ADD_RSS_RULE_MUTATION);
-  const [, updateRule] = useMutation(UPDATE_RSS_RULE_MUTATION);
+  const [addRuleState, addRule] = useMutation(ADD_RSS_RULE_MUTATION);
+  const [updateRuleState, updateRule] = useMutation(UPDATE_RSS_RULE_MUTATION);
   const [, deleteRule] = useMutation(DELETE_RSS_RULE_MUTATION);
   const [, deleteSeenItem] = useMutation(DELETE_RSS_SEEN_ITEM_MUTATION);
   const [, clearSeenItems] = useMutation(CLEAR_RSS_SEEN_ITEMS_MUTATION);
@@ -224,6 +224,8 @@ export function RssSettingsPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [syncReport, setSyncReport] = useState<RssSyncReport | null>(null);
+  const isSavingFeed = addFeedState.fetching || updateFeedState.fetching;
+  const isSavingRule = addRuleState.fetching || updateRuleState.fetching;
 
   useEffect(() => {
     if (error) {
@@ -450,6 +452,7 @@ export function RssSettingsPage() {
                 }
               : defaultFeedForm
           }
+          saving={isSavingFeed}
           onCancel={closeFeedForm}
           onSave={handleFeedSave}
         />
@@ -591,6 +594,7 @@ export function RssSettingsPage() {
                       }
                     : defaultRuleForm
                 }
+                saving={isSavingRule}
                 onCancel={closeRuleEditor}
                 onSave={(values) =>
                   handleRuleSave(feed.id, ruleEditor.rule?.id ?? null, values)
@@ -677,12 +681,14 @@ function FeedFormCard({
   categories,
   editing,
   initialValues,
+  saving,
   onSave,
   onCancel,
 }: {
   categories: Category[];
   editing: boolean;
   initialValues: FeedFormValues;
+  saving: boolean;
   onSave: (values: FeedFormValues) => Promise<void>;
   onCancel: () => void;
 }) {
@@ -824,7 +830,12 @@ function FeedFormCard({
         <div className="flex flex-wrap gap-3">
           <Button
             onClick={() => void onSave(values)}
-            disabled={!values.name.trim() || !values.url.trim() || values.pollIntervalSecs < 1}
+            disabled={
+              !values.name.trim() ||
+              !values.url.trim() ||
+              values.pollIntervalSecs < 1 ||
+              saving
+            }
           >
             {editing ? t("settings.save") : t("rss.addFeed")}
           </Button>
@@ -841,12 +852,14 @@ function RuleFormCard({
   categories,
   editing,
   initialValues,
+  saving,
   onSave,
   onCancel,
 }: {
   categories: Category[];
   editing: boolean;
   initialValues: RuleFormValues;
+  saving: boolean;
   onSave: (values: RuleFormValues) => Promise<void>;
   onCancel: () => void;
 }) {
@@ -999,7 +1012,7 @@ function RuleFormCard({
       </div>
 
       <div className="mt-4 flex flex-wrap gap-3">
-        <Button onClick={() => void onSave(values)}>
+        <Button onClick={() => void onSave(values)} disabled={saving}>
           {editing ? t("settings.save") : t("rss.addRule")}
         </Button>
         <Button variant="ghost" onClick={onCancel}>

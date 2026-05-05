@@ -94,18 +94,7 @@ impl SystemQuery {
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|error| graphql_error("INTERNAL", error))?;
 
-        Ok(DirectoryBrowseResult {
-            current_path: listing.current_path,
-            parent_path: listing.parent_path,
-            entries: listing
-                .entries
-                .into_iter()
-                .map(|entry| DirectoryBrowseEntry {
-                    name: entry.name,
-                    path: entry.path,
-                })
-                .collect(),
-        })
+        Ok(listing.into())
     }
     /// Return recent log lines from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]

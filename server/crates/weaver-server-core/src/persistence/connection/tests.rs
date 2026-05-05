@@ -441,8 +441,7 @@ fn migrate_v18_adds_two_lane_runtime_columns() {
     assert_eq!(version, SCHEMA_VERSION);
 }
 
-#[test]
-fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
+fn assert_legacy_cleanup_from(start_version: i64) {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("weaver.db");
     let now = SystemTime::now()
@@ -452,10 +451,10 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
     let metrics_cutoff_epoch_sec = now - 24 * 60 * 60;
 
     let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL;
          CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version (version) VALUES (19);
+         INSERT INTO schema_version (version) VALUES ({start_version});
          CREATE TABLE integration_events (
              id           INTEGER PRIMARY KEY AUTOINCREMENT,
              timestamp    INTEGER NOT NULL,
@@ -485,7 +484,7 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
              completed_at     INTEGER NOT NULL,
              metadata         TEXT
          );",
-    )
+    ))
     .unwrap();
     conn.execute(
         "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
@@ -588,4 +587,14 @@ fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
         .optional()
         .unwrap();
     assert!(integration_sequence.is_none());
+}
+
+#[test]
+fn migrate_v19_purges_integration_events_and_prunes_old_metrics() {
+    assert_legacy_cleanup_from(19);
+}
+
+#[test]
+fn migrate_v20_retries_legacy_cleanup_before_advancing_version() {
+    assert_legacy_cleanup_from(20);
 }

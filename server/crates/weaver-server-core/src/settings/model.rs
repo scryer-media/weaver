@@ -40,6 +40,9 @@ pub struct Config {
     /// Optional ISP bandwidth cap policy.
     #[serde(default)]
     pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
+    /// Optional SMG base URL for diagnostic bundle uploads.
+    #[serde(default)]
+    pub diagnostic_upload_url: Option<String>,
 
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]

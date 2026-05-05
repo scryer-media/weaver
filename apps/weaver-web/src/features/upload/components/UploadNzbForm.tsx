@@ -1,4 +1,5 @@
 import { UploadCloud, X } from "lucide-react";
+import type { Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb } from "@/features/upload/hooks/use-upload-nzb";
 import { formatNzbNameForDisplay } from "@/lib/format-nzb-name";
@@ -20,10 +21,12 @@ const NO_CATEGORY_VALUE = "__none__";
 export function UploadNzbForm({
   layout = "page",
   open,
+  formRef,
   onSubmitted,
 }: {
   layout?: "page" | "dialog";
   open?: boolean;
+  formRef?: Ref<HTMLFormElement>;
   onSubmitted?: () => void;
 }) {
   const t = useTranslate();
@@ -62,7 +65,18 @@ export function UploadNzbForm({
           {layout === "page" ? t("upload.accepts") : t("upload.dropzone")}
         </CardDescription>
       </CardHeader>
-      <CardContent className={cn("space-y-5", layout === "dialog" ? "px-0 pb-0" : "")}>
+      <CardContent className={cn(layout === "dialog" ? "px-0 pb-0" : "")}>
+        <form
+          ref={formRef}
+          className="space-y-5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (files.length === 0 || fetching) {
+              return;
+            }
+            void submit();
+          }}
+        >
         <button
           type="button"
           className={cn(
@@ -208,10 +222,11 @@ export function UploadNzbForm({
         ) : null}
 
         <div className="flex justify-end">
-          <Button disabled={files.length === 0 || fetching} onClick={() => void submit()}>
+          <Button type="submit" disabled={files.length === 0 || fetching}>
             {fetching ? t("action.uploading") : t("action.submit")}
           </Button>
         </div>
+        </form>
       </CardContent>
     </Card>
   );

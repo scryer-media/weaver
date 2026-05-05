@@ -13,7 +13,8 @@ impl Database {
                 "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
                         optional_recovery_bytes, optional_recovery_downloaded_bytes,
                         failed_bytes, health, category, output_dir, nzb_path,
-                        created_at, completed_at, metadata
+                        created_at, completed_at, metadata,
+                        last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
                  FROM job_history
                  WHERE job_id = ?1
                  LIMIT 1",
@@ -42,6 +43,8 @@ impl Database {
             created_at: row.get(13).map_err(db_err)?,
             completed_at: row.get(14).map_err(db_err)?,
             metadata: row.get(15).map_err(db_err)?,
+            last_diagnostic_id: row.get(16).map_err(db_err)?,
+            last_diagnostic_uploaded_at_epoch_ms: row.get(17).map_err(db_err)?,
         }))
     }
 
@@ -55,7 +58,8 @@ impl Database {
             "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata
+                    created_at, completed_at, metadata,
+                    last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
              FROM job_history WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -101,6 +105,8 @@ impl Database {
                     created_at: row.get(13)?,
                     completed_at: row.get(14)?,
                     metadata: row.get(15)?,
+                    last_diagnostic_id: row.get(16)?,
+                    last_diagnostic_uploaded_at_epoch_ms: row.get(17)?,
                 })
             })
             .map_err(db_err)?;

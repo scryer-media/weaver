@@ -212,8 +212,8 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
             }
 
             Ok(Event::Text(e)) => {
-                text_buf = e
-                    .unescape()
+                let decoded = e.decode().map_err(|e| NzbError::Xml(e.to_string()))?;
+                text_buf = quick_xml::escape::unescape(&decoded)
                     .map_err(|e| NzbError::Xml(e.to_string()))?
                     .into_owned();
             }

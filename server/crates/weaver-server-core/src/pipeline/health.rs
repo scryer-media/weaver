@@ -289,6 +289,7 @@ impl Pipeline {
         self.failed_extractions.remove(&job_id);
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
+        self.jobs_finalizing_download.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_decodes_by_job.remove(&job_id);
         self.pending_retries_by_job.remove(&job_id);

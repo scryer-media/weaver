@@ -1,8 +1,17 @@
-import { ChevronRight, FolderOpen, Loader2, MoveUp } from "lucide-react";
-import { useQuery } from "urql";
+import { useCallback, useEffect, useState } from "react";
+import { ArrowUp, ChevronRight, Folder, FolderOpen, FolderPlus, Loader2 } from "lucide-react";
+import { useClient, useMutation } from "urql";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { BROWSE_DIRECTORIES_QUERY } from "@/graphql/queries";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { BROWSE_DIRECTORIES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 
 type DirectoryBrowseResult = {
@@ -10,6 +19,20 @@ type DirectoryBrowseResult = {
   parentPath: string | null;
   entries: { name: string; path: string }[];
 };
+
+const ROOT_PATH = "/";
+
+function normalizePath(path: string | null | undefined): string {
+  return path?.trim() || ROOT_PATH;
+}
+
+function parentPathFor(path: string): string | null {
+  return path === ROOT_PATH ? null : path.replace(/\/[^/]+\/?$/, "") || ROOT_PATH;
+}
+
+function errorMessage(error: { graphQLErrors: { message: string }[]; message: string }): string {
+  return error.graphQLErrors[0]?.message ?? error.message;
+}
 
 export function DirectoryBrowserDialog({
   open,
@@ -25,13 +48,96 @@ export function DirectoryBrowserDialog({
   onChoose: (path: string) => void;
 }) {
   const t = useTranslate();
-  const [{ data, fetching, error }] = useQuery<{ browseDirectories: DirectoryBrowseResult }>({
-    query: BROWSE_DIRECTORIES_QUERY,
-    variables: { path },
-    pause: !open,
-  });
+  const client = useClient();
+  const [createState, createDirectory] = useMutation<{
+    createDirectory: DirectoryBrowseResult;
+  }>(CREATE_DIRECTORY_MUTATION);
+  const [currentPath, setCurrentPath] = useState(normalizePath(path));
+  const [parentPath, setParentPath] = useState<string | null>(parentPathFor(normalizePath(path)));
+  const [entries, setEntries] = useState<DirectoryBrowseResult["entries"]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [createError, setCreateError] = useState<string | null>(null);
 
-  const browser = data?.browseDirectories;
+  const applyListing = useCallback((browser: DirectoryBrowseResult | null | undefined, fallbackPath: string) => {
+    const resolvedPath = browser?.currentPath?.trim() || fallbackPath;
+    setCurrentPath(resolvedPath);
+    setParentPath(browser?.parentPath ?? parentPathFor(resolvedPath));
+    setEntries(browser?.entries ?? []);
+    setError(null);
+  }, []);
+
+  const browse = useCallback(
+    async function runBrowse(
+      nextPath: string | null | undefined,
+      options?: { fallbackToRootOnError?: boolean },
+    ): Promise<void> {
+      const requestedPath = normalizePath(nextPath);
+      setCurrentPath(requestedPath);
+      setLoading(true);
+      setError(null);
+      setCreateError(null);
+
+      const result = await client
+        .query<{ browseDirectories: DirectoryBrowseResult }>(BROWSE_DIRECTORIES_QUERY, {
+          path: requestedPath,
+        })
+        .toPromise();
+
+      setLoading(false);
+
+      if (result.error) {
+        if (options?.fallbackToRootOnError && requestedPath !== ROOT_PATH) {
+          await runBrowse(ROOT_PATH, { fallbackToRootOnError: false });
+          return;
+        }
+        setEntries([]);
+        setParentPath(parentPathFor(requestedPath));
+        setError(result.error.message);
+        return;
+      }
+
+      applyListing(result.data?.browseDirectories, requestedPath);
+    },
+    [applyListing, client],
+  );
+
+  const handleCreateFolder = useCallback(async () => {
+    const folderName = newFolderName.trim();
+    if (!folderName) {
+      return;
+    }
+
+    const basePath = normalizePath(currentPath);
+    const result = await createDirectory({
+      path: basePath,
+      name: folderName,
+    });
+
+    if (result.error) {
+      setCreateError(errorMessage(result.error));
+      return;
+    }
+
+    applyListing(result.data?.createDirectory, basePath);
+    setNewFolderName("");
+    setCreateError(null);
+  }, [applyListing, createDirectory, currentPath, newFolderName]);
+
+  useEffect(() => {
+    if (!open) {
+      setError(null);
+      setCreateError(null);
+      setNewFolderName("");
+      return;
+    }
+
+    void browse(path, { fallbackToRootOnError: true });
+  }, [open, path, browse]);
+
+  const isBusy = loading || createState.fetching;
+  const pathSegments = currentPath.split("/").filter(Boolean);
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
@@ -42,67 +148,162 @@ export function DirectoryBrowserDialog({
         </DialogHeader>
 
         <div className="space-y-4">
-          <div className="rounded-xl border border-border/70 bg-background/70 px-3 py-2">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-              {t("categories.currentFolder")}
-            </div>
-            <div className="mt-1 break-all text-sm text-foreground">
-              {browser?.currentPath ?? path ?? t("label.loading")}
-            </div>
+          <div className="flex items-center gap-1 overflow-x-auto rounded-xl border border-border/70 bg-background/70 px-2 py-2 text-sm">
+            <button
+              type="button"
+              onClick={() => void browse(ROOT_PATH)}
+              disabled={isBusy}
+              className="shrink-0 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+            >
+              /
+            </button>
+            {pathSegments.map((segment, index) => {
+              const segmentPath = `${ROOT_PATH}${pathSegments.slice(0, index + 1).join("/")}`;
+              const isLast = index === pathSegments.length - 1;
+
+              return (
+                <span key={segmentPath} className="flex items-center gap-1">
+                  <ChevronRight className="size-3 shrink-0 text-muted-foreground" />
+                  <button
+                    type="button"
+                    onClick={() => void browse(segmentPath)}
+                    disabled={isBusy}
+                    className={
+                      isLast
+                        ? "shrink-0 rounded px-1.5 py-0.5 font-medium text-foreground"
+                        : "shrink-0 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+                    }
+                  >
+                    {segment}
+                  </button>
+                </span>
+              );
+            })}
           </div>
 
-          <div className="flex flex-wrap gap-2">
+          <div className="flex gap-2">
+            <Input
+              value={currentPath}
+              onChange={(event) => setCurrentPath(event.target.value)}
+              disabled={isBusy}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void browse(currentPath);
+                }
+              }}
+              className="font-mono text-sm"
+            />
             <Button
               type="button"
               variant="outline"
-              onClick={() => browser?.parentPath && onPathChange(browser.parentPath)}
-              disabled={!browser?.parentPath || fetching}
+              onClick={() => void browse(currentPath)}
+              disabled={isBusy}
             >
-              <MoveUp className="size-4" />
-              {t("categories.up")}
-            </Button>
-            <Button
-              type="button"
-              onClick={() => browser && onChoose(browser.currentPath)}
-              disabled={!browser || fetching}
-            >
-              {t("categories.useCurrentFolder")}
+              {t("categories.browse")}
             </Button>
           </div>
 
-          <div className="max-h-[24rem] overflow-y-auto rounded-2xl border border-border/70 bg-background/70 p-2">
-            {fetching ? (
-              <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
+          <div className="space-y-2">
+            <div className="flex gap-2">
+              <Input
+                value={newFolderName}
+                placeholder={t("categories.newFolderPlaceholder")}
+                disabled={isBusy}
+                onChange={(event) => {
+                  setNewFolderName(event.target.value);
+                  setCreateError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" || isBusy || !newFolderName.trim()) {
+                    return;
+                  }
+                  event.preventDefault();
+                  void handleCreateFolder();
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isBusy || !newFolderName.trim()}
+                onClick={() => void handleCreateFolder()}
+              >
+                {createState.fetching ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <FolderPlus className="size-4" />
+                )}
+                {t("categories.createFolder")}
+              </Button>
+            </div>
+            <div aria-live="polite" className="min-h-5 text-sm text-destructive">
+              {createError}
+            </div>
+          </div>
+
+          <div className="flex h-[24rem] flex-col overflow-hidden rounded-2xl border border-border/70 bg-background/70">
+            {loading ? (
+              <div className="flex flex-1 items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" />
                 {t("categories.directoryBrowserLoading")}
               </div>
             ) : error ? (
-              <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive">
-                {error.message}
-              </div>
-            ) : browser && browser.entries.length > 0 ? (
-              <div className="space-y-1">
-                {browser.entries.map((entry) => (
-                  <button
-                    key={entry.path}
-                    type="button"
-                    className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition hover:bg-accent/40"
-                    onClick={() => onPathChange(entry.path)}
-                  >
-                    <div className="flex min-w-0 items-center gap-3">
-                      <FolderOpen className="size-4 shrink-0 text-primary" />
-                      <span className="truncate text-foreground">{entry.name}</span>
-                    </div>
-                    <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
-                  </button>
-                ))}
-              </div>
+              <div className="flex-1 overflow-y-auto px-4 py-4 text-sm text-destructive">{error}</div>
             ) : (
-              <div className="px-3 py-4 text-sm text-muted-foreground">
-                {t("categories.directoryBrowserEmpty")}
+              <div className="flex-1 overflow-y-auto divide-y divide-border/70">
+                {parentPath !== null ? (
+                  <button
+                    type="button"
+                    onClick={() => void browse(parentPath)}
+                    disabled={isBusy}
+                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+                  >
+                    <ArrowUp className="size-4 shrink-0" />
+                    <span>..</span>
+                  </button>
+                ) : null}
+
+                {entries.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-sm text-muted-foreground">
+                    {t("categories.directoryBrowserEmpty")}
+                  </div>
+                ) : (
+                  entries.map((entry) => (
+                    <button
+                      key={entry.path}
+                      type="button"
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-accent/40"
+                      onClick={() => void browse(entry.path)}
+                      disabled={isBusy}
+                    >
+                      <Folder className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate text-foreground">{entry.name}</span>
+                    </button>
+                  ))
+                )}
               </div>
             )}
           </div>
+
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose}>
+              {t("action.cancel")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                const selectedPath = normalizePath(currentPath);
+                onPathChange(selectedPath);
+                onChoose(selectedPath);
+              }}
+              disabled={isBusy}
+              className="max-w-full justify-start overflow-hidden"
+            >
+              <FolderOpen className="size-4" />
+              <span>{t("categories.useCurrentFolder")}</span>
+              <span className="min-w-0 truncate font-mono text-xs opacity-80">{currentPath}</span>
+            </Button>
+          </DialogFooter>
         </div>
       </DialogContent>
     </Dialog>

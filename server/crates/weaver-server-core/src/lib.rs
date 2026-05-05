@@ -28,7 +28,15 @@ pub use jobs::{
     job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
 };
 pub use operations::metrics::{MetricsSnapshot, PipelineMetrics};
-pub use operations::{MetricsScrapeRow, StableStateExport};
+pub use operations::{
+    AsyncOperationState, AsyncOperationTargetState,
+    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
+    DiagnosticRunInsertError, DiagnosticRunRow, DiagnosticRunStage,
+    HistoryDeleteOperationInsertError, HistoryDeleteOperationPayload, HistoryDeleteOperationRow,
+    HistoryDeleteOperationSummary, HistoryDeleteRowState, HistoryDeleteTargetWork,
+    MetricsScrapeRow, StableStateExport, diagnostic_cleanup_cutoff_ms,
+    diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
+};
 pub use persistence::{Database, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};

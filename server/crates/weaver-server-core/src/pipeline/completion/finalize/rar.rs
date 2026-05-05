@@ -869,10 +869,12 @@ impl Pipeline {
         // Ensure DownloadFinished is journaled before JobCompleted so the
         // timeline shows an accurate download duration.
         if self.active_download_passes.remove(&job_id) {
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::DownloadFinished { job_id });
+            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+                job_id,
+                finalization_pending: false,
+            });
         }
+        self.jobs_finalizing_download.remove(&job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_rar_runtime(job_id);
         self.job_order.retain(|id| *id != job_id);

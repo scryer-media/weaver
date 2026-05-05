@@ -20,14 +20,14 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/weaver"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
-async-graphql = { version = "7.0", features = ["chrono"] }
+async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
 crc32fast = "1.4"
 md-5 = "0.10"
 blake2 = "0.10"
@@ -49,12 +49,12 @@ rustls-pemfile = "2"
 webpki-roots = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 pin-project-lite = "0.2"
-quick-xml = "0.37"
+quick-xml = "0.39.2"
 crossbeam-queue = "0.3"
 bitvec = "1.0"
 rmp-serde = "1.3"
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "compression-zstd", "compression-deflate", "decompression-gzip", "decompression-br", "decompression-zstd", "decompression-deflate"] }
 tower = "0.5"
@@ -63,22 +63,23 @@ mime_guess = "2"
 async-graphql-axum = "7.0"
 socket2 = { version = "0.5", features = ["all"] }
 memchr = "2"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 tempfile = "3"
 memmap2 = "0.9"
 zstd = "0.13"
 chrono = { version = "0.4", features = ["clock", "serde"] }
-sevenz-rust2 = { version = "0.20", features = ["aes256", "brotli", "bzip2", "deflate", "zstd"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "zstd"] }
+sevenz-rust2 = { version = "0.21", features = ["aes256", "brotli", "bzip2", "deflate", "zstd"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd"] }
 feed-rs = "2.3"
 rand = "0.9"
 regex = "1.11"
 tar = "0.4"
-zip = "2"
+zip = { version = "8", default-features = false, features = ["aes-crypto", "deflate64", "deflate-flate2-zlib-rs", "bzip2", "time"] }
 flate2 = "1"
-brotli = "7"
-bzip2 = "0.5"
+brotli = "8"
+bzip2 = "0.6"
 base64 = "0.22"
+age = "0.11"
 security-framework = "3"
 security-framework-sys = "2"
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

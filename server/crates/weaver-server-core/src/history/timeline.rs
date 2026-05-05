@@ -11,6 +11,8 @@ pub struct JobEvent {
     pub file_id: Option<String>,
 }
 
+pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
+
 fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }

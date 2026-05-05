@@ -56,10 +56,10 @@ pub(crate) fn map_seen_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Rss
         item_id: row.get(1)?,
         item_title: row.get(2)?,
         published_at: row.get(3)?,
-        size_bytes: row.get(4)?,
+        size_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
         decision: row.get(5)?,
         seen_at: row.get(6)?,
-        job_id: row.get(7)?,
+        job_id: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
         item_url: row.get(8)?,
         error: row.get(9)?,
     })

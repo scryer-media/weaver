@@ -22,8 +22,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  ACCEPT_HISTORY_DELETE_MUTATION,
   CANCEL_JOB_MUTATION,
-  DELETE_HISTORY_MUTATION,
   JOB_OUTPUT_FILES_QUERY,
   JOB_DETAIL_UPDATES_SUBSCRIPTION,
   JOB_QUERY,
@@ -113,12 +113,13 @@ export function JobDetail() {
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-  const [, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
+  const [acceptDeleteState, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
 
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showRedownloadConfirm, setShowRedownloadConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
+  const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
   const [lastLiveJob, setLastLiveJob] = useState<JobData | null>(null);
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
@@ -230,6 +231,7 @@ export function JobDetail() {
     && optionalRecoveryBytes === 0
     && optionalRecoveryDownloadedBytes === 0;
   const canRestart = job.status === "COMPLETE" || job.status === "FAILED";
+  const deleteLocked = Boolean(job.deleteOperation?.locked);
   const savedBandwidthDetail =
     savedBandwidthBytes > 0
       ? t("job.savedBandwidthSkipped")
@@ -341,13 +343,28 @@ export function JobDetail() {
                 {t("action.cancel")}
               </Button>
             ) : (
-              <Button variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
+              <Button
+                variant="destructive"
+                disabled={deleteLocked || acceptDeleteState.fetching}
+                onClick={() => {
+                  setDeleteAcceptError(null);
+                  setShowDeleteConfirm(true);
+                }}
+              >
                 {t("action.delete")}
               </Button>
             )}
           </>
         }
       />
+
+      {deleteLocked ? (
+        <Card className="border-amber-500/30 bg-amber-500/5">
+          <CardContent className="py-4 text-sm text-amber-700">
+            This history item is already being deleted in the background. It will disappear when the delete completes.
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Progress & stats */}
       <Card>
@@ -513,17 +530,45 @@ export function JobDetail() {
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}
+        confirmDisabled={acceptDeleteState.fetching}
+        cancelDisabled={acceptDeleteState.fetching}
         onConfirm={() => {
-          void deleteHistory({ id: job.id, deleteFiles }).then(() => navigate("/history"));
+          void (async () => {
+            setDeleteAcceptError(null);
+            const result = await acceptHistoryDelete({
+              input: {
+                mode: "IDS",
+                ids: [job.id],
+                deleteFiles,
+              },
+            });
+            if (result.error) {
+              setDeleteAcceptError(result.error.message);
+              return;
+            }
+
+            setShowDeleteConfirm(false);
+            setDeleteFiles(false);
+            navigate("/history");
+          })();
+        }}
+        onCancel={() => {
+          setDeleteAcceptError(null);
           setShowDeleteConfirm(false);
           setDeleteFiles(false);
         }}
-        onCancel={() => { setShowDeleteConfirm(false); setDeleteFiles(false); }}
       >
         <label className="flex items-center gap-2">
-          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <Checkbox
+            checked={deleteFiles}
+            disabled={acceptDeleteState.fetching}
+            onCheckedChange={(v) => setDeleteFiles(v === true)}
+          />
           <span className="text-sm">{t("confirm.deleteFiles")}</span>
         </label>
+        {deleteAcceptError ? (
+          <p className="text-sm text-destructive">{deleteAcceptError}</p>
+        ) : null}
       </ConfirmDialog>
     </div>
   );

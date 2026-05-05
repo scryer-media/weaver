@@ -27,6 +27,7 @@ impl Database {
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
+        let diagnostic_upload_url = settings.get("diagnostic_upload_url").cloned();
         let isp_bandwidth_cap = {
             let enabled = settings
                 .get("bandwidth_cap.enabled")
@@ -156,6 +157,7 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             isp_bandwidth_cap,
+            diagnostic_upload_url,
             config_path: None,
         })
     }
@@ -174,6 +176,9 @@ impl Database {
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
+        }
+        if let Some(ref diagnostic_upload_url) = config.diagnostic_upload_url {
+            self.set_setting("diagnostic_upload_url", diagnostic_upload_url)?;
         }
         if let Some(ref cap) = config.isp_bandwidth_cap {
             self.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;

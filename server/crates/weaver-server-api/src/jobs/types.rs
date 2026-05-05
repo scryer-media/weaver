@@ -4,6 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::DownloadBlockState;
 use weaver_server_core::operations::metrics::MetricsSnapshot;
+use weaver_server_core::{
+    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
+};
 
 use super::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
@@ -399,7 +402,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
 /// GraphQL job statuses collapse the internal `Checking` phase into
 /// `Verifying` so clients see one post-download verification step before
 /// extraction begins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
 pub enum JobStatusGql {
     Queued,
     Downloading,
@@ -784,6 +787,10 @@ fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attri
     for (key, value) in metadata {
         if key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY {
             client_request_id = Some(value.clone());
+        } else if key == DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY
+            || key == DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY
+        {
+            continue;
         } else {
             attributes.push(Attribute {
                 key: key.clone(),

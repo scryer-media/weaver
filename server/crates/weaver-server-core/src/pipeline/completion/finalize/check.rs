@@ -1102,6 +1102,9 @@ impl Pipeline {
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
         let par2_loaded = self.par2_set(job_id).is_some();
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
+        if download_pipeline_exhausted {
+            self.emit_download_pipeline_drained_if_pending(job_id);
+        }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
@@ -1822,10 +1825,12 @@ impl Pipeline {
                 }
                 self.transition_completed_runtime(job_id);
                 if self.active_download_passes.remove(&job_id) {
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::DownloadFinished { job_id });
+                    let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+                        job_id,
+                        finalization_pending: false,
+                    });
                 }
+                self.jobs_finalizing_download.remove(&job_id);
                 self.clear_par2_runtime_state(job_id);
                 self.clear_job_rar_runtime(job_id);
                 self.job_order.retain(|id| *id != job_id);
@@ -1961,10 +1966,12 @@ impl Pipeline {
 
                 self.transition_completed_runtime(job_id);
                 if self.active_download_passes.remove(&job_id) {
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::DownloadFinished { job_id });
+                    let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+                        job_id,
+                        finalization_pending: false,
+                    });
                 }
+                self.jobs_finalizing_download.remove(&job_id);
                 self.clear_par2_runtime_state(job_id);
                 self.clear_job_rar_runtime(job_id);
                 self.job_order.retain(|id| *id != job_id);

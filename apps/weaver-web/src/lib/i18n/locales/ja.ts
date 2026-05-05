@@ -37,6 +37,8 @@ const ja: LocaleDictionary = {
   "action.reprocess": "再処理",
   "action.refresh": "更新",
   "action.clearFilters": "フィルターをクリア",
+  "action.previous": "前へ",
+  "action.next": "次へ",
 
   // Confirmation dialogs
   "confirm.cancelJob": "このジョブをキャンセルしますか？",
@@ -93,6 +95,7 @@ const ja: LocaleDictionary = {
   "jobs.empty": "キューは空です。",
   "jobs.emptyAction": "NZB をアップロード",
   "jobs.emptyHint": "して始めましょう。",
+  "jobs.searchPlaceholder": "名前またはカテゴリでキューを絞り込み",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "ダウンロードの配信がグローバルに一時停止されています。待機中およびダウンロード中のジョブは、キューの再開まで現在の位置を保持します。",
   "jobs.downloadsPaused": "ダウンロード一時停止中",
@@ -117,6 +120,7 @@ const ja: LocaleDictionary = {
   // Table headers
   "table.name": "名前",
   "table.status": "ステータス",
+  "table.filters": "フィルター",
   "table.priority": "優先度",
   "table.progress": "進捗",
   "table.size": "サイズ",
@@ -149,6 +153,7 @@ const ja: LocaleDictionary = {
   "timeline.noData": "タイムライン追跡が利用可能になった後に処理されたジョブのパイプライン詳細タイミングが表示されます。",
   "timeline.pendingDownload": "ダウンロード待ち",
   "timeline.downloading": "ダウンロード中",
+  "timeline.finalizingDownload": "ダウンロードを最終処理中",
   "timeline.paused": "一時停止",
   "timeline.verifying": "検証中",
   "timeline.repairing": "修復中",
@@ -254,6 +259,7 @@ const ja: LocaleDictionary = {
   "history.noMatches": "現在のフィルターに一致する履歴がありません。",
   "table.health": "健全性",
   "table.category": "カテゴリ",
+  "table.rowsPerPage": "1ページあたりの行数",
 
   // Servers page
   "nav.servers": "サーバー",
@@ -295,6 +301,8 @@ const ja: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Weaver サーバーのファイルシステムから保存先ディレクトリを選択します。",
   "categories.directoryBrowserLoading": "ディレクトリを読み込み中...",
   "categories.directoryBrowserEmpty": "サブディレクトリがありません。",
+  "categories.createFolder": "フォルダーを作成",
+  "categories.newFolderPlaceholder": "新しいフォルダー名",
   "categories.currentFolder": "現在のフォルダー",
   "categories.useCurrentFolder": "このフォルダーを使用",
   "categories.up": "上へ",

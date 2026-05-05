@@ -42,6 +42,8 @@ const en: LocaleDictionary = {
   "action.redownload": "Re-download",
   "action.refresh": "Refresh",
   "action.clearFilters": "Clear Filters",
+  "action.previous": "Previous",
+  "action.next": "Next",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Cancel this job?",
@@ -102,6 +104,7 @@ const en: LocaleDictionary = {
   "jobs.empty": "Queue is empty.",
   "jobs.emptyAction": "Upload an NZB",
   "jobs.emptyHint": "to get started.",
+  "jobs.searchPlaceholder": "Filter queue by name or category",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "Download dispatch is globally paused. Queued and downloading jobs are holding position until you resume the queue.",
   "jobs.downloadsPaused": "Downloads paused",
@@ -126,6 +129,7 @@ const en: LocaleDictionary = {
   // Table headers
   "table.name": "Name",
   "table.status": "Status",
+  "table.filters": "Filters",
   "table.priority": "Priority",
   "table.progress": "Progress",
   "table.size": "Size",
@@ -158,6 +162,7 @@ const en: LocaleDictionary = {
   "timeline.noData": "Detailed pipeline timing will appear for jobs processed after timeline tracking is available.",
   "timeline.pendingDownload": "Pending Download",
   "timeline.downloading": "Downloading",
+  "timeline.finalizingDownload": "Finalizing Download",
   "timeline.paused": "Paused",
   "timeline.verifying": "Verifying",
   "timeline.repairing": "Repairing",
@@ -264,6 +269,7 @@ const en: LocaleDictionary = {
   "history.noMatches": "No history jobs match the current filter.",
   "table.health": "Health",
   "table.category": "Category",
+  "table.rowsPerPage": "Rows per page",
 
   // Servers page
   "nav.servers": "Servers",
@@ -305,6 +311,8 @@ const en: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Pick a destination directory from the Weaver server filesystem.",
   "categories.directoryBrowserLoading": "Loading directories...",
   "categories.directoryBrowserEmpty": "No subdirectories here.",
+  "categories.createFolder": "Create Folder",
+  "categories.newFolderPlaceholder": "New folder name",
   "categories.currentFolder": "Current Folder",
   "categories.useCurrentFolder": "Use Current Folder",
   "categories.up": "Up",

@@ -10,7 +10,7 @@ impl Database {
         end_bucket_epoch_minute: i64,
     ) -> Result<u64, StateError> {
         let conn = self.conn();
-        let total: Option<u64> = conn
+        let total: Option<i64> = conn
             .query_row(
                 "SELECT SUM(payload_bytes)
                  FROM bandwidth_usage_minute_buckets
@@ -19,6 +19,6 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(db_err)?;
-        Ok(total.unwrap_or(0))
+        Ok(total.unwrap_or(0) as u64)
     }
 }

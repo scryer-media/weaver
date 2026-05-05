@@ -37,6 +37,8 @@ const de: LocaleDictionary = {
   "action.reprocess": "Erneut verarbeiten",
   "action.refresh": "Aktualisieren",
   "action.clearFilters": "Filter zurücksetzen",
+  "action.previous": "Vorherige",
+  "action.next": "Nächste",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Diesen Auftrag abbrechen?",
@@ -93,6 +95,7 @@ const de: LocaleDictionary = {
   "jobs.empty": "Warteschlange ist leer.",
   "jobs.emptyAction": "Eine NZB hochladen",
   "jobs.emptyHint": "um loszulegen.",
+  "jobs.searchPlaceholder": "Warteschlange nach Name oder Kategorie filtern",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "Der Downloadversand ist global pausiert. Eingestellte und laufende Downloads behalten ihre Position, bis die Warteschlange fortgesetzt wird.",
   "jobs.downloadsPaused": "Downloads pausiert",
@@ -117,6 +120,7 @@ const de: LocaleDictionary = {
   // Table headers
   "table.name": "Name",
   "table.status": "Status",
+  "table.filters": "Filter",
   "table.priority": "Priorität",
   "table.progress": "Fortschritt",
   "table.size": "Größe",
@@ -149,6 +153,7 @@ const de: LocaleDictionary = {
   "timeline.noData": "Detaillierte Pipeline-Zeiten werden für Aufträge angezeigt, die nach Aktivierung der Zeitleistenerfassung verarbeitet wurden.",
   "timeline.pendingDownload": "Ausstehender Download",
   "timeline.downloading": "Wird heruntergeladen",
+  "timeline.finalizingDownload": "Download wird finalisiert",
   "timeline.paused": "Pausiert",
   "timeline.verifying": "Wird verifiziert",
   "timeline.repairing": "Wird repariert",
@@ -254,6 +259,7 @@ const de: LocaleDictionary = {
   "history.noMatches": "Keine Verlaufseinträge entsprechen dem aktuellen Filter.",
   "table.health": "Zustand",
   "table.category": "Kategorie",
+  "table.rowsPerPage": "Zeilen pro Seite",
 
   // Servers page
   "nav.servers": "Server",
@@ -295,6 +301,8 @@ const de: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Wählen Sie ein Zielverzeichnis aus dem Weaver-Server-Dateisystem.",
   "categories.directoryBrowserLoading": "Verzeichnisse werden geladen...",
   "categories.directoryBrowserEmpty": "Keine Unterverzeichnisse vorhanden.",
+  "categories.createFolder": "Ordner erstellen",
+  "categories.newFolderPlaceholder": "Neuer Ordnername",
   "categories.currentFolder": "Aktueller Ordner",
   "categories.useCurrentFolder": "Diesen Ordner verwenden",
   "categories.up": "Hoch",

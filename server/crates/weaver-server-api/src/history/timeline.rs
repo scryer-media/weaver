@@ -7,6 +7,7 @@ use crate::history::types::{
     EventKind, ExtractionMemberSpanKind, ExtractionMemberState, ExtractionMemberTimeline,
     ExtractionMemberTimelineSpan, ExtractionTimelineGroup, JobTimeline, JobTimelineLane,
     JobTimelineSpan, TimelineSpanState, TimelineStage, decode_timeline_member_subject,
+    marks_download_finalization,
 };
 use crate::jobs::types::JobStatusGql;
 
@@ -54,6 +55,7 @@ pub(crate) fn build_job_timeline(
 
     let download_spans =
         synthesize_active_download_span(collect_download_spans(events), job, started_at);
+    let finalizing_download_spans = collect_finalizing_download_spans(events);
     let pause_spans = collect_pause_spans(events);
     let verify_spans = collect_job_spans(
         events,
@@ -103,6 +105,11 @@ pub(crate) fn build_job_timeline(
         &mut lanes,
         TimelineStage::Downloading,
         close_open_job_spans(download_spans, ended_at, outcome, now),
+    );
+    push_lane(
+        &mut lanes,
+        TimelineStage::FinalizingDownload,
+        close_open_job_spans(finalizing_download_spans, ended_at, outcome, now),
     );
     push_lane(
         &mut lanes,
@@ -271,10 +278,77 @@ fn collect_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
     spans
 }
 
+fn collect_finalizing_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
+    let mut spans = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut finalization_pending = false;
+
+    for event in events {
+        let Ok(kind) = event.kind.parse::<EventKind>() else {
+            continue;
+        };
+        let at = event.timestamp as f64;
+
+        match kind {
+            EventKind::DownloadFinished
+                if marks_download_finalization(event.file_id.as_deref()) =>
+            {
+                finalization_pending = true;
+                if open.is_none() {
+                    spans.push(JobTimelineSpan {
+                        started_at: at,
+                        ended_at: None,
+                        state: TimelineSpanState::Running,
+                        label: None,
+                    });
+                    open = Some(spans.len() - 1);
+                }
+            }
+            EventKind::DownloadPipelineDrained => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                finalization_pending = false;
+            }
+            EventKind::JobPaused => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+            }
+            EventKind::JobResumed => {
+                if finalization_pending && open.is_none() {
+                    spans.push(JobTimelineSpan {
+                        started_at: at,
+                        ended_at: None,
+                        state: TimelineSpanState::Running,
+                        label: None,
+                    });
+                    open = Some(spans.len() - 1);
+                }
+            }
+            EventKind::JobVerificationStarted
+            | EventKind::RepairStarted
+            | EventKind::ExtractionReady
+            | EventKind::MoveToCompleteStarted => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                finalization_pending = false;
+            }
+            EventKind::JobCreated | EventKind::JobCompleted => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                finalization_pending = false;
+            }
+            EventKind::JobFailed | EventKind::JobCancelled => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Failed);
+                finalization_pending = false;
+            }
+            _ => {}
+        }
+    }
+
+    spans
+}
+
 fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
     let mut spans = Vec::new();
     let mut open: Option<usize> = None;
     let mut download_active = false;
+    let mut finalization_active = false;
     let mut pause_boundary_at: Option<f64> = None;
 
     for event in events {
@@ -286,7 +360,16 @@ fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
         match kind {
             EventKind::DownloadStarted => {
                 download_active = true;
+                finalization_active = false;
                 pause_boundary_at = None;
+            }
+            EventKind::DownloadFinished
+                if marks_download_finalization(event.file_id.as_deref()) =>
+            {
+                download_active = false;
+                finalization_active = true;
+                pause_boundary_at = Some(at);
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
             }
             EventKind::DownloadFinished
             | EventKind::JobFailed
@@ -299,10 +382,22 @@ fn collect_pause_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
                     pause_boundary_at = None;
                 }
                 download_active = false;
+                finalization_active = false;
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+            }
+            EventKind::DownloadPipelineDrained
+            | EventKind::JobVerificationStarted
+            | EventKind::RepairStarted
+            | EventKind::ExtractionReady
+            | EventKind::MoveToCompleteStarted => {
+                finalization_active = false;
+                pause_boundary_at = None;
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
             }
             EventKind::JobPaused => {
-                if open.is_none() && (download_active || pause_boundary_at == Some(at)) {
+                if open.is_none()
+                    && (download_active || finalization_active || pause_boundary_at == Some(at))
+                {
                     spans.push(JobTimelineSpan {
                         started_at: at,
                         ended_at: None,

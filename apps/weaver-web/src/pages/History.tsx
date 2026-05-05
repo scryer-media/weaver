@@ -1,265 +1,488 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, RefreshCcw, Trash2 } from "lucide-react";
+import {
+  getCoreRowModel,
+  useReactTable,
+  type ColumnDef,
+  type RowSelectionState,
+  type SortingState,
+} from "@tanstack/react-table";
+import { Bug, Download, RefreshCcw, Trash2 } from "lucide-react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { DataTable } from "@/components/data-table/DataTable";
+import type { DataTableColumnMeta } from "@/components/data-table/DataTable";
+import { DataTableColumnHeader } from "@/components/data-table/DataTableColumnHeader";
+import { DataTablePagination } from "@/components/data-table/DataTablePagination";
+import { DataTableToolbar } from "@/components/data-table/DataTableToolbar";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
+import { useTranslate } from "@/lib/context/translate-context";
+import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
+import {
+  formatJobReleaseName,
+  normalizeJobData,
+  type DeleteOperationData,
+  type GraphqlJobData,
+  type JobData,
+} from "@/lib/job-types";
+import { cn } from "@/lib/utils";
+import {
+  ACCEPT_HISTORY_DELETE_MUTATION,
+  HISTORY_FACADE_EVENTS_SUBSCRIPTION,
+  HISTORY_DELETE_OPERATIONS_QUERY,
+  HISTORY_PAGE_QUERY,
+  REDOWNLOAD_JOB_MUTATION,
+  REPROCESS_JOB_MUTATION,
+  START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
+} from "@/graphql/queries";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  DELETE_ALL_HISTORY_MUTATION,
-  DELETE_HISTORY_MUTATION,
-  FACADE_HISTORY_ITEM_FIELDS,
-  HISTORY_JOBS_COUNT_QUERY,
-  HISTORY_FACADE_EVENTS_SUBSCRIPTION,
-  HISTORY_JOBS_QUERY,
-  PARSED_RELEASE_FIELDS,
-  REDOWNLOAD_JOB_MUTATION,
-  REPROCESS_JOB_MUTATION,
-} from "@/graphql/queries";
-import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
-import { formatJobReleaseName, normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
-import { useTranslate } from "@/lib/context/translate-context";
-import { cn } from "@/lib/utils";
 
 type HistoryJob = JobData;
-
 type HistoryFilter = "all" | "success" | "failure";
-
-const PAGE_SIZE = 50;
-
 type FacadeHistoryJob = GraphqlJobData;
-
-type HistoryCountResponse = {
+type HistoryPageCounts = {
   all: number;
   success: number;
   failure: number;
+};
+type HistoryPageResponse = {
+  historyPage: {
+    items: FacadeHistoryJob[];
+    totalCount: number;
+    counts: HistoryPageCounts;
+  };
+};
+type HistoryDeleteAcceptanceResponse = {
+  acceptHistoryDelete: {
+    operationId: number;
+    acceptedIds: number[];
+    totalTargets: number;
+  };
+};
+type HistoryDeleteOperationSummary = {
+  id: number;
+  state: "QUEUED" | "RUNNING" | "COMPLETED" | "COMPLETED_WITH_ERRORS";
+  deleteFiles: boolean;
+  totalTargets: number;
+  queuedTargets: number;
+  runningTargets: number;
+  completedTargets: number;
+  failedTargets: number;
+  requestedAt: string;
+};
+type HistoryDeleteOperationsResponse = {
+  historyDeleteOperations: HistoryDeleteOperationSummary[];
+};
+type HistoryTablePreferences = {
+  pageSize: number;
+  search: string;
+  status: HistoryFilter;
+  sorting: SortingState;
+};
+type LocalDeleteLock = {
+  operationId: number;
+  deleteFiles: boolean;
+};
+
+const HISTORY_PAGE_SIZE_OPTIONS = [25, 50, 100, 500] as const;
+const DEFAULT_HISTORY_SORTING: SortingState = [{ id: "completedAt", desc: true }];
+const DEFAULT_HISTORY_PREFERENCES: HistoryTablePreferences = {
+  pageSize: 100,
+  search: "",
+  status: "all",
+  sorting: DEFAULT_HISTORY_SORTING,
 };
 
 function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
   return normalizeJobData(job);
 }
 
-function encodeOffsetCursor(offset: number): string {
-  return btoa(`off:${offset}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function historyFilterVariables(filter: HistoryFilter) {
+function historyStatusToGraphql(filter: HistoryFilter): "ALL" | "SUCCESS" | "FAILURE" {
   switch (filter) {
     case "success":
-      return { states: ["COMPLETED"] };
+      return "SUCCESS";
     case "failure":
-      return { states: ["FAILED"] };
+      return "FAILURE";
     default:
-      return null;
+      return "ALL";
   }
+}
+
+function historySortingToGraphql(sorting: SortingState) {
+  const current = sorting[0];
+  switch (current?.id) {
+    case "name":
+      return { sortField: "NAME" as const, sortDirection: current.desc ? "DESC" : "ASC" };
+    case "status":
+      return { sortField: "STATE" as const, sortDirection: current.desc ? "DESC" : "ASC" };
+    case "health":
+      return { sortField: "HEALTH" as const, sortDirection: current.desc ? "DESC" : "ASC" };
+    case "size":
+      return { sortField: "SIZE" as const, sortDirection: current.desc ? "DESC" : "ASC" };
+    case "category":
+      return { sortField: "CATEGORY" as const, sortDirection: current.desc ? "DESC" : "ASC" };
+    default:
+      return { sortField: "COMPLETED_AT" as const, sortDirection: current?.desc === false ? "ASC" : "DESC" };
+  }
+}
+
+function buildHistoryPageInput(
+  preferences: HistoryTablePreferences,
+  search: string,
+  pageIndex: number,
+) {
+  return {
+    pageIndex,
+    pageSize: preferences.pageSize,
+    search: search.length > 0 ? search : undefined,
+    status: historyStatusToGraphql(preferences.status),
+    ...historySortingToGraphql(preferences.sorting),
+  };
+}
+
+function removeRowSelectionIds(
+  selection: RowSelectionState,
+  ids: number[],
+): RowSelectionState {
+  const next = { ...selection };
+  for (const id of ids) {
+    delete next[String(id)];
+  }
+  return next;
+}
+
+function isDefaultHistorySorting(sorting: SortingState) {
+  return sorting.length === 1
+    && sorting[0]?.id === DEFAULT_HISTORY_SORTING[0]?.id
+    && sorting[0]?.desc === DEFAULT_HISTORY_SORTING[0]?.desc;
+}
+
+function localDeleteOperation(lock: LocalDeleteLock): DeleteOperationData {
+  return {
+    operationId: lock.operationId,
+    state: "QUEUED",
+    locked: true,
+    deleteFiles: lock.deleteFiles,
+    errorMessage: null,
+  };
+}
+
+function isDiagnosticRunActive(
+  diagnosticRun: HistoryJob["diagnosticRun"],
+) {
+  return diagnosticRun != null
+    && ["QUEUED", "RUNNING", "COLLECTING", "UPLOADING"].includes(diagnosticRun.stage);
+}
+
+function diagnosticStageLabel(
+  t: ReturnType<typeof useTranslate>,
+  stage: NonNullable<HistoryJob["diagnosticRun"]>["stage"],
+) {
+  switch (stage) {
+    case "QUEUED":
+      return t("history.diagnosticQueued");
+    case "RUNNING":
+      return t("history.diagnosticRunning");
+    case "COLLECTING":
+      return t("history.diagnosticCollecting");
+    case "UPLOADING":
+      return t("history.diagnosticUploading");
+    case "COMPLETE":
+      return t("history.diagnosticComplete");
+    case "FAILED":
+      return t("history.diagnosticFailed");
+    default:
+      return stage;
+  }
+}
+
+function formatDiagnosticSummary(
+  t: ReturnType<typeof useTranslate>,
+  job: HistoryJob,
+) {
+  const diagnosticRun = job.diagnosticRun;
+  if (diagnosticRun) {
+    const stageLabel = diagnosticStageLabel(t, diagnosticRun.stage);
+    if (diagnosticRun.smgDiagnosticId) {
+      return t("history.diagnosticWithId", {
+        stage: stageLabel,
+        id: diagnosticRun.smgDiagnosticId,
+      });
+    }
+    if (diagnosticRun.errorMessage) {
+      return `${stageLabel}: ${diagnosticRun.errorMessage}`;
+    }
+    return stageLabel;
+  }
+  if (job.lastDiagnosticId) {
+    return t("history.lastDiagnosticId", { id: job.lastDiagnosticId });
+  }
+  return "";
 }
 
 export function History() {
   const t = useTranslate();
   const client = useClient();
-  const [deleteState, deleteHistory] = useMutation(DELETE_HISTORY_MUTATION);
-  const [deleteAllState, deleteAllHistory] = useMutation(DELETE_ALL_HISTORY_MUTATION);
-  const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
-  const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-
-  const [jobs, setJobs] = useState<HistoryJob[]>([]);
-  const [totalCount, setTotalCount] = useState(0);
-  const [hasMore, setHasMore] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [initialFetching, setInitialFetching] = useState(true);
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [historyPreferences, setHistoryPreferences] = useTablePreferences(
+    "weaver.history.table.preferences",
+    DEFAULT_HISTORY_PREFERENCES,
+  );
+  const [pageIndex, setPageIndex] = useState(0);
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [redownloadConfirmId, setRedownloadConfirmId] = useState<number | null>(null);
+  const [diagnosticConfirm, setDiagnosticConfirm] = useState<{
+    id: number;
+    includeServerHostnames: boolean;
+  } | null>(null);
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
-  const [deleteBatchFetching, setDeleteBatchFetching] = useState(false);
-  const [filter, setFilter] = useState<HistoryFilter>("all");
-  const [search, setSearch] = useState("");
+  const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
+  const [diagnosticAcceptError, setDiagnosticAcceptError] = useState<string | null>(null);
+  const [acceptedDeleteLocks, setAcceptedDeleteLocks] = useState<Record<number, LocalDeleteLock>>(
+    {},
+  );
+  const [hadActiveDeleteOperations, setHadActiveDeleteOperations] = useState(false);
 
-  const desktopSentinelRef = useRef<HTMLDivElement>(null);
-  const mobileSentinelRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const queryFilter = useMemo(() => historyFilterVariables(filter), [filter]);
+  const deferredSearch = useDeferredValue(historyPreferences.search.trim());
+  const historyPageInput = useMemo(
+    () => buildHistoryPageInput(historyPreferences, deferredSearch, pageIndex),
+    [deferredSearch, historyPreferences, pageIndex],
+  );
 
-  // Initial page + count
-  const [{ data: initialData }] = useQuery({
-    query: HISTORY_JOBS_QUERY,
-    variables: { first: PAGE_SIZE, after: null, filter: queryFilter },
+  const [{ data, fetching }, reexecuteHistoryPage] = useQuery<HistoryPageResponse>({
+    query: HISTORY_PAGE_QUERY,
+    variables: { input: historyPageInput },
   });
-  const [{ data: countData }, refetchCount] = useQuery<{ all: number; success: number; failure: number }>({
-    query: HISTORY_JOBS_COUNT_QUERY,
-  });
+  const [{ data: deleteOperationsData }, reexecuteHistoryDeleteOperations] =
+    useQuery<HistoryDeleteOperationsResponse>({
+      query: HISTORY_DELETE_OPERATIONS_QUERY,
+      variables: { activeOnly: true },
+    });
 
-  useEffect(() => {
-    setJobs([]);
-    setTotalCount(0);
-    setHasMore(true);
-    setLoadingMore(false);
-    setInitialFetching(true);
-    setSelectedIds(new Set());
-  }, [filter]);
+  const [acceptDeleteState, acceptHistoryDelete] =
+    useMutation<HistoryDeleteAcceptanceResponse>(ACCEPT_HISTORY_DELETE_MUTATION);
+  const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
+  const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
+  const [diagnosticStartState, startDiagnosticRedownload] = useMutation(
+    START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
+  );
 
-  useEffect(() => {
-    if (initialData?.historyItems) {
-      const nextJobs = (initialData.historyItems as FacadeHistoryJob[]).map(normalizeHistoryJob);
-      setJobs(nextJobs);
-      setHasMore(nextJobs.length >= PAGE_SIZE);
-      setInitialFetching(false);
-    }
-  }, [initialData?.historyItems]);
-
-  useEffect(() => {
-    if (!countData) {
-      return;
-    }
-    const counts = countData as HistoryCountResponse;
-    if (filter === "success") {
-      setTotalCount(counts.success ?? 0);
-      return;
-    }
-    if (filter === "failure") {
-      setTotalCount(counts.failure ?? 0);
-      return;
-    }
-    setTotalCount(counts.all ?? 0);
-  }, [countData, filter]);
-
-  // Load next page
-  const loadMore = useCallback(async () => {
-    if (loadingMore || !hasMore) return;
-    setLoadingMore(true);
-    try {
-      const result = await client
-        .query(HISTORY_JOBS_QUERY, {
-          first: PAGE_SIZE,
-          after: encodeOffsetCursor(jobs.length),
-          filter: queryFilter,
-        })
-        .toPromise();
-      const nextJobs: HistoryJob[] = ((result.data?.historyItems ?? []) as FacadeHistoryJob[])
-        .map(normalizeHistoryJob);
-      if (nextJobs.length > 0) {
-        setJobs((prev) => {
-          const existingIds = new Set(prev.map((j) => j.id));
-          const deduped = nextJobs.filter((j) => !existingIds.has(j.id));
-          return [...prev, ...deduped];
-        });
-      }
-      setHasMore(nextJobs.length >= PAGE_SIZE);
-    } finally {
-      setLoadingMore(false);
-    }
-  }, [loadingMore, hasMore, jobs.length, client, queryFilter]);
-
-  // Desktop: sentinel is inside the scrollable Table container
-  useEffect(() => {
-    const el = desktopSentinelRef.current;
-    const root = scrollRef.current;
-    if (!el || !root || !hasMore) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => { if (entry?.isIntersecting) void loadMore(); },
-      { root, rootMargin: "200px" },
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [hasMore, loadMore]);
-
-  // Mobile: sentinel is in page flow, observed against viewport
-  useEffect(() => {
-    const el = mobileSentinelRef.current;
-    if (!el || !hasMore) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => { if (entry?.isIntersecting) void loadMore(); },
-      { rootMargin: "200px" },
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [hasMore, loadMore]);
-
-  // Delete mutations update local state
-  useEffect(() => {
-    if (deleteState.data?.deleteHistory) {
-      setJobs((deleteState.data.deleteHistory as FacadeHistoryJob[]).map(normalizeHistoryJob));
-      void refetchCount();
-    }
-  }, [deleteState.data, refetchCount]);
-
-  useEffect(() => {
-    if (deleteAllState.data?.deleteAllHistory) {
-      setJobs(
-        (deleteAllState.data.deleteAllHistory as FacadeHistoryJob[]).map(normalizeHistoryJob),
+  const rawJobs = useMemo(
+    () => ((data?.historyPage.items ?? []) as FacadeHistoryJob[]).map(normalizeHistoryJob),
+    [data?.historyPage.items],
+  );
+  const jobs = useMemo(
+    () =>
+      rawJobs.map((job) => ({
+        ...job,
+        deleteOperation:
+          job.deleteOperation ?? (acceptedDeleteLocks[job.id]
+            ? localDeleteOperation(acceptedDeleteLocks[job.id]!)
+            : null),
+      })),
+    [acceptedDeleteLocks, rawJobs],
+  );
+  const deleteOperations = useMemo(
+    () => deleteOperationsData?.historyDeleteOperations ?? [],
+    [deleteOperationsData?.historyDeleteOperations],
+  );
+  const counts = data?.historyPage.counts ?? { all: 0, success: 0, failure: 0 };
+  const totalCount = data?.historyPage.totalCount ?? 0;
+  const pageCount = Math.max(1, Math.ceil(totalCount / historyPreferences.pageSize));
+  const lockedRowIds = useMemo(
+    () => new Set(jobs.filter((job) => job.deleteOperation?.locked).map((job) => job.id)),
+    [jobs],
+  );
+  const selectedIds = useMemo(
+    () => Object.entries(rowSelection)
+      .filter(([, selected]) => selected)
+      .map(([id]) => Number(id)),
+    [rowSelection],
+  );
+  const selectedActionIds = useMemo(
+    () => selectedIds.filter((id) => !lockedRowIds.has(id)),
+    [lockedRowIds, selectedIds],
+  );
+  const selectedCount = selectedActionIds.length;
+  const hasActiveDeleteOperations =
+    deleteOperations.length > 0
+    || jobs.some((job) => job.deleteOperation?.locked)
+    || Object.keys(acceptedDeleteLocks).length > 0;
+  const deleteProgress = useMemo(
+    () => {
+      const summary = deleteOperations.reduce(
+        (current, operation) => ({
+          totalTargets: current.totalTargets + operation.totalTargets,
+          completedTargets: current.completedTargets + operation.completedTargets,
+          failedTargets: current.failedTargets + operation.failedTargets,
+          runningTargets: current.runningTargets + operation.runningTargets,
+          queuedTargets: current.queuedTargets + operation.queuedTargets,
+        }),
+        {
+          totalTargets: 0,
+          completedTargets: 0,
+          failedTargets: 0,
+          runningTargets: 0,
+          queuedTargets: 0,
+        },
       );
-      setSelectedIds(new Set());
-      setTotalCount(0);
-      setHasMore(false);
-    }
-  }, [deleteAllState.data]);
+      if (summary.totalTargets > 0) {
+        return summary;
+      }
 
-  // Prepend newly completed/failed jobs from event stream
+      const pendingTargets = Object.keys(acceptedDeleteLocks).length;
+      return {
+        totalTargets: pendingTargets,
+        completedTargets: 0,
+        failedTargets: 0,
+        runningTargets: 0,
+        queuedTargets: pendingTargets,
+      };
+    },
+    [acceptedDeleteLocks, deleteOperations],
+  );
+  const actionsBusy =
+    acceptDeleteState.fetching
+    || reprocessState.fetching
+    || redownloadState.fetching
+    || diagnosticStartState.fetching;
+  const hasActiveDiagnosticRuns = useMemo(
+    () => jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
+    [jobs],
+  );
+
+  useEffect(() => {
+    if (pageIndex >= pageCount && pageIndex > 0) {
+      setPageIndex(pageCount - 1);
+    }
+  }, [pageCount, pageIndex]);
+
+  useEffect(() => {
+    setRowSelection({});
+  }, [pageIndex, historyPreferences.pageSize, historyPreferences.search, historyPreferences.sorting, historyPreferences.status]);
+
+  useEffect(() => {
+    if (lockedRowIds.size === 0) {
+      return;
+    }
+    setRowSelection((current) => removeRowSelectionIds(current, [...lockedRowIds]));
+  }, [lockedRowIds]);
+
+  useEffect(() => {
+    setAcceptedDeleteLocks((current) => {
+      let changed = false;
+      const next = { ...current };
+      const rawJobsById = new Map(rawJobs.map((job) => [job.id, job]));
+
+      for (const [id, lock] of Object.entries(current)) {
+        const numericId = Number(id);
+        const job = rawJobsById.get(numericId);
+        if (!job) {
+          delete next[numericId];
+          changed = true;
+          continue;
+        }
+        if (job.deleteOperation == null) {
+          continue;
+        }
+        if (job.deleteOperation.operationId !== lock.operationId && job.deleteOperation.locked) {
+          delete next[numericId];
+          changed = true;
+          continue;
+        }
+        delete next[numericId];
+        changed = true;
+      }
+
+      return changed ? next : current;
+    });
+  }, [rawJobs]);
+
+  useEffect(() => {
+    if (!hasActiveDeleteOperations && !hasActiveDiagnosticRuns) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+      void reexecuteHistoryPage({ requestPolicy: "network-only" });
+    }, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [
+    hasActiveDeleteOperations,
+    hasActiveDiagnosticRuns,
+    reexecuteHistoryDeleteOperations,
+    reexecuteHistoryPage,
+  ]);
+
+  useEffect(() => {
+    if (hasActiveDeleteOperations) {
+      if (!hadActiveDeleteOperations) {
+        setHadActiveDeleteOperations(true);
+      }
+      return;
+    }
+
+    if (!hadActiveDeleteOperations) {
+      return;
+    }
+
+    setHadActiveDeleteOperations(false);
+    void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+    void reexecuteHistoryPage({ requestPolicy: "network-only" });
+  }, [
+    hadActiveDeleteOperations,
+    hasActiveDeleteOperations,
+    reexecuteHistoryDeleteOperations,
+    reexecuteHistoryPage,
+  ]);
+
+  const refetchHistoryPage = useCallback(async (preferredPageIndex: number) => {
+    const probeInput = buildHistoryPageInput(historyPreferences, deferredSearch, preferredPageIndex);
+    const probe = await client
+      .query(HISTORY_PAGE_QUERY, { input: probeInput }, { requestPolicy: "network-only" })
+      .toPromise();
+    const nextTotal = probe.data?.historyPage.totalCount ?? 0;
+    const nextPageCount = Math.max(1, Math.ceil(nextTotal / historyPreferences.pageSize));
+    const nextPageIndex = Math.min(preferredPageIndex, nextPageCount - 1);
+
+    if (nextPageIndex !== pageIndex) {
+      setPageIndex(nextPageIndex);
+      return;
+    }
+
+    void reexecuteHistoryPage({ requestPolicy: "network-only" });
+  }, [client, deferredSearch, historyPreferences, pageIndex, reexecuteHistoryPage]);
+
   const handleSubscription = useCallback(
     (
-      _prev: unknown,
+      previous: unknown,
       response: { queueEvents: { kind: string; itemId: number | null; state: string | null } },
     ) => {
       const event = response.queueEvents;
       if (
         (event.kind === "ITEM_COMPLETED"
-          || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED")) &&
-        event.itemId != null
+          || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED")
+          || event.kind === "ITEM_REMOVED")
+        && event.itemId != null
       ) {
-        void client
-          .query(HISTORY_JOBS_QUERY, { first: 1, after: null, filter: queryFilter })
-          .toPromise()
-          .then((result) => {
-            const newJobs: HistoryJob[] = ((result.data?.historyItems ?? []) as FacadeHistoryJob[])
-              .map(normalizeHistoryJob);
-            if (newJobs.length > 0) {
-              setJobs((prev) => {
-                const existingIds = new Set(prev.map((j) => j.id));
-                const fresh = newJobs.filter((j) => !existingIds.has(j.id));
-                return [...fresh, ...prev];
-              });
-              setTotalCount((c) => c + newJobs.length);
-            }
-          });
+        void refetchHistoryPage(pageIndex === 0 ? 0 : pageIndex);
+        void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
       }
-      return [];
+      return previous;
     },
-    [client, queryFilter],
+    [pageIndex, refetchHistoryPage, reexecuteHistoryDeleteOperations],
   );
   useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handleSubscription);
 
-  const counts = useMemo(
-    () => ({
-      all: (countData as HistoryCountResponse | undefined)?.all ?? totalCount,
-      success: (countData as HistoryCountResponse | undefined)?.success ?? 0,
-      failure: (countData as HistoryCountResponse | undefined)?.failure ?? 0,
-    }),
-    [countData, totalCount],
-  );
-  const sortedJobs = useMemo(
-    () =>
-      [...jobs].sort(
-        (left, right) =>
-          (right.createdAt ?? 0) - (left.createdAt ?? 0) || right.id - left.id,
-      ),
-    [jobs],
-  );
   const timestampFormatter = useMemo(
     () =>
       new Intl.DateTimeFormat(undefined, {
@@ -272,176 +495,507 @@ export function History() {
     [],
   );
 
-  const normalizedSearch = search.trim().toLowerCase();
-  const filteredJobs = useMemo(
-    () =>
-      sortedJobs.filter((job) => {
-        if (!normalizedSearch) {
-          return true;
-        }
-        return [job.name, job.category ?? "", job.outputDir ?? ""]
-          .join(" ")
-          .toLowerCase()
-          .includes(normalizedSearch);
-      }),
-    [normalizedSearch, sortedJobs],
-  );
-
-  const filteredIds = useMemo(() => new Set(filteredJobs.map((j) => j.id)), [filteredJobs]);
-  const visibleSelectedCount = useMemo(
-    () => [...selectedIds].filter((id) => filteredIds.has(id)).length,
-    [selectedIds, filteredIds],
-  );
-  const allVisibleSelected = filteredJobs.length > 0 && visibleSelectedCount === filteredJobs.length;
-
-  function toggleSelect(id: number) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
+  const handleReprocess = useCallback(
+    async (jobId: number) => {
+      const result = await reprocessJob({ id: jobId });
+      if (!result.error) {
+        setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
+        await refetchHistoryPage(pageIndex);
       }
-      return next;
-    });
-  }
+    },
+    [pageIndex, refetchHistoryPage, reprocessJob],
+  );
 
-  function toggleSelectAll() {
-    if (allVisibleSelected) {
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        for (const id of filteredIds) {
-          next.delete(id);
+  const handleDiagnosticRedownload = useCallback(
+    async (jobId: number, includeServerHostnames: boolean) => {
+      setDiagnosticAcceptError(null);
+      const result = await startDiagnosticRedownload({
+        id: jobId,
+        includeServerHostnames,
+      });
+      if (result.error) {
+        setDiagnosticAcceptError(result.error.message ?? "Unable to start diagnostic rerun.");
+        return false;
+      }
+      setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
+      await refetchHistoryPage(pageIndex);
+      void reexecuteHistoryPage({ requestPolicy: "network-only" });
+      return true;
+    },
+    [pageIndex, refetchHistoryPage, reexecuteHistoryPage, startDiagnosticRedownload],
+  );
+
+  const isJobLocked = useCallback(
+    (job: HistoryJob) => Boolean(job.deleteOperation?.locked || isDiagnosticRunActive(job.diagnosticRun)),
+    [],
+  );
+
+  const acceptDelete = useCallback(
+    async (
+      input:
+        | { mode: "IDS"; ids: number[]; deleteFiles: boolean }
+        | { mode: "ALL_HISTORY"; ids?: number[]; deleteFiles: boolean },
+    ) => {
+      setDeleteAcceptError(null);
+      const result = await acceptHistoryDelete({ input });
+      const acceptance = result.data?.acceptHistoryDelete;
+      if (result.error || !acceptance) {
+        setDeleteAcceptError(result.error?.message ?? "Unable to queue delete request.");
+        return false;
+      }
+
+      setAcceptedDeleteLocks((current) => {
+        const next = { ...current };
+        for (const id of acceptance.acceptedIds) {
+          next[id] = {
+            operationId: acceptance.operationId,
+            deleteFiles: input.deleteFiles,
+          };
         }
         return next;
       });
-    } else {
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        for (const id of filteredIds) {
-          next.add(id);
-        }
-        return next;
-      });
-    }
-  }
+      setRowSelection((current) => removeRowSelectionIds(current, acceptance.acceptedIds));
+      void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+      void reexecuteHistoryPage({ requestPolicy: "network-only" });
+      return true;
+    },
+    [acceptHistoryDelete, reexecuteHistoryDeleteOperations, reexecuteHistoryPage],
+  );
 
-  function removeHistoryJob(jobId: number) {
-    setJobs((prev) => prev.filter((job) => job.id !== jobId));
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.delete(jobId);
-      return next;
-    });
-    setTotalCount((prev) => Math.max(0, prev - 1));
-    void refetchCount();
-  }
+  const renderActions = useCallback(
+    (job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) => {
+      const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
+      const locked = isJobLocked(job);
+      const hasActiveDiagnostic = isDiagnosticRunActive(job.diagnosticRun);
 
-  async function handleReprocess(jobId: number) {
-    const result = await reprocessJob({ id: jobId });
-    if (!result.error) {
-      removeHistoryJob(jobId);
-    }
+      return (
+        <div
+          className="flex h-full w-full items-center justify-end gap-1 px-2 py-1.5"
+          data-row-click-ignore="true"
+        >
+          {isRestartable ? (
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                title={t("action.reprocess")}
+                aria-label={t("action.reprocess")}
+                className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
+                disabled={actionsBusy || locked}
+                onClick={() => {
+                  void handleReprocess(job.id);
+                }}
+              >
+                <RefreshCcw className={iconSizeClassName} />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                title={t("action.diagnosticRedownload")}
+                aria-label={t("action.diagnosticRedownload")}
+                className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
+                disabled={actionsBusy || locked || hasActiveDiagnostic}
+                onClick={() => {
+                  setDiagnosticAcceptError(null);
+                  setDiagnosticConfirm({
+                    id: job.id,
+                    includeServerHostnames: true,
+                  });
+                }}
+              >
+                <Bug className={iconSizeClassName} />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                title={t("action.redownload")}
+                aria-label={t("action.redownload")}
+                className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
+                disabled={actionsBusy || locked}
+                onClick={() => setRedownloadConfirmId(job.id)}
+              >
+                <Download className={iconSizeClassName} />
+              </Button>
+            </>
+          ) : null}
+          <Button
+            variant="ghost"
+            size="icon"
+            title={t("action.delete")}
+            aria-label={t("action.delete")}
+            className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
+            disabled={actionsBusy || locked}
+            onClick={() => {
+              setDeleteAcceptError(null);
+              setDeleteConfirmId(job.id);
+            }}
+          >
+            <Trash2 className={iconSizeClassName} />
+          </Button>
+        </div>
+      );
+    },
+    [actionsBusy, handleReprocess, isJobLocked, t],
+  );
+
+  const columns = useMemo<ColumnDef<HistoryJob>[]>(
+    () => [
+      {
+        id: "select",
+        enableSorting: false,
+        enableHiding: false,
+        header: ({ table }) => (
+          <div className="flex justify-center">
+            <Checkbox
+              checked={(() => {
+                const selectableRows = table
+                  .getRowModel()
+                  .rows
+                  .filter((row) => !isJobLocked(row.original));
+                if (selectableRows.length === 0) {
+                  return false;
+                }
+                const selectedRows = selectableRows.filter((row) => row.getIsSelected());
+                return selectedRows.length === selectableRows.length
+                  ? true
+                  : selectedRows.length > 0
+                    ? "indeterminate"
+                    : false;
+              })()}
+              disabled={table.getRowModel().rows.every((row) => isJobLocked(row.original))}
+              onCheckedChange={(value) => {
+                const shouldSelect = value === true;
+                setRowSelection((current) => {
+                  const next = { ...current };
+                  for (const row of table.getRowModel().rows) {
+                    if (isJobLocked(row.original)) {
+                      delete next[row.id];
+                      continue;
+                    }
+                    if (shouldSelect) {
+                      next[row.id] = true;
+                    } else {
+                      delete next[row.id];
+                    }
+                  }
+                  return next;
+                });
+              }}
+              aria-label="Select page"
+            />
+          </div>
+        ),
+        cell: ({ row }) => (
+          <div
+            className="flex h-full w-full items-center justify-center px-2 py-1.5"
+            data-row-click-ignore="true"
+          >
+            <Checkbox
+              checked={row.getIsSelected()}
+              disabled={isJobLocked(row.original)}
+              onCheckedChange={(value) => row.toggleSelected(value === true)}
+              aria-label={`Select ${formatJobReleaseName(row.original)}`}
+            />
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 w-[52px] px-2 text-center",
+          cellClassName: "p-0 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        accessorKey: "name",
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.name")} />,
+        cell: ({ row }) => {
+          const displayName = formatJobReleaseName(row.original);
+          const deleteOperation = row.original.deleteOperation;
+          return (
+            <div className="min-w-0">
+              <Link
+                to={`/jobs/${row.original.id}`}
+                className="flex min-h-6 w-full items-center truncate text-[11px] font-medium leading-tight text-foreground"
+              >
+                {displayName}
+              </Link>
+              {deleteOperation?.locked ? (
+                <span className="text-[9px] text-amber-500">Deleting…</span>
+              ) : row.original.diagnosticRun ? (
+                <span
+                  className={cn(
+                    "block truncate text-[9px]",
+                    isDiagnosticRunActive(row.original.diagnosticRun)
+                      ? "text-sky-600"
+                      : row.original.diagnosticRun.stage === "FAILED"
+                        ? "text-destructive"
+                        : "text-muted-foreground",
+                  )}
+                  title={formatDiagnosticSummary(t, row.original)}
+                >
+                  {formatDiagnosticSummary(t, row.original)}
+                </span>
+              ) : row.original.lastDiagnosticId ? (
+                <span className="block truncate text-[9px] text-muted-foreground">
+                  {t("history.lastDiagnosticId", { id: row.original.lastDiagnosticId })}
+                </span>
+              ) : deleteOperation?.state === "FAILED" ? (
+                <span
+                  className="block truncate text-[9px] text-destructive"
+                  title={deleteOperation.errorMessage ?? "Delete failed"}
+                >
+                  {deleteOperation.errorMessage ?? "Delete failed"}
+                </span>
+              ) : null}
+            </div>
+          );
+        },
+        meta: {
+          headerClassName: "h-7 min-w-[260px] px-2 text-left",
+          cellClassName: "min-w-[260px] px-2 py-1.5 text-left",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        accessorKey: "status",
+        header: ({ column }) => (
+          <DataTableColumnHeader
+            column={column}
+            title={t("table.status")}
+            className="justify-center text-center"
+          />
+        ),
+        cell: ({ row }) => (
+          <div className="space-y-1 text-center">
+            <div className="flex justify-center">
+              <JobStatusBadge status={row.original.status} compact className="px-1.5" />
+            </div>
+            {row.original.deleteOperation?.locked ? (
+              <div className="text-[9px] text-amber-500">Locked</div>
+            ) : row.original.diagnosticRun ? (
+              <div className="text-[9px] text-sky-600">
+                {diagnosticStageLabel(t, row.original.diagnosticRun.stage)}
+              </div>
+            ) : null}
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 w-[120px] px-2 text-center",
+          cellClassName: "px-2 py-1.5 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        id: "completedAt",
+        accessorFn: (job) => job.completedAt ?? 0,
+        header: ({ column }) => (
+          <DataTableColumnHeader
+            column={column}
+            title={t("table.time")}
+            className="justify-center text-center"
+          />
+        ),
+        cell: ({ row }) => (
+          <div
+            className="text-center text-[10px] text-muted-foreground"
+            title={formatHistoryTimestamp(row.original.completedAt ?? null)}
+          >
+            {formatHistoryTimestamp(row.original.completedAt ?? null, timestampFormatter)}
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 min-w-[180px] px-2 text-center",
+          cellClassName: "min-w-[180px] px-2 py-1.5 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        accessorKey: "health",
+        header: ({ column }) => (
+          <DataTableColumnHeader
+            column={column}
+            title={t("table.health")}
+            className="justify-center text-center"
+          />
+        ),
+        cell: ({ row }) => (
+          <div className="text-center text-[10px] text-muted-foreground">
+            {(row.original.health / 10).toFixed(1)}%
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 w-[96px] px-2 text-center",
+          cellClassName: "w-[96px] px-2 py-1.5 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        id: "size",
+        accessorFn: (job) => job.totalBytes,
+        header: ({ column }) => (
+          <DataTableColumnHeader
+            column={column}
+            title={t("table.size")}
+            className="justify-center text-center"
+          />
+        ),
+        cell: ({ row }) => (
+          <div className="text-center text-[10px] text-muted-foreground">
+            {formatBytes(row.original.totalBytes)}
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 w-[120px] px-2 text-center",
+          cellClassName: "w-[120px] px-2 py-1.5 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        accessorKey: "category",
+        header: ({ column }) => (
+          <DataTableColumnHeader
+            column={column}
+            title={t("table.category")}
+            className="justify-center text-center"
+          />
+        ),
+        cell: ({ row }) => (
+          <div
+            className="truncate text-center text-[10px] text-muted-foreground"
+            title={row.original.category ?? "\u2014"}
+          >
+            {row.original.category ?? "\u2014"}
+          </div>
+        ),
+        meta: {
+          headerClassName: "h-7 min-w-[120px] px-2 text-center",
+          cellClassName: "min-w-[120px] px-2 py-1.5 text-center",
+        } satisfies DataTableColumnMeta,
+      },
+      {
+        id: "actions",
+        enableSorting: false,
+        header: () => <div className="text-right">{t("table.actions")}</div>,
+        cell: ({ row }) => renderActions(row.original, "size-8", "size-4"),
+        meta: {
+          headerClassName: "h-7 w-[184px] px-2 text-right",
+          cellClassName: "w-[184px] p-0 text-right",
+        } satisfies DataTableColumnMeta,
+      },
+    ],
+    [isJobLocked, setRowSelection, t, timestampFormatter, renderActions],
+  );
+
+  const historyTable = useReactTable({
+    data: jobs,
+    columns,
+    getRowId: (row) => String(row.id),
+    manualPagination: true,
+    manualSorting: true,
+    enableRowSelection: (row) => !isJobLocked(row.original),
+    pageCount,
+    getCoreRowModel: getCoreRowModel(),
+    state: {
+      pagination: {
+        pageIndex,
+        pageSize: historyPreferences.pageSize,
+      },
+      rowSelection,
+      sorting: historyPreferences.sorting,
+    },
+    onRowSelectionChange: setRowSelection,
+    onPaginationChange: (updater) => {
+      const next =
+        typeof updater === "function"
+          ? updater({
+            pageIndex,
+            pageSize: historyPreferences.pageSize,
+          })
+          : updater;
+
+      if (next.pageSize !== historyPreferences.pageSize) {
+        setHistoryPreferences((current) => ({
+          ...current,
+          pageSize: next.pageSize,
+        }));
+        setPageIndex(0);
+        return;
+      }
+
+      setPageIndex(next.pageIndex);
+    },
+    onSortingChange: (updater) => {
+      const next =
+        typeof updater === "function"
+          ? updater(historyPreferences.sorting)
+          : updater;
+      setHistoryPreferences((current) => ({
+        ...current,
+        sorting: next,
+      }));
+      setPageIndex(0);
+    },
+  });
+
+  function resetHistoryView() {
+    setHistoryPreferences((current) => ({
+      ...current,
+      search: "",
+      status: "all",
+      sorting: DEFAULT_HISTORY_SORTING,
+    }));
+    setPageIndex(0);
   }
 
   async function handleRedownload(jobId: number) {
     const result = await redownloadJob({ id: jobId });
     if (!result.error) {
-      removeHistoryJob(jobId);
+      setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
+      await refetchHistoryPage(pageIndex);
     }
   }
 
-  async function handleBatchDelete() {
-    const ids = [...selectedIds].filter((id) => filteredIds.has(id));
-    if (ids.length === 0) {
-      setDeleteBatchConfirm(false);
-      setDeleteFiles(false);
+  async function handleSingleDelete(jobId: number) {
+    const accepted = await acceptDelete({
+      mode: "IDS",
+      ids: [jobId],
+      deleteFiles,
+    });
+    if (!accepted) {
       return;
     }
 
-    setDeleteBatchFetching(true);
-    const result = await executeAliasedIdMutation<FacadeHistoryJob[]>({
-      client,
-      ids,
-      operationName: "DeleteSelectedHistoryItems",
-      aliasPrefix: "deleteHistory",
-      fieldName: "deleteHistory",
-      sharedVariables: {
-        deleteFiles: { type: "Boolean", value: deleteFiles },
-      },
-      buildFieldArguments: (idVariable) => `id: ${idVariable}, deleteFiles: $deleteFiles`,
-      selectionSet: `{
-        ...FacadeHistoryItemFields
-      }`,
-      fragments: [PARSED_RELEASE_FIELDS, FACADE_HISTORY_ITEM_FIELDS],
-    });
-    setDeleteBatchFetching(false);
-    if (!result.error) {
-      const finalAlias = `deleteHistory${ids.length - 1}`;
-      const remainingItems = result.data?.[finalAlias];
-      if (remainingItems) {
-        setJobs(remainingItems.map(normalizeHistoryJob));
-      }
-      setSelectedIds(new Set());
-      void refetchCount();
+    setDeleteConfirmId(null);
+    setDeleteFiles(false);
+  }
+
+  async function handleBatchDelete() {
+    if (selectedActionIds.length === 0) {
+      return;
     }
+
+    const accepted = await acceptDelete({
+      mode: "IDS",
+      ids: selectedActionIds,
+      deleteFiles,
+    });
+    if (!accepted) {
+      return;
+    }
+
     setDeleteBatchConfirm(false);
     setDeleteFiles(false);
   }
 
-  function renderActions(job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) {
-    const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
-    const actionsBusy =
-      deleteState.fetching
-      || deleteBatchFetching
-      || deleteAllState.fetching
-      || reprocessState.fetching
-      || redownloadState.fetching;
+  async function handleDeleteAll() {
+    const accepted = await acceptDelete({
+      mode: "ALL_HISTORY",
+      deleteFiles,
+    });
+    if (!accepted) {
+      return;
+    }
 
-    return (
-      <div className="flex justify-end gap-0.5">
-        {isRestartable ? (
-          <>
-            <Button
-              variant="ghost"
-              size="icon"
-              title={t("action.reprocess")}
-              aria-label={t("action.reprocess")}
-              className={buttonSizeClassName}
-              disabled={actionsBusy}
-              onClick={() => {
-                void handleReprocess(job.id);
-              }}
-            >
-              <RefreshCcw className={iconSizeClassName} />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              title={t("action.redownload")}
-              aria-label={t("action.redownload")}
-              className={buttonSizeClassName}
-              disabled={actionsBusy}
-              onClick={() => setRedownloadConfirmId(job.id)}
-            >
-              <Download className={iconSizeClassName} />
-            </Button>
-          </>
-        ) : null}
-        <Button
-          variant="ghost"
-          size="icon"
-          title={t("action.delete")}
-          aria-label={t("action.delete")}
-          className={buttonSizeClassName}
-          disabled={actionsBusy}
-          onClick={() => setDeleteConfirmId(job.id)}
-        >
-          <Trash2 className={iconSizeClassName} />
-        </Button>
-      </div>
-    );
+    setDeleteAllConfirm(false);
+    setDeleteFiles(false);
+    setPageIndex(0);
   }
+
+  const showFilterCard = counts.all > 0 || historyPreferences.search.length > 0 || historyPreferences.status !== "all";
+  const showEmptyState = !fetching && counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
 
   return (
     <div className="space-y-6">
@@ -449,14 +1003,28 @@ export function History() {
         title={t("history.title")}
         description={t("history.empty")}
         actions={
-          jobs.length > 0 ? (
+          counts.all > 0 ? (
             <div className="flex gap-2">
-              {visibleSelectedCount > 0 ? (
-                <Button variant="destructive" onClick={() => setDeleteBatchConfirm(true)}>
-                  {t("action.delete")} ({visibleSelectedCount})
+              {selectedCount > 0 ? (
+                <Button
+                  variant="destructive"
+                  disabled={acceptDeleteState.fetching}
+                  onClick={() => {
+                    setDeleteAcceptError(null);
+                    setDeleteBatchConfirm(true);
+                  }}
+                >
+                  {t("action.delete")} ({selectedCount})
                 </Button>
               ) : null}
-              <Button variant="outline" onClick={() => setDeleteAllConfirm(true)}>
+              <Button
+                variant="outline"
+                disabled={hasActiveDeleteOperations || acceptDeleteState.fetching}
+                onClick={() => {
+                  setDeleteAcceptError(null);
+                  setDeleteAllConfirm(true);
+                }}
+              >
                 {t("action.deleteAll")}
               </Button>
             </div>
@@ -464,239 +1032,165 @@ export function History() {
         }
       />
 
-      {jobs.length > 0 ? (
-        <Card>
-          <CardContent className="space-y-4 pt-6">
-            <div className="flex flex-wrap gap-2">
-              <FilterButton
-                active={filter === "all"}
-                label={t("history.filterAll")}
-                count={counts.all}
-                onClick={() => setFilter("all")}
-              />
-              <FilterButton
-                active={filter === "success"}
-                label={t("history.filterSuccess")}
-                count={counts.success}
-                onClick={() => setFilter("success")}
-              />
-              <FilterButton
-                active={filter === "failure"}
-                label={t("history.filterFailure")}
-                count={counts.failure}
-                onClick={() => setFilter("failure")}
-              />
-            </div>
-
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-              <div className="max-w-md flex-1">
-                <Input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder={t("history.searchPlaceholder")}
-                />
+      {hasActiveDeleteOperations ? (
+        <Card className="sticky top-4 z-10 border-amber-500/30 bg-amber-500/5">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
+            <div className="space-y-1">
+              <div className="text-sm font-medium text-foreground">Deleting history items</div>
+              <div className="text-xs text-muted-foreground">
+                {deleteProgress.completedTargets + deleteProgress.failedTargets}
+                /
+                {deleteProgress.totalTargets}
+                {" "}processed
+                {deleteProgress.runningTargets > 0
+                  ? ` • ${deleteProgress.runningTargets} running`
+                  : ""}
+                {deleteProgress.queuedTargets > 0
+                  ? ` • ${deleteProgress.queuedTargets} queued`
+                  : ""}
+                {deleteProgress.failedTargets > 0
+                  ? ` • ${deleteProgress.failedTargets} failed`
+                  : ""}
               </div>
-              {search || filter !== "all" ? (
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setFilter("all");
-                    setSearch("");
-                  }}
-                >
-                  {t("action.clearFilters")}
-                </Button>
-              ) : null}
+            </div>
+            <div className="text-sm font-medium text-amber-600">
+              Rows stay visible until each delete finishes
             </div>
           </CardContent>
         </Card>
       ) : null}
 
-      {initialFetching && jobs.length === 0 ? (
+      {showFilterCard ? (
+        <Card>
+          <CardContent className="space-y-4 pt-6">
+            <div className="flex flex-wrap gap-2">
+              <FilterButton
+                active={historyPreferences.status === "all"}
+                label={t("history.filterAll")}
+                count={counts.all}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "all" }));
+                  setPageIndex(0);
+                }}
+              />
+              <FilterButton
+                active={historyPreferences.status === "success"}
+                label={t("history.filterSuccess")}
+                count={counts.success}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "success" }));
+                  setPageIndex(0);
+                }}
+              />
+              <FilterButton
+                active={historyPreferences.status === "failure"}
+                label={t("history.filterFailure")}
+                count={counts.failure}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "failure" }));
+                  setPageIndex(0);
+                }}
+              />
+            </div>
+
+            <DataTableToolbar
+              searchValue={historyPreferences.search}
+              onSearchChange={(value) => {
+                setHistoryPreferences((current) => ({
+                  ...current,
+                  search: value,
+                }));
+                setPageIndex(0);
+              }}
+              searchPlaceholder={t("history.searchPlaceholder")}
+              clearLabel={
+                historyPreferences.search || historyPreferences.status !== "all" || !isDefaultHistorySorting(historyPreferences.sorting)
+                  ? t("action.clearFilters")
+                  : undefined
+              }
+              onClear={
+                historyPreferences.search || historyPreferences.status !== "all" || !isDefaultHistorySorting(historyPreferences.sorting)
+                  ? resetHistoryView
+                  : undefined
+              }
+            />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {fetching && !data ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
             {t("label.loading")}
           </CardContent>
         </Card>
-      ) : jobs.length === 0 ? (
+      ) : showEmptyState ? (
         <EmptyState title={t("history.title")} description={t("history.empty")} />
-      ) : filteredJobs.length === 0 ? (
+      ) : (
         <Card>
-          <CardContent className="space-y-3 py-12 text-center">
-            <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-            <div>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setFilter("all");
-                  setSearch("");
-                }}
-              >
-                {t("action.clearFilters")}
-              </Button>
-            </div>
+          <CardContent className="px-0 pb-0">
+            <DataTable
+              table={historyTable}
+              tableClassName="table-fixed"
+              wrapperClassName="max-h-[70vh]"
+              rowClassName={(row) => cn(
+                "text-[11px]",
+                row.getIsSelected() && "bg-muted/50",
+                row.original.deleteOperation?.locked && "bg-amber-500/5 opacity-75",
+              )}
+              emptyState={
+                <div className="space-y-3 py-12 text-center">
+                  <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+                  <div>
+                    <Button variant="outline" onClick={resetHistoryView}>
+                      {t("action.clearFilters")}
+                    </Button>
+                  </div>
+                </div>
+              }
+            />
+            <DataTablePagination
+              table={historyTable}
+              totalCount={totalCount}
+              pageSizeOptions={[...HISTORY_PAGE_SIZE_OPTIONS]}
+              rowsPerPageLabel={t("table.rowsPerPage")}
+              previousLabel={t("action.previous")}
+              nextLabel={t("action.next")}
+            />
           </CardContent>
         </Card>
-      ) : (
-        <>
-          <Card className="hidden lg:block">
-            <CardContent className="px-0 pb-0">
-              <Table ref={scrollRef} className="table-fixed" wrapperClassName="max-h-[1700px]">
-                <TableHeader className="sticky top-0 z-10 bg-card">
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-7 w-[4%] px-2">
-                      <Checkbox
-                        checked={allVisibleSelected}
-                        onCheckedChange={toggleSelectAll}
-                        aria-label="Select all"
-                      />
-                    </TableHead>
-                    <TableHead className="h-7 w-[30%] px-2 text-[9px]">{t("table.name")}</TableHead>
-                    <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.status")}</TableHead>
-                    <TableHead className="h-7 w-[16%] px-2 text-[9px]">{t("table.time")}</TableHead>
-                    <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.health")}</TableHead>
-                    <TableHead className="h-7 w-[12%] px-2 text-right text-[9px]">{t("table.size")}</TableHead>
-                    <TableHead className="h-7 w-[10%] px-2 text-[9px]">{t("table.category")}</TableHead>
-                    <TableHead className="h-7 w-[8%] px-2 text-right text-[9px]">{t("table.actions")}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {filteredJobs.map((job) => {
-                    const displayName = formatJobReleaseName(job);
-                    return (
-                      <TableRow
-                        key={job.id}
-                        className={cn("text-[11px]", selectedIds.has(job.id) && "bg-muted/50")}
-                      >
-                        <TableCell className="px-2 py-1.5">
-                          <Checkbox
-                            checked={selectedIds.has(job.id)}
-                            onCheckedChange={() => toggleSelect(job.id)}
-                            aria-label={`Select ${displayName}`}
-                          />
-                        </TableCell>
-                        <TableCell className="min-w-0 px-2 py-1.5">
-                          <Link
-                            to={`/jobs/${job.id}`}
-                            title={displayName}
-                            className="block min-w-0 truncate text-[11px] font-medium leading-tight text-foreground transition hover:text-primary"
-                          >
-                            {displayName}
-                          </Link>
-                          {job.hasPassword ? (
-                            <span className="ml-2 shrink-0 text-[9px] text-amber-500">
-                              {t("jobs.passwordProtected")}
-                            </span>
-                          ) : null}
-                        </TableCell>
-                        <TableCell className="overflow-hidden px-2 py-1.5">
-                          <JobStatusBadge status={job.status} compact className="px-1.5" />
-                        </TableCell>
-                        <TableCell
-                          className="px-2 py-1.5 text-[10px] text-muted-foreground"
-                          title={formatHistoryTimestamp(job.createdAt ?? null)}
-                        >
-                          {formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}
-                        </TableCell>
-                        <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
-                          {(job.health / 10).toFixed(1)}%
-                        </TableCell>
-                        <TableCell className="px-2 py-1.5 text-right text-[10px] text-muted-foreground">
-                          {formatBytes(job.totalBytes)}
-                        </TableCell>
-                        <TableCell className="truncate px-2 py-1.5 text-[10px] text-muted-foreground" title={job.category ?? "\u2014"}>
-                          {job.category ?? "\u2014"}
-                        </TableCell>
-                        <TableCell className="px-2 py-1.5">
-                          {renderActions(job, "size-6", "size-3.5")}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                  {hasMore ? (
-                    <tr>
-                      <td colSpan={8}>
-                        <div ref={desktopSentinelRef} className="flex justify-center py-3 text-xs text-muted-foreground">
-                          {loadingMore ? t("label.loading") : null}
-                        </div>
-                      </td>
-                    </tr>
-                  ) : null}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          <div className="space-y-3 lg:hidden">
-            {filteredJobs.map((job) => {
-              const displayName = formatJobReleaseName(job);
-              return (
-                <Card key={job.id} className={cn(selectedIds.has(job.id) && "ring-1 ring-primary/40")}>
-                  <CardContent className="space-y-3">
-                    <div className="flex items-start gap-3">
-                      <Checkbox
-                        checked={selectedIds.has(job.id)}
-                        onCheckedChange={() => toggleSelect(job.id)}
-                        className="mt-1"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-3">
-                          <Link
-                            to={`/jobs/${job.id}`}
-                            title={displayName}
-                            className="block truncate font-medium text-foreground transition hover:text-primary"
-                          >
-                            {displayName}
-                          </Link>
-                          <JobStatusBadge status={job.status} compact />
-                        </div>
-                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                          <span>{formatHistoryTimestamp(job.createdAt ?? null, timestampFormatter)}</span>
-                          <span>{formatBytes(job.totalBytes)}</span>
-                          <span>Health {(job.health / 10).toFixed(1)}%</span>
-                          {job.category ? <span>{job.category}</span> : null}
-                        </div>
-                      </div>
-                    </div>
-                    {renderActions(job, "size-7", "size-4")}
-                  </CardContent>
-                </Card>
-              );
-            })}
-            {hasMore ? (
-              <div ref={mobileSentinelRef} className="flex justify-center py-3 text-xs text-muted-foreground">
-                {loadingMore ? t("label.loading") : null}
-              </div>
-            ) : null}
-          </div>
-        </>
       )}
 
-      {/* Single delete confirm */}
       <ConfirmDialog
         open={deleteConfirmId != null}
         title={t("confirm.deleteHistory")}
         message={t("confirm.deleteHistoryMessage")}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}
+        confirmDisabled={acceptDeleteState.fetching}
+        cancelDisabled={acceptDeleteState.fetching}
         onConfirm={() => {
           if (deleteConfirmId != null) {
-            void deleteHistory({ id: deleteConfirmId, deleteFiles });
-            setSelectedIds((prev) => {
-              const next = new Set(prev);
-              next.delete(deleteConfirmId);
-              return next;
-            });
+            void handleSingleDelete(deleteConfirmId);
           }
+        }}
+        onCancel={() => {
+          setDeleteAcceptError(null);
           setDeleteConfirmId(null);
           setDeleteFiles(false);
         }}
-        onCancel={() => { setDeleteConfirmId(null); setDeleteFiles(false); }}
       >
         <label className="flex items-center gap-2">
-          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <Checkbox
+            checked={deleteFiles}
+            disabled={acceptDeleteState.fetching}
+            onCheckedChange={(value) => setDeleteFiles(value === true)}
+          />
           <span className="text-sm">{t("confirm.deleteFiles")}</span>
         </label>
+        {deleteAcceptError ? (
+          <p className="text-sm text-destructive">{deleteAcceptError}</p>
+        ) : null}
       </ConfirmDialog>
 
       <ConfirmDialog
@@ -714,49 +1208,115 @@ export function History() {
         onCancel={() => setRedownloadConfirmId(null)}
       />
 
-      {/* Batch delete confirm */}
+      <ConfirmDialog
+        open={diagnosticConfirm != null}
+        title={t("confirm.diagnosticRedownload")}
+        message={t("confirm.diagnosticRedownloadMessage")}
+        confirmLabel={t("confirm.diagnosticRedownloadConfirm")}
+        cancelLabel={t("confirm.diagnosticRedownloadDismiss")}
+        confirmDisabled={diagnosticStartState.fetching}
+        cancelDisabled={diagnosticStartState.fetching}
+        onConfirm={() => {
+          if (!diagnosticConfirm) {
+            return;
+          }
+          void handleDiagnosticRedownload(
+            diagnosticConfirm.id,
+            diagnosticConfirm.includeServerHostnames,
+          ).then((accepted) => {
+            if (accepted) {
+              setDiagnosticConfirm(null);
+            }
+          });
+        }}
+        onCancel={() => {
+          setDiagnosticAcceptError(null);
+          setDiagnosticConfirm(null);
+        }}
+      >
+        <label className="flex items-center gap-2">
+          <Checkbox
+            checked={diagnosticConfirm?.includeServerHostnames ?? true}
+            disabled={diagnosticStartState.fetching}
+            onCheckedChange={(value) => {
+              setDiagnosticConfirm((current) => (current ? {
+                ...current,
+                includeServerHostnames: value === true,
+              } : current));
+            }}
+          />
+          <span className="text-sm">{t("confirm.includeServerHostnames")}</span>
+        </label>
+        {diagnosticAcceptError ? (
+          <p className="text-sm text-destructive">{diagnosticAcceptError}</p>
+        ) : null}
+      </ConfirmDialog>
+
       <ConfirmDialog
         open={deleteBatchConfirm}
-        title={t("confirm.deleteHistory")}
-        message={`Delete ${visibleSelectedCount} selected item${visibleSelectedCount === 1 ? "" : "s"} from history?`}
+        title={t("confirm.deleteHistoryBatch")}
+        message={t("confirm.deleteHistoryBatchMessage", { count: selectedCount })}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}
+        confirmDisabled={acceptDeleteState.fetching || selectedCount === 0}
+        cancelDisabled={acceptDeleteState.fetching}
         onConfirm={() => {
           void handleBatchDelete();
         }}
-        onCancel={() => { setDeleteBatchConfirm(false); setDeleteFiles(false); }}
+        onCancel={() => {
+          setDeleteAcceptError(null);
+          setDeleteBatchConfirm(false);
+          setDeleteFiles(false);
+        }}
       >
         <label className="flex items-center gap-2">
-          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <Checkbox
+            checked={deleteFiles}
+            disabled={acceptDeleteState.fetching}
+            onCheckedChange={(value) => setDeleteFiles(value === true)}
+          />
           <span className="text-sm">{t("confirm.deleteFiles")}</span>
         </label>
+        {deleteAcceptError ? (
+          <p className="text-sm text-destructive">{deleteAcceptError}</p>
+        ) : null}
       </ConfirmDialog>
 
-      {/* Delete all confirm */}
       <ConfirmDialog
         open={deleteAllConfirm}
         title={t("confirm.deleteAllHistory")}
         message={t("confirm.deleteAllHistoryMessage")}
-        confirmLabel={t("confirm.deleteAllHistoryConfirm")}
-        cancelLabel={t("confirm.deleteAllHistoryDismiss")}
+        confirmLabel={t("confirm.deleteHistoryConfirm")}
+        cancelLabel={t("confirm.deleteHistoryDismiss")}
+        confirmDisabled={acceptDeleteState.fetching}
+        cancelDisabled={acceptDeleteState.fetching}
         onConfirm={() => {
-          void deleteAllHistory({ deleteFiles });
+          void handleDeleteAll();
+        }}
+        onCancel={() => {
+          setDeleteAcceptError(null);
           setDeleteAllConfirm(false);
           setDeleteFiles(false);
         }}
-        onCancel={() => { setDeleteAllConfirm(false); setDeleteFiles(false); }}
       >
         <label className="flex items-center gap-2">
-          <Checkbox checked={deleteFiles} onCheckedChange={(v) => setDeleteFiles(v === true)} />
+          <Checkbox
+            checked={deleteFiles}
+            disabled={acceptDeleteState.fetching}
+            onCheckedChange={(value) => setDeleteFiles(value === true)}
+          />
           <span className="text-sm">{t("confirm.deleteFiles")}</span>
         </label>
+        {deleteAcceptError ? (
+          <p className="text-sm text-destructive">{deleteAcceptError}</p>
+        ) : null}
       </ConfirmDialog>
     </div>
   );
 }
 
 function formatHistoryTimestamp(
-  timestamp: number | null,
+  epochMs: number | null,
   formatter = new Intl.DateTimeFormat(undefined, {
     year: "numeric",
     month: "short",
@@ -765,35 +1325,29 @@ function formatHistoryTimestamp(
     minute: "2-digit",
   }),
 ) {
-  if (!timestamp) {
-    return "-";
+  if (!epochMs) {
+    return "\u2014";
   }
 
-  return formatter.format(new Date(timestamp));
+  return formatter.format(epochMs);
 }
 
-function FilterButton({
-  active,
-  label,
-  count,
-  onClick,
-}: {
+type FilterButtonProps = {
   active: boolean;
   label: string;
   count: number;
   onClick: () => void;
-}) {
+};
+
+function FilterButton({ active, label, count, onClick }: FilterButtonProps) {
   return (
-    <Button variant={active ? "default" : "outline"} size="sm" onClick={onClick}>
-      <span>{label}</span>
-      <span
-        className={cn(
-          "ml-1.5 rounded-full px-1.5 py-0.5 text-[11px] leading-none",
-          active
-            ? "bg-primary-foreground/18 text-primary-foreground"
-            : "bg-muted text-muted-foreground",
-        )}
-      >
+    <Button
+      variant={active ? "default" : "outline"}
+      className="rounded-full"
+      onClick={onClick}
+    >
+      {label}
+      <span className="rounded-full bg-background/20 px-2 py-0.5 text-xs">
         {count}
       </span>
     </Button>

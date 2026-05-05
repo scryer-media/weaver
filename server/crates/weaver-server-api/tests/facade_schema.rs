@@ -40,12 +40,22 @@ async fn public_facade_schema_exposes_core_surface() {
         "jobDetailSnapshot query should be present"
     );
     assert!(
+        sdl.contains("historyDeleteOperations(activeOnly: Boolean"),
+        "historyDeleteOperations query should be present"
+    );
+    assert!(
         sdl.contains("metricsHistory(minutes: Int!, metrics: [String!]!): MetricsHistoryResult!"),
         "metricsHistory query should be present"
     );
     assert!(
         sdl.contains("submitNzb(input: SubmitNzbInput!): SubmissionResult!"),
         "submitNzb mutation should use facade input"
+    );
+    assert!(
+        sdl.contains(
+            "acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!"
+        ),
+        "acceptHistoryDelete mutation should be present"
     );
     assert!(
         !sdl.contains("submitNzbLegacy"),

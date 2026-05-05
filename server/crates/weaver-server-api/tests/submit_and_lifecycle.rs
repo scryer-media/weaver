@@ -53,14 +53,10 @@ fn submit_upload(
 }
 
 fn assert_upload_accepts(encoded_bytes: &[u8], filename: &str, content_type: &str) -> UploadValue {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(encoded_bytes).unwrap();
-    file.flush().unwrap();
-
     UploadValue {
         filename: filename.to_string(),
         content_type: Some(content_type.to_string()),
-        content: file.reopen().unwrap(),
+        content: encoded_bytes.to_vec().into(),
     }
 }
 

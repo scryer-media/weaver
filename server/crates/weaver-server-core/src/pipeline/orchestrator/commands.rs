@@ -68,6 +68,8 @@ impl Pipeline {
                         nzb_path: None,
                         created_at,
                         completed_at: now,
+                        last_diagnostic_id: None,
+                        last_diagnostic_uploaded_at_epoch_ms: None,
                         metadata: if state.spec.metadata.is_empty() {
                             None
                         } else {
@@ -97,6 +99,7 @@ impl Pipeline {
                     self.clear_par2_runtime_state(job_id);
                     self.clear_job_extraction_runtime(job_id);
                     self.active_download_passes.remove(&job_id);
+                    self.jobs_finalizing_download.remove(&job_id);
                     self.active_downloads_by_job.remove(&job_id);
                     self.job_last_download_activity.remove(&job_id);
                     self.clear_job_rar_runtime(job_id);
@@ -277,6 +280,19 @@ impl Pipeline {
             }
             SchedulerCommand::RedownloadJob { job_id, reply } => {
                 let result = self.redownload_job(job_id).await;
+                if result.is_ok() {
+                    self.publish_snapshot();
+                }
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::StartDiagnosticRedownload {
+                source_job_id,
+                include_server_hostnames,
+                reply,
+            } => {
+                let result = self
+                    .start_diagnostic_redownload(source_job_id, include_server_hostnames)
+                    .await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }

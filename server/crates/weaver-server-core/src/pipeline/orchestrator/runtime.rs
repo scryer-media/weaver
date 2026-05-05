@@ -63,6 +63,7 @@ impl Pipeline {
             active_downloads: 0,
             active_recovery: 0,
             active_download_passes: HashSet::new(),
+            jobs_finalizing_download: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             job_last_download_activity: HashMap::new(),
@@ -226,9 +227,24 @@ impl Pipeline {
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
         if self.active_download_passes.remove(&job_id) {
+            let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
+            if finalization_pending {
+                self.jobs_finalizing_download.insert(job_id);
+            } else {
+                self.jobs_finalizing_download.remove(&job_id);
+            }
+            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+                job_id,
+                finalization_pending,
+            });
+        }
+    }
+
+    pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.jobs_finalizing_download.remove(&job_id) {
             let _ = self
                 .event_tx
-                .send(PipelineEvent::DownloadFinished { job_id });
+                .send(PipelineEvent::DownloadPipelineDrained { job_id });
         }
     }
 

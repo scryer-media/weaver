@@ -55,7 +55,13 @@ pub enum PipelineEvent {
     DownloadStarted { job_id: JobId },
 
     /// A job finished an active article download pass.
-    DownloadFinished { job_id: JobId },
+    DownloadFinished {
+        job_id: JobId,
+        finalization_pending: bool,
+    },
+
+    /// A job fully drained the post-download decode/write pipeline.
+    DownloadPipelineDrained { job_id: JobId },
 
     /// Article not found on any configured server.
     ArticleNotFound { segment_id: SegmentId },

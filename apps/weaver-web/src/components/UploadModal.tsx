@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { UploadNzbForm } from "@/features/upload/components/UploadNzbForm";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -10,6 +10,48 @@ interface UploadModalProps {
 
 export function UploadModal({ open, onClose }: UploadModalProps) {
   const t = useTranslate();
+  const formRef = useRef<HTMLFormElement | null>(null);
+
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (
+      event.key !== "Enter" ||
+      event.defaultPrevented ||
+      event.nativeEvent.isComposing ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.shiftKey
+    ) {
+      return;
+    }
+
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const role = target.getAttribute("role");
+    if (
+      target instanceof HTMLButtonElement ||
+      target instanceof HTMLTextAreaElement ||
+      target.isContentEditable ||
+      role === "button" ||
+      role === "combobox" ||
+      role === "listbox" ||
+      role === "option" ||
+      target.closest("[role='listbox']") ||
+      target.closest("[data-radix-select-content]")
+    ) {
+      return;
+    }
+
+    if (!formRef.current) {
+      return;
+    }
+
+    event.preventDefault();
+    formRef.current.requestSubmit();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -22,12 +64,15 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
-      <DialogContent className="max-h-[90vh] w-[min(96vw,72rem)] overflow-y-auto p-4 sm:max-w-5xl sm:p-6">
+      <DialogContent
+        className="max-h-[90vh] w-[min(96vw,72rem)] overflow-y-auto p-4 sm:max-w-5xl sm:p-6"
+        onKeyDownCapture={handleDialogKeyDown}
+      >
         <DialogHeader>
           <DialogTitle>{t("upload.title")}</DialogTitle>
           <DialogDescription>{t("upload.accepts")}</DialogDescription>
         </DialogHeader>
-        <UploadNzbForm layout="dialog" open={open} onSubmitted={onClose} />
+        <UploadNzbForm layout="dialog" open={open} onSubmitted={onClose} formRef={formRef} />
       </DialogContent>
     </Dialog>
   );

@@ -37,6 +37,8 @@ const it: LocaleDictionary = {
   "action.reprocess": "Rielabora",
   "action.refresh": "Aggiorna",
   "action.clearFilters": "Cancella Filtri",
+  "action.previous": "Precedente",
+  "action.next": "Successivo",
 
   // Confirmation dialogs
   "confirm.cancelJob": "Annullare questo job?",
@@ -93,6 +95,7 @@ const it: LocaleDictionary = {
   "jobs.empty": "La coda è vuota.",
   "jobs.emptyAction": "Carica un NZB",
   "jobs.emptyHint": "per iniziare.",
+  "jobs.searchPlaceholder": "Filtra coda per nome o categoria",
   "jobs.passwordProtected": "[PW]",
   "jobs.pausedHeaderHint": "L'invio dei download è in pausa globale. I job in coda e in download mantengono la posizione fino alla ripresa della coda.",
   "jobs.downloadsPaused": "Download in pausa",
@@ -117,6 +120,7 @@ const it: LocaleDictionary = {
   // Table headers
   "table.name": "Nome",
   "table.status": "Stato",
+  "table.filters": "Filtri",
   "table.priority": "Priorità",
   "table.progress": "Avanzamento",
   "table.size": "Dimensione",
@@ -149,6 +153,7 @@ const it: LocaleDictionary = {
   "timeline.noData": "La cronometraggio dettagliata del pipeline apparirà per i job elaborati dopo che il tracciamento della timeline è disponibile.",
   "timeline.pendingDownload": "Download in Attesa",
   "timeline.downloading": "Download in Corso",
+  "timeline.finalizingDownload": "Finalizzazione del Download",
   "timeline.paused": "In Pausa",
   "timeline.verifying": "Verifica in Corso",
   "timeline.repairing": "Riparazione in Corso",
@@ -254,6 +259,7 @@ const it: LocaleDictionary = {
   "history.noMatches": "Nessun job nella cronologia corrisponde al filtro attuale.",
   "table.health": "Salute",
   "table.category": "Categoria",
+  "table.rowsPerPage": "Righe per pagina",
 
   // Servers page
   "nav.servers": "Server",
@@ -295,6 +301,8 @@ const it: LocaleDictionary = {
   "categories.directoryBrowserDesc": "Scegli una directory di destinazione dal filesystem del server Weaver.",
   "categories.directoryBrowserLoading": "Caricamento directory...",
   "categories.directoryBrowserEmpty": "Nessuna sottodirectory qui.",
+  "categories.createFolder": "Crea cartella",
+  "categories.newFolderPlaceholder": "Nome nuova cartella",
   "categories.currentFolder": "Cartella Corrente",
   "categories.useCurrentFolder": "Usa Cartella Corrente",
   "categories.up": "Su",
