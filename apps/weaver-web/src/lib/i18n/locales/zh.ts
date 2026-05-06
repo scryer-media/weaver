@@ -89,6 +89,14 @@ const zh: LocaleDictionary = {
   "upload.batchFailure": "上传 {{name}} 时失败。",
   "upload.partialFailure": "在 {{name}} 失败前已提交 {{submitted}}/{{total}} 个文件。",
   "upload.rejected": "上传被服务器拒绝。",
+  "upload.retryFile": "Retry File",
+  "upload.summary": "{{ready}} ready, {{staging}} staging, {{failed}} failed",
+  "upload.statusStaging": "Staging",
+  "upload.statusReady": "Ready",
+  "upload.statusFailed": "Failed",
+  "upload.statusSubmitting": "Submitting",
+  "upload.statusSubmitted": "Submitted",
+  "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
   "jobs.title": "队列",

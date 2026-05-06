@@ -131,10 +131,7 @@ pub async fn recover_server_state(
                 .ok_or_else(|| {
                     ingest::PersistedNzbError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!(
-                            "persisted NZB missing from database for job {}",
-                            job_id.0
-                        ),
+                        format!("persisted NZB missing from database for job {}", job_id.0),
                     ))
                 })
                 .and_then(ingest::parse_persisted_nzb_bytes);

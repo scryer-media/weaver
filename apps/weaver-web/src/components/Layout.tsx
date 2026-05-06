@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { useTheme } from "next-themes";
 import {
@@ -29,7 +29,7 @@ import {
 } from "@/graphql/queries";
 import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
-import { LiveDataContext, type DownloadBlockState } from "@/lib/context/live-data-context";
+import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import {
@@ -42,7 +42,7 @@ import {
 } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
 import { usePwa } from "@/lib/context/pwa-context";
-import { settingsNav } from "@/pages/settings/SettingsLayout";
+import { settingsNav } from "@/pages/settings/settings-nav";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -101,6 +101,10 @@ const DEFAULT_GLOBAL_STATE: Snapshot["globalState"] = {
   isPaused: false,
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
+
+const RoutedOutlet = memo(function RoutedOutlet() {
+  return <Outlet />;
+});
 
 function sameStringArray(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -500,7 +504,13 @@ export function Layout() {
   const settingsOpen = location.pathname.startsWith("/settings");
 
   return (
-    <LiveDataContext.Provider value={liveData}>
+    <LiveDataProvider
+      jobs={liveData.jobs}
+      speed={liveData.speed}
+      isPaused={liveData.isPaused}
+      downloadBlock={liveData.downloadBlock}
+      connection={liveData.connection}
+    >
       <div className="min-h-screen bg-background text-foreground">
         <div className="mx-auto w-full max-w-[1787px] px-3 py-3 sm:px-4 sm:py-4">
           <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
@@ -612,7 +622,7 @@ export function Layout() {
                 </header>
 
                 <div className="w-full px-4 py-6 sm:px-6 md:px-8 md:py-8">
-                  <Outlet />
+                  <RoutedOutlet />
                 </div>
               </main>
             </div>
@@ -701,6 +711,6 @@ export function Layout() {
         <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
         <PwaUpdateBanner />
       </div>
-    </LiveDataContext.Provider>
+    </LiveDataProvider>
   );
 }

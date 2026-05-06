@@ -1,7 +1,7 @@
 use tracing::error;
 
 use crate::http;
-use weaver_server_core::Database;
+use weaver_server_core::{Database, SchedulerHandle};
 
 pub(crate) async fn wait_for_shutdown() {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -34,7 +34,7 @@ pub(crate) fn pipeline_exit_error(result: Result<(), tokio::task::JoinError>) ->
 }
 
 pub(crate) fn spawn_metrics_history_task(
-    exporter: http::PrometheusMetricsExporter,
+    handle: SchedulerHandle,
     db: Database,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -44,20 +44,24 @@ pub(crate) fn spawn_metrics_history_task(
         loop {
             interval.tick().await;
 
-            let rendered = exporter.render().await;
+            let metrics = handle.get_metrics();
+            let jobs = handle.list_jobs();
             let db = db.clone();
             let recorded_at_epoch_sec = epoch_sec_now();
             match tokio::task::spawn_blocking(move || {
-                db.record_metrics_scrape(recorded_at_epoch_sec, &rendered)
+                db.record_metrics_history_sample(recorded_at_epoch_sec, &metrics, &jobs)
             })
             .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "failed to persist metrics scrape");
+                    tracing::warn!(error = %error, "failed to persist metrics history sample");
                 }
                 Err(join_error) => {
-                    tracing::warn!(error = %join_error, "metrics scrape persistence task failed");
+                    tracing::warn!(
+                        error = %join_error,
+                        "metrics history persistence task failed"
+                    );
                 }
             }
         }

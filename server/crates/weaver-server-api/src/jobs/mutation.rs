@@ -1,21 +1,24 @@
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
 
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
-use crate::auth::{ControlGuard, graphql_error};
+use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
 use crate::history::types::{
     AcceptHistoryDeleteInput, DiagnosticRedownloadAcceptance, HistoryCommandResult,
     HistoryDeleteAcceptance, HistoryItem, history_delete_row_state_from_core,
     history_item_from_row,
 };
+use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
     PRIORITY_ATTRIBUTE_KEY, PersistedQueueEvent, QueueCommandResult, QueueEventKind,
-    SubmissionResult, SubmitNzbInput, global_queue_state, normalize_priority_value,
-    queue_item_from_job, queue_item_from_submission, submit_metadata,
+    StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult,
+    SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state,
+    normalize_priority_value, queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
 use weaver_server_core::ingest::{
-    SubmitNzbError, SubmittedJob, fetch_nzb_from_url, submit_nzb_bytes, submit_uploaded_nzb_reader,
+    SubmitNzbError, SubmittedJob, fetch_nzb_from_url, submit_nzb_bytes, submit_staged_nzb_zstd,
+    submit_uploaded_nzb_reader,
 };
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::settings::SharedConfig;
@@ -57,6 +60,135 @@ impl JobsMutation {
         input: SubmitNzbInput,
     ) -> Result<SubmissionResult> {
         submit_from_facade_input(ctx, input).await
+    }
+    #[graphql(guard = "ControlGuard")]
+    async fn stage_nzb_upload(
+        &self,
+        ctx: &Context<'_>,
+        input: StageNzbUploadInput,
+    ) -> Result<StagedNzbUploadResult> {
+        let manager = ctx.data::<StagedUploadManager>()?;
+        let caller_identity = caller_identity(ctx)?;
+        let filename = input.filename.clone();
+        let upload = match input.nzb_upload.value(ctx) {
+            Ok(upload) => upload,
+            Err(error) => {
+                return Ok(rejected_stage_upload_result(
+                    filename,
+                    format!("invalid upload: {error}"),
+                ));
+            }
+        };
+
+        match manager.stage_upload(caller_identity, upload, input.filename).await {
+            Ok(staged) => Ok(StagedNzbUploadResult {
+                accepted: true,
+                staged_upload_id: Some(staged.staged_upload_id),
+                filename: Some(staged.filename),
+                display_name: Some(staged.display_name),
+                total_files: Some(staged.total_files),
+                total_bytes: Some(staged.total_bytes),
+                error: None,
+            }),
+            Err(error) => Ok(rejected_stage_upload_result(filename, error.to_string())),
+        }
+    }
+    #[graphql(guard = "ControlGuard")]
+    async fn submit_staged_nzbs(
+        &self,
+        ctx: &Context<'_>,
+        input: SubmitStagedNzbsInput,
+    ) -> Result<SubmitStagedNzbsResult> {
+        if input.staged_upload_ids.is_empty() {
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "submitStagedNzbs requires at least one staged upload id",
+            ));
+        }
+
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        let manager = ctx.data::<StagedUploadManager>()?;
+        let caller_identity = caller_identity(ctx)?;
+        let client_request_id = input.client_request_id.clone();
+        let metadata = submit_metadata(input.attributes, client_request_id.clone())
+            .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+        let category = input.category.clone();
+        let password = input.password.clone();
+
+        let (entries, missing) = manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
+        let mut found_by_id = entries
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        let missing_ids = missing.into_iter().collect::<HashSet<_>>();
+        let mut accepted_count = 0u32;
+        let mut results = Vec::with_capacity(input.staged_upload_ids.len());
+
+        for staged_upload_id in input.staged_upload_ids {
+            let Some(entry) = found_by_id.remove(&staged_upload_id) else {
+                let error = if missing_ids.contains(&staged_upload_id) {
+                    "staged upload expired; re-add file".to_string()
+                } else {
+                    "staged upload not found".to_string()
+                };
+                results.push(StagedNzbSubmissionResult {
+                    staged_upload_id,
+                    accepted: false,
+                    retained: false,
+                    item: None,
+                    error: Some(error),
+                });
+                continue;
+            };
+
+            match submit_staged_nzb_zstd(
+                handle,
+                config,
+                entry.nzb_zstd.clone(),
+                Some(entry.filename.clone()),
+                password.clone(),
+                category.clone(),
+                metadata.clone(),
+            )
+            .await
+            {
+                Ok(submitted) => {
+                    accepted_count += 1;
+                    let item = submission_result_item(handle, &submitted).await;
+                    results.push(StagedNzbSubmissionResult {
+                        staged_upload_id,
+                        accepted: true,
+                        retained: false,
+                        item: Some(item),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    manager.restore_entry(entry);
+                    results.push(StagedNzbSubmissionResult {
+                        staged_upload_id,
+                        accepted: false,
+                        retained: true,
+                        item: None,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+
+        Ok(SubmitStagedNzbsResult {
+            accepted_count,
+            client_request_id,
+            results,
+        })
+    }
+    #[graphql(guard = "ControlGuard")]
+    async fn discard_staged_nzbs(&self, ctx: &Context<'_>, ids: Vec<String>) -> Result<bool> {
+        let manager = ctx.data::<StagedUploadManager>()?;
+        let caller_identity = caller_identity(ctx)?;
+        manager.discard_owned(&caller_identity, &ids);
+        Ok(true)
     }
     /// Pause a running job.
     #[graphql(guard = "ControlGuard")]
@@ -433,6 +565,43 @@ fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Re
     result.map_err(scheduler_graphql_error)
 }
 
+fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {
+    ctx.data::<CallerIdentity>()
+        .cloned()
+        .map_err(|_| graphql_error("INTERNAL", "missing caller identity"))
+}
+
+fn rejected_stage_upload_result(
+    filename: Option<String>,
+    error: String,
+) -> StagedNzbUploadResult {
+    StagedNzbUploadResult {
+        accepted: false,
+        staged_upload_id: None,
+        filename,
+        display_name: None,
+        total_files: None,
+        total_bytes: None,
+        error: Some(error),
+    }
+}
+
+async fn submission_result_item(
+    handle: &SchedulerHandle,
+    submitted: &SubmittedJob,
+) -> crate::jobs::types::QueueItem {
+    if let Ok(info) = handle.get_job(submitted.job_id) {
+        return queue_item_from_job(&info);
+    }
+
+    tokio::task::yield_now().await;
+    if let Ok(info) = handle.get_job(submitted.job_id) {
+        return queue_item_from_job(&info);
+    }
+
+    queue_item_from_submission(submitted)
+}
+
 async fn submit_from_facade_input(
     ctx: &Context<'_>,
     input: SubmitNzbInput,
@@ -501,92 +670,11 @@ async fn submit_from_facade_input(
         .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?
     };
 
-    if let Ok(info) = handle.get_job(submitted.job_id) {
-        return Ok(SubmissionResult {
-            accepted: true,
-            client_request_id,
-            item: queue_item_from_job(&info),
-        });
-    }
-
-    tokio::task::yield_now().await;
-    if let Ok(info) = handle.get_job(submitted.job_id) {
-        return Ok(SubmissionResult {
-            accepted: true,
-            client_request_id,
-            item: queue_item_from_job(&info),
-        });
-    }
-
     Ok(SubmissionResult {
         accepted: true,
         client_request_id,
-        item: queue_item_from_submission(&submitted),
+        item: submission_result_item(handle, &submitted).await,
     })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UploadEncoding {
-    Plain,
-    Zstd,
-    Gzip,
-    Brotli,
-    Deflate,
-}
-
-fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
-    let filename = upload.filename.trim().to_ascii_lowercase();
-    if filename.ends_with(".zst") {
-        return UploadEncoding::Zstd;
-    }
-    if filename.ends_with(".gz") || filename.ends_with(".gzip") {
-        return UploadEncoding::Gzip;
-    }
-    if filename.ends_with(".br") {
-        return UploadEncoding::Brotli;
-    }
-    if filename.ends_with(".deflate") {
-        return UploadEncoding::Deflate;
-    }
-
-    let Some(content_type) = upload.content_type.as_deref() else {
-        return UploadEncoding::Plain;
-    };
-    let normalized = content_type.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "application/zstd" | "application/x-zstd" | "application/octet-stream+zstd" => {
-            UploadEncoding::Zstd
-        }
-        "application/gzip" | "application/x-gzip" | "application/octet-stream+gzip" => {
-            UploadEncoding::Gzip
-        }
-        "application/brotli" | "application/x-brotli" | "application/octet-stream+brotli" => {
-            UploadEncoding::Brotli
-        }
-        "application/deflate" | "application/x-deflate" | "application/octet-stream+deflate" => {
-            UploadEncoding::Deflate
-        }
-        _ => UploadEncoding::Plain,
-    }
-}
-
-fn normalize_uploaded_nzb_reader(
-    upload: UploadValue,
-) -> Result<Box<dyn Read + Send>, SubmitNzbError> {
-    let encoding = detect_upload_encoding(&upload);
-    let source = upload.into_read();
-
-    match encoding {
-        UploadEncoding::Plain => Ok(Box::new(source)),
-        UploadEncoding::Zstd => {
-            let decoder =
-                zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?;
-            Ok(Box::new(decoder))
-        }
-        UploadEncoding::Gzip => Ok(Box::new(flate2::read::GzDecoder::new(source))),
-        UploadEncoding::Brotli => Ok(Box::new(brotli::Decompressor::new(source, 64 * 1024))),
-        UploadEncoding::Deflate => Ok(Box::new(flate2::read::DeflateDecoder::new(source))),
-    }
 }
 
 async fn submit_uploaded_nzb(

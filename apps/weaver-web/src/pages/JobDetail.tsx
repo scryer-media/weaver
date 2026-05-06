@@ -33,44 +33,18 @@ import {
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
-import { useLiveData } from "@/lib/context/live-data-context";
+import {
+  useLiveConnection,
+  useLiveJob,
+  useLiveSpeed,
+} from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
-
-function filenameFromContentDisposition(value: string | null): string | null {
-  return value ? /filename="?([^"]+)"?/i.exec(value)?.[1] ?? null : null;
-}
-
-function submitStreamingDownload(action: string, fields: Record<string, string>) {
-  const frameName = `download-frame-${Math.random().toString(36).slice(2)}`;
-  const frame = document.createElement("iframe");
-  frame.name = frameName;
-  frame.style.display = "none";
-  document.body.appendChild(frame);
-
-  const form = document.createElement("form");
-  form.method = "POST";
-  form.action = action;
-  form.target = frameName;
-  form.style.display = "none";
-
-  for (const [name, value] of Object.entries(fields)) {
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = name;
-    input.value = value;
-    form.appendChild(input);
-  }
-
-  document.body.appendChild(form);
-  form.submit();
-  form.remove();
-  window.setTimeout(() => frame.remove(), 60_000);
-}
+import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 
 interface JobDetailSnapshotData {
   queueItem?: GraphqlJobData | null;
@@ -94,7 +68,9 @@ export function JobDetail() {
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
-  const { jobs: liveJobs, speed, connection } = useLiveData();
+  const liveJob = useLiveJob(jobId);
+  const speed = useLiveSpeed();
+  const connection = useLiveConnection();
   const queryVariables = useMemo(() => ({ id: jobId }), [jobId]);
 
   const [{ data, fetching }, reexecuteJobQuery] = useQuery<JobDetailQueryData>({
@@ -124,7 +100,6 @@ export function JobDetail() {
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
-  const liveJob = liveJobs.find((candidate) => candidate.id === jobId) ?? null;
   const jobQueryData =
     polledData?.jobDetailSnapshot
     ?? subscriptionData?.jobDetailUpdates
@@ -250,29 +225,10 @@ export function JobDetail() {
         credentials: "same-origin",
       });
       if (!response.ok) {
-        let message = "Failed to download NZB.";
-        try {
-          const body = await response.json() as { error?: string };
-          if (body.error) {
-            message = body.error;
-          }
-        } catch {
-          // Ignore non-JSON error bodies and fall back to a generic message.
-        }
-        throw new Error(message);
+        throw new Error(await readDownloadErrorMessage(response, "Failed to download NZB."));
       }
 
-      const blob = await response.blob();
-      const objectUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = objectUrl;
-      link.download =
-        filenameFromContentDisposition(response.headers.get("content-disposition"))
-        ?? defaultNzbFilename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(objectUrl);
+      await saveResponseAsDownload(response, defaultNzbFilename);
     } catch (error) {
       setNzbDownloadError(error instanceof Error ? error.message : "Failed to download NZB.");
     } finally {
@@ -377,11 +333,11 @@ export function JobDetail() {
               ) : null}
             </div>
             {showEta ? (
-              <div className="shrink-0 text-right">
+              <div className="min-w-[7.5rem] shrink-0 text-right tabular-nums sm:min-w-[8.5rem]">
                 <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
                   {t("table.eta")}
                 </div>
-                <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
+                <div className="mt-1 text-2xl font-semibold tracking-tight text-foreground tabular-nums sm:text-3xl">
                   {eta}
                 </div>
               </div>
@@ -588,7 +544,7 @@ function MetricTile({
   return (
     <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
       <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
-      <div className={`mt-2 text-lg font-semibold ${className ?? "text-foreground"}`}>{value}</div>
+      <div className={`mt-2 text-lg font-semibold tabular-nums ${className ?? "text-foreground"}`}>{value}</div>
       {detail ? <div className="mt-1 text-xs text-muted-foreground">{detail}</div> : null}
     </div>
   );
@@ -651,6 +607,8 @@ type OutputResult = { outputDir: string; files: OutputFile[]; totalBytes: number
 function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }) {
   const t = useTranslate();
   const isTerminal = status === "COMPLETE" || status === "FAILED";
+  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [{ data, fetching }] = useQuery<{ jobOutputFiles: OutputResult | null }>({
     query: JOB_OUTPUT_FILES_QUERY,
     variables: { jobId },
@@ -660,7 +618,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   if (!isTerminal) return null;
 
   const result = data?.jobOutputFiles;
-  const authToken = authHeaders().Authorization?.replace(/^Bearer\s+/i, "") ?? "";
+  const outputFileDownloadHref = new URL(`api/jobs/${jobId}/output-file`, document.baseURI).href;
 
   if (fetching) {
     return (
@@ -693,6 +651,35 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     );
   }
 
+  async function downloadOutputFile(file: OutputFile) {
+    setDownloadingPath(file.path);
+    setDownloadError(null);
+
+    try {
+      const response = await fetch(outputFileDownloadHref, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          ...authHeaders(),
+        },
+        credentials: "same-origin",
+        body: new URLSearchParams({ path: file.path }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readDownloadErrorMessage(response, `Failed to download ${file.name}.`));
+      }
+
+      await saveResponseAsDownload(response, file.name);
+    } catch (error) {
+      setDownloadError(
+        error instanceof Error ? error.message : `Failed to download ${file.name}.`,
+      );
+    } finally {
+      setDownloadingPath((current) => (current === file.path ? null : current));
+    }
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -703,6 +690,7 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
           </span>
         </div>
         <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
+        {downloadError ? <p className="text-sm text-destructive">{downloadError}</p> : null}
       </CardHeader>
       <CardContent className="px-0 pb-0">
         <Table>
@@ -726,15 +714,11 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
                       variant="ghost"
                       size="icon"
                       className="size-8 text-muted-foreground hover:text-foreground"
-                      title={`Download ${file.name}`}
+                      title={downloadingPath === file.path ? "Preparing download..." : `Download ${file.name}`}
                       aria-label={`Download ${file.name}`}
+                      disabled={downloadingPath === file.path}
                       onClick={() => {
-                        const action = new URL(`api/jobs/${jobId}/output-file`, document.baseURI).href;
-                        const fields: Record<string, string> = { path: file.path };
-                        if (authToken) {
-                          fields.token = authToken;
-                        }
-                        submitStreamingDownload(action, fields);
+                        void downloadOutputFile(file);
                       }}
                     >
                       <Download className="size-4" />

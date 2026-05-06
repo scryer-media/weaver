@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AVAILABLE_LANGUAGES,
   DEFAULT_LANGUAGE,
   type LocaleCode,
   getLanguageLabel,
+  loadLocaleDictionary,
   normalizeLocale,
-  t as translate,
+  translateDictionary,
 } from "@/lib/i18n";
+import type { LocaleDictionary } from "@/lib/i18n/types";
 
 const UI_LANGUAGE_STORAGE_KEY = "weaver.ui.language";
 
@@ -26,11 +28,36 @@ function writeStoredLanguageCode(code: string) {
 
 export function useLanguage() {
   const [uiLanguage, setUiLanguage] = useState<LocaleCode>(readStoredLanguageCode);
+  const [dictionary, setDictionary] = useState<LocaleDictionary | null>(null);
+  const [isReady, setIsReady] = useState(false);
+  const initialLanguageRef = useRef(uiLanguage);
+  const loadRequestIdRef = useRef(0);
+
+  const loadLanguage = useCallback(async (code: string) => {
+    const normalized = normalizeLocale(code);
+    const requestId = loadRequestIdRef.current + 1;
+    loadRequestIdRef.current = requestId;
+
+    const nextDictionary = await loadLocaleDictionary(normalized);
+    if (loadRequestIdRef.current !== requestId) {
+      return;
+    }
+
+    setDictionary(nextDictionary);
+    setUiLanguage(normalized);
+    writeStoredLanguageCode(normalized);
+    document.documentElement.lang = normalized;
+    setIsReady(true);
+  }, []);
+
+  useEffect(() => {
+    void loadLanguage(initialLanguageRef.current);
+  }, [loadLanguage]);
 
   const t = useCallback(
     (key: string, values?: Record<string, string | number | boolean | null | undefined>) =>
-      translate(key, uiLanguage, values),
-    [uiLanguage],
+      translateDictionary(dictionary, key, values),
+    [dictionary],
   );
 
   const selectedLanguage = useMemo(
@@ -39,17 +66,11 @@ export function useLanguage() {
   );
 
   const setLanguagePreference = useCallback((code: string) => {
-    const normalized = normalizeLocale(code);
-    setUiLanguage(normalized);
-    writeStoredLanguageCode(normalized);
-  }, []);
-
-  useEffect(() => {
-    writeStoredLanguageCode(uiLanguage);
-    document.documentElement.lang = uiLanguage;
-  }, [uiLanguage]);
+    void loadLanguage(code);
+  }, [loadLanguage]);
 
   return {
+    isReady,
     uiLanguage,
     setLanguagePreference,
     selectedLanguage,

@@ -143,23 +143,22 @@ pub async fn resolve_submission_category(
     }
 }
 
-pub async fn submit_nzb_bytes(
+async fn submit_prepared_nzb(
     handle: &SchedulerHandle,
     config: &SharedConfig,
-    nzb_bytes: &[u8],
+    nzb: Nzb,
+    nzb_zstd: Vec<u8>,
     filename: Option<String>,
     password: Option<String>,
     category: Option<String>,
     metadata: Vec<(String, String)>,
+    submit_started: Instant,
 ) -> Result<SubmittedJob, SubmitNzbError> {
-    let submit_started = Instant::now();
-    let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
     if nzb.files.is_empty() {
         return Err(SubmitNzbError::Empty);
     }
 
     let resolved_category = resolve_submission_category(config, category.as_deref()).await;
-
     let job_id = next_submission_job_id();
     let spec = nzb_to_submission_spec(
         &nzb,
@@ -168,9 +167,6 @@ pub async fn submit_nzb_bytes(
         resolved_category,
         metadata,
     );
-
-    let nzb_zstd =
-        persisted_nzb::compress_nzb_bytes(&nzb_bytes).map_err(SubmitNzbError::Save)?;
     let nzb_path = PathBuf::from(
         filename
             .clone()
@@ -198,6 +194,32 @@ pub async fn submit_nzb_bytes(
         spec,
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
     })
+}
+
+pub async fn submit_nzb_bytes(
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb_bytes: &[u8],
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let submit_started = Instant::now();
+    let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
+    let nzb_zstd = persisted_nzb::compress_nzb_bytes(&nzb_bytes).map_err(SubmitNzbError::Save)?;
+    submit_prepared_nzb(
+        handle,
+        config,
+        nzb,
+        nzb_zstd,
+        filename,
+        password,
+        category,
+        metadata,
+        submit_started,
+    )
+    .await
 }
 
 pub async fn fetch_nzb_from_url(
@@ -245,8 +267,7 @@ pub async fn submit_uploaded_nzb_reader<R>(
 where
     R: Read + Send + 'static,
 {
-    let resolved_category = resolve_submission_category(config, category.as_deref()).await;
-    let job_id = next_submission_job_id();
+    let submit_started = Instant::now();
     let persist_result = tokio::task::spawn_blocking(move || {
         let mut source = source;
         super::persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source)
@@ -262,35 +283,43 @@ where
             return Err(SubmitNzbError::Parse(error));
         }
     };
-    if nzb.files.is_empty() {
-        return Err(SubmitNzbError::Empty);
-    }
-
-    let spec = nzb_to_submission_spec(
-        &nzb,
-        filename.as_deref(),
+    submit_prepared_nzb(
+        handle,
+        config,
+        nzb,
+        nzb_zstd,
+        filename,
         password,
-        resolved_category,
+        category,
         metadata,
-    );
-    let nzb_path = PathBuf::from(
-        filename
-            .clone()
-            .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
-    );
+        submit_started,
+    )
+    .await
+}
 
-    if let Err(error) = handle
-        .add_job(job_id, spec.clone(), nzb_path.clone(), nzb_zstd)
-        .await
-    {
-        return Err(error.into());
-    }
-
-    Ok(SubmittedJob {
-        job_id,
-        spec,
-        created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
-    })
+pub async fn submit_staged_nzb_zstd(
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    let submit_started = Instant::now();
+    let nzb = persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd)?;
+    submit_prepared_nzb(
+        handle,
+        config,
+        nzb,
+        nzb_zstd,
+        filename,
+        password,
+        category,
+        metadata,
+        submit_started,
+    )
+    .await
 }
 
 fn extract_filename_from_response(response: &reqwest::Response, url: &str) -> Option<String> {

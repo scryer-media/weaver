@@ -7,11 +7,14 @@ pub mod events;
 pub mod history;
 pub mod ingest;
 pub mod jobs;
+pub mod migration_assets;
+mod migration_hook_ids;
 pub mod operations;
 pub mod persistence;
 pub mod pipeline;
 pub mod rss;
 pub mod runtime;
+pub mod schema_migrations;
 pub mod servers;
 pub mod settings;
 
@@ -34,7 +37,8 @@ pub use operations::{
     DiagnosticRunInsertError, DiagnosticRunRow, DiagnosticRunStage,
     HistoryDeleteOperationInsertError, HistoryDeleteOperationPayload, HistoryDeleteOperationRow,
     HistoryDeleteOperationSummary, HistoryDeleteRowState, HistoryDeleteTargetWork,
-    MetricsScrapeRow, StableStateExport, diagnostic_cleanup_cutoff_ms,
+    MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
+    MetricsHistoryTier, StableStateExport, diagnostic_cleanup_cutoff_ms,
     diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
 };
 pub use persistence::{Database, StateError};

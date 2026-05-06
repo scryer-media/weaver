@@ -67,7 +67,12 @@ import {
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
-import { useLiveData } from "@/lib/context/live-data-context";
+import {
+  useLiveDownloadBlock,
+  useLiveJobs,
+  useLivePaused,
+  useLiveSpeed,
+} from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
@@ -508,7 +513,10 @@ export function JobList() {
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
   const [openQueueCellSelect, setOpenQueueCellSelect] = useState<OpenQueueCellSelect>(null);
 
-  const { jobs: allJobs, speed, isPaused, downloadBlock } = useLiveData();
+  const allJobs = useLiveJobs();
+  const speed = useLiveSpeed();
+  const isPaused = useLivePaused();
+  const downloadBlock = useLiveDownloadBlock();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
   const capBlockedJobs = jobs.filter((job) => isBlockedByIspCap(job, downloadBlock)).length;
   const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);

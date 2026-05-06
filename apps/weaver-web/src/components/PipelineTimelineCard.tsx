@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -98,6 +98,9 @@ const JOB_STAGE_KEYS: Record<TimelineLane["stage"], string> = {
   INTERRUPTED: "timeline.interrupted",
   FINAL_MOVE: "timeline.finalMove",
 };
+
+const TIMELINE_HOVER_OPEN_DELAY_MS = 140;
+const TIMELINE_HOVER_CLOSE_DELAY_MS = 100;
 
 function laneColor(stage: TimelineLane["stage"]): string {
   switch (stage) {
@@ -322,21 +325,35 @@ function TimelineSpanPopover({
   axisEnd,
   row,
   span,
+  open,
+  onPointerEnter,
+  onPointerLeave,
+  onFocus,
+  onBlur,
+  onToggle,
+  onOpenChange,
 }: {
   axisStart: number;
   axisEnd: number;
   row: PlotRow;
   span: PlotSpan;
+  open: boolean;
+  onPointerEnter: () => void;
+  onPointerLeave: () => void;
+  onFocus: () => void;
+  onBlur: () => void;
+  onToggle: () => void;
+  onOpenChange: (nextOpen: boolean) => void;
 }) {
   const t = useTranslate();
-  const [open, setOpen] = useState(false);
-
-  const handlePointerEnter = () => setOpen(true);
-  const handlePointerLeave = () => setOpen(false);
   const preventAutoFocus = (event: Event) => event.preventDefault();
 
   return (
-    <Popover modal={false} open={open} onOpenChange={setOpen}>
+    <Popover
+      modal={false}
+      open={open}
+      onOpenChange={onOpenChange}
+    >
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -345,11 +362,11 @@ function TimelineSpanPopover({
           )}
           style={spanStyle(span.startedAt, span.endedAt, axisStart, axisEnd)}
           aria-label={`${row.title}: ${span.title}`}
-          onPointerEnter={handlePointerEnter}
-          onPointerLeave={handlePointerLeave}
-          onFocus={handlePointerEnter}
-          onBlur={handlePointerLeave}
-          onClick={() => setOpen((current) => !current)}
+          onPointerEnter={onPointerEnter}
+          onPointerLeave={onPointerLeave}
+          onFocus={onFocus}
+          onBlur={onBlur}
+          onClick={onToggle}
         >
           <span
             className={cn(
@@ -367,8 +384,8 @@ function TimelineSpanPopover({
         className="w-[36rem] max-w-[calc(100vw-2rem)] space-y-3"
         onOpenAutoFocus={preventAutoFocus}
         onCloseAutoFocus={preventAutoFocus}
-        onPointerEnter={handlePointerEnter}
-        onPointerLeave={handlePointerLeave}
+        onPointerEnter={onPointerEnter}
+        onPointerLeave={onPointerLeave}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="space-y-1">
@@ -426,13 +443,104 @@ function SharedPlot({
   rows: PlotRow[];
 }) {
   const ticks = useMemo(() => tickLabels(axisStart, axisEnd), [axisEnd, axisStart]);
+  const [openSpanKey, setOpenSpanKey] = useState<string | null>(null);
+  const openTimerRef = useRef<number | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const pendingOpenKeyRef = useRef<string | null>(null);
+
+  const clearOpenTimer = useCallback(() => {
+    if (openTimerRef.current != null) {
+      window.clearTimeout(openTimerRef.current);
+      openTimerRef.current = null;
+    }
+  }, []);
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+  const clearTimers = useCallback(() => {
+    pendingOpenKeyRef.current = null;
+    clearOpenTimer();
+    clearCloseTimer();
+  }, [clearCloseTimer, clearOpenTimer]);
+
+  const scheduleOpen = useCallback((spanKey: string) => {
+    clearCloseTimer();
+    if (openSpanKey === spanKey || pendingOpenKeyRef.current === spanKey) {
+      return;
+    }
+
+    clearOpenTimer();
+    pendingOpenKeyRef.current = spanKey;
+    openTimerRef.current = window.setTimeout(() => {
+      openTimerRef.current = null;
+      const nextSpanKey = pendingOpenKeyRef.current;
+      pendingOpenKeyRef.current = null;
+      if (!nextSpanKey) {
+        return;
+      }
+      setOpenSpanKey((current) => (current === nextSpanKey ? current : nextSpanKey));
+    }, TIMELINE_HOVER_OPEN_DELAY_MS);
+  }, [clearCloseTimer, clearOpenTimer, openSpanKey]);
+
+  const scheduleClose = useCallback((delay = TIMELINE_HOVER_CLOSE_DELAY_MS) => {
+    clearOpenTimer();
+    pendingOpenKeyRef.current = null;
+    clearCloseTimer();
+    if (openSpanKey == null) {
+      return;
+    }
+
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      setOpenSpanKey(null);
+    }, delay);
+  }, [clearCloseTimer, clearOpenTimer, openSpanKey]);
+
+  const openImmediately = useCallback((spanKey: string) => {
+    clearTimers();
+    setOpenSpanKey((current) => (current === spanKey ? current : spanKey));
+  }, [clearTimers]);
+
+  const closeImmediately = useCallback((spanKey: string) => {
+    clearTimers();
+    setOpenSpanKey((current) => (current === spanKey ? null : current));
+  }, [clearTimers]);
+
+  const toggleOpen = useCallback((spanKey: string) => {
+    clearTimers();
+    setOpenSpanKey((current) => (current === spanKey ? null : spanKey));
+  }, [clearTimers]);
+
+  const handleOpenChange = useCallback((spanKey: string, nextOpen: boolean) => {
+    clearTimers();
+    setOpenSpanKey((current) => {
+      if (nextOpen) {
+        return current === spanKey ? current : spanKey;
+      }
+      return current === spanKey ? null : current;
+    });
+  }, [clearTimers]);
+
+  useEffect(() => clearTimers, [clearTimers]);
+
+  useEffect(() => {
+    if (
+      openSpanKey
+      && !rows.some((row) => row.spans.some((span) => span.key === openSpanKey))
+    ) {
+      setOpenSpanKey(null);
+    }
+  }, [openSpanKey, rows]);
 
   return (
     <div className="overflow-hidden rounded-2xl border border-border/60 bg-background/20">
       <div className="grid grid-cols-1 md:grid-cols-[minmax(16rem,22rem)_1fr]">
         <div className="hidden border-b border-border/50 px-3 py-1.5 md:block" />
         <div className="border-b border-border/50 px-3 py-1.5">
-          <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80">
+          <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.18em] text-muted-foreground/80 tabular-nums">
             {ticks.map((tick) => (
               <span key={tick.ratio}>{tick.label}</span>
             ))}
@@ -479,6 +587,13 @@ function SharedPlot({
                         axisEnd={axisEnd}
                         row={row}
                         span={span}
+                        open={openSpanKey === span.key}
+                        onPointerEnter={() => scheduleOpen(span.key)}
+                        onPointerLeave={() => scheduleClose()}
+                        onFocus={() => openImmediately(span.key)}
+                        onBlur={() => closeImmediately(span.key)}
+                        onToggle={() => toggleOpen(span.key)}
+                        onOpenChange={(nextOpen) => handleOpenChange(span.key, nextOpen)}
                       />
                       {span.endedAt != null ? (
                         <div
@@ -660,7 +775,7 @@ export function PipelineTimelineCard({
             <CardTitle>{t("timeline.title")}</CardTitle>
             <div className="text-xs text-muted-foreground">{t("timeline.sharedAxisHint")}</div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground tabular-nums">
             <Badge variant="outline">{formatDuration(axisEnd - axisStart)}</Badge>
             {extractionRows.length > 0 ? (
               <Badge variant="outline">

@@ -89,6 +89,14 @@ const fr: LocaleDictionary = {
   "upload.batchFailure": "Le téléversement a échoué pour {{name}}.",
   "upload.partialFailure": "{{submitted}} fichiers sur {{total}} soumis avant l'échec sur {{name}}.",
   "upload.rejected": "Le téléversement a été refusé par le serveur.",
+  "upload.retryFile": "Retry File",
+  "upload.summary": "{{ready}} ready, {{staging}} staging, {{failed}} failed",
+  "upload.statusStaging": "Staging",
+  "upload.statusReady": "Ready",
+  "upload.statusFailed": "Failed",
+  "upload.statusSubmitting": "Submitting",
+  "upload.statusSubmitted": "Submitted",
+  "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
   "jobs.title": "File d'attente",

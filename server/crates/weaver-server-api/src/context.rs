@@ -6,6 +6,7 @@ use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
 
 use crate::auth::LoginAuthCache;
+use crate::jobs::staging::StagedUploadManager;
 use crate::jobs::replay::QueueEventReplay;
 use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
@@ -51,6 +52,8 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         http_client.clone(),
     );
     diagnostic_manager.spawn_worker();
+    let staged_upload_manager = StagedUploadManager::new();
+    staged_upload_manager.spawn_cleanup_worker();
 
     Schema::build(
         QueryRoot::default(),
@@ -69,5 +72,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(replay)
     .data(history_delete_manager)
     .data(diagnostic_manager)
+    .data(staged_upload_manager)
     .finish()
 }

@@ -9,13 +9,17 @@ import { TranslateContext, type TranslateContextValue } from "@/lib/context/tran
 import { PwaProvider } from "@/lib/context/pwa-context";
 
 function AppProviders() {
-  const { t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
+  const { isReady, t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
   const client = useGraphqlClient();
 
   const contextValue = useMemo<TranslateContextValue>(
     () => ({ t, uiLanguage, setLanguagePreference, selectedLanguage }),
     [t, uiLanguage, setLanguagePreference, selectedLanguage],
   );
+
+  if (!isReady) {
+    return <div className="min-h-screen bg-background" aria-hidden="true" />;
+  }
 
   return (
     <TranslateContext.Provider value={contextValue}>

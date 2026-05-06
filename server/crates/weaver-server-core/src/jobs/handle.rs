@@ -239,6 +239,7 @@ pub enum SchedulerCommand {
     /// Re-download a completed or failed job as a linked diagnostic rerun under a new job ID.
     StartDiagnosticRedownload {
         source_job_id: JobId,
+        diagnostic_job_id: JobId,
         include_server_hostnames: bool,
         reply: oneshot::Sender<Result<JobId, SchedulerError>>,
     },
@@ -415,12 +416,14 @@ impl SchedulerHandle {
     pub async fn start_diagnostic_redownload(
         &self,
         source_job_id: JobId,
+        diagnostic_job_id: JobId,
         include_server_hostnames: bool,
     ) -> Result<JobId, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::StartDiagnosticRedownload {
                 source_job_id,
+                diagnostic_job_id,
                 include_server_hostnames,
                 reply: tx,
             })

@@ -34,6 +34,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { saveResponseAsDownload } from "@/lib/download";
 
 export function SettingsPageHeader({
   title,
@@ -143,18 +144,7 @@ export function BackupRestoreSection({
       if (!response.ok) {
         await throwJsonError(response);
       }
-      const blob = await response.blob();
-      const filename =
-        parseAttachmentFilename(response.headers.get("content-disposition")) ??
-        `weaver_backup_${Date.now()}.tar.zst`;
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
+      await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.tar.zst`);
       setBackupMessage(t("settings.backupDownloadReady"));
     } catch (error) {
       setBackupError(error instanceof Error ? error.message : String(error));
@@ -780,12 +770,6 @@ async function throwJsonError(response: Response): Promise<never> {
     }
     throw new Error(`Request failed with status ${response.status}`, { cause: error });
   }
-}
-
-function parseAttachmentFilename(contentDisposition: string | null): string | null {
-  if (!contentDisposition) return null;
-  const match = /filename="?([^"]+)"?/.exec(contentDisposition);
-  return match?.[1] ?? null;
 }
 
 function formatEpoch(ms: number): string {

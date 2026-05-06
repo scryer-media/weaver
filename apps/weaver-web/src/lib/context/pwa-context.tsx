@@ -37,6 +37,8 @@ export function PwaProvider({ children }: { children: ReactNode }) {
     let activeRegistration: ServiceWorkerRegistration | null = null;
     let disposed = false;
     let updateTimer: number | null = null;
+    let watchedInstallingWorker: ServiceWorker | null = null;
+    let handleInstallingStateChange: (() => void) | null = null;
     const serviceWorkerUrl = `${import.meta.env.BASE_URL}sw.js`;
 
     // Auto-apply updates: tell the waiting worker to activate immediately
@@ -57,20 +59,32 @@ export function PwaProvider({ children }: { children: ReactNode }) {
       void activeRegistration.update();
     };
 
+    const detachInstallingWorker = () => {
+      if (watchedInstallingWorker && handleInstallingStateChange) {
+        watchedInstallingWorker.removeEventListener("statechange", handleInstallingStateChange);
+      }
+      watchedInstallingWorker = null;
+      handleInstallingStateChange = null;
+    };
+
     const watchInstallingWorker = (registration: ServiceWorkerRegistration) => {
       const installing = registration.installing;
-      if (!installing) {
+      if (!installing || watchedInstallingWorker === installing) {
         return;
       }
 
-      installing.addEventListener("statechange", () => {
+      detachInstallingWorker();
+
+      handleInstallingStateChange = () => {
         if (
           installing.state === "installed" &&
           navigator.serviceWorker.controller
         ) {
           autoApplyUpdate(installing);
         }
-      });
+      };
+      watchedInstallingWorker = installing;
+      installing.addEventListener("statechange", handleInstallingStateChange);
     };
 
     const handleControllerChange = () => {
@@ -92,6 +106,11 @@ export function PwaProvider({ children }: { children: ReactNode }) {
 
     navigator.serviceWorker.addEventListener("controllerchange", handleControllerChange);
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    const handleUpdateFound = () => {
+      if (activeRegistration) {
+        watchInstallingWorker(activeRegistration);
+      }
+    };
 
     void navigator.serviceWorker.register(serviceWorkerUrl).then((registration) => {
       if (disposed) {
@@ -105,10 +124,7 @@ export function PwaProvider({ children }: { children: ReactNode }) {
         autoApplyUpdate(registration.waiting);
       }
       watchInstallingWorker(registration);
-
-      registration.addEventListener("updatefound", () => {
-        watchInstallingWorker(registration);
-      });
+      registration.addEventListener("updatefound", handleUpdateFound);
 
       lastUpdateCheckRef.current = Date.now();
       updateTimer = window.setInterval(triggerUpdateCheck, UPDATE_CHECK_INTERVAL_MS);
@@ -119,6 +135,10 @@ export function PwaProvider({ children }: { children: ReactNode }) {
       if (updateTimer !== null) {
         window.clearInterval(updateTimer);
       }
+      if (activeRegistration) {
+        activeRegistration.removeEventListener("updatefound", handleUpdateFound);
+      }
+      detachInstallingWorker();
       navigator.serviceWorker.removeEventListener(
         "controllerchange",
         handleControllerChange,

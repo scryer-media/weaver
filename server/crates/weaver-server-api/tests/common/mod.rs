@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use weaver_server_api::auth::{CallerScope, LoginAuthCache};
+use weaver_server_api::auth::{CallerIdentity, CallerScope, LoginAuthCache};
 use weaver_server_api::{RssService, SchemaContext, WeaverSchema, build_schema};
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::events::model::PipelineEvent;
@@ -130,6 +130,10 @@ pub struct TestHarness {
 }
 
 impl TestHarness {
+    fn local_identity() -> CallerIdentity {
+        CallerIdentity::Local([7; 32])
+    }
+
     /// Create a new test harness with in-memory DB, default config, mock
     /// scheduler, and a real GraphQL schema.
     pub async fn new() -> Self {
@@ -187,13 +191,17 @@ impl TestHarness {
 
     /// Execute a GraphQL query/mutation with full admin access.
     pub async fn execute(&self, query: &str) -> Response {
-        let request = Request::new(query).data(CallerScope::Local);
+        let request = Request::new(query)
+            .data(CallerScope::Local)
+            .data(Self::local_identity());
         self.schema.execute(request).await
     }
 
     /// Execute a GraphQL query/mutation as a specific caller scope.
     pub async fn execute_as(&self, query: &str, scope: CallerScope) -> Response {
-        let request = Request::new(query).data(scope);
+        let request = Request::new(query)
+            .data(scope)
+            .data(Self::local_identity());
         self.schema.execute(request).await
     }
 
@@ -202,6 +210,7 @@ impl TestHarness {
     pub async fn execute_with_variables(&self, query: &str, variables: Variables) -> Response {
         let request = Request::new(query)
             .data(CallerScope::Local)
+            .data(Self::local_identity())
             .variables(variables);
         self.schema.execute(request).await
     }
@@ -357,6 +366,7 @@ fn spawn_test_scheduler(
                     spec,
                     nzb_path: _,
                     reply,
+                    ..
                 } => {
                     if jobs.contains_key(&job_id) {
                         let _ =
@@ -583,13 +593,12 @@ fn spawn_test_scheduler(
                 }
                 SchedulerCommand::StartDiagnosticRedownload {
                     source_job_id,
+                    diagnostic_job_id,
                     include_server_hostnames,
                     reply,
                 } => {
                     let result = match jobs.get(&source_job_id) {
                         Some(source_state) => {
-                            let diagnostic_job_id =
-                                JobId(jobs.keys().map(|job_id| job_id.0).max().unwrap_or(0) + 1);
                             let mut spec = source_state.spec.clone();
                             spec.metadata.push((
                                 DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),

@@ -1,0 +1,56 @@
+format_version = 1
+starting_version = 21
+
+[[migration]]
+version = 21
+description = "legacy adoption bridge"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0021_legacy_schema_parity/fresh.sql"
+scope = "new_install_only"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "adopt_legacy_schema_to_21"
+scope = "upgrade_only"
+
+[[migration]]
+version = 22
+description = "diagnostic and async operation state"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0022_diagnostic_and_async_state/schema.sql"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "upgrade_to_schema_22"
+scope = "all"
+
+[[migration]]
+version = 23
+description = "persisted nzb blobs"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "upgrade_to_schema_23"
+scope = "all"
+
+[[migration]]
+version = 24
+description = "tiered metrics history"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0024_tiered_metrics_history/schema.sql"
+scope = "all"
+
+[[baseline]]
+through_version = 21
+file = "migrations/0021_legacy_schema_parity/fresh.sql"

@@ -257,6 +257,48 @@ pub struct SubmitNzbInput {
     pub client_request_id: Option<String>,
 }
 
+#[derive(Debug, InputObject)]
+pub struct StageNzbUploadInput {
+    pub nzb_upload: Upload,
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct StagedNzbUploadResult {
+    pub accepted: bool,
+    pub staged_upload_id: Option<String>,
+    pub filename: Option<String>,
+    pub display_name: Option<String>,
+    pub total_files: Option<u32>,
+    pub total_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, InputObject, Default)]
+pub struct SubmitStagedNzbsInput {
+    pub staged_upload_ids: Vec<String>,
+    pub password: Option<String>,
+    pub category: Option<String>,
+    pub attributes: Option<Vec<AttributeInput>>,
+    pub client_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct StagedNzbSubmissionResult {
+    pub staged_upload_id: String,
+    pub accepted: bool,
+    pub retained: bool,
+    pub item: Option<QueueItem>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct SubmitStagedNzbsResult {
+    pub accepted_count: u32,
+    pub client_request_id: Option<String>,
+    pub results: Vec<StagedNzbSubmissionResult>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedQueueEvent {
     pub occurred_at_ms: i64,

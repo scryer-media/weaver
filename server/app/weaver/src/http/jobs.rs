@@ -152,10 +152,11 @@ async fn load_job_nzb_download(
 ) -> Result<Option<JobNzbDownload>, StatusCode> {
     if let Ok(info) = handle.get_job(JobId(job_id)) {
         let db = db.clone();
-        let recovered = tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(JobId(job_id)))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let recovered =
+            tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(JobId(job_id)))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if let Some((_, nzb_zstd)) = recovered {
             return Ok(Some(JobNzbDownload {
                 nzb_zstd,

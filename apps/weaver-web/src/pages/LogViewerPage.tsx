@@ -24,6 +24,7 @@ const LOG_LEVEL_COLORS: Record<string, string> = {
 };
 
 const MAX_BUFFER = 2000;
+const KEEP_SUBSCRIPTION_DURING_STRICT_REMOUNT = import.meta.env.DEV;
 
 const SERVICE_LOG_LINES_SUB = `subscription ServiceLogLines { serviceLogLines }`;
 
@@ -156,7 +157,7 @@ export function LogViewerPage() {
 
   // Subscribe to live log lines via WebSocket
   useEffect(() => {
-    if (teardownTimer.current) {
+    if (KEEP_SUBSCRIPTION_DURING_STRICT_REMOUNT && teardownTimer.current) {
       clearTimeout(teardownTimer.current);
       teardownTimer.current = null;
       return;
@@ -188,6 +189,12 @@ export function LogViewerPage() {
     setConnected(true);
 
     return () => {
+      if (!KEEP_SUBSCRIPTION_DURING_STRICT_REMOUNT) {
+        unsubscribe();
+        setConnected(false);
+        return;
+      }
+
       teardownTimer.current = setTimeout(() => {
         teardownTimer.current = null;
         unsubscribe();

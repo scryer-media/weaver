@@ -306,6 +306,10 @@ fn collect_finalizing_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimeli
                     open = Some(spans.len() - 1);
                 }
             }
+            EventKind::DownloadStarted => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+                finalization_pending = false;
+            }
             EventKind::DownloadPipelineDrained => {
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
                 finalization_pending = false;

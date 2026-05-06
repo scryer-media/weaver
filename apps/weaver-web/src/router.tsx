@@ -1,60 +1,137 @@
+import type { ComponentType } from "react";
 import { createBrowserRouter, Navigate } from "react-router";
 import { Layout } from "@/components/Layout";
 import { RouteErrorPage } from "@/components/RouteErrorPage";
-import { JobList } from "@/pages/JobList";
-import { JobDetail } from "@/pages/JobDetail";
-import { Upload } from "@/pages/Upload";
-import { Servers } from "@/pages/Servers";
-import { Categories } from "@/pages/Categories";
-import { History } from "@/pages/History";
-import { SettingsLayout } from "@/pages/settings/SettingsLayout";
-import { GeneralSettingsPage } from "@/pages/settings/GeneralSettingsPage";
-import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
-import { BackupSettingsPage } from "@/pages/settings/BackupSettingsPage";
-import { RssSettingsPage } from "@/pages/settings/RssSettingsPage";
-import { ScheduleSettingsPage } from "@/pages/settings/ScheduleSettingsPage";
-import { BandwidthCapSettingsPage } from "@/pages/settings/BandwidthCapSettingsPage";
 
 const basename = window.__WEAVER_BASE__ || "/";
+
+function lazyNamedRoute<TModule extends Record<string, unknown>, TKey extends keyof TModule>(
+  importer: () => Promise<TModule>,
+  exportName: TKey,
+) {
+  return async () => {
+    const module = await importer();
+    return {
+      Component: module[exportName] as ComponentType,
+    };
+  };
+}
+
+function lazyEmbeddedRoute<TModule extends Record<string, unknown>, TKey extends keyof TModule>(
+  importer: () => Promise<TModule>,
+  exportName: TKey,
+  props: Record<string, unknown>,
+) {
+  return async () => {
+    const module = await importer();
+    const BaseComponent = module[exportName] as ComponentType<Record<string, unknown>>;
+
+    function EmbeddedRouteComponent() {
+      return <BaseComponent {...props} />;
+    }
+
+    EmbeddedRouteComponent.displayName = `${String(exportName)}EmbeddedRoute`;
+
+    return {
+      Component: EmbeddedRouteComponent,
+    };
+  };
+}
 
 export const router = createBrowserRouter([
   {
     element: <Layout />,
     errorElement: <RouteErrorPage />,
     children: [
-      { index: true, element: <JobList /> },
-      { path: "jobs/:id", element: <JobDetail /> },
-      { path: "upload", element: <Upload /> },
+      {
+        index: true,
+        lazy: lazyNamedRoute(() => import("@/pages/JobList"), "JobList"),
+      },
+      {
+        path: "jobs/:id",
+        lazy: lazyNamedRoute(() => import("@/pages/JobDetail"), "JobDetail"),
+      },
+      {
+        path: "upload",
+        lazy: lazyNamedRoute(() => import("@/pages/Upload"), "Upload"),
+      },
       {
         path: "monitoring",
-        lazy: async () => {
-          const page = await import("@/pages/MetricsPage");
-          return { Component: page.MetricsPage };
-        },
+        lazy: lazyNamedRoute(() => import("@/pages/MetricsPage"), "MetricsPage"),
       },
-      { path: "history", element: <History /> },
+      {
+        path: "history",
+        lazy: lazyNamedRoute(() => import("@/pages/History"), "History"),
+      },
       {
         path: "logs",
-        lazy: async () => {
-          const page = await import("@/pages/LogViewerPage");
-          return { Component: page.LogViewerPage };
-        },
+        lazy: lazyNamedRoute(() => import("@/pages/LogViewerPage"), "LogViewerPage"),
       },
       { path: "servers", element: <Navigate to="/settings/servers" replace /> },
       { path: "categories", element: <Navigate to="/settings/categories" replace /> },
       {
         path: "settings",
-        element: <SettingsLayout />,
+        lazy: lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
         children: [
           { index: true, element: <Navigate to="general" replace /> },
-          { path: "general", element: <GeneralSettingsPage /> },
-          { path: "bandwidth", element: <BandwidthCapSettingsPage /> },
-          { path: "security", element: <SecuritySettingsPage /> },
-          { path: "backup", element: <BackupSettingsPage /> },
-          { path: "rss", element: <RssSettingsPage /> },
-          { path: "schedules", element: <ScheduleSettingsPage /> },
-          { path: "categories", element: <Categories embedded /> },
-          { path: "servers", element: <Servers embedded /> },
+          {
+            path: "general",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/GeneralSettingsPage"),
+              "GeneralSettingsPage",
+            ),
+          },
+          {
+            path: "bandwidth",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/BandwidthCapSettingsPage"),
+              "BandwidthCapSettingsPage",
+            ),
+          },
+          {
+            path: "security",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/SecuritySettingsPage"),
+              "SecuritySettingsPage",
+            ),
+          },
+          {
+            path: "backup",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/BackupSettingsPage"),
+              "BackupSettingsPage",
+            ),
+          },
+          {
+            path: "rss",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/RssSettingsPage"),
+              "RssSettingsPage",
+            ),
+          },
+          {
+            path: "schedules",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/ScheduleSettingsPage"),
+              "ScheduleSettingsPage",
+            ),
+          },
+          {
+            path: "categories",
+            lazy: lazyEmbeddedRoute(
+              () => import("@/pages/Categories"),
+              "Categories",
+              { embedded: true },
+            ),
+          },
+          {
+            path: "servers",
+            lazy: lazyEmbeddedRoute(
+              () => import("@/pages/Servers"),
+              "Servers",
+              { embedded: true },
+            ),
+          },
         ],
       },
     ],

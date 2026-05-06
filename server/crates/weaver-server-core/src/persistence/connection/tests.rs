@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,8 @@ fn test_db(conn: Connection) -> Database {
         writer_conn: Arc::new(Mutex::new(conn)),
         read_pool: None,
         writer_tx,
+        pending_archive_retries: Arc::new(AtomicUsize::new(0)),
+        pending_archive_notify: Arc::new(tokio::sync::Notify::new()),
         encryption_key: None,
     }
 }
@@ -45,6 +48,36 @@ fn open_applies_sqlite_memory_pragmas() {
         .query_row("PRAGMA mmap_size", [], |row| row.get(0))
         .unwrap();
     assert_eq!(mmap_size, 16 * 1024 * 1024);
+}
+
+#[test]
+fn open_file_database_stamps_sqlx_migration_ledger() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("weaver.db")).unwrap();
+    let conn = db.conn();
+
+    let latest_version: i64 = conn
+        .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latest_version, SCHEMA_VERSION);
+
+    let migration_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(migration_count, 3);
+
+    let checksum_algo: String = conn
+        .query_row(
+            "SELECT checksum_algo FROM _sqlx_migrations WHERE version = ?1",
+            [SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(checksum_algo, "blake3");
 }
 
 #[test]
@@ -274,7 +307,7 @@ fn migrate_v12_adds_bandwidth_usage_ledger() {
 }
 
 #[test]
-fn migrate_v14_adds_metrics_scrapes() {
+fn migrate_v14_adds_metrics_history_chunks() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -286,14 +319,14 @@ fn migrate_v14_adds_metrics_scrapes() {
     db.create_schema().unwrap();
 
     let conn = db.conn();
-    let metrics_scrape_cols: i64 = conn
+    let metrics_chunk_cols: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('metrics_scrapes')",
+            "SELECT COUNT(*) FROM pragma_table_info('metrics_history_chunks')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(metrics_scrape_cols, 2);
+    assert_eq!(metrics_chunk_cols, 3);
 
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))

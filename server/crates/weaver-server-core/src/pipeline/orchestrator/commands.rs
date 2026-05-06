@@ -84,9 +84,8 @@ impl Pipeline {
                     let archive_result = self
                         .db_blocking({
                             move |db| {
-                                db.archive_job(job_id, &row).map_err(|e| {
-                                    format!("failed to archive cancelled job: {e}")
-                                })?;
+                                db.archive_job(job_id, &row)
+                                    .map_err(|e| format!("failed to archive cancelled job: {e}"))?;
                                 Ok::<(), String>(())
                             }
                         })
@@ -285,11 +284,16 @@ impl Pipeline {
             }
             SchedulerCommand::StartDiagnosticRedownload {
                 source_job_id,
+                diagnostic_job_id,
                 include_server_hostnames,
                 reply,
             } => {
                 let result = self
-                    .start_diagnostic_redownload(source_job_id, include_server_hostnames)
+                    .start_diagnostic_redownload(
+                        source_job_id,
+                        diagnostic_job_id,
+                        include_server_hostnames,
+                    )
                     .await;
                 if result.is_ok() {
                     self.publish_snapshot();

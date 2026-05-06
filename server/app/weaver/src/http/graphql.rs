@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use weaver_server_api::WeaverSchema;
+use weaver_server_api::auth::CallerIdentity;
 use weaver_server_core::auth::{CallerScope, hash_api_key};
 
 pub(super) async fn graphql_handler(
@@ -13,7 +14,7 @@ pub(super) async fn graphql_handler(
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Result<GraphQLResponse, StatusCode> {
-    let scope = super::auth::resolve_scope(
+    let resolved = super::auth::resolve_caller(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
@@ -22,7 +23,7 @@ pub(super) async fn graphql_handler(
     )
     .await?;
     let mut request = req.into_inner();
-    request = request.data(scope);
+    request = request.data(resolved.scope).data(resolved.identity);
     Ok(schema.execute(request).await.into())
 }
 
@@ -36,7 +37,7 @@ pub(super) async fn ws_handler(
     // Pre-resolve scope from cookies on the upgrade request. Browsers
     // automatically send cookies on WebSocket upgrade, so JWT auth works
     // without needing api_key in connection_init.
-    let upgrade_scope = super::auth::resolve_scope(
+    let upgrade_caller = super::auth::resolve_caller(
         &request_auth.db,
         &request_auth.auth_cache,
         &request_auth.api_key_cache,
@@ -53,9 +54,10 @@ pub(super) async fn ws_handler(
                 move |payload: serde_json::Value| async move {
                     // If the upgrade request was already authenticated (via cookie),
                     // use that scope directly.
-                    if let Some(scope) = upgrade_scope {
+                    if let Some(caller) = upgrade_caller.clone() {
                         let mut data = Data::default();
-                        data.insert(scope);
+                        data.insert(caller.scope);
+                        data.insert(caller.identity);
                         return Ok(data);
                     }
 
@@ -73,6 +75,7 @@ pub(super) async fn ws_handler(
                     if key == request_auth.session_token.0.as_str() {
                         let mut data = Data::default();
                         data.insert(CallerScope::Local);
+                        data.insert(CallerIdentity::Local(hash_api_key(key)));
                         return Ok(data);
                     }
                     let key_hash = hash_api_key(key);
@@ -91,6 +94,7 @@ pub(super) async fn ws_handler(
                             let scope = super::auth::caller_scope_from_api_key_scope(&row.scope);
                             let mut data = Data::default();
                             data.insert(scope);
+                            data.insert(CallerIdentity::ApiKey(row.key_hash));
                             Ok(data)
                         }
                         None => Err(async_graphql::Error::new("Invalid API key")),

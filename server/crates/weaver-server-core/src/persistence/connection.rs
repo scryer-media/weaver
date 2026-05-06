@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::StateError;
 
@@ -15,11 +15,14 @@ pub use crate::jobs::{
     ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
     ExtractionChunk, RecoveredJob,
 };
-use crate::operations::metrics_store::METRICS_RETENTION_SECS;
-pub use crate::operations::{MetricsScrapeRow, StableStateExport};
+use crate::operations::metrics_store::LEGACY_METRICS_RETENTION_SECS;
+pub use crate::operations::{
+    MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
+    RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
+};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 const LEGACY_SCHEMA_VERSION: i64 = 20;
 const DEFAULT_SQLITE_READ_CONNECTIONS: usize = 4;
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
@@ -150,7 +153,7 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
             row.get(0)
         })
         .map_err(|e| StateError::Database(e.to_string()))?;
-    let metrics_cutoff_epoch_sec = current_epoch_sec() - METRICS_RETENTION_SECS;
+    let metrics_cutoff_epoch_sec = current_epoch_sec() - LEGACY_METRICS_RETENTION_SECS;
     let db_path = main_database_path(conn)?;
     let db_size_before_bytes = file_size_bytes(db_path.as_deref());
 
@@ -212,7 +215,9 @@ fn backfill_persisted_nzb_blobs(conn: &Connection, table: &str) -> Result<(), St
         ))
         .map_err(|e| StateError::Database(e.to_string()))?;
     let rows = select
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|e| StateError::Database(e.to_string()))?;
 
     let mut updates = Vec::new();
@@ -259,13 +264,17 @@ pub struct Database {
     writer_conn: Arc<Mutex<Connection>>,
     read_pool: Option<Arc<ReadPool>>,
     writer_tx: mpsc::Sender<DbWriteCommand>,
+    pending_archive_retries: Arc<AtomicUsize>,
+    pending_archive_notify: Arc<Notify>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
 }
 
 impl Database {
     /// Open (or create) the database at `path`.
-    /// Runs schema creation and sets WAL mode.
+    /// Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {
+        crate::schema_migrations::run_embedded_migrations_on_path_blocking(path)?;
+
         let conn = Connection::open(path).map_err(|e| StateError::Database(e.to_string()))?;
         configure_connection(&conn, false)?;
 
@@ -277,9 +286,10 @@ impl Database {
                 sqlite_read_connection_count(),
             )?)),
             writer_tx,
+            pending_archive_retries: Arc::new(AtomicUsize::new(0)),
+            pending_archive_notify: Arc::new(Notify::new()),
             encryption_key: None,
         };
-        db.create_schema()?;
         db.spawn_writer_task(writer_rx);
         Ok(db)
     }
@@ -293,6 +303,8 @@ impl Database {
             writer_conn: Arc::new(Mutex::new(conn)),
             read_pool: None,
             writer_tx,
+            pending_archive_retries: Arc::new(AtomicUsize::new(0)),
+            pending_archive_notify: Arc::new(Notify::new()),
             encryption_key: None,
         };
         db.create_schema()?;
@@ -486,9 +498,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_integration_events_item_id
                 ON integration_events(item_id);
 
-            CREATE TABLE IF NOT EXISTS metrics_scrapes (
-                scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
-                body_zstd            BLOB NOT NULL
+            CREATE TABLE IF NOT EXISTS metrics_history_chunks (
+                resolution_sec       INTEGER NOT NULL,
+                chunk_start_epoch_sec INTEGER NOT NULL,
+                body_zstd            BLOB NOT NULL,
+                PRIMARY KEY (resolution_sec, chunk_start_epoch_sec)
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS async_operations (
@@ -995,9 +1009,15 @@ impl Database {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
                 let tx = self.writer_tx.clone();
+                let pending_archive_retries = self.pending_archive_retries.clone();
+                let pending_archive_notify = self.pending_archive_notify.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    pending_archive_retries.fetch_add(1, Ordering::AcqRel);
                     handle.spawn(async move {
-                        if let Err(error) = tx.send(command).await {
+                        let send_result = tx.send(command).await;
+                        pending_archive_retries.fetch_sub(1, Ordering::AcqRel);
+                        pending_archive_notify.notify_waiters();
+                        if let Err(error) = send_result {
                             tracing::warn!(error = %error, "sqlite writer queue closed while retrying archive enqueue");
                         }
                     });
@@ -1035,6 +1055,7 @@ impl Database {
     }
 
     pub async fn flush_write_queue(&self) -> Result<(), StateError> {
+        self.wait_for_pending_archive_retries().await;
         let (reply, rx) = oneshot::channel();
         self.writer_tx
             .send(DbWriteCommand::Flush { reply })
@@ -1042,6 +1063,19 @@ impl Database {
             .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))?;
         rx.await
             .map_err(|_| StateError::Database("sqlite writer flush failed".to_string()))
+    }
+
+    async fn wait_for_pending_archive_retries(&self) {
+        loop {
+            if self.pending_archive_retries.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.pending_archive_notify.notified();
+            if self.pending_archive_retries.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Re-encrypt any plaintext passwords in the database.

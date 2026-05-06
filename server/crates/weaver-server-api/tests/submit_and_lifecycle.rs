@@ -6,7 +6,7 @@ use async_graphql::{Request, UploadValue, Variables};
 use base64::Engine;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use serde_json::json;
-use weaver_server_api::auth::CallerScope;
+use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_api::encode_event_cursor;
 
 fn encode_nzb(xml: &str) -> String {
@@ -49,6 +49,105 @@ fn submit_upload(
         }
     })));
     request.set_upload("variables.input.nzbUpload", upload);
+    h.schema.execute(request)
+}
+
+fn local_identity(value: u8) -> CallerIdentity {
+    CallerIdentity::Local([value; 32])
+}
+
+fn stage_upload(
+    h: &TestHarness,
+    upload: UploadValue,
+    identity: CallerIdentity,
+) -> impl std::future::Future<Output = async_graphql::Response> + '_ {
+    let mut request = Request::new(
+        r#"
+        mutation Stage($input: StageNzbUploadInput!) {
+            stageNzbUpload(input: $input) {
+                accepted
+                stagedUploadId
+                filename
+                displayName
+                totalFiles
+                totalBytes
+                error
+            }
+        }
+        "#,
+    )
+    .data(CallerScope::Local)
+    .data(identity)
+    .variables(Variables::from_json(json!({
+        "input": {
+            "nzbUpload": null
+        }
+    })));
+    request.set_upload("variables.input.nzbUpload", upload);
+    h.schema.execute(request)
+}
+
+fn submit_staged(
+    h: &TestHarness,
+    identity: CallerIdentity,
+    staged_upload_ids: Vec<String>,
+) -> impl std::future::Future<Output = async_graphql::Response> + '_ {
+    let request = Request::new(
+        r#"
+        mutation Submit($input: SubmitStagedNzbsInput!) {
+            submitStagedNzbs(input: $input) {
+                acceptedCount
+                clientRequestId
+                results {
+                    stagedUploadId
+                    accepted
+                    retained
+                    error
+                    item {
+                        id
+                        state
+                        category
+                        hasPassword
+                        clientRequestId
+                        attributes { key value }
+                    }
+                }
+            }
+        }
+        "#,
+    )
+    .data(CallerScope::Local)
+    .data(identity)
+    .variables(Variables::from_json(json!({
+        "input": {
+            "stagedUploadIds": staged_upload_ids,
+            "password": "secret123",
+            "category": "movies",
+            "clientRequestId": "req-staged-123",
+            "attributes": [
+                { "key": "priority", "value": "HIGH" },
+                { "key": "source", "value": "staged-test" }
+            ]
+        }
+    })));
+    h.schema.execute(request)
+}
+
+fn discard_staged(
+    h: &TestHarness,
+    identity: CallerIdentity,
+    ids: Vec<String>,
+) -> impl std::future::Future<Output = async_graphql::Response> + '_ {
+    let request = Request::new(
+        r#"
+        mutation Discard($ids: [String!]!) {
+            discardStagedNzbs(ids: $ids)
+        }
+        "#,
+    )
+    .data(CallerScope::Local)
+    .data(identity)
+    .variables(Variables::from_json(json!({ "ids": ids })));
     h.schema.execute(request)
 }
 
@@ -112,6 +211,125 @@ async fn submit_with_upload() {
         data["submitNzb"]["item"]["state"].as_str().unwrap(),
         "QUEUED"
     );
+}
+
+#[tokio::test]
+async fn stage_upload_and_submit_staged_nzb() {
+    let h = TestHarness::new().await;
+    let identity = local_identity(11);
+    let upload = assert_upload_accepts(
+        minimal_nzb("staged-upload-test").as_bytes(),
+        "staged-upload-test.nzb",
+        "application/x-nzb",
+    );
+
+    let staged_resp = stage_upload(&h, upload, identity.clone()).await;
+    assert_no_errors(&staged_resp);
+    let staged_data = response_data(&staged_resp);
+    assert!(staged_data["stageNzbUpload"]["accepted"].as_bool().unwrap());
+    assert_eq!(
+        staged_data["stageNzbUpload"]["displayName"].as_str().unwrap(),
+        "staged-upload-test"
+    );
+    let staged_upload_id = staged_data["stageNzbUpload"]["stagedUploadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let submit_resp = submit_staged(&h, identity, vec![staged_upload_id.clone()]).await;
+    assert_no_errors(&submit_resp);
+    let submit_data = response_data(&submit_resp);
+    assert_eq!(
+        submit_data["submitStagedNzbs"]["acceptedCount"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        submit_data["submitStagedNzbs"]["clientRequestId"]
+            .as_str()
+            .unwrap(),
+        "req-staged-123"
+    );
+    let result = &submit_data["submitStagedNzbs"]["results"][0];
+    assert_eq!(result["stagedUploadId"].as_str().unwrap(), staged_upload_id);
+    assert!(result["accepted"].as_bool().unwrap());
+    assert!(!result["retained"].as_bool().unwrap());
+    assert_eq!(result["item"]["state"].as_str().unwrap(), "QUEUED");
+    assert_eq!(result["item"]["category"].as_str().unwrap(), "movies");
+    assert!(result["item"]["hasPassword"].as_bool().unwrap());
+    assert_eq!(
+        result["item"]["clientRequestId"].as_str().unwrap(),
+        "req-staged-123"
+    );
+}
+
+#[tokio::test]
+async fn discard_staged_uploads_is_idempotent() {
+    let h = TestHarness::new().await;
+    let identity = local_identity(12);
+    let upload = assert_upload_accepts(
+        minimal_nzb("staged-discard-test").as_bytes(),
+        "staged-discard-test.nzb",
+        "application/x-nzb",
+    );
+    let staged_resp = stage_upload(&h, upload, identity.clone()).await;
+    assert_no_errors(&staged_resp);
+    let staged_upload_id = response_data(&staged_resp)["stageNzbUpload"]["stagedUploadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let discard_once = discard_staged(&h, identity.clone(), vec![staged_upload_id.clone()]).await;
+    assert_no_errors(&discard_once);
+    assert!(response_data(&discard_once)["discardStagedNzbs"]
+        .as_bool()
+        .unwrap());
+
+    let discard_twice = discard_staged(&h, identity.clone(), vec![staged_upload_id.clone()]).await;
+    assert_no_errors(&discard_twice);
+    assert!(response_data(&discard_twice)["discardStagedNzbs"]
+        .as_bool()
+        .unwrap());
+
+    let submit_resp = submit_staged(&h, identity, vec![staged_upload_id]).await;
+    assert_no_errors(&submit_resp);
+    let result = &response_data(&submit_resp)["submitStagedNzbs"]["results"][0];
+    assert!(!result["accepted"].as_bool().unwrap());
+    assert!(!result["retained"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn staged_uploads_are_scoped_to_caller_identity() {
+    let h = TestHarness::new().await;
+    let owner = local_identity(13);
+    let intruder = local_identity(14);
+    let upload = assert_upload_accepts(
+        minimal_nzb("staged-owner-test").as_bytes(),
+        "staged-owner-test.nzb",
+        "application/x-nzb",
+    );
+    let staged_resp = stage_upload(&h, upload, owner).await;
+    assert_no_errors(&staged_resp);
+    let staged_upload_id = response_data(&staged_resp)["stageNzbUpload"]["stagedUploadId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let submit_resp = submit_staged(&h, intruder, vec![staged_upload_id]).await;
+    assert_no_errors(&submit_resp);
+    let data = response_data(&submit_resp);
+    assert_eq!(
+        data["submitStagedNzbs"]["acceptedCount"].as_u64().unwrap(),
+        0
+    );
+    let result = &data["submitStagedNzbs"]["results"][0];
+    assert!(!result["accepted"].as_bool().unwrap());
+    assert!(!result["retained"].as_bool().unwrap());
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
 }
 
 #[tokio::test]

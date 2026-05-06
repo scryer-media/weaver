@@ -1,14 +1,6 @@
 import type { LocaleDictionary } from "./types";
 import { DEFAULT_LANGUAGE, interpolate } from "./types";
-import en from "./locales/en";
-import es from "./locales/es";
-import zh from "./locales/zh";
-import fr from "./locales/fr";
-import pt from "./locales/pt";
-import ja from "./locales/ja";
-import de from "./locales/de";
-import it from "./locales/it";
-import ko from "./locales/ko";
+
 export { DEFAULT_LANGUAGE } from "./types";
 
 export type LocaleCode =
@@ -27,7 +19,19 @@ export type LanguageOption = {
   label: string;
 };
 
-type LocaleMap = Record<LocaleCode, LocaleDictionary>;
+type LocaleLoader = () => Promise<{ default: LocaleDictionary }>;
+
+const SUPPORTED_LOCALES: LocaleCode[] = [
+  "eng",
+  "spa",
+  "zho",
+  "fra",
+  "por",
+  "jpn",
+  "deu",
+  "ita",
+  "kor",
+];
 
 const LOCALE_ALIASES: Record<string, LocaleCode> = {
   en: "eng",
@@ -41,17 +45,19 @@ const LOCALE_ALIASES: Record<string, LocaleCode> = {
   ko: "kor",
 };
 
-const locales: LocaleMap = {
-  eng: en,
-  spa: es,
-  zho: zh,
-  fra: fr,
-  por: pt,
-  jpn: ja,
-  deu: de,
-  ita: it,
-  kor: ko,
+const localeLoaders: Record<LocaleCode, LocaleLoader> = {
+  eng: () => import("./locales/en"),
+  spa: () => import("./locales/es"),
+  zho: () => import("./locales/zh"),
+  fra: () => import("./locales/fr"),
+  por: () => import("./locales/pt"),
+  jpn: () => import("./locales/ja"),
+  deu: () => import("./locales/de"),
+  ita: () => import("./locales/it"),
+  kor: () => import("./locales/ko"),
 };
+
+const localeDictionaryCache = new Map<LocaleCode, Promise<LocaleDictionary>>();
 
 export const AVAILABLE_LANGUAGES: LanguageOption[] = [
   { code: "eng", label: "English" },
@@ -65,19 +71,33 @@ export const AVAILABLE_LANGUAGES: LanguageOption[] = [
   { code: "zho", label: "中文" },
 ];
 
+function isLocaleCode(code: string): code is LocaleCode {
+  return SUPPORTED_LOCALES.includes(code as LocaleCode);
+}
+
+function cachedLocaleDictionary(code: LocaleCode): Promise<LocaleDictionary> {
+  const existing = localeDictionaryCache.get(code);
+  if (existing) {
+    return existing;
+  }
+
+  const next = localeLoaders[code]().then((module) => module.default);
+  localeDictionaryCache.set(code, next);
+  return next;
+}
+
 export function getLanguageLabel(code: string): string {
   const normalized = normalizeLocale(code);
   return AVAILABLE_LANGUAGES.find((language) => language.code === normalized)?.label ?? normalized;
 }
 
-const FALLBACK: LocaleDictionary = en;
-
-export function getLocaleDictionary(code: string | null | undefined): LocaleDictionary {
-  if (!code) {
-    return FALLBACK;
-  }
+export async function loadLocaleDictionary(code: string | null | undefined): Promise<LocaleDictionary> {
   const key = normalizeLocale(code);
-  return locales[key] ?? FALLBACK;
+  try {
+    return await cachedLocaleDictionary(key);
+  } catch {
+    return {};
+  }
 }
 
 export function normalizeLocale(code?: string | null): LocaleCode {
@@ -85,19 +105,25 @@ export function normalizeLocale(code?: string | null): LocaleCode {
   if (!normalized) {
     return DEFAULT_LANGUAGE;
   }
+
   const root = normalized.split("-")[0]!;
-  if (root in locales) {
-    return root as LocaleCode;
+  if (isLocaleCode(root)) {
+    return root;
   }
+
   const alias = LOCALE_ALIASES[root];
   if (alias) {
     return alias;
   }
+
   return DEFAULT_LANGUAGE;
 }
 
-export function t(key: string, code: string, values?: Record<string, string | number | boolean | null | undefined>): string {
-  const locale = getLocaleDictionary(code);
-  const template = locale[key] ?? FALLBACK[key] ?? key;
+export function translateDictionary(
+  dictionary: LocaleDictionary | null | undefined,
+  key: string,
+  values?: Record<string, string | number | boolean | null | undefined>,
+): string {
+  const template = dictionary?.[key] ?? key;
   return interpolate(template, values);
 }

@@ -232,11 +232,7 @@ fn history_row_with_output_dir(
     }
 }
 
-fn insert_history_row_with_nzb_zstd(
-    db: &Database,
-    row: &crate::JobHistoryRow,
-    nzb_zstd: &[u8],
-) {
+fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, nzb_zstd: &[u8]) {
     db.insert_job_history(row).unwrap();
     let conn = db.conn();
     conn.execute(
@@ -1360,7 +1356,10 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             return;
         }
 
-        if matches!(job_status_for_assert(pipeline, job_id), Some(JobStatus::Moving)) {
+        if matches!(
+            job_status_for_assert(pipeline, job_id),
+            Some(JobStatus::Moving)
+        ) {
             let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
                 .await
                 .unwrap_or_else(|_| {
@@ -1856,12 +1855,8 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
 
     assert_eq!(dest, expected_dest);
     assert!(pipeline.jobs.get(&job_id).is_none());
-    assert!(
-        pipeline
-            .finished_jobs
-            .iter()
-            .any(|job| job.job_id == job_id && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap()))
-    );
+    assert!(pipeline.finished_jobs.iter().any(|job| job.job_id == job_id
+        && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap())));
     assert!(!working_dir.exists());
     assert_eq!(
         tokio::fs::read(dest.join(payload_dir).join(episode_name))

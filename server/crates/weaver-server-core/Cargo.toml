@@ -17,6 +17,7 @@ weaver-yenc = { path = "../../../engines/weaver-yenc" }
 weaver-par2 = { path = "../../../engines/weaver-par2" }
 weaver-rar = { path = "../../../engines/weaver-rar" }
 serde = { workspace = true }
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 crossbeam-queue = { workspace = true }
@@ -40,6 +41,7 @@ flate2 = { workspace = true }
 brotli = { workspace = true }
 bzip2 = { workspace = true }
 rusqlite = { workspace = true }
+sqlx = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = { workspace = true }
 aes-gcm = { workspace = true }
@@ -64,3 +66,10 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 sevenz-rust2 = { workspace = true }
 axum = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+zstd = { workspace = true }

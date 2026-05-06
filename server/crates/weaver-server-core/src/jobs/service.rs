@@ -688,10 +688,7 @@ impl Pipeline {
                         .load_history_job_persisted_nzb(job_id.0)
                         .map_err(crate::SchedulerError::State)?
                         .unwrap_or_else(|| {
-                            (
-                                self.persisted_nzb_path_for_job(job_id, Some(row)),
-                                None,
-                            )
+                            (self.persisted_nzb_path_for_job(job_id, Some(row)), None)
                         });
                     let (nzb, nzb_path, _) =
                         self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
@@ -725,8 +722,7 @@ impl Pipeline {
                                 None,
                             )
                         });
-                    let (nzb, nzb_path, _) =
-                        self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+                    let (nzb, nzb_path, _) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
 
                     (
                         nzb,
@@ -870,8 +866,7 @@ impl Pipeline {
                 .load_active_job_persisted_nzb(job_id)
                 .map_err(crate::SchedulerError::State)?
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
-            let (nzb, nzb_path, nzb_zstd) =
-                self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+            let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
             let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
 
             self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
@@ -903,8 +898,7 @@ impl Pipeline {
                 .load_history_job_persisted_nzb(job_id.0)
                 .map_err(crate::SchedulerError::State)?
                 .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, Some(row)), None));
-            let (nzb, nzb_path, nzb_zstd) =
-                self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+            let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
             let metadata = row
                 .metadata
                 .as_deref()
@@ -944,7 +938,12 @@ impl Pipeline {
             .db
             .load_history_job_persisted_nzb(job_id.0)
             .map_err(crate::SchedulerError::State)?
-            .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, history_row.as_ref()), None));
+            .unwrap_or_else(|| {
+                (
+                    self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
+                    None,
+                )
+            });
         let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
         let spec = crate::ingest::nzb_to_spec(
             &nzb,
@@ -973,10 +972,9 @@ impl Pipeline {
     pub(crate) async fn start_diagnostic_redownload(
         &mut self,
         source_job_id: JobId,
+        diagnostic_job_id: JobId,
         include_server_hostnames: bool,
     ) -> Result<JobId, crate::SchedulerError> {
-        let diagnostic_job_id = crate::ingest::next_submission_job_id();
-
         if let Some(state) = self.jobs.get(&source_job_id) {
             if !Self::is_restartable_terminal_status(&state.status) {
                 return Err(crate::SchedulerError::Conflict(format!(
@@ -1041,12 +1039,8 @@ impl Pipeline {
                 .unwrap_or_default();
             let metadata =
                 with_diagnostic_metadata(metadata, source_job_id.0, include_server_hostnames);
-            let spec = crate::ingest::nzb_to_spec(
-                &nzb,
-                &source_nzb_path,
-                row.category.clone(),
-                metadata,
-            );
+            let spec =
+                crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, row.category.clone(), metadata);
 
             self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
                 .await?;

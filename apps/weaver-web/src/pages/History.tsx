@@ -5,8 +5,16 @@ import {
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
-import { Bug, Download, RefreshCcw, Trash2 } from "lucide-react";
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { Bug, ChevronDown, Download, ListFilter, RefreshCcw, Trash2 } from "lucide-react";
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { Link } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -41,6 +49,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 type HistoryJob = JobData;
 type HistoryFilter = "all" | "success" | "failure";
@@ -97,6 +106,20 @@ const DEFAULT_HISTORY_PREFERENCES: HistoryTablePreferences = {
   status: "all",
   sorting: DEFAULT_HISTORY_SORTING,
 };
+
+function countActiveHistoryFilters(status: HistoryFilter) {
+  return status === "all" ? 0 : 1;
+}
+
+function handleHistoryFilterOptionKeyDown(
+  event: KeyboardEvent<HTMLDivElement>,
+  onActivate: () => void,
+) {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    onActivate();
+  }
+}
 
 function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
   return normalizeJobData(job);
@@ -156,12 +179,6 @@ function removeRowSelectionIds(
   return next;
 }
 
-function isDefaultHistorySorting(sorting: SortingState) {
-  return sorting.length === 1
-    && sorting[0]?.id === DEFAULT_HISTORY_SORTING[0]?.id
-    && sorting[0]?.desc === DEFAULT_HISTORY_SORTING[0]?.desc;
-}
-
 function localDeleteOperation(lock: LocalDeleteLock): DeleteOperationData {
   return {
     operationId: lock.operationId,
@@ -170,6 +187,198 @@ function localDeleteOperation(lock: LocalDeleteLock): DeleteOperationData {
     deleteFiles: lock.deleteFiles,
     errorMessage: null,
   };
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameEpisode(left: JobData["parsedRelease"]["episode"], right: JobData["parsedRelease"]["episode"]): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return left == null && right == null;
+  }
+  return left.season === right.season
+    && left.absoluteEpisode === right.absoluteEpisode
+    && left.raw === right.raw
+    && left.episodeNumbers.length === right.episodeNumbers.length
+    && left.episodeNumbers.every((value, index) => value === right.episodeNumbers[index]);
+}
+
+function sameParsedRelease(left: JobData["parsedRelease"], right: JobData["parsedRelease"]): boolean {
+  return left.normalizedTitle === right.normalizedTitle
+    && left.releaseGroup === right.releaseGroup
+    && sameStringArray(left.languagesAudio, right.languagesAudio)
+    && sameStringArray(left.languagesSubtitles, right.languagesSubtitles)
+    && left.year === right.year
+    && left.quality === right.quality
+    && left.source === right.source
+    && left.videoCodec === right.videoCodec
+    && left.videoEncoding === right.videoEncoding
+    && left.audio === right.audio
+    && sameStringArray(left.audioCodecs, right.audioCodecs)
+    && left.audioChannels === right.audioChannels
+    && left.isDualAudio === right.isDualAudio
+    && left.isAtmos === right.isAtmos
+    && left.isDolbyVision === right.isDolbyVision
+    && left.detectedHdr === right.detectedHdr
+    && left.isHdr10Plus === right.isHdr10Plus
+    && left.isHlg === right.isHlg
+    && left.fps === right.fps
+    && left.isProperUpload === right.isProperUpload
+    && left.isRepack === right.isRepack
+    && left.isRemux === right.isRemux
+    && left.isBdDisk === right.isBdDisk
+    && left.isAiEnhanced === right.isAiEnhanced
+    && left.isHardcodedSubs === right.isHardcodedSubs
+    && left.streamingService === right.streamingService
+    && left.edition === right.edition
+    && left.animeVersion === right.animeVersion
+    && left.parseConfidence === right.parseConfidence
+    && sameEpisode(left.episode, right.episode);
+}
+
+function sameMetadata(left: { key: string; value: string }[], right: { key: string; value: string }[]): boolean {
+  return left.length === right.length
+    && left.every((entry, index) =>
+      entry.key === right[index]?.key && entry.value === right[index]?.value);
+}
+
+function sameDeleteOperationData(
+  left: JobData["deleteOperation"],
+  right: JobData["deleteOperation"],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return left == null && right == null;
+  }
+  return left.operationId === right.operationId
+    && left.state === right.state
+    && left.locked === right.locked
+    && left.deleteFiles === right.deleteFiles
+    && left.errorMessage === right.errorMessage;
+}
+
+function sameDiagnosticRunData(
+  left: JobData["diagnosticRun"],
+  right: JobData["diagnosticRun"],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return left == null && right == null;
+  }
+  return left.sourceJobId === right.sourceJobId
+    && left.diagnosticJobId === right.diagnosticJobId
+    && left.diagnosticId === right.diagnosticId
+    && left.stage === right.stage
+    && left.includeServerHostnames === right.includeServerHostnames
+    && left.rerunSucceeded === right.rerunSucceeded
+    && left.errorMessage === right.errorMessage
+    && left.updatedAt === right.updatedAt;
+}
+
+function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
+  return left.id === right.id
+    && left.name === right.name
+    && left.displayTitle === right.displayTitle
+    && left.originalTitle === right.originalTitle
+    && sameParsedRelease(left.parsedRelease, right.parsedRelease)
+    && left.status === right.status
+    && left.progress === right.progress
+    && left.progressPercent === right.progressPercent
+    && left.totalBytes === right.totalBytes
+    && left.downloadedBytes === right.downloadedBytes
+    && left.optionalRecoveryBytes === right.optionalRecoveryBytes
+    && left.optionalRecoveryDownloadedBytes === right.optionalRecoveryDownloadedBytes
+    && left.failedBytes === right.failedBytes
+    && left.health === right.health
+    && left.hasPassword === right.hasPassword
+    && left.category === right.category
+    && left.createdAt === right.createdAt
+    && left.completedAt === right.completedAt
+    && left.error === right.error
+    && left.outputDir === right.outputDir
+    && sameMetadata(left.metadata, right.metadata)
+    && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null)
+    && sameDiagnosticRunData(left.diagnosticRun ?? null, right.diagnosticRun ?? null)
+    && left.lastDiagnosticId === right.lastDiagnosticId
+    && left.lastDiagnosticUploadedAt === right.lastDiagnosticUploadedAt;
+}
+
+function reconcileHistoryJobs(nextJobs: HistoryJob[], previousJobs: HistoryJob[]): HistoryJob[] {
+  if (nextJobs.length === 0) {
+    return previousJobs.length === 0 ? previousJobs : nextJobs;
+  }
+
+  const previousJobsById = new Map(previousJobs.map((job) => [job.id, job] as const));
+  let reusedAllJobs = nextJobs.length === previousJobs.length;
+  const reconciled = nextJobs.map((job, index) => {
+    const previousAtIndex = previousJobs[index];
+    const candidate = previousAtIndex?.id === job.id
+      ? previousAtIndex
+      : previousJobsById.get(job.id);
+
+    if (candidate && sameHistoryJob(candidate, job)) {
+      return candidate;
+    }
+
+    reusedAllJobs = false;
+    return job;
+  });
+
+  return reusedAllJobs && reconciled.every((job, index) => job === previousJobs[index])
+    ? previousJobs
+    : reconciled;
+}
+
+function sameDeleteOperationSummary(
+  left: HistoryDeleteOperationSummary,
+  right: HistoryDeleteOperationSummary,
+): boolean {
+  return left.id === right.id
+    && left.state === right.state
+    && left.deleteFiles === right.deleteFiles
+    && left.totalTargets === right.totalTargets
+    && left.queuedTargets === right.queuedTargets
+    && left.runningTargets === right.runningTargets
+    && left.completedTargets === right.completedTargets
+    && left.failedTargets === right.failedTargets
+    && left.requestedAt === right.requestedAt;
+}
+
+function reconcileDeleteOperations(
+  nextOperations: HistoryDeleteOperationSummary[],
+  previousOperations: HistoryDeleteOperationSummary[],
+): HistoryDeleteOperationSummary[] {
+  if (nextOperations.length === 0) {
+    return previousOperations.length === 0 ? previousOperations : nextOperations;
+  }
+
+  const previousById = new Map(previousOperations.map((operation) => [operation.id, operation] as const));
+  let reusedAllOperations = nextOperations.length === previousOperations.length;
+  const reconciled = nextOperations.map((operation, index) => {
+    const previousAtIndex = previousOperations[index];
+    const candidate = previousAtIndex?.id === operation.id
+      ? previousAtIndex
+      : previousById.get(operation.id);
+
+    if (candidate && sameDeleteOperationSummary(candidate, operation)) {
+      return candidate;
+    }
+
+    reusedAllOperations = false;
+    return operation;
+  });
+
+  return reusedAllOperations && reconciled.every((operation, index) => operation === previousOperations[index])
+    ? previousOperations
+    : reconciled;
 }
 
 function isDiagnosticRunActive(
@@ -228,6 +437,9 @@ function formatDiagnosticSummary(
 export function History() {
   const t = useTranslate();
   const client = useClient();
+  const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
+  const previousRawJobsRef = useRef<HistoryJob[]>([]);
+  const previousVisibleJobsRef = useRef<HistoryJob[]>([]);
   const [historyPreferences, setHistoryPreferences] = useTablePreferences(
     "weaver.history.table.preferences",
     DEFAULT_HISTORY_PREFERENCES,
@@ -274,25 +486,34 @@ export function History() {
     START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
   );
 
-  const rawJobs = useMemo(
-    () => ((data?.historyPage.items ?? []) as FacadeHistoryJob[]).map(normalizeHistoryJob),
-    [data?.historyPage.items],
-  );
-  const jobs = useMemo(
-    () =>
-      rawJobs.map((job) => ({
+  const rawJobs = useMemo(() => {
+    const nextJobs = ((data?.historyPage.items ?? []) as FacadeHistoryJob[]).map(normalizeHistoryJob);
+    const reconciled = reconcileHistoryJobs(nextJobs, previousRawJobsRef.current);
+    previousRawJobsRef.current = reconciled;
+    return reconciled;
+  }, [data?.historyPage.items]);
+  const jobs = useMemo(() => {
+    const nextJobs = rawJobs.map((job) => {
+      const localLock = acceptedDeleteLocks[job.id];
+      if (!localLock || job.deleteOperation != null) {
+        return job;
+      }
+
+      return {
         ...job,
-        deleteOperation:
-          job.deleteOperation ?? (acceptedDeleteLocks[job.id]
-            ? localDeleteOperation(acceptedDeleteLocks[job.id]!)
-            : null),
-      })),
-    [acceptedDeleteLocks, rawJobs],
-  );
-  const deleteOperations = useMemo(
-    () => deleteOperationsData?.historyDeleteOperations ?? [],
-    [deleteOperationsData?.historyDeleteOperations],
-  );
+        deleteOperation: localDeleteOperation(localLock),
+      };
+    });
+    const reconciled = reconcileHistoryJobs(nextJobs, previousVisibleJobsRef.current);
+    previousVisibleJobsRef.current = reconciled;
+    return reconciled;
+  }, [acceptedDeleteLocks, rawJobs]);
+  const deleteOperations = useMemo(() => {
+    const nextOperations = deleteOperationsData?.historyDeleteOperations ?? [];
+    const reconciled = reconcileDeleteOperations(nextOperations, previousDeleteOperationsRef.current);
+    previousDeleteOperationsRef.current = reconciled;
+    return reconciled;
+  }, [deleteOperationsData?.historyDeleteOperations]);
   const counts = data?.historyPage.counts ?? { all: 0, success: 0, failure: 0 };
   const totalCount = data?.historyPage.totalCount ?? 0;
   const pageCount = Math.max(1, Math.ceil(totalCount / historyPreferences.pageSize));
@@ -353,6 +574,7 @@ export function History() {
     || reprocessState.fetching
     || redownloadState.fetching
     || diagnosticStartState.fetching;
+  const activeHistoryFilterCount = countActiveHistoryFilters(historyPreferences.status);
   const hasActiveDiagnosticRuns = useMemo(
     () => jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
     [jobs],
@@ -411,8 +633,12 @@ export function History() {
     }
 
     const intervalId = window.setInterval(() => {
-      void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
-      void reexecuteHistoryPage({ requestPolicy: "network-only" });
+      if (hasActiveDeleteOperations) {
+        void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
+      }
+      if (hasActiveDeleteOperations || hasActiveDiagnosticRuns) {
+        void reexecuteHistoryPage({ requestPolicy: "network-only" });
+      }
     }, 1000);
 
     return () => window.clearInterval(intervalId);
@@ -994,7 +1220,6 @@ export function History() {
     setPageIndex(0);
   }
 
-  const showFilterCard = counts.all > 0 || historyPreferences.search.length > 0 || historyPreferences.status !== "all";
   const showEmptyState = !fetching && counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
 
   return (
@@ -1005,26 +1230,15 @@ export function History() {
         actions={
           counts.all > 0 ? (
             <div className="flex gap-2">
-              {selectedCount > 0 ? (
-                <Button
-                  variant="destructive"
-                  disabled={acceptDeleteState.fetching}
-                  onClick={() => {
-                    setDeleteAcceptError(null);
-                    setDeleteBatchConfirm(true);
-                  }}
-                >
-                  {t("action.delete")} ({selectedCount})
-                </Button>
-              ) : null}
               <Button
-                variant="outline"
+                variant="destructive"
                 disabled={hasActiveDeleteOperations || acceptDeleteState.fetching}
                 onClick={() => {
                   setDeleteAcceptError(null);
                   setDeleteAllConfirm(true);
                 }}
               >
+                <Trash2 className="size-4" />
                 {t("action.deleteAll")}
               </Button>
             </div>
@@ -1058,64 +1272,6 @@ export function History() {
         </Card>
       ) : null}
 
-      {showFilterCard ? (
-        <Card>
-          <CardContent className="space-y-4 pt-6">
-            <div className="flex flex-wrap gap-2">
-              <FilterButton
-                active={historyPreferences.status === "all"}
-                label={t("history.filterAll")}
-                count={counts.all}
-                onClick={() => {
-                  setHistoryPreferences((current) => ({ ...current, status: "all" }));
-                  setPageIndex(0);
-                }}
-              />
-              <FilterButton
-                active={historyPreferences.status === "success"}
-                label={t("history.filterSuccess")}
-                count={counts.success}
-                onClick={() => {
-                  setHistoryPreferences((current) => ({ ...current, status: "success" }));
-                  setPageIndex(0);
-                }}
-              />
-              <FilterButton
-                active={historyPreferences.status === "failure"}
-                label={t("history.filterFailure")}
-                count={counts.failure}
-                onClick={() => {
-                  setHistoryPreferences((current) => ({ ...current, status: "failure" }));
-                  setPageIndex(0);
-                }}
-              />
-            </div>
-
-            <DataTableToolbar
-              searchValue={historyPreferences.search}
-              onSearchChange={(value) => {
-                setHistoryPreferences((current) => ({
-                  ...current,
-                  search: value,
-                }));
-                setPageIndex(0);
-              }}
-              searchPlaceholder={t("history.searchPlaceholder")}
-              clearLabel={
-                historyPreferences.search || historyPreferences.status !== "all" || !isDefaultHistorySorting(historyPreferences.sorting)
-                  ? t("action.clearFilters")
-                  : undefined
-              }
-              onClear={
-                historyPreferences.search || historyPreferences.status !== "all" || !isDefaultHistorySorting(historyPreferences.sorting)
-                  ? resetHistoryView
-                  : undefined
-              }
-            />
-          </CardContent>
-        </Card>
-      ) : null}
-
       {fetching && !data ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
@@ -1126,7 +1282,146 @@ export function History() {
         <EmptyState title={t("history.title")} description={t("history.empty")} />
       ) : (
         <Card>
-          <CardContent className="px-0 pb-0">
+          <CardContent className="space-y-4 px-0 pb-0 pt-6">
+            <div className="px-6">
+              <DataTableToolbar
+                className="lg:min-h-11"
+                searchValue={historyPreferences.search}
+                onSearchChange={(value) => {
+                  setHistoryPreferences((current) => ({
+                    ...current,
+                    search: value,
+                  }));
+                  setPageIndex(0);
+                }}
+                searchPlaceholder={t("history.searchPlaceholder")}
+                searchContainerClassName="max-w-[280px]"
+                searchInputClassName="h-10"
+                centerContainerClassName="min-h-10"
+                centerContent={selectedCount > 0 ? (
+                  <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
+                    <span className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
+                      {t("bulk.selected", { count: selectedCount })}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-8 text-destructive hover:text-destructive"
+                      aria-label={t("action.delete")}
+                      title={t("action.delete")}
+                      disabled={acceptDeleteState.fetching}
+                      onClick={() => {
+                        setDeleteAcceptError(null);
+                        setDeleteBatchConfirm(true);
+                      }}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </div>
+                ) : null}
+              >
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button variant="outline" className="h-10 w-full justify-between gap-3 sm:w-[176px]">
+                      <span className="inline-flex items-center gap-2">
+                        <ListFilter className="size-4 text-muted-foreground" />
+                        <span>{t("table.filters")}</span>
+                      </span>
+                      <span className="inline-flex items-center gap-2">
+                        {activeHistoryFilterCount > 0 ? (
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-foreground">
+                            {activeHistoryFilterCount}
+                          </span>
+                        ) : (
+                          <span className="text-[11px] text-muted-foreground">
+                            {t("history.filterAll")}
+                          </span>
+                        )}
+                        <ChevronDown className="size-4 text-muted-foreground" />
+                      </span>
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[288px] p-0">
+                    <div className="space-y-4 p-4">
+                      <div className="space-y-2">
+                        <div className="px-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                          {t("table.status")}
+                        </div>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
+                          onClick={() => {
+                            setHistoryPreferences((current) => ({ ...current, status: "all" }));
+                            setPageIndex(0);
+                          }}
+                          onKeyDown={(event) => {
+                            handleHistoryFilterOptionKeyDown(event, () => {
+                              setHistoryPreferences((current) => ({ ...current, status: "all" }));
+                              setPageIndex(0);
+                            });
+                          }}
+                        >
+                          <Checkbox
+                            className="pointer-events-none"
+                            tabIndex={-1}
+                            aria-hidden="true"
+                            checked={historyPreferences.status === "all"}
+                          />
+                          <span className="text-sm">{t("history.filterAll")}</span>
+                        </div>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
+                          onClick={() => {
+                            setHistoryPreferences((current) => ({ ...current, status: "success" }));
+                            setPageIndex(0);
+                          }}
+                          onKeyDown={(event) => {
+                            handleHistoryFilterOptionKeyDown(event, () => {
+                              setHistoryPreferences((current) => ({ ...current, status: "success" }));
+                              setPageIndex(0);
+                            });
+                          }}
+                        >
+                          <Checkbox
+                            className="pointer-events-none"
+                            tabIndex={-1}
+                            aria-hidden="true"
+                            checked={historyPreferences.status === "success"}
+                          />
+                          <span className="text-sm">{t("history.filterSuccess")} ({counts.success})</span>
+                        </div>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
+                          onClick={() => {
+                            setHistoryPreferences((current) => ({ ...current, status: "failure" }));
+                            setPageIndex(0);
+                          }}
+                          onKeyDown={(event) => {
+                            handleHistoryFilterOptionKeyDown(event, () => {
+                              setHistoryPreferences((current) => ({ ...current, status: "failure" }));
+                              setPageIndex(0);
+                            });
+                          }}
+                        >
+                          <Checkbox
+                            className="pointer-events-none"
+                            tabIndex={-1}
+                            aria-hidden="true"
+                            checked={historyPreferences.status === "failure"}
+                          />
+                          <span className="text-sm">{t("history.filterFailure")} ({counts.failure})</span>
+                        </div>
+                      </div>
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              </DataTableToolbar>
+            </div>
             <DataTable
               table={historyTable}
               tableClassName="table-fixed"
@@ -1328,26 +1623,4 @@ function formatHistoryTimestamp(
   }
 
   return formatter.format(epochMs);
-}
-
-type FilterButtonProps = {
-  active: boolean;
-  label: string;
-  count: number;
-  onClick: () => void;
-};
-
-function FilterButton({ active, label, count, onClick }: FilterButtonProps) {
-  return (
-    <Button
-      variant={active ? "default" : "outline"}
-      className="rounded-full"
-      onClick={onClick}
-    >
-      {label}
-      <span className="rounded-full bg-background/20 px-2 py-0.5 text-xs">
-        {count}
-      </span>
-    </Button>
-  );
 }

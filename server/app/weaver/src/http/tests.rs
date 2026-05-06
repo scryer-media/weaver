@@ -297,32 +297,35 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         metadata: vec![],
     })
     .unwrap();
-    db.archive_job(JobId(10_000), &weaver_server_core::JobHistoryRow {
-        job_id: 10_000,
-        name: "Friends".to_string(),
-        status: "complete".to_string(),
-        error_message: None,
-        total_bytes: 123,
-        downloaded_bytes: 123,
-        optional_recovery_bytes: 0,
-        optional_recovery_downloaded_bytes: 0,
-        failed_bytes: 0,
-        health: 1000,
-        category: Some("tv".to_string()),
-        output_dir: None,
-        nzb_path: Some("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb".to_string()),
-        created_at: 1_700_000_000,
-        completed_at: 1_700_000_100,
-        metadata: Some(
-            serde_json::to_string(&vec![(
-                weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
-                "Friends.S05.720p.BluRay.DD5.1.x264-NTb".to_string(),
-            )])
-            .unwrap(),
-        ),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
-    })
+    db.archive_job(
+        JobId(10_000),
+        &weaver_server_core::JobHistoryRow {
+            job_id: 10_000,
+            name: "Friends".to_string(),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 123,
+            downloaded_bytes: 123,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: Some("tv".to_string()),
+            output_dir: None,
+            nzb_path: Some("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb".to_string()),
+            created_at: 1_700_000_000,
+            completed_at: 1_700_000_100,
+            metadata: Some(
+                serde_json::to_string(&vec![(
+                    weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+                    "Friends.S05.720p.BluRay.DD5.1.x264-NTb".to_string(),
+                )])
+                .unwrap(),
+            ),
+            last_diagnostic_id: None,
+            last_diagnostic_uploaded_at_epoch_ms: None,
+        },
+    )
     .unwrap();
     let app = job_nzb_test_router(db, handle);
 

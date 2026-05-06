@@ -1,5 +1,6 @@
 pub(crate) mod release_display;
 pub(crate) mod replay;
+pub(crate) mod staging;
 pub mod types;
 
 pub use crate::schema::jobs_mutation as mutation;

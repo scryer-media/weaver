@@ -20,6 +20,7 @@ use crate::history::types::{
 };
 use crate::system::types::PipelineEventGql;
 use weaver_server_core::events::model::PipelineEvent;
+use weaver_server_core::ingest::{decode_persisted_nzb_bytes, next_submission_job_id};
 use weaver_server_core::operations::snapshot_service_logs;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{
@@ -248,12 +249,7 @@ impl DiagnosticManager {
             ));
         }
 
-        let diagnostic_job_id = self
-            .handle
-            .start_diagnostic_redownload(JobId(source_job_id), include_server_hostnames)
-            .await
-            .map_err(scheduler_graphql_error)?
-            .0;
+        let diagnostic_job_id = next_submission_job_id().0;
         let now = Utc::now().timestamp_millis();
         let row = DiagnosticRunRow {
             source_job_id,
@@ -275,10 +271,31 @@ impl DiagnosticManager {
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
-        self.track_run(&row).await;
         self.ensure_staging_dir(&row)
             .await
             .map_err(bundle_graphql_error)?;
+        if let Err(error) = self
+            .handle
+            .start_diagnostic_redownload(
+                JobId(source_job_id),
+                JobId(diagnostic_job_id),
+                include_server_hostnames,
+            )
+            .await
+        {
+            let db = self.db.clone();
+            let cleanup_source_job_id = source_job_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                db.delete_diagnostic_run(cleanup_source_job_id)
+            })
+            .await;
+            let _ =
+                tokio::fs::remove_dir_all(self.staging_dir(&TrackedDiagnosticRun::from_row(&row)))
+                    .await;
+            return Err(scheduler_graphql_error(error));
+        }
+
+        self.track_run(&row).await;
         self.wake.notify_one();
 
         Ok(DiagnosticRedownloadAcceptance {
@@ -648,9 +665,12 @@ impl DiagnosticManager {
             &source_snapshot,
         )
         .await?;
+        let source_raw_nzb = self
+            .load_raw_nzb_text(run.source_job_id, source_history_row.nzb_path.as_deref())
+            .await?;
         write_raw_nzb_file(
             bundle_dir.join("first_attempt/raw.nzb.xml"),
-            source_history_row.nzb_path.as_deref(),
+            source_raw_nzb.as_deref(),
             &redactions,
         )
         .await?;
@@ -662,9 +682,15 @@ impl DiagnosticManager {
             &diagnostic_snapshot,
         )
         .await?;
+        let diagnostic_raw_nzb = self
+            .load_raw_nzb_text(
+                diagnostic_job_id,
+                diagnostic_history_row.nzb_path.as_deref(),
+            )
+            .await?;
         write_raw_nzb_file(
             bundle_dir.join("diagnostic_attempt/raw.nzb.xml"),
-            diagnostic_history_row.nzb_path.as_deref(),
+            diagnostic_raw_nzb.as_deref(),
             &redactions,
         )
         .await?;
@@ -964,6 +990,35 @@ impl DiagnosticManager {
             .await
             .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
             .map_err(|error| DiagnosticBundleError::State(error.to_string()))
+    }
+
+    async fn load_raw_nzb_text(
+        &self,
+        job_id: u64,
+        fallback_path: Option<&str>,
+    ) -> std::result::Result<Option<String>, DiagnosticBundleError> {
+        let db = self.db.clone();
+        let persisted =
+            tokio::task::spawn_blocking(move || db.load_history_job_persisted_nzb(job_id))
+                .await
+                .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
+                .map_err(|error| DiagnosticBundleError::State(error.to_string()))?;
+        if let Some((_, Some(nzb_zstd))) = persisted {
+            let decoded = decode_persisted_nzb_bytes(&nzb_zstd)
+                .map_err(|error| DiagnosticBundleError::Io(error.to_string()))?;
+            let content = String::from_utf8(decoded)
+                .map_err(|error| DiagnosticBundleError::Io(error.to_string()))?;
+            return Ok(Some(content));
+        }
+
+        let Some(nzb_path) = fallback_path else {
+            return Ok(None);
+        };
+        match tokio::fs::read_to_string(nzb_path).await {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DiagnosticBundleError::Io(error.to_string())),
+        }
     }
 
     async fn load_run_by_job(
@@ -1363,18 +1418,13 @@ async fn read_json_file_if_exists<T: DeserializeOwned>(
 
 async fn write_raw_nzb_file(
     destination: PathBuf,
-    nzb_path: Option<&str>,
+    content: Option<&str>,
     redactions: &RedactionPlan,
 ) -> std::result::Result<(), DiagnosticBundleError> {
-    let Some(nzb_path) = nzb_path else {
+    let Some(content) = content else {
         return Ok(());
     };
-    let content = match tokio::fs::read_to_string(nzb_path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(DiagnosticBundleError::Io(error.to_string())),
-    };
-    write_text_file(&destination, &redactions.apply_to_text(&content)).await
+    write_text_file(&destination, &redactions.apply_to_text(content)).await
 }
 
 async fn copy_if_exists(

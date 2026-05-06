@@ -51,8 +51,8 @@ export function JobStatusBadge({
     <Badge
       variant={STATUS_VARIANTS[status] ?? "outline"}
       className={cn(
-        "font-medium",
-        compact && "px-2 py-0 text-[10px] uppercase tracking-[0.12em]",
+        "min-w-[9ch] justify-center whitespace-nowrap font-medium tabular-nums",
+        compact && "min-w-[10ch] px-2 py-0 text-[10px] uppercase tracking-[0.12em]",
         className,
       )}
     >

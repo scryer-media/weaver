@@ -89,6 +89,14 @@ const ja: LocaleDictionary = {
   "upload.batchFailure": "{{name}} のアップロードに失敗しました。",
   "upload.partialFailure": "{{total}} 件中 {{submitted}} 件を送信後、{{name}} で失敗しました。",
   "upload.rejected": "アップロードはサーバーに拒否されました。",
+  "upload.retryFile": "Retry File",
+  "upload.summary": "{{ready}} ready, {{staging}} staging, {{failed}} failed",
+  "upload.statusStaging": "Staging",
+  "upload.statusReady": "Ready",
+  "upload.statusFailed": "Failed",
+  "upload.statusSubmitting": "Submitting",
+  "upload.statusSubmitted": "Submitted",
+  "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
   "jobs.title": "キュー",

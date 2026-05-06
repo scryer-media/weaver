@@ -74,17 +74,6 @@ function createEmptyBuffer(): HistoryBuffer {
   };
 }
 
-function cloneBuffer(buffer: HistoryBuffer): HistoryBuffer {
-  return {
-    timestampsMs: [...buffer.timestampsMs],
-    series: (buffer.series ?? []).map((series) => ({
-      metric: series.metric,
-      labels: (series.labels ?? []).map((label) => ({ ...label })),
-      values: [...(series.values ?? [])],
-    })),
-  };
-}
-
 function bufferFromResponse(data?: MetricsHistoryResponse["metricsHistory"]): HistoryBuffer {
   if (!data) {
     return createEmptyBuffer();
@@ -100,26 +89,30 @@ function bufferFromResponse(data?: MetricsHistoryResponse["metricsHistory"]): Hi
   };
 }
 
-function trimBufferToRange(buffer: HistoryBuffer, cutoffMs: number) {
+function trimBufferToRange(buffer: HistoryBuffer, cutoffMs: number): boolean {
+  if (buffer.timestampsMs.length === 0) {
+    return false;
+  }
+
   const startIndex = buffer.timestampsMs.findIndex((timestamp) => timestamp >= cutoffMs);
   if (startIndex === -1) {
+    const changed = buffer.timestampsMs.length > 0 || buffer.series.some((series) => series.values.length > 0);
     buffer.timestampsMs = [];
-    buffer.series = buffer.series.map((series) => ({
-      ...series,
-      values: [],
-    }));
-    return;
+    for (const series of buffer.series) {
+      series.values = [];
+    }
+    return changed;
   }
 
   if (startIndex === 0) {
-    return;
+    return false;
   }
 
   buffer.timestampsMs = buffer.timestampsMs.slice(startIndex);
-  buffer.series = buffer.series.map((series) => ({
-    ...series,
-    values: series.values.slice(startIndex),
-  }));
+  for (const series of buffer.series) {
+    series.values = series.values.slice(startIndex);
+  }
+  return true;
 }
 
 function sortLabels(labels: MetricsHistoryLabel[]): MetricsHistoryLabel[] {
@@ -142,13 +135,13 @@ function ensureSeries(
   buffer: HistoryBuffer,
   metric: string,
   labels: MetricsHistoryLabel[] = [],
-): MetricsHistorySeries {
+): { series: MetricsHistorySeries; created: boolean } {
   const normalizedLabels = sortLabels(labels);
   const existing = buffer.series.find(
     (series) => series.metric === metric && labelsEqual(series.labels, normalizedLabels),
   );
   if (existing) {
-    return existing;
+    return { series: existing, created: false };
   }
 
   const nextSeries: MetricsHistorySeries = {
@@ -157,13 +150,28 @@ function ensureSeries(
     values: new Array(buffer.timestampsMs.length).fill(0),
   };
   buffer.series.push(nextSeries);
-  return nextSeries;
+  return { series: nextSeries, created: true };
 }
 
-function applyLiveJobStatuses(buffer: HistoryBuffer, liveJobs: JobData[], targetIndex: number) {
+function setSeriesValue(series: MetricsHistorySeries, index: number, value: number): boolean {
+  const normalizedValue = Number.isFinite(value) ? value : 0;
+  if (series.values[index] === normalizedValue) {
+    return false;
+  }
+
+  series.values[index] = normalizedValue;
+  return true;
+}
+
+function applyLiveJobStatuses(
+  buffer: HistoryBuffer,
+  liveJobs: JobData[],
+  targetIndex: number,
+): boolean {
+  let changed = false;
   for (const series of buffer.series) {
     if (series.metric === JOB_STATUS_HISTORY_METRIC) {
-      series.values[targetIndex] = 0;
+      changed = setSeriesValue(series, targetIndex, 0) || changed;
     }
   }
 
@@ -178,9 +186,14 @@ function applyLiveJobStatuses(buffer: HistoryBuffer, liveJobs: JobData[], target
   }
 
   for (const status of JOB_STATUS_LABEL_ORDER) {
-    const series = ensureSeries(buffer, JOB_STATUS_HISTORY_METRIC, [{ key: "status", value: status }]);
-    series.values[targetIndex] = countsByStatus.get(status) ?? 0;
+    const { series, created } = ensureSeries(buffer, JOB_STATUS_HISTORY_METRIC, [
+      { key: "status", value: status },
+    ]);
+    changed = created || changed;
+    changed = setSeriesValue(series, targetIndex, countsByStatus.get(status) ?? 0) || changed;
   }
+
+  return changed;
 }
 
 function applyLiveSnapshot(
@@ -189,7 +202,7 @@ function applyLiveSnapshot(
   liveJobs: JobData[] | undefined,
   timestampMs: number,
   minutes: MetricsRangeMinutes,
-) {
+): boolean {
   const roundedTimestampMs =
     Math.floor(timestampMs / LIVE_SNAPSHOT_INTERVAL_MS) * LIVE_SNAPSHOT_INTERVAL_MS;
   const lastTimestampMs = buffer.timestampsMs[buffer.timestampsMs.length - 1];
@@ -199,25 +212,29 @@ function applyLiveSnapshot(
       === Math.floor(roundedTimestampMs / LIVE_SNAPSHOT_INTERVAL_MS);
 
   let targetIndex = buffer.timestampsMs.length - 1;
+  let changed = false;
   if (!replaceLastPoint) {
     buffer.timestampsMs.push(roundedTimestampMs);
     for (const series of buffer.series) {
       series.values.push(0);
     }
     targetIndex = buffer.timestampsMs.length - 1;
+    changed = true;
   }
 
   for (const metric of SNAPSHOT_HISTORY_METRIC_NAMES) {
     const snapshotKey = PROM_METRIC_TO_SNAPSHOT_FIELD[metric];
-    const series = ensureSeries(buffer, metric);
-    series.values[targetIndex] = liveMetrics[snapshotKey];
+    const { series, created } = ensureSeries(buffer, metric);
+    changed = created || changed;
+    changed = setSeriesValue(series, targetIndex, liveMetrics[snapshotKey]) || changed;
   }
 
   if (liveJobs) {
-    applyLiveJobStatuses(buffer, liveJobs, targetIndex);
+    changed = applyLiveJobStatuses(buffer, liveJobs, targetIndex) || changed;
   }
 
-  trimBufferToRange(buffer, roundedTimestampMs - minutes * 60 * 1000);
+  changed = trimBufferToRange(buffer, roundedTimestampMs - minutes * 60 * 1000) || changed;
+  return changed;
 }
 
 function lookupSeriesValues(buffer: HistoryBuffer, metric: HistoryMetricName): number[] {
@@ -229,9 +246,9 @@ function lookupSeriesValues(buffer: HistoryBuffer, metric: HistoryMetricName): n
     return new Array(buffer.timestampsMs.length).fill(0);
   }
 
-  if (values.length < buffer.timestampsMs.length) {
-    return [...values, ...new Array(buffer.timestampsMs.length - values.length).fill(0)];
-  }
+    if (values.length < buffer.timestampsMs.length) {
+      return [...values, ...new Array(buffer.timestampsMs.length - values.length).fill(0)];
+    }
 
   return values.slice(0, buffer.timestampsMs.length);
 }
@@ -405,15 +422,18 @@ export function useMetricsHistory({
         return;
       }
 
-      const nextBuffer = cloneBuffer(historyRef.current);
-      applyLiveSnapshot(
+      const nextBuffer = historyRef.current;
+      const changed = applyLiveSnapshot(
         nextBuffer,
         latestLiveMetricsRef.current,
         latestLiveJobsRef.current,
         Date.now(),
         minutes,
       );
-      historyRef.current = nextBuffer;
+      if (!changed) {
+        return;
+      }
+
       setCharts(buildChartModels(nextBuffer));
       setJobStatusRows(buildJobStatusRows(nextBuffer));
     };

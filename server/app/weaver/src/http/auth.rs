@@ -3,6 +3,7 @@ use axum::extract::Extension;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use weaver_server_api::auth::CallerIdentity;
 
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
@@ -107,8 +108,14 @@ pub(super) async fn refresh_auth_caches(
     Ok(())
 }
 
-/// Resolve the caller scope from API key header, JWT cookie, or session token.
-pub(super) async fn resolve_scope(
+#[derive(Clone)]
+pub(super) struct ResolvedCaller {
+    pub(super) scope: CallerScope,
+    pub(super) identity: CallerIdentity,
+}
+
+/// Resolve the caller scope and stable request identity from API key header, JWT cookie, or session token.
+pub(super) async fn resolve_caller(
     db: &Database,
     auth_cache: &LoginAuthCache,
     api_key_cache: &ApiKeyCache,
@@ -124,12 +131,18 @@ pub(super) async fn resolve_scope(
     // 1. Bearer token or API key header (session token or stored key).
     if let Some(raw_key) = presented_token {
         if raw_key == session_token {
-            return Ok(CallerScope::Local);
+            return Ok(ResolvedCaller {
+                scope: CallerScope::Local,
+                identity: CallerIdentity::Local(hash_api_key(raw_key)),
+            });
         }
         let key_hash = hash_api_key(raw_key);
         if let Some(row) = lookup_api_key_auth(db, api_key_cache, key_hash).await? {
             queue_touch_api_key_last_used(db, row.id);
-            return Ok(caller_scope_from_api_key_scope(&row.scope));
+            return Ok(ResolvedCaller {
+                scope: caller_scope_from_api_key_scope(&row.scope),
+                identity: CallerIdentity::ApiKey(row.key_hash),
+            });
         }
     }
 
@@ -139,7 +152,10 @@ pub(super) async fn resolve_scope(
         && let Some(auth) = cached_auth.as_ref()
         && jwt::verify_jwt(&token, &auth.jwt_secret).is_ok()
     {
-        return Ok(CallerScope::Admin);
+        return Ok(ResolvedCaller {
+            scope: CallerScope::Admin,
+            identity: CallerIdentity::Jwt(hash_api_key(&token)),
+        });
     }
 
     // 3. No login auth enabled: require an explicit session token or API key.
@@ -148,6 +164,19 @@ pub(super) async fn resolve_scope(
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// Resolve the caller scope from API key header, JWT cookie, or session token.
+pub(super) async fn resolve_scope(
+    db: &Database,
+    auth_cache: &LoginAuthCache,
+    api_key_cache: &ApiKeyCache,
+    session_token: &str,
+    headers: &HeaderMap,
+) -> Result<CallerScope, StatusCode> {
+    Ok(resolve_caller(db, auth_cache, api_key_cache, session_token, headers)
+        .await?
+        .scope)
 }
 
 #[derive(Deserialize)]

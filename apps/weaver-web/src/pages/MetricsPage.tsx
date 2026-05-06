@@ -9,7 +9,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { requestGraphqlClientRestart } from "@/graphql/client";
 import { METRICS_PAGE_QUERY, METRICS_PAGE_SUBSCRIPTION } from "@/graphql/queries";
-import { useLiveData } from "@/lib/context/live-data-context";
+import {
+  useLiveConnection,
+  useLiveDownloadBlock,
+  useLiveJobs,
+  useLivePaused,
+  useLiveSpeed,
+} from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useMetricsHistory } from "@/lib/hooks/use-metrics-history";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
@@ -21,7 +27,11 @@ import {
 
 export function MetricsPage() {
   const t = useTranslate();
-  const liveData = useLiveData();
+  const liveConnection = useLiveConnection();
+  const liveDownloadBlock = useLiveDownloadBlock();
+  const liveJobs = useLiveJobs();
+  const livePaused = useLivePaused();
+  const liveSpeed = useLiveSpeed();
   const [historyRange, setHistoryRange] = useState<MetricsRangeMinutes>(60);
   const [polledSnapshot, setPolledSnapshot] = useState<MetricsPageData | undefined>();
   const [{ data: queryData, fetching, error }] = useQuery<MetricsPageData>({
@@ -36,7 +46,7 @@ export function MetricsPage() {
     handleSubscription,
   );
   useReconnectPolling<MetricsPageData>({
-    enabled: liveData.connection.isDisconnected,
+    enabled: liveConnection.isDisconnected,
     query: METRICS_PAGE_QUERY,
     onData: (nextSnapshot) => {
       setPolledSnapshot(nextSnapshot);
@@ -45,28 +55,28 @@ export function MetricsPage() {
   });
 
   useEffect(() => {
-    if (!liveData.connection.isDisconnected) {
+    if (!liveConnection.isDisconnected) {
       setPolledSnapshot(undefined);
     }
-  }, [liveData.connection.isDisconnected]);
+  }, [liveConnection.isDisconnected]);
 
   const counts = useMemo(() => {
-    const total = liveData.jobs.length;
-    const active = liveData.jobs.filter(
+    const total = liveJobs.length;
+    const active = liveJobs.filter(
       (job) => job.status !== "COMPLETE" && job.status !== "FAILED",
     ).length;
-    const downloading = liveData.jobs.filter((job) => job.status === "DOWNLOADING").length;
-    const queued = liveData.jobs.filter((job) => job.status === "QUEUED").length;
-    const paused = liveData.jobs.filter((job) => job.status === "PAUSED").length;
-    const failed = liveData.jobs.filter((job) => job.status === "FAILED").length;
+    const downloading = liveJobs.filter((job) => job.status === "DOWNLOADING").length;
+    const queued = liveJobs.filter((job) => job.status === "QUEUED").length;
+    const paused = liveJobs.filter((job) => job.status === "PAUSED").length;
+    const failed = liveJobs.filter((job) => job.status === "FAILED").length;
 
     return { total, active, downloading, queued, paused, failed };
-  }, [liveData.jobs]);
+  }, [liveJobs]);
 
   const snapshot = subscriptionData ?? polledSnapshot ?? queryData;
   const metrics = snapshot?.metrics;
-  const isPaused = snapshot?.globalState?.isPaused ?? liveData.isPaused;
-  const downloadBlock = snapshot?.globalState?.downloadBlock ?? liveData.downloadBlock;
+  const isPaused = snapshot?.globalState?.isPaused ?? livePaused;
+  const downloadBlock = snapshot?.globalState?.downloadBlock ?? liveDownloadBlock;
   const capResetAt = downloadBlock.windowEndsAtEpochMs
     ? new Date(downloadBlock.windowEndsAtEpochMs).toLocaleString([], {
         month: "short",
@@ -78,7 +88,7 @@ export function MetricsPage() {
   const history = useMetricsHistory({
     minutes: historyRange,
     liveMetrics: metrics,
-    liveJobs: liveData.jobs,
+    liveJobs,
   });
 
   const jobStatusRows = history.jobStatusRows;
@@ -125,7 +135,7 @@ export function MetricsPage() {
             />
             <MetricTile
               label={t("metrics.downloadSpeed")}
-              value={<SpeedDisplay bytesPerSec={liveData.speed} className="text-base" />}
+              value={<SpeedDisplay bytesPerSec={liveSpeed} className="text-base" />}
             />
             <MetricTile label={t("metrics.activeJobs")} value={counts.active} />
             <MetricTile label={t("metrics.queuedJobs")} value={counts.queued} />
@@ -296,7 +306,7 @@ function MetricTile({
       <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
         {label}
       </div>
-      <div className="mt-2 text-base font-semibold text-foreground">{value}</div>
+      <div className="mt-2 text-base font-semibold text-foreground tabular-nums">{value}</div>
     </div>
   );
 }

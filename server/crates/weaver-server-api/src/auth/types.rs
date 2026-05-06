@@ -27,3 +27,10 @@ pub struct LoginStatusResult {
     pub enabled: bool,
     pub username: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallerIdentity {
+    Local([u8; 32]),
+    Jwt([u8; 32]),
+    ApiKey([u8; 32]),
+}

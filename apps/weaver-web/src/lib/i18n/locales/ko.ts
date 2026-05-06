@@ -89,6 +89,14 @@ const ko: LocaleDictionary = {
   "upload.batchFailure": "{{name}} 업로드 실패.",
   "upload.partialFailure": "{{name}}에서 실패하기 전 {{total}}개 중 {{submitted}}개 파일 제출됨.",
   "upload.rejected": "업로드가 서버에서 거부되었습니다.",
+  "upload.retryFile": "Retry File",
+  "upload.summary": "{{ready}} ready, {{staging}} staging, {{failed}} failed",
+  "upload.statusStaging": "Staging",
+  "upload.statusReady": "Ready",
+  "upload.statusFailed": "Failed",
+  "upload.statusSubmitting": "Submitting",
+  "upload.statusSubmitted": "Submitted",
+  "upload.stageExpired": "Staged upload expired. Re-add the file.",
 
   // Jobs page
   "jobs.title": "대기열",
