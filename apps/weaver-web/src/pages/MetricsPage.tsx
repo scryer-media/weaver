@@ -94,11 +94,6 @@ export function MetricsPage() {
   const bandwidthCapLabel = downloadBlock.capEnabled && downloadBlock.limitBytes > 0
     ? formatBytes(downloadBlock.limitBytes)
     : t("label.disabled");
-  const bandwidthTrackerStatus = downloadBlock.kind === "ISP_CAP"
-    ? t("metrics.bandwidthCapHit")
-    : downloadBlock.capEnabled
-      ? t("metrics.bandwidthCapActive")
-      : t("label.disabled");
 
   return (
     <div className="space-y-6">
@@ -135,6 +130,48 @@ export function MetricsPage() {
             <MetricTile label={t("metrics.activeJobs")} value={counts.active} />
             <MetricTile label={t("metrics.queuedJobs")} value={counts.queued} />
           </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("metrics.bandwidthCap")}</CardTitle>
+              <CardDescription>{t("metrics.bandwidthCapDesc")}</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="rounded-3xl border border-border/70 bg-field/55 p-4">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="space-y-2">
+                    <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
+                      {t("metrics.bandwidthCapUsage")}
+                    </div>
+                    <div className="text-3xl font-semibold text-foreground">
+                      {formatBytes(downloadBlock.usedBytes)}
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      {downloadBlock.capEnabled && downloadBlock.limitBytes > 0
+                        ? `${formatBytes(downloadBlock.usedBytes)} / ${formatBytes(downloadBlock.limitBytes)}`
+                        : t("metrics.bandwidthCapDesc")}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <MetricTile label={t("metrics.bandwidthCapLimit")} value={bandwidthCapLabel} />
+                    <MetricTile label={t("metrics.bandwidthCapReset")} value={capResetAt} />
+                  </div>
+                </div>
+                <Progress
+                  value={bandwidthProgress}
+                  className="mt-4 h-3 bg-background/70"
+                  indicatorClassName={
+                    downloadBlock.kind === "ISP_CAP"
+                      ? "bg-destructive"
+                      : downloadBlock.capEnabled
+                        ? "bg-primary"
+                        : "bg-muted-foreground/40"
+                  }
+                />
+              </div>
+            </CardContent>
+          </Card>
 
           <Card>
             <CardHeader className="gap-4 lg:flex-row lg:items-end lg:justify-between">
@@ -230,57 +267,6 @@ export function MetricsPage() {
               </Card>
             ))}
           </div>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("metrics.bandwidthCap")}</CardTitle>
-              <CardDescription>{t("metrics.bandwidthCapDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="rounded-3xl border border-border/70 bg-field/55 p-4">
-                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-                  <div className="space-y-2">
-                    <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                      {t("metrics.bandwidthCapUsage")}
-                    </div>
-                    <div className="text-3xl font-semibold text-foreground">
-                      {formatBytes(downloadBlock.usedBytes)}
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      {downloadBlock.capEnabled && downloadBlock.limitBytes > 0
-                        ? `${formatBytes(downloadBlock.usedBytes)} / ${formatBytes(downloadBlock.limitBytes)}`
-                        : t("metrics.bandwidthCapDesc")}
-                    </div>
-                  </div>
-
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <MetricTile label={t("metrics.bandwidthCapLimit")} value={bandwidthCapLabel} />
-                    <MetricTile label={t("metrics.bandwidthCapReset")} value={capResetAt} />
-                  </div>
-                </div>
-                <Progress
-                  value={bandwidthProgress}
-                  className="mt-4 h-3 bg-background/70"
-                  indicatorClassName={
-                    downloadBlock.kind === "ISP_CAP"
-                      ? "bg-destructive"
-                      : downloadBlock.capEnabled
-                        ? "bg-primary"
-                        : "bg-muted-foreground/40"
-                  }
-                />
-              </div>
-
-              <div className="grid gap-3 md:grid-cols-3">
-                <MetricTile label={t("metrics.bandwidthCapUsed")} value={formatBytes(downloadBlock.usedBytes)} />
-                <MetricTile label={t("metrics.bandwidthCapState")} value={bandwidthTrackerStatus} />
-                <MetricTile
-                  label={t("metrics.bandwidthCapLimit")}
-                  value={bandwidthCapLabel}
-                />
-              </div>
-            </CardContent>
-          </Card>
         </>
       ) : null}
     </div>
