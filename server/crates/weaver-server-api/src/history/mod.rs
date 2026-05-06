@@ -1,4 +1,5 @@
 pub(crate) mod delete_ops;
+#[cfg(weaver_diagnostics)]
 pub(crate) mod diagnostics;
 pub mod timeline;
 pub mod types;

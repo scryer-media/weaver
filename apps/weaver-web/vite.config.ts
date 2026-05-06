@@ -5,6 +5,7 @@ import path from "path";
 
 const BACKEND_ORIGIN =
   process.env.WEAVER_DEV_PROXY_TARGET?.trim() || "http://127.0.0.1:9090";
+const DIAGNOSTICS_ENABLED = parseEnvFlag("WEAVER_ENABLE_DIAGNOSTICS", true);
 const DEV_WATCH_USE_POLLING =
   process.env.WEAVER_VITE_USE_POLLING?.trim() === "true";
 const DEV_WATCH_POLL_INTERVAL = Number.parseInt(
@@ -22,6 +23,14 @@ const PUBLIC_PWA_ASSETS = [
   "/app-icon-dark-192.png",
   "/app-icon-dark-512.png",
 ];
+
+function parseEnvFlag(name: string, defaultValue: boolean): boolean {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value) {
+    return defaultValue;
+  }
+  return !["0", "false", "off", "no", "disabled"].includes(value);
+}
 
 function buildManualPwaPlugin(): Plugin {
   let resolvedConfig: ResolvedConfig | null = null;
@@ -216,6 +225,9 @@ function buildDevSessionPlugin(): Plugin {
 
 export default defineConfig(({ mode }) => ({
   base: "./",
+  define: {
+    __WEAVER_ENABLE_DIAGNOSTICS__: JSON.stringify(DIAGNOSTICS_ENABLED),
+  },
   plugins: [
     react({
       babel:

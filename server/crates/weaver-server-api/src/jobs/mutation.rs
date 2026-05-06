@@ -4,10 +4,11 @@ use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
 use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
+#[cfg(weaver_diagnostics)]
+use crate::history::types::DiagnosticRedownloadAcceptance;
 use crate::history::types::{
-    AcceptHistoryDeleteInput, DiagnosticRedownloadAcceptance, HistoryCommandResult,
-    HistoryDeleteAcceptance, HistoryItem, history_delete_row_state_from_core,
-    history_item_from_row,
+    AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
+    history_delete_row_state_from_core, history_item_from_row,
 };
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
@@ -231,6 +232,7 @@ impl JobsMutation {
     }
     /// Re-download a terminal history item under a fresh linked job ID and collect a
     /// diagnostic bundle for support.
+    #[cfg(weaver_diagnostics)]
     #[graphql(guard = "ControlGuard")]
     async fn start_diagnostic_redownload(
         &self,

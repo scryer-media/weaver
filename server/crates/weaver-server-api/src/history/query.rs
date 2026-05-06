@@ -357,6 +357,9 @@ fn load_history_diagnostic_states(
     db: &Database,
     ids: impl Iterator<Item = u64>,
 ) -> Result<HashMap<u64, weaver_server_core::DiagnosticRunRow>, weaver_server_core::StateError> {
+    if !crate::feature_flags::DIAGNOSTICS_ENABLED {
+        return Ok(HashMap::new());
+    }
     let ids = ids.collect::<Vec<_>>();
     if ids.is_empty() {
         return Ok(HashMap::new());

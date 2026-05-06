@@ -16,6 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "25"
   RUST_TOOLCHAIN: "1.95"
+  WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
 
 jobs:

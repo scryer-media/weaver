@@ -1,4 +1,22 @@
 import { gql } from "urql";
+import { DIAGNOSTICS_ENABLED } from "@/lib/features";
+
+const DIAGNOSTIC_HISTORY_FIELDS = DIAGNOSTICS_ENABLED
+  ? `
+    lastDiagnosticId
+    lastDiagnosticUploadedAt
+    diagnosticRun {
+      sourceJobId
+      diagnosticJobId
+      diagnosticId
+      stage
+      includeServerHostnames
+      rerunSucceeded
+      errorMessage
+      updatedAt
+    }
+  `
+  : "";
 
 const FACADE_QUEUE_ITEM_FIELDS = `
   fragment FacadeQueueItemFields on QueueItem {
@@ -48,18 +66,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     outputDir
     createdAt
     completedAt
-    lastDiagnosticId
-    lastDiagnosticUploadedAt
-    diagnosticRun {
-      sourceJobId
-      diagnosticJobId
-      diagnosticId
-      stage
-      includeServerHostnames
-      rerunSucceeded
-      errorMessage
-      updatedAt
-    }
+    ${DIAGNOSTIC_HISTORY_FIELDS}
     deleteOperation {
       operationId
       state
@@ -526,19 +533,25 @@ export const REDOWNLOAD_JOB_MUTATION = gql`
   }
 `;
 
-export const START_DIAGNOSTIC_REDOWNLOAD_MUTATION = gql`
-  mutation StartDiagnosticRedownload($id: Int!, $includeServerHostnames: Boolean!) {
-    startDiagnosticRedownload(
-      id: $id
-      includeServerHostnames: $includeServerHostnames
-    ) {
-      sourceJobId
-      diagnosticJobId
-      stage
-      includeServerHostnames
-    }
-  }
-`;
+export const START_DIAGNOSTIC_REDOWNLOAD_MUTATION = DIAGNOSTICS_ENABLED
+  ? gql`
+      mutation StartDiagnosticRedownload($id: Int!, $includeServerHostnames: Boolean!) {
+        startDiagnosticRedownload(
+          id: $id
+          includeServerHostnames: $includeServerHostnames
+        ) {
+          sourceJobId
+          diagnosticJobId
+          stage
+          includeServerHostnames
+        }
+      }
+    `
+  : gql`
+      mutation DiagnosticsDisabled {
+        __typename
+      }
+    `;
 
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {

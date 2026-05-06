@@ -1753,6 +1753,8 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         std::env::var("WEAVER_VITE_USE_POLLING").unwrap_or_else(|_| "true".to_string());
     let vite_poll_interval =
         std::env::var("WEAVER_VITE_POLL_INTERVAL_MS").unwrap_or_else(|_| "250".to_string());
+    let diagnostics_enabled =
+        std::env::var("WEAVER_ENABLE_DIAGNOSTICS").unwrap_or_else(|_| "0".to_string());
 
     let keep_data = std::env::var("WEAVER_DEV_KEEP_DATA")
         .map(|value| value == "1")
@@ -1798,6 +1800,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
 
     println!("==> Building Weaver backend...");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
+    build.env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled);
     build.args(["build", "--locked", "-p", "weaver"]);
     run_checked(&mut build)?;
 
@@ -1844,12 +1847,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    println!("    Diagnostics enabled: {diagnostics_enabled}");
     println!("    Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
     let mut vite = ctx.command_in("npm", &web_dir);
     vite.env("WEAVER_DEV_PROXY_TARGET", &backend_url)
+        .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
         .env("WEAVER_VITE_USE_POLLING", &vite_use_polling)
         .env("WEAVER_VITE_POLL_INTERVAL_MS", &vite_poll_interval)
         .args([

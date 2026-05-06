@@ -1,3 +1,5 @@
+#![cfg(weaver_diagnostics)]
+
 mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};

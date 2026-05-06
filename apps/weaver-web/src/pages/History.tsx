@@ -28,6 +28,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
+import { DIAGNOSTICS_ENABLED } from "@/lib/features";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
@@ -384,7 +385,8 @@ function reconcileDeleteOperations(
 function isDiagnosticRunActive(
   diagnosticRun: HistoryJob["diagnosticRun"],
 ) {
-  return diagnosticRun != null
+  return DIAGNOSTICS_ENABLED
+    && diagnosticRun != null
     && ["QUEUED", "RUNNING", "COLLECTING", "UPLOADING"].includes(diagnosticRun.stage);
 }
 
@@ -414,6 +416,9 @@ function formatDiagnosticSummary(
   t: ReturnType<typeof useTranslate>,
   job: HistoryJob,
 ) {
+  if (!DIAGNOSTICS_ENABLED) {
+    return "";
+  }
   const diagnosticRun = job.diagnosticRun;
   if (diagnosticRun) {
     const stageLabel = diagnosticStageLabel(t, diagnosticRun.stage);
@@ -585,7 +590,7 @@ export function History() {
     || diagnosticStartState.fetching;
   const activeHistoryFilterCount = countActiveHistoryFilters(historyPreferences.status);
   const hasActiveDiagnosticRuns = useMemo(
-    () => jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
+    () => DIAGNOSTICS_ENABLED && jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
     [jobs],
   );
 
@@ -765,6 +770,9 @@ export function History() {
 
   const handleDiagnosticRedownload = useCallback(
     async (jobId: number, includeServerHostnames: boolean) => {
+      if (!DIAGNOSTICS_ENABLED) {
+        return false;
+      }
       setDiagnosticAcceptError(null);
       const result = await startDiagnosticRedownload({
         id: jobId,
@@ -783,7 +791,11 @@ export function History() {
   );
 
   const isJobLocked = useCallback(
-    (job: HistoryJob) => Boolean(job.deleteOperation?.locked || isDiagnosticRunActive(job.diagnosticRun)),
+    (job: HistoryJob) =>
+      Boolean(
+        job.deleteOperation?.locked
+          || (DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun)),
+      ),
     [],
   );
 
@@ -823,7 +835,7 @@ export function History() {
     (job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) => {
       const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
       const locked = isJobLocked(job);
-      const hasActiveDiagnostic = isDiagnosticRunActive(job.diagnosticRun);
+      const hasActiveDiagnostic = DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun);
 
       return (
         <div
@@ -845,23 +857,25 @@ export function History() {
               >
                 <RefreshCcw className={iconSizeClassName} />
               </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                title={t("action.diagnosticRedownload")}
-                aria-label={t("action.diagnosticRedownload")}
-                className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
-                disabled={actionsBusy || locked || hasActiveDiagnostic}
-                onClick={() => {
-                  setDiagnosticAcceptError(null);
-                  setDiagnosticConfirm({
-                    id: job.id,
-                    includeServerHostnames: true,
-                  });
-                }}
-              >
-                <Bug className={iconSizeClassName} />
-              </Button>
+              {DIAGNOSTICS_ENABLED ? (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title={t("action.diagnosticRedownload")}
+                  aria-label={t("action.diagnosticRedownload")}
+                  className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
+                  disabled={actionsBusy || locked || hasActiveDiagnostic}
+                  onClick={() => {
+                    setDiagnosticAcceptError(null);
+                    setDiagnosticConfirm({
+                      id: job.id,
+                      includeServerHostnames: true,
+                    });
+                  }}
+                >
+                  <Bug className={iconSizeClassName} />
+                </Button>
+              ) : null}
               <Button
                 variant="ghost"
                 size="icon"
@@ -976,7 +990,7 @@ export function History() {
               </Link>
               {deleteOperation?.locked ? (
                 <span className="text-[9px] text-amber-500">Deleting…</span>
-              ) : row.original.diagnosticRun ? (
+              ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
                 <span
                   className={cn(
                     "block truncate text-[9px]",
@@ -990,7 +1004,7 @@ export function History() {
                 >
                   {formatDiagnosticSummary(t, row.original)}
                 </span>
-              ) : row.original.lastDiagnosticId ? (
+              ) : DIAGNOSTICS_ENABLED && row.original.lastDiagnosticId ? (
                 <span className="block truncate text-[9px] text-muted-foreground">
                   {t("history.lastDiagnosticId", { id: row.original.lastDiagnosticId })}
                 </span>
@@ -1026,7 +1040,7 @@ export function History() {
             </div>
             {row.original.deleteOperation?.locked ? (
               <div className="text-[9px] text-amber-500">Locked</div>
-            ) : row.original.diagnosticRun ? (
+            ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
               <div className="text-[9px] text-sky-600">
                 {diagnosticStageLabel(t, row.original.diagnosticRun.stage)}
               </div>
@@ -1576,49 +1590,51 @@ export function History() {
         onCancel={() => setRedownloadConfirmId(null)}
       />
 
-      <ConfirmDialog
-        open={diagnosticConfirm != null}
-        title={t("confirm.diagnosticRedownload")}
-        message={t("confirm.diagnosticRedownloadMessage")}
-        confirmLabel={t("confirm.diagnosticRedownloadConfirm")}
-        cancelLabel={t("confirm.diagnosticRedownloadDismiss")}
-        confirmDisabled={diagnosticStartState.fetching}
-        cancelDisabled={diagnosticStartState.fetching}
-        onConfirm={() => {
-          if (!diagnosticConfirm) {
-            return;
-          }
-          void handleDiagnosticRedownload(
-            diagnosticConfirm.id,
-            diagnosticConfirm.includeServerHostnames,
-          ).then((accepted) => {
-            if (accepted) {
-              setDiagnosticConfirm(null);
+      {DIAGNOSTICS_ENABLED ? (
+        <ConfirmDialog
+          open={diagnosticConfirm != null}
+          title={t("confirm.diagnosticRedownload")}
+          message={t("confirm.diagnosticRedownloadMessage")}
+          confirmLabel={t("confirm.diagnosticRedownloadConfirm")}
+          cancelLabel={t("confirm.diagnosticRedownloadDismiss")}
+          confirmDisabled={diagnosticStartState.fetching}
+          cancelDisabled={diagnosticStartState.fetching}
+          onConfirm={() => {
+            if (!diagnosticConfirm) {
+              return;
             }
-          });
-        }}
-        onCancel={() => {
-          setDiagnosticAcceptError(null);
-          setDiagnosticConfirm(null);
-        }}
-      >
-        <label className="flex items-center gap-2">
-          <Checkbox
-            checked={diagnosticConfirm?.includeServerHostnames ?? true}
-            disabled={diagnosticStartState.fetching}
-            onCheckedChange={(value) => {
-              setDiagnosticConfirm((current) => (current ? {
-                ...current,
-                includeServerHostnames: value === true,
-              } : current));
-            }}
-          />
-          <span className="text-sm">{t("confirm.includeServerHostnames")}</span>
-        </label>
-        {diagnosticAcceptError ? (
-          <p className="text-sm text-destructive">{diagnosticAcceptError}</p>
-        ) : null}
-      </ConfirmDialog>
+            void handleDiagnosticRedownload(
+              diagnosticConfirm.id,
+              diagnosticConfirm.includeServerHostnames,
+            ).then((accepted) => {
+              if (accepted) {
+                setDiagnosticConfirm(null);
+              }
+            });
+          }}
+          onCancel={() => {
+            setDiagnosticAcceptError(null);
+            setDiagnosticConfirm(null);
+          }}
+        >
+          <label className="flex items-center gap-2">
+            <Checkbox
+              checked={diagnosticConfirm?.includeServerHostnames ?? true}
+              disabled={diagnosticStartState.fetching}
+              onCheckedChange={(value) => {
+                setDiagnosticConfirm((current) => (current ? {
+                  ...current,
+                  includeServerHostnames: value === true,
+                } : current));
+              }}
+            />
+            <span className="text-sm">{t("confirm.includeServerHostnames")}</span>
+          </label>
+          {diagnosticAcceptError ? (
+            <p className="text-sm text-destructive">{diagnosticAcceptError}</p>
+          ) : null}
+        </ConfirmDialog>
+      ) : null}
 
       <ConfirmDialog
         open={deleteBatchConfirm}
