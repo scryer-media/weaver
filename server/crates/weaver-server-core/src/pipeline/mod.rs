@@ -247,7 +247,7 @@ pub struct Pipeline {
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).
     pub(super) complete_dir: PathBuf,
-    /// Directory where persisted NZB files live (for reprocessing after restart).
+    /// Legacy logical NZB path base retained for compatibility with existing rows and tests.
     pub(super) nzb_dir: PathBuf,
     /// Pending segment commits (flushed to SQLite in batches).
     pub(super) segment_batch: Vec<CommittedSegment>,

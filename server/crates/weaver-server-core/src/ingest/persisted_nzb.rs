@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -66,6 +66,19 @@ pub fn parse_persisted_nzb(path: &Path) -> Result<Nzb, PersistedNzbError> {
     parse_nzb_reader(reader).map_err(PersistedNzbError::Parse)
 }
 
+pub fn decode_persisted_nzb_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        zstd::stream::decode_all(Cursor::new(bytes))
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+pub fn parse_persisted_nzb_bytes(bytes: &[u8]) -> Result<Nzb, PersistedNzbError> {
+    let decoded = decode_persisted_nzb_bytes(bytes).map_err(PersistedNzbError::Io)?;
+    weaver_nzb::parse_nzb(&decoded).map_err(PersistedNzbError::Parse)
+}
+
 pub async fn remove_persisted_nzb_if_exists(path: &Path) {
     if let Err(error) = tokio::fs::remove_file(path).await
         && error.kind() != io::ErrorKind::NotFound
@@ -86,6 +99,21 @@ pub fn write_compressed_nzb(path: &Path, nzb_bytes: &[u8]) -> io::Result<()> {
     let mut writer = encoder.finish()?;
     writer.flush()?;
     Ok(())
+}
+
+pub fn compress_nzb_bytes(nzb_bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if nzb_bytes.starts_with(&ZSTD_MAGIC) {
+        return Ok(nzb_bytes.to_vec());
+    }
+
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3)?;
+    encoder.write_all(nzb_bytes)?;
+    encoder.finish()
+}
+
+pub fn load_persisted_nzb_storage_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    compress_nzb_bytes(&bytes)
 }
 
 pub fn persist_decoded_nzb_reader<R: Read>(
@@ -111,6 +139,16 @@ pub fn persist_decoded_nzb_reader<R: Read>(
     persist_result
 }
 
+pub fn persist_decoded_nzb_reader_to_zstd<R: Read>(
+    source: &mut R,
+) -> Result<(Vec<u8>, Nzb), PersistedNzbError> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).map_err(PersistedNzbError::Io)?;
+    io::copy(source, &mut encoder).map_err(PersistedNzbError::Io)?;
+    let bytes = encoder.finish().map_err(PersistedNzbError::Io)?;
+    let nzb = parse_persisted_nzb_bytes(&bytes)?;
+    Ok((bytes, nzb))
+}
+
 pub fn hash_persisted_nzb(path: &Path) -> io::Result<[u8; 32]> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
@@ -125,6 +163,12 @@ pub fn hash_persisted_nzb(path: &Path) -> io::Result<[u8; 32]> {
     }
 
     Ok(finalize_sha256(hasher))
+}
+
+pub fn hash_persisted_nzb_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    finalize_sha256(hasher)
 }
 
 pub fn hash_persisted_nzb_or_empty(path: &Path) -> [u8; 32] {

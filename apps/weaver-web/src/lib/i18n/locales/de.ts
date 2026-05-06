@@ -334,6 +334,7 @@ const de: LocaleDictionary = {
   "settings.storageAndBehavior": "Speicher und Verhalten",
   "settings.storageAndBehaviorDesc": "Diese Werte steuern, wo Auftragsdaten auf der Festplatte liegen und wie aggressiv Weaver bereinigt und Arbeit wiederholt.",
   "settings.save": "Speichern",
+  "settings.saving": "Speichert…",
   "settings.saved": "Gespeichert",
   "settings.settingsSaveHint": "Beim Speichern wird auch das gewählte Geschwindigkeitslimit auf die laufende Pipeline angewendet.",
 

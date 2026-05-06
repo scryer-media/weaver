@@ -51,12 +51,13 @@ impl Database {
         };
         conn.execute(
             "INSERT INTO active_jobs
-             (job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
-             VALUES (?1, ?2, ?3, ?4, 'queued', 'queued', 'idle', 'active', ?5, ?6, ?7)",
+             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 'queued', 'idle', 'active', ?6, ?7, ?8)",
             rusqlite::params![
                 job.job_id.0 as i64,
                 job.nzb_hash.as_slice(),
                 job.nzb_path.to_str().unwrap_or(""),
+                job.nzb_zstd,
                 job.output_dir.to_str().unwrap_or(""),
                 job.created_at as i64,
                 job.category,

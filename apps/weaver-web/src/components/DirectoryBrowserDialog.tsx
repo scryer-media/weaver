@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, ChevronRight, Folder, FolderOpen, FolderPlus, Loader2 } from "lucide-react";
 import { useClient, useMutation } from "urql";
 import { Button } from "@/components/ui/button";
@@ -59,6 +59,7 @@ export function DirectoryBrowserDialog({
   const [error, setError] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
+  const breadcrumbRef = useRef<HTMLDivElement | null>(null);
 
   const applyListing = useCallback((browser: DirectoryBrowseResult | null | undefined, fallbackPath: string) => {
     const resolvedPath = browser?.currentPath?.trim() || fallbackPath;
@@ -136,23 +137,36 @@ export function DirectoryBrowserDialog({
     void browse(path, { fallbackToRootOnError: true });
   }, [open, path, browse]);
 
+  useEffect(() => {
+    const breadcrumb = breadcrumbRef.current;
+    if (!breadcrumb) {
+      return;
+    }
+
+    breadcrumb.scrollLeft = breadcrumb.scrollWidth;
+  }, [currentPath]);
+
   const isBusy = loading || createState.fetching;
   const pathSegments = currentPath.split("/").filter(Boolean);
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
-      <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-2xl">
+      <DialogContent className="flex max-h-[85vh] w-[min(96vw,64rem)] flex-col overflow-hidden sm:max-w-4xl">
         <DialogHeader>
           <DialogTitle>{t("categories.directoryBrowserTitle")}</DialogTitle>
           <DialogDescription>{t("categories.directoryBrowserDesc")}</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <div className="flex items-center gap-1 overflow-x-auto rounded-xl border border-border/70 bg-background/70 px-2 py-2 text-sm">
+        <div className="min-w-0 space-y-4">
+          <div
+            ref={breadcrumbRef}
+            className="flex items-center gap-1 overflow-x-auto whitespace-nowrap rounded-xl border border-border/70 bg-background/70 px-2 py-2 text-sm"
+          >
             <button
               type="button"
               onClick={() => void browse(ROOT_PATH)}
               disabled={isBusy}
+              title={ROOT_PATH}
               className="shrink-0 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
             >
               /
@@ -168,10 +182,11 @@ export function DirectoryBrowserDialog({
                     type="button"
                     onClick={() => void browse(segmentPath)}
                     disabled={isBusy}
+                    title={segmentPath}
                     className={
                       isLast
-                        ? "shrink-0 rounded px-1.5 py-0.5 font-medium text-foreground"
-                        : "shrink-0 rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+                        ? "max-w-[10rem] shrink-0 truncate rounded px-1.5 py-0.5 font-medium text-foreground sm:max-w-[14rem]"
+                        : "max-w-[10rem] shrink-0 truncate rounded px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground sm:max-w-[14rem]"
                     }
                   >
                     {segment}
@@ -181,31 +196,33 @@ export function DirectoryBrowserDialog({
             })}
           </div>
 
-          <div className="flex gap-2">
+          <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
             <Input
               value={currentPath}
               onChange={(event) => setCurrentPath(event.target.value)}
               disabled={isBusy}
+              title={currentPath}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   event.preventDefault();
                   void browse(currentPath);
                 }
               }}
-              className="font-mono text-sm"
+              className="min-w-0 flex-1 font-mono text-sm"
             />
             <Button
               type="button"
               variant="outline"
               onClick={() => void browse(currentPath)}
               disabled={isBusy}
+              className="shrink-0"
             >
               {t("categories.browse")}
             </Button>
           </div>
 
           <div className="space-y-2">
-            <div className="flex gap-2">
+            <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
               <Input
                 value={newFolderName}
                 placeholder={t("categories.newFolderPlaceholder")}
@@ -221,12 +238,14 @@ export function DirectoryBrowserDialog({
                   event.preventDefault();
                   void handleCreateFolder();
                 }}
+                className="min-w-0 flex-1"
               />
               <Button
                 type="button"
                 variant="outline"
                 disabled={isBusy || !newFolderName.trim()}
                 onClick={() => void handleCreateFolder()}
+                className="shrink-0"
               >
                 {createState.fetching ? (
                   <Loader2 className="size-4 animate-spin" />
@@ -285,24 +304,31 @@ export function DirectoryBrowserDialog({
             )}
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="min-w-0 gap-2 sm:flex-row sm:items-end sm:justify-between">
             <Button type="button" variant="outline" onClick={onClose}>
               {t("action.cancel")}
             </Button>
-            <Button
-              type="button"
-              onClick={() => {
-                const selectedPath = normalizePath(currentPath);
-                onPathChange(selectedPath);
-                onChoose(selectedPath);
-              }}
-              disabled={isBusy}
-              className="max-w-full justify-start overflow-hidden"
-            >
-              <FolderOpen className="size-4" />
-              <span>{t("categories.useCurrentFolder")}</span>
-              <span className="min-w-0 truncate font-mono text-xs opacity-80">{currentPath}</span>
-            </Button>
+            <div className="flex min-w-0 flex-1 flex-col items-stretch gap-2 sm:items-end">
+              <span
+                className="w-full truncate text-left font-mono text-xs text-muted-foreground sm:text-right"
+                title={currentPath}
+              >
+                {currentPath}
+              </span>
+              <Button
+                type="button"
+                onClick={() => {
+                  const selectedPath = normalizePath(currentPath);
+                  onPathChange(selectedPath);
+                  onChoose(selectedPath);
+                }}
+                disabled={isBusy}
+                className="w-full sm:w-auto"
+              >
+                <FolderOpen className="size-4" />
+                <span>{t("categories.useCurrentFolder")}</span>
+              </Button>
+            </div>
           </DialogFooter>
         </div>
       </DialogContent>

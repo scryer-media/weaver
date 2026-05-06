@@ -123,9 +123,12 @@ impl Database {
             "INSERT OR REPLACE INTO job_history
              (job_id, name, status, error_message, total_bytes, downloaded_bytes,
               optional_recovery_bytes, optional_recovery_downloaded_bytes,
-              failed_bytes, health, category, output_dir, nzb_path,
+              failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
               created_at, completed_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     COALESCE(?13, (SELECT nzb_path FROM active_jobs WHERE job_id = ?1)),
+                     (SELECT nzb_zstd FROM active_jobs WHERE job_id = ?1),
+                     ?14, ?15, ?16)",
             rusqlite::params![
                 history.job_id as i64,
                 history.name,

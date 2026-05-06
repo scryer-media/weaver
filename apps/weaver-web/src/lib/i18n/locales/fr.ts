@@ -334,6 +334,7 @@ const fr: LocaleDictionary = {
   "settings.storageAndBehavior": "Stockage et comportement",
   "settings.storageAndBehaviorDesc": "Ces valeurs contrôlent l'emplacement de l'état des tâches sur le disque et l'agressivité du nettoyage et des réessais de Weaver.",
   "settings.save": "Enregistrer",
+  "settings.saving": "Enregistrement…",
   "settings.saved": "Enregistré",
   "settings.settingsSaveHint": "L'enregistrement applique également la limite de vitesse sélectionnée au pipeline actif.",
 

@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -31,8 +31,6 @@ pub enum SubmitNzbError {
     Parse(#[from] weaver_nzb::NzbError),
     #[error("NZB contains no files")]
     Empty,
-    #[error("failed to create NZB storage dir: {0}")]
-    CreateStorageDir(std::io::Error),
     #[error("failed to save NZB: {0}")]
     Save(std::io::Error),
     #[error("failed to read uploaded NZB: {0}")]
@@ -145,11 +143,6 @@ pub async fn resolve_submission_category(
     }
 }
 
-pub async fn nzb_storage_dir(config: &SharedConfig) -> PathBuf {
-    let cfg = config.read().await;
-    Path::new(&cfg.data_dir).join(".weaver-nzbs")
-}
-
 pub async fn submit_nzb_bytes(
     handle: &SchedulerHandle,
     config: &SharedConfig,
@@ -176,25 +169,18 @@ pub async fn submit_nzb_bytes(
         metadata,
     );
 
-    let nzb_dir = nzb_storage_dir(config).await;
-    tokio::fs::create_dir_all(&nzb_dir)
-        .await
-        .map_err(SubmitNzbError::CreateStorageDir)?;
-    let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
-    let write_path = nzb_path.clone();
-    let compressed_bytes = nzb_bytes.to_vec();
-    let persist_result = tokio::task::spawn_blocking(move || {
-        persisted_nzb::write_compressed_nzb(&write_path, &compressed_bytes)
-    })
-    .await
-    .map_err(|error| SubmitNzbError::Save(std::io::Error::other(error.to_string())))?;
-    if let Err(error) = persist_result {
-        persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
-        return Err(SubmitNzbError::Save(error));
-    }
+    let nzb_zstd =
+        persisted_nzb::compress_nzb_bytes(&nzb_bytes).map_err(SubmitNzbError::Save)?;
+    let nzb_path = PathBuf::from(
+        filename
+            .clone()
+            .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
+    );
 
-    if let Err(error) = handle.add_job(job_id, spec.clone(), nzb_path.clone()).await {
-        persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
+    if let Err(error) = handle
+        .add_job(job_id, spec.clone(), nzb_path.clone(), nzb_zstd)
+        .await
+    {
         return Err(error.into());
     }
 
@@ -261,31 +247,22 @@ where
 {
     let resolved_category = resolve_submission_category(config, category.as_deref()).await;
     let job_id = next_submission_job_id();
-    let nzb_dir = nzb_storage_dir(config).await;
-    tokio::fs::create_dir_all(&nzb_dir)
-        .await
-        .map_err(SubmitNzbError::CreateStorageDir)?;
-    let nzb_path = nzb_dir.join(format!("{}.nzb", job_id.0));
-    let persisted_path = nzb_path.clone();
     let persist_result = tokio::task::spawn_blocking(move || {
         let mut source = source;
-        super::persisted_nzb::persist_decoded_nzb_reader(&persisted_path, &mut source)
+        super::persisted_nzb::persist_decoded_nzb_reader_to_zstd(&mut source)
     })
     .await
     .map_err(|error| SubmitNzbError::Upload(std::io::Error::other(error.to_string())))?;
-    let nzb = match persist_result {
-        Ok(nzb) => nzb,
+    let (nzb_zstd, nzb) = match persist_result {
+        Ok(values) => values,
         Err(super::persisted_nzb::PersistedNzbError::Io(error)) => {
-            super::persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
             return Err(SubmitNzbError::Save(error));
         }
         Err(super::persisted_nzb::PersistedNzbError::Parse(error)) => {
-            super::persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
             return Err(SubmitNzbError::Parse(error));
         }
     };
     if nzb.files.is_empty() {
-        super::persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
         return Err(SubmitNzbError::Empty);
     }
 
@@ -296,9 +273,16 @@ where
         resolved_category,
         metadata,
     );
+    let nzb_path = PathBuf::from(
+        filename
+            .clone()
+            .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
+    );
 
-    if let Err(error) = handle.add_job(job_id, spec.clone(), nzb_path.clone()).await {
-        super::persisted_nzb::remove_persisted_nzb_if_exists(&nzb_path).await;
+    if let Err(error) = handle
+        .add_job(job_id, spec.clone(), nzb_path.clone(), nzb_zstd)
+        .await
+    {
         return Err(error.into());
     }
 

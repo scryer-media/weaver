@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
 import { FolderOpen } from "lucide-react";
 import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
@@ -34,6 +34,35 @@ type GeneralSettings = {
   maxRetries: number;
 };
 
+type StorageBehaviorDraft = {
+  intermediateDir: string;
+  completeDir: string;
+  cleanupAfterExtract: boolean;
+  maxRetries: number;
+};
+
+function normalizeStorageBehaviorDraft(draft: StorageBehaviorDraft): StorageBehaviorDraft {
+  return {
+    intermediateDir: draft.intermediateDir.trim(),
+    completeDir: draft.completeDir.trim(),
+    cleanupAfterExtract: draft.cleanupAfterExtract,
+    maxRetries: Number.isFinite(draft.maxRetries) ? Math.max(0, Math.min(20, draft.maxRetries)) : 0,
+  };
+}
+
+function storageBehaviorDraftFromSettings(settings: GeneralSettings): StorageBehaviorDraft {
+  return normalizeStorageBehaviorDraft({
+    intermediateDir: settings.intermediateDir ?? "",
+    completeDir: settings.completeDir ?? "",
+    cleanupAfterExtract: settings.cleanupAfterExtract ?? true,
+    maxRetries: settings.maxRetries ?? 3,
+  });
+}
+
+function storageBehaviorDraftKey(draft: StorageBehaviorDraft | null): string {
+  return draft ? JSON.stringify(draft) : "";
+}
+
 export function GeneralSettingsPage() {
   const t = useTranslate();
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
@@ -48,9 +77,16 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
-  const [settingsSaved, setSettingsSaved] = useState(false);
+  const [speedSaved, setSpeedSaved] = useState(false);
+  const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
   const [browserTarget, setBrowserTarget] = useState<"intermediate" | "complete" | null>(null);
   const [browsePath, setBrowsePath] = useState<string | null>(null);
+  const speedSavedTimerRef = useRef<number | null>(null);
+  const storageSaveTimerRef = useRef<number | null>(null);
+  const storageSavedTimerRef = useRef<number | null>(null);
+  const pendingStorageSaveRef = useRef<StorageBehaviorDraft | null>(null);
+  const storageSaveInFlightRef = useRef(false);
 
   useEffect(() => {
     if (data?.settings) {
@@ -68,27 +104,135 @@ export function GeneralSettingsPage() {
   }, [settings]);
 
   useEffect(() => {
-    if (updateState.data?.updateSettings) {
-      setSettings(updateState.data.updateSettings);
-      setSettingsSaved(true);
-      reexecuteQuery({ requestPolicy: "network-only" });
-      const timeout = window.setTimeout(() => setSettingsSaved(false), 2000);
-      return () => window.clearTimeout(timeout);
-    }
-  }, [updateState.data, reexecuteQuery]);
+    return () => {
+      if (storageSaveTimerRef.current !== null) {
+        window.clearTimeout(storageSaveTimerRef.current);
+      }
+      if (speedSavedTimerRef.current !== null) {
+        window.clearTimeout(speedSavedTimerRef.current);
+      }
+      if (storageSavedTimerRef.current !== null) {
+        window.clearTimeout(storageSavedTimerRef.current);
+      }
+    };
+  }, []);
 
-  const persistSettings = async () => {
-    const nextIntermediateDir = intermediateDir.trim();
-    const nextCompleteDir = completeDir.trim();
-    await updateSettings({
+  const applyUpdatedSettings = useCallback((nextSettings: GeneralSettings | null | undefined) => {
+    if (!nextSettings) {
+      return;
+    }
+    setSettings(nextSettings);
+    reexecuteQuery({ requestPolicy: "network-only" });
+  }, [reexecuteQuery]);
+
+  const pulseSpeedSaved = useCallback(() => {
+    if (speedSavedTimerRef.current !== null) {
+      window.clearTimeout(speedSavedTimerRef.current);
+    }
+    setSpeedSaved(true);
+    speedSavedTimerRef.current = window.setTimeout(() => setSpeedSaved(false), 2000);
+  }, []);
+
+  const currentStorageDraft = useMemo(
+    () => normalizeStorageBehaviorDraft({
+      intermediateDir,
+      completeDir,
+      cleanupAfterExtract: cleanup,
+      maxRetries,
+    }),
+    [cleanup, completeDir, intermediateDir, maxRetries],
+  );
+
+  const persistedStorageDraft = useMemo(
+    () => (settings ? storageBehaviorDraftFromSettings(settings) : null),
+    [settings],
+  );
+
+  const setStorageSavedState = useCallback(() => {
+    if (storageSavedTimerRef.current !== null) {
+      window.clearTimeout(storageSavedTimerRef.current);
+    }
+    setStorageSaveStatus("saved");
+    storageSavedTimerRef.current = window.setTimeout(() => {
+      setStorageSaveStatus("idle");
+    }, 2000);
+  }, []);
+
+  const flushPendingStorageSave = useCallback(async () => {
+    if (storageSaveInFlightRef.current || pendingStorageSaveRef.current == null) {
+      return;
+    }
+
+    storageSaveInFlightRef.current = true;
+
+    while (pendingStorageSaveRef.current != null) {
+      const nextDraft = pendingStorageSaveRef.current;
+      pendingStorageSaveRef.current = null;
+
+      if (storageSavedTimerRef.current !== null) {
+        window.clearTimeout(storageSavedTimerRef.current);
+      }
+      setStorageSaveStatus("saving");
+      setStorageSaveError(null);
+
+      const result = await updateSettings({
+        input: {
+          intermediateDir: nextDraft.intermediateDir || null,
+          completeDir: nextDraft.completeDir || null,
+          cleanupAfterExtract: nextDraft.cleanupAfterExtract,
+          maxRetries: nextDraft.maxRetries,
+        },
+      });
+
+      if (result.error) {
+        setStorageSaveStatus("error");
+        setStorageSaveError(result.error.message ?? "Unable to save settings.");
+        break;
+      }
+
+      applyUpdatedSettings(result.data?.updateSettings);
+      setStorageSavedState();
+    }
+
+    storageSaveInFlightRef.current = false;
+  }, [applyUpdatedSettings, setStorageSavedState, updateSettings]);
+
+  useEffect(() => {
+    if (!settings) {
+      return;
+    }
+
+    if (storageBehaviorDraftKey(currentStorageDraft) === storageBehaviorDraftKey(persistedStorageDraft)) {
+      return;
+    }
+
+    if (storageSaveTimerRef.current !== null) {
+      window.clearTimeout(storageSaveTimerRef.current);
+    }
+
+    storageSaveTimerRef.current = window.setTimeout(() => {
+      pendingStorageSaveRef.current = currentStorageDraft;
+      void flushPendingStorageSave();
+    }, 500);
+
+    return () => {
+      if (storageSaveTimerRef.current !== null) {
+        window.clearTimeout(storageSaveTimerRef.current);
+      }
+    };
+  }, [currentStorageDraft, flushPendingStorageSave, persistedStorageDraft, settings]);
+
+  const applySpeedLimit = async () => {
+    const result = await updateSettings({
       input: {
-        intermediateDir: nextIntermediateDir ? nextIntermediateDir : null,
-        completeDir: nextCompleteDir ? nextCompleteDir : null,
-        cleanupAfterExtract: cleanup,
         maxDownloadSpeed: speedValue,
-        maxRetries,
       },
     });
+
+    if (result.data?.updateSettings) {
+      applyUpdatedSettings(result.data.updateSettings);
+      pulseSpeedSaved();
+    }
   };
 
   return (
@@ -151,13 +295,13 @@ export function GeneralSettingsPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={() => void persistSettings()} disabled={updateState.fetching}>
+            <Button onClick={() => void applySpeedLimit()} disabled={updateState.fetching}>
               {t("settings.applySpeedNow")}
             </Button>
             <Button variant="outline" onClick={() => setSpeedValue(0)}>
               {t("settings.resetSpeedLimit")}
             </Button>
-            {settingsSaved ? (
+            {speedSaved ? (
               <span className="text-sm text-emerald-600 dark:text-emerald-300">
                 {t("settings.saved")}
               </span>
@@ -244,13 +388,16 @@ export function GeneralSettingsPage() {
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
-              <Button onClick={() => void persistSettings()} disabled={updateState.fetching}>
-                {t("settings.save")}
-              </Button>
-              {settingsSaved ? (
+              {storageSaveStatus === "saving" ? (
+                <span className="text-sm text-muted-foreground">{t("settings.saving")}</span>
+              ) : null}
+              {storageSaveStatus === "saved" ? (
                 <span className="text-sm text-emerald-600 dark:text-emerald-300">
                   {t("settings.saved")}
                 </span>
+              ) : null}
+              {storageSaveStatus === "error" && storageSaveError ? (
+                <span className="text-sm text-destructive">{storageSaveError}</span>
               ) : null}
             </div>
 

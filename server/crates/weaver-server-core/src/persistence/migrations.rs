@@ -251,10 +251,38 @@ impl Database {
 
         // Insert into SQLite.
         for job in recovered_jobs.values() {
+            let is_terminal = matches!(
+                job.status,
+                PersistedJobStatus::Complete
+                    | PersistedJobStatus::Failed { .. }
+                    | PersistedJobStatus::Cancelled
+            );
+            let nzb_zstd = match crate::ingest::load_persisted_nzb_storage_bytes(&job.nzb_path) {
+                Ok(nzb_zstd) => nzb_zstd,
+                Err(error) if is_terminal => {
+                    tracing::warn!(
+                        job_id = job.job_id.0,
+                        path = %job.nzb_path.display(),
+                        error = %error,
+                        "failed to backfill persisted NZB blob for terminal migrated job"
+                    );
+                    Vec::new()
+                }
+                Err(error) => {
+                    return Err(StateError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to backfill persisted NZB blob for migrated job {}: {error}",
+                            job.job_id.0
+                        ),
+                    )));
+                }
+            };
             self.create_active_job(&ActiveJob {
                 job_id: job.job_id,
                 nzb_hash: [0; 32], // hash not stored in journal entries after creation
                 nzb_path: job.nzb_path.clone(),
+                nzb_zstd,
                 output_dir: job.output_dir.clone(),
                 created_at: job.created_at,
                 category: job.category.clone(),

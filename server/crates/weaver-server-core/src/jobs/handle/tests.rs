@@ -173,6 +173,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     spec,
                     nzb_path: _,
                     reply,
+                    ..
                 } => {
                     if jobs.contains_key(&job_id) {
                         let _ = reply.send(Err(SchedulerError::JobExists(job_id)));
@@ -427,16 +428,41 @@ fn make_spec(name: &str) -> JobSpec {
     }
 }
 
+fn sample_nzb_zstd() -> Vec<u8> {
+    crate::ingest::compress_nzb_bytes(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="sample">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>
+              <segment bytes="10" number="1">abc@test</segment>
+            </segments>
+          </file>
+        </nzb>"#,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn add_and_list_jobs() {
     let (handle, task) = test_scheduler();
 
     handle
-        .add_job(JobId(1), make_spec("Job 1"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("Job 1"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
     handle
-        .add_job(JobId(2), make_spec("Job 2"), PathBuf::from("test2.nzb"))
+        .add_job(
+            JobId(2),
+            make_spec("Job 2"),
+            PathBuf::from("test2.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
 
@@ -456,7 +482,12 @@ async fn pause_resume() {
     let (handle, task) = test_scheduler();
 
     handle
-        .add_job(JobId(1), make_spec("Test Job"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("Test Job"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
 
@@ -477,7 +508,12 @@ async fn cancel_job() {
     let (handle, task) = test_scheduler();
 
     handle
-        .add_job(JobId(1), make_spec("To Cancel"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("To Cancel"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
     assert_eq!(handle.list_jobs().len(), 1);
@@ -531,7 +567,12 @@ async fn update_job_applies_explicit_patch() {
     let (handle, task) = test_scheduler();
 
     handle
-        .add_job(JobId(1), make_spec("Patch Me"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("Patch Me"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
 
@@ -600,6 +641,7 @@ async fn event_subscription() {
             JobId(1),
             make_spec("Evented Job"),
             PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
         )
         .await
         .unwrap();
@@ -622,11 +664,21 @@ async fn duplicate_job_rejected() {
     let (handle, task) = test_scheduler();
 
     handle
-        .add_job(JobId(1), make_spec("First"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("First"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap();
     let err = handle
-        .add_job(JobId(1), make_spec("Duplicate"), PathBuf::from("test.nzb"))
+        .add_job(
+            JobId(1),
+            make_spec("Duplicate"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, SchedulerError::JobExists(_)));
@@ -643,7 +695,7 @@ async fn password_passthrough() {
     spec.password = Some("secret123".to_string());
 
     handle
-        .add_job(JobId(1), spec, PathBuf::from("test.nzb"))
+        .add_job(JobId(1), spec, PathBuf::from("test.nzb"), sample_nzb_zstd())
         .await
         .unwrap();
 

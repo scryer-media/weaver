@@ -38,7 +38,6 @@ impl Pipeline {
         tokio::fs::create_dir_all(&intermediate_dir).await?;
         tokio::fs::create_dir_all(&complete_dir).await?;
 
-        let nzb_dir = data_dir.join(".weaver-nzbs");
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
@@ -71,7 +70,7 @@ impl Pipeline {
             pending_retries_by_job: HashMap::new(),
             intermediate_dir,
             complete_dir,
-            nzb_dir,
+            nzb_dir: data_dir.join(".weaver-nzbs"),
             segment_batch: Vec::new(),
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),

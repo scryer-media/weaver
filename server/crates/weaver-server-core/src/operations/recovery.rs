@@ -70,10 +70,6 @@ pub async fn recover_server_state(
     }
 
     let active_jobs = db.load_active_jobs().unwrap_or_default();
-    let mut referenced_nzb_paths: HashSet<PathBuf> = active_jobs
-        .values()
-        .map(|recovered| recovered.nzb_path.clone())
-        .collect();
     let mut referenced_intermediate_dirs: HashSet<PathBuf> = active_jobs
         .values()
         .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
@@ -128,44 +124,22 @@ pub async fn recover_server_state(
             });
         } else {
             // In-progress job - need to re-parse NZB and restore.
-            if !recovered.nzb_path.exists() {
-                warn!(
-                    job_id = job_id.0,
-                    nzb_path = %recovered.nzb_path.display(),
-                    "NZB file missing for recovered job, marking as failed"
-                );
-                initial_history.push(JobInfo {
-                    job_id,
-                    name: recovered
-                        .nzb_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("Unknown")
-                        .to_string(),
-                    error: Some("NZB file missing after restart".to_string()),
-                    status: JobStatus::Failed {
-                        error: "NZB file missing after restart".to_string(),
-                    },
-                    download_state: DownloadState::Failed,
-                    post_state: PostState::Failed,
-                    run_state: RunState::Active,
-                    progress: 0.0,
-                    total_bytes: 0,
-                    downloaded_bytes: 0,
-                    optional_recovery_bytes: 0,
-                    optional_recovery_downloaded_bytes: 0,
-                    failed_bytes: 0,
-                    health: 0,
-                    password: None,
-                    category: recovered.category,
-                    metadata: recovered.metadata,
-                    output_dir: Some(recovered.output_dir.display().to_string()),
-                    created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
-                });
-                continue;
-            }
+            let parse_result = recovered
+                .nzb_zstd
+                .as_deref()
+                .filter(|nzb_zstd| !nzb_zstd.is_empty())
+                .ok_or_else(|| {
+                    ingest::PersistedNzbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "persisted NZB missing from database for job {}",
+                            job_id.0
+                        ),
+                    ))
+                })
+                .and_then(ingest::parse_persisted_nzb_bytes);
 
-            match ingest::parse_persisted_nzb(&recovered.nzb_path) {
+            match parse_result {
                 Ok(nzb) => {
                     let spec = ingest::nzb_to_spec(
                         &nzb,
@@ -241,9 +215,6 @@ pub async fn recover_server_state(
     match db.list_job_history(&crate::HistoryFilter::default()) {
         Ok(history_rows) => {
             for row in history_rows {
-                if let Some(nzb_path) = row.nzb_path.as_ref() {
-                    referenced_nzb_paths.insert(PathBuf::from(nzb_path));
-                }
                 if let Some(output_dir) = row.output_dir.as_ref() {
                     let output_dir = PathBuf::from(output_dir);
                     if output_dir.starts_with(intermediate_dir) {
@@ -313,21 +284,6 @@ pub async fn recover_server_state(
         }
     }
 
-    let nzb_dir = data_dir.join(".weaver-nzbs");
-    match ingest::cleanup_orphaned_persisted_nzbs(&nzb_dir, &referenced_nzb_paths) {
-        Ok(removed) if removed > 0 => {
-            info!(removed, nzb_dir = %nzb_dir.display(), "removed orphaned persisted nzbs");
-        }
-        Ok(_) => {}
-        Err(error) => {
-            warn!(
-                error = %error,
-                nzb_dir = %nzb_dir.display(),
-                "failed to cleanup orphaned persisted nzbs"
-            );
-        }
-    }
-
     if !initial_history.is_empty() {
         info!(
             count = initial_history.len(),
@@ -390,6 +346,7 @@ mod tests {
             job_id: JobId(id),
             nzb_hash: [0xAA; 32],
             nzb_path,
+            nzb_zstd: sample_nzb_zstd(),
             output_dir,
             created_at: 1_700_000_000 + id,
             category: None,
@@ -408,6 +365,10 @@ mod tests {
           </file>
         </nzb>"#
             .to_vec()
+    }
+
+    fn sample_nzb_zstd() -> Vec<u8> {
+        crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
     }
 
     fn count_rows(db: &Database, table: &str, job_id: u64) -> i64 {

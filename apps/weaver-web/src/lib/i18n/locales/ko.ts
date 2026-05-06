@@ -334,6 +334,7 @@ const ko: LocaleDictionary = {
   "settings.storageAndBehavior": "저장소 및 동작",
   "settings.storageAndBehaviorDesc": "이 값들은 작업 상태가 디스크에 저장되는 위치와 Weaver가 정리 및 재시도를 수행하는 정도를 제어합니다.",
   "settings.save": "저장",
+  "settings.saving": "저장 중…",
   "settings.saved": "저장됨",
   "settings.settingsSaveHint": "저장 시 선택한 속도 제한도 활성 파이프라인에 적용됩니다.",
 

@@ -1,6 +1,18 @@
 use super::*;
 use std::io::Write;
 
+fn sample_nzb_bytes() -> &'static [u8] {
+    br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="sample">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>
+              <segment bytes="10" number="1">abc@test</segment>
+            </segments>
+          </file>
+        </nzb>"#
+}
+
 #[test]
 fn migrate_from_toml_file() {
     let dir = std::env::temp_dir().join(format!(
@@ -99,12 +111,14 @@ fn migrate_journal_to_sqlite() {
 
     // Build a journal with 1 job, 3 segments, 1 completed file.
     let mut data = Vec::new();
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
     write_journal_entry(
         &mut data,
         &JournalEntry::JobCreated {
             job_id: JobId(1),
             nzb_hash: [0xAA; 32],
-            nzb_path: PathBuf::from("/tmp/test.nzb"),
+            nzb_path: nzb_path.clone(),
             output_dir: PathBuf::from("/tmp/output"),
             created_at: 1700000000,
             category: Some("movies".to_string()),
@@ -156,7 +170,7 @@ fn migrate_journal_to_sqlite() {
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
     let job = &jobs[&JobId(1)];
-    assert_eq!(job.nzb_path, PathBuf::from("/tmp/test.nzb"));
+    assert_eq!(job.nzb_path, nzb_path);
     assert_eq!(job.status, "verifying");
     assert_eq!(job.committed_segments.len(), 3);
     assert_eq!(job.complete_files.len(), 1);

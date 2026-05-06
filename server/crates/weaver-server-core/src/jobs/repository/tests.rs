@@ -8,11 +8,27 @@ use crate::{
     HistoryFilter, JobHistoryRow, JobId,
 };
 
+fn sample_nzb_zstd() -> Vec<u8> {
+    crate::ingest::compress_nzb_bytes(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="sample">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>
+              <segment bytes="10" number="1">abc@test</segment>
+            </segments>
+          </file>
+        </nzb>"#,
+    )
+    .unwrap()
+}
+
 fn sample_job(id: u64) -> ActiveJob {
     ActiveJob {
         job_id: JobId(id),
         nzb_hash: [0xAA; 32],
         nzb_path: PathBuf::from(format!("/tmp/test_{id}.nzb")),
+        nzb_zstd: sample_nzb_zstd(),
         output_dir: PathBuf::from(format!("/tmp/output_{id}")),
         created_at: 1700000000 + id,
         category: None,

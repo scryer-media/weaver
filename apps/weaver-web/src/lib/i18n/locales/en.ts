@@ -351,6 +351,7 @@ const en: LocaleDictionary = {
   "settings.storageAndBehavior": "Storage and Behavior",
   "settings.storageAndBehaviorDesc": "These values control where job state lives on disk and how aggressively Weaver cleans up and retries work.",
   "settings.save": "Save",
+  "settings.saving": "Saving…",
   "settings.saved": "Saved",
   "settings.settingsSaveHint": "Saving also applies the selected speed limit to the live pipeline.",
 

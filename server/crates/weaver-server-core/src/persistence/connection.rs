@@ -19,7 +19,7 @@ use crate::operations::metrics_store::METRICS_RETENTION_SECS;
 pub use crate::operations::{MetricsScrapeRow, StableStateExport};
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const LEGACY_SCHEMA_VERSION: i64 = 20;
 const DEFAULT_SQLITE_READ_CONNECTIONS: usize = 4;
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
@@ -201,6 +201,58 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
     Ok(())
 }
 
+fn backfill_persisted_nzb_blobs(conn: &Connection, table: &str) -> Result<(), StateError> {
+    let mut select = conn
+        .prepare(&format!(
+            "SELECT job_id, nzb_path
+             FROM {table}
+             WHERE nzb_zstd IS NULL
+               AND nzb_path IS NOT NULL
+               AND nzb_path != ''"
+        ))
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let rows = select
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let (job_id, path) = row.map_err(|e| StateError::Database(e.to_string()))?;
+        match crate::ingest::load_persisted_nzb_storage_bytes(Path::new(&path)) {
+            Ok(bytes) => updates.push((job_id, bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    table,
+                    job_id,
+                    nzb_path = %path,
+                    error = %error,
+                    "failed to backfill persisted nzb blob from filesystem"
+                );
+            }
+        }
+    }
+
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut update = conn
+        .prepare(&format!(
+            "UPDATE {table}
+             SET nzb_zstd = ?1
+             WHERE job_id = ?2"
+        ))
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    for (job_id, bytes) in updates {
+        update
+            .execute(rusqlite::params![bytes, job_id])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
 /// SQLite-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
@@ -306,6 +358,7 @@ impl Database {
                 category         TEXT,
                 output_dir       TEXT,
                 nzb_path         TEXT,
+                nzb_zstd         BLOB,
                 created_at       INTEGER NOT NULL,
                 completed_at     INTEGER NOT NULL,
                 metadata         TEXT,
@@ -339,6 +392,7 @@ impl Database {
                 job_id       INTEGER PRIMARY KEY NOT NULL,
                 nzb_hash     BLOB NOT NULL,
                 nzb_path     TEXT NOT NULL,
+                nzb_zstd     BLOB,
                 output_dir   TEXT NOT NULL,
                 status       TEXT NOT NULL DEFAULT 'downloading',
                 download_state TEXT,
@@ -792,7 +846,7 @@ impl Database {
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
             }
-            Some(19) | Some(20) | Some(21) => {}
+            Some(19) | Some(20) | Some(21) | Some(22) => {}
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -846,7 +900,12 @@ impl Database {
         ensure_column(&conn, "active_jobs", "run_state", "TEXT")?;
         ensure_column(&conn, "active_jobs", "paused_resume_download_state", "TEXT")?;
         ensure_column(&conn, "active_jobs", "paused_resume_post_state", "TEXT")?;
+        ensure_column(&conn, "active_jobs", "nzb_zstd", "BLOB")?;
+        ensure_column(&conn, "job_history", "nzb_zstd", "BLOB")?;
         ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
+
+        backfill_persisted_nzb_blobs(&conn, "active_jobs")?;
+        backfill_persisted_nzb_blobs(&conn, "job_history")?;
 
         if needs_v20_cleanup {
             cleanup_legacy_queue_event_storage(&conn)?;

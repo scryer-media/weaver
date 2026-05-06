@@ -284,11 +284,20 @@ async fn auth_status_handler_uses_cached_auth_state() {
 async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     let db = Database::open_in_memory().unwrap();
     let handle = test_scheduler_handle();
-    let temp_dir = tempfile::tempdir().unwrap();
-    let nzb_path = temp_dir.path().join("10000.nzb");
     let xml = minimal_nzb("Friends.S05.720p.BluRay.DD5.1.x264-NTb");
-    weaver_server_core::ingest::write_compressed_nzb(&nzb_path, xml.as_bytes()).unwrap();
-    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+    let nzb_zstd = weaver_server_core::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap();
+    db.create_active_job(&weaver_server_core::ActiveJob {
+        job_id: JobId(10_000),
+        nzb_hash: weaver_server_core::ingest::hash_persisted_nzb_bytes(&nzb_zstd),
+        nzb_path: std::path::PathBuf::from("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb"),
+        nzb_zstd,
+        output_dir: std::path::PathBuf::from("/tmp/weaver-http-test"),
+        created_at: 1_700_000_000,
+        category: Some("tv".to_string()),
+        metadata: vec![],
+    })
+    .unwrap();
+    db.archive_job(JobId(10_000), &weaver_server_core::JobHistoryRow {
         job_id: 10_000,
         name: "Friends".to_string(),
         status: "complete".to_string(),
@@ -301,7 +310,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         health: 1000,
         category: Some("tv".to_string()),
         output_dir: None,
-        nzb_path: Some(nzb_path.display().to_string()),
+        nzb_path: Some("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb".to_string()),
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some(
@@ -311,6 +320,8 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
             )])
             .unwrap(),
         ),
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle);
@@ -373,6 +384,8 @@ async fn job_output_file_download_handler_streams_history_file() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle);

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::StateError;
 use crate::history::model::HistoryFilter;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
@@ -187,5 +189,30 @@ impl Database {
             .query_row("SELECT MAX(job_id) FROM job_history", [], |row| row.get(0))
             .map_err(db_err)?;
         Ok(max.unwrap_or(0) as u64)
+    }
+
+    pub fn load_history_job_persisted_nzb(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<(PathBuf, Option<Vec<u8>>)>, StateError> {
+        let conn = self.read_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT nzb_path, nzb_zstd
+                 FROM job_history
+                 WHERE job_id = ?1
+                 LIMIT 1",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt.query([job_id as i64]).map_err(db_err)?;
+        let Some(row) = rows.next().map_err(db_err)? else {
+            return Ok(None);
+        };
+        let path: Option<String> = row.get(0).map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.get(1).map_err(db_err)?;
+        let path = path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("job-{job_id}.nzb")));
+        Ok(Some((path, nzb_zstd)))
     }
 }

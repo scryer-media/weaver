@@ -141,7 +141,7 @@ impl Database {
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT job_id, nzb_path, output_dir, status, download_state, post_state, run_state, error,
+                    "SELECT job_id, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, error,
                             created_at, queued_repair_at_epoch_ms,
                             queued_extract_at_epoch_ms, paused_resume_status,
                             paused_resume_download_state, paused_resume_post_state,
@@ -153,26 +153,28 @@ impl Database {
                 .query_map([], |row| {
                     let job_id = JobId(row.get::<_, i64>(0)? as u64);
                     let nzb_path: String = row.get(1)?;
-                    let output_dir: String = row.get(2)?;
-                    let status: String = row.get(3)?;
-                    let download_state: Option<String> = row.get(4)?;
-                    let post_state: Option<String> = row.get(5)?;
-                    let run_state: Option<String> = row.get(6)?;
-                    let error: Option<String> = row.get(7)?;
-                    let created_at = row.get::<_, i64>(8)? as u64;
-                    let queued_repair_at_epoch_ms: Option<f64> = row.get(9)?;
-                    let queued_extract_at_epoch_ms: Option<f64> = row.get(10)?;
-                    let paused_resume_status: Option<String> = row.get(11)?;
-                    let paused_resume_download_state: Option<String> = row.get(12)?;
-                    let paused_resume_post_state: Option<String> = row.get(13)?;
-                    let category: Option<String> = row.get(14)?;
-                    let metadata_json: Option<String> = row.get(15)?;
+                    let nzb_zstd: Option<Vec<u8>> = row.get(2)?;
+                    let output_dir: String = row.get(3)?;
+                    let status: String = row.get(4)?;
+                    let download_state: Option<String> = row.get(5)?;
+                    let post_state: Option<String> = row.get(6)?;
+                    let run_state: Option<String> = row.get(7)?;
+                    let error: Option<String> = row.get(8)?;
+                    let created_at = row.get::<_, i64>(9)? as u64;
+                    let queued_repair_at_epoch_ms: Option<f64> = row.get(10)?;
+                    let queued_extract_at_epoch_ms: Option<f64> = row.get(11)?;
+                    let paused_resume_status: Option<String> = row.get(12)?;
+                    let paused_resume_download_state: Option<String> = row.get(13)?;
+                    let paused_resume_post_state: Option<String> = row.get(14)?;
+                    let category: Option<String> = row.get(15)?;
+                    let metadata_json: Option<String> = row.get(16)?;
                     let metadata: Vec<(String, String)> = metadata_json
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default();
                     Ok(RecoveredJob {
                         job_id,
                         nzb_path: PathBuf::from(nzb_path),
+                        nzb_zstd,
                         output_dir: PathBuf::from(output_dir),
                         committed_segments: HashSet::new(),
                         file_progress: HashMap::new(),
@@ -376,6 +378,28 @@ impl Database {
         }
 
         Ok(jobs)
+    }
+
+    pub fn load_active_job_persisted_nzb(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<(PathBuf, Option<Vec<u8>>)>, StateError> {
+        let conn = self.read_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT nzb_path, nzb_zstd
+                 FROM active_jobs
+                 WHERE job_id = ?1
+                 LIMIT 1",
+            )
+            .map_err(db_err)?;
+        let mut rows = stmt.query([job_id.0 as i64]).map_err(db_err)?;
+        let Some(row) = rows.next().map_err(db_err)? else {
+            return Ok(None);
+        };
+        let path: String = row.get(0).map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.get(1).map_err(db_err)?;
+        Ok(Some((PathBuf::from(path), nzb_zstd)))
     }
 
     pub fn load_detected_archive_identities(

@@ -334,6 +334,7 @@ const zh: LocaleDictionary = {
   "settings.storageAndBehavior": "存储与行为",
   "settings.storageAndBehaviorDesc": "这些选项控制任务状态在磁盘上的存储位置，以及 Weaver 清理和重试工作的策略。",
   "settings.save": "保存",
+  "settings.saving": "保存中…",
   "settings.saved": "已保存",
   "settings.settingsSaveHint": "保存时也会将所选速度限制应用到正在运行的流水线。",
 

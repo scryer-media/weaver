@@ -120,8 +120,9 @@ pub(crate) async fn run(
     });
 
     // Submit the job via the handle.
+    let nzb_zstd = ingest::compress_nzb_bytes(&nzb_bytes)?;
     handle
-        .add_job(job_id, job_spec, PathBuf::from(nzb_path))
+        .add_job(job_id, job_spec, PathBuf::from(nzb_path), nzb_zstd)
         .await?;
 
     tokio::select! {

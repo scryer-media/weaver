@@ -161,6 +161,7 @@ pub enum SchedulerCommand {
         job_id: JobId,
         spec: JobSpec,
         nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Restore a job from the journal (crash recovery).
@@ -317,6 +318,7 @@ impl SchedulerHandle {
         job_id: JobId,
         spec: JobSpec,
         nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -324,6 +326,7 @@ impl SchedulerHandle {
                 job_id,
                 spec,
                 nzb_path,
+                nzb_zstd,
                 reply: tx,
             })
             .await

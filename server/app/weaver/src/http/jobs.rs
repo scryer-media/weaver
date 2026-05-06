@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::{Path as FsPath, PathBuf};
 
 use axum::Form;
@@ -12,7 +11,7 @@ use tokio_util::io::ReaderStream;
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
-use weaver_server_core::ingest::{open_persisted_nzb_reader, original_release_title};
+use weaver_server_core::ingest::{decode_persisted_nzb_bytes, original_release_title};
 use weaver_server_core::jobs::ids::JobId;
 
 const INTERNAL_OUTPUT_MARKER_NAME: &str = ".weaver-job-dir";
@@ -34,7 +33,7 @@ async fn require_read(
 }
 
 struct JobNzbDownload {
-    path: PathBuf,
+    nzb_zstd: Option<Vec<u8>>,
     title: String,
 }
 
@@ -65,7 +64,7 @@ pub(super) async fn job_nzb_download_handler(
         Err(status) => return status.into_response(),
     };
 
-    match load_uncompressed_nzb_bytes(job.path).await {
+    match load_uncompressed_nzb_bytes(job.nzb_zstd).await {
         Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "application/x-nzb".to_string()),
@@ -153,28 +152,32 @@ async fn load_job_nzb_download(
 ) -> Result<Option<JobNzbDownload>, StatusCode> {
     if let Ok(info) = handle.get_job(JobId(job_id)) {
         let db = db.clone();
-        let recovered = tokio::task::spawn_blocking(move || db.load_active_jobs())
+        let recovered = tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(JobId(job_id)))
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if let Some(active) = recovered.get(&JobId(job_id)) {
+        if let Some((_, nzb_zstd)) = recovered {
             return Ok(Some(JobNzbDownload {
-                path: active.nzb_path.clone(),
-                title: original_release_title(&info.name, &active.metadata),
+                nzb_zstd,
+                title: original_release_title(&info.name, &info.metadata),
             }));
         }
     }
 
     let db = db.clone();
-    let history = tokio::task::spawn_blocking(move || db.get_job_history(job_id))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let history = tokio::task::spawn_blocking(move || {
+        let row = db.get_job_history(job_id)?;
+        let nzb = db.load_history_job_persisted_nzb(job_id)?;
+        Ok::<_, weaver_server_core::StateError>((row, nzb))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let Some(row) = history else {
+    let Some(row) = history.0 else {
         return Ok(None);
     };
-    let Some(path) = row.nzb_path else {
+    let Some((_, nzb_zstd)) = history.1 else {
         return Ok(None);
     };
     let metadata = row
@@ -184,7 +187,7 @@ async fn load_job_nzb_download(
         .unwrap_or_default();
 
     Ok(Some(JobNzbDownload {
-        path: PathBuf::from(path),
+        nzb_zstd,
         title: original_release_title(&row.name, &metadata),
     }))
 }
@@ -279,12 +282,12 @@ async fn stream_output_file(path: PathBuf) -> Result<Response, StatusCode> {
         .into_response())
 }
 
-async fn load_uncompressed_nzb_bytes(path: PathBuf) -> Result<Vec<u8>, StatusCode> {
+async fn load_uncompressed_nzb_bytes(nzb_zstd: Option<Vec<u8>>) -> Result<Vec<u8>, StatusCode> {
     tokio::task::spawn_blocking(move || {
-        let mut reader = open_persisted_nzb_reader(&path).map_err(io_status)?;
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).map_err(io_status)?;
-        Ok::<_, StatusCode>(bytes)
+        let Some(nzb_zstd) = nzb_zstd else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        decode_persisted_nzb_bytes(&nzb_zstd).map_err(io_status)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

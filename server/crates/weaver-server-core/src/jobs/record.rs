@@ -9,6 +9,7 @@ pub struct ActiveJob {
     pub job_id: JobId,
     pub nzb_hash: [u8; 32],
     pub nzb_path: PathBuf,
+    pub nzb_zstd: Vec<u8>,
     pub output_dir: PathBuf,
     pub created_at: u64,
     pub category: Option<String>,
@@ -68,6 +69,7 @@ pub struct ActiveFileIdentity {
 pub struct RecoveredJob {
     pub job_id: JobId,
     pub nzb_path: PathBuf,
+    pub nzb_zstd: Option<Vec<u8>>,
     pub output_dir: PathBuf,
     pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,

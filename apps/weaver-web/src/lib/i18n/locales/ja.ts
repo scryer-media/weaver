@@ -334,6 +334,7 @@ const ja: LocaleDictionary = {
   "settings.storageAndBehavior": "ストレージと動作",
   "settings.storageAndBehaviorDesc": "ジョブ状態のディスク上の保存場所と、Weaver のクリーンアップおよびリトライの積極性を制御します。",
   "settings.save": "保存",
+  "settings.saving": "保存中…",
   "settings.saved": "保存しました",
   "settings.settingsSaveHint": "保存すると、選択した速度制限がライブパイプラインにも適用されます。",
 
