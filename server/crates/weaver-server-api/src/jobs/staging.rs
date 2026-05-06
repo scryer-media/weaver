@@ -310,7 +310,7 @@ mod tests {
             .unwrap();
 
         let (found, missing) =
-            manager.take_for_submit(&owner_b, &[staged.staged_upload_id.clone()]);
+            manager.take_for_submit(&owner_b, std::slice::from_ref(&staged.staged_upload_id));
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
     }
@@ -325,7 +325,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.purge_expired(), 1);
-        let (found, missing) = manager.take_for_submit(&owner, &[staged.staged_upload_id.clone()]);
+        let (found, missing) =
+            manager.take_for_submit(&owner, std::slice::from_ref(&staged.staged_upload_id));
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
     }

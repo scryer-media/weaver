@@ -1854,7 +1854,7 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     ));
 
     assert_eq!(dest, expected_dest);
-    assert!(pipeline.jobs.get(&job_id).is_none());
+    assert!(!pipeline.jobs.contains_key(&job_id));
     assert!(pipeline.finished_jobs.iter().any(|job| job.job_id == job_id
         && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap())));
     assert!(!working_dir.exists());

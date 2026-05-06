@@ -16,7 +16,14 @@ fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) 
         optional_recovery_downloaded_bytes: 0,
         failed_bytes: if status == "failed" { 10 } else { 0 },
         health: if status == "failed" { 640 } else { 1000 },
-        category: Some(if job_id % 2 == 0 { "tv" } else { "movies" }.to_string()),
+        category: Some(
+            if job_id.is_multiple_of(2) {
+                "tv"
+            } else {
+                "movies"
+            }
+            .to_string(),
+        ),
         output_dir: Some(format!("/downloads/{name}")),
         nzb_path: Some(format!("/nzb/{name}.nzb")),
         created_at: completed_at - 60,
