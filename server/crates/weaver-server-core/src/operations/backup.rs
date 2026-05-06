@@ -42,7 +42,7 @@ const STABLE_TABLES: &[&str] = &[
 ];
 
 const RESTORE_PRISTINE_TABLES: &[&str] = &[
-    "metrics_scrapes",
+    "metrics_history_chunks",
     "job_history",
     "job_events",
     "active_jobs",
@@ -63,7 +63,7 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
 ];
 
 const CLEAR_IMPORT_TABLES: &[&str] = &[
-    "metrics_scrapes",
+    "metrics_history_chunks",
     "rss_seen_items",
     "rss_rules",
     "rss_feeds",

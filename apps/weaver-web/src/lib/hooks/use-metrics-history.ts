@@ -4,27 +4,37 @@ import { useClient } from "urql";
 import { METRICS_HISTORY_QUERY } from "@/graphql/queries";
 import type { JobData } from "@/lib/job-types";
 import {
-  HISTORY_METRIC_NAMES,
+  COUNTER_HISTORY_METRIC_NAMES,
+  GAUGE_HISTORY_METRIC_NAMES,
   JOB_STATUS_COLORS,
   JOB_STATUS_HISTORY_METRIC,
   JOB_STATUS_LABEL_ORDER,
   METRIC_CHART_DEFINITIONS,
   PROM_METRIC_TO_SNAPSHOT_FIELD,
-  SNAPSHOT_HISTORY_METRIC_NAMES,
   humanizeJobStatusLabel,
+  isRollupMetricsRange,
   jobStatusMetricLabelFromLiveStatus,
+  metricsRangeWindowMinutes,
+  type ChartColorToken,
+  type ChartDisplayVariant,
   type HistoryMetricName,
   type MetricChartDefinition,
+  type MetricScale,
+  type MetricValueFormat,
+  type MetricsHistoryRange,
+  type MetricsHistorySeriesVariant,
   type MetricsJobStatusRow,
-  type MetricsRangeMinutes,
   type MetricsSnapshot,
+  type SnapshotHistoryMetricName,
 } from "@/lib/metrics";
 
 type MetricsHistoryResponse = {
   metricsHistory: {
     timestamps: number[];
+    resolutionSec: number;
     series: {
       metric: string;
+      variant: MetricsHistorySeriesVariant;
       labels: {
         key: string;
         value: string;
@@ -35,27 +45,42 @@ type MetricsHistoryResponse = {
 };
 
 type MetricsHistoryVariables = {
-  minutes: number;
-  metrics: string[];
+  range: MetricsHistoryRange;
 };
 
 type MetricsHistorySeries = MetricsHistoryResponse["metricsHistory"]["series"][number];
 type MetricsHistoryLabel = MetricsHistorySeries["labels"][number];
 
 type HistoryBuffer = {
+  resolutionSec: number;
   timestampsMs: number[];
   series: MetricsHistorySeries[];
+  persistedPointCount: number;
+};
+
+type LiveSample = {
+  timestampMs: number;
+  metrics: MetricsSnapshot;
 };
 
 const LIVE_SNAPSHOT_INTERVAL_MS = 10_000;
 
+export interface MetricsChartDisplaySeries {
+  labelKey: string;
+  colorToken: ChartColorToken;
+  format: MetricValueFormat;
+  scale?: MetricScale;
+  variant: ChartDisplayVariant;
+}
+
 export interface MetricsChartModel {
   definition: MetricChartDefinition;
   data: uPlot.AlignedData;
+  series: MetricsChartDisplaySeries[];
 }
 
 interface UseMetricsHistoryOptions {
-  minutes: MetricsRangeMinutes;
+  range: MetricsHistoryRange;
   liveMetrics?: MetricsSnapshot;
   liveJobs?: JobData[];
 }
@@ -69,8 +94,10 @@ interface UseMetricsHistoryResult {
 
 function createEmptyBuffer(): HistoryBuffer {
   return {
+    resolutionSec: 10,
     timestampsMs: [],
     series: [],
+    persistedPointCount: 0,
   };
 }
 
@@ -80,39 +107,37 @@ function bufferFromResponse(data?: MetricsHistoryResponse["metricsHistory"]): Hi
   }
 
   return {
+    resolutionSec: data.resolutionSec ?? 10,
     timestampsMs: [...(data.timestamps ?? [])],
     series: (data.series ?? []).map((series) => ({
       metric: series.metric,
+      variant: series.variant,
       labels: (series.labels ?? []).map((label) => ({ ...label })),
       values: [...(series.values ?? [])],
     })),
+    persistedPointCount: data.timestamps?.length ?? 0,
   };
 }
 
-function trimBufferToRange(buffer: HistoryBuffer, cutoffMs: number): boolean {
-  if (buffer.timestampsMs.length === 0) {
-    return false;
-  }
-
+function trimBufferToRange(buffer: HistoryBuffer, cutoffMs: number) {
   const startIndex = buffer.timestampsMs.findIndex((timestamp) => timestamp >= cutoffMs);
   if (startIndex === -1) {
-    const changed = buffer.timestampsMs.length > 0 || buffer.series.some((series) => series.values.length > 0);
     buffer.timestampsMs = [];
-    for (const series of buffer.series) {
-      series.values = [];
-    }
-    return changed;
+    buffer.series = buffer.series.map((series) => ({ ...series, values: [] }));
+    buffer.persistedPointCount = 0;
+    return;
   }
 
   if (startIndex === 0) {
-    return false;
+    return;
   }
 
   buffer.timestampsMs = buffer.timestampsMs.slice(startIndex);
-  for (const series of buffer.series) {
-    series.values = series.values.slice(startIndex);
-  }
-  return true;
+  buffer.series = buffer.series.map((series) => ({
+    ...series,
+    values: series.values.slice(startIndex),
+  }));
+  buffer.persistedPointCount = Math.max(0, buffer.persistedPointCount - startIndex);
 }
 
 function sortLabels(labels: MetricsHistoryLabel[]): MetricsHistoryLabel[] {
@@ -134,44 +159,74 @@ function labelsEqual(left: MetricsHistoryLabel[], right: MetricsHistoryLabel[]):
 function ensureSeries(
   buffer: HistoryBuffer,
   metric: string,
+  variant: MetricsHistorySeriesVariant,
   labels: MetricsHistoryLabel[] = [],
-): { series: MetricsHistorySeries; created: boolean } {
+): MetricsHistorySeries {
   const normalizedLabels = sortLabels(labels);
   const existing = buffer.series.find(
-    (series) => series.metric === metric && labelsEqual(series.labels, normalizedLabels),
+    (series) =>
+      series.metric === metric
+      && series.variant === variant
+      && labelsEqual(series.labels, normalizedLabels),
   );
   if (existing) {
-    return { series: existing, created: false };
+    return existing;
   }
 
   const nextSeries: MetricsHistorySeries = {
     metric,
+    variant,
     labels: normalizedLabels,
     values: new Array(buffer.timestampsMs.length).fill(0),
   };
   buffer.series.push(nextSeries);
-  return { series: nextSeries, created: true };
+  return nextSeries;
 }
 
-function setSeriesValue(series: MetricsHistorySeries, index: number, value: number): boolean {
-  const normalizedValue = Number.isFinite(value) ? value : 0;
-  if (series.values[index] === normalizedValue) {
-    return false;
+function appendTimestamp(buffer: HistoryBuffer, timestampMs: number): number {
+  const lastTimestampMs = buffer.timestampsMs[buffer.timestampsMs.length - 1];
+  const replaceLastPoint =
+    typeof lastTimestampMs === "number"
+    && Math.floor(lastTimestampMs / LIVE_SNAPSHOT_INTERVAL_MS)
+      === Math.floor(timestampMs / LIVE_SNAPSHOT_INTERVAL_MS);
+
+  if (!replaceLastPoint) {
+    buffer.timestampsMs.push(timestampMs);
+    for (const series of buffer.series) {
+      series.values.push(0);
+    }
+    return buffer.timestampsMs.length - 1;
   }
 
-  series.values[index] = normalizedValue;
-  return true;
+  return buffer.timestampsMs.length - 1;
+}
+
+function appendRollupOverlayTimestamp(buffer: HistoryBuffer, timestampMs: number): number {
+  if (buffer.timestampsMs.length > buffer.persistedPointCount) {
+    const overlayIndex = buffer.timestampsMs.length - 1;
+    buffer.timestampsMs[overlayIndex] = timestampMs;
+    return overlayIndex;
+  }
+
+  buffer.timestampsMs.push(timestampMs);
+  for (const series of buffer.series) {
+    series.values.push(0);
+  }
+  return buffer.timestampsMs.length - 1;
 }
 
 function applyLiveJobStatuses(
   buffer: HistoryBuffer,
+  variants: readonly MetricsHistorySeriesVariant[],
   liveJobs: JobData[],
   targetIndex: number,
-): boolean {
-  let changed = false;
-  for (const series of buffer.series) {
-    if (series.metric === JOB_STATUS_HISTORY_METRIC) {
-      changed = setSeriesValue(series, targetIndex, 0) || changed;
+) {
+  for (const status of JOB_STATUS_LABEL_ORDER) {
+    for (const variant of variants) {
+      const series = ensureSeries(buffer, JOB_STATUS_HISTORY_METRIC, variant, [
+        { key: "status", value: status },
+      ]);
+      series.values[targetIndex] = 0;
     }
   }
 
@@ -181,74 +236,122 @@ function applyLiveJobStatuses(
     if (!status) {
       continue;
     }
-
     countsByStatus.set(status, (countsByStatus.get(status) ?? 0) + 1);
   }
 
   for (const status of JOB_STATUS_LABEL_ORDER) {
-    const { series, created } = ensureSeries(buffer, JOB_STATUS_HISTORY_METRIC, [
-      { key: "status", value: status },
-    ]);
-    changed = created || changed;
-    changed = setSeriesValue(series, targetIndex, countsByStatus.get(status) ?? 0) || changed;
+    const count = countsByStatus.get(status) ?? 0;
+    for (const variant of variants) {
+      const series = ensureSeries(buffer, JOB_STATUS_HISTORY_METRIC, variant, [
+        { key: "status", value: status },
+      ]);
+      series.values[targetIndex] = count;
+    }
   }
-
-  return changed;
 }
 
-function applyLiveSnapshot(
+function applyLiveRawSnapshot(
   buffer: HistoryBuffer,
   liveMetrics: MetricsSnapshot,
   liveJobs: JobData[] | undefined,
   timestampMs: number,
-  minutes: MetricsRangeMinutes,
+  range: MetricsHistoryRange,
 ): boolean {
   const roundedTimestampMs =
     Math.floor(timestampMs / LIVE_SNAPSHOT_INTERVAL_MS) * LIVE_SNAPSHOT_INTERVAL_MS;
-  const lastTimestampMs = buffer.timestampsMs[buffer.timestampsMs.length - 1];
-  const replaceLastPoint =
-    typeof lastTimestampMs === "number"
-    && Math.floor(lastTimestampMs / LIVE_SNAPSHOT_INTERVAL_MS)
-      === Math.floor(roundedTimestampMs / LIVE_SNAPSHOT_INTERVAL_MS);
+  const targetIndex = appendTimestamp(buffer, roundedTimestampMs);
 
-  let targetIndex = buffer.timestampsMs.length - 1;
-  let changed = false;
-  if (!replaceLastPoint) {
-    buffer.timestampsMs.push(roundedTimestampMs);
-    for (const series of buffer.series) {
-      series.values.push(0);
-    }
-    targetIndex = buffer.timestampsMs.length - 1;
-    changed = true;
-  }
-
-  for (const metric of SNAPSHOT_HISTORY_METRIC_NAMES) {
+  for (const metric of [...COUNTER_HISTORY_METRIC_NAMES, ...GAUGE_HISTORY_METRIC_NAMES]) {
     const snapshotKey = PROM_METRIC_TO_SNAPSHOT_FIELD[metric];
-    const { series, created } = ensureSeries(buffer, metric);
-    changed = created || changed;
-    changed = setSeriesValue(series, targetIndex, liveMetrics[snapshotKey]) || changed;
+    const series = ensureSeries(buffer, metric, "ACTUAL");
+    series.values[targetIndex] = liveMetrics[snapshotKey];
   }
 
   if (liveJobs) {
-    changed = applyLiveJobStatuses(buffer, liveJobs, targetIndex) || changed;
+    applyLiveJobStatuses(buffer, ["ACTUAL"], liveJobs, targetIndex);
   }
 
-  changed = trimBufferToRange(buffer, roundedTimestampMs - minutes * 60 * 1000) || changed;
-  return changed;
+  trimBufferToRange(buffer, roundedTimestampMs - metricsRangeWindowMinutes(range) * 60 * 1000);
+  return true;
 }
 
-function lookupSeriesValues(buffer: HistoryBuffer, metric: HistoryMetricName): number[] {
+function computeCounterLiveRate(
+  metric: SnapshotHistoryMetricName,
+  previous: LiveSample | null,
+  current: LiveSample,
+): number {
+  if (!previous) {
+    return 0;
+  }
+
+  const elapsedSec = (current.timestampMs - previous.timestampMs) / 1000;
+  if (elapsedSec <= 0) {
+    return 0;
+  }
+
+  const snapshotKey = PROM_METRIC_TO_SNAPSHOT_FIELD[metric];
+  const delta = current.metrics[snapshotKey] - previous.metrics[snapshotKey];
+  return delta < 0 ? 0 : delta / elapsedSec;
+}
+
+function applyLiveRollupSnapshot(
+  buffer: HistoryBuffer,
+  liveMetrics: MetricsSnapshot,
+  liveJobs: JobData[] | undefined,
+  currentSample: LiveSample,
+  previousSample: LiveSample | null,
+  range: MetricsHistoryRange,
+): boolean {
+  const roundedTimestampMs =
+    Math.floor(currentSample.timestampMs / LIVE_SNAPSHOT_INTERVAL_MS) * LIVE_SNAPSHOT_INTERVAL_MS;
+  const targetIndex = appendRollupOverlayTimestamp(buffer, roundedTimestampMs);
+
+  for (const metric of COUNTER_HISTORY_METRIC_NAMES) {
+    const liveRate = computeCounterLiveRate(metric, previousSample, currentSample);
+    const avgSeries = ensureSeries(buffer, metric, "AVG");
+    const peakSeries = ensureSeries(buffer, metric, "PEAK");
+    avgSeries.values[targetIndex] = liveRate;
+    peakSeries.values[targetIndex] = liveRate;
+  }
+
+  for (const metric of GAUGE_HISTORY_METRIC_NAMES) {
+    const snapshotKey = PROM_METRIC_TO_SNAPSHOT_FIELD[metric];
+    const nextValue = liveMetrics[snapshotKey];
+    const avgSeries = ensureSeries(buffer, metric, "AVG");
+    const peakSeries = ensureSeries(buffer, metric, "PEAK");
+    avgSeries.values[targetIndex] = nextValue;
+    peakSeries.values[targetIndex] = nextValue;
+  }
+
+  if (liveJobs) {
+    applyLiveJobStatuses(buffer, ["AVG", "PEAK"], liveJobs, targetIndex);
+  }
+
+  trimBufferToRange(buffer, roundedTimestampMs - metricsRangeWindowMinutes(range) * 60 * 1000);
+  return true;
+}
+
+function lookupSeriesValues(
+  buffer: HistoryBuffer,
+  metric: HistoryMetricName,
+  variant: MetricsHistorySeriesVariant,
+  labels: MetricsHistoryLabel[] = [],
+): number[] {
+  const normalizedLabels = sortLabels(labels);
   const values = buffer.series.find(
-    (series) => series.metric === metric && series.labels.length === 0,
+    (series) =>
+      series.metric === metric
+      && series.variant === variant
+      && labelsEqual(series.labels, normalizedLabels),
   )?.values;
 
   if (!values) {
     return new Array(buffer.timestampsMs.length).fill(0);
   }
 
-    if (values.length < buffer.timestampsMs.length) {
-      return [...values, ...new Array(buffer.timestampsMs.length - values.length).fill(0)];
-    }
+  if (values.length < buffer.timestampsMs.length) {
+    return [...values, ...new Array(buffer.timestampsMs.length - values.length).fill(0)];
+  }
 
   return values.slice(0, buffer.timestampsMs.length);
 }
@@ -273,21 +376,60 @@ function buildRateSeries(timestampsMs: number[], values: number[]): number[] {
   return rates;
 }
 
-function buildChartModel(buffer: HistoryBuffer, definition: MetricChartDefinition): MetricsChartModel {
+function buildChartModel(
+  buffer: HistoryBuffer,
+  definition: MetricChartDefinition,
+  range: MetricsHistoryRange,
+): MetricsChartModel {
   const timestampsSec = buffer.timestampsMs.map((timestamp) => timestamp / 1000);
-  const lineValues = definition.lines.map((line) => {
-    const values = lookupSeriesValues(buffer, line.metric);
-    return line.mode === "rate" ? buildRateSeries(buffer.timestampsMs, values) : values;
-  });
+  const rollupRange = isRollupMetricsRange(range);
+  const displaySeries: MetricsChartDisplaySeries[] = [];
+  const lineValues: number[][] = [];
+
+  for (const line of definition.lines) {
+    if (!rollupRange) {
+      const actualValues = lookupSeriesValues(buffer, line.metric, "ACTUAL");
+      lineValues.push(
+        line.kind === "counter" ? buildRateSeries(buffer.timestampsMs, actualValues) : actualValues,
+      );
+      displaySeries.push({
+        labelKey: line.labelKey,
+        colorToken: line.colorToken,
+        format: line.format,
+        scale: line.scale,
+        variant: "actual",
+      });
+      continue;
+    }
+
+    lineValues.push(lookupSeriesValues(buffer, line.metric, "AVG"));
+    displaySeries.push({
+      labelKey: line.labelKey,
+      colorToken: line.colorToken,
+      format: line.format,
+      scale: line.scale,
+      variant: "avg",
+    });
+
+    lineValues.push(lookupSeriesValues(buffer, line.metric, "PEAK"));
+    displaySeries.push({
+      labelKey: line.labelKey,
+      colorToken: line.colorToken,
+      format: line.format,
+      scale: line.scale,
+      variant: "peak",
+    });
+  }
 
   return {
     definition,
+    series: displaySeries,
     data: [timestampsSec, ...lineValues],
   };
 }
 
-function buildChartModels(buffer: HistoryBuffer): MetricsChartModel[] {
-  return METRIC_CHART_DEFINITIONS.map((definition) => buildChartModel(buffer, definition));
+function buildChartModels(buffer: HistoryBuffer, range: MetricsHistoryRange): MetricsChartModel[] {
+  return METRIC_CHART_DEFINITIONS.map((definition) => buildChartModel(buffer, definition, range));
 }
 
 function readLatestSeriesValue(series: MetricsHistorySeries, index: number): number {
@@ -298,16 +440,20 @@ function readLatestSeriesValue(series: MetricsHistorySeries, index: number): num
   return value;
 }
 
-function buildJobStatusRows(buffer: HistoryBuffer): MetricsJobStatusRow[] {
+function buildJobStatusRows(
+  buffer: HistoryBuffer,
+  range: MetricsHistoryRange,
+): MetricsJobStatusRow[] {
   if (buffer.timestampsMs.length === 0) {
     return [];
   }
 
   const latestIndex = buffer.timestampsMs.length - 1;
+  const expectedVariant: MetricsHistorySeriesVariant = isRollupMetricsRange(range) ? "AVG" : "ACTUAL";
   const countsByStatus = new Map<string, number>();
 
   for (const series of buffer.series) {
-    if (series.metric !== JOB_STATUS_HISTORY_METRIC) {
+    if (series.metric !== JOB_STATUS_HISTORY_METRIC || series.variant !== expectedVariant) {
       continue;
     }
 
@@ -319,38 +465,32 @@ function buildJobStatusRows(buffer: HistoryBuffer): MetricsJobStatusRow[] {
     countsByStatus.set(status, Math.max(0, Math.round(readLatestSeriesValue(series, latestIndex))));
   }
 
-  const orderedStatuses = Array.from(countsByStatus.keys()).sort((left, right) => {
-    const leftRank = JOB_STATUS_LABEL_ORDER.indexOf(left as (typeof JOB_STATUS_LABEL_ORDER)[number]);
-    const rightRank = JOB_STATUS_LABEL_ORDER.indexOf(right as (typeof JOB_STATUS_LABEL_ORDER)[number]);
-    const normalizedLeftRank = leftRank === -1 ? Number.MAX_SAFE_INTEGER : leftRank;
-    const normalizedRightRank = rightRank === -1 ? Number.MAX_SAFE_INTEGER : rightRank;
-
-    return normalizedLeftRank - normalizedRightRank || left.localeCompare(right);
-  });
-
-  return orderedStatuses
+  return JOB_STATUS_LABEL_ORDER
+    .filter((status) => (countsByStatus.get(status) ?? 0) > 0)
     .map((status) => ({
       status,
       label: humanizeJobStatusLabel(status),
       count: countsByStatus.get(status) ?? 0,
-      color: JOB_STATUS_COLORS[status as keyof typeof JOB_STATUS_COLORS] ?? "#64748b",
-    }))
-    .filter((row) => row.count > 0);
+      color: JOB_STATUS_COLORS[status] ?? "#64748b",
+    }));
 }
 
 export function useMetricsHistory({
-  minutes,
+  range,
   liveMetrics,
   liveJobs,
 }: UseMetricsHistoryOptions): UseMetricsHistoryResult {
   const client = useClient();
-  const [charts, setCharts] = useState<MetricsChartModel[]>(() => buildChartModels(createEmptyBuffer()));
+  const [charts, setCharts] = useState<MetricsChartModel[]>(() =>
+    buildChartModels(createEmptyBuffer(), range)
+  );
   const [jobStatusRows, setJobStatusRows] = useState<MetricsJobStatusRow[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const historyRef = useRef<HistoryBuffer>(createEmptyBuffer());
   const latestLiveMetricsRef = useRef<MetricsSnapshot | undefined>(liveMetrics);
   const latestLiveJobsRef = useRef<JobData[] | undefined>(liveJobs);
+  const previousLiveSampleRef = useRef<LiveSample | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -362,10 +502,7 @@ export function useMetricsHistory({
       const result = await client
         .query<MetricsHistoryResponse, MetricsHistoryVariables>(
           METRICS_HISTORY_QUERY,
-          {
-            minutes,
-            metrics: [...HISTORY_METRIC_NAMES],
-          },
+          { range },
           { requestPolicy: "network-only" },
         )
         .toPromise();
@@ -377,27 +514,18 @@ export function useMetricsHistory({
       if (result.error) {
         const emptyBuffer = createEmptyBuffer();
         historyRef.current = emptyBuffer;
-        setCharts(buildChartModels(emptyBuffer));
-        setJobStatusRows(buildJobStatusRows(emptyBuffer));
+        setCharts(buildChartModels(emptyBuffer, range));
+        setJobStatusRows(buildJobStatusRows(emptyBuffer, range));
         setError(result.error.message);
         setIsLoading(false);
         return;
       }
 
       const nextBuffer = bufferFromResponse(result.data?.metricsHistory);
-      if (latestLiveMetricsRef.current) {
-        applyLiveSnapshot(
-          nextBuffer,
-          latestLiveMetricsRef.current,
-          latestLiveJobsRef.current,
-          Date.now(),
-          minutes,
-        );
-      }
-
       historyRef.current = nextBuffer;
-      setCharts(buildChartModels(nextBuffer));
-      setJobStatusRows(buildJobStatusRows(nextBuffer));
+      setCharts(buildChartModels(nextBuffer, range));
+      setJobStatusRows(buildJobStatusRows(nextBuffer, range));
+      previousLiveSampleRef.current = null;
       setIsLoading(false);
     };
 
@@ -406,7 +534,7 @@ export function useMetricsHistory({
     return () => {
       cancelled = true;
     };
-  }, [client, minutes]);
+  }, [client, range]);
 
   useEffect(() => {
     latestLiveMetricsRef.current = liveMetrics;
@@ -423,19 +551,33 @@ export function useMetricsHistory({
       }
 
       const nextBuffer = historyRef.current;
-      const changed = applyLiveSnapshot(
-        nextBuffer,
-        latestLiveMetricsRef.current,
-        latestLiveJobsRef.current,
-        Date.now(),
-        minutes,
-      );
+      const currentSample: LiveSample = {
+        metrics: latestLiveMetricsRef.current,
+        timestampMs: Date.now(),
+      };
+      const changed = isRollupMetricsRange(range)
+        ? applyLiveRollupSnapshot(
+            nextBuffer,
+            latestLiveMetricsRef.current,
+            latestLiveJobsRef.current,
+            currentSample,
+            previousLiveSampleRef.current,
+            range,
+          )
+        : applyLiveRawSnapshot(
+            nextBuffer,
+            latestLiveMetricsRef.current,
+            latestLiveJobsRef.current,
+            currentSample.timestampMs,
+            range,
+          );
+      previousLiveSampleRef.current = currentSample;
       if (!changed) {
         return;
       }
 
-      setCharts(buildChartModels(nextBuffer));
-      setJobStatusRows(buildJobStatusRows(nextBuffer));
+      setCharts(buildChartModels(nextBuffer, range));
+      setJobStatusRows(buildJobStatusRows(nextBuffer, range));
     };
 
     const scheduleNextTick = () => {
@@ -455,11 +597,12 @@ export function useMetricsHistory({
 
     return () => {
       cancelled = true;
+      previousLiveSampleRef.current = null;
       if (timeoutId != null) {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [minutes]);
+  }, [range]);
 
   return {
     charts,

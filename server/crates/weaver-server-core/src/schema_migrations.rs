@@ -325,6 +325,12 @@ fn validate_known_migrations(
     catalog: &CompiledMigrationCatalog,
 ) -> Result<(), StateError> {
     for row in applied {
+        if !row.success {
+            return Err(StateError::Database(format!(
+                "database has failed migration version {} recorded in _sqlx_migrations; manual recovery required before startup can continue",
+                row.version
+            )));
+        }
         let Some(migration) = catalog.find_migration(row.version) else {
             return Err(StateError::Database(format!(
                 "database has unknown migration version {}",
@@ -509,11 +515,6 @@ async fn mirror_schema_version(
 async fn cleanup_legacy_queue_event_storage(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StateError> {
-    let metrics_cutoff_epoch_sec = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-        - crate::operations::metrics_store::METRICS_RETENTION_SECS;
     sqlx::query("DELETE FROM integration_events")
         .execute(&mut **tx)
         .await
@@ -522,8 +523,7 @@ async fn cleanup_legacy_queue_event_storage(
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
-    sqlx::query("DELETE FROM metrics_scrapes WHERE scraped_at_epoch_sec < ?1")
-        .bind(metrics_cutoff_epoch_sec)
+    sqlx::query("DROP TABLE IF EXISTS metrics_scrapes")
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
@@ -626,7 +626,7 @@ async fn adopt_legacy_schema_to_21(
             // maintenance handle compaction separately.
             mirror_schema_version(tx, LEGACY_SCHEMA_VERSION).await?;
         }
-        2 | 3 | 4 => {
+        2..=4 => {
             ensure_column(
                 tx,
                 "active_extraction_chunks",
@@ -770,6 +770,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        let expected_migrations = embedded_catalog().unwrap().migrations.len() as i64;
 
         run_embedded_migrations(&pool, MigrationMode::Apply)
             .await
@@ -785,7 +786,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(stamped, 3);
+        assert_eq!(stamped, expected_migrations);
 
         let tls_ca_cert_cols: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('servers') WHERE name = 'tls_ca_cert'",
@@ -880,7 +881,7 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
         let metrics_cutoff_epoch_sec =
-            now - crate::operations::metrics_store::METRICS_RETENTION_SECS;
+            now - crate::operations::metrics_store::RAW_METRICS_RETENTION_SECS;
 
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
@@ -1017,7 +1018,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(stamped, 3);
+        assert_eq!(stamped, embedded_catalog().unwrap().migrations.len() as i64);
 
         let integration_events: i64 = conn
             .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
@@ -1026,14 +1027,21 @@ mod tests {
             .unwrap();
         assert_eq!(integration_events, 0);
 
-        let retained_metrics: i64 = conn
+        let legacy_metrics_tables: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM metrics_scrapes WHERE scraped_at_epoch_sec >= ?1",
-                [metrics_cutoff_epoch_sec],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_scrapes'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retained_metrics, 1);
+        assert_eq!(legacy_metrics_tables, 0);
+
+        let retained_metrics_history_chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metrics_history_chunks", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(retained_metrics_history_chunks, 0);
 
         assert_eq!(
             pragma_column_count(
@@ -1093,6 +1101,38 @@ mod tests {
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
         validate_payload_checksum(&catalog, &payload).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_failed_migration_rows_before_replay() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        ensure_migration_ledger_shape(&pool).await.unwrap();
+        let migration = catalog.find_migration(21).unwrap();
+
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                (version, description, success, checksum, execution_time, checksum_algo)
+             VALUES (?1, ?2, 0, ?3, 0, ?4)",
+        )
+        .bind(migration.version)
+        .bind(&migration.description)
+        .bind(&migration.checksum)
+        .bind(migration.checksum_algo.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("failed migration version 21"));
+        assert!(message.contains("_sqlx_migrations"));
     }
 
     #[test]

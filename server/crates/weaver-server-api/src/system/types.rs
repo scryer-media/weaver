@@ -169,6 +169,36 @@ pub struct SystemMetricsSnapshot {
     pub global_state: GlobalQueueState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum MetricsHistoryRangeGql {
+    TenMinutes,
+    OneHour,
+    SixHours,
+    TwentyFourHours,
+    SevenDays,
+    ThirtyDays,
+}
+
+impl MetricsHistoryRangeGql {
+    pub fn window_sec(self) -> i64 {
+        match self {
+            Self::TenMinutes => 10 * 60,
+            Self::OneHour => 60 * 60,
+            Self::SixHours => 6 * 60 * 60,
+            Self::TwentyFourHours => 24 * 60 * 60,
+            Self::SevenDays => 7 * 24 * 60 * 60,
+            Self::ThirtyDays => 30 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum MetricSeriesVariant {
+    Actual,
+    Avg,
+    Peak,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct MetricLabel {
     pub key: String,
@@ -179,12 +209,14 @@ pub struct MetricLabel {
 pub struct MetricSeries {
     pub metric: String,
     pub labels: Vec<MetricLabel>,
+    pub variant: MetricSeriesVariant,
     pub values: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct MetricsHistoryResult {
     pub timestamps: Vec<f64>,
+    pub resolution_sec: i32,
     pub series: Vec<MetricSeries>,
 }
 

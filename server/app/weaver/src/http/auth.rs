@@ -121,7 +121,7 @@ pub(super) async fn resolve_caller(
     api_key_cache: &ApiKeyCache,
     session_token: &str,
     headers: &HeaderMap,
-) -> Result<CallerScope, StatusCode> {
+) -> Result<ResolvedCaller, StatusCode> {
     let api_key_header = headers.get("x-api-key");
     let bearer_token = extract_bearer_token(headers);
     let presented_token = bearer_token
@@ -174,9 +174,11 @@ pub(super) async fn resolve_scope(
     session_token: &str,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
-    Ok(resolve_caller(db, auth_cache, api_key_cache, session_token, headers)
-        .await?
-        .scope)
+    Ok(
+        resolve_caller(db, auth_cache, api_key_cache, session_token, headers)
+            .await?
+            .scope,
+    )
 }
 
 #[derive(Deserialize)]

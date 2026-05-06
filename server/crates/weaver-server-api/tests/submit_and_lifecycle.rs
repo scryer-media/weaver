@@ -228,7 +228,9 @@ async fn stage_upload_and_submit_staged_nzb() {
     let staged_data = response_data(&staged_resp);
     assert!(staged_data["stageNzbUpload"]["accepted"].as_bool().unwrap());
     assert_eq!(
-        staged_data["stageNzbUpload"]["displayName"].as_str().unwrap(),
+        staged_data["stageNzbUpload"]["displayName"]
+            .as_str()
+            .unwrap(),
         "staged-upload-test"
     );
     let staged_upload_id = staged_data["stageNzbUpload"]["stagedUploadId"]
@@ -282,15 +284,19 @@ async fn discard_staged_uploads_is_idempotent() {
 
     let discard_once = discard_staged(&h, identity.clone(), vec![staged_upload_id.clone()]).await;
     assert_no_errors(&discard_once);
-    assert!(response_data(&discard_once)["discardStagedNzbs"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        response_data(&discard_once)["discardStagedNzbs"]
+            .as_bool()
+            .unwrap()
+    );
 
     let discard_twice = discard_staged(&h, identity.clone(), vec![staged_upload_id.clone()]).await;
     assert_no_errors(&discard_twice);
-    assert!(response_data(&discard_twice)["discardStagedNzbs"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        response_data(&discard_twice)["discardStagedNzbs"]
+            .as_bool()
+            .unwrap()
+    );
 
     let submit_resp = submit_staged(&h, identity, vec![staged_upload_id]).await;
     assert_no_errors(&submit_resp);
@@ -326,10 +332,7 @@ async fn staged_uploads_are_scoped_to_caller_identity() {
     let result = &data["submitStagedNzbs"]["results"][0];
     assert!(!result["accepted"].as_bool().unwrap());
     assert!(!result["retained"].as_bool().unwrap());
-    assert!(result["error"]
-        .as_str()
-        .unwrap()
-        .contains("expired"));
+    assert!(result["error"].as_str().unwrap().contains("expired"));
 }
 
 #[tokio::test]

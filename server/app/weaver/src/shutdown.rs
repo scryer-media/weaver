@@ -1,6 +1,5 @@
 use tracing::error;
 
-use crate::http;
 use weaver_server_core::{Database, SchedulerHandle};
 
 pub(crate) async fn wait_for_shutdown() {

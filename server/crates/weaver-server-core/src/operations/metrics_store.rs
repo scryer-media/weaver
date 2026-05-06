@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::io::Cursor;
 
+use rusqlite::OptionalExtension;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ use crate::persistence::Database;
 use crate::{JobInfo, JobStatus, MetricsSnapshot, StateError};
 
 const METRICS_HISTORY_COMPRESSION_LEVEL: i32 = 3;
+#[cfg(test)]
 pub(crate) const LEGACY_METRICS_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub const RAW_METRICS_RESOLUTION_SECS: i64 = 10;
 pub const ROLLUP_5M_RESOLUTION_SECS: i64 = 5 * 60;
@@ -97,17 +99,6 @@ impl MetricsHistoryTier {
             Self::Rollup5m | Self::Rollup1h => ROLLUP_CHUNK_SPAN_SECS,
         }
     }
-
-    fn from_resolution_sec(resolution_sec: i64) -> Result<Self, StateError> {
-        match resolution_sec {
-            RAW_METRICS_RESOLUTION_SECS => Ok(Self::Raw10s),
-            ROLLUP_5M_RESOLUTION_SECS => Ok(Self::Rollup5m),
-            ROLLUP_1H_RESOLUTION_SECS => Ok(Self::Rollup1h),
-            other => Err(StateError::Database(format!(
-                "unsupported metrics history resolution {other}"
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -115,12 +106,16 @@ pub struct CounterRollupValue {
     pub end: f64,
     pub avg_rate: f64,
     pub peak_rate: f64,
+    #[serde(default)]
+    pub avg_rate_weight_sec: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct GaugeRollupValue {
     pub avg: f64,
     pub peak: f64,
+    #[serde(default)]
+    pub sample_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,7 +216,8 @@ impl Database {
         jobs: &[JobInfo],
     ) -> Result<(), StateError> {
         let recorded_at_epoch_sec = quantize_raw_timestamp(recorded_at_epoch_sec);
-        let raw_point = RawMetricsHistoryPoint::from_snapshot(recorded_at_epoch_sec, snapshot, jobs);
+        let raw_point =
+            RawMetricsHistoryPoint::from_snapshot(recorded_at_epoch_sec, snapshot, jobs);
 
         let conn = self.conn();
         let tx = conn.unchecked_transaction().map_err(db_err)?;
@@ -243,20 +239,26 @@ impl Database {
         since_epoch_sec: i64,
         until_epoch_sec: i64,
     ) -> Result<MetricsHistoryQueryResult, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         match tier {
             MetricsHistoryTier::Raw10s => Ok(MetricsHistoryQueryResult {
                 resolution_sec: tier.resolution_sec(),
-                data: MetricsHistoryQueryData::Raw(
-                    load_raw_points_between(&conn, tier, since_epoch_sec, until_epoch_sec)?,
-                ),
+                data: MetricsHistoryQueryData::Raw(load_raw_points_between(
+                    &conn,
+                    tier,
+                    since_epoch_sec,
+                    until_epoch_sec,
+                )?),
             }),
             MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
                 Ok(MetricsHistoryQueryResult {
                     resolution_sec: tier.resolution_sec(),
-                    data: MetricsHistoryQueryData::Rollup(
-                        load_rollup_points_between(&conn, tier, since_epoch_sec, until_epoch_sec)?,
-                    ),
+                    data: MetricsHistoryQueryData::Rollup(load_rollup_points_between(
+                        &conn,
+                        tier,
+                        since_epoch_sec,
+                        until_epoch_sec,
+                    )?),
                 })
             }
         }
@@ -266,7 +268,7 @@ impl Database {
         &self,
         tier: MetricsHistoryTier,
     ) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
@@ -477,16 +479,12 @@ fn upsert_rollup_point(
     store_chunk(conn, tier, chunk_start_epoch_sec, &chunk)
 }
 
-fn upsert_sorted_point<T, F, R>(
-    points: &mut Vec<T>,
-    point: T,
-    timestamp: F,
-    replace: R,
-) where
+fn upsert_sorted_point<T, F, R>(points: &mut Vec<T>, point: T, timestamp: F, replace: R)
+where
     F: Fn(&T) -> i64,
     R: Fn(&mut T, T),
 {
-    match points.binary_search_by_key(&timestamp(&point), |entry| timestamp(entry)) {
+    match points.binary_search_by_key(&timestamp(&point), timestamp) {
         Ok(index) => replace(&mut points[index], point),
         Err(index) => points.insert(index, point),
     }
@@ -569,7 +567,8 @@ fn prune_metrics_history(
     match tier {
         MetricsHistoryTier::Raw10s => {
             let mut chunk = load_raw_chunk(conn, tier, boundary_chunk_start)?;
-            chunk.points
+            chunk
+                .points
                 .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
             if chunk.points.is_empty() {
                 delete_chunk(conn, tier, boundary_chunk_start)?;
@@ -579,7 +578,8 @@ fn prune_metrics_history(
         }
         MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
             let mut chunk = load_rollup_chunk(conn, tier, boundary_chunk_start)?;
-            chunk.points
+            chunk
+                .points
                 .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
             if chunk.points.is_empty() {
                 delete_chunk(conn, tier, boundary_chunk_start)?;
@@ -602,15 +602,10 @@ fn load_raw_points_between(
     let mut points = Vec::new();
     for row in rows {
         let chunk: RawMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
-        points.extend(
-            chunk
-                .points
-                .into_iter()
-                .filter(|point| {
-                    point.timestamp_epoch_sec >= since_epoch_sec
-                        && point.timestamp_epoch_sec <= until_epoch_sec
-                }),
-        );
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
     }
     points.sort_by_key(|point| point.timestamp_epoch_sec);
     Ok(points)
@@ -626,15 +621,10 @@ fn load_rollup_points_between(
     let mut points = Vec::new();
     for row in rows {
         let chunk: RollupMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
-        points.extend(
-            chunk
-                .points
-                .into_iter()
-                .filter(|point| {
-                    point.timestamp_epoch_sec >= since_epoch_sec
-                        && point.timestamp_epoch_sec <= until_epoch_sec
-                }),
-        );
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
     }
     points.sort_by_key(|point| point.timestamp_epoch_sec);
     Ok(points)
@@ -667,7 +657,7 @@ fn aggregate_single_counter_rollup(
         0.0
     };
 
-    let mut peak_rate = 0.0;
+    let mut peak_rate = 0.0_f64;
     for window in points.windows(2) {
         let previous = &window[0];
         let current = &window[1];
@@ -683,10 +673,19 @@ fn aggregate_single_counter_rollup(
         end,
         avg_rate,
         peak_rate,
+        avg_rate_weight_sec: if points.len() >= 2 {
+            let first = &points[0];
+            let last = &points[points.len() - 1];
+            (last.timestamp_epoch_sec - first.timestamp_epoch_sec).max(0) as f64
+        } else {
+            0.0
+        },
     }
 }
 
-fn aggregate_gauge_rollups(points: &[RawMetricsHistoryPoint]) -> [GaugeRollupValue; NUM_GAUGE_METRICS] {
+fn aggregate_gauge_rollups(
+    points: &[RawMetricsHistoryPoint],
+) -> [GaugeRollupValue; NUM_GAUGE_METRICS] {
     std::array::from_fn(|index| {
         let values = points.iter().map(|point| point.gauge_values[index]);
         aggregate_gauge_rollup_values(values)
@@ -705,47 +704,83 @@ fn aggregate_job_status_rollups(
 fn aggregate_counter_rollups_from_rollups(
     points: &[RollupMetricsHistoryPoint],
 ) -> [CounterRollupValue; NUM_COUNTER_METRICS] {
-    std::array::from_fn(|index| CounterRollupValue {
-        end: points
-            .last()
-            .map(|point| point.counter_values[index].end)
-            .unwrap_or_default(),
-        avg_rate: mean(points.iter().map(|point| point.counter_values[index].avg_rate)),
-        peak_rate: points
+    std::array::from_fn(|index| {
+        let avg_rate_weight_sec: f64 = points
             .iter()
-            .map(|point| point.counter_values[index].peak_rate)
-            .fold(0.0, f64::max),
+            .map(|point| point.counter_values[index].avg_rate_weight_sec)
+            .sum();
+        CounterRollupValue {
+            end: points
+                .last()
+                .map(|point| point.counter_values[index].end)
+                .unwrap_or_default(),
+            avg_rate: weighted_mean(points.iter().map(|point| {
+                (
+                    point.counter_values[index].avg_rate,
+                    point.counter_values[index].avg_rate_weight_sec,
+                )
+            })),
+            peak_rate: points
+                .iter()
+                .map(|point| point.counter_values[index].peak_rate)
+                .fold(0.0, f64::max),
+            avg_rate_weight_sec,
+        }
     })
 }
 
 fn aggregate_gauge_rollups_from_rollups(
     points: &[RollupMetricsHistoryPoint],
 ) -> [GaugeRollupValue; NUM_GAUGE_METRICS] {
-    std::array::from_fn(|index| GaugeRollupValue {
-        avg: mean(points.iter().map(|point| point.gauge_values[index].avg)),
-        peak: points
+    std::array::from_fn(|index| {
+        let sample_count: u32 = points
             .iter()
-            .map(|point| point.gauge_values[index].peak)
-            .fold(0.0, f64::max),
+            .map(|point| point.gauge_values[index].sample_count)
+            .sum();
+        GaugeRollupValue {
+            avg: weighted_mean(points.iter().map(|point| {
+                (
+                    point.gauge_values[index].avg,
+                    point.gauge_values[index].sample_count as f64,
+                )
+            })),
+            peak: points
+                .iter()
+                .map(|point| point.gauge_values[index].peak)
+                .fold(0.0, f64::max),
+            sample_count,
+        }
     })
 }
 
 fn aggregate_job_rollups_from_rollups(
     points: &[RollupMetricsHistoryPoint],
 ) -> [GaugeRollupValue; NUM_JOB_STATUS_METRICS] {
-    std::array::from_fn(|index| GaugeRollupValue {
-        avg: mean(points.iter().map(|point| point.job_status_values[index].avg)),
-        peak: points
+    std::array::from_fn(|index| {
+        let sample_count: u32 = points
             .iter()
-            .map(|point| point.job_status_values[index].peak)
-            .fold(0.0, f64::max),
+            .map(|point| point.job_status_values[index].sample_count)
+            .sum();
+        GaugeRollupValue {
+            avg: weighted_mean(points.iter().map(|point| {
+                (
+                    point.job_status_values[index].avg,
+                    point.job_status_values[index].sample_count as f64,
+                )
+            })),
+            peak: points
+                .iter()
+                .map(|point| point.job_status_values[index].peak)
+                .fold(0.0, f64::max),
+            sample_count,
+        }
     })
 }
 
 fn aggregate_gauge_rollup_values(values: impl Iterator<Item = f64>) -> GaugeRollupValue {
     let mut total = 0.0;
     let mut count = 0_u64;
-    let mut peak = 0.0;
+    let mut peak = 0.0_f64;
     for value in values {
         total += value;
         count += 1;
@@ -753,22 +788,30 @@ fn aggregate_gauge_rollup_values(values: impl Iterator<Item = f64>) -> GaugeRoll
     }
 
     GaugeRollupValue {
-        avg: if count == 0 { 0.0 } else { total / count as f64 },
+        avg: if count == 0 {
+            0.0
+        } else {
+            total / count as f64
+        },
         peak,
+        sample_count: count as u32,
     }
 }
 
-fn mean(values: impl Iterator<Item = f64>) -> f64 {
-    let mut total = 0.0;
-    let mut count = 0_u64;
-    for value in values {
-        total += value;
-        count += 1;
+fn weighted_mean(values: impl Iterator<Item = (f64, f64)>) -> f64 {
+    let mut weighted_total = 0.0;
+    let mut total_weight = 0.0;
+    for (value, weight) in values {
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted_total += value * weight;
+        total_weight += weight;
     }
-    if count == 0 {
+    if total_weight == 0.0 {
         0.0
     } else {
-        total / count as f64
+        weighted_total / total_weight
     }
 }
 
@@ -797,7 +840,9 @@ fn job_status_index(status: &JobStatus) -> Option<usize> {
         JobStatus::Failed { .. } => "failed",
         JobStatus::Complete => "complete",
     };
-    JOB_STATUS_KEYS.iter().position(|candidate| *candidate == label)
+    JOB_STATUS_KEYS
+        .iter()
+        .position(|candidate| *candidate == label)
 }
 
 #[cfg(test)]

@@ -135,8 +135,7 @@ pub(crate) async fn run(
     });
 
     let rss_task = rss.start_background_loop();
-    let metrics_history_task =
-        shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
 
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

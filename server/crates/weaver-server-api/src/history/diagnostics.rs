@@ -271,9 +271,20 @@ impl DiagnosticManager {
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
-        self.ensure_staging_dir(&row)
-            .await
-            .map_err(bundle_graphql_error)?;
+        if let Err(error) = self.ensure_staging_dir(&row).await {
+            let db = self.db.clone();
+            let cleanup_source_job_id = source_job_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                db.delete_diagnostic_run(cleanup_source_job_id)
+            })
+            .await;
+            let _ = tokio::fs::remove_dir_all(
+                self.staging_dir(&TrackedDiagnosticRun::from_row(&row))
+                    .await,
+            )
+            .await;
+            return Err(bundle_graphql_error(error));
+        }
         if let Err(error) = self
             .handle
             .start_diagnostic_redownload(
@@ -289,9 +300,11 @@ impl DiagnosticManager {
                 db.delete_diagnostic_run(cleanup_source_job_id)
             })
             .await;
-            let _ =
-                tokio::fs::remove_dir_all(self.staging_dir(&TrackedDiagnosticRun::from_row(&row)))
-                    .await;
+            let _ = tokio::fs::remove_dir_all(
+                self.staging_dir(&TrackedDiagnosticRun::from_row(&row))
+                    .await,
+            )
+            .await;
             return Err(scheduler_graphql_error(error));
         }
 
@@ -331,7 +344,7 @@ impl DiagnosticManager {
                     let runs = self.active_runs().await;
                     for run in runs {
                         if let Err(error) = self
-                            .append_text_line(self.staging_dir(&run).join(LOG_FILE), &line)
+                            .append_text_line(self.staging_dir(&run).await.join(LOG_FILE), &line)
                             .await
                         {
                             tracing::warn!(
@@ -417,7 +430,7 @@ impl DiagnosticManager {
                 }
             };
             self.append_json_line(
-                self.staging_dir(&run).join(SERVER_ATTEMPTS_FILE),
+                self.staging_dir(&run).await.join(SERVER_ATTEMPTS_FILE),
                 &DiagnosticServerAttemptRecord {
                     occurred_at_ms: Utc::now().timestamp_millis(),
                     segment_id: segment_id.to_string(),
@@ -439,7 +452,7 @@ impl DiagnosticManager {
 
         let event_gql = PipelineEventGql::from(&event);
         self.append_json_line(
-            self.staging_dir(&run).join(EVENTS_FILE),
+            self.staging_dir(&run).await.join(EVENTS_FILE),
             &DiagnosticEventRecord {
                 occurred_at_ms: Utc::now().timestamp_millis(),
                 event: event_gql.clone(),
@@ -545,6 +558,19 @@ impl DiagnosticManager {
                             );
                         }
                     });
+                } else if matches!(row.stage, DiagnosticRunStage::Queued) {
+                    tracing::warn!(
+                        diagnostic_job_id = row.diagnostic_job_id,
+                        source_job_id = row.source_job_id,
+                        "purging orphaned queued diagnostic run"
+                    );
+                    if let Err(error) = self.delete_run_state(&row).await {
+                        tracing::warn!(
+                            error = %error,
+                            diagnostic_job_id = row.diagnostic_job_id,
+                            "failed to purge orphaned queued diagnostic run"
+                        );
+                    }
                 }
             }
         }
@@ -561,7 +587,7 @@ impl DiagnosticManager {
             is_globally_paused: self.handle.is_globally_paused(),
         };
         for run in runs {
-            self.append_json_line(self.staging_dir(&run).join(METRICS_FILE), &record)
+            self.append_json_line(self.staging_dir(&run).await.join(METRICS_FILE), &record)
                 .await?;
         }
         Ok(())
@@ -605,7 +631,9 @@ impl DiagnosticManager {
         let mut run = self.load_run_by_job(diagnostic_job_id).await?.ok_or(
             DiagnosticBundleError::MissingDiagnosticRun(diagnostic_job_id),
         )?;
-        let staging_dir = self.staging_dir(&TrackedDiagnosticRun::from_row(&run));
+        let staging_dir = self
+            .staging_dir(&TrackedDiagnosticRun::from_row(&run))
+            .await;
         if self
             .resume_finalized_upload_if_present(&run, &staging_dir)
             .await?
@@ -1083,7 +1111,8 @@ impl DiagnosticManager {
             .map_err(|error| DiagnosticBundleError::State(error.to_string()))?;
         self.tracked.write().await.remove(&row.diagnostic_job_id);
         let _ =
-            tokio::fs::remove_dir_all(self.staging_dir(&TrackedDiagnosticRun::from_row(row))).await;
+            tokio::fs::remove_dir_all(self.staging_dir(&TrackedDiagnosticRun::from_row(row)).await)
+                .await;
         Ok(())
     }
 
@@ -1169,8 +1198,8 @@ impl DiagnosticManager {
         self.config.read().await.clone()
     }
 
-    fn staging_dir(&self, run: &TrackedDiagnosticRun) -> PathBuf {
-        let root = futures_staging_root(&self.config);
+    async fn staging_dir(&self, run: &TrackedDiagnosticRun) -> PathBuf {
+        let root = Path::new(&self.config.read().await.data_dir).join(DIAGNOSTIC_ROOT_DIR);
         root.join(format!("{}-{}", run.source_job_id, run.diagnostic_job_id))
     }
 
@@ -1186,7 +1215,7 @@ impl DiagnosticManager {
         &self,
         run: &TrackedDiagnosticRun,
     ) -> std::result::Result<(), DiagnosticBundleError> {
-        create_dir(&self.staging_dir(run)).await
+        create_dir(&self.staging_dir(run).await).await
     }
 
     async fn append_json_line<T: Serialize>(
@@ -1501,11 +1530,6 @@ async fn file_size_and_sha256(
         .map_err(|error| DiagnosticBundleError::Io(error.to_string()))?;
     let sha = Sha256::digest(&bytes);
     Ok((bytes.len() as u64, hex::encode(sha)))
-}
-
-fn futures_staging_root(config: &SharedConfig) -> PathBuf {
-    let guard = config.blocking_read();
-    Path::new(&guard.data_dir).join(DIAGNOSTIC_ROOT_DIR)
 }
 
 fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {

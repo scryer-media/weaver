@@ -253,9 +253,8 @@ pub fn compile_source_bundle(db_root: &Path) -> Result<CompiledMigrationBundle, 
     let mut migrations = manifest.migrations.clone();
     migrations.sort_by_key(|migration| migration.version);
 
-    let mut expected_version = manifest.starting_version;
     let mut compiled_migrations = Vec::with_capacity(migrations.len());
-    for migration in migrations {
+    for (expected_version, migration) in (manifest.starting_version..).zip(migrations) {
         if migration.version != expected_version {
             return Err(format!(
                 "migration versions must be contiguous starting at {:04}; expected {:04}, found {:04}",
@@ -263,7 +262,6 @@ pub fn compile_source_bundle(db_root: &Path) -> Result<CompiledMigrationBundle, 
             ));
         }
         compiled_migrations.push(compile_migration(db_root, &migration, &mut payload_bytes)?);
-        expected_version += 1;
     }
 
     let mut baselines = Vec::new();

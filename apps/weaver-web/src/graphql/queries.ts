@@ -479,11 +479,13 @@ export const LIVE_METRICS_QUERY = gql`
 `;
 
 export const METRICS_HISTORY_QUERY = gql`
-  query MetricsHistory($minutes: Int!, $metrics: [String!]!) {
-    metricsHistory(minutes: $minutes, metrics: $metrics) {
+  query MetricsHistory($range: MetricsHistoryRangeGql!) {
+    metricsHistory(range: $range) {
       timestamps
+      resolutionSec
       series {
         metric
+        variant
         labels {
           key
           value

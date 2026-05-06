@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "urql";
 import { getGraphqlWsClient } from "@/graphql/client";
 import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
@@ -14,6 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useTranslate } from "@/lib/context/translate-context";
+import { useIsMobile } from "@/lib/hooks/use-mobile";
 
 const LOG_LEVEL_COLORS: Record<string, string> = {
   error: "text-red-400",
@@ -23,7 +24,11 @@ const LOG_LEVEL_COLORS: Record<string, string> = {
   trace: "text-zinc-600",
 };
 
-const MAX_BUFFER = 2000;
+const RAW_BUFFER_MAX = 2000;
+const LIVE_TAIL_LINES = 300;
+const MAX_RENDERED_LINES = 2000;
+const LOG_INGEST_BATCH_MS = 50;
+const LOG_RENDER_BATCH_MS = 150;
 const KEEP_SUBSCRIPTION_DURING_STRICT_REMOUNT = import.meta.env.DEV;
 
 const SERVICE_LOG_LINES_SUB = `subscription ServiceLogLines { serviceLogLines }`;
@@ -47,6 +52,29 @@ type ParsedLine = {
   message: string;
   kvPairs: { key: string; value: string; start: number; end: number }[];
   raw: string;
+};
+
+type RawLogLineEntry = {
+  id: number;
+  raw: string;
+  lower: string;
+  level: string;
+  parsed?: ParsedLine | null;
+};
+
+type LogLineEntry = {
+  id: number;
+  raw: string;
+  lower: string;
+  level: string;
+  parsed: ParsedLine | null;
+};
+
+type LogViewerSnapshot = {
+  lines: LogLineEntry[];
+  bufferedCount: number;
+  matchedCount: number;
+  liveTailing: boolean;
 };
 
 function parseLine(raw: string): ParsedLine | null {
@@ -76,10 +104,72 @@ function parseLine(raw: string): ParsedLine | null {
   };
 }
 
-function HighlightedLine({ line }: { line: string }) {
-  const parsed = parseLine(line);
+function buildRawLogLineEntry(id: number, raw: string): RawLogLineEntry {
+  return {
+    id,
+    raw,
+    lower: raw.toLowerCase(),
+    level: detectLogLevel(raw),
+  };
+}
+
+function materializeLogLineEntry(entry: RawLogLineEntry): LogLineEntry {
+  if (entry.parsed === undefined) {
+    entry.parsed = parseLine(entry.raw);
+  }
+
+  return {
+    id: entry.id,
+    raw: entry.raw,
+    lower: entry.lower,
+    level: entry.level,
+    parsed: entry.parsed,
+  };
+}
+
+const EMPTY_LOG_SNAPSHOT: LogViewerSnapshot = {
+  lines: [],
+  bufferedCount: 0,
+  matchedCount: 0,
+  liveTailing: false,
+};
+
+function buildLogViewerSnapshot(
+  source: RawLogLineEntry[],
+  query: string,
+  level: string,
+  paused: boolean,
+): LogViewerSnapshot {
+  const normalizedQuery = query.trim().toLowerCase();
+  const hasFilters = normalizedQuery.length > 0 || level !== "all";
+
+  const matching = source.filter((line) => {
+    if (normalizedQuery && !line.lower.includes(normalizedQuery)) {
+      return false;
+    }
+    if (level !== "all" && line.level !== level) {
+      return false;
+    }
+    return true;
+  });
+
+  const liveTailing = !paused && !hasFilters && matching.length > LIVE_TAIL_LINES;
+  const visible = liveTailing
+    ? matching.slice(-LIVE_TAIL_LINES)
+    : matching.slice(-MAX_RENDERED_LINES);
+
+  return {
+    lines: visible.map(materializeLogLineEntry),
+    bufferedCount: source.length,
+    matchedCount: matching.length,
+    liveTailing,
+  };
+}
+
+function HighlightedLine({ entry }: { entry: LogLineEntry }) {
+  const parsed = entry.parsed;
   if (!parsed) {
-    return <span className="text-foreground">{line}</span>;
+    return <span className="text-foreground">{entry.raw}</span>;
   }
 
   const lvl = parsed.level.toLowerCase();
@@ -129,31 +219,122 @@ function HighlightedLine({ line }: { line: string }) {
 
 export function LogViewerPage() {
   const t = useTranslate();
+  const isMobile = useIsMobile();
   const [search, setSearch] = useState("");
   const [level, setLevel] = useState("all");
   const [paused, setPaused] = useState(false);
-  const [lines, setLines] = useState<string[]>([]);
+  const [snapshot, setSnapshot] = useState<LogViewerSnapshot>(EMPTY_LOG_SNAPSHOT);
   const [connected, setConnected] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const pausedRef = useRef(paused);
+  const searchRef = useRef(search);
+  const levelRef = useRef(level);
   const teardownTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const nextLineIdRef = useRef(0);
+  const rawBufferRef = useRef<RawLogLineEntry[]>([]);
+  const pendingLinesRef = useRef<string[]>([]);
+  const ingestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const commitSnapshot = useCallback(() => {
+    const nextSnapshot = buildLogViewerSnapshot(
+      rawBufferRef.current,
+      searchRef.current,
+      levelRef.current,
+      pausedRef.current,
+    );
+
+    startTransition(() => {
+      setSnapshot(nextSnapshot);
+    });
+  }, []);
+
+  const scheduleSnapshot = useCallback((immediate = false) => {
+    if (snapshotTimerRef.current) {
+      if (!immediate) {
+        return;
+      }
+      clearTimeout(snapshotTimerRef.current);
+      snapshotTimerRef.current = null;
+    }
+
+    snapshotTimerRef.current = setTimeout(() => {
+      snapshotTimerRef.current = null;
+      commitSnapshot();
+    }, immediate ? 0 : LOG_RENDER_BATCH_MS);
+  }, [commitSnapshot]);
+
+  const flushPendingLines = useCallback(() => {
+    ingestTimerRef.current = null;
+    if (pendingLinesRef.current.length === 0) {
+      return;
+    }
+
+    const pending = pendingLinesRef.current.splice(0, pendingLinesRef.current.length);
+    const buffer = rawBufferRef.current;
+
+    for (const line of pending) {
+      const id = nextLineIdRef.current;
+      nextLineIdRef.current += 1;
+      buffer.push(buildRawLogLineEntry(id, line));
+    }
+
+    if (buffer.length > RAW_BUFFER_MAX) {
+      buffer.splice(0, buffer.length - RAW_BUFFER_MAX);
+    }
+
+    scheduleSnapshot();
+  }, [scheduleSnapshot]);
+
+  const enqueueLine = useCallback((line: string) => {
+    pendingLinesRef.current.push(line);
+    if (ingestTimerRef.current) {
+      return;
+    }
+
+    ingestTimerRef.current = setTimeout(flushPendingLines, LOG_INGEST_BATCH_MS);
+  }, [flushPendingLines]);
 
   useEffect(() => {
     pausedRef.current = paused;
-  });
+    if (paused && ingestTimerRef.current) {
+      clearTimeout(ingestTimerRef.current);
+      ingestTimerRef.current = null;
+      flushPendingLines();
+    }
+    scheduleSnapshot(true);
+  }, [flushPendingLines, paused, scheduleSnapshot]);
+
+  useEffect(() => {
+    searchRef.current = search;
+    scheduleSnapshot(true);
+  }, [scheduleSnapshot, search]);
+
+  useEffect(() => {
+    levelRef.current = level;
+    scheduleSnapshot(true);
+  }, [level, scheduleSnapshot]);
 
   // Initial load via query
   const [{ data }] = useQuery({
     query: SERVICE_LOGS_QUERY,
-    variables: { limit: MAX_BUFFER },
+    variables: { limit: RAW_BUFFER_MAX },
   });
 
   useEffect(() => {
     if (data?.serviceLogs?.lines) {
-      setLines(data.serviceLogs.lines);
+      const initial: string[] = data.serviceLogs.lines;
+      const seeded = initial.map((line) => {
+        const id = nextLineIdRef.current;
+        nextLineIdRef.current += 1;
+        return buildRawLogLineEntry(id, line);
+      });
+      const existing = rawBufferRef.current;
+      rawBufferRef.current = [...seeded, ...existing].slice(-RAW_BUFFER_MAX);
+      scheduleSnapshot(true);
     }
-  }, [data]);
+  }, [data, scheduleSnapshot]);
 
   // Subscribe to live log lines via WebSocket
   useEffect(() => {
@@ -170,10 +351,7 @@ export function LogViewerPage() {
         next(result: { data?: { serviceLogLines?: string } }) {
           const line = result.data?.serviceLogLines;
           if (line && !pausedRef.current) {
-            setLines((prev) => {
-              const next = [...prev, line];
-              return next.length > MAX_BUFFER ? next.slice(next.length - MAX_BUFFER) : next;
-            });
+            enqueueLine(line);
           }
           setConnected(true);
         },
@@ -201,14 +379,27 @@ export function LogViewerPage() {
         setConnected(false);
       }, 200);
     };
-  }, []);
+  }, [enqueueLine]);
+
+  useEffect(
+    () => () => {
+      if (ingestTimerRef.current) {
+        clearTimeout(ingestTimerRef.current);
+      }
+      if (snapshotTimerRef.current) {
+        clearTimeout(snapshotTimerRef.current);
+      }
+      pendingLinesRef.current = [];
+    },
+    [],
+  );
 
   // Auto-scroll when new lines arrive
   useEffect(() => {
     if (autoScrollRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [lines]);
+  }, [snapshot.lines]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -216,14 +407,13 @@ export function LogViewerPage() {
     autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   }, []);
 
-  const filteredLines = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return lines.filter((line) => {
-      if (query && !line.toLowerCase().includes(query)) return false;
-      if (level !== "all" && detectLogLevel(line) !== level) return false;
-      return true;
-    });
-  }, [level, lines, search]);
+  const liveTailNotice = useMemo(() => {
+    if (!snapshot.liveTailing) {
+      return null;
+    }
+
+    return `Live mode is showing the latest ${snapshot.lines.length} lines from ${snapshot.bufferedCount} buffered entries. Pause or filter to inspect more history.`;
+  }, [snapshot.bufferedCount, snapshot.liveTailing, snapshot.lines.length]);
 
   return (
     <div className="space-y-4">
@@ -270,7 +460,20 @@ export function LogViewerPage() {
             variant="secondary"
             className="w-full sm:w-auto"
             onClick={() => {
-              setLines([]);
+              if (ingestTimerRef.current) {
+                clearTimeout(ingestTimerRef.current);
+                ingestTimerRef.current = null;
+              }
+              if (snapshotTimerRef.current) {
+                clearTimeout(snapshotTimerRef.current);
+                snapshotTimerRef.current = null;
+              }
+              pendingLinesRef.current = [];
+              rawBufferRef.current = [];
+              nextLineIdRef.current = 0;
+              startTransition(() => {
+                setSnapshot(EMPTY_LOG_SNAPSHOT);
+              });
               autoScrollRef.current = true;
             }}
           >
@@ -285,31 +488,34 @@ export function LogViewerPage() {
           {paused && <span className="text-yellow-400">(paused)</span>}
         </div>
       </div>
+      {liveTailNotice ? (
+        <p className="text-xs text-muted-foreground">{liveTailNotice}</p>
+      ) : null}
 
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="h-[calc(100vh-220px)] min-h-[400px] overflow-y-auto rounded-lg border border-border bg-card text-xs leading-5"
+        className={`overflow-y-auto rounded-lg border border-border bg-card text-xs leading-5 ${isMobile ? "h-[50vh] min-h-[260px]" : "h-[28rem] min-h-[320px]"}`}
         style={{
           fontFamily:
             "'Fira Code', 'Fira Mono', 'JetBrains Mono', 'Source Code Pro', 'Cascadia Code', 'Consolas', monospace",
         }}
       >
-        {filteredLines.length === 0 ? (
+        {snapshot.lines.length === 0 ? (
           <p className="p-4 text-muted-foreground">No logs available yet.</p>
         ) : (
-          <div className="p-2">
-            {filteredLines.map((line, i) => (
-              <div key={i} className="flex hover:bg-muted/30">
+          <div className="space-y-0.5 p-2">
+            {snapshot.lines.map((line, i) => (
+              <div key={line.id} className="flex items-start gap-3 rounded-sm px-1 hover:bg-muted/30">
                 <span
-                  className="mr-3 select-none text-right text-muted-foreground/40"
-                  style={{ minWidth: "3ch" }}
+                  className="shrink-0 select-none text-right tabular-nums text-muted-foreground/40"
+                  style={{ minWidth: "4ch" }}
                 >
                   {i + 1}
                 </span>
-                <span className="break-all">
-                  <HighlightedLine line={line} />
-                </span>
+                <div className="min-w-0 flex-1 whitespace-pre-wrap break-all">
+                  <HighlightedLine entry={line} />
+                </div>
               </div>
             ))}
           </div>
@@ -317,9 +523,10 @@ export function LogViewerPage() {
       </div>
 
       <p className="text-xs text-muted-foreground">
-        {filteredLines.length} lines
-        {level !== "all" ? ` (${level})` : ""}
-        {search ? ` matching "${search}"` : ""}
+        {snapshot.lines.length} shown
+        {` · ${snapshot.matchedCount} matching`}
+        {` · ${snapshot.bufferedCount} buffered`}
+        {snapshot.liveTailing ? " · live tail" : ""}
       </p>
     </div>
   );

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { FilePenLine, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -271,9 +272,11 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       <TableCell>
                         <div className="flex flex-wrap gap-2">
                           <Button variant="outline" size="sm" onClick={() => openEdit(server)}>
+                            <FilePenLine className="size-4" />
                             {t("action.edit")}
                           </Button>
                           <Button variant="destructive" size="sm" onClick={() => setDeleteConfirmId(server.id)}>
+                            <Trash2 className="size-4" />
                             {t("action.delete")}
                           </Button>
                         </div>

@@ -14,6 +14,7 @@ fn test_db(conn: Connection) -> Database {
         pending_archive_retries: Arc::new(AtomicUsize::new(0)),
         pending_archive_notify: Arc::new(tokio::sync::Notify::new()),
         encryption_key: None,
+        _ephemeral_dir: None,
     }
 }
 
@@ -21,6 +22,19 @@ fn test_db(conn: Connection) -> Database {
 fn open_in_memory_creates_schema() {
     let db = Database::open_in_memory().unwrap();
     assert!(db.is_empty().unwrap());
+}
+
+#[test]
+fn open_in_memory_stamps_sqlx_migration_ledger() {
+    let db = Database::open_in_memory().unwrap();
+    let conn = db.conn();
+
+    let latest_version: i64 = conn
+        .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latest_version, SCHEMA_VERSION);
 }
 
 #[test]
@@ -68,7 +82,13 @@ fn open_file_database_stamps_sqlx_migration_ledger() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(migration_count, 3);
+    assert_eq!(
+        migration_count,
+        crate::schema_migrations::embedded_catalog()
+            .unwrap()
+            .migrations
+            .len() as i64
+    );
 
     let checksum_algo: String = conn
         .query_row(

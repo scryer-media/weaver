@@ -99,12 +99,12 @@ export function UploadNzbForm({
 
   return (
     <Card className={cn(layout === "dialog" ? "border-0 bg-transparent shadow-none" : "")}>
-      <CardHeader className={cn(layout === "dialog" ? "px-0 pt-0" : "")}>
-        <CardTitle>{t("upload.title")}</CardTitle>
-        <CardDescription>
-          {layout === "page" ? t("upload.accepts") : t("upload.dropzone")}
-        </CardDescription>
-      </CardHeader>
+      {layout === "page" ? (
+        <CardHeader>
+          <CardTitle>{t("upload.title")}</CardTitle>
+          <CardDescription>{t("upload.accepts")}</CardDescription>
+        </CardHeader>
+      ) : null}
       <CardContent className={cn(layout === "dialog" ? "px-0 pb-0" : "")}>
         <form
           ref={formRef}

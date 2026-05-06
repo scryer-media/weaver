@@ -44,7 +44,7 @@ async fn public_facade_schema_exposes_core_surface() {
         "historyDeleteOperations query should be present"
     );
     assert!(
-        sdl.contains("metricsHistory(minutes: Int!, metrics: [String!]!): MetricsHistoryResult!"),
+        sdl.contains("metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!"),
         "metricsHistory query should be present"
     );
     assert!(

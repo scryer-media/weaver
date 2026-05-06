@@ -12,6 +12,8 @@ use crate::persistence::Database;
 
 use super::repository::db_err;
 
+type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
+
 impl Database {
     pub fn load_complete_file_hashes(
         &self,
@@ -383,7 +385,7 @@ impl Database {
     pub fn load_active_job_persisted_nzb(
         &self,
         job_id: JobId,
-    ) -> Result<Option<(PathBuf, Option<Vec<u8>>)>, StateError> {
+    ) -> Result<Option<PersistedNzbRecord>, StateError> {
         let conn = self.read_conn();
         let mut stmt = conn
             .prepare(

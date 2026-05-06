@@ -135,8 +135,17 @@ impl Database {
             ));
         }
 
-        let existing = self
-            .get_diagnostic_run_for_source(row.source_job_id)
+        let existing = conn
+            .query_row(
+                "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
+                        rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
+                 FROM diagnostic_runs
+                 WHERE source_job_id = ?1",
+                [row.source_job_id as i64],
+                diagnostic_run_from_row,
+            )
+            .optional()
+            .map_err(db_err)
             .map_err(DiagnosticRunInsertError::State)?;
         if existing
             .as_ref()

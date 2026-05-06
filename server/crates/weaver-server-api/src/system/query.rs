@@ -1,4 +1,6 @@
 use super::*;
+use crate::system::metrics_history::{build_metrics_history, tier_for_range};
+use crate::system::types::MetricsHistoryRangeGql;
 
 #[derive(Default)]
 pub(crate) struct SystemQuery;
@@ -45,27 +47,26 @@ impl SystemQuery {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(metrics_from_snapshot(&handle.get_metrics()))
     }
-    /// Historical Prometheus metrics, parsed on demand from compressed SQLite scrapes.
+    /// Tiered local metrics history for the built-in monitoring UI.
     #[graphql(guard = "ReadGuard")]
     async fn metrics_history(
         &self,
         ctx: &Context<'_>,
-        minutes: i32,
-        metrics: Vec<String>,
+        range: MetricsHistoryRangeGql,
     ) -> Result<MetricsHistoryResult> {
-        let clamped_minutes = minutes.clamp(1, 1440) as i64;
         let db = ctx.data::<Database>()?.clone();
-        let since_epoch_sec = std::time::SystemTime::now()
+        let now_epoch_sec = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64
-            - clamped_minutes * 60;
+            .as_secs() as i64;
+        let since_epoch_sec = now_epoch_sec - range.window_sec();
+        let tier = tier_for_range(range);
 
         tokio::task::spawn_blocking(move || {
-            let rows = db
-                .list_metrics_scrapes_since(since_epoch_sec)
+            let history = db
+                .read_metrics_history(tier, since_epoch_sec, now_epoch_sec)
                 .map_err(|error| error.to_string())?;
-            build_metrics_history(rows, &metrics)
+            build_metrics_history(history)
         })
         .await
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?

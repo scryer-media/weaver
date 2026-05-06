@@ -531,6 +531,15 @@ export function History() {
     () => selectedIds.filter((id) => !lockedRowIds.has(id)),
     [lockedRowIds, selectedIds],
   );
+  const selectedRestartableIds = useMemo(
+    () => jobs
+      .filter((job) =>
+        selectedActionIds.includes(job.id)
+        && (job.status === "FAILED" || job.status === "COMPLETE"),
+      )
+      .map((job) => job.id),
+    [jobs, selectedActionIds],
+  );
   const selectedCount = selectedActionIds.length;
   const hasActiveDeleteOperations =
     deleteOperations.length > 0
@@ -726,6 +735,28 @@ export function History() {
       const result = await reprocessJob({ id: jobId });
       if (!result.error) {
         setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
+        await refetchHistoryPage(pageIndex);
+      }
+    },
+    [pageIndex, refetchHistoryPage, reprocessJob],
+  );
+
+  const handleBatchReprocess = useCallback(
+    async (jobIds: number[]) => {
+      if (jobIds.length === 0) {
+        return;
+      }
+
+      const completedIds: number[] = [];
+      for (const jobId of jobIds) {
+        const result = await reprocessJob({ id: jobId });
+        if (!result.error) {
+          completedIds.push(jobId);
+        }
+      }
+
+      if (completedIds.length > 0) {
+        setRowSelection((current) => removeRowSelectionIds(current, completedIds));
         await refetchHistoryPage(pageIndex);
       }
     },
@@ -1174,6 +1205,25 @@ export function History() {
     }
   }
 
+  async function handleBatchRedownload(jobIds: number[]) {
+    if (jobIds.length === 0) {
+      return;
+    }
+
+    const completedIds: number[] = [];
+    for (const jobId of jobIds) {
+      const result = await redownloadJob({ id: jobId });
+      if (!result.error) {
+        completedIds.push(jobId);
+      }
+    }
+
+    if (completedIds.length > 0) {
+      setRowSelection((current) => removeRowSelectionIds(current, completedIds));
+      await refetchHistoryPage(pageIndex);
+    }
+  }
+
   async function handleSingleDelete(jobId: number) {
     const accepted = await acceptDelete({
       mode: "IDS",
@@ -1305,17 +1355,42 @@ export function History() {
                     </span>
                     <Button
                       variant="ghost"
-                      size="icon"
-                      className="size-8 text-destructive hover:text-destructive"
+                      size="sm"
+                      className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+                      disabled={actionsBusy || selectedRestartableIds.length === 0}
+                      onClick={() => {
+                        void handleBatchReprocess(selectedRestartableIds);
+                      }}
+                    >
+                      <RefreshCcw className="size-4" />
+                      <span>{t("action.reprocess")}</span>
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+                      disabled={actionsBusy || selectedRestartableIds.length === 0}
+                      onClick={() => {
+                        void handleBatchRedownload(selectedRestartableIds);
+                      }}
+                    >
+                      <Download className="size-4" />
+                      <span>{t("action.redownload")}</span>
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 gap-1.5 px-2 text-destructive hover:text-destructive"
                       aria-label={t("action.delete")}
                       title={t("action.delete")}
-                      disabled={acceptDeleteState.fetching}
+                      disabled={acceptDeleteState.fetching || selectedActionIds.length === 0}
                       onClick={() => {
                         setDeleteAcceptError(null);
                         setDeleteBatchConfirm(true);
                       }}
                     >
                       <Trash2 className="size-4" />
+                      <span>{t("action.delete")}</span>
                     </Button>
                   </div>
                 ) : null}

@@ -80,7 +80,10 @@ impl JobsMutation {
             }
         };
 
-        match manager.stage_upload(caller_identity, upload, input.filename).await {
+        match manager
+            .stage_upload(caller_identity, upload, input.filename)
+            .await
+        {
             Ok(staged) => Ok(StagedNzbUploadResult {
                 accepted: true,
                 staged_upload_id: Some(staged.staged_upload_id),
@@ -116,7 +119,8 @@ impl JobsMutation {
         let category = input.category.clone();
         let password = input.password.clone();
 
-        let (entries, missing) = manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
+        let (entries, missing) =
+            manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
         let mut found_by_id = entries
             .into_iter()
             .map(|entry| (entry.id.clone(), entry))
@@ -571,10 +575,7 @@ fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {
         .map_err(|_| graphql_error("INTERNAL", "missing caller identity"))
 }
 
-fn rejected_stage_upload_result(
-    filename: Option<String>,
-    error: String,
-) -> StagedNzbUploadResult {
+fn rejected_stage_upload_result(filename: Option<String>, error: String) -> StagedNzbUploadResult {
     StagedNzbUploadResult {
         accepted: false,
         staged_upload_id: None,

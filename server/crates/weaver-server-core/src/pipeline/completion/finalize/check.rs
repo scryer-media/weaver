@@ -1820,9 +1820,7 @@ impl Pipeline {
                 // No archives — move to complete and finish.
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
-                    return;
                 }
-                return;
             }
             ExtractionReadiness::Ready => {
                 // Collect sets that still need extraction (some may have been
@@ -1946,9 +1944,7 @@ impl Pipeline {
                 // Move extracted files to complete directory.
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
-                    return;
                 }
-                return;
             }
             ExtractionReadiness::Blocked { reason } => {
                 self.fail_job(job_id, reason);

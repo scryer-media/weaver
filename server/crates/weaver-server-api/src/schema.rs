@@ -31,7 +31,6 @@ use crate::jobs::types::{
 use crate::rss::types::{RssFeed, RssSeenItem};
 use crate::servers::types::Server;
 use crate::settings::types::GeneralSettings;
-use crate::system::metrics_history::build_metrics_history;
 use crate::system::types::{
     DirectoryBrowseResult, MetricsHistoryResult, ServiceLogsPayload, SystemMetricsSnapshot,
     SystemStatus,

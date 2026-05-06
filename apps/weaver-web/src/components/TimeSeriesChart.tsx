@@ -17,6 +17,7 @@ export interface TimeSeriesChartSeries {
   colorToken: ChartColorToken;
   format: MetricValueFormat;
   scale?: MetricScale;
+  strokeStyle?: "solid" | "dashed";
 }
 
 interface TimeSeriesChartProps {
@@ -149,6 +150,7 @@ export function TimeSeriesChart({
         label: item.label,
         color: item.color,
         scale: item.scale ?? "left",
+        strokeStyle: item.strokeStyle ?? "solid",
       })),
     }),
     [height, leftAxisFormat, resolvedSeries, rightAxisFormat, timeSpanBucket],
@@ -170,6 +172,7 @@ export function TimeSeriesChart({
           label: string;
           color: string;
           scale: MetricScale;
+          strokeStyle: "solid" | "dashed";
         }>;
       },
     [configKey],
@@ -249,6 +252,7 @@ export function TimeSeriesChart({
               label: item.label,
               stroke: item.color,
               width: 2,
+              dash: item.strokeStyle === "dashed" ? [8, 6] : [],
               scale: item.scale === "right" ? "y2" : "y",
               points: { show: false },
               spanGaps: false,

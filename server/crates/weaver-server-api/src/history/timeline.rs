@@ -317,17 +317,16 @@ fn collect_finalizing_download_spans(events: &[StoredJobEvent]) -> Vec<JobTimeli
             EventKind::JobPaused => {
                 close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
             }
-            EventKind::JobResumed => {
-                if finalization_pending && open.is_none() {
-                    spans.push(JobTimelineSpan {
-                        started_at: at,
-                        ended_at: None,
-                        state: TimelineSpanState::Running,
-                        label: None,
-                    });
-                    open = Some(spans.len() - 1);
-                }
+            EventKind::JobResumed if finalization_pending && open.is_none() => {
+                spans.push(JobTimelineSpan {
+                    started_at: at,
+                    ended_at: None,
+                    state: TimelineSpanState::Running,
+                    label: None,
+                });
+                open = Some(spans.len() - 1);
             }
+            EventKind::JobResumed => {}
             EventKind::JobVerificationStarted
             | EventKind::RepairStarted
             | EventKind::ExtractionReady

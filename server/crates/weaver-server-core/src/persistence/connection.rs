@@ -1,7 +1,11 @@
+#[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -15,6 +19,7 @@ pub use crate::jobs::{
     ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
     ExtractionChunk, RecoveredJob,
 };
+#[cfg(test)]
 use crate::operations::metrics_store::LEGACY_METRICS_RETENTION_SECS;
 pub use crate::operations::{
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
@@ -22,11 +27,14 @@ pub use crate::operations::{
 };
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
+#[cfg(test)]
 const SCHEMA_VERSION: i64 = 24;
+#[cfg(test)]
 const LEGACY_SCHEMA_VERSION: i64 = 20;
 const DEFAULT_SQLITE_READ_CONNECTIONS: usize = 4;
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
 
+#[cfg(test)]
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -49,6 +57,7 @@ fn ensure_column(
     Ok(())
 }
 
+#[cfg(test)]
 fn current_epoch_sec() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -56,6 +65,7 @@ fn current_epoch_sec() -> i64 {
         .as_secs() as i64
 }
 
+#[cfg(test)]
 fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, StateError> {
     let mut stmt = conn
         .prepare("PRAGMA database_list")
@@ -76,6 +86,7 @@ fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, StateError> 
     Ok(None)
 }
 
+#[cfg(test)]
 fn file_size_bytes(path: Option<&Path>) -> Option<u64> {
     path.and_then(|value| fs::metadata(value).ok())
         .map(|meta| meta.len())
@@ -137,7 +148,7 @@ impl ReadPool {
 enum DbWriteCommand {
     ArchiveJob {
         job_id: crate::jobs::ids::JobId,
-        history: crate::history::JobHistoryRow,
+        history: Box<crate::history::JobHistoryRow>,
     },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
@@ -147,6 +158,7 @@ enum DbWriteCommand {
     },
 }
 
+#[cfg(test)]
 fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateError> {
     let integration_event_rows_deleted: i64 = conn
         .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
@@ -164,12 +176,22 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
         [],
     )
     .map_err(|e| StateError::Database(e.to_string()))?;
-    let metrics_rows_deleted = conn
-        .execute(
+    let metrics_scrapes_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_scrapes'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let metrics_rows_deleted = if metrics_scrapes_exists > 0 {
+        conn.execute(
             "DELETE FROM metrics_scrapes WHERE scraped_at_epoch_sec < ?1",
             [metrics_cutoff_epoch_sec],
         )
-        .map_err(|e| StateError::Database(e.to_string()))?;
+        .map_err(|e| StateError::Database(e.to_string()))?
+    } else {
+        0
+    };
 
     let vacuum_succeeded = match conn.execute_batch("VACUUM") {
         Ok(()) => true,
@@ -204,6 +226,7 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
     Ok(())
 }
 
+#[cfg(test)]
 fn backfill_persisted_nzb_blobs(conn: &Connection, table: &str) -> Result<(), StateError> {
     let mut select = conn
         .prepare(&format!(
@@ -267,6 +290,7 @@ pub struct Database {
     pending_archive_retries: Arc<AtomicUsize>,
     pending_archive_notify: Arc<Notify>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
+    _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl Database {
@@ -289,6 +313,7 @@ impl Database {
             pending_archive_retries: Arc::new(AtomicUsize::new(0)),
             pending_archive_notify: Arc::new(Notify::new()),
             encryption_key: None,
+            _ephemeral_dir: None,
         };
         db.spawn_writer_task(writer_rx);
         Ok(db)
@@ -296,7 +321,12 @@ impl Database {
 
     /// Open an in-memory database (for tests).
     pub fn open_in_memory() -> Result<Self, StateError> {
-        let conn = Connection::open_in_memory().map_err(|e| StateError::Database(e.to_string()))?;
+        let tempdir =
+            Arc::new(tempfile::tempdir().map_err(|e| StateError::Database(e.to_string()))?);
+        let path = tempdir.path().join("weaver.db");
+        crate::schema_migrations::run_embedded_migrations_on_path_blocking(&path)?;
+
+        let conn = Connection::open(&path).map_err(|e| StateError::Database(e.to_string()))?;
         configure_connection(&conn, true)?;
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
@@ -306,8 +336,8 @@ impl Database {
             pending_archive_retries: Arc::new(AtomicUsize::new(0)),
             pending_archive_notify: Arc::new(Notify::new()),
             encryption_key: None,
+            _ephemeral_dir: Some(tempdir),
         };
-        db.create_schema()?;
         db.spawn_writer_task(writer_rx);
         Ok(db)
     }
@@ -331,6 +361,7 @@ impl Database {
         Ok(count == 0)
     }
 
+    #[cfg(test)]
     fn create_schema(&self) -> Result<(), StateError> {
         let conn = self.conn();
         conn.execute_batch(
@@ -941,7 +972,7 @@ impl Database {
                     DbWriteCommand::ArchiveJob { job_id, history } => {
                         let db = db.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(error) = db.archive_job(job_id, &history) {
+                            if let Err(error) = db.archive_job(job_id, history.as_ref()) {
                                 tracing::warn!(
                                     job_id = job_id.0,
                                     error = %error,
@@ -1004,7 +1035,10 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
-        let command = DbWriteCommand::ArchiveJob { job_id, history };
+        let command = DbWriteCommand::ArchiveJob {
+            job_id,
+            history: Box::new(history),
+        };
         match self.writer_tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
@@ -1039,7 +1073,10 @@ impl Database {
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
         self.writer_tx
-            .send(DbWriteCommand::ArchiveJob { job_id, history })
+            .send(DbWriteCommand::ArchiveJob {
+                job_id,
+                history: Box::new(history),
+            })
             .await
             .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))
     }

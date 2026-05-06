@@ -25,6 +25,15 @@ pub struct SubmittedJob {
     pub created_at_epoch_ms: f64,
 }
 
+struct PreparedSubmission {
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    submit_started: Instant,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitNzbError {
     #[error("NZB parse error: {0}")]
@@ -147,16 +156,20 @@ async fn submit_prepared_nzb(
     handle: &SchedulerHandle,
     config: &SharedConfig,
     nzb: Nzb,
-    nzb_zstd: Vec<u8>,
-    filename: Option<String>,
-    password: Option<String>,
-    category: Option<String>,
-    metadata: Vec<(String, String)>,
-    submit_started: Instant,
+    prepared: PreparedSubmission,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     if nzb.files.is_empty() {
         return Err(SubmitNzbError::Empty);
     }
+
+    let PreparedSubmission {
+        nzb_zstd,
+        filename,
+        password,
+        category,
+        metadata,
+        submit_started,
+    } = prepared;
 
     let resolved_category = resolve_submission_category(config, category.as_deref()).await;
     let job_id = next_submission_job_id();
@@ -207,17 +220,19 @@ pub async fn submit_nzb_bytes(
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
     let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
-    let nzb_zstd = persisted_nzb::compress_nzb_bytes(&nzb_bytes).map_err(SubmitNzbError::Save)?;
+    let nzb_zstd = persisted_nzb::compress_nzb_bytes(nzb_bytes).map_err(SubmitNzbError::Save)?;
     submit_prepared_nzb(
         handle,
         config,
         nzb,
-        nzb_zstd,
-        filename,
-        password,
-        category,
-        metadata,
-        submit_started,
+        PreparedSubmission {
+            nzb_zstd,
+            filename,
+            password,
+            category,
+            metadata,
+            submit_started,
+        },
     )
     .await
 }
@@ -287,12 +302,14 @@ where
         handle,
         config,
         nzb,
-        nzb_zstd,
-        filename,
-        password,
-        category,
-        metadata,
-        submit_started,
+        PreparedSubmission {
+            nzb_zstd,
+            filename,
+            password,
+            category,
+            metadata,
+            submit_started,
+        },
     )
     .await
 }
@@ -307,17 +324,27 @@ pub async fn submit_staged_nzb_zstd(
     metadata: Vec<(String, String)>,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
-    let nzb = persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd)?;
+    let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) {
+        Ok(nzb) => nzb,
+        Err(persisted_nzb::PersistedNzbError::Io(error)) => {
+            return Err(SubmitNzbError::Save(error));
+        }
+        Err(persisted_nzb::PersistedNzbError::Parse(error)) => {
+            return Err(SubmitNzbError::Parse(error));
+        }
+    };
     submit_prepared_nzb(
         handle,
         config,
         nzb,
-        nzb_zstd,
-        filename,
-        password,
-        category,
-        metadata,
-        submit_started,
+        PreparedSubmission {
+            nzb_zstd,
+            filename,
+            password,
+            category,
+            metadata,
+            submit_started,
+        },
     )
     .await
 }

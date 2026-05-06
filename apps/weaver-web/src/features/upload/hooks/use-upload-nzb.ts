@@ -295,7 +295,7 @@ export function useUploadNzb(options?: {
         const stagedUploadId = payload.data?.stageNzbUpload?.stagedUploadId ?? undefined;
         if (!isEntryCurrent(entry.localId, generation)) {
           if (stagedUploadId) {
-            discardKnownStageIds([stagedUploadId]);
+            discardKnownStageIds([stagedUploadId], !mountedRef.current);
           }
           return;
         }
@@ -427,8 +427,6 @@ export function useUploadNzb(options?: {
       if (!target) {
         return;
       }
-
-      generationRef.current += 1;
       controllerRef.current.get(localId)?.abort();
       controllerRef.current.delete(localId);
       if (target.stagedUploadId) {

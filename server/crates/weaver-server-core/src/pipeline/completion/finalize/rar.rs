@@ -861,7 +861,6 @@ impl Pipeline {
 
         if let Err(error) = self.start_move_to_complete(job_id).await {
             self.fail_job(job_id, error);
-            return;
         }
     }
 

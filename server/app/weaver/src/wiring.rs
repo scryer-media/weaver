@@ -206,10 +206,10 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
         }
     }
 
-    if !batch.is_empty() {
-        if let Err(error) = db.queue_job_events(std::mem::take(&mut batch)).await {
-            tracing::warn!(error = %error, "failed to queue final job events");
-        }
+    if !batch.is_empty()
+        && let Err(error) = db.queue_job_events(std::mem::take(&mut batch)).await
+    {
+        tracing::warn!(error = %error, "failed to queue final job events");
     }
     if let Err(error) = db.flush_write_queue().await {
         tracing::warn!(error = %error, "failed to flush final job event writes");

@@ -6,8 +6,8 @@ use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
 
 use crate::auth::LoginAuthCache;
-use crate::jobs::staging::StagedUploadManager;
 use crate::jobs::replay::QueueEventReplay;
+use crate::jobs::staging::StagedUploadManager;
 use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 

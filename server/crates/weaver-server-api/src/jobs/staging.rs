@@ -19,9 +19,6 @@ pub(crate) struct StagedUploadEntry {
     pub(crate) id: String,
     pub(crate) owner: CallerIdentity,
     pub(crate) filename: String,
-    pub(crate) display_name: String,
-    pub(crate) total_files: u32,
-    pub(crate) total_bytes: u64,
     pub(crate) nzb_zstd: Vec<u8>,
     created_at: Instant,
     last_touched_at: Instant,
@@ -111,9 +108,6 @@ impl StagedUploadManager {
             id: staged_upload_id.clone(),
             owner,
             filename: filename.clone(),
-            display_name: spec.name.clone(),
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
             nzb_zstd,
             created_at: now,
             last_touched_at: now,
@@ -306,7 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn take_for_submit_is_scoped_to_owner() {
-        let manager = StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
+        let manager =
+            StagedUploadManager::with_timing(Duration::from_secs(60), Duration::from_secs(60));
         let owner_a = CallerIdentity::Local([1; 32]);
         let owner_b = CallerIdentity::Local([2; 32]);
         let staged = manager
@@ -314,7 +309,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (found, missing) = manager.take_for_submit(&owner_b, &[staged.staged_upload_id.clone()]);
+        let (found, missing) =
+            manager.take_for_submit(&owner_b, &[staged.staged_upload_id.clone()]);
         assert!(found.is_empty());
         assert_eq!(missing, vec![staged.staged_upload_id]);
     }

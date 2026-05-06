@@ -7,6 +7,8 @@ use crate::persistence::Database;
 
 use super::repository::db_err;
 
+type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
+
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
         let conn = self.read_conn();
@@ -194,7 +196,7 @@ impl Database {
     pub fn load_history_job_persisted_nzb(
         &self,
         job_id: u64,
-    ) -> Result<Option<(PathBuf, Option<Vec<u8>>)>, StateError> {
+    ) -> Result<Option<PersistedNzbRecord>, StateError> {
         let conn = self.read_conn();
         let mut stmt = conn
             .prepare(

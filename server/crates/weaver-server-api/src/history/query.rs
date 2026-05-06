@@ -454,11 +454,9 @@ fn history_matches_search(item: &HistoryItem, search: Option<&str>) -> bool {
     };
 
     [
-        item.name.as_str(),
         item.display_title.as_str(),
         item.original_title.as_str(),
-        item.category.as_deref().unwrap_or_default(),
-        item.output_dir.as_deref().unwrap_or_default(),
+        item.name.as_str(),
     ]
     .into_iter()
     .any(|value| value.to_lowercase().contains(search))

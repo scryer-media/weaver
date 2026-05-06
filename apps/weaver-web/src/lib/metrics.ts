@@ -38,13 +38,30 @@ export interface MetricsPageData {
 }
 
 export const METRICS_RANGE_OPTIONS = [
-  { minutes: 10, labelKey: "metrics.range10m" },
-  { minutes: 60, labelKey: "metrics.range1h" },
-  { minutes: 360, labelKey: "metrics.range6h" },
-  { minutes: 1440, labelKey: "metrics.range24h" },
+  { range: "TEN_MINUTES", minutes: 10, labelKey: "metrics.range10m" },
+  { range: "ONE_HOUR", minutes: 60, labelKey: "metrics.range1h" },
+  { range: "SIX_HOURS", minutes: 360, labelKey: "metrics.range6h" },
+  { range: "TWENTY_FOUR_HOURS", minutes: 1440, labelKey: "metrics.range24h" },
+  { range: "SEVEN_DAYS", minutes: 10_080, labelKey: "metrics.range7d" },
+  { range: "THIRTY_DAYS", minutes: 43_200, labelKey: "metrics.range30d" },
 ] as const;
 
-export type MetricsRangeMinutes = (typeof METRICS_RANGE_OPTIONS)[number]["minutes"];
+export type MetricsHistoryRange = (typeof METRICS_RANGE_OPTIONS)[number]["range"];
+export type MetricsHistorySeriesVariant = "ACTUAL" | "AVG" | "PEAK";
+
+export function metricsRangeWindowMinutes(range: MetricsHistoryRange): number {
+  return METRICS_RANGE_OPTIONS.find((option) => option.range === range)?.minutes ?? 60;
+}
+
+export function isRollupMetricsRange(range: MetricsHistoryRange): boolean {
+  return range !== "TEN_MINUTES" && range !== "ONE_HOUR";
+}
+
+export function preferredMetricsSeriesVariant(
+  range: MetricsHistoryRange,
+): MetricsHistorySeriesVariant {
+  return isRollupMetricsRange(range) ? "AVG" : "ACTUAL";
+}
 
 export const JOB_STATUS_HISTORY_METRIC = "weaver_pipeline_jobs" as const;
 
@@ -91,7 +108,7 @@ const LIVE_JOB_STATUS_TO_METRIC_LABEL: Record<string, JobStatusMetricLabel> = {
   QUEUED: "queued",
   DOWNLOADING: "downloading",
   PAUSED: "paused",
-  CHECKING: "verifying",
+  CHECKING: "checking",
   VERIFYING: "verifying",
   QUEUED_REPAIR: "queued_repair",
   REPAIRING: "repairing",
@@ -114,7 +131,7 @@ export function humanizeJobStatusLabel(status: string): string {
     .join(" ");
 }
 
-export const SNAPSHOT_HISTORY_METRIC_NAMES = [
+export const COUNTER_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_bytes_downloaded_total",
   "weaver_pipeline_bytes_decoded_total",
   "weaver_pipeline_bytes_committed_total",
@@ -126,6 +143,9 @@ export const SNAPSHOT_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_articles_not_found_total",
   "weaver_pipeline_decode_errors_total",
   "weaver_pipeline_crc_errors_total",
+] as const;
+
+export const GAUGE_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_current_download_speed_bytes_per_second",
   "weaver_pipeline_download_queue_depth",
   "weaver_pipeline_decode_pending",
@@ -141,11 +161,18 @@ export const SNAPSHOT_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_decode_rate_mebibytes_per_second",
 ] as const;
 
+export const SNAPSHOT_HISTORY_METRIC_NAMES = [
+  ...COUNTER_HISTORY_METRIC_NAMES,
+  ...GAUGE_HISTORY_METRIC_NAMES,
+] as const;
+
 export const HISTORY_METRIC_NAMES = [
   ...SNAPSHOT_HISTORY_METRIC_NAMES,
   JOB_STATUS_HISTORY_METRIC,
 ] as const satisfies readonly string[];
 
+export type CounterHistoryMetricName = (typeof COUNTER_HISTORY_METRIC_NAMES)[number];
+export type GaugeHistoryMetricName = (typeof GAUGE_HISTORY_METRIC_NAMES)[number];
 export type SnapshotHistoryMetricName = (typeof SNAPSHOT_HISTORY_METRIC_NAMES)[number];
 export type HistoryMetricName = SnapshotHistoryMetricName | typeof JOB_STATUS_HISTORY_METRIC;
 
@@ -199,11 +226,14 @@ export type ChartColorToken =
   | "indigo"
   | "green";
 
+export type MetricHistoryLineKind = "counter" | "gauge";
+export type ChartDisplayVariant = "actual" | "avg" | "peak";
+
 export interface MetricChartLineDefinition {
-  metric: HistoryMetricName;
+  metric: SnapshotHistoryMetricName;
   labelKey: string;
   colorToken: ChartColorToken;
-  mode: "raw" | "rate";
+  kind: MetricHistoryLineKind;
   format: MetricValueFormat;
   scale?: MetricScale;
 }
@@ -228,21 +258,21 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_bytes_downloaded_total",
         labelKey: "metrics.downloaded",
         colorToken: "sky",
-        mode: "rate",
+        kind: "counter",
         format: "bytesPerSecond",
       },
       {
         metric: "weaver_pipeline_bytes_decoded_total",
         labelKey: "metrics.decoded",
         colorToken: "teal",
-        mode: "rate",
+        kind: "counter",
         format: "bytesPerSecond",
       },
       {
         metric: "weaver_pipeline_bytes_committed_total",
         labelKey: "metrics.committed",
         colorToken: "orange",
-        mode: "rate",
+        kind: "counter",
         format: "bytesPerSecond",
       },
     ],
@@ -257,35 +287,35 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_segments_downloaded_total",
         labelKey: "metrics.segmentsDownloaded",
         colorToken: "sky",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_segments_decoded_total",
         labelKey: "metrics.segmentsDecoded",
         colorToken: "teal",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_segments_committed_total",
         labelKey: "metrics.segmentsCommitted",
         colorToken: "orange",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_segments_retried_total",
         labelKey: "metrics.segmentsRetried",
         colorToken: "violet",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_segments_failed_permanent_total",
         labelKey: "metrics.failedPermanent",
         colorToken: "red",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
     ],
@@ -300,21 +330,21 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_articles_not_found_total",
         labelKey: "metrics.articlesNotFound",
         colorToken: "amber",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_decode_errors_total",
         labelKey: "metrics.decodeErrors",
         colorToken: "red",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_crc_errors_total",
         labelKey: "metrics.crcErrors",
         colorToken: "magenta",
-        mode: "rate",
+        kind: "counter",
         format: "countPerSecond",
       },
     ],
@@ -329,7 +359,7 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_current_download_speed_bytes_per_second",
         labelKey: "metrics.downloadSpeed",
         colorToken: "sky",
-        mode: "raw",
+        kind: "gauge",
         format: "bytesPerSecond",
       },
     ],
@@ -344,28 +374,28 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_download_queue_depth",
         labelKey: "metrics.downloadQueue",
         colorToken: "sky",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
       {
         metric: "weaver_pipeline_decode_pending",
         labelKey: "metrics.decodePending",
         colorToken: "teal",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
       {
         metric: "weaver_pipeline_commit_pending",
         labelKey: "metrics.commitPending",
         colorToken: "orange",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
       {
         metric: "weaver_pipeline_recovery_queue_depth",
         labelKey: "metrics.recoveryQueue",
         colorToken: "violet",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
     ],
@@ -380,21 +410,21 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_verify_active",
         labelKey: "metrics.verifyActive",
         colorToken: "teal",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
       {
         metric: "weaver_pipeline_repair_active",
         labelKey: "metrics.repairActive",
         colorToken: "amber",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
       {
         metric: "weaver_pipeline_extract_active",
         labelKey: "metrics.extractActive",
         colorToken: "indigo",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
       },
     ],
@@ -410,14 +440,14 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_write_buffered_bytes",
         labelKey: "metrics.writeBufferedBytes",
         colorToken: "orange",
-        mode: "raw",
+        kind: "gauge",
         format: "bytes",
       },
       {
         metric: "weaver_pipeline_write_buffered_segments",
         labelKey: "metrics.writeBufferedSegments",
         colorToken: "violet",
-        mode: "raw",
+        kind: "gauge",
         format: "count",
         scale: "right",
       },
@@ -433,7 +463,7 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_disk_write_latency_microseconds",
         labelKey: "metrics.diskWriteLatency",
         colorToken: "red",
-        mode: "raw",
+        kind: "gauge",
         format: "latencyUs",
       },
     ],
@@ -449,14 +479,14 @@ export const METRIC_CHART_DEFINITIONS: readonly MetricChartDefinition[] = [
         metric: "weaver_pipeline_articles_per_second",
         labelKey: "metrics.articlesPerSec",
         colorToken: "sky",
-        mode: "raw",
+        kind: "gauge",
         format: "countPerSecond",
       },
       {
         metric: "weaver_pipeline_decode_rate_mebibytes_per_second",
         labelKey: "metrics.decodeRate",
         colorToken: "green",
-        mode: "raw",
+        kind: "gauge",
         format: "mibPerSecond",
         scale: "right",
       },
@@ -518,5 +548,7 @@ export function formatMetricValue(format: MetricValueFormat, value: number): str
       return formatLatency(safeValue);
     case "mibPerSecond":
       return `${formatRoundedNumber(safeValue, safeValue >= 100 ? "whole" : "one")} MiB/s`;
+    default:
+      return formatRoundedNumber(safeValue, "whole");
   }
 }

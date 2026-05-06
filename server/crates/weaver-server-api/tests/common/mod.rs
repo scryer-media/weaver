@@ -199,9 +199,7 @@ impl TestHarness {
 
     /// Execute a GraphQL query/mutation as a specific caller scope.
     pub async fn execute_as(&self, query: &str, scope: CallerScope) -> Response {
-        let request = Request::new(query)
-            .data(scope)
-            .data(Self::local_identity());
+        let request = Request::new(query).data(scope).data(Self::local_identity());
         self.schema.execute(request).await
     }
 

@@ -22,7 +22,7 @@ import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import {
   METRICS_RANGE_OPTIONS,
   type MetricsPageData,
-  type MetricsRangeMinutes,
+  type MetricsHistoryRange,
 } from "@/lib/metrics";
 
 export function MetricsPage() {
@@ -32,7 +32,7 @@ export function MetricsPage() {
   const liveJobs = useLiveJobs();
   const livePaused = useLivePaused();
   const liveSpeed = useLiveSpeed();
-  const [historyRange, setHistoryRange] = useState<MetricsRangeMinutes>(60);
+  const [historyRange, setHistoryRange] = useState<MetricsHistoryRange>("ONE_HOUR");
   const [polledSnapshot, setPolledSnapshot] = useState<MetricsPageData | undefined>();
   const [{ data: queryData, fetching, error }] = useQuery<MetricsPageData>({
     query: METRICS_PAGE_QUERY,
@@ -86,7 +86,7 @@ export function MetricsPage() {
       })
     : "\u2014";
   const history = useMetricsHistory({
-    minutes: historyRange,
+    range: historyRange,
     liveMetrics: metrics,
     liveJobs,
   });
@@ -196,13 +196,13 @@ export function MetricsPage() {
               <div className="inline-flex rounded-full border border-border/70 bg-background/80 p-1">
                 {METRICS_RANGE_OPTIONS.map((option) => (
                   <Button
-                    key={option.minutes}
+                    key={option.range}
                     type="button"
                     size="sm"
-                    variant={historyRange === option.minutes ? "default" : "ghost"}
+                    variant={historyRange === option.range ? "default" : "ghost"}
                     className="rounded-full px-4"
                     disabled={history.isLoading}
-                    onClick={() => setHistoryRange(option.minutes)}
+                    onClick={() => setHistoryRange(option.range)}
                   >
                     {t(option.labelKey)}
                   </Button>
@@ -261,11 +261,12 @@ export function MetricsPage() {
                   ) : (
                     <TimeSeriesChart
                       data={chart.data}
-                      series={chart.definition.lines.map((line) => ({
-                        label: t(line.labelKey),
+                      series={chart.series.map((line) => ({
+                        label: formatChartSeriesLabel(t, line.labelKey, line.variant),
                         colorToken: line.colorToken,
                         scale: line.scale,
                         format: line.format,
+                        strokeStyle: line.variant === "peak" ? "dashed" : "solid",
                       }))}
                       leftAxisFormat={chart.definition.leftAxisFormat}
                       rightAxisFormat={chart.definition.rightAxisFormat}
@@ -309,4 +310,17 @@ function MetricTile({
       <div className="mt-2 text-base font-semibold text-foreground tabular-nums">{value}</div>
     </div>
   );
+}
+
+function formatChartSeriesLabel(
+  t: (key: string) => string,
+  labelKey: string,
+  variant: "actual" | "avg" | "peak",
+) {
+  if (variant === "actual") {
+    return t(labelKey);
+  }
+
+  const suffix = variant === "avg" ? t("metrics.seriesAvg") : t("metrics.seriesPeak");
+  return `${t(labelKey)} ${suffix}`;
 }
