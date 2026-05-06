@@ -1,4 +1,5 @@
 use super::*;
+use weaver_nntp::client::FetchAttemptOutcome;
 
 enum DispatchAttempt {
     Dispatched,
@@ -512,19 +513,23 @@ impl Pipeline {
         let exclude_servers = work.exclude_servers;
 
         tokio::spawn(async move {
-            let data = if exclude_servers.is_empty() {
-                nntp.fetch_body_with_groups(&message_id, &groups).await
-            } else {
-                nntp.fetch_body_with_groups_excluding(&message_id, &groups, &exclude_servers)
+            let trace = if exclude_servers.is_empty() {
+                nntp.fetch_body_with_groups_traced(&message_id, &groups)
                     .await
-            }
-            .map(DownloadPayload::Raw)
-            .map_err(|e| DownloadError::Fetch(e.to_string()));
+            } else {
+                nntp.fetch_body_with_groups_excluding_traced(&message_id, &groups, &exclude_servers)
+                    .await
+            };
+            let data = trace
+                .result
+                .map(DownloadPayload::Raw)
+                .map_err(|e| DownloadError::Fetch(e.to_string()));
 
             let _ = tx
                 .send(DownloadResult {
                     segment_id,
                     data,
+                    attempts: trace.attempts,
                     is_recovery,
                     retry_count,
                     exclude_servers,
@@ -578,6 +583,34 @@ impl Pipeline {
         }
 
         let excluded_servers = result.exclude_servers.clone();
+
+        for (attempt_index, attempt) in result.attempts.iter().enumerate() {
+            let outcome = match attempt.outcome {
+                FetchAttemptOutcome::Success => crate::events::model::ServerAttemptOutcome::Success,
+                FetchAttemptOutcome::NotFound => {
+                    crate::events::model::ServerAttemptOutcome::NotFound
+                }
+                FetchAttemptOutcome::AuthenticationFailure => {
+                    crate::events::model::ServerAttemptOutcome::AuthenticationFailure
+                }
+                FetchAttemptOutcome::TransientFailure => {
+                    crate::events::model::ServerAttemptOutcome::TransientFailure
+                }
+                FetchAttemptOutcome::PermanentFailure => {
+                    crate::events::model::ServerAttemptOutcome::PermanentFailure
+                }
+            };
+            let _ = self.event_tx.send(PipelineEvent::ServerAttempt {
+                segment_id: result.segment_id,
+                server_id: crate::ServerId(attempt.server_idx as u16),
+                attempt: (attempt_index as u32) + 1,
+                retry_count: result.retry_count,
+                latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
+                outcome,
+                error: attempt.error.clone(),
+                is_recovery: result.is_recovery,
+            });
+        }
 
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {

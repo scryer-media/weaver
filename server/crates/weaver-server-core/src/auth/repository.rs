@@ -20,7 +20,7 @@ pub struct AuthCredentials {
 impl Database {
     /// Get the stored login credentials, if any.
     pub fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT username, password_hash, created_at, updated_at FROM auth_credentials WHERE id = 1",
             [],

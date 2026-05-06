@@ -7,7 +7,7 @@ use super::repository::db_err;
 
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
@@ -52,7 +52,7 @@ impl Database {
         &self,
         filter: &HistoryFilter,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
 
         let mut sql = String::from(
             "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
@@ -124,7 +124,7 @@ impl Database {
         item_id: Option<u64>,
         limit: Option<u32>,
     ) -> Result<Vec<IntegrationEventRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
 
         let mut sql = String::from(
             "SELECT id, timestamp, kind, item_id, payload_json
@@ -174,7 +174,7 @@ impl Database {
     }
 
     pub fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row("SELECT MAX(id) FROM integration_events", [], |row| {
             row.get(0)
         })
@@ -182,7 +182,7 @@ impl Database {
     }
 
     pub fn max_job_id(&self) -> Result<u64, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let max: Option<i64> = conn
             .query_row("SELECT MAX(job_id) FROM job_history", [], |row| row.get(0))
             .map_err(db_err)?;

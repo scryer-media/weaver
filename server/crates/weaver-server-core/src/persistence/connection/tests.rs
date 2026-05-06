@@ -4,6 +4,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::OptionalExtension;
 
+fn test_db(conn: Connection) -> Database {
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+    Database {
+        writer_conn: Arc::new(Mutex::new(conn)),
+        read_pool: None,
+        writer_tx,
+        encryption_key: None,
+    }
+}
+
 #[test]
 fn open_in_memory_creates_schema() {
     let db = Database::open_in_memory().unwrap();
@@ -68,10 +78,7 @@ fn migrate_v3_creates_extraction_chunks_with_appended_once() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -100,10 +107,7 @@ fn migrate_v6_creates_rss_tables() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -164,10 +168,7 @@ fn migrate_v10_adds_optional_recovery_history_columns() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -207,10 +208,7 @@ fn migrate_v11_adds_restart_runtime_state() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -256,10 +254,7 @@ fn migrate_v12_adds_bandwidth_usage_ledger() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -287,10 +282,7 @@ fn migrate_v14_adds_metrics_scrapes() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -318,10 +310,7 @@ fn migrate_v15_adds_active_file_progress() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -361,10 +350,7 @@ fn migrate_v16_adds_active_runtime_columns() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -412,10 +398,7 @@ fn migrate_v18_adds_two_lane_runtime_columns() {
     )
     .unwrap();
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(conn)),
-        encryption_key: None,
-    };
+    let db = test_db(conn);
     db.create_schema().unwrap();
 
     let conn = db.conn();
@@ -532,10 +515,7 @@ fn assert_legacy_cleanup_from(start_version: i64) {
     .unwrap();
     drop(conn);
 
-    let db = Database {
-        conn: Arc::new(Mutex::new(Connection::open(&db_path).unwrap())),
-        encryption_key: None,
-    };
+    let db = test_db(Connection::open(&db_path).unwrap());
     db.create_schema().unwrap();
 
     let conn = db.conn();

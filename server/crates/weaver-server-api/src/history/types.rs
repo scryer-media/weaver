@@ -60,7 +60,7 @@ pub enum HistoryDiagnosticStage {
 pub struct HistoryDiagnosticRun {
     pub source_job_id: u64,
     pub diagnostic_job_id: u64,
-    pub smg_diagnostic_id: Option<String>,
+    pub diagnostic_id: Option<String>,
     pub stage: HistoryDiagnosticStage,
     pub include_server_hostnames: bool,
     pub rerun_succeeded: Option<bool>,
@@ -246,6 +246,7 @@ pub enum EventKind {
     DownloadStarted,
     DownloadFinished,
     DownloadPipelineDrained,
+    ServerAttempt,
     ArticleDownloaded,
     ArticleNotFound,
     SegmentDecoded,
@@ -292,6 +293,7 @@ impl std::str::FromStr for EventKind {
             "DownloadStarted" => Ok(Self::DownloadStarted),
             "DownloadFinished" => Ok(Self::DownloadFinished),
             "DownloadPipelineDrained" => Ok(Self::DownloadPipelineDrained),
+            "ServerAttempt" => Ok(Self::ServerAttempt),
             "ArticleDownloaded" => Ok(Self::ArticleDownloaded),
             "ArticleNotFound" => Ok(Self::ArticleNotFound),
             "SegmentDecoded" => Ok(Self::SegmentDecoded),
@@ -465,7 +467,7 @@ pub fn history_diagnostic_run_from_core(row: DiagnosticRunRow) -> HistoryDiagnos
     HistoryDiagnosticRun {
         source_job_id: row.source_job_id,
         diagnostic_job_id: row.diagnostic_job_id,
-        smg_diagnostic_id: row.smg_diagnostic_id,
+        diagnostic_id: row.diagnostic_id,
         stage: history_diagnostic_stage_from_core(row.stage),
         include_server_hostnames: row.include_server_hostnames,
         rerun_succeeded: row.rerun_succeeded,

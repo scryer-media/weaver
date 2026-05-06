@@ -4,6 +4,7 @@ pub fn should_record_job_event(event: &PipelineEvent) -> bool {
     !matches!(
         event,
         PipelineEvent::ArticleDownloaded { .. }
+            | PipelineEvent::ServerAttempt { .. }
             | PipelineEvent::ArticleNotFound { .. }
             | PipelineEvent::SegmentQueued { .. }
             | PipelineEvent::SegmentDecoded { .. }
@@ -58,6 +59,7 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::FileMissing { file_id, .. } => Some(file_id.job_id.0),
         PipelineEvent::SegmentQueued { segment_id, .. }
         | PipelineEvent::ArticleDownloaded { segment_id, .. }
+        | PipelineEvent::ServerAttempt { segment_id, .. }
         | PipelineEvent::ArticleNotFound { segment_id }
         | PipelineEvent::SegmentRetryScheduled { segment_id, .. }
         | PipelineEvent::SegmentFailedPermanent { segment_id, .. }

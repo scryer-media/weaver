@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::history::types::{history_delete_row_state_from_core, history_diagnostic_run_from_core};
@@ -187,10 +188,15 @@ impl HistoryQuery {
             Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
+        let live_only = live_job.is_some();
 
         let (events, history) = tokio::task::spawn_blocking(move || {
             let events = db.get_job_events(job_id)?;
-            let history = db.get_job_history(job_id)?;
+            let history = if live_only {
+                None
+            } else {
+                db.get_job_history(job_id)?
+            };
             Ok::<_, weaver_server_core::StateError>((events, history))
         })
         .await
@@ -229,16 +235,22 @@ pub(crate) async fn load_job_detail_snapshot(
     db: weaver_server_core::Database,
     job_id: u64,
 ) -> Result<JobDetailSnapshot> {
+    let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
         Ok(info) => Some(info),
         Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
         Err(error) => return Err(error.into()),
     };
+    let live_only = live_job.is_some();
 
     let (events, history, delete_states, diagnostic_states) =
         tokio::task::spawn_blocking(move || {
             let events = db.get_job_events(job_id)?;
-            let history = db.get_job_history(job_id)?;
+            let history = if live_only {
+                None
+            } else {
+                db.get_job_history(job_id)?
+            };
             let delete_states =
                 load_history_delete_states(&db, history.iter().map(|row| row.job_id))?;
             let diagnostic_states =
@@ -286,6 +298,22 @@ pub(crate) async fn load_job_detail_snapshot(
             timestamp: event.timestamp as f64,
         })
         .collect();
+
+    let elapsed = snapshot_started.elapsed();
+    if elapsed > Duration::from_millis(200) {
+        tracing::debug!(
+            job_id,
+            elapsed_ms = elapsed.as_millis(),
+            snapshot_mode = if queue_item.is_some() && history_item.is_none() {
+                "live-only"
+            } else if queue_item.is_some() && history_item.is_some() {
+                "live+history"
+            } else {
+                "history-only"
+            },
+            "slow job detail snapshot"
+        );
+    }
 
     Ok(JobDetailSnapshot {
         queue_item,

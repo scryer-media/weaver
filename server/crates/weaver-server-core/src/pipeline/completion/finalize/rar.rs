@@ -855,31 +855,14 @@ impl Pipeline {
             NestedExtractionDecision::PreserveOutputsAtDepthLimit => {}
         }
 
-        self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
         let _ = self
             .event_tx
             .send(PipelineEvent::ExtractionComplete { job_id });
 
-        if let Err(error) = self.move_to_complete(job_id).await {
+        if let Err(error) = self.start_move_to_complete(job_id).await {
             self.fail_job(job_id, error);
             return;
         }
-
-        self.transition_completed_runtime(job_id);
-        // Ensure DownloadFinished is journaled before JobCompleted so the
-        // timeline shows an accurate download duration.
-        if self.active_download_passes.remove(&job_id) {
-            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
-                job_id,
-                finalization_pending: false,
-            });
-        }
-        self.jobs_finalizing_download.remove(&job_id);
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_rar_runtime(job_id);
-        self.job_order.retain(|id| *id != job_id);
-        let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-        self.record_job_history(job_id);
     }
 
     pub(super) async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {

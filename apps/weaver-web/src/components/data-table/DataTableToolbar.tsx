@@ -9,6 +9,7 @@ type DataTableToolbarProps = {
   searchPlaceholder: string;
   clearLabel?: string;
   onClear?: () => void;
+  className?: string;
   centerContent?: ReactNode;
   searchContainerClassName?: string;
   searchInputClassName?: string;
@@ -23,6 +24,7 @@ export function DataTableToolbar({
   searchPlaceholder,
   clearLabel,
   onClear,
+  className,
   centerContent,
   searchContainerClassName,
   searchInputClassName,
@@ -31,7 +33,7 @@ export function DataTableToolbar({
   children,
 }: DataTableToolbarProps) {
   return (
-    <div className="flex flex-col gap-3 lg:grid lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center lg:gap-4">
+    <div className={cn("flex flex-col gap-3 lg:grid lg:grid-cols-[auto_minmax(0,1fr)_auto] lg:items-center lg:gap-4", className)}>
       <div className={cn("max-w-md flex-1", searchContainerClassName)}>
         <Input
           className={searchInputClassName}
@@ -43,11 +45,12 @@ export function DataTableToolbar({
           placeholder={searchPlaceholder}
         />
       </div>
-      {centerContent ? (
-        <div className={cn("flex items-center justify-center lg:hidden", centerContainerClassName)}>
-          {centerContent}
-        </div>
-      ) : null}
+      <div
+        className={cn("flex items-center justify-center lg:hidden", centerContainerClassName)}
+        aria-hidden={centerContent ? undefined : true}
+      >
+        {centerContent}
+      </div>
       <div
         className={cn(
           "hidden min-w-0 items-center justify-center lg:flex",

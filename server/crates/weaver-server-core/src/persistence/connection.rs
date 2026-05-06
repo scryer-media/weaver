@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::StateError;
 
@@ -19,6 +21,8 @@ pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
 const SCHEMA_VERSION: i64 = 22;
 const LEGACY_SCHEMA_VERSION: i64 = 20;
+const DEFAULT_SQLITE_READ_CONNECTIONS: usize = 4;
+const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
 
 fn ensure_column(
     conn: &Connection,
@@ -72,6 +76,72 @@ fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, StateError> 
 fn file_size_bytes(path: Option<&Path>) -> Option<u64> {
     path.and_then(|value| fs::metadata(value).ok())
         .map(|meta| meta.len())
+}
+
+fn configure_connection(conn: &Connection, is_memory: bool) -> Result<(), StateError> {
+    let pragma_batch = if is_memory {
+        "PRAGMA foreign_keys=ON;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA temp_store=MEMORY;"
+    } else {
+        "PRAGMA journal_mode=WAL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA auto_vacuum=INCREMENTAL;
+         PRAGMA cache_size=-16000;
+         PRAGMA mmap_size=16777216;
+         PRAGMA temp_store=MEMORY;"
+    };
+
+    conn.execute_batch(pragma_batch)
+        .map_err(|e| StateError::Database(e.to_string()))
+}
+
+fn sqlite_read_connection_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(DEFAULT_SQLITE_READ_CONNECTIONS)
+        .clamp(2, DEFAULT_SQLITE_READ_CONNECTIONS)
+}
+
+struct ReadPool {
+    conns: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+impl ReadPool {
+    fn open(path: &Path, size: usize) -> Result<Self, StateError> {
+        let mut conns = Vec::with_capacity(size);
+        for _ in 0..size {
+            let conn = Connection::open(path).map_err(|e| StateError::Database(e.to_string()))?;
+            configure_connection(&conn, false)?;
+            conns.push(Mutex::new(conn));
+        }
+        Ok(Self {
+            conns,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn checkout(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        self.conns[idx].lock().unwrap()
+    }
+}
+
+enum DbWriteCommand {
+    ArchiveJob {
+        job_id: crate::jobs::ids::JobId,
+        history: crate::history::JobHistoryRow,
+    },
+    InsertJobEvents {
+        events: Vec<crate::history::JobEvent>,
+    },
+    Flush {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateError> {
@@ -134,7 +204,9 @@ fn cleanup_legacy_queue_event_storage(conn: &Connection) -> Result<(), StateErro
 /// SQLite-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    writer_conn: Arc<Mutex<Connection>>,
+    read_pool: Option<Arc<ReadPool>>,
+    writer_tx: mpsc::Sender<DbWriteCommand>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
 }
 
@@ -143,35 +215,36 @@ impl Database {
     /// Runs schema creation and sets WAL mode.
     pub fn open(path: &Path) -> Result<Self, StateError> {
         let conn = Connection::open(path).map_err(|e| StateError::Database(e.to_string()))?;
+        configure_connection(&conn, false)?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA auto_vacuum=INCREMENTAL;
-             PRAGMA cache_size=-16000;
-             PRAGMA mmap_size=16777216;
-             PRAGMA temp_store=MEMORY;",
-        )
-        .map_err(|e| StateError::Database(e.to_string()))?;
-
+        let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            writer_conn: Arc::new(Mutex::new(conn)),
+            read_pool: Some(Arc::new(ReadPool::open(
+                path,
+                sqlite_read_connection_count(),
+            )?)),
+            writer_tx,
             encryption_key: None,
         };
         db.create_schema()?;
+        db.spawn_writer_task(writer_rx);
         Ok(db)
     }
 
     /// Open an in-memory database (for tests).
     pub fn open_in_memory() -> Result<Self, StateError> {
         let conn = Connection::open_in_memory().map_err(|e| StateError::Database(e.to_string()))?;
+        configure_connection(&conn, true)?;
+        let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            writer_conn: Arc::new(Mutex::new(conn)),
+            read_pool: None,
+            writer_tx,
             encryption_key: None,
         };
         db.create_schema()?;
+        db.spawn_writer_task(writer_rx);
         Ok(db)
     }
 
@@ -187,7 +260,7 @@ impl Database {
 
     /// Check if the database has no settings (i.e. fresh / needs migration).
     pub fn is_empty(&self) -> Result<bool, StateError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -195,7 +268,7 @@ impl Database {
     }
 
     fn create_schema(&self) -> Result<(), StateError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
@@ -787,9 +860,129 @@ impl Database {
         Ok(())
     }
 
-    /// Get the inner connection lock (for use by sub-modules).
+    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<DbWriteCommand>) {
+        let db = self.clone();
+        let worker = async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    DbWriteCommand::ArchiveJob { job_id, history } => {
+                        let db = db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(error) = db.archive_job(job_id, &history) {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "failed to archive job on sqlite writer path"
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                    }
+                    DbWriteCommand::InsertJobEvents { events } => {
+                        let db = db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(error) = db.insert_job_events(&events) {
+                                tracing::warn!(
+                                    count = events.len(),
+                                    error = %error,
+                                    "failed to persist job events on sqlite writer path"
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                    }
+                    DbWriteCommand::Flush { reply } => {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(worker);
+        } else {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("sqlite writer runtime should build");
+                runtime.block_on(worker);
+            });
+        }
+    }
+
+    /// Get the writer connection lock (for persistence/mutation paths).
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap()
+        self.writer_conn.lock().unwrap()
+    }
+
+    /// Get a read-side connection lock when the pool is available.
+    pub(crate) fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.read_pool
+            .as_ref()
+            .map(|pool| pool.checkout())
+            .unwrap_or_else(|| self.writer_conn.lock().unwrap())
+    }
+
+    pub fn try_queue_archive_job(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        history: crate::history::JobHistoryRow,
+    ) -> Result<(), StateError> {
+        let command = DbWriteCommand::ArchiveJob { job_id, history };
+        match self.writer_tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+                let tx = self.writer_tx.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Err(error) = tx.send(command).await {
+                            tracing::warn!(error = %error, "sqlite writer queue closed while retrying archive enqueue");
+                        }
+                    });
+                    Ok(())
+                } else {
+                    tx.blocking_send(command)
+                        .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(StateError::Database(
+                "sqlite writer queue closed".to_string(),
+            )),
+        }
+    }
+
+    pub async fn queue_archive_job(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        history: crate::history::JobHistoryRow,
+    ) -> Result<(), StateError> {
+        self.writer_tx
+            .send(DbWriteCommand::ArchiveJob { job_id, history })
+            .await
+            .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))
+    }
+
+    pub async fn queue_job_events(
+        &self,
+        events: Vec<crate::history::JobEvent>,
+    ) -> Result<(), StateError> {
+        self.writer_tx
+            .send(DbWriteCommand::InsertJobEvents { events })
+            .await
+            .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))
+    }
+
+    pub async fn flush_write_queue(&self) -> Result<(), StateError> {
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(DbWriteCommand::Flush { reply })
+            .await
+            .map_err(|_| StateError::Database("sqlite writer queue closed".to_string()))?;
+        rx.await
+            .map_err(|_| StateError::Database("sqlite writer flush failed".to_string()))
     }
 
     /// Re-encrypt any plaintext passwords in the database.

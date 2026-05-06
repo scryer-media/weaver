@@ -68,7 +68,7 @@ impl Database {
 
     /// Load all events for a specific job, ordered by timestamp ascending.
     pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT job_id, timestamp, kind, message, file_id

@@ -1818,25 +1818,11 @@ impl Pipeline {
                     self.cleanup_par2_files(job_id).await;
                 }
                 // No archives — move to complete and finish.
-                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
-                if let Err(error) = self.move_to_complete(job_id).await {
+                if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
                     return;
                 }
-                self.transition_completed_runtime(job_id);
-                if self.active_download_passes.remove(&job_id) {
-                    let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
-                        job_id,
-                        finalization_pending: false,
-                    });
-                }
-                self.jobs_finalizing_download.remove(&job_id);
-                self.clear_par2_runtime_state(job_id);
-                self.clear_job_rar_runtime(job_id);
-                self.job_order.retain(|id| *id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-                info!(job_id = job_id.0, "job completed (no archives)");
-                self.record_job_history(job_id);
+                return;
             }
             ExtractionReadiness::Ready => {
                 // Collect sets that still need extraction (some may have been
@@ -1952,31 +1938,17 @@ impl Pipeline {
                     NestedExtractionDecision::PreserveOutputsAtDepthLimit => {}
                 }
 
-                self.transition_postprocessing_status(job_id, JobStatus::Moving, None);
                 info!(job_id = job_id.0, "extraction complete");
                 let _ = self
                     .event_tx
                     .send(PipelineEvent::ExtractionComplete { job_id });
 
                 // Move extracted files to complete directory.
-                if let Err(error) = self.move_to_complete(job_id).await {
+                if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
                     return;
                 }
-
-                self.transition_completed_runtime(job_id);
-                if self.active_download_passes.remove(&job_id) {
-                    let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
-                        job_id,
-                        finalization_pending: false,
-                    });
-                }
-                self.jobs_finalizing_download.remove(&job_id);
-                self.clear_par2_runtime_state(job_id);
-                self.clear_job_rar_runtime(job_id);
-                self.job_order.retain(|id| *id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
-                self.record_job_history(job_id);
+                return;
             }
             ExtractionReadiness::Blocked { reason } => {
                 self.fail_job(job_id, reason);

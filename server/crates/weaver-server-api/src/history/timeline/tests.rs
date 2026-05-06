@@ -600,6 +600,26 @@ fn finalizing_download_lane_closes_on_terminal_boundary_without_drain_event() {
 }
 
 #[test]
+fn cancelled_job_uses_cancellation_time_as_timeline_end_without_history_row() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Failed {
+            error: "cancelled".into(),
+        }),
+        None,
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 3_000, None, ""),
+            event("JobPaused", 4_000, None, "paused"),
+            event("JobCancelled", 5_000, None, "cancelled"),
+        ],
+    );
+
+    assert_eq!(timeline.ended_at, Some(5_000.0));
+    assert_eq!(timeline.outcome, JobStatusGql::Failed);
+}
+
+#[test]
 fn pause_during_finalizing_download_creates_pause_lane() {
     let timeline = build_job_timeline(
         &job(JobStatus::Verifying),

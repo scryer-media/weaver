@@ -34,7 +34,203 @@ fn move_path_with_copy_fallback(
     Ok(())
 }
 
+async fn run_move_to_complete(
+    job_id: JobId,
+    working_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+    dest: PathBuf,
+) -> Result<MoveToCompleteResult, String> {
+    // Verify at least one source directory exists before creating
+    // the destination, so a missing source doesn't leave behind an
+    // empty complete dir.
+    let staging_exists = staging_dir.as_ref().is_some_and(|s| s.exists());
+    let working_exists = working_dir.exists();
+    if !staging_exists && !working_exists {
+        return Err(format!(
+            "failed to read working directory {} for move: No such file or directory (os error 2)",
+            working_dir.display()
+        ));
+    }
+
+    if let Err(error) = tokio::fs::create_dir_all(&dest).await {
+        return Err(format!(
+            "failed to create complete directory {}: {error}",
+            dest.display()
+        ));
+    }
+
+    let mut moved = 0u32;
+    let mut failures = Vec::new();
+
+    if let Some(ref staging) = staging_dir
+        && let Ok(mut entries) = tokio::fs::read_dir(staging).await
+    {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            if file_name == ".weaver-chunks" {
+                let src = entry.path();
+                if let Err(error) = tokio::fs::remove_dir_all(&src).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        job_id = job_id.0,
+                        path = %src.display(),
+                        error = %error,
+                        "failed to remove chunk workspace during final move"
+                    );
+                }
+                continue;
+            }
+            let src = entry.path();
+            let dst = dest.join(&file_name);
+            match tokio::fs::rename(&src, &dst).await {
+                Ok(()) => {
+                    moved += 1;
+                }
+                Err(rename_err) => {
+                    let src_fb = src.clone();
+                    let dst_fb = dst.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        move_path_with_copy_fallback(&src_fb, &dst_fb)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            moved += 1;
+                        }
+                        Ok(Err(copy_err)) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                copy_err
+                            ));
+                        }
+                        Err(join_err) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback task failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                join_err
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(mut entries) = tokio::fs::read_dir(&working_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = entry.file_name();
+            if file_name == ".weaver-chunks"
+                || file_name == ".weaver-staging"
+                || file_name == WORKING_DIR_MARKER
+            {
+                continue;
+            }
+            let src = entry.path();
+            let dst = dest.join(&file_name);
+            if dst.exists() {
+                continue;
+            }
+            match tokio::fs::rename(&src, &dst).await {
+                Ok(()) => {
+                    moved += 1;
+                }
+                Err(rename_err) => {
+                    let src_fb = src.clone();
+                    let dst_fb = dst.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        move_path_with_copy_fallback(&src_fb, &dst_fb)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            moved += 1;
+                        }
+                        Ok(Err(copy_err)) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                copy_err
+                            ));
+                        }
+                        Err(join_err) => {
+                            failures.push(format!(
+                                "{}: rename failed: {}; fallback task failed: {}",
+                                file_name.to_string_lossy(),
+                                rename_err,
+                                join_err
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
+        }
+        return Err(format!(
+            "failed to move {} entr{} to complete directory",
+            failures.len(),
+            if failures.len() == 1 { "y" } else { "ies" }
+        ));
+    }
+
+    if let Some(ref staging) = staging_dir
+        && let Err(error) = tokio::fs::remove_dir_all(staging).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            dir = %staging.display(),
+            error = %error,
+            "failed to remove staging directory after move"
+        );
+    }
+
+    let marker_path = working_dir.join(WORKING_DIR_MARKER);
+    if let Err(error) = tokio::fs::remove_file(&marker_path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            path = %marker_path.display(),
+            error = %error,
+            "failed to remove working directory marker during final move"
+        );
+    }
+
+    if let Err(error) = tokio::fs::remove_dir(&working_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            dir = %working_dir.display(),
+            error = %error,
+            "failed to remove intermediate directory after move"
+        );
+    }
+
+    Ok(MoveToCompleteResult {
+        moved_entries: moved,
+    })
+}
+
 impl Pipeline {
+    fn complete_destination_is_reserved(&self, job_id: JobId, candidate: &std::path::Path) -> bool {
+        self.reserved_complete_destinations
+            .iter()
+            .any(|(reserved_job_id, reserved_path)| {
+                *reserved_job_id != job_id && reserved_path == candidate
+            })
+    }
+
     async fn compute_complete_destination(
         &self,
         job_id: JobId,
@@ -66,7 +262,7 @@ impl Pipeline {
             }
         };
 
-        if !base_dest.exists() {
+        if !base_dest.exists() && !self.complete_destination_is_reserved(job_id, &base_dest) {
             return base_dest;
         }
 
@@ -74,14 +270,14 @@ impl Pipeline {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         let suffixed = parent.join(format!("{}.#{}", dir_name, job_id.0));
-        if !suffixed.exists() {
+        if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
             return suffixed;
         }
 
         let mut attempt = 1u32;
         loop {
             let candidate = parent.join(format!("{}.#{}.{}", dir_name, job_id.0, attempt));
-            if !candidate.exists() {
+            if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
                 return candidate;
             }
             attempt += 1;
@@ -95,10 +291,14 @@ impl Pipeline {
     /// On collision, appends `.#<job_id>` (and a numeric suffix if needed).
     ///
     /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
-    pub(crate) async fn move_to_complete(&mut self, job_id: JobId) -> Result<PathBuf, String> {
+    pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
+        if self.inflight_moves.contains(&job_id) {
+            return Ok(());
+        }
+
         let (working_dir, staging_dir, job_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
-                return Err(format!("job {} not found for move_to_complete", job_id.0));
+                return Err(format!("job {} not found for final move", job_id.0));
             };
             (
                 state.working_dir.clone(),
@@ -110,214 +310,102 @@ impl Pipeline {
 
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::MoveToCompleteStarted { job_id });
-
         let dest = self
             .compute_complete_destination(job_id, &job_name, category.as_deref())
             .await;
+        self.reserved_complete_destinations
+            .insert(job_id, dest.clone());
+        self.inflight_moves.insert(job_id);
 
-        // Verify at least one source directory exists before creating
-        // the destination, so a missing source doesn't leave behind an
-        // empty complete dir.
-        let staging_exists = staging_dir.as_ref().is_some_and(|s| s.exists());
-        let working_exists = working_dir.exists();
-        if !staging_exists && !working_exists {
-            return Err(format!(
-                "failed to read working directory {} for move: No such file or directory (os error 2)",
-                working_dir.display()
-            ));
-        }
-
-        // Ensure destination exists.
-        if let Err(e) = tokio::fs::create_dir_all(&dest).await {
-            return Err(format!(
-                "failed to create complete directory {}: {e}",
-                dest.display()
-            ));
-        }
-
-        let mut moved = 0u32;
-        let mut failures = Vec::new();
-
-        // Move extracted files from the staging directory (same filesystem as
-        // complete_dir, so renames are instant).
-        if let Some(ref staging) = staging_dir
-            && let Ok(mut entries) = tokio::fs::read_dir(staging).await
-        {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name();
-                if file_name == ".weaver-chunks" {
-                    let src = entry.path();
-                    if let Err(error) = tokio::fs::remove_dir_all(&src).await
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(
-                            path = %src.display(),
-                            error = %error,
-                            "failed to remove chunk workspace during final move"
-                        );
-                    }
-                    continue;
-                }
-                let src = entry.path();
-                let dst = dest.join(&file_name);
-                match tokio::fs::rename(&src, &dst).await {
-                    Ok(()) => {
-                        moved += 1;
-                    }
-                    Err(rename_err) => {
-                        let src_fb = src.clone();
-                        let dst_fb = dst.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            move_path_with_copy_fallback(&src_fb, &dst_fb)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                moved += 1;
-                            }
-                            Ok(Err(copy_err)) => {
-                                failures.push(format!(
-                                    "{}: rename failed: {}; fallback failed: {}",
-                                    file_name.to_string_lossy(),
-                                    rename_err,
-                                    copy_err
-                                ));
-                            }
-                            Err(join_err) => {
-                                failures.push(format!(
-                                    "{}: rename failed: {}; fallback task failed: {}",
-                                    file_name.to_string_lossy(),
-                                    rename_err,
-                                    join_err
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Move any remaining non-archive files from working_dir (NFOs, SRTs, etc.).
-        if let Ok(mut entries) = tokio::fs::read_dir(&working_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name();
-                // Skip leftover chunk workspaces and staging dirs.
-                if file_name == ".weaver-chunks"
-                    || file_name == ".weaver-staging"
-                    || file_name == WORKING_DIR_MARKER
-                {
-                    continue;
-                }
-                let src = entry.path();
-                let dst = dest.join(&file_name);
-                // Skip if the destination already has this file (from staging).
-                if dst.exists() {
-                    continue;
-                }
-                match tokio::fs::rename(&src, &dst).await {
-                    Ok(()) => {
-                        moved += 1;
-                    }
-                    Err(rename_err) => {
-                        let src_fb = src.clone();
-                        let dst_fb = dst.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            move_path_with_copy_fallback(&src_fb, &dst_fb)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                moved += 1;
-                            }
-                            Ok(Err(copy_err)) => {
-                                failures.push(format!(
-                                    "{}: rename failed: {}; fallback failed: {}",
-                                    file_name.to_string_lossy(),
-                                    rename_err,
-                                    copy_err
-                                ));
-                            }
-                            Err(join_err) => {
-                                failures.push(format!(
-                                    "{}: rename failed: {}; fallback task failed: {}",
-                                    file_name.to_string_lossy(),
-                                    rename_err,
-                                    join_err
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !failures.is_empty() {
-            for failure in &failures {
-                warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
-            }
-            return Err(format!(
-                "failed to move {} entr{} to complete directory",
-                failures.len(),
-                if failures.len() == 1 { "y" } else { "ies" }
-            ));
-        }
-
-        // Remove the now-empty staging directory.
-        if let Some(ref staging) = staging_dir
-            && let Err(e) = tokio::fs::remove_dir_all(staging).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                job_id = job_id.0,
-                dir = %staging.display(),
-                error = %e,
-                "failed to remove staging directory after move"
-            );
-        }
-
-        let marker_path = working_dir.join(WORKING_DIR_MARKER);
-        if let Err(error) = tokio::fs::remove_file(&marker_path).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                job_id = job_id.0,
-                path = %marker_path.display(),
-                error = %error,
-                "failed to remove working directory marker during final move"
-            );
-        }
-
-        // Remove the now-empty intermediate directory.
-        if let Err(e) = tokio::fs::remove_dir(&working_dir).await
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                job_id = job_id.0,
-                dir = %working_dir.display(),
-                error = %e,
-                "failed to remove intermediate directory after move"
-            );
-        }
-
-        // Update working_dir to point to the complete path (for API reporting).
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.working_dir = dest.clone();
-            state.staging_dir = None;
-        }
-
-        info!(
-            job_id = job_id.0,
-            moved,
-            dest = %dest.display(),
-            "moved files to complete directory"
-        );
         let _ = self
             .event_tx
-            .send(PipelineEvent::MoveToCompleteFinished { job_id });
-        Ok(dest)
+            .send(PipelineEvent::MoveToCompleteStarted { job_id });
+        self.publish_snapshot();
+
+        let move_done_tx = self.move_done_tx.clone();
+        info!(
+            job_id = job_id.0,
+            dest = %dest.display(),
+            "starting final move"
+        );
+        tokio::spawn(async move {
+            let move_started = Instant::now();
+            let result = run_move_to_complete(job_id, working_dir, staging_dir, dest.clone()).await;
+            match &result {
+                Ok(outcome) => info!(
+                    job_id = job_id.0,
+                    moved = outcome.moved_entries,
+                    dest = %dest.display(),
+                    elapsed_ms = move_started.elapsed().as_millis(),
+                    "final move finished"
+                ),
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    dest = %dest.display(),
+                    elapsed_ms = move_started.elapsed().as_millis(),
+                    error = %error,
+                    "final move failed"
+                ),
+            }
+            let _ = move_done_tx
+                .send(MoveToCompleteDone {
+                    job_id,
+                    dest,
+                    result,
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    pub(crate) fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {
+        let MoveToCompleteDone {
+            job_id,
+            dest,
+            result,
+        } = done;
+        self.inflight_moves.remove(&job_id);
+        self.reserved_complete_destinations.remove(&job_id);
+
+        match result {
+            Ok(outcome) => {
+                let Some(state) = self.jobs.get_mut(&job_id) else {
+                    warn!(
+                        job_id = job_id.0,
+                        dest = %dest.display(),
+                        "final move finished after job runtime was removed"
+                    );
+                    return;
+                };
+                state.working_dir = dest.clone();
+                state.staging_dir = None;
+
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::MoveToCompleteFinished { job_id });
+                self.transition_completed_runtime(job_id);
+                if self.active_download_passes.remove(&job_id) {
+                    let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+                        job_id,
+                        finalization_pending: false,
+                    });
+                }
+                self.jobs_finalizing_download.remove(&job_id);
+                self.clear_par2_runtime_state(job_id);
+                self.clear_job_rar_runtime(job_id);
+                self.job_order.retain(|id| *id != job_id);
+                let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
+                info!(
+                    job_id = job_id.0,
+                    moved = outcome.moved_entries,
+                    dest = %dest.display(),
+                    "job completed after final move"
+                );
+                self.record_job_history(job_id);
+                self.publish_snapshot();
+            }
+            Err(error) => self.fail_job(job_id, error),
+        }
     }
 
     pub(in crate::pipeline) fn resolve_job_input_path(

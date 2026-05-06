@@ -18,6 +18,8 @@ fn sample_history() -> JobHistoryRow {
         created_at: 1700000000,
         completed_at: 1700001000,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 

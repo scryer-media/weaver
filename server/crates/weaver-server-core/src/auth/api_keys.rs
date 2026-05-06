@@ -53,7 +53,7 @@ impl Database {
 
     /// Look up an API key by its SHA-256 hash.
     pub fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, scope, created_at, last_used_at
@@ -77,7 +77,7 @@ impl Database {
 
     /// List all API keys (without hashes).
     pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, scope, created_at, last_used_at
@@ -101,7 +101,7 @@ impl Database {
     }
 
     pub fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare("SELECT key_hash, id, scope FROM api_keys")
             .map_err(db_err)?;

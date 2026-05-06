@@ -6,6 +6,7 @@ use std::time::Duration;
 use age::Encryptor;
 use async_graphql::Result;
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -27,10 +28,13 @@ use weaver_server_core::{
 };
 
 const DIAGNOSTIC_ROOT_DIR: &str = ".diagnostics";
+const DEFAULT_DIAGNOSTIC_UPLOAD_URL: &str = "https://diagnostics.scryer.media";
 const EVENTS_FILE: &str = "diagnostic_attempt/events.ndjson";
 const METRICS_FILE: &str = "diagnostic_attempt/metrics.ndjson";
 const LOG_FILE: &str = "diagnostic_attempt/runtime.log";
 const SERVER_ATTEMPTS_FILE: &str = "diagnostic_attempt/server_attempts.ndjson";
+const UPLOAD_SESSION_FILE: &str = "upload_session.json";
+const UPLOAD_RECEIPT_FILE: &str = "upload_receipt.json";
 
 #[derive(Clone)]
 pub(crate) struct DiagnosticManager {
@@ -60,6 +64,21 @@ struct DiagnosticMetricsRecord {
     occurred_at_ms: i64,
     metrics: weaver_server_core::MetricsSnapshot,
     is_globally_paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticServerAttemptRecord {
+    occurred_at_ms: i64,
+    segment_id: String,
+    file_id: String,
+    server_id: u16,
+    server_alias: String,
+    attempt: u32,
+    retry_count: u32,
+    latency_ms: u64,
+    outcome: String,
+    error: Option<String>,
+    is_recovery: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,14 +139,14 @@ struct SanitizedServer {
 }
 
 #[derive(Debug, Serialize)]
-struct SmgCreateDiagnosticUploadRequest {
+struct DiagnosticServiceCreateUploadRequest {
     source_job_id: u64,
     diagnostic_job_id: u64,
     include_server_hostnames: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SmgCreateDiagnosticUploadResponse {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiagnosticServiceCreateUploadResponse {
     diagnostic_id: String,
     public_key: String,
     key_id: String,
@@ -136,10 +155,16 @@ struct SmgCreateDiagnosticUploadResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct SmgFinalizeDiagnosticUploadRequest<'a> {
+struct DiagnosticServiceFinalizeUploadRequest<'a> {
     key_id: &'a str,
     size_bytes: u64,
     sha256: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiagnosticUploadReceipt {
+    diagnostic_id: String,
+    uploaded_at_ms: i64,
 }
 
 #[derive(Debug, Error)]
@@ -233,7 +258,7 @@ impl DiagnosticManager {
         let row = DiagnosticRunRow {
             source_job_id,
             diagnostic_job_id,
-            smg_diagnostic_id: None,
+            diagnostic_id: None,
             stage: DiagnosticRunStage::Queued,
             include_server_hostnames,
             rerun_succeeded: None,
@@ -338,8 +363,11 @@ impl DiagnosticManager {
         &self,
         event: PipelineEvent,
     ) -> std::result::Result<(), DiagnosticBundleError> {
-        let event_gql = PipelineEventGql::from(&event);
-        let Some(job_id) = event_gql.job_id else {
+        let job_id = match &event {
+            PipelineEvent::ServerAttempt { segment_id, .. } => Some(segment_id.file_id.job_id.0),
+            _ => PipelineEventGql::from(&event).job_id,
+        };
+        let Some(job_id) = job_id else {
             return Ok(());
         };
         let Some(run) = self.lookup_run(job_id).await? else {
@@ -347,6 +375,52 @@ impl DiagnosticManager {
         };
 
         self.ensure_staging_dir_for_tracked(&run).await?;
+        if let PipelineEvent::ServerAttempt {
+            segment_id,
+            server_id,
+            attempt,
+            retry_count,
+            latency_ms,
+            outcome,
+            error,
+            is_recovery,
+        } = &event
+        {
+            let outcome = match outcome {
+                weaver_server_core::events::model::ServerAttemptOutcome::Success => "success",
+                weaver_server_core::events::model::ServerAttemptOutcome::NotFound => "not_found",
+                weaver_server_core::events::model::ServerAttemptOutcome::AuthenticationFailure => {
+                    "authentication_failure"
+                }
+                weaver_server_core::events::model::ServerAttemptOutcome::TransientFailure => {
+                    "transient_failure"
+                }
+                weaver_server_core::events::model::ServerAttemptOutcome::PermanentFailure => {
+                    "permanent_failure"
+                }
+            };
+            self.append_json_line(
+                self.staging_dir(&run).join(SERVER_ATTEMPTS_FILE),
+                &DiagnosticServerAttemptRecord {
+                    occurred_at_ms: Utc::now().timestamp_millis(),
+                    segment_id: segment_id.to_string(),
+                    file_id: segment_id.file_id.to_string(),
+                    server_id: server_id.0,
+                    server_alias: format!("server-{}", u32::from(server_id.0) + 1),
+                    attempt: *attempt,
+                    retry_count: *retry_count,
+                    latency_ms: *latency_ms,
+                    outcome: outcome.to_string(),
+                    error: error.clone(),
+                    is_recovery: *is_recovery,
+                },
+            )
+            .await?;
+            self.touch_run(run.source_job_id).await?;
+            return Ok(());
+        }
+
+        let event_gql = PipelineEventGql::from(&event);
         self.append_json_line(
             self.staging_dir(&run).join(EVENTS_FILE),
             &DiagnosticEventRecord {
@@ -514,11 +588,18 @@ impl DiagnosticManager {
         let mut run = self.load_run_by_job(diagnostic_job_id).await?.ok_or(
             DiagnosticBundleError::MissingDiagnosticRun(diagnostic_job_id),
         )?;
+        let staging_dir = self.staging_dir(&TrackedDiagnosticRun::from_row(&run));
+        if self
+            .resume_finalized_upload_if_present(&run, &staging_dir)
+            .await?
+        {
+            return Ok(());
+        }
         self.ensure_staging_dir(&run).await?;
         self.update_stage(
             diagnostic_job_id,
             DiagnosticRunStage::Collecting,
-            run.smg_diagnostic_id.clone(),
+            run.diagnostic_id.clone(),
             run.rerun_succeeded,
             run.error_message.clone(),
         )
@@ -542,7 +623,6 @@ impl DiagnosticManager {
             run.include_server_hostnames,
         );
 
-        let staging_dir = self.staging_dir(&TrackedDiagnosticRun::from_row(&run));
         let bundle_dir = staging_dir.join("bundle");
         if tokio::fs::try_exists(&bundle_dir).await.unwrap_or(false) {
             let _ = tokio::fs::remove_dir_all(&bundle_dir).await;
@@ -673,12 +753,13 @@ impl DiagnosticManager {
             .current_upload_url()
             .await
             .ok_or(DiagnosticBundleError::MissingUploadUrl)?;
-        let session = self.create_upload_session(&upload_url, &run).await?;
-        run.smg_diagnostic_id = Some(session.diagnostic_id.clone());
+        let session = self
+            .load_or_create_upload_session(&upload_url, &mut run, &staging_dir)
+            .await?;
         self.update_stage(
             diagnostic_job_id,
             DiagnosticRunStage::Uploading,
-            run.smg_diagnostic_id.clone(),
+            run.diagnostic_id.clone(),
             run.rerun_succeeded,
             run.error_message.clone(),
         )
@@ -699,28 +780,66 @@ impl DiagnosticManager {
         .await?;
 
         let uploaded_at = Utc::now().timestamp_millis();
-        let db = self.db.clone();
-        let diagnostic_id = session.diagnostic_id.clone();
-        tokio::task::spawn_blocking(move || {
-            db.persist_job_history_diagnostic_receipt(
-                run.source_job_id,
-                &diagnostic_id,
-                uploaded_at,
-            )
-        })
-        .await
-        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
-        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?;
-
-        self.delete_run_state(&run).await?;
+        let receipt = DiagnosticUploadReceipt {
+            diagnostic_id: session.diagnostic_id.clone(),
+            uploaded_at_ms: uploaded_at,
+        };
+        write_json_file(&staging_dir.join(UPLOAD_RECEIPT_FILE), &receipt).await?;
+        self.persist_diagnostic_receipt_and_cleanup(&run, &receipt)
+            .await?;
         Ok(())
+    }
+
+    async fn load_or_create_upload_session(
+        &self,
+        base_url: &str,
+        run: &mut DiagnosticRunRow,
+        staging_dir: &Path,
+    ) -> std::result::Result<DiagnosticServiceCreateUploadResponse, DiagnosticBundleError> {
+        let session_path = staging_dir.join(UPLOAD_SESSION_FILE);
+        if let Some(session) =
+            read_json_file_if_exists::<DiagnosticServiceCreateUploadResponse>(&session_path).await?
+        {
+            if let Some(existing) = &run.diagnostic_id
+                && existing != &session.diagnostic_id
+            {
+                return Err(DiagnosticBundleError::State(
+                    "diagnostic upload session id did not match local run state".to_string(),
+                ));
+            }
+            if run.diagnostic_id.is_none() {
+                run.diagnostic_id = Some(session.diagnostic_id.clone());
+                self.update_stage(
+                    run.diagnostic_job_id,
+                    run.stage,
+                    run.diagnostic_id.clone(),
+                    run.rerun_succeeded,
+                    run.error_message.clone(),
+                )
+                .await?;
+            }
+            return Ok(session);
+        }
+
+        let session = self.create_upload_session(base_url, run).await?;
+        write_json_file(&session_path, &session).await?;
+        run.diagnostic_id = Some(session.diagnostic_id.clone());
+        self.update_stage(
+            run.diagnostic_job_id,
+            run.stage,
+            run.diagnostic_id.clone(),
+            run.rerun_succeeded,
+            run.error_message.clone(),
+        )
+        .await?;
+        Ok(session)
     }
 
     async fn create_upload_session(
         &self,
         base_url: &str,
         run: &DiagnosticRunRow,
-    ) -> std::result::Result<SmgCreateDiagnosticUploadResponse, DiagnosticBundleError> {
+    ) -> std::result::Result<DiagnosticServiceCreateUploadResponse, DiagnosticBundleError> {
         let url = format!(
             "{}/api/v1/metadata/diagnostics",
             base_url.trim_end_matches('/')
@@ -728,7 +847,7 @@ impl DiagnosticManager {
         let response = self
             .http_client
             .post(url)
-            .json(&SmgCreateDiagnosticUploadRequest {
+            .json(&DiagnosticServiceCreateUploadRequest {
                 source_job_id: run.source_job_id,
                 diagnostic_job_id: run.diagnostic_job_id,
                 include_server_hostnames: run.include_server_hostnames,
@@ -740,7 +859,7 @@ impl DiagnosticManager {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(DiagnosticBundleError::Http(format!(
-                "SMG create diagnostic upload failed: {status} {body}",
+                "diagnostic service create upload failed: {status} {body}",
             )));
         }
         response
@@ -776,7 +895,7 @@ impl DiagnosticManager {
         } else {
             let body = response.text().await.unwrap_or_default();
             Err(DiagnosticBundleError::Http(format!(
-                "SMG upload failed: {status} {body}",
+                "diagnostic service upload failed: {status} {body}",
             )))
         }
     }
@@ -796,7 +915,7 @@ impl DiagnosticManager {
         let response = self
             .http_client
             .post(url)
-            .json(&SmgFinalizeDiagnosticUploadRequest {
+            .json(&DiagnosticServiceFinalizeUploadRequest {
                 key_id,
                 size_bytes,
                 sha256: sha256_hex,
@@ -810,7 +929,7 @@ impl DiagnosticManager {
         } else {
             let body = response.text().await.unwrap_or_default();
             Err(DiagnosticBundleError::Http(format!(
-                "SMG finalize failed: {status} {body}",
+                "diagnostic service finalize failed: {status} {body}",
             )))
         }
     }
@@ -862,7 +981,7 @@ impl DiagnosticManager {
         &self,
         diagnostic_job_id: u64,
         stage: DiagnosticRunStage,
-        smg_diagnostic_id: Option<String>,
+        diagnostic_id: Option<String>,
         rerun_succeeded: Option<bool>,
         error_message: Option<String>,
     ) -> std::result::Result<(), DiagnosticBundleError> {
@@ -870,7 +989,7 @@ impl DiagnosticManager {
             return Ok(());
         };
         row.stage = stage;
-        row.smg_diagnostic_id = smg_diagnostic_id;
+        row.diagnostic_id = diagnostic_id;
         row.rerun_succeeded = rerun_succeeded;
         row.error_message = error_message;
         let now = Utc::now().timestamp_millis();
@@ -913,6 +1032,41 @@ impl DiagnosticManager {
         Ok(())
     }
 
+    async fn resume_finalized_upload_if_present(
+        &self,
+        run: &DiagnosticRunRow,
+        staging_dir: &Path,
+    ) -> std::result::Result<bool, DiagnosticBundleError> {
+        let Some(receipt) = read_json_file_if_exists::<DiagnosticUploadReceipt>(
+            &staging_dir.join(UPLOAD_RECEIPT_FILE),
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        self.persist_diagnostic_receipt_and_cleanup(run, &receipt)
+            .await?;
+        Ok(true)
+    }
+
+    async fn persist_diagnostic_receipt_and_cleanup(
+        &self,
+        run: &DiagnosticRunRow,
+        receipt: &DiagnosticUploadReceipt,
+    ) -> std::result::Result<(), DiagnosticBundleError> {
+        let db = self.db.clone();
+        let source_job_id = run.source_job_id;
+        let diagnostic_id = receipt.diagnostic_id.clone();
+        let uploaded_at_ms = receipt.uploaded_at_ms;
+        tokio::task::spawn_blocking(move || {
+            db.persist_job_history_diagnostic_receipt(source_job_id, &diagnostic_id, uploaded_at_ms)
+        })
+        .await
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?;
+        self.delete_run_state(run).await
+    }
+
     async fn lookup_run(
         &self,
         diagnostic_job_id: u64,
@@ -953,7 +1107,7 @@ impl DiagnosticManager {
     }
 
     async fn current_upload_url(&self) -> Option<String> {
-        self.config.read().await.diagnostic_upload_url.clone()
+        resolved_diagnostic_upload_url(self.config.read().await.diagnostic_upload_url.as_deref())
     }
 
     async fn current_config(&self) -> Config {
@@ -1119,7 +1273,10 @@ fn sanitize_config(config: &Config, include_server_hostnames: bool) -> Sanitized
         max_download_speed: config.max_download_speed,
         cleanup_after_extract: config.cleanup_after_extract,
         isp_bandwidth_cap: config.isp_bandwidth_cap.clone(),
-        diagnostic_upload_url_present: config.diagnostic_upload_url.is_some(),
+        diagnostic_upload_url_present: resolved_diagnostic_upload_url(
+            config.diagnostic_upload_url.as_deref(),
+        )
+        .is_some(),
         categories: config
             .categories
             .iter()
@@ -1189,6 +1346,19 @@ async fn write_text_file(
     tokio::fs::write(path, value)
         .await
         .map_err(|error| DiagnosticBundleError::Io(error.to_string()))
+}
+
+async fn read_json_file_if_exists<T: DeserializeOwned>(
+    path: &Path,
+) -> std::result::Result<Option<T>, DiagnosticBundleError> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DiagnosticBundleError::Io(error.to_string())),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| DiagnosticBundleError::Serialization(error.to_string()))
 }
 
 async fn write_raw_nzb_file(
@@ -1303,6 +1473,14 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
     }
 }
 
+fn resolved_diagnostic_upload_url(configured_url: Option<&str>) -> Option<String> {
+    configured_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .or_else(|| Some(DEFAULT_DIAGNOSTIC_UPLOAD_URL.to_string()))
+}
+
 fn bundle_graphql_error(error: DiagnosticBundleError) -> async_graphql::Error {
     match error {
         DiagnosticBundleError::MissingUploadUrl => {
@@ -1316,5 +1494,30 @@ fn bundle_graphql_error(error: DiagnosticBundleError) -> async_graphql::Error {
         | DiagnosticBundleError::Http(_)
         | DiagnosticBundleError::Encryption(_)
         | DiagnosticBundleError::Serialization(_) => graphql_error("INTERNAL", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_DIAGNOSTIC_UPLOAD_URL, resolved_diagnostic_upload_url};
+
+    #[test]
+    fn defaults_to_public_diagnostics_service_when_unset() {
+        assert_eq!(
+            resolved_diagnostic_upload_url(None).as_deref(),
+            Some(DEFAULT_DIAGNOSTIC_UPLOAD_URL),
+        );
+        assert_eq!(
+            resolved_diagnostic_upload_url(Some("   ")).as_deref(),
+            Some(DEFAULT_DIAGNOSTIC_UPLOAD_URL),
+        );
+    }
+
+    #[test]
+    fn preserves_trimmed_explicit_diagnostics_override() {
+        assert_eq!(
+            resolved_diagnostic_upload_url(Some(" https://example.test/diagnostics ")).as_deref(),
+            Some("https://example.test/diagnostics"),
+        );
     }
 }

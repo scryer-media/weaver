@@ -67,6 +67,7 @@ fn health_milli(total: u64, failed_bytes: u64) -> u32 {
 pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
+    pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
     /// Whether this was a speculative recovery download.
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
@@ -141,6 +142,16 @@ pub(super) enum ExtractionDone {
         set_name: String,
         result: Result<FullSetExtractionOutcome, String>,
     },
+}
+
+pub(super) struct MoveToCompleteResult {
+    pub(super) moved_entries: u32,
+}
+
+pub(super) struct MoveToCompleteDone {
+    pub(super) job_id: JobId,
+    pub(super) dest: PathBuf,
+    pub(super) result: Result<MoveToCompleteResult, String>,
 }
 
 /// Result of a decode task.
@@ -268,6 +279,9 @@ pub struct Pipeline {
     /// Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
+    /// Channel for background final-move results.
+    pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
+    pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// ISP bandwidth cap runtime state.
@@ -303,6 +317,10 @@ pub struct Pipeline {
     /// Archives with in-flight extraction tasks (spawned but not yet completed).
     /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
+    /// Jobs currently performing their final move into the complete directory.
+    pub(super) inflight_moves: HashSet<JobId>,
+    /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
+    pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     /// Members whose incremental extraction failed (corrupt volume, CRC error, etc).
     /// Prevents immediate retry during download; cleared after PAR2 repair so
     /// the post-repair extraction path can re-extract them.

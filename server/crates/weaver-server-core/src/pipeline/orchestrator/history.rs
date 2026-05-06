@@ -226,6 +226,8 @@ impl Pipeline {
         self.job_order.retain(|id| *id != job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
+        self.inflight_moves.remove(&job_id);
+        self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
@@ -319,10 +321,16 @@ impl Pipeline {
             created_at_epoch_ms: state.created_at_epoch_ms,
         });
 
-        if let Err(e) = self.db.archive_job(job_id, &row) {
-            tracing::error!(job_id = row.job_id, error = %e, "failed to archive job to history");
+        let archive_started = Instant::now();
+        if let Err(e) = self.db.try_queue_archive_job(job_id, row) {
+            tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
             return;
         }
+        debug!(
+            job_id = job_id.0,
+            elapsed_ms = archive_started.elapsed().as_millis(),
+            "queued job history archival"
+        );
         self.purge_terminal_job_runtime(job_id);
     }
 }

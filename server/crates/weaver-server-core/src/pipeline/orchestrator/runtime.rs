@@ -44,6 +44,7 @@ impl Pipeline {
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
+        let (move_done_tx, move_done_rx) = mpsc::channel(32);
         shared_state.set_paused(initial_global_paused);
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
@@ -90,6 +91,8 @@ impl Pipeline {
             probe_result_rx,
             extract_done_tx,
             extract_done_rx,
+            move_done_tx,
+            move_done_rx,
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
@@ -105,6 +108,8 @@ impl Pipeline {
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
             inflight_extractions: HashMap::new(),
+            inflight_moves: HashSet::new(),
+            reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
@@ -396,6 +401,9 @@ impl Pipeline {
                 }
                 Some(done) = self.extract_done_rx.recv() => {
                     self.handle_extraction_done(done).await;
+                }
+                Some(done) = self.move_done_rx.recv() => {
+                    self.handle_move_to_complete_done(done);
                 }
                 Some(work) = self.retry_rx.recv() => {
                     let job_id = work.segment_id.file_id.job_id;

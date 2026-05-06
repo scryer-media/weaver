@@ -93,6 +93,11 @@ type QueueSelectOption = {
   value: string;
   label: string;
 };
+type OpenQueueCellSelect = {
+  field: "priority" | "category";
+  jobId: number;
+} | null;
+type QueueCellSelectField = NonNullable<OpenQueueCellSelect>["field"];
 
 type QueueTablePreferences = {
   pageSize: number;
@@ -202,23 +207,45 @@ const QueueActionButtons = memo(function QueueActionButtons({
 });
 
 const QueueCellSelect = memo(function QueueCellSelect({
+  jobId,
+  field,
   value,
   options,
   ariaLabel,
   disabled,
+  open,
+  onOpenChange,
   onValueChange,
   className,
 }: {
+  jobId: number;
+  field: QueueCellSelectField;
   value: string;
   options: QueueSelectOption[];
   ariaLabel: string;
   disabled?: boolean;
-  onValueChange: (value: string) => void;
+  open?: boolean;
+  onOpenChange?: (jobId: number, field: QueueCellSelectField, open: boolean) => void;
+  onValueChange: (jobId: number, value: string) => void;
   className?: string;
 }) {
+  const handleOpenChange = useCallback((nextOpen: boolean) => {
+    onOpenChange?.(jobId, field, nextOpen);
+  }, [field, jobId, onOpenChange]);
+
+  const handleValueChange = useCallback((nextValue: string) => {
+    onValueChange(jobId, nextValue);
+  }, [jobId, onValueChange]);
+
   return (
     <div className="flex justify-center" data-row-click-ignore="true">
-      <Select value={value} onValueChange={onValueChange} disabled={disabled}>
+      <Select
+        value={value}
+        open={open}
+        onOpenChange={handleOpenChange}
+        onValueChange={handleValueChange}
+        disabled={disabled}
+      >
         <SelectTrigger
           size="sm"
           aria-label={ariaLabel}
@@ -238,6 +265,93 @@ const QueueCellSelect = memo(function QueueCellSelect({
           ))}
         </SelectContent>
       </Select>
+    </div>
+  );
+});
+
+const QueueNameCell = memo(function QueueNameCell({
+  jobId,
+  displayName,
+}: {
+  jobId: number;
+  displayName: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <Link
+        to={`/jobs/${jobId}`}
+        className="block min-h-6 whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
+      >
+        {displayName}
+      </Link>
+    </div>
+  );
+});
+
+const QueueStatusCell = memo(function QueueStatusCell({
+  status,
+  blockedByIspCap,
+  bandwidthCapLabel,
+}: {
+  status: JobData["status"];
+  blockedByIspCap: boolean;
+  bandwidthCapLabel: string;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-1 text-center">
+      <JobStatusBadge status={status} compact className="px-1.5" />
+      {blockedByIspCap ? (
+        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-orange-600 dark:text-orange-300">
+          {bandwidthCapLabel}
+        </span>
+      ) : null}
+    </div>
+  );
+});
+
+const QueueProgressCell = memo(function QueueProgressCell({
+  etaDisplay,
+  progress,
+  status,
+  totalBytes,
+  downloadedBytes,
+  failedBytes,
+}: {
+  etaDisplay: string;
+  progress: number;
+  status: JobData["status"];
+  totalBytes: number;
+  downloadedBytes: number;
+  failedBytes: number;
+}) {
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[176px]">
+        <div className="mb-1 text-right text-[10px] font-medium tabular-nums text-muted-foreground">
+          {etaDisplay}
+        </div>
+        <JobProgress
+          progress={progress}
+          status={status}
+          totalBytes={totalBytes}
+          downloadedBytes={downloadedBytes}
+          failedBytes={failedBytes}
+          compact
+          showLabel={false}
+        />
+      </div>
+    </div>
+  );
+});
+
+const QueueSizeCell = memo(function QueueSizeCell({
+  totalBytes,
+}: {
+  totalBytes: number;
+}) {
+  return (
+    <div className="text-center text-[11px] text-muted-foreground">
+      {formatBytes(totalBytes)}
     </div>
   );
 });
@@ -374,6 +488,10 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
   }
 }
 
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 export function JobList() {
   const client = useClient();
   const [serversResult] = useQuery({ query: SERVERS_QUERY });
@@ -388,6 +506,7 @@ export function JobList() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [pendingJobUpdates, setPendingJobUpdates] = useState<Record<number, PendingQueueJobUpdate>>({});
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
+  const [openQueueCellSelect, setOpenQueueCellSelect] = useState<OpenQueueCellSelect>(null);
 
   const { jobs: allJobs, speed, isPaused, downloadBlock } = useLiveData();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
@@ -456,28 +575,46 @@ export function JobList() {
     [rowSelection],
   );
 
+  const queueCategoriesRef = useRef<string[]>([]);
   const queueCategories = useMemo(
-    () =>
-      Array.from(
+    () => {
+      const next = Array.from(
         new Set(
           jobs
             .map((job) => resolveJobCategory(job, pendingJobUpdates[job.id]))
             .filter((category): category is string => Boolean(category)),
         ),
-      ).sort((left, right) => left.localeCompare(right)),
+      ).sort((left, right) => left.localeCompare(right));
+
+      if (sameStringArray(queueCategoriesRef.current, next)) {
+        return queueCategoriesRef.current;
+      }
+
+      queueCategoriesRef.current = next;
+      return next;
+    },
     [jobs, pendingJobUpdates],
   );
 
+  const editableCategoryOptionsRef = useRef<string[]>([]);
   const editableCategoryOptions = useMemo(
-    () =>
-      Array.from(
+    () => {
+      const next = Array.from(
         new Set([
           ...(((categoryData?.categories as { id: number; name: string }[] | undefined) ?? [])
             .map((entry) => entry.name)
             .filter((name): name is string => Boolean(name))),
           ...queueCategories,
         ]),
-      ).sort((left, right) => left.localeCompare(right)),
+      ).sort((left, right) => left.localeCompare(right));
+
+      if (sameStringArray(editableCategoryOptionsRef.current, next)) {
+        return editableCategoryOptionsRef.current;
+      }
+
+      editableCategoryOptionsRef.current = next;
+      return next;
+    },
     [categoryData?.categories, queueCategories],
   );
 
@@ -617,9 +754,7 @@ export function JobList() {
       new Map(
         queueTableRows.map((job) => [
           String(job.id),
-          [job.displayName, job.categoryLabel, job.priorityLabel, job.statusLabel]
-            .join(" ")
-            .toLowerCase(),
+          job.displayName.toLowerCase(),
         ]),
       ),
     [queueTableRows],
@@ -724,6 +859,29 @@ export function JobList() {
     }
   }, [setQueueFieldSaving, updateJobs]);
 
+  const handleQueueCellSelectOpenChange = useCallback(
+    (jobId: number, field: NonNullable<OpenQueueCellSelect>["field"], open: boolean) => {
+      setOpenQueueCellSelect((current) => {
+        if (!open) {
+          return current?.jobId === jobId && current.field === field ? null : current;
+        }
+        if (current?.jobId === jobId && current.field === field) {
+          return current;
+        }
+        return { jobId, field };
+      });
+    },
+    [],
+  );
+
+  const handlePrioritySelectValueChange = useCallback((jobId: number, value: string) => {
+    void handleInlinePriorityChange(jobId, value as QueuePriorityFilter);
+  }, [handleInlinePriorityChange]);
+
+  const handleCategorySelectValueChange = useCallback((jobId: number, value: string) => {
+    void handleInlineCategoryChange(jobId, value);
+  }, [handleInlineCategoryChange]);
+
   const columns = useMemo<ColumnDef<QueueRowData>[]>(
     () => [
       {
@@ -764,16 +922,7 @@ export function JobList() {
         id: "name",
         accessorKey: "displayName",
         header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.name")} />,
-        cell: ({ row }) => (
-          <div className="min-w-0">
-            <Link
-              to={`/jobs/${row.original.id}`}
-              className="block min-h-6 whitespace-normal break-words text-xs font-medium leading-snug text-foreground"
-            >
-              {row.original.displayName}
-            </Link>
-          </div>
-        ),
+        cell: ({ row }) => <QueueNameCell jobId={row.original.id} displayName={row.original.displayName} />,
         meta: {
           headerClassName: "h-7 w-[34%] px-2 text-left",
           cellClassName: "w-[34%] px-2 py-1.5 text-left",
@@ -790,14 +939,11 @@ export function JobList() {
           />
         ),
         cell: ({ row }) => (
-          <div className="flex flex-col items-center gap-1 text-center">
-            <JobStatusBadge status={row.original.status} compact className="px-1.5" />
-            {row.original.blockedByIspCap ? (
-              <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-orange-600 dark:text-orange-300">
-                {t("jobs.bandwidthCapShort")}
-              </span>
-            ) : null}
-          </div>
+          <QueueStatusCell
+            status={row.original.status}
+            blockedByIspCap={row.original.blockedByIspCap}
+            bandwidthCapLabel={t("jobs.bandwidthCapShort")}
+          />
         ),
         meta: {
           headerClassName: "h-7 w-[104px] px-2 text-center",
@@ -816,11 +962,15 @@ export function JobList() {
         ),
         cell: ({ row }) => (
           <QueueCellSelect
+            jobId={row.original.id}
+            field="priority"
             value={row.original.priorityValue}
             options={prioritySelectOptions}
             ariaLabel={`${t("upload.priorityLabel")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:priority`])}
-            onValueChange={(value) => void handleInlinePriorityChange(row.original.id, value as QueuePriorityFilter)}
+            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "priority"}
+            onOpenChange={handleQueueCellSelectOpenChange}
+            onValueChange={handlePrioritySelectValueChange}
             className="w-[108px]"
           />
         ),
@@ -840,11 +990,15 @@ export function JobList() {
         ),
         cell: ({ row }) => (
           <QueueCellSelect
+            jobId={row.original.id}
+            field="category"
             value={row.original.categoryValue ?? NO_CATEGORY_SELECT_VALUE}
             options={categorySelectOptions}
             ariaLabel={`${t("table.category")} ${row.original.displayName}`}
             disabled={Boolean(savingQueueFields[`${row.original.id}:category`])}
-            onValueChange={(value) => void handleInlineCategoryChange(row.original.id, value)}
+            open={openQueueCellSelect?.jobId === row.original.id && openQueueCellSelect.field === "category"}
+            onOpenChange={handleQueueCellSelectOpenChange}
+            onValueChange={handleCategorySelectValueChange}
             className="w-[136px]"
           />
         ),
@@ -871,22 +1025,14 @@ export function JobList() {
           />
         ),
         cell: ({ row }) => (
-          <div className="flex justify-center">
-            <div className="w-full max-w-[176px]">
-              <div className="mb-1 text-right text-[10px] font-medium tabular-nums text-muted-foreground">
-                {row.original.etaDisplay}
-              </div>
-              <JobProgress
-                progress={row.original.progress}
-                status={row.original.status}
-                totalBytes={row.original.totalBytes}
-                downloadedBytes={row.original.downloadedBytes}
-                failedBytes={row.original.failedBytes}
-                compact
-                showLabel={false}
-              />
-            </div>
-          </div>
+          <QueueProgressCell
+            etaDisplay={row.original.etaDisplay}
+            progress={row.original.progress}
+            status={row.original.status}
+            totalBytes={row.original.totalBytes}
+            downloadedBytes={row.original.downloadedBytes}
+            failedBytes={row.original.failedBytes}
+          />
         ),
         meta: {
           headerClassName: "h-7 w-[188px] px-2 text-center",
@@ -903,11 +1049,7 @@ export function JobList() {
             className="justify-center text-center"
           />
         ),
-        cell: ({ row }) => (
-          <div className="text-center text-[11px] text-muted-foreground">
-            {formatBytes(row.original.downloadedBytes)} / {formatBytes(row.original.totalBytes)}
-          </div>
-        ),
+        cell: ({ row }) => <QueueSizeCell totalBytes={row.original.totalBytes} />,
         meta: {
           headerClassName: "h-7 w-[132px] px-2 text-center",
           cellClassName: "w-[132px] px-2 py-1.5 text-center",
@@ -938,10 +1080,12 @@ export function JobList() {
     [
       categorySelectOptions,
       handleCancelJob,
-      handleInlineCategoryChange,
-      handleInlinePriorityChange,
+      handleCategorySelectValueChange,
+      handleQueueCellSelectOpenChange,
       handlePauseJob,
+      handlePrioritySelectValueChange,
       handleResumeJob,
+      openQueueCellSelect,
       prioritySelectOptions,
       savingQueueFields,
       t,
@@ -1202,6 +1346,7 @@ export function JobList() {
           <CardContent className="space-y-4 px-0 pb-0 pt-6">
             <div className="px-6">
               <DataTableToolbar
+                className="lg:min-h-11"
                 searchValue={queuePreferences.search}
                 onSearchChange={(value) => {
                   setQueuePreferences((current) => ({
@@ -1212,9 +1357,10 @@ export function JobList() {
                 }}
                 searchPlaceholder={t("jobs.searchPlaceholder")}
                 searchContainerClassName="max-w-[280px]"
-                centerContainerClassName="min-h-9"
+                searchInputClassName="h-10"
+                centerContainerClassName="min-h-10"
                 centerContent={selectedIds.length > 0 ? (
-                  <div className="inline-flex min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2 py-1.5">
+                  <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
                     <span className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
                       {t("bulk.selected", { count: selectedIds.length })}
                     </span>
@@ -1263,7 +1409,7 @@ export function JobList() {
               >
                 <Popover>
                   <PopoverTrigger asChild>
-                    <Button variant="outline" className="w-full justify-between gap-3 sm:w-[176px]">
+                    <Button variant="outline" className="h-10 w-full justify-between gap-3 sm:w-[176px]">
                       <span className="inline-flex items-center gap-2">
                         <ListFilter className="size-4 text-muted-foreground" />
                         <span>{t("table.filters")}</span>

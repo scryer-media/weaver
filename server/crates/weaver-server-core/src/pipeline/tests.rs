@@ -66,6 +66,7 @@ impl TestHarness {
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
+            diagnostic_upload_url: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }));
@@ -223,6 +224,8 @@ fn history_row_with_output_dir(
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -246,6 +249,7 @@ async fn new_direct_pipeline_with_buffers(
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
+        diagnostic_upload_url: None,
         cleanup_after_extract: Some(true),
         config_path: None,
     }));
@@ -1338,6 +1342,21 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             return;
         }
 
+        if matches!(job_status_for_assert(pipeline, job_id), Some(JobStatus::Moving)) {
+            let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "timed out waiting for final move completion\n{}",
+                        debug_job_state(pipeline, job_id)
+                    )
+                })
+                .expect("move channel should stay open");
+            pipeline.handle_move_to_complete_done(done);
+            pump_pipeline_runtime_queues(pipeline).await;
+            continue;
+        }
+
         let done = tokio::time::timeout(Duration::from_secs(180), pipeline.extract_done_rx.recv())
             .await
             .unwrap_or_else(|_| {
@@ -1352,6 +1371,30 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
     }
 
     panic!("job {job_id} did not reach a terminal state after {max_rounds} extraction rounds");
+}
+
+async fn settle_inflight_moves(pipeline: &mut Pipeline) {
+    while !pipeline.inflight_moves.is_empty() {
+        let done = tokio::time::timeout(Duration::from_secs(5), pipeline.move_done_rx.recv())
+            .await
+            .expect("final move result should arrive")
+            .expect("move channel should stay open");
+        pipeline.handle_move_to_complete_done(done);
+        pipeline.pump_decode_queue();
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+            pipeline.pump_decode_queue();
+        }
+    }
+
+    while let Ok(done) = pipeline.move_done_rx.try_recv() {
+        pipeline.handle_move_to_complete_done(done);
+        pipeline.pump_decode_queue();
+        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(queued_job).await;
+            pipeline.pump_decode_queue();
+        }
+    }
 }
 
 async fn write_and_complete_rar_volume(
@@ -1638,6 +1681,8 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
         pipeline.pump_decode_queue();
     }
 
+    settle_inflight_moves(pipeline).await;
+
     while let Ok(done) = pipeline.extract_done_rx.try_recv() {
         pipeline.handle_extraction_done(done).await;
         pipeline.pump_decode_queue();
@@ -1646,6 +1691,8 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
             pipeline.pump_decode_queue();
         }
     }
+
+    settle_inflight_moves(pipeline).await;
 }
 
 async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
@@ -1678,7 +1725,9 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
             .expect("decode result should arrive")
             .expect("decode channel should stay open");
         pipeline.handle_decode_done(done).await;
+        settle_inflight_moves(pipeline).await;
     }
+    settle_inflight_moves(pipeline).await;
 }
 
 #[tokio::test]
@@ -1776,7 +1825,11 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
         minimal_job_state(job_id, job_name, working_dir.clone()),
     );
 
-    let dest = pipeline.move_to_complete(job_id).await.unwrap();
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    let dest = done.dest.clone();
+    assert!(done.result.is_ok());
+    pipeline.handle_move_to_complete_done(done);
     let expected_dest = complete_dir.join(format!(
         "{}.#{}",
         crate::jobs::working_dir::sanitize_dirname(job_name),
@@ -1784,9 +1837,12 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     ));
 
     assert_eq!(dest, expected_dest);
-    assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().working_dir,
-        expected_dest
+    assert!(pipeline.jobs.get(&job_id).is_none());
+    assert!(
+        pipeline
+            .finished_jobs
+            .iter()
+            .any(|job| job.job_id == job_id && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap()))
     );
     assert!(!working_dir.exists());
     assert_eq!(
@@ -1817,6 +1873,11 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     );
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
     assert!(matches!(status, JobStatus::Failed { .. }));
@@ -1846,6 +1907,10 @@ async fn nested_rar_two_deep_extracts_final_media() {
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
+    settle_inflight_moves(&mut pipeline).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
@@ -2509,6 +2574,7 @@ async fn upstream_probe_does_not_misclassify_unknown_numeric_plain_files() {
     );
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Unknown Numeric Plain Files",
@@ -2571,6 +2637,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             pipeline.handle_download_done(DownloadResult {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2626,6 +2693,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 segment_number: 0,
             },
             data: Ok(DownloadPayload::Raw(raw)),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -2713,6 +2781,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
             .handle_download_done(DownloadResult {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2802,6 +2871,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                     segment_number,
                 },
                 data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2849,6 +2919,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
                 segment_number: 0,
             },
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -2894,6 +2965,7 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
                 segment_number: 0,
             },
             data: Err(DownloadError::Fetch("article not found".to_string())),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: vec![0],
@@ -2951,6 +3023,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
                 segment_number: 0,
             },
             data: Err(DownloadError::Fetch("article not found".to_string())),
+            attempts: Vec::new(),
             is_recovery: true,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -3009,6 +3082,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 1,
                 total_size,
             ))),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -3039,6 +3113,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 segment_number: 1,
             },
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
             exclude_servers: Vec::new(),
@@ -3975,6 +4050,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
             data: Ok(DownloadPayload::Raw(Bytes::from_static(
                 b"not a yenc article",
             ))),
+            attempts: Vec::new(),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -4370,6 +4446,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     assert_eq!(state.recovery_queue.len(), 1);
 
     pipeline.flush_quiescent_write_backlog().await;
+    settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.write_buffered_segments, 0);
@@ -4672,6 +4749,7 @@ async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
 
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
     pipeline.record_job_history(job_id);
+    pipeline.db.flush_write_queue().await.unwrap();
 
     assert!(pipeline.db.load_active_jobs().unwrap().is_empty());
     let history = pipeline.db.get_job_history(job_id.0).unwrap();
@@ -4719,6 +4797,7 @@ async fn record_job_history_retains_failed_job_nzb() {
         error: "boom".to_string(),
     };
     pipeline.record_job_history(job_id);
+    pipeline.db.flush_write_queue().await.unwrap();
 
     let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "failed");
@@ -4746,6 +4825,7 @@ async fn record_job_history_retains_complete_job_nzb() {
 
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
     pipeline.record_job_history(job_id);
+    pipeline.db.flush_write_queue().await.unwrap();
 
     let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "complete");
@@ -6857,6 +6937,7 @@ async fn incremental_rar_batches_survive_eager_delete_of_earlier_volumes() {
         _ => panic!("expected batch extraction completion"),
     }
     pipeline.handle_extraction_done(second_done).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     assert!(matches!(
         job_status_for_assert(&pipeline, job_id),
@@ -8621,6 +8702,7 @@ async fn complete_payload_does_not_finalize_while_promoted_recovery_is_pending()
     }
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
@@ -8674,6 +8756,7 @@ async fn complete_payload_finalizes_while_optional_recovery_is_parked() {
     }
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
@@ -9164,6 +9247,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
     }
 
     pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),

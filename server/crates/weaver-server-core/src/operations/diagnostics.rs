@@ -52,7 +52,7 @@ impl DiagnosticRunStage {
 pub struct DiagnosticRunRow {
     pub source_job_id: u64,
     pub diagnostic_job_id: u64,
-    pub smg_diagnostic_id: Option<String>,
+    pub diagnostic_id: Option<String>,
     pub stage: DiagnosticRunStage,
     pub include_server_hostnames: bool,
     pub rerun_succeeded: Option<bool>,
@@ -163,7 +163,7 @@ impl Database {
             params![
                 row.source_job_id as i64,
                 row.diagnostic_job_id as i64,
-                row.smg_diagnostic_id,
+                row.diagnostic_id,
                 row.stage.as_str(),
                 row.include_server_hostnames,
                 row.rerun_succeeded,
@@ -181,7 +181,7 @@ impl Database {
         &self,
         source_job_id: u64,
     ) -> Result<Option<DiagnosticRunRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
                     rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
@@ -198,7 +198,7 @@ impl Database {
         &self,
         diagnostic_job_id: u64,
     ) -> Result<Option<DiagnosticRunRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         conn.query_row(
             "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
                     rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
@@ -212,7 +212,7 @@ impl Database {
     }
 
     pub fn list_pending_diagnostic_runs(&self) -> Result<Vec<DiagnosticRunRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
@@ -236,7 +236,7 @@ impl Database {
         &self,
         cutoff_epoch_ms: i64,
     ) -> Result<Vec<DiagnosticRunRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
@@ -272,7 +272,7 @@ impl Database {
                 params![
                     row.source_job_id as i64,
                     row.diagnostic_job_id as i64,
-                    row.smg_diagnostic_id,
+                    row.diagnostic_id,
                     row.stage.as_str(),
                     row.include_server_hostnames,
                     row.rerun_succeeded,
@@ -340,7 +340,7 @@ fn diagnostic_run_from_row(row: &rusqlite::Row<'_>) -> Result<DiagnosticRunRow, 
     Ok(DiagnosticRunRow {
         source_job_id: row.get::<_, i64>(0)? as u64,
         diagnostic_job_id: row.get::<_, i64>(1)? as u64,
-        smg_diagnostic_id: row.get(2)?,
+        diagnostic_id: row.get(2)?,
         stage: DiagnosticRunStage::parse(&stage).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,

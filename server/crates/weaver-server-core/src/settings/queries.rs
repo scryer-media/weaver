@@ -5,7 +5,7 @@ use crate::settings::record::SettingRecord;
 
 impl Database {
     pub(crate) fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached("SELECT key, value FROM settings ORDER BY key")
             .map_err(|e| StateError::Database(e.to_string()))?;
@@ -26,7 +26,7 @@ impl Database {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached("SELECT value FROM settings WHERE key = ?1")
             .map_err(|e| StateError::Database(e.to_string()))?;

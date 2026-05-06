@@ -40,7 +40,8 @@ pub struct Config {
     /// Optional ISP bandwidth cap policy.
     #[serde(default)]
     pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
-    /// Optional SMG base URL for diagnostic bundle uploads.
+    /// Optional override for the diagnostic upload service base URL.
+    /// Defaults to https://diagnostics.scryer.media when unset.
     #[serde(default)]
     pub diagnostic_upload_url: Option<String>,
 

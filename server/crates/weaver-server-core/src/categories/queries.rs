@@ -4,7 +4,7 @@ use crate::persistence::Database;
 
 impl Database {
     pub fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached("SELECT id, name, dest_dir, aliases FROM categories ORDER BY name")
             .map_err(|e| StateError::Database(e.to_string()))?;

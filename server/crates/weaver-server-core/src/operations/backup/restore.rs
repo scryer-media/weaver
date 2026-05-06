@@ -204,6 +204,8 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            last_diagnostic_id: None,
+            last_diagnostic_uploaded_at_epoch_ms: None,
         });
         assert_eq!(repairing.status, crate::JobStatus::Repairing);
         assert_eq!(repairing.download_state, crate::DownloadState::Complete);
@@ -226,6 +228,8 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            last_diagnostic_id: None,
+            last_diagnostic_uploaded_at_epoch_ms: None,
         });
         assert_eq!(moving.status, crate::JobStatus::Moving);
         assert_eq!(moving.download_state, crate::DownloadState::Complete);

@@ -6,7 +6,7 @@ impl Database {
     pub fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert

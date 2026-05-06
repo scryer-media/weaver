@@ -39,6 +39,7 @@ fn sample_config() -> Config {
         }),
         max_download_speed: Some(42),
         isp_bandwidth_cap: None,
+        diagnostic_upload_url: None,
         cleanup_after_extract: Some(true),
         config_path: None,
     }
@@ -68,6 +69,8 @@ fn export_and_import_stable_state_roundtrip() {
         created_at: 1,
         completed_at: 2,
         metadata: Some("[[\"k\",\"v\"]]".into()),
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     src.insert_job_events(&[JobEvent {
@@ -190,6 +193,8 @@ fn restore_target_is_not_pristine_with_history() {
         created_at: 1,
         completed_at: 1,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     assert!(!db.restore_target_is_pristine().unwrap());

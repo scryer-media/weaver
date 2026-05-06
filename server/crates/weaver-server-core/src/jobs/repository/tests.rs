@@ -212,6 +212,8 @@ fn archive_job_moves_to_history() {
         created_at: 1700000001,
         completed_at: 1700001000,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
 
@@ -283,6 +285,8 @@ fn max_job_id_all_spans_both_tables() {
         created_at: 0,
         completed_at: 0,
         metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
     };
     db.insert_job_history(&history).unwrap();
 
@@ -649,6 +653,8 @@ fn late_active_state_writes_noop_after_archive() {
             created_at: 1_700_000_001,
             completed_at: 1_700_000_010,
             metadata: None,
+            last_diagnostic_id: None,
+            last_diagnostic_uploaded_at_epoch_ms: None,
         },
     )
     .unwrap();

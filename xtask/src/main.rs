@@ -1746,6 +1746,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     );
     let state_key_file = state_dir.join("encryption.key");
     let rust_log = build_rust_log(args.target.as_deref());
+    let backend_binary = ctx.path("target/debug/weaver");
     let backend_url = format!("http://127.0.0.1:{backend_port}");
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let vite_use_polling =
@@ -1795,21 +1796,25 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let encryption_key = load_state_encryption_key(&state_key_file)?;
     seed_runtime_dirs(&state_dir.join("weaver.db"), &data_dir)?;
 
-    println!("==> Starting Weaver backend with cargo run on :{backend_port}");
+    println!("==> Building Weaver backend...");
+    let mut build = ctx.command_in("cargo", &ctx.repo_root);
+    build.args(["build", "--locked", "-p", "weaver"]);
+    run_checked(&mut build)?;
+
+    println!(
+        "==> Starting Weaver backend from {} on :{backend_port}",
+        backend_binary.display()
+    );
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&backend_log)?;
     let log_err = log.try_clone()?;
-    let mut backend = ctx.command_in("cargo", &ctx.repo_root);
+    let mut backend = ctx.command(&backend_binary);
     configure_backend_process_group(&mut backend);
     backend
         .env("RUST_LOG", &rust_log)
         .args([
-            "run",
-            "-p",
-            "weaver",
-            "--",
             "--config",
             &state_dir.display().to_string(),
             "serve",
@@ -1824,7 +1829,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
-    wait_for_backend(backend_pid, backend_port, &backend_log)?;
+    if let Err(error) = wait_for_backend(backend_pid, backend_port, &backend_log) {
+        drop(backend_signal_forwarder);
+        terminate_backend(&mut backend);
+        if !keep_data {
+            drop(temp_dir);
+        }
+        return Err(error);
+    }
 
     println!("==> Weaver backend ready");
     println!("    Backend:  {backend_url}");

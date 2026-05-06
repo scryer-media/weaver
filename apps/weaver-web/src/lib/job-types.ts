@@ -49,7 +49,7 @@ export interface DeleteOperationData {
 export interface DiagnosticRunData {
   sourceJobId: number;
   diagnosticJobId: number;
-  smgDiagnosticId?: string | null;
+  diagnosticId?: string | null;
   stage: "QUEUED" | "RUNNING" | "COLLECTING" | "UPLOADING" | "COMPLETE" | "FAILED";
   includeServerHostnames: boolean;
   rerunSucceeded?: boolean | null;
@@ -153,8 +153,8 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
   };
 }
 
-export function formatJobReleaseName(job: Pick<JobData, "originalTitle" | "displayTitle">): string {
-  const releaseName = job.originalTitle.trim();
+export function formatJobReleaseName(job: Pick<JobData, "name" | "originalTitle" | "displayTitle">): string {
+  const releaseName = job.originalTitle.trim() || job.name.trim();
   if (!releaseName) {
     return job.displayTitle;
   }

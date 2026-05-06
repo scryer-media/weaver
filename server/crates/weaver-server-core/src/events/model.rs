@@ -1,5 +1,14 @@
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId, SegmentId, ServerId};
 use weaver_model::files::FileRole;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAttemptOutcome {
+    Success,
+    NotFound,
+    AuthenticationFailure,
+    TransientFailure,
+    PermanentFailure,
+}
 
 /// Pipeline events emitted by the scheduler and consumed by the state journal,
 /// API subscriptions, and internal scheduler logic.
@@ -49,6 +58,18 @@ pub enum PipelineEvent {
     ArticleDownloaded {
         segment_id: SegmentId,
         raw_size: u32,
+    },
+
+    /// A single server attempt made while fetching an article.
+    ServerAttempt {
+        segment_id: SegmentId,
+        server_id: ServerId,
+        attempt: u32,
+        retry_count: u32,
+        latency_ms: u64,
+        outcome: ServerAttemptOutcome,
+        error: Option<String>,
+        is_recovery: bool,
     },
 
     /// A job started an active article download pass.

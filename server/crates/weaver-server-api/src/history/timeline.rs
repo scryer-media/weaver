@@ -43,7 +43,9 @@ pub(crate) fn build_job_timeline(
             .iter()
             .rev()
             .find_map(|event| match event.kind.parse::<EventKind>().ok()? {
-                EventKind::JobCompleted | EventKind::JobFailed => Some(event.timestamp as f64),
+                EventKind::JobCompleted | EventKind::JobFailed | EventKind::JobCancelled => {
+                    Some(event.timestamp as f64)
+                }
                 _ => None,
             });
     let ended_at = terminal_event_at.or_else(|| {

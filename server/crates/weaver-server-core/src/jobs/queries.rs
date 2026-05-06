@@ -17,7 +17,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT file_index, md5
@@ -55,7 +55,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<HashMap<u32, ActivePar2File>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT file_index, filename, recovery_block_count, promoted
@@ -82,7 +82,7 @@ impl Database {
     }
 
     pub fn load_failed_extractions(&self, job_id: JobId) -> Result<HashSet<String>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT member_name FROM active_failed_extractions
@@ -96,7 +96,7 @@ impl Database {
     }
 
     pub fn load_active_job_normalization_retried(&self, job_id: JobId) -> Result<bool, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let result = conn.query_row(
             "SELECT normalization_retried FROM active_jobs WHERE job_id = ?1",
             [job_id.0 as i64],
@@ -113,7 +113,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<HashMap<String, HashSet<u32>>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT set_name, volume_index
@@ -135,7 +135,7 @@ impl Database {
     }
 
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut jobs = HashMap::new();
 
         {
@@ -382,7 +382,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<HashMap<u32, DetectedArchiveIdentity>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT file_index, kind, set_name, volume_index
@@ -419,7 +419,7 @@ impl Database {
     }
 
     pub fn max_job_id_all(&self) -> Result<u64, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let max: Option<i64> = conn
             .query_row(
                 "SELECT MAX(id) FROM (
@@ -439,7 +439,7 @@ impl Database {
         job_id: JobId,
         set_name: &str,
     ) -> Result<Vec<ExtractionChunk>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT member_name, volume_index, bytes_written, temp_path,
@@ -471,7 +471,7 @@ impl Database {
         job_id: JobId,
         set_name: &str,
     ) -> Result<Option<Vec<u8>>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let result = conn.query_row(
             "SELECT headers FROM active_archive_headers
              WHERE job_id = ?1 AND set_name = ?2",
@@ -489,7 +489,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<HashMap<String, Vec<u8>>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT set_name, headers FROM active_archive_headers
@@ -508,7 +508,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<RarVolumeFactsBySet, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT set_name, volume_index, facts_blob
@@ -541,7 +541,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<Vec<(String, u32)>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT set_name, volume_index

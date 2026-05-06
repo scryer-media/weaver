@@ -208,10 +208,10 @@ function formatDiagnosticSummary(
   const diagnosticRun = job.diagnosticRun;
   if (diagnosticRun) {
     const stageLabel = diagnosticStageLabel(t, diagnosticRun.stage);
-    if (diagnosticRun.smgDiagnosticId) {
+    if (diagnosticRun.diagnosticId) {
       return t("history.diagnosticWithId", {
         stage: stageLabel,
-        id: diagnosticRun.smgDiagnosticId,
+        id: diagnosticRun.diagnosticId,
       });
     }
     if (diagnosticRun.errorMessage) {
@@ -1038,10 +1038,8 @@ export function History() {
             <div className="space-y-1">
               <div className="text-sm font-medium text-foreground">Deleting history items</div>
               <div className="text-xs text-muted-foreground">
-                {deleteProgress.completedTargets + deleteProgress.failedTargets}
-                /
                 {deleteProgress.totalTargets}
-                {" "}processed
+                {" "}tracked
                 {deleteProgress.runningTargets > 0
                   ? ` • ${deleteProgress.runningTargets} running`
                   : ""}
@@ -1254,7 +1252,7 @@ export function History() {
 
       <ConfirmDialog
         open={deleteBatchConfirm}
-        title={t("confirm.deleteHistoryBatch")}
+        title={t("confirm.deleteHistoryBatch", { count: selectedCount })}
         message={t("confirm.deleteHistoryBatchMessage", { count: selectedCount })}
         confirmLabel={t("confirm.deleteHistoryConfirm")}
         cancelLabel={t("confirm.deleteHistoryDismiss")}

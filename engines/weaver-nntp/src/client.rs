@@ -81,6 +81,29 @@ pub struct ProbeBatchResult {
     pub inconclusive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchAttemptOutcome {
+    Success,
+    NotFound,
+    AuthenticationFailure,
+    TransientFailure,
+    PermanentFailure,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchAttemptTrace {
+    pub server_idx: usize,
+    pub elapsed: Duration,
+    pub outcome: FetchAttemptOutcome,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct FetchBodyTrace {
+    pub attempts: Vec<FetchAttemptTrace>,
+    pub result: Result<Bytes>,
+}
+
 impl NntpClient {
     /// Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
@@ -248,80 +271,9 @@ impl NntpClient {
         message_id: &str,
         groups: &[String],
     ) -> Result<Bytes> {
-        if groups.is_empty() {
-            return self.fetch_body(message_id).await;
-        }
-
-        let order = self.build_server_order(&[]).await;
-        let mut last_error: Option<NntpError> = None;
-
-        for idx in order {
-            let server = ServerId(idx);
-            let start = Instant::now();
-
-            match self
-                .fetch_from_server_with_groups(server, message_id, groups)
-                .await
-            {
-                Ok(data) => {
-                    let elapsed = start.elapsed();
-                    self.record_server_success(idx, elapsed).await;
-                    return Ok(data);
-                }
-                Err(NntpError::ArticleNotFound)
-                | Err(NntpError::NoSuchArticle { .. })
-                | Err(NntpError::NoArticleWithNumber) => {
-                    debug!(
-                        server = idx,
-                        message_id, "article not found, trying next server"
-                    );
-                    last_error = Some(NntpError::NoSuchArticle {
-                        message_id: message_id.to_string(),
-                    });
-                    continue;
-                }
-                Err(e @ NntpError::SoftTimeout(_)) => {
-                    warn!(
-                        server = idx,
-                        error = %e,
-                        message_id,
-                        "soft timeout, trying next server"
-                    );
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
-                    last_error = Some(e);
-                    continue;
-                }
-                Err(NntpError::AuthenticationFailed)
-                | Err(NntpError::AuthenticationRejected)
-                | Err(NntpError::AccessDenied) => {
-                    warn!(
-                        server = idx,
-                        message_id, "authentication/access failure, trying next server"
-                    );
-                    self.record_server_failure(idx, true).await;
-                    last_error = Some(NntpError::AuthenticationFailed);
-                    continue;
-                }
-                Err(e) if is_transient(&e) => {
-                    warn!(
-                        server = idx,
-                        error = %e,
-                        message_id,
-                        "transient error, trying next server"
-                    );
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
-                    last_error = Some(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(last_error.unwrap_or(NntpError::PoolExhausted))
+        self.fetch_body_with_groups_traced(message_id, groups)
+            .await
+            .result
     }
 
     /// Like [`fetch_body_with_groups`](Self::fetch_body_with_groups) but skips
@@ -333,18 +285,45 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> Result<Bytes> {
+        self.fetch_body_with_groups_excluding_traced(message_id, groups, exclude)
+            .await
+            .result
+    }
+
+    pub async fn fetch_body_with_groups_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+    ) -> FetchBodyTrace {
+        self.fetch_body_with_groups_excluding_traced(message_id, groups, &[])
+            .await
+    }
+
+    pub async fn fetch_body_with_groups_excluding_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> FetchBodyTrace {
         if groups.is_empty() {
-            return self
-                .fetch_with_failover_excluding(message_id, FetchKind::Body, exclude)
-                .await;
+            return FetchBodyTrace {
+                attempts: Vec::new(),
+                result: self
+                    .fetch_with_failover_excluding(message_id, FetchKind::Body, exclude)
+                    .await,
+            };
         }
 
         let order = self.build_server_order(exclude).await;
 
         if order.is_empty() {
-            return Err(NntpError::PoolExhausted);
+            return FetchBodyTrace {
+                attempts: Vec::new(),
+                result: Err(NntpError::PoolExhausted),
+            };
         }
 
+        let mut attempts = Vec::new();
         let mut last_error: Option<NntpError> = None;
 
         for idx in order {
@@ -358,17 +337,38 @@ impl NntpClient {
                 Ok(data) => {
                     let elapsed = start.elapsed();
                     self.record_server_success(idx, elapsed).await;
-                    return Ok(data);
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed,
+                        outcome: FetchAttemptOutcome::Success,
+                        error: None,
+                    });
+                    return FetchBodyTrace {
+                        attempts,
+                        result: Ok(data),
+                    };
                 }
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::NotFound,
+                        error: Some("article not found".to_string()),
+                    });
                     last_error = Some(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
                     });
                     continue;
                 }
                 Err(e @ NntpError::SoftTimeout(_)) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::TransientFailure,
+                        error: Some(e.to_string()),
+                    });
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
@@ -378,22 +378,48 @@ impl NntpClient {
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::AuthenticationFailure,
+                        error: Some("authentication/access failure".to_string()),
+                    });
                     self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::TransientFailure,
+                        error: Some(e.to_string()),
+                    });
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
                     last_error = Some(e);
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::PermanentFailure,
+                        error: Some(e.to_string()),
+                    });
+                    return FetchBodyTrace {
+                        attempts,
+                        result: Err(e),
+                    };
+                }
             }
         }
 
-        Err(last_error.unwrap_or(NntpError::PoolExhausted))
+        FetchBodyTrace {
+            attempts,
+            result: Err(last_error.unwrap_or(NntpError::PoolExhausted)),
+        }
     }
 
     /// Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.

@@ -40,7 +40,11 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::CancelJob { job_id, reply } => {
-                let result = if let Some(state) = self.jobs.remove(&job_id) {
+                let result = if self.inflight_moves.contains(&job_id) {
+                    Err(crate::SchedulerError::Conflict(
+                        "cancel is not supported while the final move is running".to_string(),
+                    ))
+                } else if let Some(state) = self.jobs.remove(&job_id) {
                     self.job_order.retain(|id| *id != job_id);
                     self.remove_pending_completion_check(job_id);
                     self.update_queue_metrics();

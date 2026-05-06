@@ -28,7 +28,7 @@ impl Database {
     pub fn list_rss_feeds(&self) -> Result<Vec<RssFeedRow>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, name, url, enabled, poll_interval_secs, username, password,
@@ -72,7 +72,7 @@ impl Database {
     pub fn get_rss_feed(&self, id: u32) -> Result<Option<RssFeedRow>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, name, url, enabled, poll_interval_secs, username, password,
@@ -111,7 +111,7 @@ impl Database {
     }
 
     pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, feed_id, sort_order, enabled, action, title_regex, item_categories,
@@ -148,7 +148,7 @@ impl Database {
     }
 
     pub fn get_rss_rule(&self, id: u32) -> Result<Option<RssRuleRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, feed_id, sort_order, enabled, action, title_regex, item_categories,
@@ -180,7 +180,7 @@ impl Database {
     }
 
     pub fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM rss_seen_items WHERE feed_id = ?1 AND item_id = ?2",
@@ -197,7 +197,7 @@ impl Database {
         feed_id: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Vec<RssSeenItemRow>, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut out = Vec::new();
 
         match (feed_id, limit) {

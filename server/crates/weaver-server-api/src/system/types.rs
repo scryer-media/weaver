@@ -263,6 +263,33 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: "download pipeline drained".into(),
             },
+            PipelineEvent::ServerAttempt {
+                segment_id,
+                server_id,
+                attempt,
+                retry_count,
+                latency_ms,
+                outcome,
+                error,
+                is_recovery,
+            } => Self {
+                kind: EventKind::ServerAttempt,
+                job_id: Some(segment_id.file_id.job_id.0),
+                file_id: Some(segment_id.file_id.to_string()),
+                message: format!(
+                    "server-{} attempt {} retry {} {} in {}ms{}{}",
+                    u32::from(server_id.0) + 1,
+                    attempt,
+                    retry_count,
+                    format!("{outcome:?}").to_ascii_lowercase(),
+                    latency_ms,
+                    if *is_recovery { " recovery" } else { "" },
+                    error
+                        .as_ref()
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default()
+                ),
+            },
             PipelineEvent::ArticleDownloaded {
                 segment_id,
                 raw_size,

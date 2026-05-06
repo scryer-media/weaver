@@ -53,7 +53,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     diagnosticRun {
       sourceJobId
       diagnosticJobId
-      smgDiagnosticId
+      diagnosticId
       stage
       includeServerHostnames
       rerunSucceeded

@@ -255,9 +255,9 @@ function mapQueueSnapshot(
   const globalState = previous && sameGlobalState(previous.globalState, snapshot.globalState)
     ? previous.globalState
     : snapshot.globalState;
-  const latestCursor = previous?.latestCursor === snapshot.latestCursor
+  const latestCursor = previous && previous.latestCursor === snapshot.latestCursor
     ? previous.latestCursor
-    : snapshot.latestCursor;
+    : (snapshot.latestCursor ?? previous?.latestCursor ?? "");
 
   if (
     previous

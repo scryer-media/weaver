@@ -165,12 +165,9 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
                 result = rx.recv() => result,
                 _ = tokio::time::sleep(flush_interval) => {
                     let events = std::mem::take(&mut batch);
-                    let db = db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = db.insert_job_events(&events) {
-                            tracing::warn!(error = %e, "failed to persist job events");
-                        }
-                    });
+                    if let Err(error) = db.queue_job_events(events).await {
+                        tracing::warn!(error = %error, "failed to queue job events");
+                    }
                     continue;
                 }
             }
@@ -197,12 +194,9 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
 
                 if batch.len() >= 50 {
                     let events = std::mem::take(&mut batch);
-                    let db = db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = db.insert_job_events(&events) {
-                            tracing::warn!(error = %e, "failed to persist job events");
-                        }
-                    });
+                    if let Err(error) = db.queue_job_events(events).await {
+                        tracing::warn!(error = %error, "failed to queue job events");
+                    }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -213,7 +207,12 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
     }
 
     if !batch.is_empty() {
-        let _ = db.insert_job_events(&batch);
+        if let Err(error) = db.queue_job_events(std::mem::take(&mut batch)).await {
+            tracing::warn!(error = %error, "failed to queue final job events");
+        }
+    }
+    if let Err(error) = db.flush_write_queue().await {
+        tracing::warn!(error = %error, "failed to flush final job event writes");
     }
 }
 
