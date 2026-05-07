@@ -23,6 +23,17 @@ pub trait BitRead {
         self.position() / 8
     }
     fn read_bits(&mut self, count: u8) -> RarResult<u32>;
+    fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
+        debug_assert!(count <= 64);
+        if count <= 32 {
+            return Ok(self.read_bits(count)? as u64);
+        }
+
+        let high_bits = count - 32;
+        let high = self.read_bits(high_bits)? as u64;
+        let low = self.read_bits(32)? as u64;
+        Ok((high << 32) | low)
+    }
     fn peek_16_left_aligned(&mut self) -> RarResult<u32>;
     fn consume_bits(&mut self, count: u8) -> RarResult<()>;
     fn skip_bits(&mut self, count: u32) -> RarResult<()>;

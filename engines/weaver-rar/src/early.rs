@@ -51,104 +51,97 @@ pub fn detect_encryption(data: &[u8]) -> EncryptionStatus {
 
 /// Detect encryption in RAR5 data (positioned after the 8-byte signature).
 fn detect_rar5_encryption(data: &[u8]) -> EncryptionStatus {
-    // Parse the first header to check if it's an encryption header (type 4).
-    let (header_type, header_end) = match parse_rar5_header_envelope(data) {
-        Ok(v) => v,
-        Err(need) => {
-            return EncryptionStatus::Insufficient {
-                min_bytes: 8 + need,
-            };
+    let mut offset = 0usize;
+
+    loop {
+        let header = match parse_rar5_header(data, offset) {
+            Ok(header) => header,
+            Err(need) => {
+                return EncryptionStatus::Insufficient {
+                    min_bytes: 8 + need,
+                };
+            }
+        };
+
+        if header.header_type == 4 {
+            return EncryptionStatus::HeaderEncrypted;
         }
-    };
 
-    // RAR5 header type 4 = Encryption — all subsequent headers are encrypted.
-    if header_type == 4 {
-        return EncryptionStatus::HeaderEncrypted;
-    }
-
-    // First header should be MainArchive (type 1). Skip to next header.
-    if header_type != 1 {
-        // Unexpected header order — can't determine, report what we found.
-        return EncryptionStatus::None;
-    }
-
-    // Try to parse the second header (should be a file or service header).
-    let remaining = &data[header_end..];
-    let (header_type2, header2_body, _header2_end) = match parse_rar5_header_with_body(remaining) {
-        Ok(v) => v,
-        Err(need) => {
-            return EncryptionStatus::Insufficient {
-                min_bytes: 8 + header_end + need,
-            };
+        if (header.header_type == 2 || header.header_type == 3)
+            && has_rar5_encryption_extra(header.header_flags, &header.body)
+        {
+            return EncryptionStatus::FileEncrypted;
         }
-    };
 
-    // Type 2 = File, Type 3 = Service — both can have encryption extra records.
-    if (header_type2 == 2 || header_type2 == 3) && has_rar5_encryption_extra(&header2_body) {
-        return EncryptionStatus::FileEncrypted;
+        offset = header.next_header_offset;
+        if header.header_type == 5 {
+            return EncryptionStatus::None;
+        }
     }
-
-    EncryptionStatus::None
 }
 
-/// Parse a RAR5 header envelope, returning (header_type, total_bytes_consumed).
-/// On insufficient data, returns Err(min_bytes_needed_from_start_of_this_header).
-fn parse_rar5_header_envelope(data: &[u8]) -> Result<(u64, usize), usize> {
-    let mut pos = 0;
+struct ParsedRar5Header {
+    header_type: u64,
+    header_flags: u64,
+    body: Vec<u8>,
+    next_header_offset: usize,
+}
 
-    // CRC32 (4 bytes)
-    if data.len() < 4 {
-        return Err(32);
+/// Parse a RAR5 header starting at `offset`.
+fn parse_rar5_header(data: &[u8], offset: usize) -> Result<ParsedRar5Header, usize> {
+    let remaining = &data[offset..];
+    let mut pos = 0usize;
+
+    if remaining.len() < 4 {
+        return Err(offset + 32);
     }
     pos += 4;
 
-    // header_size vint
-    let (header_size, n) = vint::read_vint(&data[pos..]).map_err(|_| pos + 16)?;
+    let (header_size, n) = vint::read_vint(&remaining[pos..]).map_err(|_| offset + pos + 16)?;
     pos += n;
 
     let body_start = pos;
     let total = body_start + header_size as usize;
-
-    // Read header type from body
-    let (header_type, _n) = vint::read_vint(&data[pos..]).map_err(|_| total)?;
-
-    Ok((header_type, total))
-}
-
-/// Parse a RAR5 header, returning (header_type, body_bytes, total_bytes_consumed).
-fn parse_rar5_header_with_body(data: &[u8]) -> Result<(u64, Vec<u8>, usize), usize> {
-    let mut pos = 0;
-
-    // CRC32 (4 bytes)
-    if data.len() < 4 {
-        return Err(32);
-    }
-    pos += 4;
-
-    // header_size vint
-    let (header_size, n) = vint::read_vint(&data[pos..]).map_err(|_| pos + 16)?;
-    pos += n;
-
-    let body_start = pos;
-    let total = body_start + header_size as usize;
-
-    if data.len() < total {
-        return Err(total);
+    if remaining.len() < total {
+        return Err(offset + total);
     }
 
-    let body = data[body_start..total].to_vec();
+    let body = remaining[body_start..total].to_vec();
 
-    // Parse header type from body
-    let (header_type, _) = vint::read_vint(&body).map_err(|_| total)?;
+    let (header_type, n) = vint::read_vint(&body).map_err(|_| offset + total)?;
+    let (header_flags, mut body_pos) =
+        vint::read_vint(&body[n..]).map_err(|_| offset + total)?;
+    body_pos += n;
 
-    Ok((header_type, body, total))
+    if header_flags & 0x0001 != 0 {
+        let (_, extra_n) = vint::read_vint(&body[body_pos..]).map_err(|_| offset + total)?;
+        body_pos += extra_n;
+    }
+    let data_area_size = if header_flags & 0x0002 != 0 {
+        let (value, _) = vint::read_vint(&body[body_pos..]).map_err(|_| offset + total)?;
+        value as usize
+    } else {
+        0
+    };
+
+    let next_header_offset = offset + total + data_area_size;
+    if data.len() < next_header_offset {
+        return Err(next_header_offset);
+    }
+
+    Ok(ParsedRar5Header {
+        header_type,
+        header_flags,
+        body,
+        next_header_offset,
+    })
 }
 
 /// Check if a RAR5 file/service header body contains an encryption extra record.
 ///
 /// Extra record layout: each record has size (vint), type (vint), then data.
 /// Encryption extra record type = 1 (for file headers).
-fn has_rar5_encryption_extra(body: &[u8]) -> bool {
+fn has_rar5_encryption_extra(header_flags: u64, body: &[u8]) -> bool {
     // Parse past common fields to find the extra area.
     let mut pos = 0;
 
@@ -166,6 +159,10 @@ fn has_rar5_encryption_extra(body: &[u8]) -> bool {
 
     let has_extra = flags & 0x0001 != 0; // EXTRA_AREA flag
     if !has_extra {
+        return false;
+    }
+
+    if header_flags & 0x0001 == 0 {
         return false;
     }
 
@@ -369,6 +366,22 @@ mod tests {
         result
     }
 
+    fn build_rar5_plain_file_header() -> Vec<u8> {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_vint(0));
+        type_body.extend_from_slice(&encode_vint(1000));
+        type_body.extend_from_slice(&encode_vint(0));
+        type_body.extend_from_slice(&0u32.to_le_bytes());
+        type_body.extend_from_slice(&0u32.to_le_bytes());
+        type_body.extend_from_slice(&encode_vint(0));
+        type_body.extend_from_slice(&encode_vint(0));
+        let name = b"test.dat";
+        type_body.extend_from_slice(&encode_vint(name.len() as u64));
+        type_body.extend_from_slice(name);
+
+        build_rar5_header(2, 0, &type_body)
+    }
+
     #[test]
     fn rar5_header_encrypted() {
         let mut data = RAR5_SIGNATURE.to_vec();
@@ -384,11 +397,14 @@ mod tests {
         let mut data = RAR5_SIGNATURE.to_vec();
         // Main archive header (type 1), then a file header with no encryption
         let main_header = build_rar5_header(1, 0, &encode_vint(0)); // archive_flags = 0
-        let file_header = build_rar5_header(2, 0, &[]); // no extra area
+        let file_header = build_rar5_plain_file_header();
         data.extend_from_slice(&main_header);
         data.extend_from_slice(&file_header);
 
-        assert_eq!(detect_encryption(&data), EncryptionStatus::None);
+        assert!(matches!(
+            detect_encryption(&data),
+            EncryptionStatus::Insufficient { .. }
+        ));
     }
 
     #[test]

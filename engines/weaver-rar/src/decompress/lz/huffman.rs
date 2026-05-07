@@ -3,7 +3,8 @@
 //! RAR5 uses 5 canonical Huffman tables:
 //! - `HUFF_BC = 20` — bit-length bootstrap codes (used to decode other tables)
 //! - `HUFF_NC = 306` — literal/length codes (256 literals + 50 length codes)
-//! - `HUFF_DC = 64` — distance codes
+//! - `HUFF_DCB = 64` — RAR5 distance codes
+//! - `HUFF_DCX = 80` — RAR7 distance codes
 //! - `HUFF_LDC = 16` — lower distance bits codes
 //! - `HUFF_RC = 44` — repeating/cached distance codes
 //!
@@ -21,8 +22,12 @@ use super::bitstream::{BitRead, BitReader};
 pub const HUFF_BC: usize = 20;
 /// Number of literal/length codes (256 literals + 50 length codes).
 pub const HUFF_NC: usize = 306;
-/// Number of distance codes.
-pub const HUFF_DC: usize = 64;
+/// Number of RAR5 distance codes.
+pub const HUFF_DCB: usize = 64;
+/// Number of RAR7 distance codes.
+pub const HUFF_DCX: usize = 80;
+/// Backward-compatible alias for RAR5 distance codes.
+pub const HUFF_DC: usize = HUFF_DCB;
 /// Number of lower distance bit codes.
 pub const HUFF_LDC: usize = 16;
 /// Number of repeating/cached distance codes.
@@ -338,14 +343,20 @@ fn quick_bits_for_size(num_symbols: usize) -> u8 {
     }
 }
 
+fn total_symbols(extra_dist: bool) -> usize {
+    HUFF_NC + if extra_dist { HUFF_DCX } else { HUFF_DCB } + HUFF_LDC + HUFF_RC
+}
+
 fn build_tables_from_combined_lengths(
     all_lengths: &[u8],
+    extra_dist: bool,
 ) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     let mut offset = 0;
     let nc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_NC])?;
     offset += HUFF_NC;
-    let dc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_DC])?;
-    offset += HUFF_DC;
+    let dc_symbols = if extra_dist { HUFF_DCX } else { HUFF_DCB };
+    let dc_table = HuffmanTable::build(&all_lengths[offset..offset + dc_symbols])?;
+    offset += dc_symbols;
     let ldc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_LDC])?;
     offset += HUFF_LDC;
     let rc_table = HuffmanTable::build(&all_lengths[offset..offset + HUFF_RC])?;
@@ -363,6 +374,7 @@ fn build_tables_from_combined_lengths(
 pub fn read_tables<R: BitRead>(
     reader: &mut R,
     prev_lengths: &mut [u8],
+    extra_dist: bool,
 ) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     let mut bc_lengths = [0u8; HUFF_BC];
     let mut i = 0;
@@ -388,7 +400,7 @@ pub fn read_tables<R: BitRead>(
     }
     let bc_table = HuffmanTable::build(&bc_lengths)?;
 
-    let total_symbols = HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC;
+    let total_symbols = total_symbols(extra_dist);
     let all_lengths = prev_lengths;
     let mut i = 0;
 
@@ -408,7 +420,12 @@ pub fn read_tables<R: BitRead>(
             } else {
                 reader.read_bits(7)? as usize + 11
             };
-            let value = if i == 0 { 0 } else { all_lengths[i - 1] };
+            if i == 0 {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 table repeat used at index zero".into(),
+                });
+            }
+            let value = all_lengths[i - 1];
             for _ in 0..count {
                 if i >= total_symbols {
                     break;
@@ -432,12 +449,13 @@ pub fn read_tables<R: BitRead>(
         }
     }
 
-    build_tables_from_combined_lengths(all_lengths)
+    build_tables_from_combined_lengths(all_lengths, extra_dist)
 }
 
 pub fn read_tables_bitreader(
     reader: &mut BitReader<'_>,
     prev_lengths: &mut [u8],
+    extra_dist: bool,
 ) -> RarResult<(HuffmanTable, HuffmanTable, HuffmanTable, HuffmanTable)> {
     let mut bc_lengths = [0u8; HUFF_BC];
     let mut i = 0usize;
@@ -465,7 +483,7 @@ pub fn read_tables_bitreader(
     }
 
     let bc_table = HuffmanTable::build(&bc_lengths)?;
-    let total_symbols = HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC;
+    let total_symbols = total_symbols(extra_dist);
     let all_lengths = prev_lengths;
     let mut i = 0usize;
 
@@ -485,7 +503,12 @@ pub fn read_tables_bitreader(
                 ((reader.getbits()? >> 9) as usize) + 11
             };
             reader.addbits(if number == 16 { 3 } else { 7 })?;
-            let value = if i == 0 { 0 } else { all_lengths[i - 1] };
+            if i == 0 {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR5 table repeat used at index zero".into(),
+                });
+            }
+            let value = all_lengths[i - 1];
             for _ in 0..count {
                 if i >= total_symbols {
                     break;
@@ -510,7 +533,7 @@ pub fn read_tables_bitreader(
         }
     }
 
-    build_tables_from_combined_lengths(all_lengths)
+    build_tables_from_combined_lengths(all_lengths, extra_dist)
 }
 
 #[cfg(test)]
@@ -822,9 +845,9 @@ mod tests {
         let mut ported = BitReader::new(&data);
 
         let (generic_nc, generic_dc, generic_ldc, generic_rc) =
-            read_tables(&mut generic, &mut prev_generic).unwrap();
+            read_tables(&mut generic, &mut prev_generic, false).unwrap();
         let (ported_nc, ported_dc, ported_ldc, ported_rc) =
-            read_tables_bitreader(&mut ported, &mut prev_ported).unwrap();
+            read_tables_bitreader(&mut ported, &mut prev_ported, false).unwrap();
 
         assert_eq!(generic.position(), ported.position());
         assert_eq!(prev_generic, prev_ported);

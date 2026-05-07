@@ -10,7 +10,10 @@
 //! - Salt (16 bytes)
 //! - Password check data (12 bytes, if flag 0x0001)
 
-use crate::error::RarResult;
+use sha2::{Digest, Sha256};
+
+use crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX;
+use crate::error::{RarError, RarResult};
 use crate::header::common::{self, RawHeader};
 use crate::vint;
 
@@ -25,8 +28,10 @@ pub struct EncryptionHeader {
     pub kdf_count: u8,
     /// Salt (16 bytes).
     pub salt: [u8; 16],
-    /// Whether password check data is present.
+    /// Whether password check data is present in the raw header.
     pub has_password_check: bool,
+    /// Password check data with a valid checksum, if present.
+    pub check_data: Option<[u8; 12]>,
 }
 
 /// Parse an encryption header from a raw header.
@@ -50,14 +55,32 @@ pub fn parse(raw: &RawHeader) -> RarResult<EncryptionHeader> {
     }
 
     let kdf_count = body[pos];
+    if kdf_count > CRYPT5_KDF_LG2_COUNT_MAX {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "RAR5 header encryption KDF log2 count {} exceeds maximum {}",
+                kdf_count, CRYPT5_KDF_LG2_COUNT_MAX
+            ),
+        });
+    }
     pos += 1;
 
     let mut salt = [0u8; 16];
     salt.copy_from_slice(&body[pos..pos + 16]);
     pos += 16;
-    let _ = pos;
-
     let has_password_check = enc_flags & 0x0001 != 0;
+    let check_data = if has_password_check && body.len() >= pos + 12 {
+        let mut check_data = [0u8; 12];
+        check_data.copy_from_slice(&body[pos..pos + 12]);
+        let digest = Sha256::digest(&check_data[..8]);
+        if digest[..4] == check_data[8..12] {
+            Some(check_data)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(EncryptionHeader {
         version,
@@ -65,6 +88,7 @@ pub fn parse(raw: &RawHeader) -> RarResult<EncryptionHeader> {
         kdf_count,
         salt,
         has_password_check,
+        check_data,
     })
 }
 
@@ -76,12 +100,15 @@ mod tests {
 
     #[test]
     fn test_encryption_header() {
+        let password_check = [0xBB; 8];
+        let checksum: [u8; 4] = Sha256::digest(password_check)[..4].try_into().unwrap();
         let mut type_body = Vec::new();
         type_body.extend_from_slice(&encode_vint(0)); // version = AES-256
         type_body.extend_from_slice(&encode_vint(0x0001)); // password check present
         type_body.push(15); // kdf_count
         type_body.extend_from_slice(&[0xAA; 16]); // salt
-        type_body.extend_from_slice(&[0xBB; 12]); // password check data
+        type_body.extend_from_slice(&password_check);
+        type_body.extend_from_slice(&checksum);
 
         let header_type = 4u64;
         let header_flags = 0u64;
@@ -112,6 +139,7 @@ mod tests {
         assert!(enc.has_password_check);
         assert_eq!(enc.kdf_count, 15);
         assert_eq!(enc.salt, [0xAA; 16]);
+        assert!(enc.check_data.is_some());
     }
 
     #[test]

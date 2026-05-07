@@ -30,8 +30,13 @@ pub struct RarVolumeMemberFacts {
     pub data_offset: u64,
     pub data_size: u64,
     pub compression_method: u8,
+    pub compression_version: u8,
     pub compression_solid: bool,
+    pub dict_size: u64,
     pub use_hash_mac: bool,
+    pub redirection_type: Option<u64>,
+    pub redirection_target: Option<String>,
+    pub redirection_target_is_directory: bool,
 }
 
 impl RarVolumeFacts {
@@ -93,8 +98,13 @@ impl RarArchive {
                         .compression
                         .method
                         .code(),
+                    compression_version: fh.unpack_version,
                     compression_solid: fh.is_solid,
+                    dict_size: fh.dict_size,
                     use_hash_mac: false,
+                    redirection_type: None,
+                    redirection_target: None,
+                    redirection_target_is_directory: false,
                 })
                 .collect();
             return Ok(RarVolumeFacts {
@@ -131,11 +141,28 @@ impl RarArchive {
                 data_offset: parsed_file.header.data_offset,
                 data_size: parsed_file.header.data_size,
                 compression_method: parsed_file.header.compression.method.code(),
+                compression_version: parsed_file.header.compression.version,
                 compression_solid: parsed_file.header.compression.solid,
+                dict_size: parsed_file.header.compression.dict_size,
                 use_hash_mac: parsed_file
                     .file_encryption
                     .as_ref()
                     .is_some_and(|info| info.use_hash_mac),
+                redirection_type: parsed_file.redirection.as_ref().map(|redir| match redir.redir_type {
+                    crate::header::RedirectionType::UnixSymlink => 1,
+                    crate::header::RedirectionType::WindowsSymlink => 2,
+                    crate::header::RedirectionType::WindowsJunction => 3,
+                    crate::header::RedirectionType::Hardlink => 4,
+                    crate::header::RedirectionType::Unknown(value) => value,
+                }),
+                redirection_target: parsed_file
+                    .redirection
+                    .as_ref()
+                    .map(|redir| redir.target.clone()),
+                redirection_target_is_directory: parsed_file
+                    .redirection
+                    .as_ref()
+                    .is_some_and(|redir| redir.target_is_directory),
             })
             .collect();
 

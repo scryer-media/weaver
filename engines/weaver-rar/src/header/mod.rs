@@ -59,6 +59,7 @@ pub struct ParsedFile {
 pub struct Redirection {
     pub redir_type: RedirectionType,
     pub target: String,
+    pub target_is_directory: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,17 @@ pub fn parse_all_headers<R: Read + Seek>(
                     Some(p) => p,
                     None => return Err(RarError::EncryptedArchive),
                 };
+
+                if let Some(check_data) = enc.check_data
+                    && !crate::crypto::verify_password_check(
+                        pwd,
+                        &enc.salt,
+                        enc.kdf_count,
+                        &check_data,
+                    )
+                {
+                    return Err(RarError::InvalidPassword);
+                }
 
                 // Derive key (IV comes per-header from stream, not PBKDF2).
                 let (key, _) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count);
@@ -331,8 +343,9 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
             result.main = Some(main);
         }
         HeaderType::File => {
-            let file_hdr = file::parse(raw, data_offset)?;
-            let (is_encrypted, file_encryption, hash, redirection) = extract_extra_info(raw);
+            let mut file_hdr = file::parse(raw, data_offset)?;
+            let (is_encrypted, file_encryption, hash, redirection) =
+                apply_extra_records(raw, extra::ExtraAreaOwner::File, &mut file_hdr);
             debug!(
                 "file: name={:?} size={:?} method={:?} encrypted={}",
                 file_hdr.name, file_hdr.unpacked_size, file_hdr.compression.method, is_encrypted
@@ -346,7 +359,8 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
             });
         }
         HeaderType::Service => {
-            let svc = service::parse(raw, data_offset)?;
+            let mut svc = service::parse(raw, data_offset)?;
+            let _ = apply_extra_records(raw, extra::ExtraAreaOwner::Service, &mut svc.inner);
             debug!("service: name={:?}", svc.service_name());
             result.services.push(svc);
         }
@@ -365,8 +379,10 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
 }
 
 /// Extract encryption status, encryption params, BLAKE2 hash, and redirection info from extra records.
-fn extract_extra_info(
+fn apply_extra_records(
     raw: &RawHeader,
+    owner: extra::ExtraAreaOwner,
+    header: &mut file::FileHeader,
 ) -> (
     bool,
     Option<FileEncryptionParams>,
@@ -376,45 +392,74 @@ fn extract_extra_info(
     let Some(ea_bytes) = common::extra_area_bytes(raw) else {
         return (false, None, None, None);
     };
-    let Ok(records) = extra::parse_extra_area(ea_bytes) else {
+    let Ok(records) = extra::parse_extra_area(ea_bytes, owner) else {
         return (false, None, None, None);
     };
 
-    let is_encrypted = extra::is_encrypted(&records);
-    let hash = extra::blake2_hash(&records);
+    let mut is_encrypted = false;
+    let mut file_encryption = None;
+    let mut hash = None;
+    let mut redirection = None;
 
-    let file_encryption = records.iter().find_map(|r| {
-        if let extra::ExtraRecord::FileEncryption {
-            kdf_count,
-            salt,
-            iv,
-            check_data,
-            enc_flags,
-            ..
-        } = r
-        {
-            Some(FileEncryptionParams {
-                kdf_count: *kdf_count,
-                salt: *salt,
-                iv: *iv,
-                check_data: *check_data,
-                use_hash_mac: enc_flags & 0x0002 != 0,
-            })
-        } else {
-            None
+    for record in &records {
+        match record {
+            extra::ExtraRecord::FileEncryption {
+                kdf_count,
+                salt,
+                iv,
+                check_data,
+                enc_flags,
+                ..
+            } => {
+                is_encrypted = true;
+                file_encryption = Some(FileEncryptionParams {
+                    kdf_count: *kdf_count,
+                    salt: *salt,
+                    iv: *iv,
+                    check_data: *check_data,
+                    use_hash_mac: enc_flags & 0x0002 != 0,
+                });
+            }
+            extra::ExtraRecord::FileHash(file_hash) => {
+                hash = Some(file_hash.clone());
+            }
+            extra::ExtraRecord::FileTime {
+                mtime,
+                ctime,
+                atime,
+            } => {
+                if let Some(value) = *mtime {
+                    header.mtime = Some(value);
+                }
+                if let Some(value) = *ctime {
+                    header.ctime = Some(value);
+                }
+                if let Some(value) = *atime {
+                    header.atime = Some(value);
+                }
+            }
+            extra::ExtraRecord::FileVersion { version } if *version != 0 => {
+                header.version = Some(*version);
+                header.name.push(';');
+                header.name.push_str(&version.to_string());
+            }
+            extra::ExtraRecord::Redirection {
+                redir_type,
+                target,
+                target_is_directory,
+            } => {
+                redirection = Some(Redirection {
+                    redir_type: RedirectionType::from(*redir_type),
+                    target: target.clone(),
+                    target_is_directory: *target_is_directory,
+                });
+            }
+            extra::ExtraRecord::ServiceData(data) => {
+                header.service_subdata = Some(data.clone());
+            }
+            _ => {}
         }
-    });
-
-    let redirection = records.iter().find_map(|r| {
-        if let extra::ExtraRecord::Redirection { redir_type, target } = r {
-            Some(Redirection {
-                redir_type: RedirectionType::from(*redir_type),
-                target: target.clone(),
-            })
-        } else {
-            None
-        }
-    });
+    }
 
     (is_encrypted, file_encryption, hash, redirection)
 }
@@ -422,7 +467,12 @@ fn extract_extra_info(
 /// Get extra records for a file header from its raw header's extra area.
 pub fn parse_file_extra_records(raw: &RawHeader) -> RarResult<Vec<extra::ExtraRecord>> {
     if let Some(ea_bytes) = common::extra_area_bytes(raw) {
-        extra::parse_extra_area(ea_bytes)
+        let owner = if raw.header_type == HeaderType::Service {
+            extra::ExtraAreaOwner::Service
+        } else {
+            extra::ExtraAreaOwner::File
+        };
+        extra::parse_extra_area(ea_bytes, owner)
     } else {
         Ok(Vec::new())
     }

@@ -12,7 +12,7 @@ mod volume;
 pub use cache::CachedArchiveHeaders;
 pub use facts::{RarVolumeFacts, RarVolumeMemberFacts};
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::decompress::lz::LzDecoder;
 use crate::decompress::rar4::Rar4LzDecoder;
@@ -446,45 +446,5 @@ impl RarArchive {
     /// Whether a member is encrypted.
     pub fn member_is_encrypted(&self, index: usize) -> bool {
         self.members.get(index).is_some_and(|e| e.is_encrypted)
-    }
-}
-
-/// Writer wrapper that computes CRC32 of all data written through it.
-pub(super) struct CrcWriter<'a, W: Write> {
-    inner: &'a mut W,
-    hasher: Option<crc32fast::Hasher>,
-}
-
-impl<'a, W: Write> CrcWriter<'a, W> {
-    pub(super) fn new(inner: &'a mut W, compute_crc: bool) -> Self {
-        Self {
-            inner,
-            hasher: if compute_crc {
-                Some(crc32fast::Hasher::new())
-            } else {
-                None
-            },
-        }
-    }
-
-    pub(super) fn finalize_crc(&self) -> u32 {
-        self.hasher
-            .as_ref()
-            .map(|h| h.clone().finalize())
-            .unwrap_or(0)
-    }
-}
-
-impl<W: Write> Write for CrcWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        if let Some(ref mut h) = self.hasher {
-            h.update(&buf[..n]);
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
     }
 }

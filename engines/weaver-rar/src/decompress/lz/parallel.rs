@@ -11,7 +11,7 @@
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use super::bitstream::BitReader;
+use super::bitstream::{BitRead, BitReader};
 use super::filter::{FilterType, PendingFilter};
 use super::huffman::{self, HuffmanTable};
 use super::{LzDecoder, NUM_LENGTH_SLOTS};
@@ -128,6 +128,7 @@ fn parse_next_block(
     reader: &mut BitReader<'_>,
     code_lengths: &mut [u8],
     table_sets: &mut Vec<TableSet>,
+    extra_dist: bool,
 ) -> RarResult<Option<(BlockInfo, bool)>> {
     if !reader.has_bits() {
         return Ok(None);
@@ -170,11 +171,22 @@ fn parse_next_block(
         });
     }
 
-    let mut block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+    let mut block_bits_remaining = if block_bytes == 0 {
+        0
+    } else {
+        extra_bits + (block_bytes - 1) * 8
+    };
 
-    let table_set_index = if table_present || table_sets.is_empty() {
+    if !table_present && table_sets.is_empty() {
+        return Err(RarError::CorruptArchive {
+            detail: "RAR5 first block is missing Huffman tables".into(),
+        });
+    }
+
+    let table_set_index = if table_present {
         let pos_before = reader.position();
-        let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths)?;
+        let (nc, dc, ldc, rc) =
+            huffman::read_tables_bitreader(reader, code_lengths, extra_dist)?;
         let bits_used = (reader.position() - pos_before) as i64;
         block_bits_remaining -= bits_used;
         table_sets.push(TableSet {
@@ -210,6 +222,7 @@ fn preparse_complete_blocks(
     input: &[u8],
     code_lengths: &mut [u8],
     existing_tables: Option<&TableSet>,
+    extra_dist: bool,
 ) -> RarResult<PreparsedBlocks> {
     let mut reader = BitReader::new(input);
     let estimated_blocks = (input.len() / 0x4000).clamp(8, 512);
@@ -227,7 +240,12 @@ fn preparse_complete_blocks(
         let checkpoint_code_lengths = working_code_lengths.clone();
         let checkpoint_table_set_len = table_sets.len();
 
-        match parse_next_block(&mut reader, &mut working_code_lengths, &mut table_sets) {
+        match parse_next_block(
+            &mut reader,
+            &mut working_code_lengths,
+            &mut table_sets,
+            extra_dist,
+        ) {
             Ok(Some((block, is_last))) => {
                 blocks.push(block);
                 consumed_bytes = reader.position().div_ceil(8);
@@ -274,6 +292,7 @@ fn preparse_blocks(
     input: &[u8],
     code_lengths: &mut [u8],
     existing_tables: Option<&TableSet>,
+    extra_dist: bool,
 ) -> RarResult<(Vec<BlockInfo>, Vec<TableSet>)> {
     let mut reader = BitReader::new(input);
     let mut blocks = Vec::new();
@@ -333,12 +352,23 @@ fn preparse_blocks(
             });
         }
 
-        let mut block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+        let mut block_bits_remaining = if block_bytes == 0 {
+            0
+        } else {
+            extra_bits + (block_bytes - 1) * 8
+        };
+
+        if !table_present && table_sets.is_empty() {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 first block is missing Huffman tables".into(),
+            });
+        }
 
         // Read tables if present — this advances the reader and consumes bits.
-        let table_set_index = if table_present || table_sets.is_empty() {
+        let table_set_index = if table_present {
             let pos_before = reader.position();
-            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(&mut reader, code_lengths)?;
+            let (nc, dc, ldc, rc) =
+                huffman::read_tables_bitreader(&mut reader, code_lengths, extra_dist)?;
             let bits_used = (reader.position() - pos_before) as i64;
             block_bits_remaining -= bits_used;
             table_sets.push(TableSet {
@@ -385,6 +415,7 @@ fn decode_block_symbols(
     input: &[u8],
     block: &BlockInfo,
     tables: &TableSet,
+    extra_dist: bool,
     items: &mut Vec<DecodedItem>,
 ) -> RarResult<()> {
     // Create a BitReader positioned at this block's data.
@@ -429,7 +460,7 @@ fn decode_block_symbols(
             // Inline match — fully resolve length and distance from bitstream.
             let length_idx = (sym - 262) as usize;
             let length = slot_to_length(&mut reader, length_idx)?;
-            let distance = decode_distance(&mut reader, &tables.dc, &tables.ldc)?;
+            let distance = decode_distance(&mut reader, &tables.dc, &tables.ldc, extra_dist)?;
             let length = adjust_length_for_distance(length, distance);
             items.push(DecodedItem::Match {
                 length: length as u32,
@@ -472,27 +503,13 @@ fn decode_block_symbols(
 /// Read a filter descriptor from the bitstream (sym 256 handler).
 /// Returns (filter_type_code, block_start_delta, block_length, channels).
 fn read_filter_descriptor(reader: &mut BitReader) -> RarResult<(u8, u64, u32, u8)> {
-    let flags = reader.read_bits(8)?;
-    let filter_code = (flags & 0x07) as u8;
-    let use_counts = (flags >> 3) & 1;
-    let block_start_bits = ((flags >> 4) & 0x0F) as u8;
+    let block_start_delta = read_filter_data(reader)? as u64;
+    let block_length = read_filter_data(reader)?;
+    let filter_code = reader.read_bits(3)? as u8;
 
     let _ = FilterType::from_code(filter_code).ok_or(RarError::UnsupportedFilter {
         filter_type: filter_code,
     })?;
-
-    let block_start_delta = if block_start_bits > 0 {
-        reader.read_bits(block_start_bits + 4)? as u64
-    } else {
-        0
-    };
-
-    let block_length_bits = reader.read_bits(4)? as u8;
-    let block_length = if block_length_bits > 0 {
-        reader.read_bits(block_length_bits + 4)?
-    } else {
-        0
-    };
 
     if block_length > MAX_FILTER_BLOCK_SIZE {
         return Err(RarError::CorruptArchive {
@@ -503,16 +520,22 @@ fn read_filter_descriptor(reader: &mut BitReader) -> RarResult<(u8, u64, u32, u8
         });
     }
 
-    let channels = if filter_code == 0 && use_counts != 0 {
-        // DELTA filter with channel count
+    let channels = if filter_code == 0 {
         (reader.read_bits(5)? + 1) as u8
-    } else if filter_code == 0 {
-        1
     } else {
         0
     };
 
     Ok((filter_code, block_start_delta, block_length, channels))
+}
+
+fn read_filter_data(reader: &mut BitReader) -> RarResult<u32> {
+    let byte_count = reader.read_bits(2)? as usize + 1;
+    let mut data = 0u32;
+    for index in 0..byte_count {
+        data |= reader.read_bits(8)? << (index * 8);
+    }
+    Ok(data)
 }
 
 // ─── Standalone decode helpers (no &self, usable from parallel context) ──────
@@ -541,9 +564,11 @@ fn decode_distance(
     reader: &mut BitReader,
     dc: &HuffmanTable,
     ldc: &HuffmanTable,
+    extra_dist: bool,
 ) -> RarResult<usize> {
     let dist_code = dc.decode_bitreader(reader)? as usize;
-    if dist_code > 63 {
+    let max_dist_code = if extra_dist { 79 } else { 63 };
+    if dist_code > max_dist_code {
         return Err(RarError::CorruptArchive {
             detail: format!("distance code out of range: {dist_code}"),
         });
@@ -557,14 +582,14 @@ fn decode_distance(
 
         if num_bits >= 4 {
             let high = if num_bits > 4 {
-                (reader.read_bits((num_bits - 4) as u8)? as usize) << 4
+                (reader.read_bits64((num_bits - 4) as u8)? as usize) << 4
             } else {
                 0
             };
             let low = ldc.decode_bitreader(reader)? as usize;
             base + high + low
         } else {
-            base + reader.read_bits(num_bits as u8)? as usize
+            base + reader.read_bits64(num_bits as u8)? as usize
         }
     };
 
@@ -594,13 +619,14 @@ fn parallel_decode_batch(
     input: &[u8],
     blocks: &[BlockInfo],
     table_sets: &[TableSet],
+    extra_dist: bool,
 ) -> RarResult<Vec<Vec<DecodedItem>>> {
     blocks
         .par_iter()
         .map(|block| {
             let tables = &table_sets[block.table_set_index];
             let mut items = Vec::with_capacity(DECODED_ITEMS_CAPACITY);
-            decode_block_symbols(input, block, tables, &mut items)?;
+            decode_block_symbols(input, block, tables, extra_dist, &mut items)?;
             Ok(items)
         })
         .collect::<RarResult<Vec<_>>>()
@@ -649,8 +675,12 @@ impl LzDecoder {
             None
         };
 
-        let preparsed =
-            preparse_complete_blocks(input, &mut self.code_lengths, existing_tables.as_ref())?;
+        let preparsed = preparse_complete_blocks(
+            input,
+            &mut self.code_lengths,
+            existing_tables.as_ref(),
+            self.extra_dist,
+        )?;
         if preparsed.blocks.is_empty() {
             return Ok(0);
         }
@@ -676,7 +706,8 @@ impl LzDecoder {
             let batch_end = next_small_block_batch_end(&preparsed.blocks, block_index, batch_size);
             let block_batch = &preparsed.blocks[block_index..batch_end];
             if block_batch.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
-                let all_items = parallel_decode_batch(input, block_batch, &preparsed.table_sets)?;
+                let all_items =
+                    parallel_decode_batch(input, block_batch, &preparsed.table_sets, self.extra_dist)?;
                 self.apply_decoded_items_parallel(&all_items, unpacked_size, output_size, writer)?;
             } else {
                 for block in block_batch {
@@ -898,8 +929,12 @@ impl LzDecoder {
             None
         };
 
-        let (blocks, table_sets) =
-            preparse_blocks(input, &mut self.code_lengths, existing_tables.as_ref())?;
+        let (blocks, table_sets) = preparse_blocks(
+            input,
+            &mut self.code_lengths,
+            existing_tables.as_ref(),
+            self.extra_dist,
+        )?;
 
         if blocks.len() < MIN_PARALLEL_BLOCKS {
             return Ok(None); // Too few blocks — fall back to single-threaded.
@@ -925,7 +960,8 @@ impl LzDecoder {
             } else {
                 let batch_end = next_small_block_batch_end(&blocks, block_index, batch_size);
                 let block_batch = &blocks[block_index..batch_end];
-                let all_items = parallel_decode_batch(input, block_batch, &table_sets)?;
+                let all_items =
+                    parallel_decode_batch(input, block_batch, &table_sets, self.extra_dist)?;
                 self.apply_decoded_items_parallel(
                     &all_items,
                     unpacked_size,

@@ -81,6 +81,10 @@ pub struct FileHeader {
     pub attributes: FileAttributes,
     /// Modification time.
     pub mtime: Option<SystemTime>,
+    /// Creation time from the high-precision extra record.
+    pub ctime: Option<SystemTime>,
+    /// Access time from the high-precision extra record.
+    pub atime: Option<SystemTime>,
     /// CRC32 of unpacked data.
     pub data_crc32: Option<u32>,
     /// Compression information.
@@ -101,6 +105,10 @@ pub struct FileHeader {
     pub data_offset: u64,
     /// Whether this file's data is encrypted.
     pub is_encrypted: bool,
+    /// Version suffix from the RAR5 extra area.
+    pub version: Option<u64>,
+    /// Service subdata payload, when this header is used as a service header.
+    pub service_subdata: Option<Vec<u8>>,
 }
 
 /// Parse a file header from a raw header.
@@ -164,7 +172,7 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
     // Compression info (vint, bit-packed)
     let (comp_raw, n) = vint::read_vint(&type_fields[pos..])?;
     pos += n;
-    let compression = compression_info::decode_compression_info(comp_raw);
+    let compression = compression_info::decode_compression_info(comp_raw)?;
 
     // Host OS
     let (os_val, n) = vint::read_vint(&type_fields[pos..])?;
@@ -186,6 +194,8 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
         unpacked_size,
         attributes: FileAttributes(attrs),
         mtime,
+        ctime: None,
+        atime: None,
         data_crc32,
         compression,
         host_os: HostOs::from(os_val),
@@ -196,6 +206,8 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
         split_after: raw.is_split_after(),
         data_offset,
         is_encrypted: false, // Set by caller from extra records or RAR4 flags
+        version: None,
+        service_subdata: None,
     })
 }
 

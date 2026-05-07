@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-use hmac::Hmac;
+use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
 
@@ -28,22 +28,90 @@ type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type HmacSha256 = Hmac<Sha256>;
 
+pub const CRYPT5_KDF_LG2_COUNT_MAX: u8 = 24;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Rar5KeyMaterial {
+    pub key: [u8; 32],
+    pub hash_key: [u8; 32],
+    pub psw_check: [u8; 8],
+}
+
+fn hmac_sha256(password: &HmacSha256, data: &[u8]) -> [u8; 32] {
+    let mut mac = password.clone();
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn fold_password_check(value: &[u8; 32]) -> [u8; 8] {
+    let mut psw_check = [0u8; 8];
+    for (index, byte) in value.iter().copied().enumerate() {
+        psw_check[index % psw_check.len()] ^= byte;
+    }
+    psw_check
+}
+
+pub fn derive_rar5_material(password: &str, salt: &[u8; 16], kdf_count: u8) -> RarResult<Rar5KeyMaterial> {
+    if kdf_count > CRYPT5_KDF_LG2_COUNT_MAX {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "RAR5 KDF log2 count {} exceeds maximum {}",
+                kdf_count, CRYPT5_KDF_LG2_COUNT_MAX
+            ),
+        });
+    }
+
+    let count = 1u32 << kdf_count;
+    let password_mac = <HmacSha256 as Mac>::new_from_slice(password.as_bytes())
+        .expect("HMAC accepts arbitrary keys");
+
+    let mut salt_block = [0u8; 20];
+    salt_block[..salt.len()].copy_from_slice(salt);
+    salt_block[19] = 1;
+
+    let mut u = hmac_sha256(&password_mac, &salt_block);
+    let mut fn_value = u;
+
+    let mut key = [0u8; 32];
+    let mut hash_key = [0u8; 32];
+    let mut psw_check_value = [0u8; 32];
+
+    for (rounds, output) in [
+        (count.saturating_sub(1), &mut key),
+        (16, &mut hash_key),
+        (16, &mut psw_check_value),
+    ] {
+        for _ in 0..rounds {
+            u = hmac_sha256(&password_mac, &u);
+            for (acc, next) in fn_value.iter_mut().zip(u.iter()) {
+                *acc ^= *next;
+            }
+        }
+        *output = fn_value;
+    }
+
+    Ok(Rar5KeyMaterial {
+        key,
+        hash_key,
+        psw_check: fold_password_check(&psw_check_value),
+    })
+}
+
 /// Derive AES-256 key from password and salt using PBKDF2-HMAC-SHA256.
 ///
 /// RAR5 KDF: iterations = 1 << kdf_count (confirmed against unrar source).
 /// Returns only the 32-byte key. IVs in RAR5 are read from the stream
 /// (each encrypted block is preceded by a 16-byte IV), not derived.
 pub fn derive_key(password: &str, salt: &[u8; 16], kdf_count: u8) -> ([u8; 32], [u8; 16]) {
-    let iterations = 1u32 << (kdf_count as u32);
-
-    let mut key = [0u8; 32];
-    pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut key)
-        .expect("HMAC can be initialized with any key length");
-
     // IV is not derived — return zeros. Callers that need an IV read it
     // from the stream (header encryption) or from the file header (file
     // data encryption).
-    (key, [0u8; 16])
+    (
+        derive_rar5_material(password, salt, kdf_count)
+            .expect("RAR5 KDF inputs should be validated before key derivation")
+            .key,
+        [0u8; 16],
+    )
 }
 
 /// Decrypt data using AES-256-CBC.
@@ -91,23 +159,28 @@ pub fn verify_password_check(
     kdf_count: u8,
     check_data: &[u8; 12],
 ) -> bool {
-    let iterations = (1u32 << (kdf_count as u32)) + 32;
+    derive_rar5_material(password, salt, kdf_count)
+        .map(|material| material.psw_check == check_data[..8])
+        .unwrap_or(false)
+}
 
-    // Derive V2 (PswCheckValue) using standard PBKDF2 with Count+32 iterations.
-    // This is equivalent to unrar's continuous chain because the XOR accumulation
-    // in PBKDF2 (Fn = U1 ^ U2 ^ ... ^ U_n) is identical regardless of whether
-    // you do it in one call or three sequential segments.
-    let mut v2 = [0u8; 32];
-    pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations, &mut v2)
-        .expect("HMAC can be initialized with any key length");
-
-    // XOR-fold V2 from 32 bytes to 8 bytes (unrar: PswCheck[I%8] ^= V2[I]).
-    let mut psw_check = [0u8; 8];
-    for (i, &byte) in v2.iter().enumerate() {
-        psw_check[i % 8] ^= byte;
+pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
+    let digest = hmac_sha256(
+        &<HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts arbitrary keys"),
+        &value.to_le_bytes(),
+    );
+    let mut mac = 0u32;
+    for (index, byte) in digest.iter().copied().enumerate() {
+        mac ^= (byte as u32) << ((index & 3) * 8);
     }
+    mac
+}
 
-    psw_check == check_data[..8]
+pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
+    hmac_sha256(
+        &<HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts arbitrary keys"),
+        &value,
+    )
 }
 
 // =============================================================================
@@ -122,6 +195,7 @@ struct Kdf5Entry {
     salt: [u8; 16],
     kdf_count: u8,
     key: [u8; 32],
+    hash_key: [u8; 32],
     psw_check: [u8; 8],
 }
 
@@ -152,40 +226,36 @@ impl KdfCache {
         }
     }
 
-    /// Derive (or return cached) RAR5 AES-256 key.
-    pub fn derive_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
+    pub fn derive_material_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+    ) -> RarResult<Rar5KeyMaterial> {
         let mut guard = self.rar5.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
-        // Check cache.
         for entry in entries.iter() {
             if entry.password == password && entry.salt == *salt && entry.kdf_count == kdf_count {
-                return entry.key;
+                return Ok(Rar5KeyMaterial {
+                    key: entry.key,
+                    hash_key: entry.hash_key,
+                    psw_check: entry.psw_check,
+                });
             }
         }
 
-        // Cache miss — derive key.
-        let (key, _) = derive_key(password, salt, kdf_count);
-
-        // Compute psw_check too (count+32 iterations) so verify is free.
-        let iterations_check = (1u32 << (kdf_count as u32)) + 32;
-        let mut v2 = [0u8; 32];
-        pbkdf2::pbkdf2::<HmacSha256>(password.as_bytes(), salt, iterations_check, &mut v2)
-            .expect("HMAC can be initialized with any key length");
-        let mut psw_check = [0u8; 8];
-        for (i, &byte) in v2.iter().enumerate() {
-            psw_check[i % 8] ^= byte;
-        }
+        let material = derive_rar5_material(password, salt, kdf_count)?;
 
         let entry = Kdf5Entry {
             password: password.to_string(),
             salt: *salt,
             kdf_count,
-            key,
-            psw_check,
+            key: material.key,
+            hash_key: material.hash_key,
+            psw_check: material.psw_check,
         };
 
-        // Rotating insertion into fixed-size cache.
         if entries.len() < KDF_CACHE_SLOTS {
             entries.push(entry);
         } else {
@@ -193,7 +263,25 @@ impl KdfCache {
         }
         *pos = (*pos + 1) % KDF_CACHE_SLOTS;
 
-        key
+        Ok(material)
+    }
+
+    /// Derive (or return cached) RAR5 AES-256 key.
+    pub fn derive_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
+        self.derive_material_rar5(password, salt, kdf_count)
+            .expect("RAR5 KDF inputs should be validated before key derivation")
+            .key
+    }
+
+    pub fn derive_hash_key_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+    ) -> [u8; 32] {
+        self.derive_material_rar5(password, salt, kdf_count)
+            .expect("RAR5 KDF inputs should be validated before key derivation")
+            .hash_key
     }
 
     /// Verify password check value using cached data (avoids separate PBKDF2).
@@ -204,17 +292,9 @@ impl KdfCache {
         kdf_count: u8,
         check_data: &[u8; 12],
     ) -> bool {
-        // This populates the cache (including psw_check).
-        let _ = self.derive_key_rar5(password, salt, kdf_count);
-
-        let guard = self.rar5.lock().unwrap();
-        let (entries, _) = &*guard;
-        for entry in entries.iter() {
-            if entry.password == password && entry.salt == *salt && entry.kdf_count == kdf_count {
-                return entry.psw_check == check_data[..8];
-            }
-        }
-        false
+        self.derive_material_rar5(password, salt, kdf_count)
+            .map(|material| material.psw_check == check_data[..8])
+            .unwrap_or(false)
     }
 
     /// Derive (or return cached) RAR4 AES-128 key and IV.

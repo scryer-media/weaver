@@ -364,6 +364,8 @@ mod tests {
             unpacked_size: Some(16),
             attributes: FileAttributes(0),
             mtime: None,
+            ctime: None,
+            atime: None,
             data_crc32,
             compression: CompressionInfo {
                 format: ArchiveFormat::Rar5,
@@ -380,6 +382,8 @@ mod tests {
             split_after,
             data_offset: 0,
             is_encrypted: false,
+            version: None,
+            service_subdata: None,
         }
     }
 

@@ -298,6 +298,12 @@ impl Rar4LzDecoder {
         }
 
         let new_filter = filter_pos == self.vm_filters.len();
+        if new_filter {
+            self.vm_filters.push(Rar4VmFilterDefinition {
+                filter_type: Rar4StandardFilter::E8,
+                last_block_length: 0,
+            });
+        }
         let mut block_start =
             Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "block start")?;
         if (first_byte & 0x40) != 0 {
@@ -307,12 +313,7 @@ impl Rar4LzDecoder {
         let block_length = if (first_byte & 0x20) != 0 {
             let length =
                 Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "block length")?;
-            if new_filter {
-                self.vm_filters.push(Rar4VmFilterDefinition {
-                    filter_type: Rar4StandardFilter::E8,
-                    last_block_length: length,
-                });
-            } else if let Some(existing) = self.vm_filters.get_mut(filter_pos) {
+            if let Some(existing) = self.vm_filters.get_mut(filter_pos) {
                 existing.last_block_length = length;
             }
             length
@@ -924,6 +925,7 @@ impl Rar4LzDecoder {
         let mut current_vol = first_volume_index;
         let mut current_writer = writer_factory(current_vol)?;
         let mut chunk_bytes: u64 = 0;
+        let mut pending_boundary_volume = None;
 
         while output_size < unpacked_size {
             if reader.bits_remaining() < 1 {
@@ -941,39 +943,43 @@ impl Rar4LzDecoder {
                 }
             }
             let decoded_this_round = output_size - prev_output;
+            chunk_bytes += decoded_this_round;
 
             let byte_pos = reader.byte_position() as u64;
-            if boundary_idx < boundaries.len()
+            if pending_boundary_volume.is_none()
+                && boundary_idx < boundaries.len()
                 && byte_pos >= boundaries[boundary_idx].compressed_offset
             {
-                self.window
-                    .flush_to_writer(&mut *current_writer)
-                    .map_err(RarError::Io)?;
-                chunk_bytes += decoded_this_round;
-                chunks.push((current_vol, chunk_bytes));
-
-                current_vol = boundaries[boundary_idx].volume_index;
+                pending_boundary_volume = Some(boundaries[boundary_idx].volume_index);
                 boundary_idx += 1;
+            }
+
+            if pending_boundary_volume.is_some() || self.window.unflushed_bytes() as usize >= flush_threshold {
+                self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                    return Err(RarError::CorruptArchive {
+                        detail:
+                            "RAR4 pending VM filters exceeded dictionary window before flush"
+                                .into(),
+                    });
+                }
+            }
+
+            // VM filters can span a compressed-volume boundary, so only hand
+            // output to the next writer after the current chunk is fully
+            // materialized through the filter queue.
+            if let Some(next_vol) = pending_boundary_volume
+                && self.window.total_flushed() == self.window.total_written()
+            {
+                chunks.push((current_vol, chunk_bytes));
+                current_vol = next_vol;
                 current_writer = writer_factory(current_vol)?;
                 chunk_bytes = 0;
-            } else {
-                chunk_bytes += decoded_this_round;
-                if self.window.unflushed_bytes() as usize >= flush_threshold {
-                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
-                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                        return Err(RarError::CorruptArchive {
-                            detail:
-                                "RAR4 pending VM filters exceeded dictionary window before flush"
-                                    .into(),
-                        });
-                    }
-                }
+                pending_boundary_volume = None;
             }
         }
 
-        self.window
-            .flush_to_writer(&mut *current_writer)
-            .map_err(RarError::Io)?;
+        self.flush_ready_output_to_writer(&mut *current_writer, true)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1010,6 +1016,7 @@ impl Rar4LzDecoder {
         let mut current_vol = first_volume_index;
         let mut current_writer = writer_factory(current_vol)?;
         let mut chunk_bytes: u64 = 0;
+        let mut pending_boundary_volume = None;
 
         while output_size < unpacked_size {
             if reader.bits_remaining() < 1 {
@@ -1027,6 +1034,7 @@ impl Rar4LzDecoder {
                 }
             }
             let decoded_this_round = output_size - prev_output;
+            chunk_bytes += decoded_this_round;
 
             let byte_pos = reader.byte_position() as u64;
             let next_boundary = {
@@ -1034,37 +1042,37 @@ impl Rar4LzDecoder {
                 guard.get(boundary_idx).cloned()
             };
 
-            if let Some(boundary) = next_boundary
+            if pending_boundary_volume.is_none()
+                && let Some(boundary) = next_boundary
                 && byte_pos >= boundary.compressed_offset
             {
-                self.window
-                    .flush_to_writer(&mut *current_writer)
-                    .map_err(RarError::Io)?;
-                chunk_bytes += decoded_this_round;
-                chunks.push((current_vol, chunk_bytes));
-
-                current_vol = boundary.volume_index;
+                pending_boundary_volume = Some(boundary.volume_index);
                 boundary_idx += 1;
+            }
+
+            if pending_boundary_volume.is_some() || self.window.unflushed_bytes() as usize >= flush_threshold {
+                self.flush_ready_output_to_writer(&mut *current_writer, false)?;
+                if self.window.unflushed_bytes() as usize > self.window.dict_size() {
+                    return Err(RarError::CorruptArchive {
+                        detail:
+                            "RAR4 pending VM filters exceeded dictionary window before flush"
+                                .into(),
+                    });
+                }
+            }
+
+            if let Some(next_vol) = pending_boundary_volume
+                && self.window.total_flushed() == self.window.total_written()
+            {
+                chunks.push((current_vol, chunk_bytes));
+                current_vol = next_vol;
                 current_writer = writer_factory(current_vol)?;
                 chunk_bytes = 0;
-            } else {
-                chunk_bytes += decoded_this_round;
-                if self.window.unflushed_bytes() as usize >= flush_threshold {
-                    self.flush_ready_output_to_writer(&mut *current_writer, false)?;
-                    if self.window.unflushed_bytes() as usize > self.window.dict_size() {
-                        return Err(RarError::CorruptArchive {
-                            detail:
-                                "RAR4 pending VM filters exceeded dictionary window before flush"
-                                    .into(),
-                        });
-                    }
-                }
+                pending_boundary_volume = None;
             }
         }
 
-        self.window
-            .flush_to_writer(&mut *current_writer)
-            .map_err(RarError::Io)?;
+        self.flush_ready_output_to_writer(&mut *current_writer, true)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
         }
@@ -1958,5 +1966,46 @@ mod tests {
         assert!(decoder.pending_vm_filters.is_empty());
         assert!(decoder.vm_filters.is_empty());
         assert_eq!(decoder.last_vm_filter, 0);
+    }
+
+    #[test]
+    fn test_new_vm_filter_without_length_defaults_to_zero_block_length() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+
+        let vm_code = [0x04, 0x00, 0x00, 0xD8, 0xD2];
+        decoder.add_vm_code(0x81, &vm_code, 0).unwrap();
+
+        assert_eq!(decoder.vm_filters.len(), 1);
+        assert_eq!(decoder.vm_filters[0].last_block_length, 0);
+        assert_eq!(decoder.pending_vm_filters.len(), 1);
+        assert_eq!(decoder.pending_vm_filters[0].block_length, 0);
+    }
+
+    #[test]
+    fn test_chunked_final_flush_applies_pending_vm_filter() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.tables_read = true;
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(&[0xAA, 0xBB, 0xE8, 100, 0, 0, 0]);
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 2,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let chunks = decoder
+            .decompress_to_writer_chunked(&[], 7, 0, &[], |_volume_index| {
+                Ok(Box::new(Vec::<u8>::new()))
+            })
+            .unwrap();
+
+        assert_eq!(chunks, vec![(0, 7)]);
+        assert!(decoder.pending_vm_filters.is_empty());
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
     }
 }

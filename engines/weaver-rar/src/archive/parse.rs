@@ -164,9 +164,11 @@ impl RarArchive {
         FileHeader {
             name: fh.name.clone(),
             unpacked_size: fh.unpacked_size,
+            attributes: crate::types::FileAttributes(fh.attributes as u64),
+            mtime: None,
+            ctime: None,
+            atime: None,
             data_crc32: Some(fh.crc32),
-            data_offset: fh.data_offset,
-            data_size: fh.packed_size,
             compression: crate::types::CompressionInfo {
                 format: crate::types::ArchiveFormat::Rar4,
                 version: fh.unpack_version,
@@ -194,12 +196,14 @@ impl RarArchive {
                     crate::types::HostOs::Unknown(v as u64)
                 }
             },
-            attributes: crate::types::FileAttributes(fh.attributes as u64),
-            mtime: None,
             split_before: fh.split_before,
             split_after: fh.split_after,
             file_flags: 0,
+            data_size: fh.packed_size,
+            data_offset: fh.data_offset,
             is_encrypted: fh.is_encrypted,
+            version: None,
+            service_subdata: None,
         }
     }
 }

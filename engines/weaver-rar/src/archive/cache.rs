@@ -3,10 +3,13 @@
 //! Enables reconstructing a `RarArchive` without reading volume 0 from disk.
 //! Headers are serialized with MessagePack (`rmp-serde`) for compactness.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use super::{DataSegment, FileEncryptionInfo, MemberEntry, RarArchive};
 use crate::header::file::FileHeader;
+use crate::header::{Redirection, RedirectionType};
 use crate::limits::Limits;
 use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod, FileHash};
 use crate::volume::VolumeSet;
@@ -29,6 +32,12 @@ pub struct CachedArchiveHeaders {
 pub struct CachedMember {
     pub name: String,
     pub unpacked_size: Option<u64>,
+    #[serde(default)]
+    pub mtime_ns: Option<u64>,
+    #[serde(default)]
+    pub ctime_ns: Option<u64>,
+    #[serde(default)]
+    pub atime_ns: Option<u64>,
     pub data_crc32: Option<u32>,
     pub compression_method: u8,
     pub compression_version: u8,
@@ -40,7 +49,15 @@ pub struct CachedMember {
     pub is_encrypted: bool,
     pub encryption: Option<CachedEncryption>,
     pub rar4_salt: Option<[u8; 8]>,
+    #[serde(default)]
+    pub version: Option<u64>,
     pub blake2_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub redirection_type: Option<u64>,
+    #[serde(default)]
+    pub redirection_target: Option<String>,
+    #[serde(default)]
+    pub redirection_target_is_directory: bool,
     pub segments: Vec<CachedSegment>,
 }
 
@@ -58,6 +75,33 @@ pub struct CachedSegment {
     pub volume_index: usize,
     pub data_offset: u64,
     pub data_size: u64,
+}
+
+fn encode_system_time(time: Option<SystemTime>) -> Option<u64> {
+    time.and_then(|value| {
+        value
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+    })
+}
+
+fn decode_system_time(time_ns: Option<u64>) -> Option<SystemTime> {
+    time_ns.and_then(|value| {
+        let secs = value / 1_000_000_000;
+        let nanos = (value % 1_000_000_000) as u32;
+        UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+    })
+}
+
+fn encode_redirection_type(redirection: &RedirectionType) -> u64 {
+    match redirection {
+        RedirectionType::UnixSymlink => 1,
+        RedirectionType::WindowsSymlink => 2,
+        RedirectionType::WindowsJunction => 3,
+        RedirectionType::Hardlink => 4,
+        RedirectionType::Unknown(value) => *value,
+    }
 }
 
 impl RarArchive {
@@ -79,6 +123,9 @@ impl RarArchive {
                 .map(|m| CachedMember {
                     name: m.file_header.name.clone(),
                     unpacked_size: m.file_header.unpacked_size,
+                    mtime_ns: encode_system_time(m.file_header.mtime),
+                    ctime_ns: encode_system_time(m.file_header.ctime),
+                    atime_ns: encode_system_time(m.file_header.atime),
                     data_crc32: m.file_header.data_crc32,
                     compression_method: m.file_header.compression.method.code(),
                     compression_version: m.file_header.compression.version,
@@ -96,9 +143,19 @@ impl RarArchive {
                         use_hash_mac: e.use_hash_mac,
                     }),
                     rar4_salt: m.rar4_salt,
+                    version: m.file_header.version,
                     blake2_hash: m.hash.as_ref().map(|h| match h {
                         FileHash::Blake2sp(b) => *b,
                     }),
+                    redirection_type: m
+                        .redirection
+                        .as_ref()
+                        .map(|redir| encode_redirection_type(&redir.redir_type)),
+                    redirection_target: m.redirection.as_ref().map(|redir| redir.target.clone()),
+                    redirection_target_is_directory: m
+                        .redirection
+                        .as_ref()
+                        .is_some_and(|redir| redir.target_is_directory),
                     segments: m
                         .segments
                         .iter()
@@ -150,7 +207,9 @@ impl RarArchive {
                         name: cm.name,
                         unpacked_size: cm.unpacked_size,
                         attributes: crate::types::FileAttributes(0),
-                        mtime: None,
+                        mtime: decode_system_time(cm.mtime_ns),
+                        ctime: decode_system_time(cm.ctime_ns),
+                        atime: decode_system_time(cm.atime_ns),
                         data_crc32: cm.data_crc32,
                         compression,
                         host_os: crate::types::HostOs::Unix,
@@ -161,6 +220,8 @@ impl RarArchive {
                         split_after: cm.split_after,
                         data_offset: 0,
                         is_encrypted: cm.is_encrypted,
+                        version: cm.version,
+                        service_subdata: None,
                     },
                     is_encrypted: cm.is_encrypted,
                     file_encryption: cm.encryption.map(|e| FileEncryptionInfo {
@@ -172,7 +233,11 @@ impl RarArchive {
                     }),
                     rar4_salt: cm.rar4_salt,
                     hash: cm.blake2_hash.map(FileHash::Blake2sp),
-                    redirection: None,
+                    redirection: cm.redirection_type.map(|redir_type| Redirection {
+                        redir_type: RedirectionType::from(redir_type),
+                        target: cm.redirection_target.unwrap_or_default(),
+                        target_is_directory: cm.redirection_target_is_directory,
+                    }),
                     segments: cm
                         .segments
                         .into_iter()

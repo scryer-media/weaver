@@ -135,7 +135,7 @@ where
                 )
             }
             ArchiveFormat::Rar5 => {
-                let mut decoder = lz::LzDecoder::new(info.dict_size as usize);
+                let mut decoder = lz::LzDecoder::new(info.dict_size as usize, info.version);
                 decoder.decompress_to_writer_chunked(
                     input,
                     unpacked_size,

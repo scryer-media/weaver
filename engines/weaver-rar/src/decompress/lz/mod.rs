@@ -73,6 +73,8 @@ pub struct LzDecoder {
     rc_table: Option<Arc<HuffmanTable>>,
     /// Persistent code lengths for delta encoding across blocks.
     code_lengths: Vec<u8>,
+    /// RAR7 uses larger distance tables and longer high-distance reads.
+    extra_dist: bool,
     /// Number of compressed bits remaining in the current block.
     /// When 0, a new block header must be read.
     block_bits_remaining: i64,
@@ -84,9 +86,16 @@ pub struct LzDecoder {
 
 impl LzDecoder {
     /// Create a new LZ decoder with the specified dictionary size.
-    pub fn new(dict_size: usize) -> Self {
-        let total_symbols =
-            huffman::HUFF_NC + huffman::HUFF_DC + huffman::HUFF_LDC + huffman::HUFF_RC;
+    pub fn new(dict_size: usize, version: u8) -> Self {
+        let extra_dist = version == 1;
+        let total_symbols = huffman::HUFF_NC
+            + if extra_dist {
+                huffman::HUFF_DCX
+            } else {
+                huffman::HUFF_DCB
+            }
+            + huffman::HUFF_LDC
+            + huffman::HUFF_RC;
         Self {
             window: Window::new(dict_size),
             dist_cache: [0; DIST_CACHE_SIZE],
@@ -96,6 +105,7 @@ impl LzDecoder {
             ldc_table: None,
             rc_table: None,
             code_lengths: vec![0u8; total_symbols],
+            extra_dist,
             block_bits_remaining: 0,
             is_last_block: false,
             pending_filters: Vec::new(),
@@ -232,11 +242,22 @@ impl LzDecoder {
             });
         }
 
-        self.block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+        self.block_bits_remaining = if block_bytes == 0 {
+            0
+        } else {
+            extra_bits + (block_bytes - 1) * 8
+        };
 
-        if table_present || self.nc_table.is_none() {
+        if !table_present && self.nc_table.is_none() {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 first block is missing Huffman tables".into(),
+            });
+        }
+
+        if table_present {
             let pos_before = reader.position();
-            let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, &mut self.code_lengths)?;
+            let (nc, dc, ldc, rc) =
+                huffman::read_tables_bitreader(reader, &mut self.code_lengths, self.extra_dist)?;
             let bits_used = (reader.position() - pos_before) as i64;
             self.block_bits_remaining -= bits_used;
             self.nc_table = Some(Arc::new(nc));
@@ -296,12 +317,22 @@ impl LzDecoder {
         // Block size in bits = (block_bytes - 1) * 8 + extra_bits.
         // The block_bytes value includes the last partial byte; extra_bits gives
         // how many bits are valid in that last byte (1-8).
-        self.block_bits_remaining = extra_bits + (block_bytes - 1) * 8;
+        self.block_bits_remaining = if block_bytes == 0 {
+            0
+        } else {
+            extra_bits + (block_bytes - 1) * 8
+        };
 
-        // Read new Huffman tables if present (consumes bits from the block).
-        if table_present || self.nc_table.is_none() {
+        if !table_present && self.nc_table.is_none() {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR5 first block is missing Huffman tables".into(),
+            });
+        }
+
+        if table_present {
             let pos_before = reader.position();
-            let (nc, dc, ldc, rc) = huffman::read_tables(reader, &mut self.code_lengths)?;
+            let (nc, dc, ldc, rc) =
+                huffman::read_tables(reader, &mut self.code_lengths, self.extra_dist)?;
             let bits_used = (reader.position() - pos_before) as i64;
             self.block_bits_remaining -= bits_used;
             self.nc_table = Some(Arc::new(nc));
@@ -533,7 +564,8 @@ impl LzDecoder {
         ldc: &HuffmanTable,
     ) -> RarResult<usize> {
         let dist_code = dc.decode(reader)? as usize;
-        if dist_code > 63 {
+        let max_dist_code = if self.extra_dist { 79 } else { 63 };
+        if dist_code > max_dist_code {
             return Err(RarError::CorruptArchive {
                 detail: format!("distance code out of range: {dist_code}"),
             });
@@ -548,7 +580,7 @@ impl LzDecoder {
             if num_bits >= 4 {
                 // Split: high bits from bitstream, low 4 bits from AlignDecoder (LDC).
                 let high = if num_bits > 4 {
-                    (reader.read_bits((num_bits - 4) as u8)? as usize) << 4
+                    (reader.read_bits64((num_bits - 4) as u8)? as usize) << 4
                 } else {
                     0
                 };
@@ -556,7 +588,7 @@ impl LzDecoder {
                 base + high + low
             } else {
                 // All extra bits from bitstream.
-                base + reader.read_bits(num_bits as u8)? as usize
+                base + reader.read_bits64(num_bits as u8)? as usize
             }
         };
 
@@ -569,32 +601,12 @@ impl LzDecoder {
     /// Reads the full filter descriptor from the bitstream and pushes a
     /// [`PendingFilter`] for later application to the output.
     fn handle_filter<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<u64> {
-        // Read filter flags byte.
-        let flags = reader.read_bits(8)?;
-        let filter_code = (flags & 0x07) as u8; // bits 0-2: filter type
-        let use_counts = (flags >> 3) & 1; // bit 3: channel count follows (DELTA)
-        let block_start_bits = ((flags >> 4) & 0x0F) as u8; // bits 4-7: size of block_start field
-
-        let filter_type =
-            FilterType::from_code(filter_code).ok_or(RarError::UnsupportedFilter {
-                filter_type: filter_code,
-            })?;
-
-        // Read block start delta (relative to current output position).
-        let block_start_delta = if block_start_bits > 0 {
-            reader.read_bits(block_start_bits + 4)? as u64
-        } else {
-            0
-        };
+        let block_start_delta = Self::read_filter_data(reader)? as u64;
         let block_start = output_size + block_start_delta;
-
-        // Read block length (always present).
-        let block_length_bits = reader.read_bits(4)? as u8;
-        let block_length = if block_length_bits > 0 {
-            reader.read_bits(block_length_bits + 4)? as usize
-        } else {
-            0
-        };
+        let block_length = Self::read_filter_data(reader)? as usize;
+        let filter_code = reader.read_bits(3)? as u8;
+        let filter_type = FilterType::from_code(filter_code)
+            .ok_or(RarError::UnsupportedFilter { filter_type: filter_code })?;
 
         if block_length > MAX_FILTER_BLOCK_SIZE {
             return Err(RarError::CorruptArchive {
@@ -605,11 +617,8 @@ impl LzDecoder {
             });
         }
 
-        // For DELTA filter, read channel count.
-        let channels = if filter_type == FilterType::Delta && use_counts != 0 {
+        let channels = if filter_type == FilterType::Delta {
             (reader.read_bits(5)? + 1) as u8
-        } else if filter_type == FilterType::Delta {
-            1
         } else {
             0
         };
@@ -637,6 +646,15 @@ impl LzDecoder {
         }
 
         Ok(output_size)
+    }
+
+    fn read_filter_data<R: BitRead>(reader: &mut R) -> RarResult<u32> {
+        let byte_count = reader.read_bits(2)? as usize + 1;
+        let mut data = 0u32;
+        for index in 0..byte_count {
+            data |= reader.read_bits(8)? << (index * 8);
+        }
+        Ok(data)
     }
 
     /// Streaming variant: decompress directly to a writer instead of a Vec.
@@ -1165,7 +1183,7 @@ pub fn decompress_lz(
     }
 
     let dict_size = info.dict_size as usize;
-    let mut decoder = LzDecoder::new(dict_size);
+    let mut decoder = LzDecoder::new(dict_size, info.version);
     decoder.decompress(input, unpacked_size)
 }
 
@@ -1187,7 +1205,7 @@ pub fn decompress_lz_to_writer<W: Write>(
     }
 
     let dict_size = info.dict_size as usize;
-    let mut decoder = LzDecoder::new(dict_size);
+    let mut decoder = LzDecoder::new(dict_size, info.version);
     decoder.decompress_to_writer(input, unpacked_size, writer)
 }
 
@@ -1205,7 +1223,7 @@ pub fn decompress_lz_reader_to_writer<Rd: std::io::Read, W: Write>(
     }
 
     let dict_size = info.dict_size as usize;
-    let mut decoder = LzDecoder::new(dict_size);
+    let mut decoder = LzDecoder::new(dict_size, info.version);
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
 }
 
@@ -1228,7 +1246,7 @@ where
     }
 
     let dict_size = info.dict_size as usize;
-    let mut decoder = LzDecoder::new(dict_size);
+    let mut decoder = LzDecoder::new(dict_size, info.version);
     decoder.decompress_reader_to_writer_chunked(
         input,
         unpacked_size,
@@ -1281,7 +1299,7 @@ mod tests {
 
     #[test]
     fn test_decoder_creation() {
-        let decoder = LzDecoder::new(128 * 1024);
+        let decoder = LzDecoder::new(128 * 1024, 0);
         assert_eq!(decoder.window.dict_size(), 128 * 1024);
         assert_eq!(decoder.dist_cache, [0; 4]);
     }
@@ -1315,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_decoder_reset() {
-        let mut decoder = LzDecoder::new(128 * 1024);
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.dist_cache = [10, 20, 30, 40];
         decoder.block_bits_remaining = 100;
         decoder.reset();
@@ -1326,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_prepare_solid_continuation() {
-        let mut decoder = LzDecoder::new(128 * 1024);
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.dist_cache = [10, 20, 30, 40];
         decoder.block_bits_remaining = 50;
         // Write some data to the window to simulate previous decompression.

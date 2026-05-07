@@ -497,6 +497,8 @@ mod tests {
             unpacked_size: Some(data.len() as u64),
             attributes: FileAttributes(0o644),
             mtime: None,
+            ctime: None,
+            atime: None,
             data_crc32: Some(crc),
             compression: CompressionInfo {
                 format: ArchiveFormat::Rar5,
@@ -513,6 +515,8 @@ mod tests {
             split_after: false,
             data_offset,
             is_encrypted: false,
+            version: None,
+            service_subdata: None,
         }
     }
 

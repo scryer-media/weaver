@@ -43,16 +43,25 @@ pub struct PendingFilter {
 
 /// Apply the DELTA filter in-place.
 ///
-/// Reverses delta encoding: for each channel, accumulates a running sum.
-/// Input is interleaved channel data where byte `i` belongs to channel
-/// `i % channels`.
+/// RAR5 stores bytes from the same channel in contiguous groups, so decoding
+/// must both reverse the subtractive delta and de-interleave the channels.
 pub fn apply_delta(data: &mut [u8], channels: u8) {
     let ch = channels as usize;
     if ch == 0 {
         return;
     }
-    for i in ch..data.len() {
-        data[i] = data[i].wrapping_add(data[i - ch]);
+
+    let src = data.to_vec();
+    let mut src_pos = 0usize;
+    for channel in 0..ch {
+        let mut prev = 0u8;
+        let mut dest = channel;
+        while dest < data.len() && src_pos < src.len() {
+            prev = prev.wrapping_sub(src[src_pos]);
+            data[dest] = prev;
+            src_pos += 1;
+            dest += ch;
+        }
     }
 }
 
@@ -74,9 +83,9 @@ pub fn apply_e8e9(data: &mut [u8], file_offset: u64) {
 
 /// Shared implementation for E8 and E8E9 filters.
 ///
-/// The file_size for range checking is the block_length (data.len()).
+/// RAR5 uses a fixed 16 MiB address window for E8/E9 fixups.
 fn apply_e8e9_inner(data: &mut [u8], file_offset: u64, include_e9: bool) {
-    let file_size = data.len() as i64;
+    const FILE_SIZE: u32 = 0x01_00_00_00;
     if data.len() < 5 {
         return;
     }
@@ -95,31 +104,17 @@ fn apply_e8e9_inner(data: &mut [u8], file_offset: u64, include_e9: bool) {
 
         i += found;
 
-        let addr = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
-        let cur_pos = (file_offset as i64) + (i as i64) + 5;
+        let addr = u32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+        let offset = (((i + 1) as u64) + file_offset) as u32 % FILE_SIZE;
 
-        // RAR5 range check: after subtracting current position, the result
-        // must be >= 0 and < file_size to be considered a valid conversion.
-        if addr >= 0 && i64::from(addr) < file_size {
-            // Stored as absolute, convert back to relative.
-            let relative = addr - cur_pos as i32;
-            let bytes = relative.to_le_bytes();
-            data[i + 1] = bytes[0];
-            data[i + 2] = bytes[1];
-            data[i + 3] = bytes[2];
-            data[i + 4] = bytes[3];
-        } else if addr < 0 && addr.wrapping_add(cur_pos as i32) >= 0 {
-            // Negative address that wraps into valid range.
-            let relative = addr.wrapping_add(cur_pos as i32);
-            // Convert: this was stored as `addr = relative + cur_pos`, so
-            // the original relative value is actually just `relative` here
-            // which equals `addr + cur_pos`. We need to store it as-is since
-            // it represents the absolute form.
-            let bytes = relative.to_le_bytes();
-            data[i + 1] = bytes[0];
-            data[i + 2] = bytes[1];
-            data[i + 3] = bytes[2];
-            data[i + 4] = bytes[3];
+        if addr & 0x8000_0000 != 0 {
+            if addr.wrapping_add(offset) & 0x8000_0000 == 0 {
+                let bytes = addr.wrapping_add(FILE_SIZE).to_le_bytes();
+                data[i + 1..i + 5].copy_from_slice(&bytes);
+            }
+        } else if addr.wrapping_sub(FILE_SIZE) & 0x8000_0000 != 0 {
+            let bytes = addr.wrapping_sub(offset).to_le_bytes();
+            data[i + 1..i + 5].copy_from_slice(&bytes);
         }
 
         i += 5;
@@ -144,8 +139,6 @@ pub fn apply_arm(data: &mut [u8], file_offset: u64) {
             let b2 = data[i + 2] as u32;
             let offset = b0 | (b1 << 8) | (b2 << 16);
 
-            // Convert from absolute back to relative by subtracting
-            // the current instruction's position (in units of 4 bytes).
             let cur_pos = ((file_offset as u32) + (i as u32)) / 4;
             let relative = offset.wrapping_sub(cur_pos) & 0x00FF_FFFF;
 
@@ -163,19 +156,20 @@ mod tests {
 
     #[test]
     fn test_apply_delta_single_channel() {
-        let mut data = [1u8, 2, 3, 4];
+        let mut data = [255u8, 254, 253, 252];
         apply_delta(&mut data, 1);
-        // Running sum: 1, 1+2=3, 3+3=6, 6+4=10
+        // UnRAR-style delta uses subtractive accumulation.
+        // Encoded bytes [255, 254, 253, 252] decode to [1, 3, 6, 10].
         assert_eq!(data, [1, 3, 6, 10]);
     }
 
     #[test]
     fn test_apply_delta_multi_channel() {
-        // 2 channels: channel 0 = positions 0,2,4; channel 1 = positions 1,3,5
-        let mut data = [10u8, 20, 5, 3, 7, 1];
+        // UnRAR groups each channel contiguously in the encoded stream.
+        // Channel 0 encoded deltas [246, 251, 249] -> [10, 15, 22]
+        // Channel 1 encoded deltas [236, 253, 255] -> [20, 23, 24]
+        let mut data = [246u8, 251, 249, 236, 253, 255];
         apply_delta(&mut data, 2);
-        // Channel 0: 10, 10+5=15, 15+7=22
-        // Channel 1: 20, 20+3=23, 23+1=24
         // Interleaved: [10, 20, 15, 23, 22, 24]
         assert_eq!(data, [10, 20, 15, 23, 22, 24]);
     }
@@ -184,9 +178,10 @@ mod tests {
     fn test_apply_e8_basic() {
         // Place a 0xE8 at position 0 with an absolute address that should
         // be converted back to relative.
-        // file_offset = 0, position = 0, so cur_pos = 0 + 0 + 5 = 5
+        // UnRAR uses the current written offset of the 4-byte address field,
+        // so file_offset = 0 and position = 0 yields an address offset of 1.
         // Stored absolute addr = 100 (which is >= 0 and < file_size)
-        // Expected relative = 100 - 5 = 95
+        // Expected relative = 100 - 1 = 99
         let file_size = 256; // block_length
         let mut data = vec![0u8; file_size];
         data[0] = 0xE8;
@@ -200,7 +195,7 @@ mod tests {
         apply_e8(&mut data, 0);
 
         let result = i32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        assert_eq!(result, 95); // 100 - 5
+        assert_eq!(result, 99); // 100 - 1
     }
 
     #[test]
@@ -208,7 +203,7 @@ mod tests {
         let file_size = 256;
         let mut data = vec![0u8; file_size];
 
-        // E8 at position 0: absolute addr = 50, cur_pos = 5, relative = 45
+        // E8 at position 0: absolute addr = 50, address offset = 1, relative = 49
         data[0] = 0xE8;
         let addr1: i32 = 50;
         let b1 = addr1.to_le_bytes();
@@ -217,7 +212,7 @@ mod tests {
         data[3] = b1[2];
         data[4] = b1[3];
 
-        // E9 at position 10: absolute addr = 80, cur_pos = 15, relative = 65
+        // E9 at position 10: absolute addr = 80, address offset = 11, relative = 69
         data[10] = 0xE9;
         let addr2: i32 = 80;
         let b2 = addr2.to_le_bytes();
@@ -229,10 +224,10 @@ mod tests {
         apply_e8e9(&mut data, 0);
 
         let r1 = i32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-        assert_eq!(r1, 45); // 50 - 5
+        assert_eq!(r1, 49); // 50 - 1
 
         let r2 = i32::from_le_bytes([data[11], data[12], data[13], data[14]]);
-        assert_eq!(r2, 65); // 80 - 15
+        assert_eq!(r2, 69); // 80 - 11
     }
 
     #[test]
