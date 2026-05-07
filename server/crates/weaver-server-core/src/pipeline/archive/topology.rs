@@ -70,6 +70,66 @@ fn cached_rar_snapshot_conflicts_with_volume_facts(
     })
 }
 
+fn cached_rar_plan_is_incoherent(
+    plan: &RarDerivedPlan,
+    failed: &HashSet<String>,
+    worker_active: bool,
+    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    volume_paths: &BTreeMap<u32, PathBuf>,
+) -> bool {
+    matches!(plan.phase, RarSetPhase::WaitingForVolumes)
+        && plan.waiting_on_volumes.is_empty()
+        && plan.ready_members.is_empty()
+        && failed.is_empty()
+        && !worker_active
+        && !volume_paths.is_empty()
+        && volume_paths.keys().all(|volume| facts.contains_key(volume))
+        && facts.values().any(|volume_facts| {
+            volume_facts
+                .members
+                .iter()
+                .any(|member| !member.is_directory || member.data_size > 0)
+        })
+}
+
+pub(in crate::pipeline) fn ownerless_present_member_volumes(
+    plan: &RarDerivedPlan,
+    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+) -> Vec<u32> {
+    let mut volumes: Vec<u32> = plan
+        .delete_decisions
+        .iter()
+        .filter_map(|(volume, decision)| {
+            let has_named_member = facts.get(volume).is_some_and(|volume_facts| {
+                volume_facts.members.iter().any(|member| {
+                    (!member.is_directory || member.data_size > 0)
+                        && !weaver_rar::sanitize_path(&member.name).is_empty()
+                })
+            });
+            (decision.owners.is_empty() && has_named_member).then_some(*volume)
+        })
+        .collect();
+    volumes.sort_unstable();
+    volumes
+}
+
+const INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER: &str =
+    "produced incoherent waiting state with no missing volumes after rebuild";
+const OWNERLESS_RAR_PLAN_ERROR_MARKER: &str =
+    "produced ownerless present RAR volumes after rebuild";
+
+pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) -> bool {
+    error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
+}
+
+pub(in crate::pipeline) fn is_ownerless_rar_plan_error(error: &str) -> bool {
+    error.contains(OWNERLESS_RAR_PLAN_ERROR_MARKER)
+}
+
+pub(in crate::pipeline) fn ownerless_rar_plan_error(set_name: &str, volumes: &[u32]) -> String {
+    format!("RAR set '{set_name}' {OWNERLESS_RAR_PLAN_ERROR_MARKER}: {volumes:?}")
+}
+
 impl Pipeline {
     fn register_rar_volume_file(state: &mut RarSetState, logical_volume: u32, filename: String) {
         state.volume_files.retain(|volume, existing_filename| {
@@ -377,6 +437,66 @@ impl Pipeline {
                 .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}"))
             };
 
+            let attach_volumes_and_build_plan = |
+                mut archive: weaver_rar::RarArchive,
+                rebuild_source: RarTopologyRebuildSource,
+                using_cached_headers: bool,
+                force_refresh_all_volumes: bool,
+            | -> Result<_, String> {
+                for (volume_number, path) in &volume_paths {
+                    let volume_file = match std::fs::File::open(path) {
+                        Ok(file) => file,
+                        Err(error)
+                            if using_cached_headers
+                                && error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
+                            ));
+                        }
+                    };
+                    let volume_needs_refresh = force_refresh_all_volumes
+                        || !facts.contains_key(volume_number)
+                        || verified_suspect_volumes.contains(volume_number);
+                    if using_cached_headers
+                        && volume_needs_refresh
+                        && archive.has_volume(*volume_number as usize)
+                    {
+                        archive
+                            .refresh_volume(*volume_number as usize, Box::new(volume_file))
+                            .map_err(|e| {
+                                format!(
+                                    "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                                )
+                            })?;
+                    } else if archive.has_volume(*volume_number as usize) {
+                        archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
+                    } else {
+                        archive
+                            .add_volume(*volume_number as usize, Box::new(volume_file))
+                            .map_err(|e| {
+                                format!(
+                                    "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                                )
+                            })?;
+                    }
+                }
+
+                let plan = rar_state::build_plan(
+                    volume_map.clone(),
+                    &facts,
+                    &archive,
+                    &extracted,
+                    &failed,
+                    worker_active,
+                )?;
+
+                Ok((plan, archive.serialize_headers(), rebuild_source, using_cached_headers))
+            };
+
             let mut rebuild_source = if cached_headers.is_some() {
                 RarTopologyRebuildSource::CachedHeaders
             } else {
@@ -430,56 +550,78 @@ impl Pipeline {
                 }
             }
 
-            for (volume_number, path) in &volume_paths {
-                let volume_file = match std::fs::File::open(path) {
-                    Ok(file) => file,
-                    Err(error)
-                        if has_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
-                        ));
-                    }
-                };
-                let volume_needs_refresh = force_refresh_all_volumes
-                    || !facts.contains_key(volume_number)
-                    || verified_suspect_volumes.contains(volume_number);
-                if using_cached_headers
-                    && volume_needs_refresh
-                    && archive.has_volume(*volume_number as usize)
-                {
-                    archive
-                        .refresh_volume(*volume_number as usize, Box::new(volume_file))
-                        .map_err(|e| {
-                            format!(
-                                "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
-                            )
-                        })?;
-                } else if archive.has_volume(*volume_number as usize) {
-                    archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
-                } else {
-                    archive
-                        .add_volume(*volume_number as usize, Box::new(volume_file))
-                        .map_err(|e| {
-                            format!(
-                                "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
-                            )
-                        })?;
-                }
+            let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers) =
+                attach_volumes_and_build_plan(
+                    archive,
+                    rebuild_source,
+                    using_cached_headers,
+                    force_refresh_all_volumes,
+                )?;
+
+            let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
+            if used_cached_headers && !ownerless_volumes.is_empty() && volume_paths.contains_key(&0)
+            {
+                warn!(
+                    set_name = %set_name_owned,
+                    volumes = ?ownerless_volumes,
+                    "cached RAR headers produced ownerless present volumes; retrying from live volumes"
+                );
+
+                (plan, headers, rebuild_source, used_cached_headers) =
+                    attach_volumes_and_build_plan(
+                        open_from_volume_zero()?,
+                        RarTopologyRebuildSource::VolumeZero,
+                        false,
+                        false,
+                    )?;
             }
 
-            let plan = rar_state::build_plan(
-                volume_map,
-                &facts,
-                &archive,
-                &extracted,
+            if used_cached_headers
+                && cached_rar_plan_is_incoherent(
+                    &plan,
+                    &failed,
+                    worker_active,
+                    &facts,
+                    &volume_paths,
+                )
+                && volume_paths.contains_key(&0)
+            {
+                warn!(
+                    set_name = %set_name_owned,
+                    "cached RAR headers produced incoherent waiting plan; retrying from live volumes"
+                );
+
+                (plan, headers, rebuild_source, used_cached_headers) =
+                    attach_volumes_and_build_plan(
+                        open_from_volume_zero()?,
+                        RarTopologyRebuildSource::VolumeZero,
+                        false,
+                        false,
+                    )?;
+            }
+
+            let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
+            if !ownerless_volumes.is_empty() {
+                return Err(ownerless_rar_plan_error(
+                    &set_name_owned,
+                    &ownerless_volumes,
+                ));
+            }
+
+            if cached_rar_plan_is_incoherent(
+                &plan,
                 &failed,
                 worker_active,
-            )?;
-            Ok((plan, archive.serialize_headers(), rebuild_source))
+                &facts,
+                &volume_paths,
+            ) {
+                return Err(format!(
+                    "RAR set '{set_name_owned}' {INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER}"
+                ));
+            }
+
+            let _ = used_cached_headers;
+            Ok((plan, headers, rebuild_source))
         })
         .await
         .map_err(|e| format!("RAR plan task panicked: {e}"))?;
@@ -497,6 +639,11 @@ impl Pipeline {
                 Ok(())
             }
             Err(error) => {
+                if is_ownerless_rar_plan_error(&error) {
+                    self.clear_rar_snapshot(job_id, set_name);
+                    return Err(error);
+                }
+
                 let mut fallback = existing.plan.clone().unwrap_or_else(|| RarDerivedPlan {
                     phase: RarSetPhase::FallbackFullSet,
                     is_solid: false,

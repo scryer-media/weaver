@@ -27,7 +27,7 @@ fn sample_rule(id: u32, feed_id: u32) -> RssRuleRow {
         sort_order: id as i32,
         enabled: true,
         action: RssRuleAction::Accept,
-        title_regex: Some("Frieren".to_string()),
+        title_regex: Some("Silver Horizon".to_string()),
         item_categories: vec!["tv".to_string()],
         min_size_bytes: Some(100),
         max_size_bytes: Some(1000),

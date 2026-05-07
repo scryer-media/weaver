@@ -41,7 +41,7 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
                 <title>Example</title>
                 <item>
                   <guid>guid-1</guid>
-                  <title>Frieren - enclosure</title>
+                  <title>Silver Horizon - enclosure</title>
                   <link>https://example.com/detail</link>
                   <enclosure url="https://example.com/download.nzb" length="1234" type="application/x-nzb"/>
                   <category>TV</category>
@@ -62,7 +62,7 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
               <title>Atom Example</title>
               <entry>
                 <id>tag:example.com,2026:test</id>
-                <title>Frieren - link fallback</title>
+                <title>Silver Horizon - link fallback</title>
                 <link href="https://example.com/api?t=get&id=1" />
               </entry>
             </feed>"#;
@@ -78,7 +78,7 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
 fn first_matching_rule_wins() {
     let item = FeedItem {
         item_id: "guid-1".to_string(),
-        title: "Frieren".to_string(),
+        title: "Silver Horizon".to_string(),
         published_at: None,
         size_bytes: Some(500),
         categories: vec!["tv".to_string()],
@@ -92,7 +92,7 @@ fn first_matching_rule_wins() {
             sort_order: 0,
             enabled: true,
             action: RssRuleAction::Reject,
-            title_regex: Some("Frieren".to_string()),
+            title_regex: Some("Silver Horizon".to_string()),
             item_categories: vec![],
             min_size_bytes: None,
             max_size_bytes: None,
@@ -105,7 +105,7 @@ fn first_matching_rule_wins() {
             sort_order: 1,
             enabled: true,
             action: RssRuleAction::Accept,
-            title_regex: Some("Frieren".to_string()),
+            title_regex: Some("Silver Horizon".to_string()),
             item_categories: vec![],
             min_size_bytes: None,
             max_size_bytes: None,
@@ -122,7 +122,7 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("rss.sqlite");
     let state = TestHttpState {
-        feed_body: sample_rss_feed("guid-1", "Frieren 01", "/download.nzb"),
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
         etag: None,
         require_auth: false,
@@ -159,7 +159,7 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
         sort_order: 0,
         enabled: true,
         action: RssRuleAction::Accept,
-        title_regex: Some("Frieren".to_string()),
+        title_regex: Some("Silver Horizon".to_string()),
         item_categories: vec!["TV".to_string()],
         min_size_bytes: Some(1),
         max_size_bytes: Some(10_000),
@@ -202,7 +202,7 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
     let temp = TempDir::new().unwrap();
     let db = Database::open(&temp.path().join("rss-auth.sqlite")).unwrap();
     let state = TestHttpState {
-        feed_body: sample_rss_feed("guid-1", "Frieren 01", "/download.nzb"),
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
         etag: Some("v1".to_string()),
         require_auth: true,
@@ -238,7 +238,7 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
         sort_order: 0,
         enabled: true,
         action: RssRuleAction::Accept,
-        title_regex: Some("Frieren".to_string()),
+        title_regex: Some("Silver Horizon".to_string()),
         item_categories: vec![],
         min_size_bytes: None,
         max_size_bytes: None,
@@ -263,7 +263,7 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
     let temp = TempDir::new().unwrap();
     let db = Database::open(&temp.path().join("rss-failure.sqlite")).unwrap();
     let state = TestHttpState {
-        feed_body: sample_rss_feed("guid-1", "Frieren 01", "/download.nzb"),
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: b"not an nzb".to_vec(),
         etag: None,
         require_auth: false,
@@ -298,7 +298,7 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
         sort_order: 0,
         enabled: true,
         action: RssRuleAction::Accept,
-        title_regex: Some("Frieren".to_string()),
+        title_regex: Some("Silver Horizon".to_string()),
         item_categories: vec![],
         min_size_bytes: None,
         max_size_bytes: None,
@@ -325,7 +325,7 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
     let temp = TempDir::new().unwrap();
     let db = Database::open(&temp.path().join("rss-due.sqlite")).unwrap();
     let state = TestHttpState {
-        feed_body: sample_rss_feed("guid-1", "Frieren 01", "/download.nzb"),
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
         etag: None,
         require_auth: false,
@@ -360,7 +360,7 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
         sort_order: 0,
         enabled: true,
         action: RssRuleAction::Accept,
-        title_regex: Some("Frieren".to_string()),
+        title_regex: Some("Silver Horizon".to_string()),
         item_categories: vec![],
         min_size_bytes: None,
         max_size_bytes: None,
@@ -510,7 +510,7 @@ fn sample_rss_feed(guid: &str, title: &str, path: &str) -> String {
 fn sample_nzb_bytes() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8"?>
         <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
-          <file poster="poster" date="1700000000" subject="Frieren.Sample.rar">
+          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
             <groups><group>alt.binaries.test</group></groups>
             <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
           </file>

@@ -864,19 +864,71 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn retry_archive_extraction_after_verify_or_repair(&mut self, job_id: JobId) {
+    async fn recompute_rar_sets_after_verify_or_repair(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), String> {
+        for set_name in self.rar_set_names_for_job(job_id) {
+            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
+                if crate::pipeline::archive::topology::is_incoherent_rar_waiting_state_error(&error)
+                {
+                    return Err(error);
+                }
+
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "RAR state recompute after verify/repair fell back; preserving retryable state"
+                );
+            }
+
+            if let Some(error) = self.ownerless_live_rar_plan_error_for_set(job_id, &set_name) {
+                return Err(error);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn ownerless_live_rar_plan_error_for_job(&self, job_id: JobId) -> Option<String> {
+        self.rar_set_names_for_job(job_id)
+            .into_iter()
+            .find_map(|set_name| self.ownerless_live_rar_plan_error_for_set(job_id, &set_name))
+    }
+
+    fn ownerless_live_rar_plan_error_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Option<String> {
+        let set_state = self.rar_sets.get(&(job_id, set_name.to_string()))?;
+        let plan = set_state.plan.as_ref()?;
+        let ownerless_volumes =
+            crate::pipeline::archive::topology::ownerless_present_member_volumes(
+                plan,
+                &set_state.facts,
+            );
+        (!ownerless_volumes.is_empty()).then(|| {
+            crate::pipeline::archive::topology::ownerless_rar_plan_error(
+                set_name,
+                &ownerless_volumes,
+            )
+        })
+    }
+
+    pub(in crate::pipeline) async fn retry_archive_extraction_after_verify_or_repair(
+        &mut self,
+        job_id: JobId,
+    ) {
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
 
+        if let Err(error) = self.recompute_rar_sets_after_verify_or_repair(job_id).await {
+            self.fail_job(job_id, error);
+            return;
+        }
+
         if self.job_has_only_rar_archives(job_id) {
-            let set_names: Vec<String> = self
-                .rar_sets
-                .keys()
-                .filter(|(jid, _)| *jid == job_id)
-                .map(|(_, name)| name.clone())
-                .collect();
-            for set_name in set_names {
-                let _ = self.recompute_rar_set_state(job_id, &set_name).await;
-            }
             self.reconcile_job_progress(job_id).await;
             if self.all_rar_sets_complete(job_id) {
                 self.finalize_completed_archive_job(job_id).await;

@@ -619,7 +619,7 @@ mod tests {
         });
 
         assert_eq!(info.original_title, metadata[0].1);
-        assert_eq!(info.display_title, "Attack on Titan — S04E29");
+        assert_eq!(info.display_title, "Stoneguard — S04E29");
     }
 
     #[test]
@@ -646,9 +646,9 @@ mod tests {
 
     #[test]
     fn anime_category_supports_absolute_episode_display() {
-        let info = display("[SubsPlease] Bleach - 330 [1080p]", Some("Anime"));
+        let info = display("[SubsPlease] Emberfall - 330 [1080p]", Some("Anime"));
 
-        assert_eq!(info.display_title, "Bleach — 330");
+        assert_eq!(info.display_title, "Emberfall — 330");
         assert_eq!(
             info.parsed_release
                 .episode
@@ -660,9 +660,9 @@ mod tests {
 
     #[test]
     fn unknown_category_still_extracts_common_release_metadata() {
-        let info = display("Dune.2024.2160p.BluRay.Remux.H.265-GROUP", None);
+        let info = display("Glass Harbor.2024.2160p.BluRay.Remux.H.265-GROUP", None);
 
-        assert_eq!(info.display_title, "Dune");
+        assert_eq!(info.display_title, "Glass Harbor");
         assert_eq!(info.parsed_release.quality.as_deref(), Some("2160p"));
         assert_eq!(info.parsed_release.source.as_deref(), Some("BluRay"));
     }

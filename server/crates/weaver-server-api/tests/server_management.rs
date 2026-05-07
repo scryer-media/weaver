@@ -60,6 +60,46 @@ async fn list_servers_empty() {
 }
 
 #[tokio::test]
+async fn has_configured_servers_reflects_presence() {
+    let h = TestHarness::new().await;
+    let resp = h.execute("{ hasConfiguredServers }").await;
+    assert_no_errors(&resp);
+    assert!(
+        !response_data(&resp)["hasConfiguredServers"]
+            .as_bool()
+            .unwrap()
+    );
+
+    h.execute(
+        r#"mutation {
+            addServer(input: {
+                host: "news.example.com",
+                port: 119,
+                tls: false,
+                connections: 5,
+                active: false
+            }) { id }
+        }"#,
+    )
+    .await;
+
+    let resp = h.execute("{ hasConfiguredServers }").await;
+    assert_no_errors(&resp);
+    assert!(
+        response_data(&resp)["hasConfiguredServers"]
+            .as_bool()
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn server_list_does_not_expose_username_field() {
+    let h = TestHarness::new().await;
+    let resp = h.execute("{ servers { username } }").await;
+    assert_has_errors(&resp);
+}
+
+#[tokio::test]
 async fn add_server_basic() {
     let h = TestHarness::new().await;
     let port = spawn_scripted_server(vec![
@@ -176,7 +216,6 @@ async fn add_server_with_auth() {
                 }}) {{
                     id
                     host
-                    username
                 }}
             }}"#,
         ))
@@ -184,9 +223,24 @@ async fn add_server_with_auth() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     let server = &data["addServer"];
-    assert_eq!(server["username"].as_str().unwrap(), "user");
+    let id = server["id"].as_u64().unwrap();
     // Password is intentionally not exposed in the Server output type.
     assert!(server.get("password").is_none());
+
+    let resp = h
+        .execute(&format!(
+            r#"{{
+                server(id: {id}) {{
+                    id
+                    username
+                }}
+            }}"#,
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let detail = &response_data(&resp)["server"];
+    assert_eq!(detail["username"].as_str().unwrap(), "user");
+    assert!(detail.get("password").is_none());
 }
 
 #[tokio::test]
@@ -302,7 +356,6 @@ async fn update_server_preserves_password() {
                     active: false
                 }}) {{
                     id
-                    username
                 }}
             }}"#
         ))

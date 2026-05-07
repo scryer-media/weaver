@@ -237,7 +237,7 @@ fn build_plan_blocks_delete_for_missing_start_continuation_spans() {
         .add_volume(3, Box::new(Cursor::new(files[3].1.clone())))
         .unwrap();
 
-    let facts: BTreeMap<u32, RarVolumeFacts> = files
+    let mut facts: BTreeMap<u32, RarVolumeFacts> = files
         .iter()
         .enumerate()
         .map(|(volume, (_, bytes))| {
@@ -247,6 +247,11 @@ fn build_plan_blocks_delete_for_missing_start_continuation_spans() {
             )
         })
         .collect();
+    for volume_facts in facts.values_mut() {
+        for member in &mut volume_facts.members {
+            member.is_directory = true;
+        }
+    }
     let volume_map = files
         .iter()
         .enumerate()
@@ -315,6 +320,71 @@ fn build_single_member_five_volume_rar_set() -> Vec<(String, Vec<u8>)> {
         volumes.push((filename, volume_data));
     }
     volumes
+}
+
+#[test]
+fn build_plan_uses_volume_facts_for_incremental_ownership_only() {
+    let files = build_single_member_five_volume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let mut cached = serde_json::to_value(archive.export_headers()).unwrap();
+    cached["members"] = serde_json::json!([]);
+    let archive = RarArchive::deserialize_headers_with_password(
+        &rmp_serde::to_vec(
+            &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        )
+        .unwrap(),
+        None::<String>,
+    )
+    .unwrap();
+
+    let facts: BTreeMap<u32, RarVolumeFacts> = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (_, bytes))| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    let volume_map = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+        .collect();
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    for volume in [0u32, 1, 2, 3, 4] {
+        let decision = plan
+            .delete_decisions
+            .get(&volume)
+            .expect("present volume should have a delete decision");
+        assert_eq!(decision.owners, vec!["E01.mkv".to_string()]);
+        assert!(
+            decision.unresolved_boundary,
+            "fact-derived ownership must stay conservative for volume {volume}"
+        );
+        assert!(!decision.ownership_eligible);
+        assert!(!plan.deletion_eligible.contains(&volume));
+    }
+    assert!(
+        plan.ready_members.is_empty(),
+        "fact-derived ownership must not make the member extractable"
+    );
 }
 
 #[test]

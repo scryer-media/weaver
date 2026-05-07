@@ -451,7 +451,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     };
     let jobs = vec![JobInfo {
         job_id: JobId(42),
-        name: "Frieren".into(),
+        name: "Silver Horizon".into(),
         status: JobStatus::Downloading,
         download_state: weaver_server_core::DownloadState::Downloading,
         post_state: weaver_server_core::PostState::Idle,
@@ -494,7 +494,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
     assert!(rendered.contains(
-            "weaver_job_info{job_id=\"42\",job_name=\"Frieren\",status=\"downloading\",category=\"tv\",has_password=\"true\"} 1"
+            "weaver_job_info{job_id=\"42\",job_name=\"Silver Horizon\",status=\"downloading\",category=\"tv\",has_password=\"true\"} 1"
         ));
     assert!(rendered.contains("weaver_job_progress_ratio{job_id=\"42\""));
     assert!(rendered.contains("weaver_pipeline_jobs{status=\"downloading\"} 1"));

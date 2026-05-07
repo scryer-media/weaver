@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
-use weaver_rar::{RarArchive, RarVolumeFacts, archive::MemberPlannerState};
+use weaver_rar::{RarArchive, RarVolumeFacts, archive::MemberPlannerState, sanitize_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarSetPhase {
@@ -331,6 +331,21 @@ pub(crate) fn build_plan(
         }
     }
 
+    let fact_owner_claims: BTreeMap<u32, Vec<String>> = facts
+        .iter()
+        .filter_map(|(&volume, facts)| {
+            let mut owners: Vec<String> = facts
+                .members
+                .iter()
+                .filter(|member| !member.is_directory || member.data_size > 0)
+                .map(|member| sanitize_path(&member.name))
+                .filter(|name| !name.is_empty())
+                .collect();
+            sort_dedup(&mut owners);
+            (!owners.is_empty()).then_some((volume, owners))
+        })
+        .collect();
+
     let mut delete_decisions = BTreeMap::new();
     let mut ownerless_volumes = Vec::new();
     // Iterate all members with claims (not just member_names from metadata),
@@ -357,6 +372,22 @@ pub(crate) fn build_plan(
                 pending_owners.push(member.clone());
             }
         }
+        let mut fact_derived_owners = false;
+        if owners.is_empty()
+            && let Some(fallback_owners) = fact_owner_claims.get(&volume)
+        {
+            fact_derived_owners = true;
+            for member in fallback_owners {
+                owners.push(member.clone());
+                if extracted.contains(member) {
+                    clean_owners.push(member.clone());
+                } else if failed.contains(member) {
+                    failed_owners.push(member.clone());
+                } else {
+                    pending_owners.push(member.clone());
+                }
+            }
+        }
         sort_dedup(&mut owners);
         sort_dedup(&mut clean_owners);
         sort_dedup(&mut failed_owners);
@@ -364,7 +395,8 @@ pub(crate) fn build_plan(
         let unresolved_boundary = topology
             .unresolved_spans
             .iter()
-            .any(|span| (span.first_volume..=span.last_volume).contains(&volume));
+            .any(|span| (span.first_volume..=span.last_volume).contains(&volume))
+            || fact_derived_owners;
         let ownerless = owners.is_empty();
         if ownerless {
             ownerless_volumes.push(volume);

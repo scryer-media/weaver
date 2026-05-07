@@ -5,10 +5,10 @@ fn prefers_parsed_release_title() {
     // Season-only pack: parser doesn't produce episode metadata for bare S01
     assert_eq!(
         derive_release_name(
-            Some("Frieren.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu"),
+            Some("Silver Horizon.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu"),
             None,
         ),
-        "Frieren Beyond Journeys End"
+        "Silver Horizon Beyond the Vale"
     );
 }
 
@@ -19,15 +19,15 @@ fn display_title_includes_season_episode() {
             Some("Attack.on.Titan.S04E29.The.Final.Chapters.1080p.WEB-DL.H.265"),
             None,
         ),
-        "Attack on Titan — S04E29"
+        "Stoneguard — S04E29"
     );
 }
 
 #[test]
 fn display_title_movie_no_episode_suffix() {
     assert_eq!(
-        derive_release_name(Some("Dune.2024.2160p.BluRay.Remux.H.265"), None,),
-        "Dune"
+        derive_release_name(Some("Glass Harbor.2024.2160p.BluRay.Remux.H.265"), None,),
+        "Glass Harbor"
     );
 }
 
@@ -51,7 +51,7 @@ fn falls_back_to_basic_cleanup() {
 #[test]
 fn uses_secondary_when_primary_missing() {
     assert_eq!(
-        derive_release_name(None, Some("Dune.2021.1080p.BluRay.x264")),
-        "Dune"
+        derive_release_name(None, Some("Glass Harbor.2021.1080p.BluRay.x264")),
+        "Glass Harbor"
     );
 }

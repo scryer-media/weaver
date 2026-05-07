@@ -4,7 +4,7 @@ use super::{ORIGINAL_TITLE_METADATA_KEY, append_original_title_metadata, origina
 fn appends_original_title_metadata_once() {
     let metadata = append_original_title_metadata(
         vec![("priority".to_string(), "HIGH".to_string())],
-        Some("Dune.2021.1080p.BluRay.x264.nzb"),
+        Some("Glass Harbor.2021.1080p.BluRay.x264.nzb"),
         None,
     );
 
@@ -13,7 +13,7 @@ fn appends_original_title_metadata_once() {
         metadata[1],
         (
             ORIGINAL_TITLE_METADATA_KEY.to_string(),
-            "Dune.2021.1080p.BluRay.x264".to_string()
+            "Glass Harbor.2021.1080p.BluRay.x264".to_string()
         )
     );
 }
@@ -21,12 +21,12 @@ fn appends_original_title_metadata_once() {
 #[test]
 fn original_title_prefers_metadata() {
     let title = original_release_title(
-        "Dune",
+        "Glass Harbor",
         &[(
             ORIGINAL_TITLE_METADATA_KEY.to_string(),
-            "Dune.2021.1080p.BluRay.x264".to_string(),
+            "Glass Harbor.2021.1080p.BluRay.x264".to_string(),
         )],
     );
 
-    assert_eq!(title, "Dune.2021.1080p.BluRay.x264");
+    assert_eq!(title, "Glass Harbor.2021.1080p.BluRay.x264");
 }

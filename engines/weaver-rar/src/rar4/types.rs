@@ -76,6 +76,10 @@ pub mod file_flags {
     pub const COMMENT: u16 = 0x0008;
     /// Solid flag (uses previous files' data for dictionary).
     pub const SOLID: u16 = 0x0010;
+    /// Dictionary-size bits in RAR4 file headers.
+    pub const WINDOW_MASK: u16 = 0x00e0;
+    /// Special WINDOW_MASK value used by RAR4 to mark directory entries.
+    pub const DIRECTORY: u16 = 0x00e0;
     /// High-size fields present (unpacked/packed sizes are 64-bit).
     pub const LARGE: u16 = 0x0100;
     /// Unicode filename present.

@@ -207,7 +207,12 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
         None
     };
 
-    let is_directory = attributes & 0x10 != 0 || (raw.flags & 0xE0) == 0xE0; // directory attribute in flags
+    // Match UnRAR's RAR4 handling: modern file headers encode directories in
+    // the dictionary/window bits, not in the host-specific file attributes.
+    let mut is_directory = raw.flags & file_flags::WINDOW_MASK == file_flags::DIRECTORY;
+    if data[24] < 20 && attributes & 0x10 != 0 {
+        is_directory = true;
+    }
 
     let data_offset = raw.offset + raw.header_size as u64;
 
@@ -560,6 +565,79 @@ mod tests {
 
         assert_eq!(fh.packed_size, 0x1_FFFFFFFF);
         assert_eq!(fh.unpacked_size, 0x2_FFFFFFFF);
+    }
+
+    #[test]
+    fn test_parse_file_header_unix_regular_mode_is_not_directory() {
+        let name = b"video.mkv";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&100u32.to_le_bytes());
+        extra.extend_from_slice(&200u32.to_le_bytes());
+        extra.push(3); // Unix
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(29);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0o100755u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(
+            0x74,
+            file_flags::SPLIT_BEFORE | file_flags::SPLIT_AFTER,
+            &extra,
+        );
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert!(!fh.is_directory);
+    }
+
+    #[test]
+    fn test_parse_file_header_zero_byte_windows_directory() {
+        let name = b"extras";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(2); // Windows
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(29);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0x10u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x74, file_flags::DIRECTORY, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert!(fh.is_directory);
+    }
+
+    #[test]
+    fn test_parse_file_header_legacy_attr_directory() {
+        let name = b"extras";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(2); // Windows
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(15);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0x10u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x74, 0, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert!(fh.is_directory);
     }
 
     #[test]

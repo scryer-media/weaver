@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::Database;
@@ -149,7 +150,7 @@ impl TestHarness {
 fn sample_nzb_bytes() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8"?>
         <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
-          <file poster="poster" date="1700000000" subject="Frieren.Sample.rar">
+          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
             <groups><group>alt.binaries.test</group></groups>
             <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
           </file>
@@ -724,6 +725,86 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
 }
 
 #[tokio::test]
+async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_are_incoherent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40104);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Facts Heal Incoherent Cached Headers", &files);
+
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let mut good_archive =
+        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    good_archive
+        .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(2, Box::new(std::io::Cursor::new(files[2].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(3, Box::new(std::io::Cursor::new(files[3].1.clone())))
+        .unwrap();
+
+    let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
+    cached["members"] = serde_json::json!([]);
+    let stale_headers = rmp_serde::to_vec(
+        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+    )
+    .unwrap();
+
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "show".to_string()))
+        .expect("RAR set state should exist after all volumes complete")
+        .cached_headers = Some(stale_headers.clone());
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let plan = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("RAR plan should exist after recompute");
+    assert!(
+        !matches!(
+            plan.phase,
+            crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+        ),
+        "incoherent cached headers should be healed from live volumes",
+    );
+    assert!(
+        plan.ready_members
+            .iter()
+            .any(|member| member.name == "E01.mkv"),
+        "healed plan should restore live member readiness",
+    );
+
+    let healed_headers = pipeline
+        .load_rar_snapshot(job_id, "show")
+        .expect("recompute should persist healed headers");
+    let healed_archive =
+        weaver_rar::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
+            .unwrap();
+    assert!(
+        !healed_archive.metadata().members.is_empty(),
+        "healed headers should no longer carry the incoherent empty-member snapshot",
+    );
+}
+
+#[tokio::test]
 async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_scheduling() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -827,6 +908,30 @@ fn dummy_rar_volume_facts(volume_number: u32) -> weaver_rar::RarVolumeFacts {
         is_solid: false,
         is_encrypted: false,
         members: Vec::new(),
+    }
+}
+
+fn dummy_named_rar_volume_facts(
+    volume_number: u32,
+    member_name: &str,
+) -> weaver_rar::RarVolumeFacts {
+    weaver_rar::RarVolumeFacts {
+        members: vec![weaver_rar::RarVolumeMemberFacts {
+            order: 0,
+            name: member_name.to_string(),
+            unpacked_size: Some(1024),
+            data_crc32: None,
+            split_before: volume_number > 0,
+            split_after: true,
+            is_directory: false,
+            is_encrypted: false,
+            data_offset: 0,
+            data_size: 128,
+            compression_method: 0x30,
+            compression_solid: false,
+            use_hash_mac: false,
+        }],
+        ..dummy_rar_volume_facts(volume_number)
     }
 }
 
@@ -1758,7 +1863,7 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
             &harness.handle,
             &harness.config,
             &nzb_bytes,
-            Some("Frieren.Sample.nzb".to_string()),
+            Some("Silver Horizon.Sample.nzb".to_string()),
             None,
             None,
             vec![("source".to_string(), "test".to_string())],
@@ -1784,11 +1889,9 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
         info.metadata
             .contains(&("source".to_string(), "test".to_string()))
     );
-    assert!(
-        info.metadata
-            .iter()
-            .any(|(key, value)| { key == "weaver.original_title" && value == "Frieren.Sample" })
-    );
+    assert!(info.metadata.iter().any(|(key, value)| {
+        key == "weaver.original_title" && value == "Silver Horizon.Sample"
+    }));
 
     let (stored_path, stored_nzb) = harness
         .db
@@ -1796,7 +1899,7 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
         .unwrap()
         .and_then(|(path, nzb_zstd)| nzb_zstd.map(|nzb_zstd| (path, nzb_zstd)))
         .unwrap();
-    assert_eq!(stored_path, PathBuf::from("Frieren.Sample.nzb"));
+    assert_eq!(stored_path, PathBuf::from("Silver Horizon.Sample.nzb"));
     assert!(stored_nzb.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
 
     let decoded = crate::ingest::decode_persisted_nzb_bytes(&stored_nzb).unwrap();
@@ -1810,9 +1913,10 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(10067);
-    let job_name = "Frieren Beyond Journeys End";
-    let payload_dir = "Frieren.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu";
-    let episode_name = "Frieren.Beyond.Journeys.End.S01E01.mkv";
+    let job_name = "Silver Horizon Beyond the Vale";
+    let payload_dir =
+        "Silver Horizon.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu";
+    let episode_name = "Silver Horizon.Beyond.Journeys.End.S01E01.mkv";
 
     let existing_dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
     tokio::fs::create_dir_all(existing_dest.join(payload_dir))
@@ -1877,7 +1981,7 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(10068);
-    let job_name = "Frieren Broken Final Move";
+    let job_name = "Silver Horizon Broken Final Move";
     let missing_working_dir = intermediate_dir.join("missing");
 
     pipeline.jobs.insert(
@@ -10563,6 +10667,359 @@ async fn clean_verify_after_file_swap_refreshes_stale_rar_snapshot_without_volum
         }
         _ => panic!("expected incremental retry batch"),
     }
+}
+
+#[tokio::test]
+async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30083);
+    let working_dir = temp_dir.path().join("ownerless-live-guard");
+    let mut state = minimal_job_state(job_id, "Ownerless Live Guard", working_dir);
+    let topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::from([("show.part01.rar".to_string(), 0)]),
+        complete_volumes: [0u32].into_iter().collect(),
+        expected_volume_count: Some(1),
+        members: Vec::new(),
+        unresolved_spans: Vec::new(),
+    };
+    state
+        .assembly
+        .set_archive_topology("show".to_string(), topology.clone());
+    pipeline.jobs.insert(job_id, state);
+    let mut stale_named_facts = dummy_named_rar_volume_facts(0, "E01.mkv");
+    stale_named_facts.members[0].is_directory = true;
+
+    pipeline.rar_sets.insert(
+        (job_id, "show".to_string()),
+        rar_state::RarSetState {
+            facts: BTreeMap::from([(0u32, stale_named_facts)]),
+            volume_files: BTreeMap::from([(0u32, "show.part01.rar".to_string())]),
+            cached_headers: None,
+            verified_suspect_volumes: HashSet::new(),
+            active_workers: 0,
+            in_flight_members: HashSet::new(),
+            phase: rar_state::RarSetPhase::WaitingForVolumes,
+            plan: Some(rar_state::RarDerivedPlan {
+                phase: rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: false,
+                ready_members: Vec::new(),
+                member_names: Vec::new(),
+                waiting_on_volumes: HashSet::new(),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: BTreeMap::from([(
+                    0u32,
+                    rar_state::RarVolumeDeleteDecision {
+                        owners: Vec::new(),
+                        clean_owners: Vec::new(),
+                        failed_owners: Vec::new(),
+                        pending_owners: Vec::new(),
+                        unresolved_boundary: false,
+                        ownership_eligible: false,
+                    },
+                )]),
+                topology,
+                fallback_reason: None,
+            }),
+        },
+    );
+
+    let error = pipeline
+        .ownerless_live_rar_plan_error_for_job(job_id)
+        .expect("named member facts should make ownerless live plans invalid");
+    assert!(error.contains("ownerless present RAR volumes"));
+
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "show".to_string()))
+        .unwrap()
+        .facts
+        .insert(0, dummy_rar_volume_facts(0));
+    assert!(
+        pipeline
+            .ownerless_live_rar_plan_error_for_job(job_id)
+            .is_none(),
+        "empty malformed facts stay non-fatal for restore-time eager-delete auditing"
+    );
+}
+
+#[tokio::test]
+async fn incoherent_rar_waiting_state_heals_before_reverification() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30080);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Incoherent Waiting Heals Before Verify", &files);
+
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let mut good_archive =
+        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    good_archive
+        .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(2, Box::new(std::io::Cursor::new(files[2].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(3, Box::new(std::io::Cursor::new(files[3].1.clone())))
+        .unwrap();
+
+    let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
+    cached["members"] = serde_json::json!([]);
+    let stale_headers = rmp_serde::to_vec(
+        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+    )
+    .unwrap();
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("show"))
+        .cloned()
+        .expect("RAR topology should exist after all volumes complete");
+
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&(job_id, "show".to_string()))
+            .expect("RAR set state should exist");
+        set_state.cached_headers = Some(stale_headers.clone());
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
+        set_state.plan = Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+            phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            waiting_on_volumes: HashSet::new(),
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology,
+            fallback_reason: None,
+        });
+    }
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(!pipeline.job_has_incoherent_rar_waiting_state(job_id));
+
+    let plan = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("RAR plan should exist after healing");
+    assert!(
+        !matches!(
+            plan.phase,
+            crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+        ),
+        "completion healing should not leave the set in an impossible waiting state",
+    );
+    assert!(
+        plan.ready_members
+            .iter()
+            .any(|member| member.name == "E01.mkv"),
+        "healed plan should restore ready members without another PAR2 verification",
+    );
+}
+
+#[tokio::test]
+async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_state_for_mixed_archive_jobs()
+ {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30081);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Mixed Archive Heal", &files);
+
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology(
+            "bonus".to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::Split,
+                volume_map: std::collections::HashMap::from([("bonus.001".to_string(), 0u32)]),
+                complete_volumes: std::collections::HashSet::from([0u32]),
+                expected_volume_count: Some(1),
+                members: vec![crate::jobs::assembly::ArchiveMember {
+                    name: "bonus.bin".to_string(),
+                    first_volume: 0,
+                    last_volume: 0,
+                    unpacked_size: 10,
+                }],
+                unresolved_spans: Vec::new(),
+            },
+        );
+
+    let mut good_archive =
+        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    good_archive
+        .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(2, Box::new(std::io::Cursor::new(files[2].1.clone())))
+        .unwrap();
+    good_archive
+        .add_volume(3, Box::new(std::io::Cursor::new(files[3].1.clone())))
+        .unwrap();
+
+    let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
+    cached["members"] = serde_json::json!([]);
+    let stale_headers = rmp_serde::to_vec(
+        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+    )
+    .unwrap();
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("show"))
+        .cloned()
+        .expect("RAR topology should exist after all volumes complete");
+
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&(job_id, "show".to_string()))
+            .expect("RAR set state should exist");
+        set_state.cached_headers = Some(stale_headers.clone());
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
+        set_state.plan = Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+            phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            waiting_on_volumes: HashSet::new(),
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology,
+            fallback_reason: None,
+        });
+    }
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &stale_headers)
+        .unwrap();
+    pipeline.inflight_extractions.insert(
+        job_id,
+        ["show".to_string(), "bonus".to_string()]
+            .into_iter()
+            .collect(),
+    );
+
+    pipeline
+        .retry_archive_extraction_after_verify_or_repair(job_id)
+        .await;
+
+    assert!(!pipeline.job_has_incoherent_rar_waiting_state(job_id));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+
+    let plan = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("RAR plan should exist after mixed-archive healing");
+    assert!(
+        !matches!(
+            plan.phase,
+            crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+        ),
+        "mixed-archive retry should heal the impossible waiting state",
+    );
+    assert!(
+        plan.ready_members
+            .iter()
+            .any(|member| member.name == "E01.mkv"),
+        "mixed-archive retry should restore live member readiness",
+    );
+}
+
+#[tokio::test]
+async fn retry_archive_extraction_after_verify_or_repair_preserves_recoverable_rar_fallback_plan() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30082);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Recoverable Fallback", &files);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    tokio::fs::remove_file(working_dir.join("show.part01.rar"))
+        .await
+        .unwrap();
+
+    let corrupt_headers = vec![0xFF, 0x00, 0x13];
+    pipeline
+        .rar_sets
+        .get_mut(&(job_id, "show".to_string()))
+        .expect("RAR set state should exist after all volumes complete")
+        .cached_headers = Some(corrupt_headers.clone());
+    pipeline
+        .db
+        .save_archive_headers(job_id, "show", &corrupt_headers)
+        .unwrap();
+
+    pipeline
+        .retry_archive_extraction_after_verify_or_repair(job_id)
+        .await;
+
+    assert!(!matches!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Failed { .. })
+    ));
+
+    let plan = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .and_then(|state| state.plan.as_ref())
+        .cloned()
+        .expect("fallback plan should be retained after recompute failure");
+    assert!(matches!(
+        plan.phase,
+        crate::pipeline::archive::rar_state::RarSetPhase::FallbackFullSet
+    ));
+    assert!(plan.fallback_reason.as_deref().is_some_and(|reason| {
+        reason.contains("cannot be rebuilt without cached headers or volume 0")
+    }));
 }
 
 #[tokio::test]

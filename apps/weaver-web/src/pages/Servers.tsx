@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { FilePenLine, Trash2 } from "lucide-react";
+import { FilePenLine, Loader2, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -20,6 +20,7 @@ import {
 import {
   ADD_SERVER_MUTATION,
   REMOVE_SERVER_MUTATION,
+  SERVER_QUERY,
   SERVERS_QUERY,
   TEST_CONNECTION_MUTATION,
   UPDATE_SERVER_MUTATION,
@@ -31,11 +32,14 @@ type Server = {
   host: string;
   port: number;
   tls: boolean;
-  username: string | null;
   connections: number;
   active: boolean;
   supportsPipelining: boolean;
   priority: number;
+};
+
+type ServerDetails = Server & {
+  username: string | null;
 };
 
 type ServerFormValues = {
@@ -63,13 +67,20 @@ const defaultForm: ServerFormValues = {
 export function Servers({ embedded = false }: { embedded?: boolean }) {
   const t = useTranslate();
   const [{ data }] = useQuery({ query: SERVERS_QUERY });
+  const [editingServerId, setEditingServerId] = useState<number | null>(null);
+  const [{ data: editingServerData, fetching: editingServerFetching }] = useQuery<{
+    server: ServerDetails | null;
+  }>({
+    query: SERVER_QUERY,
+    variables: { id: editingServerId ?? 0 },
+    pause: editingServerId == null,
+  });
   const [addServerState, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [updateServerState, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
 
   const [servers, setServers] = useState<Server[]>([]);
-  const [editingServer, setEditingServer] = useState<Server | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
@@ -100,21 +111,21 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   }, [servers]);
 
   const openAdd = () => {
-    setEditingServer(null);
+    setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
     setShowForm(true);
   };
 
   const openEdit = (server: Server) => {
-    setEditingServer(server);
+    setEditingServerId(server.id);
     setSaveError(null);
     setTestResult(null);
     setShowForm(true);
   };
 
   const closeForm = () => {
-    setEditingServer(null);
+    setEditingServerId(null);
     setSaveError(null);
     setTestResult(null);
     setShowForm(false);
@@ -133,12 +144,12 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       priority: values.priority,
     };
 
-    if (editingServer) {
-      const result = await updateServer({ id: editingServer.id, input });
+    if (editingServerId != null) {
+      const result = await updateServer({ id: editingServerId, input });
       if (result.data?.updateServer) {
         setServers((current) =>
           current.map((server) =>
-            server.id === editingServer.id ? result.data.updateServer : server,
+            server.id === editingServerId ? result.data.updateServer : server,
           ),
         );
         closeForm();
@@ -198,6 +209,12 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setTesting(false);
   };
 
+  const editingServer = useMemo(
+    () => servers.find((server) => server.id === editingServerId) ?? null,
+    [editingServerId, servers],
+  );
+  const editingServerDetail = editingServerData?.server ?? null;
+
   return (
     <div className={embedded ? "space-y-5" : "space-y-6"}>
       <PageHeader
@@ -207,30 +224,63 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       />
 
       {showForm ? (
-        <ServerFormCard
-          initialValues={
-            editingServer
-              ? {
-                  host: editingServer.host,
-                  port: editingServer.port,
-                  tls: editingServer.tls,
-                  username: editingServer.username ?? "",
-                  password: "",
-                  connections: editingServer.connections,
-                  active: editingServer.active,
-                  priority: editingServer.priority,
-                }
-              : defaultForm
-          }
-          editing={!!editingServer}
-          saving={isSavingServer}
-          testing={testing}
-          saveError={saveError}
-          testResult={testResult}
-          onCancel={closeForm}
-          onSave={handleSave}
-          onTest={handleTest}
-        />
+        editingServerId != null && !editingServerDetail ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>{t("servers.editServer")}</CardTitle>
+              <CardDescription>{t("settings.serversDesc")}</CardDescription>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                {editingServerFetching ? <Loader2 className="size-4 animate-spin" /> : null}
+                <span>
+                  {editingServerFetching
+                    ? t("label.loading")
+                    : "Unable to load server details for editing."}
+                </span>
+              </div>
+              <Button variant="ghost" onClick={closeForm}>
+                {t("action.cancel")}
+              </Button>
+            </CardContent>
+          </Card>
+        ) : (
+          <ServerFormCard
+            initialValues={
+              editingServerDetail
+                ? {
+                    host: editingServerDetail.host,
+                    port: editingServerDetail.port,
+                    tls: editingServerDetail.tls,
+                    username: editingServerDetail.username ?? "",
+                    password: "",
+                    connections: editingServerDetail.connections,
+                    active: editingServerDetail.active,
+                    priority: editingServerDetail.priority,
+                  }
+                : editingServer
+                  ? {
+                      host: editingServer.host,
+                      port: editingServer.port,
+                      tls: editingServer.tls,
+                      username: "",
+                      password: "",
+                      connections: editingServer.connections,
+                      active: editingServer.active,
+                      priority: editingServer.priority,
+                    }
+                  : defaultForm
+            }
+            editing={editingServerId != null}
+            saving={isSavingServer}
+            testing={testing}
+            saveError={saveError}
+            testResult={testResult}
+            onCancel={closeForm}
+            onSave={handleSave}
+            onTest={handleTest}
+          />
+        )
       ) : null}
 
       {servers.length === 0 && !showForm ? (
@@ -253,7 +303,6 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                   <TableRow className="hover:bg-transparent">
                     <TableHead>{t("servers.host")}</TableHead>
                     <TableHead>{t("servers.port")}</TableHead>
-                    <TableHead>{t("servers.username")}</TableHead>
                     <TableHead>{t("servers.connections")}</TableHead>
                     <TableHead>{t("servers.tls")}</TableHead>
                     <TableHead>{t("servers.active")}</TableHead>
@@ -265,7 +314,6 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                     <TableRow key={server.id}>
                       <TableCell className="font-medium">{server.host}</TableCell>
                       <TableCell>{server.port}</TableCell>
-                      <TableCell>{server.username ?? "\u2014"}</TableCell>
                       <TableCell>{server.connections}</TableCell>
                       <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>

@@ -138,6 +138,26 @@ impl Pipeline {
             })
     }
 
+    pub(crate) fn job_has_incoherent_rar_waiting_state(&self, job_id: JobId) -> bool {
+        let current_set_names = self.current_rar_set_names_for_job(job_id);
+
+        self.rar_sets
+            .iter()
+            .any(|((rar_job_id, set_name), set_state)| {
+                *rar_job_id == job_id
+                    && (current_set_names.is_empty() || current_set_names.contains(set_name))
+                    && set_state.active_workers == 0
+                    && set_state.in_flight_members.is_empty()
+                    && set_state.plan.as_ref().is_some_and(|plan| {
+                        matches!(
+                            plan.phase,
+                            crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes
+                        ) && plan.waiting_on_volumes.is_empty()
+                            && plan.ready_members.is_empty()
+                    })
+            })
+    }
+
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
         let has_queued_work = self
             .jobs
@@ -1217,10 +1237,25 @@ impl Pipeline {
             return;
         }
 
+        if let Some(error) = self.ownerless_live_rar_plan_error_for_job(job_id) {
+            self.fail_job(job_id, error);
+            return;
+        }
+
         if !has_crc_failures
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {
             self.finalize_completed_archive_job(job_id).await;
+            return;
+        }
+
+        if rar_waiting_for_missing_volumes && self.job_has_incoherent_rar_waiting_state(job_id) {
+            info!(
+                job_id = job_id.0,
+                "healing incoherent RAR waiting state before PAR2 verification"
+            );
+            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                .await;
             return;
         }
 

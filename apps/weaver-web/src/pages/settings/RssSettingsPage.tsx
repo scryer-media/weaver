@@ -940,7 +940,7 @@ function RuleFormCard({
         <Field label={t("rss.titleRegex")} description={t("rss.titleRegexDesc")}>
           <Input
             value={values.titleRegex}
-            placeholder="Frieren"
+            placeholder="Silver Horizon"
             onChange={(event) =>
               setValues((current) => ({ ...current, titleRegex: event.target.value }))
             }
