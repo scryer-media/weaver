@@ -230,14 +230,12 @@ export function useUploadNzb(options?: {
 
   const setEntriesState = useCallback(
     (updater: UploadNzbEntry[] | ((current: UploadNzbEntry[]) => UploadNzbEntry[])) => {
-      setEntries((current) => {
-        const next =
-          typeof updater === "function"
-            ? (updater as (current: UploadNzbEntry[]) => UploadNzbEntry[])(current)
-            : updater;
-        entriesRef.current = next;
-        return next;
-      });
+      const next =
+        typeof updater === "function"
+          ? (updater as (current: UploadNzbEntry[]) => UploadNzbEntry[])(entriesRef.current)
+          : updater;
+      entriesRef.current = next;
+      setEntries(next);
     },
     [],
   );
@@ -380,7 +378,6 @@ export function useUploadNzb(options?: {
         file,
         status: "queued",
       }));
-      entriesRef.current = nextEntries;
       setEntriesState(nextEntries);
       nextEntries.forEach((entry) => {
         void stageEntry(entry, nextGeneration);
@@ -401,6 +398,7 @@ export function useUploadNzb(options?: {
   }, [options?.open, options?.resetOnOpen, replaceEntries]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       generationRef.current += 1;

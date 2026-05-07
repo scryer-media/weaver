@@ -68,6 +68,8 @@ pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
     pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
+    /// Server that successfully served this payload, if known.
+    pub(super) source_server_idx: Option<usize>,
     /// Whether this was a speculative recovery download.
     pub(super) is_recovery: bool,
     /// How many times this segment has been retried so far.
@@ -88,6 +90,8 @@ pub(super) enum DownloadError {
 pub(super) struct PendingDecodeWork {
     pub(super) segment_id: SegmentId,
     pub(super) raw: Bytes,
+    pub(super) source_server_idx: Option<usize>,
+    pub(super) exclude_servers: Vec<usize>,
 }
 
 /// Progress update from a health probe task.
@@ -173,6 +177,8 @@ pub(super) enum DecodeDone {
     Failed {
         segment_id: SegmentId,
         error: String,
+        source_server_idx: Option<usize>,
+        exclude_servers: Vec<usize>,
     },
 }
 

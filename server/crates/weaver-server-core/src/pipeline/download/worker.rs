@@ -160,22 +160,36 @@ impl Pipeline {
 
     fn spawn_decode_task(&self, work: PendingDecodeWork, output: Option<BufferHandle>) {
         let tx = self.decode_done_tx.clone();
-        let segment_id = work.segment_id;
+        let PendingDecodeWork {
+            segment_id,
+            raw,
+            source_server_idx,
+            exclude_servers,
+        } = work;
         let metrics = Arc::clone(&self.metrics);
 
         tokio::task::spawn_blocking(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+
+            let send_decode_failure = |error: String| {
+                let _ = tx.blocking_send(DecodeDone::Failed {
+                    segment_id,
+                    error,
+                    source_server_idx,
+                    exclude_servers: exclude_servers.clone(),
+                });
+            };
 
             if let Some(mut output) = output {
                 let Some(output_buf) = output.as_mut_slice() else {
                     let error = "failed to get unique pooled decode buffer".to_string();
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(segment = %segment_id, error, "yEnc decode failed");
-                    let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                    send_decode_failure(error);
                     return;
                 };
 
-                match weaver_yenc::decode_nntp(&work.raw, output_buf) {
+                match weaver_yenc::decode_nntp(&raw, output_buf) {
                     Ok(decode_result) => {
                         output.set_len(decode_result.bytes_written);
                         metrics
@@ -206,12 +220,12 @@ impl Pipeline {
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                        send_decode_failure(error);
                     }
                 }
             } else {
-                let mut output = vec![0u8; work.raw.len()];
-                match weaver_yenc::decode_nntp(&work.raw, &mut output) {
+                let mut output = vec![0u8; raw.len()];
+                match weaver_yenc::decode_nntp(&raw, &mut output) {
                     Ok(decode_result) => {
                         output.truncate(decode_result.bytes_written);
                         metrics
@@ -241,7 +255,7 @@ impl Pipeline {
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        let _ = tx.blocking_send(DecodeDone::Failed { segment_id, error });
+                        send_decode_failure(error);
                     }
                 }
             }
@@ -520,6 +534,13 @@ impl Pipeline {
                 nntp.fetch_body_with_groups_excluding_traced(&message_id, &groups, &exclude_servers)
                     .await
             };
+            let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
+                matches!(
+                    attempt.outcome,
+                    weaver_nntp::client::FetchAttemptOutcome::Success
+                )
+                .then_some(attempt.server_idx)
+            });
             let data = trace
                 .result
                 .map(DownloadPayload::Raw)
@@ -530,6 +551,7 @@ impl Pipeline {
                     segment_id,
                     data,
                     attempts: trace.attempts,
+                    source_server_idx,
                     is_recovery,
                     retry_count,
                     exclude_servers,
@@ -583,6 +605,7 @@ impl Pipeline {
         }
 
         let excluded_servers = result.exclude_servers.clone();
+        let source_server_idx = result.source_server_idx;
 
         for (attempt_index, attempt) in result.attempts.iter().enumerate() {
             let outcome = match attempt.outcome {
@@ -633,6 +656,8 @@ impl Pipeline {
                 self.pending_decode.push_back(PendingDecodeWork {
                     segment_id: result.segment_id,
                     raw,
+                    source_server_idx,
+                    exclude_servers: excluded_servers,
                 });
                 self.pump_decode_queue();
             }

@@ -58,11 +58,11 @@ import {
 import {
   CATEGORIES_QUERY,
   CANCEL_JOB_MUTATION,
+  HAS_CONFIGURED_SERVERS_QUERY,
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
-  SERVERS_QUERY,
   SET_SPEED_LIMIT_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
@@ -499,9 +499,9 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 
 export function JobList() {
   const client = useClient();
-  const [serversResult] = useQuery({ query: SERVERS_QUERY });
+  const [serversResult] = useQuery({ query: HAS_CONFIGURED_SERVERS_QUERY });
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
-  const hasNoServers = (serversResult.data?.servers?.length ?? 1) === 0;
+  const hasNoServers = serversResult.data?.hasConfiguredServers === false;
   const t = useTranslate();
   const [queuePreferences, setQueuePreferences] = useTablePreferences(
     QUEUE_TABLE_PREFERENCES_KEY,

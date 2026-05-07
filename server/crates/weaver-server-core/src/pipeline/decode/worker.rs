@@ -85,6 +85,19 @@ impl Pipeline {
         }
     }
 
+    pub(in crate::pipeline) fn decode_retry_exclude_servers(
+        existing_excludes: &[usize],
+        source_server_idx: Option<usize>,
+    ) -> Vec<usize> {
+        let mut exclude_servers = existing_excludes.to_vec();
+        if let Some(source_server_idx) = source_server_idx
+            && !exclude_servers.contains(&source_server_idx)
+        {
+            exclude_servers.push(source_server_idx);
+        }
+        exclude_servers
+    }
+
     pub(crate) async fn flush_quiescent_write_backlog(&mut self) {
         if self.active_downloads > 0
             || !self.pending_decode.is_empty()
@@ -165,8 +178,13 @@ impl Pipeline {
 
         match result {
             DecodeDone::Success(result) => self.handle_decode_success(result).await,
-            DecodeDone::Failed { segment_id, error } => {
-                self.handle_decode_failure(segment_id, &error);
+            DecodeDone::Failed {
+                segment_id,
+                error,
+                source_server_idx,
+                exclude_servers,
+            } => {
+                self.handle_decode_failure(segment_id, &error, &exclude_servers, source_server_idx);
             }
         }
 
@@ -181,7 +199,13 @@ impl Pipeline {
     /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
     /// decode failures for the same segment, mark it as permanently failed and
     /// update health.
-    pub(crate) fn handle_decode_failure(&mut self, segment_id: SegmentId, error: &str) {
+    pub(crate) fn handle_decode_failure(
+        &mut self,
+        segment_id: SegmentId,
+        error: &str,
+        exclude_servers: &[usize],
+        source_server_idx: Option<usize>,
+    ) {
         let job_id = segment_id.file_id.job_id;
 
         if self
@@ -239,10 +263,8 @@ impl Pipeline {
                     .iter()
                     .find(|s| s.ordinal == segment_id.segment_number)
             {
-                // Exclude servers that have already returned bad data for this
-                // segment. On decode retry N, exclude the first N servers in
-                // priority order so each retry tries a different server.
-                let exclude: Vec<usize> = (0..retry_count as usize).collect();
+                let exclude =
+                    Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
                 let work = DownloadWork {
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
@@ -251,7 +273,7 @@ impl Pipeline {
                     byte_estimate: seg_spec.bytes,
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
-                    exclude_servers: exclude,
+                    exclude_servers: exclude.clone(),
                 };
                 self.metrics
                     .segments_retried
@@ -262,6 +284,8 @@ impl Pipeline {
                     segment = %segment_id,
                     error,
                     decode_retry = retry_count,
+                    source_server_idx,
+                    exclude_servers = ?exclude,
                     delay_secs = delay.as_secs(),
                     "decode failed — re-downloading"
                 );

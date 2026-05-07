@@ -127,6 +127,19 @@ const SERVER_FIELDS = `
     host
     port
     tls
+    connections
+    active
+    supportsPipelining
+    priority
+  }
+`;
+
+const SERVER_DETAILS_FIELDS = `
+  fragment ServerDetailsFields on ServerDetails {
+    id
+    host
+    port
+    tls
     username
     connections
     active
@@ -788,6 +801,12 @@ export const HISTORY_JOBS_COUNT_QUERY = gql`
 
 // --- Server management ---
 
+export const HAS_CONFIGURED_SERVERS_QUERY = gql`
+  query HasConfiguredServers {
+    hasConfiguredServers
+  }
+`;
+
 export const SERVERS_QUERY = gql`
   query Servers {
     servers {
@@ -795,6 +814,15 @@ export const SERVERS_QUERY = gql`
     }
   }
   ${SERVER_FIELDS}
+`;
+
+export const SERVER_QUERY = gql`
+  query Server($id: Int!) {
+    server(id: $id) {
+      ...ServerDetailsFields
+    }
+  }
+  ${SERVER_DETAILS_FIELDS}
 `;
 
 export const ADD_SERVER_MUTATION = gql`

@@ -6,7 +6,6 @@ pub struct Server {
     pub host: String,
     pub port: u16,
     pub tls: bool,
-    pub username: Option<String>,
     pub connections: u16,
     pub active: bool,
     pub supports_pipelining: bool,
@@ -15,6 +14,36 @@ pub struct Server {
 }
 
 impl From<&weaver_server_core::servers::ServerConfig> for Server {
+    fn from(s: &weaver_server_core::servers::ServerConfig) -> Self {
+        Self {
+            id: s.id,
+            host: s.host.clone(),
+            port: s.port,
+            tls: s.tls,
+            connections: s.connections,
+            active: s.active,
+            supports_pipelining: s.supports_pipelining,
+            priority: s.priority,
+            tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ServerDetails {
+    pub id: u32,
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub username: Option<String>,
+    pub connections: u16,
+    pub active: bool,
+    pub supports_pipelining: bool,
+    pub priority: u32,
+    pub tls_ca_cert: Option<String>,
+}
+
+impl From<&weaver_server_core::servers::ServerConfig> for ServerDetails {
     fn from(s: &weaver_server_core::servers::ServerConfig) -> Self {
         Self {
             id: s.id,

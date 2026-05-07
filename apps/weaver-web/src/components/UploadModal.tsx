@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { UploadNzbForm } from "@/features/upload/components/UploadNzbForm";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -11,6 +11,8 @@ interface UploadModalProps {
 export function UploadModal({ open, onClose }: UploadModalProps) {
   const t = useTranslate();
   const formRef = useRef<HTMLFormElement | null>(null);
+  const wasOpenRef = useRef(false);
+  const [openCycle, setOpenCycle] = useState(0);
 
   const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (
@@ -62,6 +64,13 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
     return () => window.removeEventListener("keydown", handler);
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      setOpenCycle((current) => current + 1);
+    }
+    wasOpenRef.current = open;
+  }, [open]);
+
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
       <DialogContent
@@ -72,7 +81,15 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
           <DialogTitle>{t("upload.title")}</DialogTitle>
           <DialogDescription>{t("upload.accepts")}</DialogDescription>
         </DialogHeader>
-        <UploadNzbForm layout="dialog" open={open} onSubmitted={onClose} formRef={formRef} />
+        {open ? (
+          <UploadNzbForm
+            key={openCycle}
+            layout="dialog"
+            open={open}
+            onSubmitted={onClose}
+            formRef={formRef}
+          />
+        ) : null}
       </DialogContent>
     </Dialog>
   );

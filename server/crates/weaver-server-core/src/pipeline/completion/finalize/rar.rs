@@ -1075,7 +1075,7 @@ impl Pipeline {
                             byte_estimate: segment.bytes,
                             retry_count: 0,
                             is_recovery: false,
-                            exclude_servers: vec![0],
+                            exclude_servers: vec![],
                         })
                         .collect();
                     Some(SourceRetryFile {
@@ -1204,6 +1204,7 @@ impl Pipeline {
             job_id = job_id.0,
             files = retry_sets.len().max(1),
             failed = ?failed_entries,
+            exclude_servers = ?Vec::<usize>::new(),
             "re-queueing archive source files after extraction failure without PAR2"
         );
 

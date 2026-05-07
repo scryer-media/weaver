@@ -2651,6 +2651,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2707,6 +2708,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             },
             data: Ok(DownloadPayload::Raw(raw)),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -2795,6 +2797,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2885,6 +2888,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                 },
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
@@ -2933,6 +2937,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
             },
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -2979,6 +2984,7 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
             },
             data: Err(DownloadError::Fetch("article not found".to_string())),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: vec![0],
@@ -3037,6 +3043,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
             },
             data: Err(DownloadError::Fetch("article not found".to_string())),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: true,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -3096,6 +3103,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 total_size,
             ))),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -3127,6 +3135,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             },
             data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
             exclude_servers: Vec::new(),
@@ -3237,6 +3246,8 @@ async fn emits_download_pipeline_drained_once_before_later_completion_events() {
             segment_number: 0,
         },
         raw: Bytes::from_static(b"pending"),
+        source_server_idx: None,
+        exclude_servers: Vec::new(),
     });
 
     pipeline.emit_download_finished_if_active(job_id);
@@ -4064,6 +4075,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
                 b"not a yenc article",
             ))),
             attempts: Vec::new(),
+            source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -4120,6 +4132,84 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
 }
 
 #[tokio::test]
+async fn decode_failure_retries_excluding_actual_source_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20014);
+    let files = vec![("broken.bin".to_string(), 64u32)];
+    let spec = standalone_job_spec("Decode Failure Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    pipeline.active_downloads += 1;
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Ok(DownloadPayload::Raw(Bytes::from_static(
+                b"not a yenc article",
+            ))),
+            attempts: Vec::new(),
+            source_server_idx: Some(1),
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+        })
+        .await;
+
+    let done = tokio::time::timeout(Duration::from_secs(2), pipeline.decode_done_rx.recv())
+        .await
+        .expect("decode failure should arrive")
+        .expect("decode channel should stay open");
+    let DecodeDone::Failed {
+        segment_id: failed_segment,
+        source_server_idx,
+        exclude_servers,
+        ..
+    } = &done
+    else {
+        panic!("expected decode failure");
+    };
+    assert_eq!(*failed_segment, segment_id);
+    assert_eq!(*source_server_idx, Some(1));
+    assert!(exclude_servers.is_empty());
+
+    pipeline.handle_decode_done(done).await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("decode failure should schedule a retry");
+    assert_eq!(work.exclude_servers, vec![1]);
+}
+
+#[test]
+fn decode_retry_exclude_servers_appends_actual_source_server_once() {
+    assert_eq!(
+        Pipeline::decode_retry_exclude_servers(&[], Some(1)),
+        vec![1]
+    );
+    assert_eq!(
+        Pipeline::decode_retry_exclude_servers(&[1], Some(1)),
+        vec![1]
+    );
+    assert_eq!(
+        Pipeline::decode_retry_exclude_servers(&[1], Some(0)),
+        vec![1, 0]
+    );
+    assert_eq!(
+        Pipeline::decode_retry_exclude_servers(&[1, 0], None),
+        vec![1, 0]
+    );
+}
+
+#[tokio::test]
 async fn recovery_decode_failures_do_not_mark_health_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4136,7 +4226,7 @@ async fn recovery_decode_failures_do_not_mark_health_failure() {
     };
 
     for _ in 0..=MAX_SEGMENT_RETRIES {
-        pipeline.handle_decode_failure(segment_id, "crc mismatch");
+        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], None);
     }
 
     assert_eq!(
@@ -8253,10 +8343,18 @@ async fn no_par2_full_set_failure_requeues_archive_source() {
 
     pipeline.check_job_completion(job_id).await;
 
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    assert!(matches!(state.status, JobStatus::Downloading));
-    assert_eq!(state.download_queue.len(), 1);
-    assert_eq!(state.assembly.complete_data_file_count(), 0);
+    let complete_data_files = {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        assert!(matches!(state.status, JobStatus::Downloading));
+        assert_eq!(state.download_queue.len(), 1);
+        let queued = state
+            .download_queue
+            .pop()
+            .expect("archive source should be requeued");
+        assert!(queued.exclude_servers.is_empty());
+        state.assembly.complete_data_file_count()
+    };
+    assert_eq!(complete_data_files, 0);
     assert!(!pipeline.failed_extractions.contains_key(&job_id));
     assert!(pipeline.normalization_retried.contains(&job_id));
 }

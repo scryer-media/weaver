@@ -1719,6 +1719,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_body_with_groups_traced_reports_successful_server_idx() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let trace = client
+            .fetch_body_with_groups_traced(
+                "<exists@example.com>",
+                &[String::from("alt.binaries.test")],
+            )
+            .await;
+
+        assert!(trace.result.is_ok(), "traced fetch should succeed");
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].server_idx, 0);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
     async fn weighted_selection_favours_faster_server() {
         let client = multi_server_client(2);
 
