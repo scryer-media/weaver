@@ -305,9 +305,9 @@ impl Window {
         }
 
         let dict_size = self.buf.len();
-        let end_total = start_total
-            .checked_add(len as u64)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "range overflow"))?;
+        let end_total = start_total.checked_add(len as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "range overflow")
+        })?;
         if end_total > self.total_written {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

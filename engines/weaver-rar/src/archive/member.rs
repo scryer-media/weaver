@@ -245,9 +245,7 @@ impl RarArchive {
     }
 
     fn output_capacity_hint(fh: &FileHeader) -> usize {
-        fh.unpacked_size
-            .unwrap_or(0)
-            .min(usize::MAX as u64) as usize
+        fh.unpacked_size.unwrap_or(0).min(usize::MAX as u64) as usize
     }
 
     fn wrap_rar4_encrypted_reader<R: Read>(

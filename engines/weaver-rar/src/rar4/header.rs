@@ -376,8 +376,7 @@ fn decode_rar4_unicode_name(data: &[u8]) -> String {
                     break;
                 }
                 result.resize(dec_pos + 1, 0);
-                result[dec_pos] =
-                    unicode_data[enc_pos] as u16 | ((high_byte as u16) << 8);
+                result[dec_pos] = unicode_data[enc_pos] as u16 | ((high_byte as u16) << 8);
                 enc_pos += 1;
                 dec_pos += 1;
             }
