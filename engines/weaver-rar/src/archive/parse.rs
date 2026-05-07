@@ -163,13 +163,13 @@ impl RarArchive {
     pub(super) fn rar4_to_file_header(fh: &crate::rar4::types::Rar4FileHeader) -> FileHeader {
         FileHeader {
             name: fh.name.clone(),
-            unpacked_size: Some(fh.unpacked_size),
+            unpacked_size: fh.unpacked_size,
             data_crc32: Some(fh.crc32),
             data_offset: fh.data_offset,
             data_size: fh.packed_size,
             compression: crate::types::CompressionInfo {
                 format: crate::types::ArchiveFormat::Rar4,
-                version: 29,
+                version: fh.unpack_version,
                 solid: fh.is_solid,
                 method: match fh.method {
                     crate::rar4::types::Rar4Method::Store => CompressionMethod::Store,
@@ -180,7 +180,7 @@ impl RarArchive {
                     crate::rar4::types::Rar4Method::Best => CompressionMethod::Best,
                     crate::rar4::types::Rar4Method::Unknown(c) => CompressionMethod::Unknown(c),
                 },
-                dict_size: 4 * 1024 * 1024,
+                dict_size: fh.dict_size,
             },
             is_directory: fh.is_directory,
             host_os: match fh.host_os {

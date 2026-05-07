@@ -13,7 +13,7 @@
 
 use std::io::Write;
 
-use tracing::{trace, warn};
+use tracing::trace;
 
 use super::lz::bitstream::{BitRead, BitReader, StreamingBitReader};
 use super::lz::huffman::HuffmanTable;
@@ -57,6 +57,9 @@ const LOW_DIST_REP_COUNT: usize = 16;
 
 /// Maximum dictionary size (256 MB).
 const MAX_DICT_SIZE: u64 = 256 * 1024 * 1024;
+const VM_MEM_SIZE: usize = 0x40000;
+const MAX3_UNPACK_FILTERS: usize = 8192;
+const MAX3_UNPACK_CHANNELS: u32 = 1024;
 
 /// Maximum number of bytes to accumulate before flushing decoded output.
 /// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
@@ -67,6 +70,30 @@ const UNPACK_MAX_WRITE: usize = 0x400000;
 enum BlockType {
     Lz,
     Ppm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rar4StandardFilter {
+    E8,
+    E8E9,
+    Itanium,
+    Delta,
+    Rgb,
+    Audio,
+}
+
+#[derive(Clone, Debug)]
+struct Rar4VmFilterDefinition {
+    filter_type: Rar4StandardFilter,
+    last_block_length: usize,
+}
+
+#[derive(Clone, Debug)]
+struct Rar4PendingVmFilter {
+    filter_type: Rar4StandardFilter,
+    block_start_total: u64,
+    block_length: usize,
+    init_regs: [u32; 7],
 }
 
 /// Distance decode base values (computed from DBIT_LENGTH_COUNTS).
@@ -117,6 +144,14 @@ pub struct Rar4LzDecoder {
     ppm_esc_char: u8,
     /// Equivalent to unrar's TablesRead3 flag.
     tables_read: bool,
+    /// Reusable VM filter definitions within the current filter scope.
+    vm_filters: Vec<Rar4VmFilterDefinition>,
+    /// Pending filters waiting for their output block to become flushable.
+    pending_vm_filters: Vec<Rar4PendingVmFilter>,
+    /// Last referenced VM filter slot.
+    last_vm_filter: usize,
+    /// Absolute window position where the current file started.
+    current_file_base_total: u64,
 }
 
 impl Rar4LzDecoder {
@@ -140,11 +175,561 @@ impl Rar4LzDecoder {
             ppm_model: None,
             ppm_esc_char: 2,
             tables_read: false,
+            vm_filters: Vec::new(),
+            pending_vm_filters: Vec::new(),
+            last_vm_filter: 0,
+            current_file_base_total: 0,
         }
     }
 
     fn flush_threshold(&self) -> usize {
         self.window.dict_size().clamp(1, UNPACK_MAX_WRITE)
+    }
+
+    fn begin_file_decode(&mut self) {
+        self.pending_vm_filters.clear();
+        self.current_file_base_total = self.window.total_written();
+        self.window.mark_flushed(self.current_file_base_total);
+    }
+
+    fn read_vm_data(reader: &mut BitReader<'_>) -> RarResult<u32> {
+        let data = reader.peek_bits(16)?;
+        match data & 0xC000 {
+            0 => {
+                reader.consume_bits(6)?;
+                Ok((data >> 10) & 0x0F)
+            }
+            0x4000 => {
+                if (data & 0x3C00) == 0 {
+                    reader.consume_bits(14)?;
+                    Ok(0xFFFF_FF00 | ((data >> 2) & 0xFF))
+                } else {
+                    reader.consume_bits(10)?;
+                    Ok((data >> 6) & 0xFF)
+                }
+            }
+            0x8000 => {
+                reader.consume_bits(2)?;
+                reader.read_bits(16)
+            }
+            _ => {
+                reader.consume_bits(2)?;
+                let high = reader.read_bits(16)?;
+                let low = reader.read_bits(16)?;
+                Ok((high << 16) | low)
+            }
+        }
+    }
+
+    fn decode_vm_code_length<F>(first_byte: u8, mut read_byte: F) -> RarResult<usize>
+    where
+        F: FnMut() -> RarResult<u8>,
+    {
+        let mut length = (first_byte & 7) as usize + 1;
+        if length == 7 {
+            length = read_byte()? as usize + 7;
+        } else if length == 8 {
+            let high = read_byte()? as usize;
+            let low = read_byte()? as usize;
+            length = (high << 8) | low;
+        }
+
+        if length == 0 {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR4: VM code length is 0".into(),
+            });
+        }
+
+        Ok(length)
+    }
+
+    fn standard_vm_filter(code: &[u8]) -> Option<Rar4StandardFilter> {
+        if code.is_empty() {
+            return None;
+        }
+
+        let xor_sum = code[1..].iter().fold(0u8, |acc, byte| acc ^ byte);
+        if xor_sum != code[0] {
+            return None;
+        }
+
+        match (code.len(), crc32fast::hash(code)) {
+            (53, 0xAD57_6887) => Some(Rar4StandardFilter::E8),
+            (57, 0x3CD7_E57E) => Some(Rar4StandardFilter::E8E9),
+            (120, 0x3769_893F) => Some(Rar4StandardFilter::Itanium),
+            (29, 0x0E06_077D) => Some(Rar4StandardFilter::Delta),
+            (149, 0x1C2C_5DC8) => Some(Rar4StandardFilter::Rgb),
+            (216, 0xBC85_E701) => Some(Rar4StandardFilter::Audio),
+            _ => None,
+        }
+    }
+
+    fn vm_u32_to_usize(value: u32, field: &str) -> RarResult<usize> {
+        usize::try_from(value).map_err(|_| RarError::CorruptArchive {
+            detail: format!("RAR4: {field} value {value} does not fit usize"),
+        })
+    }
+
+    fn add_vm_code(&mut self, first_byte: u8, code: &[u8], output_size: u64) -> RarResult<()> {
+        let mut vm_reader = BitReader::new(code);
+
+        let filter_pos = if (first_byte & 0x80) != 0 {
+            let value = Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "filter slot")?;
+            if value == 0 {
+                if !self.pending_vm_filters.is_empty() {
+                    return Err(RarError::CorruptArchive {
+                        detail: "RAR4: VM filter reset while previous filters are still pending"
+                            .into(),
+                    });
+                }
+                self.vm_filters.clear();
+                self.last_vm_filter = 0;
+                0
+            } else {
+                value - 1
+            }
+        } else {
+            self.last_vm_filter
+        };
+
+        if filter_pos > self.vm_filters.len() || filter_pos > MAX3_UNPACK_FILTERS {
+            return Err(RarError::CorruptArchive {
+                detail: format!("RAR4: VM filter slot {filter_pos} is out of range"),
+            });
+        }
+
+        let new_filter = filter_pos == self.vm_filters.len();
+        let mut block_start =
+            Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "block start")?;
+        if (first_byte & 0x40) != 0 {
+            block_start = block_start.saturating_add(258);
+        }
+
+        let block_length = if (first_byte & 0x20) != 0 {
+            let length =
+                Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "block length")?;
+            if new_filter {
+                self.vm_filters.push(Rar4VmFilterDefinition {
+                    filter_type: Rar4StandardFilter::E8,
+                    last_block_length: length,
+                });
+            } else if let Some(existing) = self.vm_filters.get_mut(filter_pos) {
+                existing.last_block_length = length;
+            }
+            length
+        } else if let Some(existing) = self.vm_filters.get(filter_pos) {
+            existing.last_block_length
+        } else {
+            0
+        };
+
+        let mut init_regs = [0u32; 7];
+        init_regs[4] = block_length as u32;
+        if (first_byte & 0x10) != 0 {
+            let init_mask = vm_reader.read_bits(7)? as u8;
+            for (index, register) in init_regs.iter_mut().enumerate() {
+                if (init_mask & (1 << index)) != 0 {
+                    *register = Self::read_vm_data(&mut vm_reader)?;
+                }
+            }
+        }
+
+        let filter_type = if new_filter {
+            let code_size =
+                Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "VM code size")?;
+            if code_size == 0 || code_size >= 0x10000 {
+                return Err(RarError::CorruptArchive {
+                    detail: format!("RAR4: invalid VM code size {code_size}"),
+                });
+            }
+
+            let mut vm_code = Vec::with_capacity(code_size);
+            for _ in 0..code_size {
+                vm_code.push(vm_reader.read_bits(8)? as u8);
+            }
+
+            let filter_type = Self::standard_vm_filter(&vm_code).ok_or_else(|| {
+                RarError::CorruptArchive {
+                    detail: "RAR4: unsupported custom VM filter program".into(),
+                }
+            })?;
+
+            self.vm_filters[filter_pos].filter_type = filter_type;
+            filter_type
+        } else {
+            self.vm_filters[filter_pos].filter_type
+        };
+
+        self.last_vm_filter = filter_pos;
+        self.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type,
+            block_start_total: self.current_file_base_total + output_size + block_start as u64,
+            block_length,
+            init_regs,
+        });
+        Ok(())
+    }
+
+    fn itanium_get_bits(data: &[u8], bit_pos: u32, bit_count: u32) -> u32 {
+        let in_addr = (bit_pos / 8) as usize;
+        let in_bit = bit_pos & 7;
+        let mut bit_field = data[in_addr] as u32;
+        bit_field |= (data[in_addr + 1] as u32) << 8;
+        bit_field |= (data[in_addr + 2] as u32) << 16;
+        bit_field |= (data[in_addr + 3] as u32) << 24;
+        (bit_field >> in_bit) & (0xFFFF_FFFFu32 >> (32 - bit_count))
+    }
+
+    fn itanium_set_bits(data: &mut [u8], bit_field: u32, bit_pos: u32, bit_count: u32) {
+        let in_addr = (bit_pos / 8) as usize;
+        let in_bit = bit_pos & 7;
+        let mut and_mask = !(0xFFFF_FFFFu32 >> (32 - bit_count) << in_bit);
+        let mut bit_field = bit_field << in_bit;
+
+        for offset in 0..4 {
+            data[in_addr + offset] &= and_mask as u8;
+            data[in_addr + offset] |= bit_field as u8;
+            and_mask = (and_mask >> 8) | 0xFF00_0000;
+            bit_field >>= 8;
+        }
+    }
+
+    fn execute_standard_filter(
+        filter: &Rar4PendingVmFilter,
+        file_base_total: u64,
+        data: &mut Vec<u8>,
+    ) -> RarResult<()> {
+        let data_size = data.len();
+        let file_offset = (filter.block_start_total - file_base_total) as u32;
+
+        match filter.filter_type {
+            Rar4StandardFilter::E8 | Rar4StandardFilter::E8E9 => {
+                if data_size < 4 || data_size > VM_MEM_SIZE {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!("RAR4: invalid E8 filter block length {data_size}"),
+                    });
+                }
+
+                let cmp_byte2 = if filter.filter_type == Rar4StandardFilter::E8E9 {
+                    0xE9
+                } else {
+                    0xE8
+                };
+                let file_size = 0x0100_0000u32;
+                let mut cur_pos = 0usize;
+                while cur_pos + 4 < data_size {
+                    let cur_byte = data[cur_pos];
+                    cur_pos += 1;
+                    if cur_byte == 0xE8 || cur_byte == cmp_byte2 {
+                        let offset = file_offset.wrapping_add(cur_pos as u32);
+                        let addr = u32::from_le_bytes([
+                            data[cur_pos],
+                            data[cur_pos + 1],
+                            data[cur_pos + 2],
+                            data[cur_pos + 3],
+                        ]);
+                        if (addr & 0x8000_0000) != 0 {
+                            if ((addr.wrapping_add(offset)) & 0x8000_0000) == 0 {
+                                let bytes = addr.wrapping_add(file_size).to_le_bytes();
+                                data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
+                            }
+                        } else if ((addr.wrapping_sub(file_size)) & 0x8000_0000) != 0 {
+                            let bytes = addr.wrapping_sub(offset).to_le_bytes();
+                            data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
+                        }
+                        cur_pos += 4;
+                    }
+                }
+            }
+            Rar4StandardFilter::Itanium => {
+                if data_size < 21 || data_size > VM_MEM_SIZE {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!("RAR4: invalid Itanium filter block length {data_size}"),
+                    });
+                }
+
+                let masks = [4u8, 4, 6, 6, 0, 0, 7, 7, 4, 4, 0, 0, 4, 4, 0, 0];
+                let mut file_offset = file_offset >> 4;
+                let mut cur_pos = 0usize;
+                while cur_pos + 21 < data_size {
+                    let byte = (data[cur_pos] & 0x1F) as i32 - 0x10;
+                    if byte >= 0 {
+                        let cmd_mask = masks[byte as usize];
+                        if cmd_mask != 0 {
+                            for slot in 0..=2u32 {
+                                if (cmd_mask & (1 << slot)) != 0 {
+                                    let start_pos = slot * 41 + 5;
+                                    let op_type =
+                                        Self::itanium_get_bits(data, start_pos + 37, 4);
+                                    if op_type == 5 {
+                                        let offset =
+                                            Self::itanium_get_bits(data, start_pos + 13, 20);
+                                        Self::itanium_set_bits(
+                                            data,
+                                            offset.wrapping_sub(file_offset) & 0x0F_FFFF,
+                                            start_pos + 13,
+                                            20,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cur_pos += 16;
+                    file_offset = file_offset.wrapping_add(1);
+                }
+            }
+            Rar4StandardFilter::Delta => {
+                let channels = filter.init_regs[0];
+                if data_size > VM_MEM_SIZE / 2
+                    || channels == 0
+                    || channels > MAX3_UNPACK_CHANNELS
+                {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!(
+                            "RAR4: invalid DELTA filter params size={data_size} channels={channels}"
+                        ),
+                    });
+                }
+
+                let mut dest = vec![0u8; data_size];
+                let mut src_pos = 0usize;
+                for channel in 0..channels as usize {
+                    let mut prev_byte = 0u8;
+                    let mut dest_pos = channel;
+                    while dest_pos < data_size {
+                        prev_byte = prev_byte.wrapping_sub(data[src_pos]);
+                        dest[dest_pos] = prev_byte;
+                        src_pos += 1;
+                        dest_pos += channels as usize;
+                    }
+                }
+                *data = dest;
+            }
+            Rar4StandardFilter::Rgb => {
+                let width = filter.init_regs[0]
+                    .checked_sub(3)
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: "RAR4: RGB filter width underflow".into(),
+                    })? as usize;
+                let pos_r = filter.init_regs[1] as usize;
+                if data_size < 3 || data_size > VM_MEM_SIZE / 2 || width > data_size || pos_r > 2
+                {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!(
+                            "RAR4: invalid RGB filter params size={data_size} width={width} pos_r={pos_r}"
+                        ),
+                    });
+                }
+
+                let mut dest = vec![0u8; data_size];
+                let channels = 3usize;
+                let mut src_pos = 0usize;
+                for channel in 0..channels {
+                    let mut prev_byte = 0u8;
+                    let mut index = channel;
+                    while index < data_size {
+                        let predicted = if index >= width + 3 {
+                            let upper = dest[index - width];
+                            let upper_left = dest[index - width - 3];
+                            let mut predicted = prev_byte
+                                .wrapping_add(upper)
+                                .wrapping_sub(upper_left);
+                            let pa = (predicted as i32 - prev_byte as i32).abs();
+                            let pb = (predicted as i32 - upper as i32).abs();
+                            let pc = (predicted as i32 - upper_left as i32).abs();
+                            if pa <= pb && pa <= pc {
+                                predicted = prev_byte;
+                            } else if pb <= pc {
+                                predicted = upper;
+                            } else {
+                                predicted = upper_left;
+                            }
+                            predicted
+                        } else {
+                            prev_byte
+                        };
+
+                        let value = predicted.wrapping_sub(data[src_pos]);
+                        dest[index] = value;
+                        prev_byte = value;
+                        src_pos += 1;
+                        index += channels;
+                    }
+                }
+
+                let border = data_size.saturating_sub(2);
+                let mut index = pos_r;
+                while index < border {
+                    let g = dest[index + 1];
+                    dest[index] = dest[index].wrapping_add(g);
+                    dest[index + 2] = dest[index + 2].wrapping_add(g);
+                    index += 3;
+                }
+
+                *data = dest;
+            }
+            Rar4StandardFilter::Audio => {
+                let channels = filter.init_regs[0] as usize;
+                if data_size > VM_MEM_SIZE / 2 || channels == 0 || channels > 128 {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!(
+                            "RAR4: invalid AUDIO filter params size={data_size} channels={channels}"
+                        ),
+                    });
+                }
+
+                let mut dest = vec![0u8; data_size];
+                let mut src_pos = 0usize;
+                for channel in 0..channels {
+                    let mut prev_byte = 0u32;
+                    let mut prev_delta = 0i32;
+                    let mut dif = [0i32; 7];
+                    let (mut d1, mut d2) = (0i32, 0i32);
+                    let (mut k1, mut k2, mut k3) = (0i32, 0i32, 0i32);
+                    let mut byte_count = 0usize;
+                    let mut index = channel;
+
+                    while index < data_size {
+                        let d3 = d2;
+                        d2 = prev_delta - d1;
+                        d1 = prev_delta;
+
+                        let mut predicted = (8 * prev_byte as i32 + k1 * d1 + k2 * d2 + k3 * d3)
+                            >> 3;
+                        predicted &= 0xFF;
+
+                        let cur_byte = data[src_pos];
+                        src_pos += 1;
+
+                        let decoded = (predicted as u8).wrapping_sub(cur_byte);
+                        dest[index] = decoded;
+                        prev_delta = decoded as i8 as i32 - prev_byte as i8 as i32;
+                        prev_byte = decoded as u32;
+
+                        let d = ((cur_byte as i8 as i32) << 3).abs();
+                        dif[0] += d;
+                        dif[1] += (d - d1).abs();
+                        dif[2] += (d + d1).abs();
+                        dif[3] += (d - d2).abs();
+                        dif[4] += (d + d2).abs();
+                        dif[5] += (d - d3).abs();
+                        dif[6] += (d + d3).abs();
+
+                        if (byte_count & 0x1F) == 0 {
+                            let mut min_dif = dif[0];
+                            let mut min_index = 0usize;
+                            dif[0] = 0;
+                            for (candidate, value) in dif.iter_mut().enumerate().skip(1) {
+                                if *value < min_dif {
+                                    min_dif = *value;
+                                    min_index = candidate;
+                                }
+                                *value = 0;
+                            }
+                            match min_index {
+                                1 if k1 >= -16 => k1 -= 1,
+                                2 if k1 < 16 => k1 += 1,
+                                3 if k2 >= -16 => k2 -= 1,
+                                4 if k2 < 16 => k2 += 1,
+                                5 if k3 >= -16 => k3 -= 1,
+                                6 if k3 < 16 => k3 += 1,
+                                _ => {}
+                            }
+                        }
+
+                        byte_count += 1;
+                        index += channels;
+                    }
+                }
+
+                *data = dest;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_ready_output_to_writer<W: Write>(
+        &mut self,
+        writer: &mut W,
+        final_flush: bool,
+    ) -> RarResult<()> {
+        loop {
+            let written_border = self.window.total_flushed();
+            let total_written = self.window.total_written();
+
+            if self.pending_vm_filters.is_empty() {
+                if total_written > written_border {
+                    self.window
+                        .write_range_to_writer(
+                            written_border,
+                            (total_written - written_border) as usize,
+                            writer,
+                        )
+                        .map_err(RarError::Io)?;
+                    self.window.mark_flushed(total_written);
+                }
+                return Ok(());
+            }
+
+            let next_start = self.pending_vm_filters[0].block_start_total;
+            if next_start < written_border {
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4: pending VM filter starts before flushed border ({next_start} < {written_border})"
+                    ),
+                });
+            }
+
+            let raw_len = next_start.saturating_sub(written_border);
+            if raw_len > 0 {
+                self.window
+                    .write_range_to_writer(written_border, raw_len as usize, writer)
+                    .map_err(RarError::Io)?;
+                self.window.mark_flushed(next_start);
+                continue;
+            }
+
+            let block_length = self.pending_vm_filters[0].block_length as u64;
+            let block_end = next_start.checked_add(block_length).ok_or_else(|| {
+                RarError::CorruptArchive {
+                    detail: "RAR4: VM filter block end overflow".into(),
+                }
+            })?;
+            if block_end > total_written {
+                if final_flush {
+                    return Err(RarError::CorruptArchive {
+                        detail: format!(
+                            "RAR4: VM filter block [{next_start}, {block_end}) is incomplete at EOF"
+                        ),
+                    });
+                }
+                return Ok(());
+            }
+
+            let mut data = self
+                .window
+                .copy_output(next_start, self.pending_vm_filters[0].block_length);
+            let mut chain_len = 1usize;
+            while chain_len < self.pending_vm_filters.len() {
+                let next = &self.pending_vm_filters[chain_len];
+                if next.block_start_total != next_start
+                    || next.block_length != self.pending_vm_filters[0].block_length
+                {
+                    break;
+                }
+                chain_len += 1;
+            }
+
+            for filter in self.pending_vm_filters.iter().take(chain_len) {
+                Self::execute_standard_filter(filter, self.current_file_base_total, &mut data)?;
+            }
+
+            writer.write_all(&data).map_err(RarError::Io)?;
+            self.window.mark_flushed(block_end);
+            self.pending_vm_filters.drain(..chain_len);
+        }
     }
 
     /// Decompress RAR4 LZ data, returning the decompressed output.
@@ -154,7 +739,6 @@ impl Rar4LzDecoder {
         }
 
         let mut reader = BitReader::new(input);
-
         self.decompress_with_reader(&mut reader, unpacked_size)
     }
 
@@ -163,34 +747,9 @@ impl Rar4LzDecoder {
         reader: &mut R,
         unpacked_size: u64,
     ) -> RarResult<Vec<u8>> {
-        if unpacked_size == 0 {
-            return Ok(Vec::new());
-        }
-
-        if !self.tables_read {
-            self.read_tables(reader)?;
-        }
-
-        let mut output_size: u64 = 0;
-
-        while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
-                break;
-            }
-
-            match self.block_type {
-                BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(reader, unpacked_size, output_size)?;
-                }
-                BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(reader, unpacked_size, output_size)?;
-                }
-            }
-        }
-
-        let total = output_size.min(unpacked_size) as usize;
-        let start = self.window.total_written() - total as u64;
-        Ok(self.window.copy_output(start, total))
+        let mut output = Vec::with_capacity(unpacked_size.min(1024 * 1024) as usize);
+        self.decompress_to_writer_with_reader(reader, unpacked_size, &mut output)?;
+        Ok(output)
     }
 
     /// Decode a RAR4 solid member only to advance decoder state.
@@ -209,32 +768,8 @@ impl Rar4LzDecoder {
         reader: &mut R,
         unpacked_size: u64,
     ) -> RarResult<u64> {
-        if unpacked_size == 0 {
-            return Ok(0);
-        }
-
-        if !self.tables_read {
-            self.read_tables(reader)?;
-        }
-
-        let mut output_size: u64 = 0;
-
-        while output_size < unpacked_size {
-            if reader.bits_remaining() < 1 {
-                break;
-            }
-
-            match self.block_type {
-                BlockType::Lz => {
-                    output_size = self.decode_lz_symbols(reader, unpacked_size, output_size)?;
-                }
-                BlockType::Ppm => {
-                    output_size = self.decode_ppm_symbols(reader, unpacked_size, output_size)?;
-                }
-            }
-        }
-
-        Ok(output_size.min(unpacked_size))
+        let mut sink = std::io::sink();
+        self.decompress_to_writer_with_reader(reader, unpacked_size, &mut sink)
     }
 
     /// Decompress RAR4 LZ data directly to a writer.
@@ -281,6 +816,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
+        self.begin_file_decode();
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         let decode_chunk = flush_threshold as u64;
@@ -302,11 +838,11 @@ impl Rar4LzDecoder {
             }
 
             if self.window.unflushed_bytes() as usize >= flush_threshold {
-                self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.flush_ready_output_to_writer(writer, false)?;
             }
         }
 
-        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+        self.flush_ready_output_to_writer(writer, true)?;
         Ok(output_size)
     }
 
@@ -384,6 +920,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
+        self.begin_file_decode();
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         let decode_chunk = flush_threshold as u64;
@@ -408,6 +945,12 @@ impl Rar4LzDecoder {
                 BlockType::Ppm => {
                     output_size = self.decode_ppm_symbols(reader, target_output, output_size)?;
                 }
+            }
+            if !self.pending_vm_filters.is_empty() {
+                return Err(RarError::CorruptArchive {
+                    detail:
+                        "RAR4: VM filters are not yet supported for chunked extraction".into(),
+                });
             }
             let decoded_this_round = output_size - prev_output;
 
@@ -464,6 +1007,7 @@ impl Rar4LzDecoder {
             self.read_tables(reader)?;
         }
 
+        self.begin_file_decode();
         let mut output_size: u64 = 0;
         let flush_threshold = self.flush_threshold();
         let decode_chunk = flush_threshold as u64;
@@ -488,6 +1032,12 @@ impl Rar4LzDecoder {
                 BlockType::Ppm => {
                     output_size = self.decode_ppm_symbols(reader, target_output, output_size)?;
                 }
+            }
+            if !self.pending_vm_filters.is_empty() {
+                return Err(RarError::CorruptArchive {
+                    detail:
+                        "RAR4: VM filters are not yet supported for chunked extraction".into(),
+                });
             }
             let decoded_this_round = output_size - prev_output;
 
@@ -735,8 +1285,7 @@ impl Rar4LzDecoder {
             }
 
             if number == 257 {
-                // VM filter code — read and skip.
-                self.skip_vm_code(reader)?;
+                self.read_vm_code(reader, output_size)?;
                 continue;
             }
 
@@ -894,39 +1443,20 @@ impl Rar4LzDecoder {
         Ok(false)
     }
 
-    /// Read and skip VM filter code (symbol 257).
-    ///
-    /// We don't implement the RarVM, but we must consume the data from the
-    /// bitstream to stay synchronized.
-    fn skip_vm_code<R: BitRead>(&self, reader: &mut R) -> RarResult<()> {
+    /// Read VM filter code (symbol 257) and queue a standard filter block.
+    fn read_vm_code<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<()> {
         let first_byte = reader.read_bits(8)? as u8;
-        let mut length = (first_byte & 7) as usize + 1;
-        if length == 7 {
-            length = reader.read_bits(8)? as usize + 7;
-        } else if length == 8 {
-            length = reader.read_bits(16)? as usize;
-        }
-
-        if length == 0 {
-            return Err(RarError::CorruptArchive {
-                detail: "RAR4: VM code length is 0".into(),
-            });
-        }
-
-        // Skip the VM code bytes.
+        let length = Self::decode_vm_code_length(first_byte, || Ok(reader.read_bits(8)? as u8))?;
+        let mut code = Vec::with_capacity(length);
         for _ in 0..length {
             if reader.bits_remaining() < 8 {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR4: truncated VM code".into(),
                 });
             }
-            reader.read_bits(8)?;
+            code.push(reader.read_bits(8)? as u8);
         }
-
-        warn!(
-            "RAR4: VM filter skipped ({length} bytes) — output may be incorrect for filtered data"
-        );
-        Ok(())
+        self.add_vm_code(first_byte, &code, output_size)
     }
 
     /// Initialize PPMd block (DecodeInit equivalent from unrar).
@@ -1041,7 +1571,7 @@ impl Rar4LzDecoder {
                             break;
                         }
                         3 => {
-                            self.skip_vm_code_ppm(&mut rc)?;
+                            self.read_vm_code_ppm(&mut rc, output_size)?;
                         }
                         4 => {
                             let mut distance: u32 = 0;
@@ -1105,60 +1635,32 @@ impl Rar4LzDecoder {
         Ok(output_size)
     }
 
-    /// Read and skip VM filter code in PPM mode.
-    ///
-    /// Same structure as skip_vm_code but reads bytes via PPMd model
-    /// instead of from the bitstream.
-    fn skip_vm_code_ppm<R: RangeCode>(&mut self, rc: &mut R) -> RarResult<()> {
-        let model = self
-            .ppm_model
-            .as_mut()
-            .ok_or_else(|| RarError::CorruptArchive {
-                detail: "RAR4: PPMd model missing during VM skip".into(),
-            })?;
-
-        let first_byte = model.decode_char(rc);
-        if first_byte == -1 {
-            return Err(RarError::CorruptArchive {
-                detail: "RAR4: PPMd corrupt during VM filter read".into(),
-            });
-        }
-        let first_byte = first_byte as u8;
-
-        let mut length = (first_byte & 7) as usize + 1;
-        if length == 7 {
-            let b = model.decode_char(rc);
-            if b == -1 {
+    /// Read VM filter code in PPM mode and queue a standard filter block.
+    fn read_vm_code_ppm<R: RangeCode>(&mut self, rc: &mut R, output_size: u64) -> RarResult<()> {
+        let read_model_byte = |this: &mut Self, rc: &mut R| -> RarResult<u8> {
+            let model = this
+                .ppm_model
+                .as_mut()
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "RAR4: PPMd model missing during VM filter read".into(),
+                })?;
+            let byte = model.decode_char(rc);
+            if byte == -1 {
                 return Err(RarError::CorruptArchive {
-                    detail: "RAR4: PPMd corrupt during VM filter length".into(),
+                    detail: "RAR4: PPMd corrupt during VM filter read".into(),
                 });
             }
-            length = (b as usize) + 7;
-        } else if length == 8 {
-            let b1 = model.decode_char(rc);
-            let b2 = model.decode_char(rc);
-            if b1 == -1 || b2 == -1 {
-                return Err(RarError::CorruptArchive {
-                    detail: "RAR4: PPMd corrupt during VM filter length".into(),
-                });
-            }
-            length = (b1 as usize) * 256 + (b2 as usize);
-        }
+            Ok(byte as u8)
+        };
 
-        // Consume the VM code bytes through the PPMd model.
+        let first_byte = read_model_byte(self, rc)?;
+        let length = Self::decode_vm_code_length(first_byte, || read_model_byte(self, rc))?;
+        let mut code = Vec::with_capacity(length);
         for _ in 0..length {
-            let model = self.ppm_model.as_mut().unwrap();
-            if model.decode_char(rc) == -1 {
-                return Err(RarError::CorruptArchive {
-                    detail: "RAR4: PPMd corrupt during VM filter data".into(),
-                });
-            }
+            code.push(read_model_byte(self, rc)?);
         }
 
-        warn!(
-            "RAR4: PPMd VM filter skipped ({length} bytes) — output may be incorrect for filtered data"
-        );
-        Ok(())
+        self.add_vm_code(first_byte, &code, output_size)
     }
 
     /// Prepare for solid continuation (keep window state, reset block state).
@@ -1168,6 +1670,8 @@ impl Rar4LzDecoder {
         // Reset low distance state.
         self.low_dist_rep_count = 0;
         self.prev_low_dist = 0;
+        self.pending_vm_filters.clear();
+        self.current_file_base_total = self.window.total_written();
     }
 
     /// Reset the decoder for a new non-solid file.
@@ -1185,6 +1689,10 @@ impl Rar4LzDecoder {
         self.ppm_model = None;
         self.ppm_esc_char = 2;
         self.tables_read = false;
+        self.vm_filters.clear();
+        self.pending_vm_filters.clear();
+        self.last_vm_filter = 0;
+        self.current_file_base_total = 0;
         self.window.reset();
     }
 }
@@ -1375,5 +1883,36 @@ mod tests {
             );
             prev_end = base + (1 << LBITS[i]);
         }
+    }
+
+    #[test]
+    fn test_execute_standard_delta_filter() {
+        let filter = Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::Delta,
+            block_start_total: 0,
+            block_length: 4,
+            init_regs: [1, 0, 0, 0, 4, 0, 0],
+        };
+        let mut data = vec![1u8, 2, 3, 4];
+        Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut data).unwrap();
+        assert_eq!(data, vec![255, 253, 250, 246]);
+    }
+
+    #[test]
+    fn test_flush_ready_output_to_writer_applies_e8_filter() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(&[0xAA, 0xBB, 0xE8, 100, 0, 0, 0]);
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 2,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder.flush_ready_output_to_writer(&mut out, true).unwrap();
+        assert_eq!(out, vec![0xAA, 0xBB, 0xE8, 97, 0, 0, 0]);
+        assert_eq!(decoder.window.total_flushed(), decoder.window.total_written());
     }
 }

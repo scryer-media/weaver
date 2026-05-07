@@ -180,7 +180,7 @@ fn probe_rar4<R: Read + Seek>(reader: &mut R) -> RarResult<VolumeProbe> {
         .iter()
         .map(|fh| ProbeFile {
             name: fh.name.clone(),
-            unpacked_size: Some(fh.unpacked_size),
+            unpacked_size: fh.unpacked_size,
             split_before: fh.split_before,
             split_after: fh.split_after,
         })
@@ -215,20 +215,28 @@ mod tests {
         end_flags: u16,
         end_vol_num: Option<u16>,
     ) -> Vec<u8> {
+        fn finalize_header_crc(header: &mut [u8]) {
+            let crc16 = (crc32fast::hash(&header[2..]) & 0xFFFF) as u16;
+            header[0..2].copy_from_slice(&crc16.to_le_bytes());
+        }
+
         let mut buf = Vec::new();
         buf.extend_from_slice(&RAR4_SIG);
 
         // Archive header
         let arch_header_size: u16 = 7 + 6;
+        let arch_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16
         buf.push(0x73);
         buf.extend_from_slice(&arch_flags.to_le_bytes());
         buf.extend_from_slice(&arch_header_size.to_le_bytes());
         buf.extend_from_slice(&[0u8; 6]); // reserved
+        finalize_header_crc(&mut buf[arch_start..]);
 
         // File header (no data area)
         let name_bytes = filename.as_bytes();
         let file_header_size: u16 = 7 + 25 + name_bytes.len() as u16;
+        let file_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16
         buf.push(0x74);
         buf.extend_from_slice(&file_flags.to_le_bytes());
@@ -243,6 +251,7 @@ mod tests {
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // attrs
         buf.extend_from_slice(name_bytes);
+        finalize_header_crc(&mut buf[file_start..]);
 
         // End header
         let mut end_extra = Vec::new();
@@ -254,11 +263,13 @@ mod tests {
             end_extra.extend_from_slice(&vn.to_le_bytes());
         }
         let end_header_size: u16 = 7 + end_extra.len() as u16;
+        let end_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16
         buf.push(0x7B);
         buf.extend_from_slice(&end_flags.to_le_bytes());
         buf.extend_from_slice(&end_header_size.to_le_bytes());
         buf.extend_from_slice(&end_extra);
+        finalize_header_crc(&mut buf[end_start..]);
 
         buf
     }

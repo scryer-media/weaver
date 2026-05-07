@@ -682,6 +682,12 @@ fn test_solid_archive_metadata() {
 /// RAR4 signature bytes.
 const RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 
+fn finalize_rar4_header_crc(mut header: Vec<u8>) -> Vec<u8> {
+    let crc16 = (crc32fast::hash(&header[2..]) & 0xFFFF) as u16;
+    header[0..2].copy_from_slice(&crc16.to_le_bytes());
+    header
+}
+
 /// Build a RAR4 archive header.
 /// `arch_flags`: 0x0001 = VOLUME, 0x0008 = SOLID, 0x0100 = FIRST_VOLUME, etc.
 fn build_rar4_archive_header(arch_flags: u16) -> Vec<u8> {
@@ -692,7 +698,7 @@ fn build_rar4_archive_header(arch_flags: u16) -> Vec<u8> {
     buf.extend_from_slice(&arch_flags.to_le_bytes());
     buf.extend_from_slice(&header_size.to_le_bytes());
     buf.extend_from_slice(&[0u8; 6]); // reserved
-    buf
+    finalize_rar4_header_crc(buf)
 }
 
 /// Build a RAR4 file header with configurable split flags.
@@ -724,7 +730,7 @@ fn build_rar4_file_header(
     buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // attrs
     buf.extend_from_slice(name_bytes);
-    buf
+    finalize_rar4_header_crc(buf)
 }
 
 /// Build a RAR4 end-of-archive header.
@@ -737,7 +743,7 @@ fn build_rar4_end_header(more_volumes: bool) -> Vec<u8> {
     buf.push(0x7B); // type: EndArchive
     buf.extend_from_slice(&flags.to_le_bytes());
     buf.extend_from_slice(&header_size.to_le_bytes());
-    buf
+    finalize_rar4_header_crc(buf)
 }
 
 /// Build a 2-volume RAR4 stored archive where a single file is split across volumes.
@@ -954,7 +960,7 @@ fn build_rar4_encrypted_file_header(
     buf.extend_from_slice(&0u32.to_le_bytes()); // attrs
     buf.extend_from_slice(name_bytes);
     buf.extend_from_slice(salt);
-    buf
+    finalize_rar4_header_crc(buf)
 }
 
 #[test]
@@ -975,7 +981,7 @@ fn test_rar4_encrypted_stored_file() {
 
     // Derive key/IV and encrypt.
     // We call the crypto module directly to build ciphertext.
-    let (key, iv) = weaver_rar::crypto::rar4_derive_key(password, &salt);
+    let (key, iv) = weaver_rar::crypto::rar4_derive_key(password, Some(&salt));
 
     // Pad content to AES block boundary (16 bytes).
     let padded_len = (content.len() + 15) & !15; // round up to 32
@@ -1036,7 +1042,7 @@ fn test_rar4_encrypted_no_password_fails() {
 
     let salt: [u8; 8] = [0xAA; 8];
     let content = b"needs a password";
-    let (key, iv) = weaver_rar::crypto::rar4_derive_key("pass", &salt);
+    let (key, iv) = weaver_rar::crypto::rar4_derive_key("pass", Some(&salt));
 
     let padded_len = (content.len() + 15) & !15;
     let mut ciphertext = vec![0u8; padded_len];

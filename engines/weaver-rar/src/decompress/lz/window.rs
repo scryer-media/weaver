@@ -287,6 +287,63 @@ impl Window {
         self.total_written - self.total_flushed
     }
 
+    /// Absolute position up to which data has been flushed.
+    pub fn total_flushed(&self) -> u64 {
+        self.total_flushed
+    }
+
+    /// Write a specific absolute output range to a writer without advancing
+    /// the flushed marker.
+    pub fn write_range_to_writer<W: Write + ?Sized>(
+        &self,
+        start_total: u64,
+        len: usize,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let dict_size = self.buf.len();
+        let end_total = start_total
+            .checked_add(len as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "range overflow"))?;
+        if end_total > self.total_written {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "requested range [{start_total}, {end_total}) exceeds total written {}",
+                    self.total_written
+                ),
+            ));
+        }
+        if self.total_written - start_total > dict_size as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "requested range start {start_total} is older than window capacity {dict_size}"
+                ),
+            ));
+        }
+
+        let distance = (self.total_written - start_total) as usize;
+        let mut idx = if distance <= self.pos {
+            self.pos - distance
+        } else {
+            dict_size - (distance - self.pos)
+        };
+
+        let mut remaining = len;
+        while remaining > 0 {
+            let contig = (dict_size - idx).min(remaining);
+            writer.write_all(&self.buf[idx..idx + contig])?;
+            idx = (idx + contig) % dict_size;
+            remaining -= contig;
+        }
+
+        Ok(())
+    }
+
     /// Manually mark data as flushed up to a given total position.
     /// Used when data is extracted via `copy_output` and written externally.
     pub fn mark_flushed(&mut self, up_to: u64) {

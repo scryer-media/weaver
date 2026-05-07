@@ -170,14 +170,18 @@ pub struct Rar4ArchiveHeader {
 pub struct Rar4FileHeader {
     pub flags: u16,
     pub packed_size: u64,
-    pub unpacked_size: u64,
+    pub unpacked_size: Option<u64>,
     pub host_os: Rar4HostOs,
     pub crc32: u32,
     pub mtime: u32, // DOS datetime
+    pub unpack_version: u8,
     pub method: Rar4Method,
+    pub dict_size: u64,
     pub name: String,
     pub is_directory: bool,
+    pub is_unix_symlink: bool,
     pub is_encrypted: bool,
+    pub encryption_method: Option<Rar4EncryptionMethod>,
     pub is_solid: bool,
     pub split_before: bool,
     pub split_after: bool,
@@ -187,6 +191,29 @@ pub struct Rar4FileHeader {
     pub salt: Option<[u8; 8]>,
     /// File attributes.
     pub attributes: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rar4EncryptionMethod {
+    Rar13,
+    Rar15,
+    Rar20,
+    Rar30,
+}
+
+impl Rar4EncryptionMethod {
+    pub fn for_unpack_version(unpack_version: u8) -> Self {
+        match unpack_version {
+            13 => Self::Rar13,
+            15 => Self::Rar15,
+            20 | 26 => Self::Rar20,
+            _ => Self::Rar30,
+        }
+    }
+
+    pub fn uses_salt(self) -> bool {
+        matches!(self, Self::Rar30)
+    }
 }
 
 /// RAR4 end-of-archive header flags.

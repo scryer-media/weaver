@@ -66,7 +66,7 @@ pub fn parse_rar4_headers<R: Read + Seek>(
             Rar4HeaderType::File => {
                 let fh = header::parse_file_header(&raw)?;
                 debug!(
-                    "RAR4 file: name={:?} packed={} unpacked={} method={:?}",
+                    "RAR4 file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
                 // For files with LARGE flag, the raw header's data_area_size only
@@ -138,7 +138,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
             Err(e) => return Err(RarError::Io(e)),
         }
 
-        let (key, iv) = kdf_cache.derive_key_rar4(password, &salt);
+        let (key, iv) = kdf_cache.derive_key_rar4(password, Some(&salt));
         let mut decryptor = crate::crypto::Rar4CbcDecryptor::new(&key, &iv);
 
         let raw = match header::read_raw_header_encrypted(reader, &mut decryptor)? {
@@ -154,7 +154,7 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
                 // which is where the file data starts.
                 fh.data_offset = reader.stream_position().map_err(RarError::Io)?;
                 debug!(
-                    "RAR4 encrypted file: name={:?} packed={} unpacked={} method={:?}",
+                    "RAR4 encrypted file: name={:?} packed={} unpacked={:?} method={:?}",
                     fh.name, fh.packed_size, fh.unpacked_size, fh.method
                 );
                 let skip_size = fh.packed_size;
@@ -208,7 +208,7 @@ pub fn to_member_info(fh: &Rar4FileHeader, volume_index: usize) -> MemberInfo {
     MemberInfo {
         name: fh.name.clone(),
         raw_name: fh.name.clone(),
-        unpacked_size: Some(fh.unpacked_size),
+        unpacked_size: fh.unpacked_size,
         compressed_size: fh.packed_size,
         is_directory: fh.is_directory,
         crc32: Some(fh.crc32),
@@ -216,15 +216,15 @@ pub fn to_member_info(fh: &Rar4FileHeader, volume_index: usize) -> MemberInfo {
         host_os,
         compression: CompressionInfo {
             format: crate::types::ArchiveFormat::Rar4,
-            version: 29,
+            version: fh.unpack_version,
             solid: fh.is_solid,
             method,
-            dict_size: 4 * 1024 * 1024, // RAR4 default: 4 MB
+            dict_size: fh.dict_size,
         },
         is_encrypted: fh.is_encrypted,
         hash: None,
         volumes: VolumeSpan::single(volume_index),
-        is_symlink: false,
+        is_symlink: fh.is_unix_symlink,
         is_hardlink: false,
         link_target: None,
     }
@@ -294,16 +294,23 @@ mod tests {
 
     /// Build a minimal RAR4 archive with one stored file.
     fn build_minimal_rar4_archive(filename: &str, content: &[u8]) -> Vec<u8> {
+        fn finalize_header_crc(header: &mut [u8]) {
+            let crc16 = (crc32fast::hash(&header[2..]) & 0xFFFF) as u16;
+            header[0..2].copy_from_slice(&crc16.to_le_bytes());
+        }
+
         let mut buf = Vec::new();
 
         // -- Archive header (0x73) --
         let arch_flags: u16 = 0;
         let arch_header_size: u16 = 7 + 6; // common 7 + reserved 6
+        let arch_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16 placeholder
         buf.push(0x73); // type
         buf.extend_from_slice(&arch_flags.to_le_bytes());
         buf.extend_from_slice(&arch_header_size.to_le_bytes());
         buf.extend_from_slice(&[0u8; 6]); // reserved
+        finalize_header_crc(&mut buf[arch_start..]);
 
         // -- File header (0x74) --
         let name_bytes = filename.as_bytes();
@@ -317,6 +324,7 @@ mod tests {
             h.finalize()
         };
 
+        let file_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16
         buf.push(0x74); // type
         buf.extend_from_slice(&file_flags.to_le_bytes());
@@ -331,16 +339,19 @@ mod tests {
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // attrs
         buf.extend_from_slice(name_bytes);
+        finalize_header_crc(&mut buf[file_start..]);
 
         // Data area
         buf.extend_from_slice(content);
 
         // -- End header (0x7B) --
         let end_header_size: u16 = 7;
+        let end_start = buf.len();
         buf.extend_from_slice(&[0x00, 0x00]); // CRC16
         buf.push(0x7B); // type
         buf.extend_from_slice(&0u16.to_le_bytes()); // flags
         buf.extend_from_slice(&end_header_size.to_le_bytes());
+        finalize_header_crc(&mut buf[end_start..]);
 
         buf
     }
@@ -353,7 +364,7 @@ mod tests {
         assert!(!vol.archive_header.is_solid);
         assert_eq!(vol.files.len(), 1);
         assert_eq!(vol.files[0].name, "hello.txt");
-        assert_eq!(vol.files[0].unpacked_size, 11);
+        assert_eq!(vol.files[0].unpacked_size, Some(11));
         assert!(vol.end.is_some());
     }
 
@@ -413,7 +424,7 @@ mod tests {
         eprintln!("parsed {} files from -hp archive", vol.files.len());
         for f in &vol.files {
             eprintln!(
-                "  file: {:?} packed={} unpacked={} method={:?} encrypted={} salt={:?} flags={:#06x}",
+                "  file: {:?} packed={} unpacked={:?} method={:?} encrypted={} salt={:?} flags={:#06x}",
                 f.name, f.packed_size, f.unpacked_size, f.method, f.is_encrypted, f.salt, f.flags
             );
         }

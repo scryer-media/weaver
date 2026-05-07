@@ -22,6 +22,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 use crate::error::{RarError, RarResult};
+use crate::rar4::types::Rar4EncryptionMethod;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
@@ -127,7 +128,7 @@ struct Kdf5Entry {
 /// Cached RAR4 key derivation result.
 struct Kdf3Entry {
     password: String,
-    salt: [u8; 8],
+    salt: Option<[u8; 8]>,
     key: [u8; 16],
     iv: [u8; 16],
 }
@@ -217,13 +218,17 @@ impl KdfCache {
     }
 
     /// Derive (or return cached) RAR4 AES-128 key and IV.
-    pub fn derive_key_rar4(&self, password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+    pub fn derive_key_rar4(
+        &self,
+        password: &str,
+        salt: Option<&[u8; 8]>,
+    ) -> ([u8; 16], [u8; 16]) {
         let mut guard = self.rar4.lock().unwrap();
         let (entries, pos) = &mut *guard;
 
         // Check cache.
         for entry in entries.iter() {
-            if entry.password == password && entry.salt == *salt {
+            if entry.password == password && entry.salt.as_ref() == salt {
                 return (entry.key, entry.iv);
             }
         }
@@ -233,7 +238,7 @@ impl KdfCache {
 
         let entry = Kdf3Entry {
             password: password.to_string(),
-            salt: *salt,
+            salt: salt.copied(),
             key,
             iv,
         };
@@ -256,8 +261,234 @@ impl Default for KdfCache {
 }
 
 // =============================================================================
-// RAR4 encryption: AES-128-CBC with custom SHA-1 key derivation
+// Legacy RAR4 file encryption and RAR30 AES key derivation
 // =============================================================================
+
+fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for (index, entry) in table.iter_mut().enumerate() {
+        let mut crc = index as u32;
+        for _ in 0..8 {
+            crc = if (crc & 1) != 0 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+        *entry = crc;
+    }
+    table
+}
+
+fn raw_get_u32(data: &[u8]) -> u32 {
+    u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+}
+
+fn raw_put_u32(value: u32, data: &mut [u8]) {
+    data[..4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Clone)]
+struct Rar13Decryptor {
+    key: [u8; 3],
+}
+
+impl Rar13Decryptor {
+    fn new(password: &str) -> Self {
+        let mut key = [0u8; 3];
+        for &byte in password.as_bytes() {
+            key[0] = key[0].wrapping_add(byte);
+            key[1] ^= byte;
+            key[2] = key[2].wrapping_add(byte).rotate_left(1);
+        }
+        Self { key }
+    }
+
+    fn decrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            self.key[1] = self.key[1].wrapping_add(self.key[2]);
+            self.key[0] = self.key[0].wrapping_add(self.key[1]);
+            *byte = byte.wrapping_sub(self.key[0]);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Rar15Decryptor {
+    key: [u16; 4],
+    crc_tab: [u32; 256],
+}
+
+impl Rar15Decryptor {
+    fn new(password: &str) -> Self {
+        let crc_tab = crc32_table();
+        let psw_crc = !crc32fast::hash(password.as_bytes());
+        let mut key = [(psw_crc & 0xFFFF) as u16, (psw_crc >> 16) as u16, 0, 0];
+
+        for &byte in password.as_bytes() {
+            key[2] ^= (byte as u16) ^ (crc_tab[byte as usize] as u16);
+            key[3] = key[3].wrapping_add(byte as u16 + ((crc_tab[byte as usize] >> 16) as u16));
+        }
+
+        Self { key, crc_tab }
+    }
+
+    fn decrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            self.key[0] = self.key[0].wrapping_add(0x1234);
+            let crc = self.crc_tab[((self.key[0] & 0x01FE) >> 1) as usize];
+            self.key[1] ^= crc as u16;
+            self.key[2] = self.key[2].wrapping_sub((crc >> 16) as u16);
+            self.key[0] ^= self.key[2];
+            self.key[3] = self.key[3].rotate_right(1) ^ self.key[1];
+            self.key[3] = self.key[3].rotate_right(1);
+            self.key[0] ^= self.key[3];
+            *byte ^= (self.key[0] >> 8) as u8;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Rar20Decryptor {
+    key: [u32; 4],
+    subst: [u8; 256],
+    crc_tab: [u32; 256],
+}
+
+impl Rar20Decryptor {
+    fn new(password: &str) -> Self {
+        const INIT_SUBST_TABLE20: [u8; 256] = [
+            215, 19, 149, 35, 73, 197, 192, 205, 249, 28, 16, 119, 48, 221, 2, 42, 232, 1,
+            177, 233, 14, 88, 219, 25, 223, 195, 244, 90, 87, 239, 153, 137, 255, 199, 147, 70,
+            92, 66, 246, 13, 216, 40, 62, 29, 217, 230, 86, 6, 71, 24, 171, 196, 101, 113, 218,
+            123, 93, 91, 163, 178, 202, 67, 44, 235, 107, 250, 75, 234, 49, 167, 125, 211, 83,
+            114, 157, 144, 32, 193, 143, 36, 158, 124, 247, 187, 89, 214, 141, 47, 121, 228, 61,
+            130, 213, 194, 174, 251, 97, 110, 54, 229, 115, 57, 152, 94, 105, 243, 212, 55, 209,
+            245, 63, 11, 164, 200, 31, 156, 81, 176, 227, 21, 76, 99, 139, 188, 127, 17, 248,
+            51, 207, 120, 189, 210, 8, 226, 41, 72, 183, 203, 135, 165, 166, 60, 98, 7, 122, 38,
+            155, 170, 69, 172, 252, 238, 39, 134, 59, 128, 236, 27, 240, 80, 131, 3, 85, 206,
+            145, 79, 154, 142, 159, 220, 201, 133, 74, 64, 20, 129, 224, 185, 138, 103, 173, 182,
+            43, 34, 254, 82, 198, 151, 231, 180, 58, 10, 118, 26, 102, 12, 50, 132, 22, 191,
+            136, 111, 162, 179, 45, 4, 148, 108, 161, 56, 78, 126, 242, 222, 15, 175, 146, 23,
+            33, 241, 181, 190, 77, 225, 0, 46, 169, 186, 68, 95, 237, 65, 53, 208, 253, 168, 9,
+            18, 100, 52, 116, 184, 160, 96, 109, 37, 30, 106, 140, 104, 150, 5, 204, 117, 112,
+            84,
+        ];
+
+        let crc_tab = crc32_table();
+        let pwd_bytes = password.as_bytes();
+        let key = [0xD3A3_B879, 0x3F6D_12F7, 0x7515_A235, 0xA4E7_F123];
+        let mut subst = INIT_SUBST_TABLE20;
+
+        for j in 0..256u32 {
+            let mut i = 0usize;
+            while i < pwd_bytes.len() {
+                let left = pwd_bytes[i];
+                let right = pwd_bytes.get(i + 1).copied().unwrap_or(0);
+                let mut n1 = (crc_tab[left.wrapping_sub(j as u8) as usize] & 0xFF) as u8;
+                let n2 = (crc_tab[right.wrapping_add(j as u8) as usize] & 0xFF) as u8;
+                let mut k = 1usize;
+                while n1 != n2 {
+                    let swap_index = (n1 as usize + i + k) & 0xFF;
+                    subst.swap(n1 as usize, swap_index);
+                    n1 = n1.wrapping_add(1);
+                    k += 1;
+                }
+                i += 2;
+            }
+        }
+
+        let mut padded = pwd_bytes.to_vec();
+        let remainder = padded.len() & (AES_BLOCK - 1);
+        if remainder != 0 {
+            padded.resize((padded.len() + AES_BLOCK - 1) & !(AES_BLOCK - 1), 0);
+        }
+
+        let mut decryptor = Self {
+            key,
+            subst,
+            crc_tab,
+        };
+        for chunk in padded.chunks_exact_mut(AES_BLOCK) {
+            decryptor.encrypt_block(chunk);
+        }
+        decryptor
+    }
+
+    fn subst_long(&self, value: u32) -> u32 {
+        self.subst[(value & 0xFF) as usize] as u32
+            | ((self.subst[((value >> 8) & 0xFF) as usize] as u32) << 8)
+            | ((self.subst[((value >> 16) & 0xFF) as usize] as u32) << 16)
+            | ((self.subst[((value >> 24) & 0xFF) as usize] as u32) << 24)
+    }
+
+    fn update_keys(&mut self, data: &[u8; AES_BLOCK]) {
+        for chunk in data.chunks_exact(4) {
+            self.key[0] ^= self.crc_tab[chunk[0] as usize];
+            self.key[1] ^= self.crc_tab[chunk[1] as usize];
+            self.key[2] ^= self.crc_tab[chunk[2] as usize];
+            self.key[3] ^= self.crc_tab[chunk[3] as usize];
+        }
+    }
+
+    fn encrypt_block(&mut self, block: &mut [u8]) {
+        const NROUNDS: usize = 32;
+
+        let mut a = raw_get_u32(&block[0..4]) ^ self.key[0];
+        let mut b = raw_get_u32(&block[4..8]) ^ self.key[1];
+        let mut c = raw_get_u32(&block[8..12]) ^ self.key[2];
+        let mut d = raw_get_u32(&block[12..16]) ^ self.key[3];
+
+        for round in 0..NROUNDS {
+            let t = (c.wrapping_add(d.rotate_left(11))) ^ self.key[round & 3];
+            let ta = a ^ self.subst_long(t);
+            let t = (d ^ c.rotate_left(17)).wrapping_add(self.key[round & 3]);
+            let tb = b ^ self.subst_long(t);
+            a = c;
+            b = d;
+            c = ta;
+            d = tb;
+        }
+
+        raw_put_u32(c ^ self.key[0], &mut block[0..4]);
+        raw_put_u32(d ^ self.key[1], &mut block[4..8]);
+        raw_put_u32(a ^ self.key[2], &mut block[8..12]);
+        raw_put_u32(b ^ self.key[3], &mut block[12..16]);
+
+        let mut ciphertext = [0u8; AES_BLOCK];
+        ciphertext.copy_from_slice(block);
+        self.update_keys(&ciphertext);
+    }
+
+    fn decrypt_block(&mut self, block: &mut [u8]) {
+        const NROUNDS: i32 = 32;
+
+        let mut ciphertext = [0u8; AES_BLOCK];
+        ciphertext.copy_from_slice(block);
+
+        let mut a = raw_get_u32(&block[0..4]) ^ self.key[0];
+        let mut b = raw_get_u32(&block[4..8]) ^ self.key[1];
+        let mut c = raw_get_u32(&block[8..12]) ^ self.key[2];
+        let mut d = raw_get_u32(&block[12..16]) ^ self.key[3];
+
+        for round in (0..NROUNDS).rev() {
+            let t = (c.wrapping_add(d.rotate_left(11))) ^ self.key[(round as usize) & 3];
+            let ta = a ^ self.subst_long(t);
+            let t = (d ^ c.rotate_left(17)).wrapping_add(self.key[(round as usize) & 3]);
+            let tb = b ^ self.subst_long(t);
+            a = c;
+            b = d;
+            c = ta;
+            d = tb;
+        }
+
+        raw_put_u32(c ^ self.key[0], &mut block[0..4]);
+        raw_put_u32(d ^ self.key[1], &mut block[4..8]);
+        raw_put_u32(a ^ self.key[2], &mut block[8..12]);
+        raw_put_u32(b ^ self.key[3], &mut block[12..16]);
+        self.update_keys(&ciphertext);
+    }
+}
 
 /// RAR4 key derivation iteration count.
 const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
@@ -272,15 +503,18 @@ const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 ///   SHA-1 intermediate digest word H4's low byte is extracted as an IV byte
 /// - After all iterations, the final SHA-1 digest words H0-H3 are extracted as the
 ///   AES-128 key in little-endian byte order per word
-pub fn rar4_derive_key(password: &str, salt: &[u8; 8]) -> ([u8; 16], [u8; 16]) {
+pub fn rar4_derive_key(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
     use sha1::Digest;
 
-    // Encode password as UTF-16LE, then append salt — matching unrar's RawPsw buffer.
+    // Encode password as UTF-16LE, then append salt if present — matching
+    // unrar's RawPsw buffer for both salted and saltless RAR30 members.
     let mut raw_psw: Vec<u8> = password
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect();
-    raw_psw.extend_from_slice(salt);
+    if let Some(salt) = salt {
+        raw_psw.extend_from_slice(salt);
+    }
 
     let iv_interval = RAR4_KDF_ITERATIONS / 16;
     let mut iv = [0u8; 16];
@@ -424,17 +658,41 @@ impl Rar4CbcDecryptor {
     }
 }
 
-/// Decryptor enum that handles both RAR5 (AES-256) and RAR4 (AES-128).
-pub enum CbcDecryptorAny {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecryptorMode {
+    Streaming,
+    BlockAligned,
+}
+
+/// Decryptor enum that handles RAR5 and all RAR4 file-encryption variants.
+enum CbcDecryptorAny {
     Rar5(Box<CbcDecryptor>),
     Rar4(Box<Rar4CbcDecryptor>),
+    Rar13(Rar13Decryptor),
+    Rar15(Box<Rar15Decryptor>),
+    Rar20(Box<Rar20Decryptor>),
 }
 
 impl CbcDecryptorAny {
-    pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
+    fn mode(&self) -> DecryptorMode {
+        match self {
+            Self::Rar13(_) | Self::Rar15(_) => DecryptorMode::Streaming,
+            Self::Rar5(_) | Self::Rar4(_) | Self::Rar20(_) => DecryptorMode::BlockAligned,
+        }
+    }
+
+    pub fn decrypt(&mut self, data: &mut [u8]) {
         match self {
             Self::Rar5(d) => d.decrypt_blocks(data),
             Self::Rar4(d) => d.decrypt_blocks(data),
+            Self::Rar13(d) => d.decrypt(data),
+            Self::Rar15(d) => d.decrypt(data),
+            Self::Rar20(d) => {
+                debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+                for block in data.chunks_exact_mut(AES_BLOCK) {
+                    d.decrypt_block(block);
+                }
+            }
         }
     }
 }
@@ -468,11 +726,10 @@ pub struct DecryptingReader<R: Read> {
 }
 
 impl<R: Read> DecryptingReader<R> {
-    /// Create a new decrypting reader for RAR5 (AES-256-CBC).
-    pub fn new_rar5(inner: R, key: &[u8; 32], iv: &[u8; 16]) -> Self {
+    fn new_with_decryptor(inner: R, decryptor: CbcDecryptorAny) -> Self {
         Self {
             inner,
-            decryptor: CbcDecryptorAny::Rar5(Box::new(CbcDecryptor::new(key, iv))),
+            decryptor,
             pending: [0u8; AES_BLOCK],
             pending_len: 0,
             out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
@@ -482,23 +739,42 @@ impl<R: Read> DecryptingReader<R> {
         }
     }
 
+    /// Create a new decrypting reader for RAR5 (AES-256-CBC).
+    pub fn new_rar5(inner: R, key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self::new_with_decryptor(inner, CbcDecryptorAny::Rar5(Box::new(CbcDecryptor::new(key, iv))))
+    }
+
     /// Create a new decrypting reader for RAR4 (AES-128-CBC).
     pub fn new_rar4(inner: R, key: &[u8; 16], iv: &[u8; 16]) -> Self {
-        Self {
-            inner,
-            decryptor: CbcDecryptorAny::Rar4(Box::new(Rar4CbcDecryptor::new(key, iv))),
-            pending: [0u8; AES_BLOCK],
-            pending_len: 0,
-            out_buf: vec![0u8; DECRYPT_BUF_SIZE].into_boxed_slice(),
-            out_pos: 0,
-            out_len: 0,
-            inner_eof: false,
-        }
+        Self::new_with_decryptor(inner, CbcDecryptorAny::Rar4(Box::new(Rar4CbcDecryptor::new(key, iv))))
+    }
+
+    pub fn new_rar4_legacy(inner: R, method: Rar4EncryptionMethod, password: &str) -> Self {
+        let decryptor = match method {
+            Rar4EncryptionMethod::Rar13 => CbcDecryptorAny::Rar13(Rar13Decryptor::new(password)),
+            Rar4EncryptionMethod::Rar15 => {
+                CbcDecryptorAny::Rar15(Box::new(Rar15Decryptor::new(password)))
+            }
+            Rar4EncryptionMethod::Rar20 => {
+                CbcDecryptorAny::Rar20(Box::new(Rar20Decryptor::new(password)))
+            }
+            Rar4EncryptionMethod::Rar30 => unreachable!("RAR30 must use AES constructor"),
+        };
+        Self::new_with_decryptor(inner, decryptor)
     }
 }
 
 impl<R: Read> Read for DecryptingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.decryptor.mode() == DecryptorMode::Streaming {
+            let read = self.inner.read(buf)?;
+            if read == 0 {
+                return Ok(0);
+            }
+            self.decryptor.decrypt(&mut buf[..read]);
+            return Ok(read);
+        }
+
         // Return any buffered decrypted data first.
         if self.out_pos < self.out_len {
             let n = (self.out_len - self.out_pos).min(buf.len());
@@ -568,7 +844,7 @@ impl<R: Read> Read for DecryptingReader<R> {
         }
 
         // Decrypt complete blocks in-place (no extra copy).
-        self.decryptor.decrypt_blocks(&mut self.out_buf[..complete]);
+        self.decryptor.decrypt(&mut self.out_buf[..complete]);
         self.out_pos = 0;
         self.out_len = complete;
 
@@ -679,18 +955,27 @@ mod tests {
     #[test]
     fn test_rar4_derive_key_deterministic() {
         let salt = [0xCC; 8];
-        let (key1, iv1) = rar4_derive_key("password", &salt);
-        let (key2, iv2) = rar4_derive_key("password", &salt);
+        let (key1, iv1) = rar4_derive_key("password", Some(&salt));
+        let (key2, iv2) = rar4_derive_key("password", Some(&salt));
         assert_eq!(key1, key2);
         assert_eq!(iv1, iv2);
 
         // Different password produces different key.
-        let (key3, _) = rar4_derive_key("other", &salt);
+        let (key3, _) = rar4_derive_key("other", Some(&salt));
         assert_ne!(key1, key3);
 
         // Different salt produces different key.
-        let (key4, _) = rar4_derive_key("password", &[0xDD; 8]);
+        let (key4, _) = rar4_derive_key("password", Some(&[0xDD; 8]));
         assert_ne!(key1, key4);
+    }
+
+    #[test]
+    fn test_rar4_derive_key_saltless_differs_from_salted() {
+        let salt = [0xCC; 8];
+        let (saltless_key, saltless_iv) = rar4_derive_key("password", None);
+        let (salted_key, salted_iv) = rar4_derive_key("password", Some(&salt));
+        assert_ne!(saltless_key, salted_key);
+        assert_ne!(saltless_iv, salted_iv);
     }
 
     #[test]
@@ -741,7 +1026,7 @@ mod tests {
         type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
         let salt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let (key, iv) = rar4_derive_key("testpassword", &salt);
+        let (key, iv) = rar4_derive_key("testpassword", Some(&salt));
 
         // Encrypt 32 bytes of plaintext.
         let plaintext = b"Hello from RAR4 encryption test!"; // 32 bytes

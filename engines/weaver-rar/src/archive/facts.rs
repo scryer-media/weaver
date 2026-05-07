@@ -81,7 +81,7 @@ impl RarArchive {
                 .map(|(order, fh)| RarVolumeMemberFacts {
                     order: order as u32,
                     name: fh.name.clone(),
-                    unpacked_size: Some(fh.unpacked_size),
+                    unpacked_size: fh.unpacked_size,
                     data_crc32: Some(fh.crc32),
                     split_before: fh.split_before,
                     split_after: fh.split_after,

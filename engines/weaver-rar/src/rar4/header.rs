@@ -35,6 +35,42 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn rar4_header_crc16(data: &[u8]) -> u16 {
+    if data.len() <= 2 {
+        return 0;
+    }
+
+    (crc32fast::hash(&data[2..]) & 0xFFFF) as u16
+}
+
+fn rar4_dictionary_size(flags: u16, is_directory: bool) -> u64 {
+    if is_directory {
+        0
+    } else {
+        0x1_0000u64 << ((flags & file_flags::WINDOW_MASK) >> 5)
+    }
+}
+
+fn rar4_file_encryption_method(
+    unpack_version: u8,
+    is_encrypted: bool,
+) -> Option<Rar4EncryptionMethod> {
+    if !is_encrypted {
+        return None;
+    }
+
+    Some(match unpack_version {
+        13 => Rar4EncryptionMethod::Rar13,
+        15 => Rar4EncryptionMethod::Rar15,
+        20 | 26 => Rar4EncryptionMethod::Rar20,
+        _ => Rar4EncryptionMethod::Rar30,
+    })
+}
+
+fn is_rar4_unix_symlink(host_os: Rar4HostOs, attributes: u32) -> bool {
+    matches!(host_os, Rar4HostOs::Unix) && (attributes & 0xF000) == 0xA000
+}
+
 /// Raw header data as read from the stream.
 #[derive(Debug)]
 pub struct RawRar4Header {
@@ -62,7 +98,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
         Err(e) => return Err(RarError::Io(e)),
     }
 
-    let _crc16 = read_u16(&buf, 0);
+    let crc16 = read_u16(&buf, 0);
     let header_type = Rar4HeaderType::from(buf[2]);
     let flags = read_u16(&buf, 3);
     let header_size = read_u16(&buf, 5);
@@ -89,6 +125,14 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
         reader
             .read_exact(&mut data[MIN_HEADER_SIZE..])
             .map_err(RarError::Io)?;
+    }
+
+    let actual_crc = rar4_header_crc16(&data);
+    if actual_crc != crc16 {
+        return Err(RarError::HeaderCrcMismatch {
+            expected: crc16 as u32,
+            actual: actual_crc as u32,
+        });
     }
 
     // Determine data area size.
@@ -144,18 +188,18 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
     // Offset 26: name length (2 bytes)
     // Offset 28: attributes (4 bytes)
     let packed_low = read_u32(data, 7) as u64;
-    let unpacked_low = read_u32(data, 11) as u64;
+    let unpacked_low = read_u32(data, 11);
     let host_os = Rar4HostOs::from(data[15]);
     let crc32 = read_u32(data, 16);
     let mtime = read_u32(data, 20);
-    let _unpack_version = data[24];
+    let unpack_version = data[24];
     let method = Rar4Method::from(data[25]);
     let name_len = read_u16(data, 26) as usize;
     let attributes = read_u32(data, 28);
 
     // High 32 bits of sizes (if LARGE flag set).
     let mut packed_size = packed_low;
-    let mut unpacked_size = unpacked_low;
+    let mut unpacked_size = Some(unpacked_low as u64);
     let mut pos = 32;
 
     if raw.flags & file_flags::LARGE != 0 {
@@ -165,10 +209,16 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
             });
         }
         let packed_high = read_u32(data, pos) as u64;
-        let unpacked_high = read_u32(data, pos + 4) as u64;
+        let unpacked_high = read_u32(data, pos + 4);
         packed_size |= packed_high << 32;
-        unpacked_size |= unpacked_high << 32;
+        unpacked_size = if unpacked_low == u32::MAX && unpacked_high == u32::MAX {
+            None
+        } else {
+            Some(((unpacked_high as u64) << 32) | unpacked_low as u64)
+        };
         pos += 8;
+    } else if unpacked_low == u32::MAX {
+        unpacked_size = None;
     }
 
     // Read filename.
@@ -210,11 +260,14 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
     // Match UnRAR's RAR4 handling: modern file headers encode directories in
     // the dictionary/window bits, not in the host-specific file attributes.
     let mut is_directory = raw.flags & file_flags::WINDOW_MASK == file_flags::DIRECTORY;
-    if data[24] < 20 && attributes & 0x10 != 0 {
+    if unpack_version < 20 && attributes & 0x10 != 0 {
         is_directory = true;
     }
+    let dict_size = rar4_dictionary_size(raw.flags, is_directory);
+    let is_unix_symlink = is_rar4_unix_symlink(host_os, attributes);
 
     let data_offset = raw.offset + raw.header_size as u64;
+    let is_encrypted = raw.flags & file_flags::ENCRYPTED != 0;
 
     Ok(Rar4FileHeader {
         flags: raw.flags,
@@ -223,10 +276,14 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
         host_os,
         crc32,
         mtime,
+        unpack_version,
         method,
+        dict_size,
         name,
         is_directory,
-        is_encrypted: raw.flags & file_flags::ENCRYPTED != 0,
+        is_unix_symlink,
+        is_encrypted,
+        encryption_method: rar4_file_encryption_method(unpack_version, is_encrypted),
         is_solid: raw.flags & file_flags::SOLID != 0,
         split_before: raw.flags & file_flags::SPLIT_BEFORE != 0,
         split_after: raw.flags & file_flags::SPLIT_AFTER != 0,
@@ -285,81 +342,101 @@ fn decode_rar4_unicode_name(data: &[u8]) -> String {
         return String::from_utf8_lossy(ascii_name).into_owned();
     }
 
-    // Decode the unicode portion. RAR4 uses a compact encoding:
-    // Bytes are processed in pairs (flags byte + data bytes).
-    // Each flags byte controls 4 character slots (2 bits each):
-    //   00 = use ASCII byte directly
-    //   01 = use ASCII byte + high byte from current state
-    //   10 = use 2-byte unicode char
-    //   11 = use ASCII byte + increment position
-    let mut result = Vec::with_capacity(ascii_name.len() * 2);
-    let mut ui = 0; // unicode data index
-    let mut ai = 0; // ascii index
-    let mut high_byte = 0u8;
+    let mut enc_pos = 0usize;
+    let mut dec_pos = 0usize;
+    let high_byte = unicode_data.get(enc_pos).copied().unwrap_or(0);
+    enc_pos = enc_pos.saturating_add(1);
 
-    while ui < unicode_data.len() {
-        let flags = unicode_data[ui];
-        ui += 1;
+    let mut flags = 0u8;
+    let mut flag_bits = 0u8;
+    let mut result = Vec::with_capacity(ascii_name.len());
 
-        for shift in (0..8).step_by(2) {
-            if ai >= ascii_name.len() {
+    while enc_pos < unicode_data.len() {
+        if flag_bits == 0 {
+            flags = unicode_data[enc_pos];
+            enc_pos += 1;
+            flag_bits = 8;
+            if enc_pos > unicode_data.len() {
                 break;
             }
+        }
 
-            let mode = (flags >> (6 - shift)) & 0x03;
-            match mode {
-                0 => {
-                    // Direct ASCII byte.
-                    result.push(ascii_name[ai] as u16);
-                    ai += 1;
+        match flags >> 6 {
+            0 => {
+                if enc_pos >= unicode_data.len() {
+                    break;
                 }
-                1 => {
-                    // ASCII byte + high byte.
-                    if ui >= unicode_data.len() {
-                        break;
-                    }
-                    result.push(unicode_data[ui] as u16 | (high_byte as u16) << 8);
-                    ui += 1;
-                    ai += 1;
+                result.resize(dec_pos + 1, 0);
+                result[dec_pos] = unicode_data[enc_pos] as u16;
+                enc_pos += 1;
+                dec_pos += 1;
+            }
+            1 => {
+                if enc_pos >= unicode_data.len() {
+                    break;
                 }
-                2 => {
-                    // Two-byte unicode character.
-                    if ui + 1 >= unicode_data.len() {
-                        break;
-                    }
-                    result.push(unicode_data[ui] as u16 | (unicode_data[ui + 1] as u16) << 8);
-                    ui += 2;
-                    ai += 1;
+                result.resize(dec_pos + 1, 0);
+                result[dec_pos] =
+                    unicode_data[enc_pos] as u16 | ((high_byte as u16) << 8);
+                enc_pos += 1;
+                dec_pos += 1;
+            }
+            2 => {
+                if enc_pos + 1 >= unicode_data.len() {
+                    break;
                 }
-                3 => {
-                    // Set high byte and copy ASCII.
-                    if ui >= unicode_data.len() {
+                result.resize(dec_pos + 1, 0);
+                result[dec_pos] =
+                    unicode_data[enc_pos] as u16 | ((unicode_data[enc_pos + 1] as u16) << 8);
+                enc_pos += 2;
+                dec_pos += 1;
+            }
+            3 => {
+                if enc_pos >= unicode_data.len() {
+                    break;
+                }
+                let mut length = unicode_data[enc_pos];
+                enc_pos += 1;
+
+                if (length & 0x80) != 0 {
+                    if enc_pos >= unicode_data.len() {
                         break;
                     }
-                    let count = unicode_data[ui] as usize;
-                    ui += 1;
-                    if ui >= unicode_data.len() {
-                        break;
-                    }
-                    high_byte = unicode_data[ui];
-                    ui += 1;
-                    for _ in 0..count {
-                        if ai >= ascii_name.len() {
+                    let correction = unicode_data[enc_pos];
+                    enc_pos += 1;
+                    for _ in 0..(((length & 0x7F) as usize) + 2) {
+                        if dec_pos >= ascii_name.len() {
                             break;
                         }
-                        result.push(ascii_name[ai] as u16 | (high_byte as u16) << 8);
-                        ai += 1;
+                        result.resize(dec_pos + 1, 0);
+                        result[dec_pos] = (((ascii_name[dec_pos] as u16)
+                            .wrapping_add(correction as u16))
+                            & 0x00FF)
+                            | ((high_byte as u16) << 8);
+                        dec_pos += 1;
+                    }
+                } else {
+                    length = length.saturating_add(2);
+                    for _ in 0..length {
+                        if dec_pos >= ascii_name.len() {
+                            break;
+                        }
+                        result.resize(dec_pos + 1, 0);
+                        result[dec_pos] = ascii_name[dec_pos] as u16;
+                        dec_pos += 1;
                     }
                 }
-                _ => unreachable!(),
             }
+            _ => unreachable!(),
         }
+
+        flags <<= 2;
+        flag_bits -= 2;
     }
 
-    // Append any remaining ASCII characters.
-    while ai < ascii_name.len() {
-        result.push(ascii_name[ai] as u16);
-        ai += 1;
+    while dec_pos < ascii_name.len() {
+        result.push(ascii_name[dec_pos] as u16);
+        dec_pos += 1;
     }
 
     String::from_utf16_lossy(&result)
@@ -426,6 +503,12 @@ pub fn read_raw_header_encrypted<R: Read>(
     // Extract the actual header bytes (header_size bytes, ignoring padding).
     let data = decrypted[..header_size as usize].to_vec();
 
+    let expected_crc = read_u16(&data, 0);
+    let actual_crc = rar4_header_crc16(&data);
+    if actual_crc != expected_crc {
+        return Err(RarError::InvalidPassword);
+    }
+
     // Determine data area size (same logic as plaintext).
     let data_area_size = if flags & common_flags::HAS_DATA != 0 {
         if data.len() >= 11 {
@@ -476,6 +559,8 @@ mod tests {
         buf.extend_from_slice(&header_size.to_le_bytes());
         // Extra data
         buf.extend_from_slice(extra_data);
+        let crc16 = rar4_header_crc16(&buf);
+        buf[0..2].copy_from_slice(&crc16.to_le_bytes());
         buf
     }
 
@@ -532,10 +617,12 @@ mod tests {
 
         assert_eq!(fh.name, "test.txt");
         assert_eq!(fh.packed_size, 100);
-        assert_eq!(fh.unpacked_size, 200);
+        assert_eq!(fh.unpacked_size, Some(200));
         assert_eq!(fh.host_os, Rar4HostOs::Unix);
         assert_eq!(fh.crc32, 0xDEADBEEF);
         assert_eq!(fh.method, Rar4Method::Normal);
+        assert_eq!(fh.unpack_version, 29);
+        assert_eq!(fh.dict_size, 0x1_0000);
         assert!(!fh.is_encrypted);
         assert!(!fh.is_directory);
     }
@@ -564,7 +651,78 @@ mod tests {
         let fh = parse_file_header(&raw).unwrap();
 
         assert_eq!(fh.packed_size, 0x1_FFFFFFFF);
-        assert_eq!(fh.unpacked_size, 0x2_FFFFFFFF);
+        assert_eq!(fh.unpacked_size, Some(0x2_FFFF_FFFF));
+    }
+
+    #[test]
+    fn test_parse_file_header_unknown_unpacked_size_without_large() {
+        let name = b"stream.bin";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&123u32.to_le_bytes());
+        extra.extend_from_slice(&u32::MAX.to_le_bytes());
+        extra.push(2);
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(29);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x74, 0, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert_eq!(fh.unpacked_size, None);
+    }
+
+    #[test]
+    fn test_parse_file_header_tracks_rar4_encryption_method_without_salt() {
+        let name = b"enc.bin";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&64u32.to_le_bytes());
+        extra.extend_from_slice(&64u32.to_le_bytes());
+        extra.push(3);
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(20);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x74, file_flags::ENCRYPTED, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert!(fh.is_encrypted);
+        assert_eq!(fh.salt, None);
+        assert_eq!(fh.encryption_method, Some(Rar4EncryptionMethod::Rar20));
+    }
+
+    #[test]
+    fn test_parse_file_header_detects_unix_symlink() {
+        let name = b"link";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(3); // Unix
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.extend_from_slice(&0u32.to_le_bytes());
+        extra.push(29);
+        extra.push(0x30);
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(&0xA000u32.to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x74, 0, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let fh = parse_file_header(&raw).unwrap();
+
+        assert!(fh.is_unix_symlink);
     }
 
     #[test]
@@ -656,6 +814,14 @@ mod tests {
     }
 
     #[test]
+    fn test_unicode_name_mode3_correction_matches_unrar_layout() {
+        let data = [b'a', b'b', 0, 0x01, 0xC0, 0x80, 0x00];
+        let result = decode_rar4_unicode_name(&data);
+        let units: Vec<u16> = result.encode_utf16().collect();
+        assert_eq!(units, vec![0x0161, 0x0162]);
+    }
+
+    #[test]
     fn test_end_header() {
         let data = build_raw_header(0x7B, 0x0001, &[]);
         let mut cursor = Cursor::new(data);
@@ -673,5 +839,14 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = read_raw_header(&mut cursor);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_header_crc_mismatch_is_rejected() {
+        let mut data = build_raw_header(0x73, 0x0000, &[0x00; 6]);
+        data[2] ^= 0x01;
+        let mut cursor = Cursor::new(data);
+        let result = read_raw_header(&mut cursor);
+        assert!(matches!(result, Err(RarError::HeaderCrcMismatch { .. })));
     }
 }

@@ -363,6 +363,9 @@ impl RarArchive {
             .unwrap_or(first_vol);
         let total_compressed: u64 = entry.segments.iter().map(|s| s.data_size).sum();
 
+        let rar4_unix_symlink = self.format == ArchiveFormat::Rar4
+            && matches!(fh.host_os, crate::types::HostOs::Unix)
+            && (fh.attributes.0 & 0xF000) == 0xA000;
         let (is_symlink, is_hardlink, link_target) = match &entry.redirection {
             Some(redir) => {
                 let is_sym = matches!(
@@ -374,7 +377,7 @@ impl RarArchive {
                 let is_hard = matches!(redir.redir_type, header::RedirectionType::Hardlink);
                 (is_sym, is_hard, Some(redir.target.clone()))
             }
-            None => (false, false, None),
+            None => (rar4_unix_symlink, false, None),
         };
 
         MemberInfo {

@@ -27,7 +27,7 @@ impl RarArchive {
             let skip_fh = skip_entry.file_header;
 
             if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
+                let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
                 let base_reader = ArchiveSegmentReader::new(
                     &mut self.volumes,
                     &self.limits,
@@ -45,18 +45,13 @@ impl RarArchive {
                         .to_owned();
 
                     if self.format == ArchiveFormat::Rar4 {
-                        let salt =
-                            skip_entry
-                                .rar4_salt
-                                .ok_or_else(|| RarError::CorruptArchive {
-                                    detail: format!(
-                                        "RAR4 member {} is marked encrypted but has no salt",
-                                        skip_fh.name,
-                                    ),
-                                })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(&password, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &skip_fh,
+                            &password,
+                            skip_entry.rar4_salt,
+                        )?;
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -154,7 +149,7 @@ impl RarArchive {
             let skip_fh = skip_entry.file_header;
 
             if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_unpacked = skip_fh.unpacked_size.unwrap_or(0);
+                let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
                 let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
                 let base_reader = ChainedSegmentReader::new(&segments, provider).with_continuation(
                     skip_fh.split_after,
@@ -172,18 +167,13 @@ impl RarArchive {
                         .to_owned();
 
                     if self.format == ArchiveFormat::Rar4 {
-                        let salt =
-                            skip_entry
-                                .rar4_salt
-                                .ok_or_else(|| RarError::CorruptArchive {
-                                    detail: format!(
-                                        "RAR4 member {} is marked encrypted but has no salt",
-                                        skip_fh.name,
-                                    ),
-                                })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(&password, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &skip_fh,
+                            &password,
+                            skip_entry.rar4_salt,
+                        )?;
                         Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -248,6 +238,34 @@ impl RarArchive {
         }
 
         Ok(())
+    }
+
+    fn decode_target_unpacked_size(fh: &FileHeader) -> u64 {
+        fh.unpacked_size.unwrap_or(u64::MAX)
+    }
+
+    fn output_capacity_hint(fh: &FileHeader) -> usize {
+        fh.unpacked_size
+            .unwrap_or(0)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn wrap_rar4_encrypted_reader<R: Read>(
+        kdf_cache: &crate::crypto::KdfCache,
+        reader: R,
+        fh: &FileHeader,
+        password: &str,
+        rar4_salt: Option<[u8; 8]>,
+    ) -> RarResult<crate::crypto::DecryptingReader<R>> {
+        let method =
+            crate::rar4::types::Rar4EncryptionMethod::for_unpack_version(fh.compression.version);
+        Ok(match method {
+            crate::rar4::types::Rar4EncryptionMethod::Rar30 => {
+                let (key, iv) = kdf_cache.derive_key_rar4(password, rar4_salt.as_ref());
+                crate::crypto::DecryptingReader::new_rar4(reader, &key, &iv)
+            }
+            legacy => crate::crypto::DecryptingReader::new_rar4_legacy(reader, legacy, password),
+        })
     }
 
     fn copy_reader_to_writer<R: Read, W: Write>(
@@ -386,7 +404,7 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
         // When HASHMAC is set, CRC/BLAKE2 values are HMAC-transformed and
         // cannot be verified without HashKey from unrar's custom PBKDF2 chain.
         let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
@@ -410,7 +428,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let capacity = Self::output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (written, actual_crc, actual_blake) = {
@@ -425,16 +443,14 @@ impl RarArchive {
 
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
-                        let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                fh.name,
-                            ),
-                        })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &fh,
+                            pwd,
+                            rar4_salt,
+                        )?;
+                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
                     } else {
                         let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
                             detail: format!(
@@ -462,7 +478,7 @@ impl RarArchive {
                             &key,
                             &enc_info.iv,
                         );
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
+                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
                     }
                 } else {
                     Self::copy_reader_to_writer(base_reader, &mut hash_writer, None)?
@@ -515,7 +531,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let capacity = Self::output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let decrypt_key = if let Some(ref pwd) = member_password {
@@ -617,7 +633,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let capacity = Self::output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let actual_crc = {
@@ -626,14 +642,13 @@ impl RarArchive {
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let mut crc_writer = CrcWriter::new(&mut output, expected_crc.is_some());
                 if let Some(ref pwd) = member_password {
-                    let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4 member {} is marked encrypted but has no salt",
-                            fh.name,
-                        ),
-                    })?;
-                    let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                    let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                    let reader = Self::wrap_rar4_encrypted_reader(
+                        &self.kdf_cache,
+                        base_reader,
+                        &fh,
+                        pwd,
+                        rar4_salt,
+                    )?;
                     crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
                         reader,
                         unpacked_size,
@@ -699,7 +714,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let capacity = Self::output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (actual_crc, actual_blake) = {
@@ -714,15 +729,13 @@ impl RarArchive {
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
-                        let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                fh.name,
-                            ),
-                        })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &fh,
+                            pwd,
+                            rar4_salt,
+                        )?;
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -859,7 +872,7 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
         let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
 
         if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
@@ -897,16 +910,14 @@ impl RarArchive {
 
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
-                        let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                fh.name,
-                            ),
-                        })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &fh,
+                            pwd,
+                            rar4_salt,
+                        )?;
+                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
                     } else {
                         let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
                             detail: format!(
@@ -934,7 +945,7 @@ impl RarArchive {
                             &key,
                             &enc_info.iv,
                         );
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, Some(unpacked_size))?
+                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
                     }
                 } else {
                     Self::copy_reader_to_writer(base_reader, &mut hash_writer, None)?
@@ -1071,33 +1082,35 @@ impl RarArchive {
                 ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
 
             let do_crc = expected_crc.is_some();
-            let actual_crc = {
+            let (written, actual_crc) = {
                 let mut crc_writer = CrcWriter::new(&mut writer, do_crc);
-                if let Some(ref pwd) = member_password {
-                    let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4 member {} is marked encrypted but has no salt",
-                            fh.name,
-                        ),
-                    })?;
-                    let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                    let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                let written = if let Some(ref pwd) = member_password {
+                    let reader = Self::wrap_rar4_encrypted_reader(
+                        &self.kdf_cache,
+                        base_reader,
+                        &fh,
+                        pwd,
+                        rar4_salt,
+                    )?;
                     crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
                         reader,
                         unpacked_size,
                         fh.compression.dict_size,
                         &mut crc_writer,
-                    )?;
+                    )?
                 } else {
                     crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
                         base_reader,
                         unpacked_size,
                         fh.compression.dict_size,
                         &mut crc_writer,
-                    )?;
-                }
+                    )?
+                };
                 crc_writer.flush().map_err(RarError::Io)?;
-                expected_crc.map(|_| crc_writer.finalize_crc())
+                let actual_crc = expected_crc.map(|_| crc_writer.finalize_crc());
+                drop(crc_writer);
+                writer.flush().map_err(RarError::Io)?;
+                (written, actual_crc)
             };
 
             if let (Some(expected), Some(actual)) = (expected_crc, actual_crc)
@@ -1111,11 +1124,11 @@ impl RarArchive {
             }
 
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
-                p.on_member_progress(mi, unpacked_size);
+                p.on_member_progress(mi, written);
                 p.on_member_complete(mi, &Ok(()));
             }
 
-            return Ok(unpacked_size);
+            return Ok(written);
         }
 
         if is_solid && fh.compression.method != CompressionMethod::Store {
@@ -1145,15 +1158,13 @@ impl RarArchive {
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format == ArchiveFormat::Rar4 {
-                        let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR4 member {} is marked encrypted but has no salt",
-                                fh.name,
-                            ),
-                        })?;
-                        let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                        let reader =
-                            crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                        let reader = Self::wrap_rar4_encrypted_reader(
+                            &self.kdf_cache,
+                            base_reader,
+                            &fh,
+                            pwd,
+                            rar4_salt,
+                        )?;
                         Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
@@ -1277,7 +1288,7 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let rar4_salt = entry.rar4_salt;
         let archive_format = self.format;
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
         let skip_hash_verify = file_enc.as_ref().is_some_and(|fe| fe.use_hash_mac);
 
         if !self.is_solid {
@@ -1306,15 +1317,13 @@ impl RarArchive {
 
             let chunks = if let Some(ref pwd) = member_password {
                 if archive_format == ArchiveFormat::Rar4 {
-                    let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4 member {} is marked encrypted but has no salt",
-                            fh.name,
-                        ),
-                    })?;
-                    let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                    let reader =
-                        crate::crypto::DecryptingReader::new_rar4(tracking_reader, &key, &iv);
+                    let reader = Self::wrap_rar4_encrypted_reader(
+                        &self.kdf_cache,
+                        tracking_reader,
+                        &fh,
+                        pwd,
+                        rar4_salt,
+                    )?;
                     Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
@@ -1403,14 +1412,13 @@ impl RarArchive {
 
         let chunks = if let Some(ref pwd) = member_password {
             if archive_format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                let reader = crate::crypto::DecryptingReader::new_rar4(base_reader, &key, &iv);
+                let reader = Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    base_reader,
+                    &fh,
+                    pwd,
+                    rar4_salt,
+                )?;
                 Self::copy_reader_to_writer_chunked(
                     reader,
                     Arc::clone(&volume_tracker),
@@ -1423,7 +1431,7 @@ impl RarArchive {
                             blake2: shared_blake.as_ref().map(Arc::clone),
                         }))
                     },
-                    Some(unpacked_size),
+                    fh.unpacked_size,
                 )?
             } else {
                 let enc_info = file_enc.as_ref().ok_or_else(|| RarError::CorruptArchive {
@@ -1461,7 +1469,7 @@ impl RarArchive {
                             blake2: shared_blake.as_ref().map(Arc::clone),
                         }))
                     },
-                    Some(unpacked_size),
+                    fh.unpacked_size,
                 )?
             }
         } else {
@@ -1729,7 +1737,7 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
 
         let member_password = if is_encrypted {
             let pwd = options
@@ -1887,7 +1895,7 @@ impl RarArchive {
         let chained = ChainedSegmentReader::new(&segments, provider)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
 
         let (written, actual_crc, actual_blake) = {
             let mut hash_writer = HashingWriter::new(
@@ -1898,14 +1906,13 @@ impl RarArchive {
 
             let written = if let Some(pwd) = password {
                 if self.format == ArchiveFormat::Rar4 {
-                    let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4 member {} is marked encrypted but has no salt",
-                            fh.name,
-                        ),
-                    })?;
-                    let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                    let reader = crate::crypto::DecryptingReader::new_rar4(chained, &key, &iv);
+                    let reader = Self::wrap_rar4_encrypted_reader(
+                        &self.kdf_cache,
+                        chained,
+                        fh,
+                        pwd,
+                        rar4_salt,
+                    )?;
                     Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
@@ -2044,18 +2051,15 @@ impl RarArchive {
             u64::MAX
         };
 
-        let mut reader: Box<dyn Read> = if let Some(pwd) = password {
+        let mut reader: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name,
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                Box::new(crate::crypto::DecryptingReader::new_rar4(
-                    chained, &key, &iv,
-                ))
+                Box::new(Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    chained,
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?)
             } else {
                 let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
                     detail: format!(
@@ -2175,18 +2179,15 @@ impl RarArchive {
             .with_metadata_sink(Rc::clone(&cont_meta));
 
         // Wrap in DecryptingReader if encrypted.
-        let inner: Box<dyn Read> = if let Some(pwd) = password {
+        let inner: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name,
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                Box::new(crate::crypto::DecryptingReader::new_rar4(
-                    chained, &key, &iv,
-                ))
+                Box::new(Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    chained,
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?)
             } else {
                 let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
                     detail: format!(
@@ -2314,7 +2315,7 @@ impl RarArchive {
         let is_solid = fh.compression.solid;
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
 
         let member_password = if is_encrypted {
             let pwd = options
@@ -2439,18 +2440,15 @@ impl RarArchive {
             u64::MAX
         };
 
-        let mut reader: Box<dyn Read> = if let Some(pwd) = password {
+        let mut reader: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                Box::new(crate::crypto::DecryptingReader::new_rar4(
-                    chained, &key, &iv,
-                ))
+                Box::new(Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    chained,
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?)
             } else {
                 let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
                     detail: format!(
@@ -2596,18 +2594,17 @@ impl RarArchive {
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let tracking_reader = VolumeTrackingReader::new(chained, volume_tracker)
             .with_shared_transitions(Arc::clone(&shared_transitions));
-        let unpacked_size = fh.unpacked_size.unwrap_or(0);
+        let unpacked_size = Self::decode_target_unpacked_size(&fh);
 
         let chunks = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name,
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                let reader = crate::crypto::DecryptingReader::new_rar4(tracking_reader, &key, &iv);
+                let reader = Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    tracking_reader,
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?;
                 Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
@@ -2705,18 +2702,15 @@ impl RarArchive {
             .with_volume_tracker(Arc::clone(&volume_tracker));
 
         // Build reader chain, wrapping in DecryptingReader if encrypted.
-        let inner: Box<dyn Read> = if let Some(pwd) = password {
+        let inner: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
-                let salt = rar4_salt.ok_or_else(|| RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4 member {} is marked encrypted but has no salt",
-                        fh.name
-                    ),
-                })?;
-                let (key, iv) = self.kdf_cache.derive_key_rar4(pwd, &salt);
-                Box::new(crate::crypto::DecryptingReader::new_rar4(
-                    chained, &key, &iv,
-                ))
+                Box::new(Self::wrap_rar4_encrypted_reader(
+                    &self.kdf_cache,
+                    chained,
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?)
             } else {
                 let enc_info = file_encryption.ok_or_else(|| RarError::CorruptArchive {
                     detail: format!(
