@@ -14,13 +14,14 @@ pub struct IfscPacket {
 
 /// Size of one checksum entry: 4 bytes CRC32 + 16 bytes MD5.
 const CHECKSUM_ENTRY_SIZE: usize = 20;
+const MAX_CHECKSUM_ENTRIES: usize = 32_768;
 
 impl IfscPacket {
     /// Parse an IFSC packet from its body (after the 64-byte header).
     pub fn parse(body: &[u8]) -> Result<Self> {
-        if body.len() < 16 {
+        if body.len() <= 16 {
             return Err(Par2Error::InvalidIfscPacket {
-                reason: format!("body too short: {} bytes, need at least 16", body.len()),
+                reason: format!("body too short: {} bytes, need more than 16", body.len()),
             });
         }
 
@@ -38,6 +39,13 @@ impl IfscPacket {
         }
 
         let count = checksum_area.len() / CHECKSUM_ENTRY_SIZE;
+        if count > MAX_CHECKSUM_ENTRIES {
+            return Err(Par2Error::InvalidIfscPacket {
+                reason: format!(
+                    "checksum entry count {count} exceeds maximum {MAX_CHECKSUM_ENTRIES}"
+                ),
+            });
+        }
         let mut checksums = Vec::with_capacity(count);
 
         for i in 0..count {
@@ -88,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_ifsc_no_checksums() {
+    fn reject_ifsc_no_checksums() {
         let body = make_ifsc_body([0; 16], &[]);
-        let pkt = IfscPacket::parse(&body).unwrap();
-        assert_eq!(pkt.checksums.len(), 0);
+        let err = IfscPacket::parse(&body).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidIfscPacket { .. }));
     }
 
     #[test]

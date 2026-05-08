@@ -196,12 +196,16 @@ impl RarArchive {
 
             if let Some(existing) = existing {
                 // We already have a later continuation — insert this segment at front.
+                let authoritative_hash =
+                    (!existing.file_header.split_after).then(|| existing.hash.clone());
                 existing.segments.insert(0, segment);
                 existing.file_header = entry.file_header;
                 existing.is_encrypted = entry.is_encrypted;
                 existing.file_encryption = entry.file_encryption;
                 existing.rar4_salt = entry.rar4_salt;
-                if entry.hash.is_some() {
+                if let Some(hash) = authoritative_hash {
+                    existing.hash = hash;
+                } else if entry.hash.is_some() {
                     existing.hash = entry.hash;
                 }
                 if entry.redirection.is_some() {
@@ -328,7 +332,9 @@ impl RarArchive {
         if existing.rar4_salt.is_none() && incoming_entry.rar4_salt.is_some() {
             existing.rar4_salt = incoming_entry.rar4_salt;
         }
-        if existing.hash.is_none() && incoming_entry.hash.is_some() {
+        if !incoming_header.split_after {
+            existing.hash = incoming_entry.hash.clone();
+        } else if existing.hash.is_none() && incoming_entry.hash.is_some() {
             existing.hash = incoming_entry.hash.clone();
         }
         if existing.redirection.is_none() && incoming_entry.redirection.is_some() {
@@ -351,7 +357,9 @@ mod tests {
 
     use crate::header::file::FileHeader;
     use crate::limits::Limits;
-    use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod, FileAttributes, HostOs};
+    use crate::types::{
+        ArchiveFormat, CompressionInfo, CompressionMethod, FileAttributes, FileHash, HostOs,
+    };
 
     fn test_file_header(
         name: &str,
@@ -448,6 +456,47 @@ mod tests {
                 .map(|segment| segment.volume_index)
                 .collect::<Vec<_>>(),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn merge_member_metadata_prefers_final_continuation_blake2_hash() {
+        let first_hash = [0x11; 32];
+        let final_hash = [0x22; 32];
+        let mut archive = empty_archive(vec![test_member(
+            "episode.mkv",
+            1,
+            false,
+            true,
+            Some(0x1111_1111),
+        )]);
+        archive.members[0].hash = Some(FileHash::Blake2sp(first_hash));
+        let mut continuation = test_member("", 2, true, false, Some(0x2222_2222));
+        continuation.hash = Some(FileHash::Blake2sp(final_hash));
+
+        archive.integrate_member(2, continuation);
+
+        assert_eq!(
+            archive.members[0].hash,
+            Some(FileHash::Blake2sp(final_hash))
+        );
+    }
+
+    #[test]
+    fn integrate_member_preserves_out_of_order_final_blake2_hash() {
+        let first_hash = [0x11; 32];
+        let final_hash = [0x22; 32];
+        let mut continuation = test_member("episode.mkv", 2, true, false, Some(0x2222_2222));
+        continuation.hash = Some(FileHash::Blake2sp(final_hash));
+        let mut archive = empty_archive(vec![continuation]);
+        let mut first = test_member("episode.mkv", 1, false, true, Some(0x1111_1111));
+        first.hash = Some(FileHash::Blake2sp(first_hash));
+
+        archive.integrate_member(1, first);
+
+        assert_eq!(
+            archive.members[0].hash,
+            Some(FileHash::Blake2sp(final_hash))
         );
     }
 }

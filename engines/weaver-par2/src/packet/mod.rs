@@ -15,6 +15,9 @@ use tracing::{debug, trace, warn};
 use crate::error::{Par2Error, Result};
 use crate::types::RecoverySetId;
 
+const MAX_STREAMED_NON_RECOVERY_BODY_BYTES: usize = 1024 * 1024;
+const MAX_PACKETS_PER_SCAN: usize = 65_536;
+
 pub use creator::CreatorPacket;
 pub use file_desc::FileDescriptionPacket;
 pub use file_verify::IfscPacket;
@@ -36,6 +39,13 @@ pub enum Packet {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct ScannedPacket {
+    pub packet: Packet,
+    pub offset: u64,
+    pub recovery_set_id: RecoverySetId,
+}
+
 /// Parse a single packet from a byte slice that starts at the packet header.
 ///
 /// Returns the parsed packet and the number of bytes consumed.
@@ -46,7 +56,10 @@ fn parse_packet_internal(
     recovery_path: Option<&Path>,
 ) -> Result<(Packet, usize)> {
     let header = PacketHeader::parse(data, offset)?;
-    let total_len = header.length as usize;
+    let total_len =
+        usize::try_from(header.length).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: format!("packet length {} exceeds addressable memory", header.length),
+        })?;
 
     if data.len() < total_len {
         return Err(Par2Error::PacketTooShort {
@@ -76,9 +89,9 @@ fn parse_packet_internal(
         PacketType::RecoverySlice => {
             debug!("parsed RecoverySlice packet at offset {offset}");
             if let Some(path) = recovery_path {
-                if body.len() < 4 {
+                if body.len() <= 4 {
                     return Err(Par2Error::InvalidRecoveryPacket {
-                        reason: format!("body too short: {} bytes, need at least 4", body.len()),
+                        reason: format!("body too short: {} bytes, need more than 4", body.len()),
                     });
                 }
                 let exponent = u32::from_le_bytes(body[0..4].try_into().unwrap());
@@ -96,10 +109,18 @@ fn parse_packet_internal(
         }
         PacketType::Creator => {
             debug!("parsed Creator packet at offset {offset}");
-            Packet::Creator(CreatorPacket::parse(body))
+            Packet::Creator(CreatorPacket::parse(body)?)
         }
         PacketType::Unknown(sig) => {
             debug!("parsed Unknown packet type at offset {offset}");
+            if body.len() > MAX_STREAMED_NON_RECOVERY_BODY_BYTES {
+                return Err(Par2Error::ResourceLimitExceeded {
+                    reason: format!(
+                        "unknown packet body at offset {offset} is {} bytes; max is {MAX_STREAMED_NON_RECOVERY_BODY_BYTES}",
+                        body.len()
+                    ),
+                });
+            }
             Packet::Unknown {
                 packet_type: sig,
                 body: body.to_vec(),
@@ -124,7 +145,7 @@ fn parse_packet_body(header: &PacketHeader, body: Vec<u8>) -> Result<Packet> {
             Packet::InputFileSliceChecksum(IfscPacket::parse(&body)?)
         }
         PacketType::RecoverySlice => Packet::RecoverySlice(RecoverySlicePacket::parse(&body)?),
-        PacketType::Creator => Packet::Creator(CreatorPacket::parse(&body)),
+        PacketType::Creator => Packet::Creator(CreatorPacket::parse(&body)?),
         PacketType::Unknown(sig) => Packet::Unknown {
             packet_type: sig,
             body,
@@ -158,6 +179,10 @@ fn scan_packets_internal(
         match parse_packet_internal(&data[pos..], offset, recovery_path) {
             Ok((packet, consumed)) => {
                 trace!("packet at offset {offset}, size {consumed}");
+                if packets.len() >= MAX_PACKETS_PER_SCAN {
+                    warn!("stopping PAR2 packet scan after {MAX_PACKETS_PER_SCAN} packets");
+                    break;
+                }
                 packets.push((packet, offset));
                 pos += consumed;
             }
@@ -244,7 +269,20 @@ fn parse_non_recovery_packet_from_reader(
     header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
 ) -> Result<Packet> {
-    let body_len = header.body_length() as usize;
+    let body_len =
+        usize::try_from(header.body_length()).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "packet body length {} exceeds addressable memory",
+                header.body_length()
+            ),
+        })?;
+    if body_len > MAX_STREAMED_NON_RECOVERY_BODY_BYTES {
+        return Err(Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "non-recovery packet body at offset {offset} is {body_len} bytes; max is {MAX_STREAMED_NON_RECOVERY_BODY_BYTES}"
+            ),
+        });
+    }
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).map_err(Par2Error::Io)?;
     validate_streamed_hash(header, header_bytes, &body, offset)?;
@@ -258,10 +296,16 @@ fn parse_recovery_packet_from_reader(
     offset: u64,
     path: &Path,
 ) -> Result<Packet> {
-    let body_len = header.body_length() as usize;
-    if body_len < 4 {
+    let body_len =
+        usize::try_from(header.body_length()).map_err(|_| Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "packet body length {} exceeds addressable memory",
+                header.body_length()
+            ),
+        })?;
+    if body_len <= 4 {
         return Err(Par2Error::InvalidRecoveryPacket {
-            reason: format!("body too short: {body_len} bytes, need at least 4"),
+            reason: format!("body too short: {body_len} bytes, need more than 4"),
         });
     }
 
@@ -297,7 +341,7 @@ fn parse_recovery_packet_from_reader(
     }))
 }
 
-pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(Packet, u64)>> {
+pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPacket>> {
     let file = File::open(path).map_err(Par2Error::Io)?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut packets = Vec::new();
@@ -344,7 +388,19 @@ pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(Packet, u64)>> {
 
         match packet {
             Ok(packet) => {
-                packets.push((packet, packet_offset));
+                if packets.len() >= MAX_PACKETS_PER_SCAN {
+                    return Err(Par2Error::ResourceLimitExceeded {
+                        reason: format!(
+                            "packet scan found more than {MAX_PACKETS_PER_SCAN} packets in {}",
+                            path.display()
+                        ),
+                    });
+                }
+                packets.push(ScannedPacket {
+                    packet,
+                    offset: packet_offset,
+                    recovery_set_id: header.recovery_set_id,
+                });
                 offset = packet_offset + header.length;
             }
             Err(_) => {
@@ -357,6 +413,15 @@ pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(Packet, u64)>> {
     }
 
     Ok(packets)
+}
+
+pub fn scan_packets_from_path(path: &Path) -> Result<Vec<(Packet, u64)>> {
+    scan_packets_from_path_with_set_ids(path).map(|packets| {
+        packets
+            .into_iter()
+            .map(|packet| (packet.packet, packet.offset))
+            .collect()
+    })
 }
 
 /// Find the byte offset of the next PAR2 magic sequence in `data`.

@@ -109,8 +109,7 @@ fn parse_rar5_header(data: &[u8], offset: usize) -> Result<ParsedRar5Header, usi
     let body = remaining[body_start..total].to_vec();
 
     let (header_type, n) = vint::read_vint(&body).map_err(|_| offset + total)?;
-    let (header_flags, mut body_pos) =
-        vint::read_vint(&body[n..]).map_err(|_| offset + total)?;
+    let (header_flags, mut body_pos) = vint::read_vint(&body[n..]).map_err(|_| offset + total)?;
     body_pos += n;
 
     if header_flags & 0x0001 != 0 {

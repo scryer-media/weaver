@@ -1,6 +1,8 @@
 use crate::error::{Par2Error, Result};
 use crate::types::{FileId, RecoverySetId};
 
+const MAX_FILE_IDS: usize = 32_768;
+
 /// Parsed Main packet.
 ///
 /// Contains the slice size and lists of file IDs for recovery and non-recovery files.
@@ -52,6 +54,11 @@ impl MainPacket {
         }
 
         let total_ids = file_id_area.len() / 16;
+        if total_ids > MAX_FILE_IDS {
+            return Err(Par2Error::InvalidMainPacket {
+                reason: format!("file ID count {total_ids} exceeds maximum {MAX_FILE_IDS}"),
+            });
+        }
         if recovery_file_count > total_ids {
             return Err(Par2Error::InvalidMainPacket {
                 reason: format!(

@@ -19,10 +19,12 @@ use crate::error::{Par2Error, Result};
 use crate::gf;
 use crate::matrix;
 use crate::par2_set::Par2FileSet;
-use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
+use crate::types::{
+    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressStage, ProgressUpdate,
+};
 use crate::verify::{FileAccess, Repairability, VerificationResult};
 
-const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const XOR_OUT_PAR_CHUNK: usize = 16;
 const XOR_OUT_INPUT_GROUP: usize = 3;
 
@@ -81,9 +83,25 @@ pub fn plan_repair(
     let mut global_to_file: Vec<(FileId, u32)> = Vec::new();
     for file_id in &par2_set.recovery_file_ids {
         if let Some(desc) = par2_set.file_description(file_id) {
-            let slice_count = par2_set.slice_count_for_file(desc.length);
+            let slice_count =
+                usize::try_from(par2_set.slice_count_for_file(desc.length)).map_err(|_| {
+                    Par2Error::ResourceLimitExceeded {
+                        reason: format!(
+                            "file {} has more than {MAX_SLICES_PER_FILE} addressable PAR2 slices",
+                            desc.filename
+                        ),
+                    }
+                })?;
+            if slice_count > MAX_SLICES_PER_FILE {
+                return Err(Par2Error::ResourceLimitExceeded {
+                    reason: format!(
+                        "file {} has {slice_count} PAR2 slices; max is {MAX_SLICES_PER_FILE}",
+                        desc.filename
+                    ),
+                });
+            }
             for s in 0..slice_count {
-                global_to_file.push((*file_id, s));
+                global_to_file.push((*file_id, s as u32));
             }
         }
     }
@@ -99,7 +117,23 @@ pub fn plan_repair(
             Some(d) => d,
             None => continue,
         };
-        let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
+        let slice_count =
+            usize::try_from(par2_set.slice_count_for_file(desc.length)).map_err(|_| {
+                Par2Error::ResourceLimitExceeded {
+                    reason: format!(
+                        "file {} has more than {MAX_SLICES_PER_FILE} addressable PAR2 slices",
+                        desc.filename
+                    ),
+                }
+            })?;
+        if slice_count > MAX_SLICES_PER_FILE {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: format!(
+                    "file {} has {slice_count} PAR2 slices; max is {MAX_SLICES_PER_FILE}",
+                    desc.filename
+                ),
+            });
+        }
 
         // Find this file's verification result.
         let file_verif = verification.files.iter().find(|fv| fv.file_id == *file_id);
@@ -123,7 +157,8 @@ pub fn plan_repair(
     // Select recovery exponents. Try the first N available; if the decode
     // matrix is singular (bad recovery block), skip that exponent and retry
     // with the next available one.
-    let all_exponents: Vec<u32> = par2_set.recovery_slices.keys().copied().collect();
+    let mut all_exponents: Vec<u32> = par2_set.recovery_slices.keys().copied().collect();
+    all_exponents.sort_unstable();
 
     if all_exponents.len() < missing_count {
         return Err(Par2Error::InsufficientRecoveryData {
@@ -132,19 +167,31 @@ pub fn plan_repair(
             deficit: (missing_count - all_exponents.len()) as u32,
         });
     }
+    if estimated_decode_matrix_bytes(missing_count) > DEFAULT_REPAIR_MEMORY_LIMIT {
+        return Err(Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "decode matrix for {missing_count} missing slices would exceed the {} byte repair memory limit",
+                DEFAULT_REPAIR_MEMORY_LIMIT
+            ),
+        });
+    }
 
     // Compute constants for all input slices.
     let constants = gf::input_slice_constants(total_input_slices);
 
     // Try building the decode matrix, skipping singular recovery blocks.
-    let mut skip_set: Vec<usize> = Vec::new();
+    let mut skip_set: HashSet<usize> = HashSet::new();
     let (recovery_exponents, decode) = loop {
-        let selected: Vec<u32> = all_exponents
+        let selected_indices: Vec<usize> = all_exponents
             .iter()
             .enumerate()
             .filter(|(i, _)| !skip_set.contains(i))
-            .map(|(_, &e)| e)
+            .map(|(i, _)| i)
             .take(missing_count)
+            .collect();
+        let selected: Vec<u32> = selected_indices
+            .iter()
+            .map(|&idx| all_exponents[idx])
             .collect();
 
         if selected.len() < missing_count {
@@ -158,18 +205,35 @@ pub fn plan_repair(
         match matrix::build_decode_matrix(&missing_global_indices, &selected, &constants) {
             Ok(decode) => break (selected, decode),
             Err(Par2Error::ReedSolomonError { .. }) => {
-                // Find which exponent to skip: try removing each one from the
-                // current selection until we find the culprit, or just skip
-                // the last one added (simplest heuristic).
-                let skip_idx = all_exponents
-                    .iter()
-                    .position(|e| *e == *selected.last().unwrap())
-                    .unwrap();
+                let mut skip_idx = None;
+                for candidate_idx in &selected_indices {
+                    let trial: Vec<u32> = all_exponents
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| !skip_set.contains(idx) && idx != candidate_idx)
+                        .map(|(_, &exponent)| exponent)
+                        .take(missing_count)
+                        .collect();
+                    if trial.len() < missing_count {
+                        continue;
+                    }
+                    if matrix::build_decode_matrix(&missing_global_indices, &trial, &constants)
+                        .is_ok()
+                    {
+                        skip_idx = Some(*candidate_idx);
+                        break;
+                    }
+                }
+                let skip_idx = skip_idx.unwrap_or_else(|| {
+                    *selected_indices
+                        .last()
+                        .expect("singular repair selection must contain at least one row")
+                });
                 warn!(
                     "recovery exponent {} produced singular matrix, skipping",
-                    selected.last().unwrap()
+                    all_exponents[skip_idx]
                 );
-                skip_set.push(skip_idx);
+                skip_set.insert(skip_idx);
             }
             Err(e) => return Err(e),
         }
@@ -201,11 +265,11 @@ pub struct RepairOptions {
     pub progress: Option<ProgressCallback>,
     /// Maximum transient repair workspace size in bytes.
     ///
-    /// If `Some(limit)`, repair chooses the in-memory fast path only when its
+    /// Repair chooses the in-memory fast path only when its
     /// estimated working set fits within `limit`; otherwise it switches to the
     /// streamed chunk path and sizes chunk buffers from this budget.
     ///
-    /// If `None`, repair always uses the in-memory fast path.
+    /// If `None`, the crate default bounded repair budget is used.
     pub memory_limit: Option<usize>,
 }
 
@@ -249,9 +313,19 @@ fn check_cancel(options: &RepairOptions) -> Result<()> {
 }
 
 fn estimated_in_memory_repair_bytes(plan: &RepairPlan) -> usize {
+    let slice_size = plan.slice_size as usize;
+    let scratch_slices = XOR_OUT_INPUT_GROUP + 1;
     plan.missing_slices
         .len()
-        .saturating_mul(plan.slice_size as usize)
+        .saturating_mul(slice_size)
+        .saturating_mul(2)
+        .saturating_add(scratch_slices.saturating_mul(slice_size))
+}
+
+fn estimated_decode_matrix_bytes(rows: usize) -> usize {
+    rows.saturating_mul(rows)
+        .saturating_mul(std::mem::size_of::<u16>())
+        // Matrix inversion keeps a working matrix plus the inverse.
         .saturating_mul(2)
 }
 
@@ -260,7 +334,8 @@ fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize)
         return word_count.max(1);
     }
 
-    let chunk_bytes = (limit_bytes / outputs.saturating_mul(2))
+    let streaming_buffers = outputs.saturating_mul(2).saturating_add(1);
+    let chunk_bytes = (limit_bytes / streaming_buffers)
         .max(2)
         .min(word_count.saturating_mul(2));
     (chunk_bytes / 2).max(1).min(word_count.max(1))
@@ -310,22 +385,15 @@ fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> R
     let word_count = (slice_size / 2).max(1);
     let method_chunk_words = method_tuned_chunk_words(slice_size);
 
-    match options.memory_limit {
-        None => RepairExecutionMode::InMemory {
-            chunk_words: method_chunk_words,
-        },
-        Some(limit) => {
-            let budget_chunk_words =
-                chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
-            let chunk_words = budget_chunk_words.min(method_chunk_words);
-            if estimated_in_memory_repair_bytes(plan) <= limit {
-                RepairExecutionMode::InMemory { chunk_words }
-            } else {
-                RepairExecutionMode::Streaming {
-                    chunk_words,
-                    budget: limit,
-                }
-            }
+    let limit = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
+    let budget_chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
+    let chunk_words = budget_chunk_words.min(method_chunk_words);
+    if estimated_in_memory_repair_bytes(plan) <= limit {
+        RepairExecutionMode::InMemory { chunk_words }
+    } else {
+        RepairExecutionMode::Streaming {
+            chunk_words,
+            budget: limit,
         }
     }
 }
@@ -666,8 +734,8 @@ pub fn reconstruct_and_write(
 
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
 
-    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_words).collect();
-    let total_chunks = word_chunks.len() as u32;
+    let total_chunks_usize = word_count.div_ceil(chunk_words);
+    let total_chunks = total_chunks_usize.min(u32::MAX as usize) as u32;
 
     check_cancel(options)?;
 
@@ -677,11 +745,12 @@ pub fn reconstruct_and_write(
         .map(|slice| slice.as_mut_ptr() as usize)
         .collect();
 
-    word_chunks
-        .par_iter()
-        .try_for_each(|&chunk_start| -> Result<()> {
+    (0..total_chunks_usize)
+        .into_par_iter()
+        .try_for_each(|chunk_idx| -> Result<()> {
             check_cancel(options)?;
 
+            let chunk_start = chunk_idx * chunk_words;
             let chunk_end = (chunk_start + chunk_words).min(word_count);
             let chunk_len = chunk_end - chunk_start;
             let byte_start = chunk_start * 2;
@@ -796,7 +865,7 @@ fn reconstruct_and_write_grouped_inputs(
         "PAR2 slice_size must be a multiple of 2"
     );
     let word_count = slice_size / 2;
-    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_words).collect();
+    let total_chunks_usize = word_count.div_ceil(chunk_words);
     let output_inputs = grouped_input_decode_factors(plan);
 
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
@@ -809,7 +878,8 @@ fn reconstruct_and_write_grouped_inputs(
             let decode_inputs = &output_inputs[output_idx];
             let mut chunk_inputs = Vec::with_capacity(decode_inputs.len());
 
-            for &chunk_start in &word_chunks {
+            for chunk_idx in 0..total_chunks_usize {
+                let chunk_start = chunk_idx * chunk_words;
                 let chunk_end = (chunk_start + chunk_words).min(word_count);
                 let byte_start = chunk_start * 2;
                 let byte_len = (chunk_end - chunk_start) * 2;
@@ -904,8 +974,8 @@ fn execute_repair_streaming(
     );
     let word_count = slice_size / 2;
     let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
-    let word_chunks: Vec<usize> = (0..word_count).step_by(chunk_words).collect();
-    let total_chunks = word_chunks.len() as u32;
+    let total_chunks_usize = word_count.div_ceil(chunk_words);
+    let total_chunks = total_chunks_usize.min(u32::MAX as usize) as u32;
     let write_targets = build_write_targets(plan, par2_set)?;
     let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     let max_byte_len = chunk_words * 2;
@@ -921,9 +991,10 @@ fn execute_repair_streaming(
         "repairing with streamed chunk path"
     );
 
-    for (chunk_idx, &chunk_start) in word_chunks.iter().enumerate() {
+    for chunk_idx in 0..total_chunks_usize {
         check_cancel(options)?;
 
+        let chunk_start = chunk_idx * chunk_words;
         let chunk_end = (chunk_start + chunk_words).min(word_count);
         let chunk_len = chunk_end - chunk_start;
         let byte_start = chunk_start * 2;

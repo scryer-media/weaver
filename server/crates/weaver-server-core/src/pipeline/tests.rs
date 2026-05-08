@@ -928,8 +928,13 @@ fn dummy_named_rar_volume_facts(
             data_offset: 0,
             data_size: 128,
             compression_method: 0x30,
+            compression_version: 29,
             compression_solid: false,
+            dict_size: 0,
             use_hash_mac: false,
+            redirection_type: None,
+            redirection_target: None,
+            redirection_target_is_directory: false,
         }],
         ..dummy_rar_volume_facts(volume_number)
     }
@@ -1068,6 +1073,7 @@ fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
                 hash_full,
                 hash_16k,
                 length: bytes.len() as u64,
+                par2_name: filename.clone(),
                 filename: filename.clone(),
             },
         );
@@ -1249,6 +1255,7 @@ fn build_repairable_par2_set(
                 hash_full,
                 hash_16k,
                 length: file_length,
+                par2_name: filename.to_string(),
                 filename: filename.to_string(),
             },
         )]),
@@ -8744,6 +8751,106 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
         .complete_dir
         .join(crate::jobs::working_dir::sanitize_dirname(
             "Direct Payload PAR2 Repair",
+        ));
+    let completed_payload = tokio::fs::read(output_dir.join(payload_filename))
+        .await
+        .unwrap();
+    assert_eq!(completed_payload, original_payload);
+}
+
+#[tokio::test]
+async fn direct_payload_par2_copy_only_repair_does_not_require_recovery_blocks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30086);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let spec = JobSpec {
+        name: "Direct Payload PAR2 Copy Only Repair".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "copy-only-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "copy-only-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "copy-only-index@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        working_dir.join("payload-second-block.bin"),
+        &original_payload[64..128],
+    )
+    .await
+    .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 0),
+        &[(1, index_filename, 0, false)],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(
+            "Direct Payload PAR2 Copy Only Repair",
         ));
     let completed_payload = tokio::fs::read(output_dir.join(payload_filename))
         .await

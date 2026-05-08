@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use crate::checksum;
 use crate::par2_set::Par2FileSet;
+use crate::path::is_generated_par2_artifact_name;
 use crate::types::FileId;
 
 /// A planned file move: where a file currently is and where it should go.
@@ -105,7 +106,7 @@ pub fn scan_placement(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Placemen
         }
 
         // Skip hidden/temp files from our own operations.
-        if file_name.starts_with(".swap.") || file_name.starts_with(".chunk.") {
+        if is_generated_par2_artifact_name(&file_name) {
             continue;
         }
 
@@ -653,5 +654,21 @@ mod tests {
         let plan = scan_placement(dir.path(), &par2_set).unwrap();
         assert_eq!(plan.unresolved.len(), 1);
         assert!(plan.exact.is_empty());
+    }
+
+    #[test]
+    fn generated_repair_artifacts_are_skipped() {
+        let dir = TempDir::new().unwrap();
+        let data = b"RAR data that was repaired from a backup";
+
+        let (par2_set, _ids) = setup_par2_set_multi(&[(data, "archive.rar")], 1024);
+
+        fs::write(dir.path().join("archive.rar"), data).unwrap();
+        fs::write(dir.path().join("archive.rar.weaver-par2-backup.123"), data).unwrap();
+
+        let plan = scan_placement(dir.path(), &par2_set).unwrap();
+        assert_eq!(plan.exact.len(), 1);
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.renames.is_empty());
     }
 }

@@ -36,12 +36,12 @@ impl RarArchive {
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
                 let rar5_crypto = if skip_entry.is_encrypted && self.format == ArchiveFormat::Rar5 {
-                    let password = self
-                        .password
-                        .as_deref()
-                        .ok_or_else(|| RarError::EncryptedMember {
-                            member: skip_fh.name.clone(),
-                        })?;
+                    let password =
+                        self.password
+                            .as_deref()
+                            .ok_or_else(|| RarError::EncryptedMember {
+                                member: skip_fh.name.clone(),
+                            })?;
                     Some(self.prepare_rar5_encrypted_member(
                         &skip_fh.name,
                         password,
@@ -84,7 +84,10 @@ impl RarArchive {
                         )?;
                     } else {
                         let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!("member {} is missing RAR5 crypto material", skip_fh.name),
+                            detail: format!(
+                                "member {} is missing RAR5 crypto material",
+                                skip_fh.name
+                            ),
                         })?;
                         let reader = crate::crypto::DecryptingReader::new_rar5(
                             base_reader,
@@ -151,11 +154,9 @@ impl RarArchive {
             if skip_fh.compression.method != CompressionMethod::Store {
                 let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
                 let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
-                let base_reader = ChainedSegmentReader::new(&segments, provider).with_continuation(
-                    skip_fh.split_after,
-                    self.format,
-                    self.password.clone(),
-                );
+                let base_reader = ChainedSegmentReader::new(&segments, provider)
+                    .with_max_data_segment(self.limits.max_data_segment)
+                    .with_continuation(skip_fh.split_after, self.format, self.password.clone());
 
                 if skip_entry.is_encrypted {
                     let password = self
@@ -487,7 +488,9 @@ impl RarArchive {
         let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
             member_password
                 .as_deref()
-                .map(|password| self.prepare_rar5_encrypted_member(&fh.name, password, file_enc.as_ref()))
+                .map(|password| {
+                    self.prepare_rar5_encrypted_member(&fh.name, password, file_enc.as_ref())
+                })
                 .transpose()?
         } else {
             None
@@ -609,8 +612,11 @@ impl RarArchive {
                 );
 
                 if let Some(crypto) = rar5_crypto {
-                    let reader =
-                        crate::crypto::DecryptingReader::new_rar5(base_reader, &crypto.key, &crypto.iv);
+                    let reader = crate::crypto::DecryptingReader::new_rar5(
+                        base_reader,
+                        &crypto.key,
+                        &crypto.iv,
+                    );
                     crate::decompress::lz::decompress_lz_reader_to_writer(
                         reader,
                         unpacked_size,
@@ -912,11 +918,7 @@ impl RarArchive {
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
         if fh.compression.method == CompressionMethod::Store {
-            let expected_crc = if options.verify {
-                fh.data_crc32
-            } else {
-                None
-            };
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_blake = if options.verify {
                 match hash.as_ref() {
                     Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -995,11 +997,7 @@ impl RarArchive {
             && fh.compression.method != CompressionMethod::Store
             && !is_solid
         {
-            let expected_crc = if options.verify {
-                fh.data_crc32
-            } else {
-                None
-            };
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_blake = if options.verify {
                 match hash.as_ref() {
                     Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -1073,11 +1071,7 @@ impl RarArchive {
             && fh.compression.method != CompressionMethod::Store
             && !is_solid
         {
-            let expected_crc = if options.verify {
-                fh.data_crc32
-            } else {
-                None
-            };
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_blake = if options.verify {
                 match hash.as_ref() {
                     Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -1139,11 +1133,7 @@ impl RarArchive {
         }
 
         if is_solid && fh.compression.method != CompressionMethod::Store {
-            let expected_crc = if options.verify {
-                fh.data_crc32
-            } else {
-                None
-            };
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_blake = if options.verify {
                 match hash.as_ref() {
                     Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -1310,11 +1300,7 @@ impl RarArchive {
         let segments = self.members[index].segments.clone();
 
         if fh.compression.method != CompressionMethod::Store {
-            let expected_crc = if options.verify {
-                fh.data_crc32
-            } else {
-                None
-            };
+            let expected_crc = if options.verify { fh.data_crc32 } else { None };
             let expected_blake = if options.verify {
                 match hash.as_ref() {
                     Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -1434,11 +1420,7 @@ impl RarArchive {
             return Ok(chunks);
         }
 
-        let expected_crc = if options.verify {
-            fh.data_crc32
-        } else {
-            None
-        };
+        let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
             match hash.as_ref() {
                 Some(FileHash::Blake2sp(expected)) => Some(*expected),
@@ -1914,21 +1896,21 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
 
         self.advance_solid_cursor_to_streaming(index, fh, provider)?;
 
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
         let unpacked_size = Self::decode_target_unpacked_size(&fh);
 
         let (written, actual_crc, actual_blake) = {
-            let mut hash_writer = HashingWriter::new(
-                writer,
-                expected_crc.is_some(),
-                expected_blake.is_some(),
-            );
+            let mut hash_writer =
+                HashingWriter::new(writer, expected_crc.is_some(), compute_blake2);
 
             let written = if let Some(pwd) = password {
                 if self.format == ArchiveFormat::Rar4 {
@@ -1979,12 +1961,13 @@ impl RarArchive {
             (
                 written,
                 expected_crc.map(|_| hash_writer.finalize_crc()),
-                expected_blake.map(|_| hash_writer.finalize_blake2()),
+                compute_blake2.then(|| hash_writer.finalize_blake2()),
             )
         };
 
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -1997,7 +1980,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2024,6 +2007,7 @@ impl RarArchive {
     ) -> RarResult<u64> {
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
@@ -2043,6 +2027,8 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
 
         // Wrap in DecryptingReader if encrypted, otherwise read directly.
         let mut hasher = if expected_crc.is_some() {
@@ -2050,7 +2036,7 @@ impl RarArchive {
         } else {
             None
         };
-        let mut blake_hasher = if expected_blake.is_some() {
+        let mut blake_hasher = if compute_blake2 {
             Some(Blake2s256::new())
         } else {
             None
@@ -2113,6 +2099,7 @@ impl RarArchive {
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -2130,7 +2117,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2172,6 +2159,7 @@ impl RarArchive {
         // because its PPM path depends on contiguous remaining bytes.
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
 
@@ -2181,23 +2169,23 @@ impl RarArchive {
                 Box::new(Self::wrap_rar4_encrypted_reader(
                     &self.kdf_cache,
                     chained,
-                fh,
-                pwd,
-                rar4_salt,
-            )?)
+                    fh,
+                    pwd,
+                    rar4_salt,
+                )?)
+            } else {
+                let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
+                    detail: format!("member {} is missing RAR5 crypto material", fh.name),
+                })?;
+                Box::new(crate::crypto::DecryptingReader::new_rar5(
+                    chained,
+                    &crypto.key,
+                    &crypto.iv,
+                ))
+            }
         } else {
-            let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
-                detail: format!("member {} is missing RAR5 crypto material", fh.name),
-            })?;
-            Box::new(crate::crypto::DecryptingReader::new_rar5(
-                chained,
-                &crypto.key,
-                &crypto.iv,
-            ))
-        }
-    } else {
-        Box::new(chained)
-    };
+            Box::new(chained)
+        };
 
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
@@ -2208,8 +2196,9 @@ impl RarArchive {
         } else {
             None
         };
-        let mut hash_writer =
-            HashingWriter::new(writer, expected_crc.is_some(), expected_blake.is_some());
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
+        let mut hash_writer = HashingWriter::new(writer, expected_crc.is_some(), compute_blake2);
 
         if self.format == ArchiveFormat::Rar5 {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
@@ -2234,11 +2223,12 @@ impl RarArchive {
         // Use final volume's CRC and HMAC flag if continuations were discovered.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
         let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
-        let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
+        let actual_blake = compute_blake2.then(|| hash_writer.finalize_blake2());
         Self::verify_member_crc32(
             &fh.name,
             effective_crc,
@@ -2248,7 +2238,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2412,6 +2402,7 @@ impl RarArchive {
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -2424,12 +2415,14 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let mut hasher = if expected_crc.is_some() {
             Some(crc32fast::Hasher::new())
         } else {
             None
         };
-        let mut blake_hasher: Option<Blake2s256> = expected_blake.map(|_| Blake2s256::new());
+        let mut blake_hasher: Option<Blake2s256> = compute_blake2.then(Blake2s256::new);
 
         let max_bytes = if password.is_some() {
             unpacked_size
@@ -2509,6 +2502,7 @@ impl RarArchive {
         // Verify CRC32.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -2526,7 +2520,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2586,6 +2580,7 @@ impl RarArchive {
         let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -2601,10 +2596,12 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc =
             expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
         let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-            expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
 
         let chunks = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
@@ -2632,8 +2629,11 @@ impl RarArchive {
                 let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                     detail: format!("member {} is missing RAR5 crypto material", fh.name),
                 })?;
-                let reader =
-                    crate::crypto::DecryptingReader::new_rar5(tracking_reader, &crypto.key, &crypto.iv);
+                let reader = crate::crypto::DecryptingReader::new_rar5(
+                    tracking_reader,
+                    &crypto.key,
+                    &crypto.iv,
+                );
                 Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
@@ -2666,6 +2666,7 @@ impl RarArchive {
 
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -2694,7 +2695,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2736,6 +2737,7 @@ impl RarArchive {
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -2774,10 +2776,12 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_blake2 = expected_blake.is_some()
+            || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>> =
             expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
         let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-            expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
 
         let chunks = if self.format == ArchiveFormat::Rar5 {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2842,6 +2846,7 @@ impl RarArchive {
         // Verify CRC32.
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
+        let effective_blake = final_meta.blake2_hash.or(expected_blake);
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
@@ -2870,7 +2875,7 @@ impl RarArchive {
         )?;
         Self::verify_member_blake2(
             &fh.name,
-            expected_blake,
+            effective_blake,
             actual_blake,
             final_use_hash_mac,
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
@@ -2965,6 +2970,8 @@ impl<W: Write> Write for HashTrackingWriter<W> {
 pub(super) struct ContinuationMetadata {
     /// CRC32 from the most recently discovered continuation header.
     data_crc32: Option<u32>,
+    /// BLAKE2sp from the most recently discovered continuation header.
+    blake2_hash: Option<[u8; 32]>,
     /// Whether the most recently discovered continuation has HASHMAC set.
     use_hash_mac: bool,
 }
@@ -2981,6 +2988,7 @@ pub(super) struct ContinuationMetadata {
 pub struct ChainedSegmentReader<'a> {
     segments: Vec<DataSegment>,
     provider: &'a dyn VolumeProvider,
+    max_data_segment: u64,
     current_seg: usize,
     current_reader: Option<Box<dyn ReadSeek>>,
     remaining_in_segment: u64,
@@ -3110,6 +3118,7 @@ impl<'a> ChainedSegmentReader<'a> {
         Self {
             segments: segments.to_vec(),
             provider,
+            max_data_segment: crate::limits::Limits::default().max_data_segment,
             current_seg: 0,
             current_reader: None,
             remaining_in_segment: 0,
@@ -3120,6 +3129,11 @@ impl<'a> ChainedSegmentReader<'a> {
             metadata_sink: None,
             volume_tracker: None,
         }
+    }
+
+    pub fn with_max_data_segment(mut self, max_data_segment: u64) -> Self {
+        self.max_data_segment = max_data_segment;
+        self
     }
 
     /// Enable on-demand volume discovery for multi-volume members.
@@ -3160,6 +3174,12 @@ impl<'a> ChainedSegmentReader<'a> {
         }
 
         let seg = &self.segments[self.current_seg];
+        if seg.data_size > self.max_data_segment {
+            return Err(std::io::Error::other(format!(
+                "data segment size {} exceeds limit {}",
+                seg.data_size, self.max_data_segment
+            )));
+        }
         if let Some(ref tracker) = self.volume_tracker {
             tracker.store(seg.volume_index, Ordering::Release);
         }
@@ -3197,6 +3217,12 @@ impl<'a> ChainedSegmentReader<'a> {
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
                 if fh.split_before {
+                    if fh.packed_size > self.max_data_segment {
+                        return Err(std::io::Error::other(format!(
+                            "data segment size {} exceeds limit {}",
+                            fh.packed_size, self.max_data_segment
+                        )));
+                    }
                     self.segments.push(DataSegment {
                         volume_index: vol_idx,
                         data_offset: fh.data_offset,
@@ -3207,6 +3233,7 @@ impl<'a> ChainedSegmentReader<'a> {
                     if let Some(ref sink) = self.metadata_sink {
                         let mut meta = sink.borrow_mut();
                         meta.data_crc32 = Some(fh.crc32);
+                        meta.blake2_hash = None;
                         meta.use_hash_mac = false; // RAR4 has no HMAC
                     }
                     return Ok(true);
@@ -3219,6 +3246,12 @@ impl<'a> ChainedSegmentReader<'a> {
             // Find the first file header with split_before.
             for pf in &parsed.files {
                 if pf.header.split_before {
+                    if pf.header.data_size > self.max_data_segment {
+                        return Err(std::io::Error::other(format!(
+                            "data segment size {} exceeds limit {}",
+                            pf.header.data_size, self.max_data_segment
+                        )));
+                    }
                     self.segments.push(DataSegment {
                         volume_index: vol_idx,
                         data_offset: pf.header.data_offset,
@@ -3229,6 +3262,9 @@ impl<'a> ChainedSegmentReader<'a> {
                     if let Some(ref sink) = self.metadata_sink {
                         let mut meta = sink.borrow_mut();
                         meta.data_crc32 = pf.header.data_crc32;
+                        meta.blake2_hash = pf.hash.as_ref().map(|hash| match hash {
+                            FileHash::Blake2sp(value) => *value,
+                        });
                         meta.use_hash_mac = pf
                             .file_encryption
                             .as_ref()
@@ -3328,5 +3364,39 @@ impl<R: Read> Read for VolumeTrackingReader<R> {
             }
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Read};
+
+    struct TestVolumeProvider {
+        data: Vec<u8>,
+    }
+
+    impl crate::volume::VolumeProvider for TestVolumeProvider {
+        fn get_volume(
+            &self,
+            _index: usize,
+        ) -> Result<Box<dyn crate::archive::ReadSeek>, crate::volume::VolumeProviderError> {
+            Ok(Box::new(Cursor::new(self.data.clone())))
+        }
+    }
+
+    #[test]
+    fn chained_segment_reader_rejects_oversized_segment_before_reading() {
+        let provider = TestVolumeProvider { data: vec![0; 8] };
+        let segments = [DataSegment {
+            volume_index: 0,
+            data_offset: 0,
+            data_size: 9,
+        }];
+        let mut reader = ChainedSegmentReader::new(&segments, &provider).with_max_data_segment(8);
+
+        let mut buf = [0u8; 1];
+        let err = reader.read(&mut buf).unwrap_err();
+        assert!(err.to_string().contains("exceeds limit 8"));
     }
 }

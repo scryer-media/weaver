@@ -14,6 +14,7 @@ use tracing::debug;
 use crate::checksum;
 use crate::packet::header::{self, MAGIC, PacketHeader};
 use crate::par2_set::Par2FileSet;
+use crate::path::is_generated_par2_artifact_name;
 use crate::types::{FileId, RecoverySetId};
 
 /// A suggestion to rename a file to its correct name.
@@ -76,6 +77,10 @@ pub fn scan_for_renames(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Vec<Re
             None => continue,
         };
 
+        if is_generated_par2_artifact_name(file_name) {
+            continue;
+        }
+
         // Skip files that already have a known correct name.
         if known_filenames.contains(file_name) {
             continue;
@@ -124,6 +129,14 @@ pub fn identify_par2_files(
         let path = entry.path();
 
         if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if is_generated_par2_artifact_name(file_name) {
             continue;
         }
 
@@ -358,6 +371,24 @@ mod tests {
 
         // Write file with correct name
         fs::write(dir.path().join(correct_name), file_data).unwrap();
+
+        let suggestions = scan_for_renames(dir.path(), &par2_set).unwrap();
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn scan_skips_generated_repair_artifacts() {
+        let dir = TempDir::new().unwrap();
+        let file_data = b"This is the real file content for rename testing!!";
+        let correct_name = "movie.rar";
+
+        let (par2_set, _) = setup_par2_set(file_data, 1024, correct_name);
+
+        fs::write(
+            dir.path().join("movie.rar.weaver-par2-backup.123"),
+            file_data,
+        )
+        .unwrap();
 
         let suggestions = scan_for_renames(dir.path(), &par2_set).unwrap();
         assert!(suggestions.is_empty());

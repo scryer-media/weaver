@@ -21,9 +21,11 @@ pub mod matrix;
 pub mod md5_simd;
 pub mod packet;
 pub mod par2_set;
+pub mod path;
 pub mod placement;
 pub mod rename;
 pub mod repair;
+pub mod repairer;
 pub mod session;
 pub mod types;
 pub mod verify;
@@ -37,11 +39,13 @@ pub use gf_simd::{FactorDst, mul_acc_multi_region, mul_acc_region};
 pub use matrix::{Matrix, build_decode_matrix};
 pub use packet::{
     CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, Packet, PacketHeader, PacketType,
-    RecoverySliceData, RecoverySlicePacket, parse_packet, scan_packets, scan_packets_from_path,
+    RecoverySliceData, RecoverySlicePacket, ScannedPacket, parse_packet, scan_packets,
+    scan_packets_from_path, scan_packets_from_path_with_set_ids,
 };
 pub use par2_set::{
     FileDescription, MergeResult, Par2Diagnostic, Par2FileSet, Par2ParseResult, RecoverySlice,
 };
+pub use path::{translate_par2_name_to_local_path, translate_par2_name_to_relative};
 pub use placement::{PlacementEntry, PlacementPlan, apply_placement_plan, scan_placement};
 pub use rename::{
     MatchType, RenameSuggestion, SplitFileGroup, detect_split_files, identify_par2_files,
@@ -50,6 +54,11 @@ pub use rename::{
 pub use repair::{
     RepairOptions, RepairPlan, execute_repair, execute_repair_with_options, plan_repair,
     prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
+};
+pub use repairer::{
+    BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
+    Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanDiagnostics, SourceBlock,
+    SourceFileEntry,
 };
 pub use session::VerificationSession;
 pub use types::{CancellationToken, ProgressCallback, ProgressStage, ProgressUpdate};

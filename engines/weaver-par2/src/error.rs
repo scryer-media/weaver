@@ -28,11 +28,20 @@ pub enum Par2Error {
     #[error("invalid recovery slice packet: {reason}")]
     InvalidRecoveryPacket { reason: String },
 
+    #[error("invalid creator packet: {reason}")]
+    InvalidCreatorPacket { reason: String },
+
     #[error("duplicate main packet with different recovery set ID")]
     ConflictingRecoverySet,
 
     #[error("no main packet found in PAR2 file set")]
     NoMainPacket,
+
+    #[error("insufficient critical PAR2 data: {reason}")]
+    InsufficientCriticalData { reason: String },
+
+    #[error("PAR2 resource limit exceeded: {reason}")]
+    ResourceLimitExceeded { reason: String },
 
     // --- Verification errors ---
     #[error("file not found: {filename}")]

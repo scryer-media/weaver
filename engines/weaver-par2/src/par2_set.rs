@@ -14,6 +14,7 @@ pub struct FileDescription {
     pub hash_full: [u8; 16],
     pub hash_16k: [u8; 16],
     pub length: u64,
+    pub par2_name: String,
     pub filename: String,
 }
 
@@ -178,6 +179,7 @@ impl Par2FileSet {
                             hash_full: fd.hash_full,
                             hash_16k: fd.hash_16k,
                             length: fd.file_length,
+                            par2_name: fd.par2_name,
                             filename: fd.filename,
                         });
                     } else {
@@ -306,6 +308,7 @@ impl Par2FileSetBuilder {
                         hash_full: fd.hash_full,
                         hash_16k: fd.hash_16k,
                         length: fd.file_length,
+                        par2_name: fd.par2_name,
                         filename: fd.filename,
                     });
             }
@@ -340,15 +343,38 @@ impl Par2FileSetBuilder {
 
         // Validate recovery block data lengths against slice_size.
         // PAR2 spec requires each recovery block to be exactly slice_size bytes.
-        // Blocks that are too short are zero-padded; blocks that are too long are rejected.
+        // Wrong-sized recovery blocks are unusable and must not be zero-padded.
         let mut recovery_slices = self.recovery_slices;
         let slice_size = main.slice_size;
 
         recovery_slices.retain(|exp, rs| {
             let data_len = rs.data.len() as u64;
-            if data_len > slice_size {
+            if data_len != slice_size {
                 warn!(
-                    "recovery block exponent {exp}: data length {data_len} exceeds slice_size {slice_size}, discarding"
+                    "recovery block exponent {exp}: data length {data_len} does not equal slice_size {slice_size}, discarding"
+                );
+                return false;
+            }
+            true
+        });
+
+        let mut slice_checksums = self.slice_checksums;
+        slice_checksums.retain(|file_id, checksums| {
+            let Some(desc) = self.files.get(file_id) else {
+                warn!("IFSC packet for unknown file {file_id}, discarding");
+                return false;
+            };
+            let expected = if desc.length == 0 {
+                0
+            } else {
+                desc.length.div_ceil(slice_size) as usize
+            };
+            if checksums.len() != expected {
+                warn!(
+                    file = %desc.filename,
+                    actual = checksums.len(),
+                    expected,
+                    "IFSC entry count does not match file block count, discarding"
                 );
                 return false;
             }
@@ -361,7 +387,7 @@ impl Par2FileSetBuilder {
             recovery_file_ids: main.recovery_file_ids,
             non_recovery_file_ids: main.non_recovery_file_ids,
             files: self.files,
-            slice_checksums: self.slice_checksums,
+            slice_checksums,
             recovery_slices,
             creator: self.creator,
         })
@@ -448,7 +474,7 @@ mod tests {
         let main_body = make_main_body(4096, &[file_id_a]);
         let rsid = compute_rsid(&main_body);
 
-        let fd_body = make_file_desc_body(file_id_a, [0xAA; 16], [0xBB; 16], 8192, "test.bin");
+        let fd_body = make_file_desc_body(file_id_a, [0xAA; 16], [0xAA; 16], 8192, "test.bin");
         let ifsc_body = make_ifsc_body(file_id_a, &[(0x1234, [0xCC; 16]), (0x5678, [0xDD; 16])]);
         let creator_body = b"TestApp\x00";
 

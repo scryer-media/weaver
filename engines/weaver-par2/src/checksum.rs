@@ -1,6 +1,8 @@
 use crc32fast::Hasher as Crc32Hasher;
 use md5::{Digest, Md5};
 
+const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
+
 /// Streaming CRC32 + MD5 checksum state for a single file slice.
 ///
 /// Feeds data incrementally and produces the final (CRC32, MD5) pair that can
@@ -47,9 +49,13 @@ impl SliceChecksumState {
         if let Some(target) = pad_to
             && target > self.bytes_fed
         {
-            let padding = vec![0u8; (target - self.bytes_fed) as usize];
-            self.crc32.update(&padding);
-            self.md5.update(&padding);
+            let mut remaining = target - self.bytes_fed;
+            while remaining > 0 {
+                let take = remaining.min(ZERO_PAD_CHUNK.len() as u64) as usize;
+                self.crc32.update(&ZERO_PAD_CHUNK[..take]);
+                self.md5.update(&ZERO_PAD_CHUNK[..take]);
+                remaining -= take as u64;
+            }
         }
         let crc = self.crc32.finalize();
         let md5: [u8; 16] = self.md5.finalize().into();

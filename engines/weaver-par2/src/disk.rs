@@ -89,6 +89,9 @@ impl FileAccess for DiskFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -197,6 +200,9 @@ impl FileAccess for PlacementFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)

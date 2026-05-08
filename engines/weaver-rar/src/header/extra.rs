@@ -165,7 +165,9 @@ pub fn parse_extra_area(data: &[u8], owner: ExtraAreaOwner) -> RarResult<Vec<Ext
                 flags: if record_body.is_empty() {
                     0
                 } else {
-                    vint::read_vint(record_body).map(|(value, _)| value).unwrap_or(0)
+                    vint::read_vint(record_body)
+                        .map(|(value, _)| value)
+                        .unwrap_or(0)
                 },
             },
             record_type::SERVICE_DATA => ExtraRecord::ServiceData(record_body.to_vec()),
@@ -483,8 +485,7 @@ mod tests {
 
     #[test]
     fn test_parse_high_precision_unix_mtime() {
-        let flags =
-            FHEXTRA_HTIME_UNIXTIME | FHEXTRA_HTIME_UNIX_NS | FHEXTRA_HTIME_MTIME;
+        let flags = FHEXTRA_HTIME_UNIXTIME | FHEXTRA_HTIME_UNIX_NS | FHEXTRA_HTIME_MTIME;
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(flags));
         body.extend_from_slice(&1_700_000_000u32.to_le_bytes());
@@ -494,10 +495,7 @@ mod tests {
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
             ExtraRecord::FileTime { mtime, .. } => {
-                let duration = mtime
-                    .unwrap()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap();
+                let duration = mtime.unwrap().duration_since(UNIX_EPOCH).unwrap();
                 assert_eq!(duration.as_secs(), 1_700_000_000);
                 assert_eq!(duration.subsec_nanos(), 123_456_789);
             }

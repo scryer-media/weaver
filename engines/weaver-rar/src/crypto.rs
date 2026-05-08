@@ -51,7 +51,11 @@ fn fold_password_check(value: &[u8; 32]) -> [u8; 8] {
     psw_check
 }
 
-pub fn derive_rar5_material(password: &str, salt: &[u8; 16], kdf_count: u8) -> RarResult<Rar5KeyMaterial> {
+pub fn derive_rar5_material(
+    password: &str,
+    salt: &[u8; 16],
+    kdf_count: u8,
+) -> RarResult<Rar5KeyMaterial> {
     if kdf_count > CRYPT5_KDF_LG2_COUNT_MAX {
         return Err(RarError::CorruptArchive {
             detail: format!(
@@ -273,12 +277,7 @@ impl KdfCache {
             .key
     }
 
-    pub fn derive_hash_key_rar5(
-        &self,
-        password: &str,
-        salt: &[u8; 16],
-        kdf_count: u8,
-    ) -> [u8; 32] {
+    pub fn derive_hash_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
         self.derive_material_rar5(password, salt, kdf_count)
             .expect("RAR5 KDF inputs should be validated before key derivation")
             .hash_key

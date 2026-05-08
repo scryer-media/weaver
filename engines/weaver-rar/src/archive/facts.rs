@@ -148,12 +148,14 @@ impl RarArchive {
                     .file_encryption
                     .as_ref()
                     .is_some_and(|info| info.use_hash_mac),
-                redirection_type: parsed_file.redirection.as_ref().map(|redir| match redir.redir_type {
-                    crate::header::RedirectionType::UnixSymlink => 1,
-                    crate::header::RedirectionType::WindowsSymlink => 2,
-                    crate::header::RedirectionType::WindowsJunction => 3,
-                    crate::header::RedirectionType::Hardlink => 4,
-                    crate::header::RedirectionType::Unknown(value) => value,
+                redirection_type: parsed_file.redirection.as_ref().map(|redir| {
+                    match redir.redir_type {
+                        crate::header::RedirectionType::UnixSymlink => 1,
+                        crate::header::RedirectionType::WindowsSymlink => 2,
+                        crate::header::RedirectionType::WindowsJunction => 3,
+                        crate::header::RedirectionType::Hardlink => 4,
+                        crate::header::RedirectionType::Unknown(value) => value,
+                    }
                 }),
                 redirection_target: parsed_file
                     .redirection

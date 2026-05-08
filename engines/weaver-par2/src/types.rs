@@ -1,4 +1,6 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
+
+pub(crate) const MAX_SLICES_PER_FILE: usize = 32_768;
 
 /// 16-byte MD5-based file identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,7 +136,7 @@ pub enum ProgressStage {
 }
 
 /// Callback type for progress reporting.
-pub type ProgressCallback = Box<dyn Fn(ProgressUpdate) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(ProgressUpdate) + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

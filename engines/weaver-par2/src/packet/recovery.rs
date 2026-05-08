@@ -115,9 +115,9 @@ pub struct RecoverySlicePacket {
 impl RecoverySlicePacket {
     /// Parse a Recovery Slice packet from its body (after the 64-byte header).
     pub fn parse(body: &[u8]) -> Result<Self> {
-        if body.len() < 4 {
+        if body.len() <= 4 {
             return Err(Par2Error::InvalidRecoveryPacket {
-                reason: format!("body too short: {} bytes, need at least 4", body.len()),
+                reason: format!("body too short: {} bytes, need more than 4", body.len()),
             });
         }
 
@@ -145,11 +145,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_recovery_empty_data() {
+    fn reject_recovery_empty_data() {
         let body = 0u32.to_le_bytes();
-        let pkt = RecoverySlicePacket::parse(&body).unwrap();
-        assert_eq!(pkt.exponent, 0);
-        assert_eq!(pkt.data.len(), 0);
+        let err = RecoverySlicePacket::parse(&body).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidRecoveryPacket { .. }));
     }
 
     #[test]

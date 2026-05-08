@@ -605,8 +605,10 @@ impl LzDecoder {
         let block_start = output_size + block_start_delta;
         let block_length = Self::read_filter_data(reader)? as usize;
         let filter_code = reader.read_bits(3)? as u8;
-        let filter_type = FilterType::from_code(filter_code)
-            .ok_or(RarError::UnsupportedFilter { filter_type: filter_code })?;
+        let filter_type =
+            FilterType::from_code(filter_code).ok_or(RarError::UnsupportedFilter {
+                filter_type: filter_code,
+            })?;
 
         if block_length > MAX_FILTER_BLOCK_SIZE {
             return Err(RarError::CorruptArchive {

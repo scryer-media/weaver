@@ -4,7 +4,12 @@ use std::path::PathBuf;
 
 use crate::checksum;
 use crate::par2_set::Par2FileSet;
-use crate::types::{CancellationToken, FileId, ProgressCallback, ProgressStage, ProgressUpdate};
+use crate::types::{
+    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressStage,
+    ProgressUpdate, SliceChecksum,
+};
+
+const VERIFY_SLICE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Abstraction for file I/O during verification and repair.
 pub trait FileAccess {
@@ -178,9 +183,36 @@ pub struct VerificationResult {
 }
 
 impl VerificationResult {
+    pub fn needs_repair(&self) -> bool {
+        self.total_missing_blocks > 0
+            || self
+                .files
+                .iter()
+                .any(|file| !matches!(file.status, FileStatus::Complete))
+    }
+
     pub fn refresh_repairability(&mut self) {
-        self.repairable =
-            repairability_for_counts(self.total_missing_blocks, self.recovery_blocks_available);
+        self.repairable = repairability_for_result(
+            &self.files,
+            self.total_missing_blocks,
+            self.recovery_blocks_available,
+        );
+    }
+}
+
+fn repairability_for_result(
+    files: &[FileVerification],
+    total_missing_blocks: u32,
+    recovery_blocks_available: u32,
+) -> Repairability {
+    if total_missing_blocks == 0
+        && files
+            .iter()
+            .all(|file| matches!(file.status, FileStatus::Complete))
+    {
+        Repairability::NotNeeded
+    } else {
+        repairability_for_counts(total_missing_blocks, recovery_blocks_available)
     }
 }
 
@@ -201,6 +233,21 @@ fn repairability_for_counts(
             blocks_available: recovery_blocks_available,
             deficit: total_missing_blocks - recovery_blocks_available,
         }
+    }
+}
+
+fn bounded_slice_count(par2: &Par2FileSet, length: u64) -> Option<usize> {
+    let count = usize::try_from(par2.slice_count_for_file(length)).ok()?;
+    (count <= MAX_SLICES_PER_FILE).then_some(count)
+}
+
+fn resource_limited_verification(file_id: FileId, filename: String) -> FileVerification {
+    FileVerification {
+        file_id,
+        filename,
+        status: FileStatus::Damaged(u32::MAX),
+        valid_slices: Vec::new(),
+        missing_slice_count: u32::MAX,
     }
 }
 
@@ -262,74 +309,65 @@ pub fn verify_slices(
     file_id: &FileId,
     access: &dyn FileAccess,
 ) -> Option<Vec<bool>> {
-    let _desc = par2.file_description(file_id)?;
+    let desc = par2.file_description(file_id)?;
     let checksums = par2.file_checksums(file_id)?;
     let slice_size = par2.slice_size;
-    let slice_size_usize = slice_size as usize;
-
-    if !access.file_exists(file_id) {
-        return Some(vec![false; checksums.len()]);
+    let expected_slices = bounded_slice_count(par2, desc.length)?;
+    if checksums.len() != expected_slices {
+        return Some(vec![false; expected_slices]);
     }
 
-    let file_len = access.file_length(file_id).unwrap_or(0);
+    if !access.file_exists(file_id) {
+        return Some(vec![false; expected_slices]);
+    }
 
-    let mut results = vec![false; checksums.len()];
-    let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; slice_size_usize]).collect();
+    let mut results = vec![false; expected_slices];
+    let mut buf = vec![0u8; VERIFY_SLICE_CHUNK_BYTES];
 
-    for (chunk_idx, result_chunk) in results.chunks_mut(4).enumerate() {
-        let base = chunk_idx * 4;
-        let batch_size = result_chunk.len();
-
-        let mut read_lens = vec![0usize; batch_size];
-        let mut crcs: Vec<u32> = Vec::with_capacity(batch_size);
-        let mut any_needs_pad = false;
-
-        for j in 0..batch_size {
-            let i = base + j;
-            let offset = i as u64 * slice_size;
-            if offset >= file_len {
-                crcs.push(0);
-                read_lens[j] = 0;
-                any_needs_pad = true;
-                continue;
-            }
-
-            let expected_len = (file_len - offset).min(slice_size) as usize;
-            buffers[j].fill(0);
-            let read_len = access
-                .read_file_range_into(file_id, offset, &mut buffers[j][..expected_len])
-                .ok()?;
-            read_lens[j] = read_len;
-
-            let pad_len = slice_size_usize.saturating_sub(read_len);
-            if pad_len > 0 {
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&buffers[j][..read_len]);
-                hasher.update(&vec![0u8; pad_len]);
-                crcs.push(hasher.finalize());
-                any_needs_pad = true;
-            } else {
-                crcs.push(checksum::crc32(&buffers[j][..read_len]));
-            }
-        }
-
-        let slice_refs: Vec<&[u8]> = (0..batch_size)
-            .map(|j| &buffers[j][..read_lens[j]])
-            .collect();
-        let pad_to = if any_needs_pad {
-            Some(slice_size)
-        } else {
-            None
-        };
-        let md5s = crate::md5_simd::md5_multi(&slice_refs, pad_to);
-
-        for j in 0..batch_size {
-            let i = base + j;
-            result_chunk[j] = crcs[j] == checksums[i].crc32 && md5s[j] == checksums[i].md5;
-        }
+    for (i, result) in results.iter_mut().enumerate() {
+        let offset = i as u64 * slice_size;
+        let expected_data_len = desc.length.saturating_sub(offset).min(slice_size);
+        let actual = checksum_file_slice_padded(
+            file_id,
+            offset,
+            expected_data_len,
+            slice_size,
+            access,
+            &mut buf,
+        )
+        .ok()?;
+        *result = actual.crc32 == checksums[i].crc32 && actual.md5 == checksums[i].md5;
     }
 
     Some(results)
+}
+
+fn checksum_file_slice_padded(
+    file_id: &FileId,
+    offset: u64,
+    expected_data_len: u64,
+    slice_size: u64,
+    access: &dyn FileAccess,
+    buf: &mut [u8],
+) -> io::Result<SliceChecksum> {
+    let mut state = checksum::SliceChecksumState::new();
+    let mut consumed = 0u64;
+
+    while consumed < expected_data_len {
+        let take = (expected_data_len - consumed).min(buf.len() as u64) as usize;
+        let read_len = access.read_file_range_into(file_id, offset + consumed, &mut buf[..take])?;
+        if read_len == 0 {
+            break;
+        }
+        state.update(&buf[..read_len]);
+        consumed += read_len as u64;
+        if read_len < take {
+            break;
+        }
+    }
+
+    let (crc32, md5) = state.finalize(Some(slice_size));
+    Ok(SliceChecksum { crc32, md5 })
 }
 
 /// Verify file slices using pre-computed CRC32 values instead of reading from disk.
@@ -416,16 +454,24 @@ pub fn verify_selected_file_ids_with_options(
             Some(d) => d,
             None => continue,
         };
+        let Some(slice_count) = bounded_slice_count(par2, desc.length) else {
+            total_missing_blocks = u32::MAX;
+            files.push(resource_limited_verification(
+                *file_id,
+                desc.filename.clone(),
+            ));
+            continue;
+        };
+        let slice_count_u32 = slice_count as u32;
 
         if !access.file_exists(file_id) {
-            let slice_count = par2.slice_count_for_file(desc.length);
-            total_missing_blocks += slice_count;
+            total_missing_blocks = total_missing_blocks.saturating_add(slice_count_u32);
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
                 status: FileStatus::Missing,
-                valid_slices: vec![false; slice_count as usize],
-                missing_slice_count: slice_count,
+                valid_slices: vec![false; slice_count],
+                missing_slice_count: slice_count_u32,
             });
             continue;
         }
@@ -454,14 +500,13 @@ pub fn verify_selected_file_ids_with_options(
             && actual_len == 0
             && desc.length > 0
         {
-            let slice_count = par2.slice_count_for_file(desc.length);
-            total_missing_blocks += slice_count;
+            total_missing_blocks = total_missing_blocks.saturating_add(slice_count_u32);
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
-                status: FileStatus::Damaged(slice_count),
-                valid_slices: vec![false; slice_count as usize],
-                missing_slice_count: slice_count,
+                status: FileStatus::Damaged(slice_count_u32),
+                valid_slices: vec![false; slice_count],
+                missing_slice_count: slice_count_u32,
             });
             continue;
         }
@@ -471,7 +516,6 @@ pub fn verify_selected_file_ids_with_options(
         if par2.file_checksums(file_id).is_none() {
             let full_ok = verify_full_hash(par2, file_id, access).unwrap_or(false);
             if full_ok {
-                let slice_count = par2.slice_count_for_file(desc.length) as usize;
                 files.push(FileVerification {
                     file_id: *file_id,
                     filename: desc.filename.clone(),
@@ -482,14 +526,13 @@ pub fn verify_selected_file_ids_with_options(
             } else {
                 // Can't determine which slices are bad without IFSC data.
                 // Mark all slices as damaged — repair will treat the whole file as needing recovery.
-                let slice_count = par2.slice_count_for_file(desc.length);
-                total_missing_blocks += slice_count;
+                total_missing_blocks = total_missing_blocks.saturating_add(slice_count_u32);
                 files.push(FileVerification {
                     file_id: *file_id,
                     filename: desc.filename.clone(),
-                    status: FileStatus::Damaged(slice_count),
-                    valid_slices: vec![false; slice_count as usize],
-                    missing_slice_count: slice_count,
+                    status: FileStatus::Damaged(slice_count_u32),
+                    valid_slices: vec![false; slice_count],
+                    missing_slice_count: slice_count_u32,
                 });
             }
             bytes_processed += desc.length;
@@ -508,14 +551,14 @@ pub fn verify_selected_file_ids_with_options(
         let quick_ok = quick_check_16k(par2, file_id, access).unwrap_or(false);
         if !quick_ok {
             // 16k hash failed; do slice-level check to find which slices are bad
-            let valid = verify_slices(par2, file_id, access).unwrap_or_else(|| {
-                let n = par2.slice_count_for_file(desc.length) as usize;
-                vec![false; n]
-            });
+            let valid =
+                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
-            total_missing_blocks += damaged;
+            total_missing_blocks = total_missing_blocks.saturating_add(damaged);
             let status = if damaged == 0 {
-                FileStatus::Complete
+                // Slice checks can identify usable blocks, but only a full
+                // length+MD5 match is allowed to mark a file complete.
+                FileStatus::Damaged(0)
             } else {
                 FileStatus::Damaged(damaged)
             };
@@ -532,7 +575,6 @@ pub fn verify_selected_file_ids_with_options(
         // Full hash check
         let full_ok = verify_full_hash(par2, file_id, access).unwrap_or(false);
         if full_ok {
-            let slice_count = par2.slice_count_for_file(desc.length) as usize;
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
@@ -542,12 +584,10 @@ pub fn verify_selected_file_ids_with_options(
             });
         } else {
             // Full hash failed but 16k passed; check slice by slice
-            let valid = verify_slices(par2, file_id, access).unwrap_or_else(|| {
-                let n = par2.slice_count_for_file(desc.length) as usize;
-                vec![false; n]
-            });
+            let valid =
+                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
             let damaged = valid.iter().filter(|&&v| !v).count() as u32;
-            total_missing_blocks += damaged;
+            total_missing_blocks = total_missing_blocks.saturating_add(damaged);
             files.push(FileVerification {
                 file_id: *file_id,
                 filename: desc.filename.clone(),
@@ -569,7 +609,8 @@ pub fn verify_selected_file_ids_with_options(
     }
 
     let recovery_blocks_available = par2.recovery_block_count();
-    let repairable = repairability_for_counts(total_missing_blocks, recovery_blocks_available);
+    let repairable =
+        repairability_for_result(&files, total_missing_blocks, recovery_blocks_available);
 
     VerificationResult {
         files,

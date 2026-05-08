@@ -35,6 +35,10 @@ impl PromotedRecoveryPipelineState {
     }
 }
 
+fn par2_verification_needs_repair(verification: &weaver_par2::VerificationResult) -> bool {
+    verification.needs_repair()
+}
+
 fn summarize_rar_set_phase(
     set_name: &str,
     set_state: &crate::pipeline::archive::rar_state::RarSetState,
@@ -483,6 +487,47 @@ impl Pipeline {
         renamed
     }
 
+    async fn run_par2_repairer(
+        &self,
+        par2_set: Arc<weaver_par2::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+        repair: bool,
+    ) -> Result<weaver_par2::Par2RepairOutcome, String> {
+        let repair_result = tokio::task::spawn_blocking(move || {
+            if repair {
+                crate::e2e_failpoint::maybe_delay("repair.task_start");
+            }
+            let mut options = weaver_par2::Par2RepairerOptions::new(working_dir, Vec::new());
+            options.file_set = Some((*par2_set).clone());
+            options.repair = repair;
+            let repairer = weaver_par2::Par2Repairer::new(options);
+            let outcome = repairer
+                .verify_or_repair()
+                .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
+            if repair {
+                match outcome.status {
+                    weaver_par2::Par2RepairStatus::Verified
+                    | weaver_par2::Par2RepairStatus::Repaired => {}
+                    weaver_par2::Par2RepairStatus::RepairPossible
+                    | weaver_par2::Par2RepairStatus::Insufficient => {
+                        return Err(format!(
+                            "PAR2 repairer did not complete repair: {:?}",
+                            outcome.status
+                        ));
+                    }
+                }
+            }
+            Ok(outcome)
+        })
+        .await;
+
+        match repair_result {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(format!("repair task panicked: {error}")),
+        }
+    }
+
     async fn verify_par2_with_placement(
         &mut self,
         job_id: JobId,
@@ -567,7 +612,7 @@ impl Pipeline {
         if emit_events {
             let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
                 job_id,
-                passed: verification.total_missing_blocks == 0,
+                passed: !par2_verification_needs_repair(&verification),
             });
         }
 
@@ -1442,7 +1487,7 @@ impl Pipeline {
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
 
-                if damaged == 0 {
+                if !par2_verification_needs_repair(&verification) {
                     info!(
                         job_id = job_id.0,
                         "PAR2 verification passed — no damaged slices"
@@ -1557,6 +1602,34 @@ impl Pipeline {
                         return;
                     }
 
+                    let repair_preview = match self
+                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), false)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(message) => {
+                            warn!(job_id = job_id.0, error = %message);
+                            self.fail_job(job_id, message);
+                            return;
+                        }
+                    };
+                    let repairer_damaged = repair_preview.verification.total_missing_blocks;
+                    let repairer_recovery_now = repair_preview.recovery_blocks_available;
+                    if repairer_damaged != damaged || repairer_recovery_now != recovery_now {
+                        info!(
+                            job_id = job_id.0,
+                            placement_damaged = damaged,
+                            repairer_damaged,
+                            placement_recovery = recovery_now,
+                            repairer_recovery = repairer_recovery_now,
+                            files_renamed = repair_preview.files_renamed,
+                            available_blocks = repair_preview.available_blocks,
+                            "PAR2 repairer scan adjusted repair requirements"
+                        );
+                    }
+                    let damaged = repairer_damaged;
+                    let recovery_now = repairer_recovery_now;
+
                     if total_recovery_capacity < damaged {
                         self.fail_job(
                             job_id,
@@ -1604,34 +1677,24 @@ impl Pipeline {
                         return;
                     }
 
-                    let par2_for_repair = Arc::clone(&par2_set);
-                    let repair_dir = working_dir.clone();
-
-                    let pp_pool = self.pp_pool.clone();
-                    let repair_result = tokio::task::spawn_blocking(move || {
-                        pp_pool.install(move || {
-                            crate::e2e_failpoint::maybe_delay("repair.task_start");
-                            let mut file_access =
-                                weaver_par2::DiskFileAccess::new(repair_dir, &par2_for_repair);
-                            let plan = weaver_par2::plan_repair(&par2_for_repair, &verification)
-                                .map_err(|e| format!("repair planning failed: {e}"))?;
-                            let slices = plan.missing_slices.len() as u32;
-                            weaver_par2::execute_repair(&plan, &par2_for_repair, &mut file_access)
-                                .map_err(|e| format!("repair execution failed: {e}"))?;
-                            Ok(slices)
-                        })
-                    })
-                    .await;
-
-                    let repair_outcome = match repair_result {
-                        Ok(Ok(slices)) => Ok(slices),
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(format!("repair task panicked: {e}")),
-                    };
-
-                    match repair_outcome {
-                        Ok(slices_repaired) => {
-                            info!(job_id = job_id.0, slices_repaired, "PAR2 repair complete");
+                    match self
+                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            let slices_repaired = outcome.recovery_blocks_used;
+                            info!(
+                                job_id = job_id.0,
+                                status = ?outcome.status,
+                                slices_repaired,
+                                bytes_copied = outcome.bytes_copied,
+                                bytes_reconstructed = outcome.bytes_reconstructed,
+                                files_complete = outcome.files_complete,
+                                files_renamed = outcome.files_renamed,
+                                files_damaged = outcome.files_damaged,
+                                files_missing = outcome.files_missing,
+                                "PAR2 repair complete"
+                            );
                             let _ = self.event_tx.send(PipelineEvent::RepairComplete {
                                 job_id,
                                 slices_repaired,
@@ -1655,9 +1718,9 @@ impl Pipeline {
                                 }
                             };
 
-                            if post_repair_verification.total_missing_blocks > 0 {
+                            if par2_verification_needs_repair(&post_repair_verification) {
                                 let msg = format!(
-                                    "PAR2 repair completed but {} damaged slices remain",
+                                    "PAR2 repair completed but {} damaged slices or file placements remain",
                                     post_repair_verification.total_missing_blocks
                                 );
                                 warn!(job_id = job_id.0, error = %msg);

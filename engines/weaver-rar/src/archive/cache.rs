@@ -1,7 +1,8 @@
 //! Serializable archive header cache for journal persistence.
 //!
 //! Enables reconstructing a `RarArchive` without reading volume 0 from disk.
-//! Headers are serialized with MessagePack (`rmp-serde`) for compactness.
+//! Headers are serialized as named MessagePack maps so added metadata fields
+//! remain backward-compatible.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,7 @@ pub struct CachedMember {
     pub atime_ns: Option<u64>,
     pub data_crc32: Option<u32>,
     pub compression_method: u8,
+    #[serde(default)]
     pub compression_version: u8,
     pub compression_solid: bool,
     pub dict_size: u64,
@@ -51,6 +53,7 @@ pub struct CachedMember {
     pub rar4_salt: Option<[u8; 8]>,
     #[serde(default)]
     pub version: Option<u64>,
+    #[serde(default)]
     pub blake2_hash: Option<[u8; 32]>,
     #[serde(default)]
     pub redirection_type: Option<u64>,
@@ -75,6 +78,93 @@ pub struct CachedSegment {
     pub volume_index: usize,
     pub data_offset: u64,
     pub data_size: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyCachedArchiveHeaders {
+    format: u8,
+    is_solid: bool,
+    is_encrypted: bool,
+    more_volumes: bool,
+    #[serde(default)]
+    volume_presence: Vec<bool>,
+    #[serde(default)]
+    last_volume_seen: bool,
+    members: Vec<LegacyCachedMember>,
+}
+
+#[derive(Deserialize)]
+struct LegacyCachedMember {
+    name: String,
+    unpacked_size: Option<u64>,
+    data_crc32: Option<u32>,
+    compression_method: u8,
+    compression_version: u8,
+    compression_solid: bool,
+    dict_size: u64,
+    split_before: bool,
+    split_after: bool,
+    is_directory: bool,
+    is_encrypted: bool,
+    encryption: Option<CachedEncryption>,
+    rar4_salt: Option<[u8; 8]>,
+    blake2_hash: Option<[u8; 32]>,
+    segments: Vec<CachedSegment>,
+}
+
+impl From<LegacyCachedArchiveHeaders> for CachedArchiveHeaders {
+    fn from(value: LegacyCachedArchiveHeaders) -> Self {
+        Self {
+            format: value.format,
+            is_solid: value.is_solid,
+            is_encrypted: value.is_encrypted,
+            more_volumes: value.more_volumes,
+            volume_presence: value.volume_presence,
+            last_volume_seen: value.last_volume_seen,
+            members: value.members.into_iter().map(CachedMember::from).collect(),
+        }
+    }
+}
+
+impl From<LegacyCachedMember> for CachedMember {
+    fn from(value: LegacyCachedMember) -> Self {
+        Self {
+            name: value.name,
+            unpacked_size: value.unpacked_size,
+            mtime_ns: None,
+            ctime_ns: None,
+            atime_ns: None,
+            data_crc32: value.data_crc32,
+            compression_method: value.compression_method,
+            compression_version: value.compression_version,
+            compression_solid: value.compression_solid,
+            dict_size: value.dict_size,
+            split_before: value.split_before,
+            split_after: value.split_after,
+            is_directory: value.is_directory,
+            is_encrypted: value.is_encrypted,
+            encryption: value.encryption,
+            rar4_salt: value.rar4_salt,
+            version: None,
+            blake2_hash: value.blake2_hash,
+            redirection_type: None,
+            redirection_target: None,
+            redirection_target_is_directory: false,
+            segments: value.segments,
+        }
+    }
+}
+
+fn decode_cached_headers(data: &[u8]) -> Result<CachedArchiveHeaders, rmp_serde::decode::Error> {
+    let current_error = match rmp_serde::from_slice::<CachedArchiveHeaders>(data) {
+        Ok(cached) => return Ok(cached),
+        Err(error) => error,
+    };
+
+    match rmp_serde::from_slice::<LegacyCachedArchiveHeaders>(data) {
+        Ok(cached) => Ok(cached.into()),
+        Err(_) => Err(current_error),
+    }
 }
 
 fn encode_system_time(time: Option<SystemTime>) -> Option<u64> {
@@ -271,7 +361,7 @@ impl RarArchive {
     /// Serialize headers to MessagePack bytes.
     pub fn serialize_headers(&self) -> Vec<u8> {
         let cached = self.export_headers();
-        rmp_serde::to_vec(&cached).expect("header serialization should not fail")
+        rmp_serde::to_vec_named(&cached).expect("header serialization should not fail")
     }
 
     /// Deserialize headers from MessagePack bytes and reconstruct archive.
@@ -285,7 +375,99 @@ impl RarArchive {
         data: &[u8],
         password: impl Into<Option<String>>,
     ) -> Result<Self, rmp_serde::decode::Error> {
-        let cached: CachedArchiveHeaders = rmp_serde::from_slice(data)?;
+        let cached = decode_cached_headers(data)?;
         Ok(Self::from_cached_headers_with_password(cached, password))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Serialize)]
+    struct OldCachedArchiveHeaders {
+        format: u8,
+        is_solid: bool,
+        is_encrypted: bool,
+        more_volumes: bool,
+        volume_presence: Vec<bool>,
+        last_volume_seen: bool,
+        members: Vec<OldCachedMember>,
+    }
+
+    #[derive(Serialize)]
+    struct OldCachedMember {
+        name: String,
+        unpacked_size: Option<u64>,
+        data_crc32: Option<u32>,
+        compression_method: u8,
+        compression_version: u8,
+        compression_solid: bool,
+        dict_size: u64,
+        split_before: bool,
+        split_after: bool,
+        is_directory: bool,
+        is_encrypted: bool,
+        encryption: Option<CachedEncryption>,
+        rar4_salt: Option<[u8; 8]>,
+        blake2_hash: Option<[u8; 32]>,
+        segments: Vec<CachedSegment>,
+    }
+
+    #[test]
+    fn deserialize_headers_accepts_legacy_compact_cache() {
+        let blake2_hash = [0x42; 32];
+        let cached = OldCachedArchiveHeaders {
+            format: 5,
+            is_solid: true,
+            is_encrypted: true,
+            more_volumes: true,
+            volume_presence: vec![true, false],
+            last_volume_seen: false,
+            members: vec![OldCachedMember {
+                name: "episode.mkv".to_string(),
+                unpacked_size: Some(4096),
+                data_crc32: Some(0x1234_5678),
+                compression_method: CompressionMethod::Normal.code(),
+                compression_version: 1,
+                compression_solid: true,
+                dict_size: 8 * 1024 * 1024,
+                split_before: false,
+                split_after: true,
+                is_directory: false,
+                is_encrypted: true,
+                encryption: Some(CachedEncryption {
+                    kdf_count: 15,
+                    salt: [1; 16],
+                    iv: [2; 16],
+                    check_data: Some([3; 12]),
+                    use_hash_mac: true,
+                }),
+                rar4_salt: None,
+                blake2_hash: Some(blake2_hash),
+                segments: vec![CachedSegment {
+                    volume_index: 0,
+                    data_offset: 128,
+                    data_size: 256,
+                }],
+            }],
+        };
+        let bytes = rmp_serde::to_vec(&cached).expect("legacy compact cache should serialize");
+
+        let archive = RarArchive::deserialize_headers(&bytes).expect("legacy cache should decode");
+
+        let member = &archive.members[0];
+        assert_eq!(member.file_header.compression.version, 1);
+        assert_eq!(member.hash, Some(FileHash::Blake2sp(blake2_hash)));
+        assert!(
+            member
+                .file_encryption
+                .as_ref()
+                .is_some_and(|enc| enc.use_hash_mac)
+        );
+        assert!(member.file_header.mtime.is_none());
+        assert!(member.redirection.is_none());
     }
 }

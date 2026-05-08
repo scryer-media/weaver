@@ -1,5 +1,9 @@
 use crate::error::{Par2Error, Result};
+use crate::path::translate_par2_name_to_relative;
 use crate::types::FileId;
+
+const FIXED_BODY_SIZE: usize = 56;
+const MAX_FILENAME_BYTES: usize = 100_000;
 
 /// Parsed File Description packet.
 #[derive(Debug, Clone)]
@@ -14,16 +18,21 @@ pub struct FileDescriptionPacket {
     pub file_length: u64,
     /// Filename (ASCII/UTF-8, without null terminator).
     pub filename: String,
+    /// Original PAR2 filename before filesystem-safe translation.
+    pub par2_name: String,
 }
 
 impl FileDescriptionPacket {
     /// Parse a File Description packet from its body (after the 64-byte header).
     pub fn parse(body: &[u8]) -> Result<Self> {
         // Minimum body: 16 (file_id) + 16 (hash_full) + 16 (hash_16k) + 8 (length) = 56
-        // Plus at least some filename bytes (but we allow empty)
-        if body.len() < 56 {
+        // plus at least one filename byte.
+        if body.len() <= FIXED_BODY_SIZE {
             return Err(Par2Error::InvalidFileDescPacket {
-                reason: format!("body too short: {} bytes, need at least 56", body.len()),
+                reason: format!(
+                    "body too short: {} bytes, need more than {FIXED_BODY_SIZE}",
+                    body.len()
+                ),
             });
         }
 
@@ -31,17 +40,30 @@ impl FileDescriptionPacket {
         let hash_full: [u8; 16] = body[16..32].try_into().unwrap();
         let hash_16k: [u8; 16] = body[32..48].try_into().unwrap();
         let file_length = u64::from_le_bytes(body[48..56].try_into().unwrap());
+        if file_length <= 16_384 && hash_16k != hash_full {
+            return Err(Par2Error::InvalidFileDescPacket {
+                reason: "hash_16k must match hash_full for files <= 16KiB".to_string(),
+            });
+        }
 
         // Filename: everything after offset 56, strip null padding
         let name_bytes = &body[56..];
+        if name_bytes.len() > MAX_FILENAME_BYTES {
+            return Err(Par2Error::InvalidFileDescPacket {
+                reason: format!("filename payload too large: {} bytes", name_bytes.len()),
+            });
+        }
         let name_end = name_bytes
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(name_bytes.len());
-        let filename = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
-
-        // Sanitize filename to prevent path traversal attacks.
-        let filename = sanitize_filename(&filename);
+        if name_end == 0 {
+            return Err(Par2Error::InvalidFileDescPacket {
+                reason: "filename is empty".to_string(),
+            });
+        }
+        let par2_name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+        let filename = translate_par2_name_to_relative(&par2_name)?;
 
         Ok(FileDescriptionPacket {
             file_id,
@@ -49,40 +71,9 @@ impl FileDescriptionPacket {
             hash_16k,
             file_length,
             filename,
+            par2_name,
         })
     }
-}
-
-/// Sanitize a PAR2 filename to prevent path traversal.
-///
-/// - Strips directory separators (`/`, `\`) — PAR2 filenames should be bare names
-/// - Removes `..` components
-/// - Rejects absolute paths (leading `/` or Windows drive letters)
-///
-/// If the filename is entirely invalid (e.g., `../../..`), returns an empty string
-/// which will cause the file to be skipped during verification/repair.
-fn sanitize_filename(name: &str) -> String {
-    use std::path::Path;
-
-    if name.is_empty() {
-        return String::new();
-    }
-
-    // Normalize backslashes to forward slashes for consistent handling.
-    let normalized = name.replace('\\', "/");
-
-    // Take only the final path component (strip any directory structure).
-    let base = Path::new(&normalized)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    // Reject reserved names that could still be dangerous.
-    if base == "." || base == ".." || base.is_empty() {
-        return String::new();
-    }
-
-    base.to_string()
 }
 
 #[cfg(test)]
@@ -128,10 +119,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_filename() {
+    fn reject_empty_filename() {
         let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 0, b"\x00\x00\x00\x00");
-        let pkt = FileDescriptionPacket::parse(&body).unwrap();
-        assert_eq!(pkt.filename, "");
+        let err = FileDescriptionPacket::parse(&body).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidFileDescPacket { .. }));
     }
 
     #[test]
@@ -142,32 +133,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_minimum_body() {
+    fn reject_body_without_filename() {
         // Exactly 56 bytes: no filename at all
         let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 42, b"");
-        let pkt = FileDescriptionPacket::parse(&body).unwrap();
-        assert_eq!(pkt.file_length, 42);
-        assert_eq!(pkt.filename, "");
+        let err = FileDescriptionPacket::parse(&body).unwrap_err();
+        assert!(matches!(err, Par2Error::InvalidFileDescPacket { .. }));
     }
 
     #[test]
-    fn sanitize_path_traversal() {
-        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename(".."), "");
-        assert_eq!(sanitize_filename("../.."), "");
-        assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
-        assert_eq!(sanitize_filename("subdir/file.bin"), "file.bin");
-        assert_eq!(sanitize_filename("C:\\Users\\evil\\file.exe"), "file.exe");
-        assert_eq!(sanitize_filename("file.bin"), "file.bin");
-        assert_eq!(sanitize_filename(""), "");
-        assert_eq!(sanitize_filename("."), "");
-        assert_eq!(sanitize_filename("normal.par2"), "normal.par2");
+    fn translates_par2_paths_without_flattening() {
+        assert_eq!(
+            translate_par2_name_to_relative("../../etc/passwd").unwrap(),
+            "%2E%2E/%2E%2E/etc/passwd"
+        );
+        assert_eq!(
+            translate_par2_name_to_relative("/etc/passwd").unwrap(),
+            "%2F/etc/passwd"
+        );
+        assert_eq!(
+            translate_par2_name_to_relative("subdir/file.bin").unwrap(),
+            "subdir/file.bin"
+        );
+        assert_eq!(
+            translate_par2_name_to_relative("C:\\Users\\evil\\file.exe").unwrap(),
+            "C%3A/Users/evil/file.exe"
+        );
+        assert_eq!(
+            translate_par2_name_to_relative("normal.par2").unwrap(),
+            "normal.par2"
+        );
     }
 
     #[test]
     fn parse_path_traversal_filename() {
         let body = make_file_desc_body([0; 16], [0; 16], [0; 16], 100, b"../../etc/passwd\x00");
         let pkt = FileDescriptionPacket::parse(&body).unwrap();
-        assert_eq!(pkt.filename, "passwd");
+        assert_eq!(pkt.par2_name, "../../etc/passwd");
+        assert_eq!(pkt.filename, "%2E%2E/%2E%2E/etc/passwd");
     }
 }

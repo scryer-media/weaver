@@ -185,8 +185,7 @@ fn parse_next_block(
 
     let table_set_index = if table_present {
         let pos_before = reader.position();
-        let (nc, dc, ldc, rc) =
-            huffman::read_tables_bitreader(reader, code_lengths, extra_dist)?;
+        let (nc, dc, ldc, rc) = huffman::read_tables_bitreader(reader, code_lengths, extra_dist)?;
         let bits_used = (reader.position() - pos_before) as i64;
         block_bits_remaining -= bits_used;
         table_sets.push(TableSet {
@@ -706,8 +705,12 @@ impl LzDecoder {
             let batch_end = next_small_block_batch_end(&preparsed.blocks, block_index, batch_size);
             let block_batch = &preparsed.blocks[block_index..batch_end];
             if block_batch.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
-                let all_items =
-                    parallel_decode_batch(input, block_batch, &preparsed.table_sets, self.extra_dist)?;
+                let all_items = parallel_decode_batch(
+                    input,
+                    block_batch,
+                    &preparsed.table_sets,
+                    self.extra_dist,
+                )?;
                 self.apply_decoded_items_parallel(&all_items, unpacked_size, output_size, writer)?;
             } else {
                 for block in block_batch {

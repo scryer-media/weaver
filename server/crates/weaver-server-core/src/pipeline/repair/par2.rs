@@ -629,16 +629,18 @@ impl Pipeline {
             return;
         }
 
-        if self.par2_set(job_id).is_none() {
+        let Some(expected_set_id) = self.par2_set(job_id).map(|set| set.recovery_set_id) else {
             return;
-        }
+        };
 
         let parse_path = file_path.clone();
         let packet_list = match tokio::task::spawn_blocking(move || {
-            weaver_par2::scan_packets_from_path(&parse_path).map(|packets| {
+            weaver_par2::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
                 packets
                     .into_iter()
-                    .map(|(packet, _)| packet)
+                    .filter_map(|packet| {
+                        (packet.recovery_set_id == expected_set_id).then_some(packet.packet)
+                    })
                     .collect::<Vec<_>>()
             })
         })

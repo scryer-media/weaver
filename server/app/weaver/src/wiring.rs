@@ -154,22 +154,16 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
 
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
     let flush_interval = tokio::time::Duration::from_secs(1);
+    let mut flush_tick = tokio::time::interval(flush_interval);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    flush_tick.tick().await;
 
     loop {
-        let recv = if batch.is_empty() {
-            tokio::select! {
-                result = rx.recv() => result,
-            }
-        } else {
-            tokio::select! {
-                result = rx.recv() => result,
-                _ = tokio::time::sleep(flush_interval) => {
-                    let events = std::mem::take(&mut batch);
-                    if let Err(error) = db.queue_job_events(events).await {
-                        tracing::warn!(error = %error, "failed to queue job events");
-                    }
-                    continue;
-                }
+        let recv = tokio::select! {
+            result = rx.recv() => result,
+            _ = flush_tick.tick(), if !batch.is_empty() => {
+                flush_job_event_batch(&db, &mut batch).await;
+                continue;
             }
         };
 
@@ -193,10 +187,7 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
                 }
 
                 if batch.len() >= 50 {
-                    let events = std::mem::take(&mut batch);
-                    if let Err(error) = db.queue_job_events(events).await {
-                        tracing::warn!(error = %error, "failed to queue job events");
-                    }
+                    flush_job_event_batch(&db, &mut batch).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -206,13 +197,21 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
         }
     }
 
-    if !batch.is_empty()
-        && let Err(error) = db.queue_job_events(std::mem::take(&mut batch)).await
-    {
-        tracing::warn!(error = %error, "failed to queue final job events");
+    if !batch.is_empty() {
+        flush_job_event_batch(&db, &mut batch).await;
     }
     if let Err(error) = db.flush_write_queue().await {
         tracing::warn!(error = %error, "failed to flush final job event writes");
+    }
+}
+
+async fn flush_job_event_batch(db: &Database, batch: &mut Vec<weaver_server_core::JobEvent>) {
+    if batch.is_empty() {
+        return;
+    }
+    let events = std::mem::take(batch);
+    if let Err(error) = db.queue_job_events(events).await {
+        tracing::warn!(error = %error, "failed to queue job events");
     }
 }
 
@@ -248,5 +247,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn persist_events_flushes_partial_batches_while_events_continue() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(64);
+
+        let task = tokio::spawn(persist_events(rx, db.clone()));
+        let sender_tx = tx.clone();
+        let sender = tokio::spawn(async move {
+            for _ in 0..30 {
+                sender_tx
+                    .send(PipelineEvent::JobPaused { job_id: JobId(7) })
+                    .unwrap();
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
+        db.flush_write_queue().await.unwrap();
+        let job_events = db.get_job_events(7).unwrap();
+        assert!(
+            !job_events.is_empty(),
+            "event persistence should flush partial batches without waiting for an idle event stream"
+        );
+
+        sender.await.unwrap();
+        drop(tx);
+        task.await.unwrap();
     }
 }
