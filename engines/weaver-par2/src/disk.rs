@@ -69,6 +69,13 @@ impl FileAccess for DiskFileAccess {
         file.read(dst)
     }
 
+    fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        Ok(Some(Box::new(File::open(&path)?)))
+    }
+
     fn file_exists(&self, file_id: &FileId) -> bool {
         self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
@@ -180,6 +187,13 @@ impl FileAccess for PlacementFileAccess {
         file.read(dst)
     }
 
+    fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        let path = self
+            .path_for(file_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
+        Ok(Some(Box::new(File::open(&path)?)))
+    }
+
     fn file_exists(&self, file_id: &FileId) -> bool {
         self.path_for(file_id).map(|p| p.exists()).unwrap_or(false)
     }
@@ -270,6 +284,16 @@ impl FileAccess for MultiDirectoryFileAccess {
     ) -> io::Result<usize> {
         match self.find_reader(file_id) {
             Some(accessor) => accessor.read_file_range_into(file_id, offset, dst),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found in any directory",
+            )),
+        }
+    }
+
+    fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        match self.find_reader(file_id) {
+            Some(accessor) => accessor.open_sequential_reader(file_id),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "file not found in any directory",

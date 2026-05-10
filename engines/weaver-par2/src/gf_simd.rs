@@ -326,6 +326,16 @@ pub fn mul_acc_input_batch(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
             unsafe { mul_acc_input_batch_gfni_avx2(dst, factors_and_srcs) };
             return;
         }
+        if is_x86_feature_detected!("avx2") {
+            unsafe { mul_acc_input_batch_avx2(dst, factors_and_srcs) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { mul_acc_input_batch_neon(dst, factors_and_srcs) };
+        return;
     }
 
     #[allow(unreachable_code)]
@@ -1045,6 +1055,138 @@ unsafe fn mul_acc_input_batch_gfni_avx2(dst: &mut [u8], factors_and_srcs: &[Fact
 }
 
 // ---------------------------------------------------------------------------
+// Grouped-input AVX2 kernel
+//
+// Split-nibble counterpart to the GFNI grouped-input path. This keeps x86
+// machines without GFNI from falling all the way back to repeated dst
+// load/store cycles for every input region.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mul_acc_input_batch_avx2(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+
+    struct PreparedInput<'a> {
+        tables: [__m256i; 8],
+        factor: u16,
+        src: &'a [u8],
+    }
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor != 0 && fs.factor != 1)
+        .map(|fs| {
+            let tables = precompute_mul_tables(fs.factor);
+            let load_table = |idx: usize| unsafe {
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    tables.tables[idx].as_ptr() as *const __m128i
+                ))
+            };
+            PreparedInput {
+                tables: [
+                    load_table(0),
+                    load_table(1),
+                    load_table(2),
+                    load_table(3),
+                    load_table(4),
+                    load_table(5),
+                    load_table(6),
+                    load_table(7),
+                ],
+                factor: tables.factor,
+                src: fs.src,
+            }
+        })
+        .collect();
+
+    unsafe {
+        let mask_0f = _mm256_set1_epi8(0x0F);
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
+        let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
+        let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
+
+        macro_rules! process_chunk {
+            ($chunk_offset:expr) => {{
+                let mut acc = _mm256_loadu_si256(dst.as_ptr().add($chunk_offset) as *const __m256i);
+
+                for src in &xor_inputs {
+                    let s = _mm256_loadu_si256(src.as_ptr().add($chunk_offset) as *const __m256i);
+                    acc = _mm256_xor_si256(acc, s);
+                }
+
+                for input in &prepared {
+                    let s =
+                        _mm256_loadu_si256(input.src.as_ptr().add($chunk_offset) as *const __m256i);
+
+                    let lo_bytes = _mm256_shuffle_epi8(s, deint_lo);
+                    let hi_bytes = _mm256_shuffle_epi8(s, deint_hi);
+
+                    let lo_n0 = _mm256_and_si256(lo_bytes, mask_0f);
+                    let lo_n1 = _mm256_and_si256(_mm256_srli_epi16(lo_bytes, 4), mask_0f);
+                    let hi_n0 = _mm256_and_si256(hi_bytes, mask_0f);
+                    let hi_n1 = _mm256_and_si256(_mm256_srli_epi16(hi_bytes, 4), mask_0f);
+
+                    let p0_lo = _mm256_shuffle_epi8(input.tables[0], lo_n0);
+                    let p0_hi = _mm256_shuffle_epi8(input.tables[1], lo_n0);
+                    let p1_lo = _mm256_shuffle_epi8(input.tables[2], lo_n1);
+                    let p1_hi = _mm256_shuffle_epi8(input.tables[3], lo_n1);
+                    let p2_lo = _mm256_shuffle_epi8(input.tables[4], hi_n0);
+                    let p2_hi = _mm256_shuffle_epi8(input.tables[5], hi_n0);
+                    let p3_lo = _mm256_shuffle_epi8(input.tables[6], hi_n1);
+                    let p3_hi = _mm256_shuffle_epi8(input.tables[7], hi_n1);
+
+                    let result_lo = _mm256_xor_si256(
+                        _mm256_xor_si256(p0_lo, p1_lo),
+                        _mm256_xor_si256(p2_lo, p3_lo),
+                    );
+                    let result_hi = _mm256_xor_si256(
+                        _mm256_xor_si256(p0_hi, p1_hi),
+                        _mm256_xor_si256(p2_hi, p3_hi),
+                    );
+                    let product = _mm256_unpacklo_epi8(result_lo, result_hi);
+                    acc = _mm256_xor_si256(acc, product);
+                }
+
+                _mm256_storeu_si256(dst.as_mut_ptr().add($chunk_offset) as *mut __m256i, acc);
+            }};
+        }
+
+        let mut offset = 0usize;
+        while offset + 64 <= len {
+            process_chunk!(offset);
+            process_chunk!(offset + 32);
+            offset += 64;
+        }
+
+        while offset + 32 <= len {
+            process_chunk!(offset);
+            offset += 32;
+        }
+
+        if offset < len {
+            for src in &xor_inputs {
+                for (d, s) in dst[offset..].iter_mut().zip(src[offset..].iter()) {
+                    *d ^= *s;
+                }
+            }
+            for input in &prepared {
+                mul_acc_region_scalar(input.factor, &input.src[offset..], &mut dst[offset..]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Multi-region CLMUL kernel (aarch64)
 //
 // Uses ARM polynomial multiply (PMULL/vmull_p8) with Karatsuba decomposition
@@ -1365,6 +1507,114 @@ unsafe fn mul_acc_multi_region_neon(factors_and_dsts: &mut [FactorDst<'_>], src:
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grouped-input NEON kernel (aarch64)
+//
+// Keeps the destination chunk in one register while accumulating multiple
+// source regions. This is the ARM counterpart to the GFNI grouped-input path
+// and avoids reloading/storing `dst` once per input region.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn mul_acc_input_batch_neon(dst: &mut [u8], factors_and_srcs: &[FactorSrc<'_>]) {
+    use std::arch::aarch64::*;
+
+    let len = dst.len();
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    let all_tables: Vec<(MulTables, &[u8])> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.factor != 0 && fs.factor != 1)
+        .map(|fs| (precompute_mul_tables(fs.factor), fs.src))
+        .collect();
+
+    if xor_inputs.is_empty() && all_tables.is_empty() {
+        return;
+    }
+
+    struct NeonInputTableSet<'a> {
+        t: [uint8x16_t; 8],
+        factor: u16,
+        src: &'a [u8],
+    }
+
+    let table_sets: Vec<NeonInputTableSet<'_>> = unsafe {
+        all_tables
+            .iter()
+            .map(|(tables, src)| NeonInputTableSet {
+                t: [
+                    vld1q_u8(tables.tables[0].as_ptr()),
+                    vld1q_u8(tables.tables[1].as_ptr()),
+                    vld1q_u8(tables.tables[2].as_ptr()),
+                    vld1q_u8(tables.tables[3].as_ptr()),
+                    vld1q_u8(tables.tables[4].as_ptr()),
+                    vld1q_u8(tables.tables[5].as_ptr()),
+                    vld1q_u8(tables.tables[6].as_ptr()),
+                    vld1q_u8(tables.tables[7].as_ptr()),
+                ],
+                factor: tables.factor,
+                src,
+            })
+            .collect()
+    };
+
+    unsafe {
+        let mask_0f = vdupq_n_u8(0x0F);
+        let mut offset = 0usize;
+
+        while offset + 16 <= len {
+            let mut acc = vld1q_u8(dst.as_ptr().add(offset));
+
+            for src in &xor_inputs {
+                let s = vld1q_u8(src.as_ptr().add(offset));
+                acc = veorq_u8(acc, s);
+            }
+
+            for ts in &table_sets {
+                let s = vld1q_u8(ts.src.as_ptr().add(offset));
+                let lo_bytes = vuzp1q_u8(s, s);
+                let hi_bytes = vuzp2q_u8(s, s);
+                let lo_n0 = vandq_u8(lo_bytes, mask_0f);
+                let lo_n1 = vandq_u8(vshrq_n_u8(lo_bytes, 4), mask_0f);
+                let hi_n0 = vandq_u8(hi_bytes, mask_0f);
+                let hi_n1 = vandq_u8(vshrq_n_u8(hi_bytes, 4), mask_0f);
+
+                let p0_lo = vqtbl1q_u8(ts.t[0], lo_n0);
+                let p0_hi = vqtbl1q_u8(ts.t[1], lo_n0);
+                let p1_lo = vqtbl1q_u8(ts.t[2], lo_n1);
+                let p1_hi = vqtbl1q_u8(ts.t[3], lo_n1);
+                let p2_lo = vqtbl1q_u8(ts.t[4], hi_n0);
+                let p2_hi = vqtbl1q_u8(ts.t[5], hi_n0);
+                let p3_lo = vqtbl1q_u8(ts.t[6], hi_n1);
+                let p3_hi = vqtbl1q_u8(ts.t[7], hi_n1);
+
+                let result_lo = veorq_u8(veorq_u8(p0_lo, p1_lo), veorq_u8(p2_lo, p3_lo));
+                let result_hi = veorq_u8(veorq_u8(p0_hi, p1_hi), veorq_u8(p2_hi, p3_hi));
+                acc = veorq_u8(acc, vzip1q_u8(result_lo, result_hi));
+            }
+
+            vst1q_u8(dst.as_mut_ptr().add(offset), acc);
+            offset += 16;
+        }
+
+        if offset < len {
+            for src in &xor_inputs {
+                for (d, s) in dst[offset..].iter_mut().zip(src[offset..].iter()) {
+                    *d ^= *s;
+                }
+            }
+            for ts in &table_sets {
+                mul_acc_region_scalar(ts.factor, &ts.src[offset..], &mut dst[offset..]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,6 +1849,35 @@ mod tests {
                 "multi-region large mismatch for factor={factor:#06x}"
             );
         }
+    }
+
+    #[test]
+    fn input_batch_matches_repeated_single_region() {
+        let factors = [0x0001u16, 0x1234, 0x0000, 0xABCD, 0x8000];
+        let inputs: Vec<Vec<u8>> = factors
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                (0..1026)
+                    .map(|i| ((i * (idx + 3) + 17) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+
+        let mut reference = vec![0x5Au8; 1026];
+        for (factor, input) in factors.iter().zip(inputs.iter()) {
+            mul_acc_region(*factor, input, &mut reference);
+        }
+
+        let mut batched = vec![0x5Au8; 1026];
+        let factor_srcs: Vec<FactorSrc<'_>> = factors
+            .iter()
+            .zip(inputs.iter())
+            .map(|(&factor, input)| FactorSrc { factor, src: input })
+            .collect();
+        mul_acc_input_batch(&mut batched, &factor_srcs);
+
+        assert_eq!(batched, reference);
     }
 
     /// Test the CLMUL dispatch path specifically (>2 non-zero factors).

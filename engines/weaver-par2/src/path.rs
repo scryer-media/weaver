@@ -25,15 +25,23 @@ fn encode_char(ch: char, out: &mut String) {
 fn encode_component(component: &str) -> String {
     let mut encoded = String::with_capacity(component.len());
     for ch in component.chars() {
-        let illegal =
-            ch.is_control() || matches!(ch, '"' | '*' | ':' | '<' | '>' | '?' | '|' | '\0');
-        if illegal {
+        if is_illegal_local_char(ch) {
             encode_char(ch, &mut encoded);
         } else {
             encoded.push(ch);
         }
     }
     encoded
+}
+
+#[cfg(windows)]
+fn is_illegal_local_char(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '"' | '*' | ':' | '<' | '>' | '?' | '|' | '\0')
+}
+
+#[cfg(not(windows))]
+fn is_illegal_local_char(ch: char) -> bool {
+    ch.is_control()
 }
 
 /// Translate a PAR2 filename into a safe relative path string.
@@ -48,15 +56,15 @@ pub fn translate_par2_name_to_relative(par2_name: &str) -> Result<String> {
 
     for (index, part) in normalized.split('/').enumerate() {
         if part.is_empty() {
-            if index == 0 {
+            if index == 0 && normalized.starts_with('/') {
                 parts.push("%2F".to_string());
+                saw_name_component = true;
             }
             continue;
         }
         saw_name_component = true;
 
         let encoded = match part {
-            "." => "%2E".to_string(),
             ".." => "%2E%2E".to_string(),
             other => encode_component(other),
         };
@@ -110,6 +118,10 @@ mod tests {
             translate_par2_name_to_relative("season/episode.rar").unwrap(),
             "season/episode.rar"
         );
+        assert_eq!(
+            translate_par2_name_to_relative("season/./episode.rar").unwrap(),
+            "season/./episode.rar"
+        );
     }
 
     #[test]
@@ -126,20 +138,38 @@ mod tests {
             translate_par2_name_to_relative("/tmp/../episode.rar").unwrap(),
             "%2F/tmp/%2E%2E/episode.rar"
         );
+        assert_eq!(translate_par2_name_to_relative("/").unwrap(), "%2F");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn preserves_unix_legal_punctuation() {
+        assert_eq!(
+            translate_par2_name_to_relative("bad:name*.rar").unwrap(),
+            "bad:name*.rar"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn encodes_windows_illegal_punctuation() {
+        assert_eq!(
+            translate_par2_name_to_relative("bad:name*.rar").unwrap(),
+            "bad%3Aname%2A.rar"
+        );
     }
 
     #[test]
     fn encodes_control_and_platform_illegal_chars() {
         assert_eq!(
             translate_par2_name_to_relative("bad:name\u{1}.rar").unwrap(),
-            "bad%3Aname%01.rar"
+            format!("bad{}name%01.rar", if cfg!(windows) { "%3A" } else { ":" })
         );
     }
 
     #[test]
     fn rejects_empty_names() {
         assert!(translate_par2_name_to_relative("").is_err());
-        assert!(translate_par2_name_to_relative("///").is_err());
     }
 
     #[test]

@@ -9,6 +9,34 @@
 use crate::error::{Par2Error, Result};
 use crate::gf;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodeMatrixError {
+    pub bad_row: Option<usize>,
+    pub reason: String,
+}
+
+impl DecodeMatrixError {
+    fn new(reason: String) -> Self {
+        Self {
+            bad_row: None,
+            reason,
+        }
+    }
+
+    fn singular(bad_row: usize) -> Self {
+        Self {
+            bad_row: Some(bad_row),
+            reason: "matrix is singular (no pivot found)".to_string(),
+        }
+    }
+
+    fn into_par2_error(self) -> Par2Error {
+        Par2Error::ReedSolomonError {
+            reason: self.reason,
+        }
+    }
+}
+
 /// A row-major matrix over GF(2^16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matrix {
@@ -52,19 +80,35 @@ impl Matrix {
     /// After elimination, `self` will be the identity matrix (if invertible)
     /// and `rhs` will contain the solution/inverse.
     pub fn gaussian_eliminate(&mut self, rhs: &mut Matrix) -> Result<()> {
+        let mut row_origins = (0..self.rows).collect::<Vec<_>>();
+        self.gaussian_eliminate_tracked(rhs, &mut row_origins)
+            .map_err(DecodeMatrixError::into_par2_error)
+    }
+
+    fn gaussian_eliminate_tracked(
+        &mut self,
+        rhs: &mut Matrix,
+        row_origins: &mut [usize],
+    ) -> std::result::Result<(), DecodeMatrixError> {
         let n = self.rows;
         if self.cols != n {
-            return Err(Par2Error::ReedSolomonError {
-                reason: format!("matrix is not square: {}x{}", self.rows, self.cols),
-            });
+            return Err(DecodeMatrixError::new(format!(
+                "matrix is not square: {}x{}",
+                self.rows, self.cols
+            )));
         }
         if rhs.rows != n {
-            return Err(Par2Error::ReedSolomonError {
-                reason: format!(
-                    "RHS row count {} does not match matrix rows {}",
-                    rhs.rows, n
-                ),
-            });
+            return Err(DecodeMatrixError::new(format!(
+                "RHS row count {} does not match matrix rows {}",
+                rhs.rows, n
+            )));
+        }
+        if row_origins.len() != n {
+            return Err(DecodeMatrixError::new(format!(
+                "row origin count {} does not match matrix rows {}",
+                row_origins.len(),
+                n
+            )));
         }
 
         for col in 0..n {
@@ -73,9 +117,7 @@ impl Matrix {
             let pivot_row = match pivot_row {
                 Some(r) => r,
                 None => {
-                    return Err(Par2Error::ReedSolomonError {
-                        reason: "matrix is singular (no pivot found)".to_string(),
-                    });
+                    return Err(DecodeMatrixError::singular(row_origins[col]));
                 }
             };
 
@@ -83,6 +125,7 @@ impl Matrix {
             if pivot_row != col {
                 self.data.swap(col, pivot_row);
                 rhs.data.swap(col, pivot_row);
+                row_origins.swap(col, pivot_row);
             }
 
             // Scale pivot row so that self[col][col] = 1.
@@ -126,6 +169,15 @@ impl Matrix {
         m.gaussian_eliminate(&mut inv)?;
         Ok(inv)
     }
+
+    fn invert_with_bad_row(&self) -> std::result::Result<Matrix, DecodeMatrixError> {
+        let n = self.rows;
+        let mut m = self.clone();
+        let mut inv = Matrix::identity(n);
+        let mut row_origins = (0..n).collect::<Vec<_>>();
+        m.gaussian_eliminate_tracked(&mut inv, &mut row_origins)?;
+        Ok(inv)
+    }
 }
 
 /// Build the decode matrix needed for repair.
@@ -144,14 +196,21 @@ pub fn build_decode_matrix(
     recovery_exponents: &[u32],
     constants: &[u16],
 ) -> Result<Matrix> {
+    build_decode_matrix_with_bad_row(missing_indices, recovery_exponents, constants)
+        .map_err(DecodeMatrixError::into_par2_error)
+}
+
+pub(crate) fn build_decode_matrix_with_bad_row(
+    missing_indices: &[usize],
+    recovery_exponents: &[u32],
+    constants: &[u16],
+) -> std::result::Result<Matrix, DecodeMatrixError> {
     let n = missing_indices.len();
     if recovery_exponents.len() != n {
-        return Err(Par2Error::ReedSolomonError {
-            reason: format!(
-                "recovery exponent count ({}) does not match missing slice count ({n})",
-                recovery_exponents.len()
-            ),
-        });
+        return Err(DecodeMatrixError::new(format!(
+            "recovery exponent count ({}) does not match missing slice count ({n})",
+            recovery_exponents.len()
+        )));
     }
     if n == 0 {
         return Ok(Matrix::zeros(0, 0));
@@ -167,7 +226,7 @@ pub fn build_decode_matrix(
     }
 
     // Invert the submatrix.
-    submatrix.invert()
+    submatrix.invert_with_bad_row()
 }
 
 #[cfg(test)]
@@ -257,6 +316,14 @@ mod tests {
         m.data[1] = vec![1, 2];
         let err = m.invert().unwrap_err();
         assert!(matches!(err, Par2Error::ReedSolomonError { .. }));
+    }
+
+    #[test]
+    fn singular_decode_matrix_reports_bad_recovery_row() {
+        let constants = crate::gf::input_slice_constants(2);
+        let missing = vec![0usize, 1];
+        let err = build_decode_matrix_with_bad_row(&missing, &[0, 0], &constants).unwrap_err();
+        assert_eq!(err.bad_row, Some(1));
     }
 
     #[test]

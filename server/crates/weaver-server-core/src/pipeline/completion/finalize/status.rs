@@ -57,22 +57,33 @@ impl Pipeline {
             .as_ref()
             .map(Self::persist_active_status_for)
             .map(str::to_string);
-        let (download_state, post_state, run_state) =
-            crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
-        let download_state = download_state.as_str().to_string();
-        let post_state = post_state.as_str().to_string();
-        let run_state = run_state.as_str().to_string();
-        let (paused_resume_download_state, paused_resume_post_state) = state
-            .paused_resume_status
+        let download_state = state.download_state.as_str().to_string();
+        let post_state = state.post_state.as_str().to_string();
+        let run_state = state.run_state.as_str().to_string();
+        let paused_resume_download_state = state
+            .paused_resume_download_state
             .as_ref()
-            .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
-            .map(|(download_state, post_state, _)| {
-                (
-                    Some(download_state.as_str().to_string()),
-                    Some(post_state.as_str().to_string()),
-                )
-            })
-            .unwrap_or((None, None));
+            .map(|download_state| download_state.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                state
+                    .paused_resume_status
+                    .as_ref()
+                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
+                    .map(|(download_state, _, _)| download_state.as_str().to_string())
+            });
+        let paused_resume_post_state = state
+            .paused_resume_post_state
+            .as_ref()
+            .map(|post_state| post_state.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                state
+                    .paused_resume_status
+                    .as_ref()
+                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
+                    .map(|(_, post_state, _)| post_state.as_str().to_string())
+            });
 
         self.db_fire_and_forget(move |db| {
             if let Err(error) = db.set_active_job_runtime(
@@ -156,6 +167,37 @@ impl Pipeline {
         }
     }
 
+    pub(crate) fn schedule_job_completion_check_if_download_pipeline_drained(
+        &mut self,
+        job_id: JobId,
+        reason: &'static str,
+    ) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if matches!(
+            state.status,
+            JobStatus::Paused
+                | JobStatus::Checking
+                | JobStatus::Moving
+                | JobStatus::Complete
+                | JobStatus::Failed { .. }
+        ) {
+            return;
+        }
+        if self.job_has_pending_download_pipeline_work(job_id)
+            || self.pending_completion_checks.contains(&job_id)
+        {
+            return;
+        }
+
+        debug!(
+            job_id = job_id.0,
+            reason, "scheduling completion check after download pipeline drained"
+        );
+        self.pending_completion_checks.push_back(job_id);
+    }
+
     pub(crate) fn remove_pending_completion_check(&mut self, job_id: JobId) {
         self.pending_completion_checks
             .retain(|queued| *queued != job_id);
@@ -178,10 +220,139 @@ impl Pipeline {
         }
     }
 
-    fn paused_resume_target(previous_status: &JobStatus) -> JobStatus {
-        match previous_status {
-            JobStatus::Queued => JobStatus::Queued,
-            _ => JobStatus::Downloading,
+    fn transition_runtime_snapshot(
+        &mut self,
+        job_id: JobId,
+        new_status: JobStatus,
+        new_download_state: crate::jobs::model::DownloadState,
+        new_post_state: crate::jobs::model::PostState,
+        new_run_state: crate::jobs::model::RunState,
+        persist_status: Option<&'static str>,
+    ) {
+        let failpoint_name = {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            if state.run_state != new_run_state
+                && matches!(new_run_state, crate::jobs::model::RunState::Paused)
+            {
+                Some("status.enter_paused")
+            } else if state.post_state == new_post_state {
+                None
+            } else {
+                match new_post_state {
+                    crate::jobs::model::PostState::Verifying => Some("status.enter_verifying"),
+                    crate::jobs::model::PostState::Repairing => Some("status.enter_repairing"),
+                    crate::jobs::model::PostState::QueuedRepair => {
+                        Some("status.enter_queued_repair")
+                    }
+                    crate::jobs::model::PostState::QueuedExtract => {
+                        Some("status.enter_queued_extract")
+                    }
+                    _ => None,
+                }
+            }
+        };
+        let (transitioned, released_repair, released_extract, entered_repair, entered_extract) = {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return;
+            };
+            let old_status = state.status.clone();
+            let old_download_state = state.download_state;
+            let old_post_state = state.post_state;
+            let old_run_state = state.run_state;
+            let queued_repair_at = state.queued_repair_at_epoch_ms;
+            let queued_extract_at = state.queued_extract_at_epoch_ms;
+            let transitioned = old_status != new_status
+                || old_download_state != new_download_state
+                || old_post_state != new_post_state
+                || old_run_state != new_run_state;
+            let released_repair =
+                matches!(old_post_state, crate::jobs::model::PostState::Repairing)
+                    && !matches!(new_post_state, crate::jobs::model::PostState::Repairing);
+            let released_extract =
+                matches!(old_post_state, crate::jobs::model::PostState::Extracting)
+                    && !matches!(new_post_state, crate::jobs::model::PostState::Extracting);
+            let entered_repair =
+                !matches!(old_post_state, crate::jobs::model::PostState::Repairing)
+                    && matches!(new_post_state, crate::jobs::model::PostState::Repairing);
+            let entered_extract =
+                !matches!(old_post_state, crate::jobs::model::PostState::Extracting)
+                    && matches!(new_post_state, crate::jobs::model::PostState::Extracting);
+            let now = crate::jobs::model::epoch_ms_now();
+            if let JobStatus::Failed { error } = &new_status {
+                state.failure_error = Some(error.clone());
+            } else if !matches!(new_status, JobStatus::Failed { .. }) {
+                state.failure_error = None;
+            }
+            state.queued_repair_at_epoch_ms =
+                if matches!(new_post_state, crate::jobs::model::PostState::QueuedRepair) {
+                    queued_repair_at.or(Some(now))
+                } else if matches!(new_run_state, crate::jobs::model::RunState::Paused)
+                    && matches!(
+                        state.paused_resume_post_state,
+                        Some(crate::jobs::model::PostState::QueuedRepair)
+                    )
+                {
+                    queued_repair_at
+                } else {
+                    None
+                };
+            state.queued_extract_at_epoch_ms =
+                if matches!(new_post_state, crate::jobs::model::PostState::QueuedExtract) {
+                    queued_extract_at.or(Some(now))
+                } else if matches!(new_run_state, crate::jobs::model::RunState::Paused)
+                    && matches!(
+                        state.paused_resume_post_state,
+                        Some(crate::jobs::model::PostState::QueuedExtract)
+                    )
+                {
+                    queued_extract_at
+                } else {
+                    None
+                };
+            if !matches!(new_run_state, crate::jobs::model::RunState::Paused) {
+                state.paused_resume_status = None;
+                state.paused_resume_download_state = None;
+                state.paused_resume_post_state = None;
+            }
+            state.status = new_status;
+            state.download_state = new_download_state;
+            state.post_state = new_post_state;
+            state.run_state = new_run_state;
+            (
+                transitioned,
+                released_repair,
+                released_extract,
+                entered_repair,
+                entered_extract,
+            )
+        };
+
+        if released_repair {
+            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        if released_extract {
+            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+        }
+        if entered_repair {
+            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if entered_extract {
+            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if persist_status.is_some() {
+            self.persist_active_runtime(job_id);
+        }
+        if let (true, Some(name)) = (transitioned, failpoint_name) {
+            crate::e2e_failpoint::maybe_delay(name);
+            crate::e2e_failpoint::maybe_trip(name);
+        }
+        if released_repair {
+            self.promote_queued_repairs();
+        }
+        if released_extract {
+            self.promote_queued_extractions();
         }
     }
 
@@ -407,23 +578,40 @@ impl Pipeline {
     }
 
     pub(crate) fn pause_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
-        let previous_status = match self.jobs.get(&job_id) {
-            Some(state) => state.status.clone(),
-            None => return Err(crate::SchedulerError::JobNotFound(job_id)),
-        };
-        if matches!(previous_status, JobStatus::Paused) {
+        let (previous_status, previous_download_state, previous_post_state, previous_run_state) =
+            match self.jobs.get(&job_id) {
+                Some(state) => (
+                    state.status.clone(),
+                    state.download_state,
+                    state.post_state,
+                    state.run_state,
+                ),
+                None => return Err(crate::SchedulerError::JobNotFound(job_id)),
+            };
+        if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
-        if !matches!(previous_status, JobStatus::Queued | JobStatus::Downloading) {
+        if !matches!(
+            previous_download_state,
+            crate::jobs::model::DownloadState::Queued
+                | crate::jobs::model::DownloadState::Downloading
+        ) {
             return Err(crate::SchedulerError::Conflict(format!(
                 "pause is only supported in queued or downloading states (current: {:?})",
                 previous_status
             )));
         }
 
-        let resume_status = Self::paused_resume_target(&previous_status);
+        let resume_status = crate::jobs::model::derive_legacy_job_status(
+            previous_download_state,
+            previous_post_state,
+            crate::jobs::model::RunState::Active,
+            None,
+        );
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.paused_resume_status = Some(resume_status);
+            state.paused_resume_download_state = Some(previous_download_state);
+            state.paused_resume_post_state = Some(previous_post_state);
         }
         self.remove_pending_completion_check(job_id);
         self.transition_postprocessing_status(job_id, JobStatus::Paused, Some("paused"));
@@ -434,18 +622,36 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
-        let resume_status = match self.jobs.get_mut(&job_id) {
-            Some(state) => {
-                if !matches!(state.status, JobStatus::Paused) {
-                    return Ok(());
+        let (resume_status, resume_download_state, resume_post_state) =
+            match self.jobs.get_mut(&job_id) {
+                Some(state) => {
+                    if !matches!(state.run_state, crate::jobs::model::RunState::Paused) {
+                        return Ok(());
+                    }
+                    let resume_status = state
+                        .paused_resume_status
+                        .take()
+                        .unwrap_or(JobStatus::Downloading);
+                    let (default_download_state, default_post_state, _) =
+                        crate::jobs::model::runtime_lanes_from_status_snapshot(&resume_status);
+                    let resume_download_state = state
+                        .paused_resume_download_state
+                        .take()
+                        .unwrap_or(default_download_state);
+                    let resume_post_state = state
+                        .paused_resume_post_state
+                        .take()
+                        .unwrap_or(default_post_state);
+                    let resume_status = crate::jobs::model::derive_legacy_job_status(
+                        resume_download_state,
+                        resume_post_state,
+                        crate::jobs::model::RunState::Active,
+                        None,
+                    );
+                    (resume_status, resume_download_state, resume_post_state)
                 }
-                state
-                    .paused_resume_status
-                    .take()
-                    .unwrap_or(JobStatus::Downloading)
-            }
-            None => return Err(crate::SchedulerError::JobNotFound(job_id)),
-        };
+                None => return Err(crate::SchedulerError::JobNotFound(job_id)),
+            };
 
         if matches!(
             resume_status,
@@ -454,8 +660,18 @@ impl Pipeline {
             return Ok(());
         }
         let persist_status = Self::persist_active_status_for(&resume_status);
-        self.transition_postprocessing_status(job_id, resume_status.clone(), Some(persist_status));
-        if matches!(resume_status, JobStatus::Downloading) {
+        self.transition_runtime_snapshot(
+            job_id,
+            resume_status.clone(),
+            resume_download_state,
+            resume_post_state,
+            crate::jobs::model::RunState::Active,
+            Some(persist_status),
+        );
+        if matches!(
+            resume_download_state,
+            crate::jobs::model::DownloadState::Downloading
+        ) {
             self.schedule_job_completion_check(job_id);
         }
         Ok(())
@@ -467,95 +683,16 @@ impl Pipeline {
         new_status: JobStatus,
         persist_status: Option<&'static str>,
     ) {
-        let failpoint_name = match &new_status {
-            JobStatus::Verifying => Some("status.enter_verifying"),
-            JobStatus::Repairing => Some("status.enter_repairing"),
-            JobStatus::QueuedRepair => Some("status.enter_queued_repair"),
-            JobStatus::QueuedExtract => Some("status.enter_queued_extract"),
-            JobStatus::Paused => Some("status.enter_paused"),
-            _ => None,
-        };
-        let (transitioned, released_repair, released_extract, entered_repair, entered_extract) = {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                return;
-            };
-            let old_status = state.status.clone();
-            let queued_repair_at = state.queued_repair_at_epoch_ms;
-            let queued_extract_at = state.queued_extract_at_epoch_ms;
-            let transitioned = old_status != new_status;
-            let released_repair = matches!(old_status, JobStatus::Repairing)
-                && !matches!(new_status, JobStatus::Repairing);
-            let released_extract = matches!(old_status, JobStatus::Extracting)
-                && !matches!(new_status, JobStatus::Extracting);
-            let entered_repair = !matches!(old_status, JobStatus::Repairing)
-                && matches!(new_status, JobStatus::Repairing);
-            let entered_extract = !matches!(old_status, JobStatus::Extracting)
-                && matches!(new_status, JobStatus::Extracting);
-            let now = crate::jobs::model::epoch_ms_now();
-            if let JobStatus::Failed { error } = &new_status {
-                state.failure_error = Some(error.clone());
-            } else if !matches!(new_status, JobStatus::Failed { .. }) {
-                state.failure_error = None;
-            }
-            state.status = new_status;
-            state.queued_repair_at_epoch_ms = if matches!(state.status, JobStatus::QueuedRepair) {
-                queued_repair_at.or(Some(now))
-            } else if matches!(state.status, JobStatus::Paused)
-                && matches!(state.paused_resume_status, Some(JobStatus::QueuedRepair))
-            {
-                queued_repair_at
-            } else {
-                None
-            };
-            state.queued_extract_at_epoch_ms = if matches!(state.status, JobStatus::QueuedExtract) {
-                queued_extract_at.or(Some(now))
-            } else if matches!(state.status, JobStatus::Paused)
-                && matches!(state.paused_resume_status, Some(JobStatus::QueuedExtract))
-            {
-                queued_extract_at
-            } else {
-                None
-            };
-            if !matches!(state.status, JobStatus::Paused) {
-                state.paused_resume_status = None;
-                state.paused_resume_download_state = None;
-                state.paused_resume_post_state = None;
-            }
-            state.refresh_runtime_lanes_from_status();
-            (
-                transitioned,
-                released_repair,
-                released_extract,
-                entered_repair,
-                entered_extract,
-            )
-        };
-
-        if released_repair {
-            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if released_extract {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if entered_repair {
-            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
-        }
-        if entered_extract {
-            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-        }
-        if persist_status.is_some() {
-            self.persist_active_runtime(job_id);
-        }
-        if let (true, Some(name)) = (transitioned, failpoint_name) {
-            crate::e2e_failpoint::maybe_delay(name);
-            crate::e2e_failpoint::maybe_trip(name);
-        }
-        if released_repair {
-            self.promote_queued_repairs();
-        }
-        if released_extract {
-            self.promote_queued_extractions();
-        }
+        let (new_download_state, new_post_state, new_run_state) =
+            crate::jobs::model::runtime_lanes_from_status_snapshot(&new_status);
+        self.transition_runtime_snapshot(
+            job_id,
+            new_status,
+            new_download_state,
+            new_post_state,
+            new_run_state,
+            persist_status,
+        );
     }
 
     pub(crate) async fn maybe_start_repair(&mut self, job_id: JobId) -> bool {

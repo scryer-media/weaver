@@ -64,6 +64,10 @@ impl SharedPipelineState {
         self.metrics_snapshot.read().unwrap().clone()
     }
 
+    pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.raw_snapshot()
+    }
+
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {
         &self.metrics
     }
@@ -478,6 +482,12 @@ impl SchedulerHandle {
     /// Get current metrics (reads from shared state, no channel round-trip).
     pub fn get_metrics(&self) -> MetricsSnapshot {
         self.state.metrics_snapshot()
+    }
+
+    /// Get a fresh atomics-based metrics snapshot without advancing the shared
+    /// speed tracker.
+    pub fn get_live_metrics(&self) -> MetricsSnapshot {
+        self.state.raw_metrics_snapshot()
     }
 
     pub fn get_download_block(&self) -> DownloadBlockState {

@@ -8,7 +8,7 @@ fn prefers_parsed_release_title() {
             Some("Silver Horizon.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu"),
             None,
         ),
-        "Silver Horizon Beyond the Vale"
+        "Silver Horizon Beyond Journeys End"
     );
 }
 
@@ -16,7 +16,7 @@ fn prefers_parsed_release_title() {
 fn display_title_includes_season_episode() {
     assert_eq!(
         derive_release_name(
-            Some("Attack.on.Titan.S04E29.The.Final.Chapters.1080p.WEB-DL.H.265"),
+            Some("Stoneguard.S04E29.The.Final.Chapters.1080p.WEB-DL.H.265"),
             None,
         ),
         "Stoneguard — S04E29"

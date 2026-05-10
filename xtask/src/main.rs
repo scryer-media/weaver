@@ -62,6 +62,8 @@ enum Commands {
     Profile(ProfileArgs),
     Perf(PerfArgs),
     Par2(Par2Args),
+    PrintRustflags(PrintRustflagsArgs),
+    VerifyCryptoTarget(VerifyCryptoTargetArgs),
 }
 
 #[derive(Args)]
@@ -97,6 +99,20 @@ struct ClippyArgs {
 #[derive(Args)]
 struct ServeArgs {
     target: Option<String>,
+}
+
+#[derive(Args)]
+struct PrintRustflagsArgs {
+    #[arg(long)]
+    target: Option<String>,
+    #[arg(long)]
+    ci: bool,
+}
+
+#[derive(Args)]
+struct VerifyCryptoTargetArgs {
+    #[arg(long)]
+    target: String,
 }
 
 #[cfg(unix)]
@@ -288,7 +304,123 @@ fn main() -> Result<()> {
         Commands::Par2(args) => match args.command {
             Par2Command::FinalizeKit(args) => par2_kit::run(&ctx, args.args),
         },
+        Commands::PrintRustflags(args) => run_print_rustflags(args),
+        Commands::VerifyCryptoTarget(args) => run_verify_crypto_target(args),
     }
+}
+
+fn run_print_rustflags(args: PrintRustflagsArgs) -> Result<()> {
+    let flags = if args.ci {
+        let target = args
+            .target
+            .as_deref()
+            .context("--target is required with --ci")?;
+        ci_rustflags_for_target(target)?
+    } else {
+        host_local_rustflags()
+    };
+    println!("{flags}");
+    Ok(())
+}
+
+fn run_verify_crypto_target(args: VerifyCryptoTargetArgs) -> Result<()> {
+    verify_crypto_target(&args.target)?;
+    println!("native crypto config ok for {}", args.target);
+    Ok(())
+}
+
+fn host_local_rustflags() -> String {
+    local_rustflags_for_host(std::env::consts::ARCH, std::env::consts::OS)
+}
+
+fn local_rustflags_for_host(host_arch: &str, host_os: &str) -> String {
+    let mut flags = vec!["-C target-cpu=native".to_string()];
+    if host_arch == "aarch64" {
+        flags.push("--cfg aes_armv8".to_string());
+        if host_os != "windows" {
+            flags.push("--cfg chacha20_force_neon".to_string());
+        }
+    }
+    flags.join(" ")
+}
+
+fn ci_rustflags_for_target(target: &str) -> Result<String> {
+    let flags = if target.starts_with("x86_64-pc-windows-") {
+        "-C target-cpu=haswell -C linker=rust-lld"
+    } else if target.starts_with("x86_64-") {
+        "-C target-cpu=haswell"
+    } else if target.starts_with("aarch64-apple-") {
+        "-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon"
+    } else if target.starts_with("aarch64-") && target.contains("-windows-") {
+        "-C target-cpu=cortex-a76 --cfg aes_armv8 -C linker=rust-lld"
+    } else if target.starts_with("aarch64-") && target.contains("-linux-") {
+        "-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon"
+    } else {
+        bail!("unsupported target for rustflags: {target}");
+    };
+    Ok(flags.to_string())
+}
+
+fn native_crypto_supported_target(target: &str) -> bool {
+    matches!(
+        target,
+        "x86_64-apple-darwin"
+            | "aarch64-apple-darwin"
+            | "x86_64-unknown-linux-musl"
+            | "aarch64-unknown-linux-musl"
+            | "x86_64-pc-windows-msvc"
+            | "aarch64-pc-windows-msvc"
+    )
+}
+
+fn verify_crypto_target(target: &str) -> Result<()> {
+    if !native_crypto_supported_target(target) {
+        bail!("unsupported native crypto target: {target}");
+    }
+
+    let flags = ci_rustflags_for_target(target)?;
+    let has = |needle: &str| flags.split_whitespace().any(|token| token == needle);
+
+    if target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl") {
+        if !has("target-cpu=haswell") {
+            bail!("missing haswell target-cpu for {target}: {flags}");
+        }
+        if has("aes_armv8") || has("chacha20_force_neon") || has("linker=rust-lld") {
+            bail!("unexpected ARM or Windows flags for {target}: {flags}");
+        }
+    } else if target.starts_with("x86_64-pc-windows-") {
+        if !has("target-cpu=haswell") || !has("linker=rust-lld") {
+            bail!("missing Windows x86_64 crypto/linker flags for {target}: {flags}");
+        }
+        if has("aes_armv8") || has("chacha20_force_neon") {
+            bail!("unexpected ARM flags for {target}: {flags}");
+        }
+    } else if target.starts_with("aarch64-apple-") {
+        if !has("target-cpu=apple-m1") || !has("aes_armv8") || !has("chacha20_force_neon") {
+            bail!("missing Apple ARM crypto flags for {target}: {flags}");
+        }
+        if has("linker=rust-lld") {
+            bail!("unexpected Windows linker flag for {target}: {flags}");
+        }
+    } else if target.starts_with("aarch64-unknown-linux-musl") {
+        if !has("target-cpu=cortex-a72") || !has("aes_armv8") || !has("chacha20_force_neon") {
+            bail!("missing Linux ARM crypto flags for {target}: {flags}");
+        }
+        if has("linker=rust-lld") {
+            bail!("unexpected Windows linker flag for {target}: {flags}");
+        }
+    } else if target.starts_with("aarch64-pc-windows-") {
+        if !has("target-cpu=cortex-a76") || !has("aes_armv8") || !has("linker=rust-lld") {
+            bail!("missing Windows ARM crypto/linker flags for {target}: {flags}");
+        }
+        if has("chacha20_force_neon") {
+            bail!("unexpected non-Windows ARM neon flag for {target}: {flags}");
+        }
+    } else {
+        bail!("no crypto verification rules for {target}");
+    }
+
+    Ok(())
 }
 
 fn step(message: impl AsRef<str>) {
@@ -820,7 +952,7 @@ fn write_workspace_version(path: &Path, version: &Version) -> Result<()> {
 }
 
 fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
-    let linux_target = "x86_64-unknown-linux-gnu";
+    let linux_target = "x86_64-unknown-linux-musl";
     let mut rustc = ctx.command("rustc");
     rustc.arg("-vV");
     let host_target = run_capture(&mut rustc)?
@@ -832,7 +964,11 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     let linux_image = std::env::var("WEAVER_LINUX_CLIPPY_IMAGE")
         .unwrap_or_else(|_| "rust:1.95-bookworm".to_string());
     let linux_platform =
-        std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM").unwrap_or_else(|_| "linux/arm64".to_string());
+        std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string());
+    let linux_rustflags = ci_rustflags_for_target(linux_target)?;
+    let linux_rustflags_env =
+        format!("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS={linux_rustflags}");
+    let linux_linker_env = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc";
 
     if !args.linux_only {
         println!("Running cargo clippy for host target: {host_target}");
@@ -870,18 +1006,27 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "CARGO_TARGET_DIR=/tmp/target",
                 "-e",
                 "CARGO_TERM_COLOR=always",
+                "-e",
+                &linux_rustflags_env,
+                "-e",
+                linux_linker_env,
                 &linux_image,
                 "bash",
                 "-lc",
-                "set -euo pipefail; /usr/local/cargo/bin/rustup component add clippy; toolchain=\"$('/usr/local/cargo/bin/rustup' show active-toolchain | cut -d' ' -f1)\"; toolchain_bin=\"/usr/local/rustup/toolchains/${toolchain}/bin\"; export PATH=\"${toolchain_bin}:$PATH\"; \"${toolchain_bin}/cargo-clippy\" clippy --workspace --lib --bins --tests --examples -- -D warnings",
+                "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add x86_64-unknown-linux-musl; cargo clippy --workspace --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings",
             ]);
             run_checked(&mut command)?;
-        } else if command_available("x86_64-linux-gnu-gcc")? {
+        } else if command_available("musl-gcc")? {
             let mut target_add = ctx.command("rustup");
             target_add.args(["target", "add", linux_target]);
             run_checked(&mut target_add)?;
 
             let mut command = ctx.command_in("cargo", &ctx.repo_root);
+            command.env(
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+                &linux_rustflags,
+            );
+            command.env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "musl-gcc");
             command.args([
                 "clippy",
                 "--workspace",
@@ -897,7 +1042,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
             ]);
             run_checked(&mut command)?;
         } else {
-            bail!("cannot run Linux CI clippy locally; install Docker or x86_64-linux-gnu-gcc");
+            bail!("cannot run Linux CI clippy locally; install Docker or musl-gcc");
         }
     }
 
@@ -1689,6 +1834,7 @@ fn bootstrap_state_dir(
     backend_port: u16,
     backend_log: &Path,
     encryption_key: Option<&str>,
+    rustflags: &str,
 ) -> Result<()> {
     if state_dir.join("weaver.db").exists() {
         return Ok(());
@@ -1703,6 +1849,7 @@ fn bootstrap_state_dir(
     let mut child = ctx.command_in("cargo", &ctx.repo_root);
     child
         .env("RUST_LOG", "warn")
+        .env("RUSTFLAGS", rustflags)
         .args([
             "run",
             "-p",
@@ -1759,6 +1906,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         std::env::var("WEAVER_VITE_POLL_INTERVAL_MS").unwrap_or_else(|_| "250".to_string());
     let diagnostics_enabled =
         std::env::var("WEAVER_ENABLE_DIAGNOSTICS").unwrap_or_else(|_| "0".to_string());
+    let local_rustflags = host_local_rustflags();
 
     let keep_data = std::env::var("WEAVER_DEV_KEEP_DATA")
         .map(|value| value == "1")
@@ -1798,13 +1946,16 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         backend_port,
         &backend_log,
         encryption_key.as_deref(),
+        &local_rustflags,
     )?;
     let encryption_key = load_state_encryption_key(&state_key_file)?;
     seed_runtime_dirs(&state_dir.join("weaver.db"), &data_dir)?;
 
     println!("==> Building Weaver backend...");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
-    build.env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled);
+    build
+        .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
+        .env("RUSTFLAGS", &local_rustflags);
     build.args(["build", "--locked", "-p", "weaver"]);
     run_checked(&mut build)?;
 
@@ -2013,7 +2164,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         println!("==> Building release...");
         let mut build = ctx.command_in("cargo", &ctx.repo_root);
         build
-            .env("RUSTFLAGS", "-C target-cpu=native")
+            .env("RUSTFLAGS", host_local_rustflags())
             .args(["build", "--release", "-p", "weaver"]);
         run_checked(&mut build)?;
     }
@@ -2199,5 +2350,85 @@ mod tests {
         let reason =
             release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn ci_rustflags_cover_supported_arm_targets() {
+        assert_eq!(
+            ci_rustflags_for_target("aarch64-apple-darwin").unwrap(),
+            "-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon"
+        );
+        assert_eq!(
+            ci_rustflags_for_target("aarch64-unknown-linux-musl").unwrap(),
+            "-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon"
+        );
+        assert_eq!(
+            ci_rustflags_for_target("aarch64-pc-windows-msvc").unwrap(),
+            "-C target-cpu=cortex-a76 --cfg aes_armv8 -C linker=rust-lld"
+        );
+    }
+
+    #[test]
+    fn ci_rustflags_preserve_existing_x86_targets() {
+        assert_eq!(
+            ci_rustflags_for_target("x86_64-apple-darwin").unwrap(),
+            "-C target-cpu=haswell"
+        );
+        assert_eq!(
+            ci_rustflags_for_target("x86_64-unknown-linux-musl").unwrap(),
+            "-C target-cpu=haswell"
+        );
+        assert_eq!(
+            ci_rustflags_for_target("x86_64-pc-windows-msvc").unwrap(),
+            "-C target-cpu=haswell -C linker=rust-lld"
+        );
+    }
+
+    #[test]
+    fn local_rustflags_enable_arm_crypto_backends() {
+        assert_eq!(
+            local_rustflags_for_host("aarch64", "macos"),
+            "-C target-cpu=native --cfg aes_armv8 --cfg chacha20_force_neon"
+        );
+        assert_eq!(
+            local_rustflags_for_host("aarch64", "linux"),
+            "-C target-cpu=native --cfg aes_armv8 --cfg chacha20_force_neon"
+        );
+        assert_eq!(
+            local_rustflags_for_host("aarch64", "windows"),
+            "-C target-cpu=native --cfg aes_armv8"
+        );
+    }
+
+    #[test]
+    fn local_rustflags_leave_x86_native_only() {
+        assert_eq!(
+            local_rustflags_for_host("x86_64", "linux"),
+            "-C target-cpu=native"
+        );
+    }
+
+    #[test]
+    fn verify_crypto_target_accepts_supported_release_targets() {
+        for target in [
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ] {
+            verify_crypto_target(target).unwrap();
+        }
+    }
+
+    #[test]
+    fn verify_crypto_target_rejects_unsupported_targets() {
+        let error = verify_crypto_target("x86_64-unknown-linux-gnu").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported native crypto target: x86_64-unknown-linux-gnu")
+        );
     }
 }

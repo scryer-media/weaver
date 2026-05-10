@@ -153,21 +153,109 @@ impl Pipeline {
     }
 
     pub(crate) fn persist_verified_suspect_volumes(
-        &self,
+        &mut self,
         job_id: JobId,
         set_name: &str,
         volumes: &HashSet<u32>,
     ) {
-        if let Err(error) = self
-            .db
-            .replace_verified_suspect_volumes(job_id, set_name, volumes)
+        let key = (job_id, set_name.to_string());
+        let mut launch = None;
         {
+            let state = self
+                .verified_suspect_persist_state
+                .entry(key.clone())
+                .or_default();
+            state.desired = volumes.clone();
+            if state.in_flight_version.is_some() {
+                state.queued = true;
+            } else {
+                state.next_version = state.next_version.saturating_add(1);
+                let version = state.next_version;
+                state.in_flight_version = Some(version);
+                state.queued = false;
+                launch = Some((version, state.desired.clone()));
+            }
+        }
+
+        if let Some((version, desired)) = launch {
+            self.spawn_verified_suspect_persist(job_id, set_name.to_string(), version, desired);
+        }
+    }
+
+    fn spawn_verified_suspect_persist(
+        &self,
+        job_id: JobId,
+        set_name: String,
+        version: u64,
+        volumes: HashSet<u32>,
+    ) {
+        let db = self.db.clone();
+        let done_tx = self.verified_suspect_persist_done_tx.clone();
+        let set_name_for_db = set_name.clone();
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || {
+                db.replace_verified_suspect_volumes(job_id, &set_name_for_db, &volumes)
+                    .map_err(|error| {
+                        format!("failed to persist verified suspect RAR volumes: {error}")
+                    })
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!(
+                    "verified suspect persistence task panicked: {error}"
+                )),
+            };
+
+            let _ = done_tx
+                .send(crate::pipeline::VerifiedSuspectPersistDone {
+                    job_id,
+                    set_name,
+                    version,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    pub(crate) fn handle_verified_suspect_persist_done(
+        &mut self,
+        done: crate::pipeline::VerifiedSuspectPersistDone,
+    ) {
+        if let Err(error) = &done.result {
             error!(
-                job_id = job_id.0,
-                set_name,
+                job_id = done.job_id.0,
+                set_name = %done.set_name,
                 error = %error,
-                "failed to persist verified suspect RAR volumes"
+                "verified suspect RAR volume persistence failed"
             );
+        }
+
+        let key = (done.job_id, done.set_name.clone());
+        let mut relaunch = None;
+        let mut remove_entry = false;
+        if let Some(state) = self.verified_suspect_persist_state.get_mut(&key) {
+            if state.in_flight_version != Some(done.version) {
+                return;
+            }
+            state.in_flight_version = None;
+
+            if state.queued {
+                state.queued = false;
+                state.next_version = state.next_version.saturating_add(1);
+                let version = state.next_version;
+                state.in_flight_version = Some(version);
+                relaunch = Some((version, state.desired.clone()));
+            } else if state.desired.is_empty() {
+                remove_entry = true;
+            }
+        }
+
+        if remove_entry {
+            self.verified_suspect_persist_state.remove(&key);
+        }
+        if let Some((version, desired)) = relaunch {
+            self.spawn_verified_suspect_persist(done.job_id, done.set_name, version, desired);
         }
     }
 

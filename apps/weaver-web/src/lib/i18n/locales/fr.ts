@@ -164,6 +164,7 @@ const fr: LocaleDictionary = {
   "timeline.finalizingDownload": "Finalisation du téléchargement",
   "timeline.paused": "En pause",
   "timeline.verifying": "Vérification",
+  "timeline.verifyingDetail": "Vérification PAR2 et précontrôle de récupération.",
   "timeline.repairing": "Réparation",
   "timeline.extracting": "Extraction",
   "timeline.interrupted": "Interrompu",

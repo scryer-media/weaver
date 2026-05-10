@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.13"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/scryer-media/weaver"
@@ -29,18 +29,19 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
 crc32fast = "1.4"
-md-5 = "0.10"
+md-5 = "0.11"
 blake3 = "1.8"
-blake2 = "0.10"
-aes = "0.8"
+blake2s_simd = "1.0"
+aes = "0.9"
 aes-gcm = "0.10"
-cbc = "0.1"
-pbkdf2 = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
-hmac = "0.12"
+cbc = "0.2"
+pbkdf2 = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+aws-lc-rs = { version = "1.16", default-features = false, features = ["non-fips"] }
+aws-lc-sys = "0.40"
 argon2 = "0.5"
-scrypt = { version = "0.11", features = ["password-hash"] }
 getrandom = "0.3"
 hex = "0.4"
 rayon = "1.10"

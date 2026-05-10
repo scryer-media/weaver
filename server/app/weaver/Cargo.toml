@@ -49,4 +49,3 @@ tempfile = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true }
 rusqlite = { workspace = true }
-scrypt = { workspace = true }

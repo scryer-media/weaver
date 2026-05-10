@@ -1,6 +1,9 @@
 mod common;
 
-use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use common::{
+    BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
+    response_data,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
@@ -318,6 +321,125 @@ async fn update_server_host() {
     let data = response_data(&resp);
     assert_eq!(
         data["updateServer"]["host"].as_str().unwrap(),
+        "new.example.com"
+    );
+}
+
+#[tokio::test]
+async fn update_server_connections_are_visible_in_follow_up_query() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 20,
+                    active: false
+                }}) {{
+                    id
+                    connections
+                }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["updateServer"]["connections"].as_u64().unwrap(), 20);
+
+    let resp = h.execute("{ servers { id connections } }").await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let server = data["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["id"].as_u64() == Some(id))
+        .expect("updated server should be present");
+    assert_eq!(server["connections"].as_u64().unwrap(), 20);
+}
+
+#[tokio::test]
+async fn servers_query_stays_responsive_during_update_server_persist() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "old.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    let blocker = BlockingDbOperation::new("servers.mutation.update_server.persist");
+    let schema = h.schema.clone();
+    let mutation = tokio::spawn(async move {
+        schema
+            .execute(local_request(format!(
+                r#"mutation {{
+                    updateServer(id: {id}, input: {{
+                        host: "new.example.com",
+                        port: 119,
+                        tls: false,
+                        connections: 5,
+                        active: false
+                    }}) {{
+                        id
+                        host
+                    }}
+                }}"#
+            )))
+            .await
+    });
+
+    blocker.wait_until_started().await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_millis(100),
+        h.execute(r#"{ servers { id host } }"#),
+    )
+    .await
+    .expect("servers query should stay responsive while persist is blocked");
+    assert_no_errors(&resp);
+    let servers = response_data(&resp)["servers"].as_array().unwrap().clone();
+    let server = servers
+        .iter()
+        .find(|server| server["id"].as_u64() == Some(id))
+        .expect("server should still be present");
+    assert_eq!(server["host"].as_str().unwrap(), "old.example.com");
+
+    blocker.release();
+
+    let mutation = mutation.await.unwrap();
+    assert_no_errors(&mutation);
+    assert_eq!(
+        response_data(&mutation)["updateServer"]["host"]
+            .as_str()
+            .unwrap(),
         "new.example.com"
     );
 }

@@ -408,7 +408,7 @@ impl Rar4LzDecoder {
 
         match filter.filter_type {
             Rar4StandardFilter::E8 | Rar4StandardFilter::E8E9 => {
-                if data_size < 4 || data_size > VM_MEM_SIZE {
+                if !(4..=VM_MEM_SIZE).contains(&data_size) {
                     return Err(RarError::CorruptArchive {
                         detail: format!("RAR4: invalid E8 filter block length {data_size}"),
                     });
@@ -446,7 +446,7 @@ impl Rar4LzDecoder {
                 }
             }
             Rar4StandardFilter::Itanium => {
-                if data_size < 21 || data_size > VM_MEM_SIZE {
+                if !(21..=VM_MEM_SIZE).contains(&data_size) {
                     return Err(RarError::CorruptArchive {
                         detail: format!("RAR4: invalid Itanium filter block length {data_size}"),
                     });
@@ -514,7 +514,7 @@ impl Rar4LzDecoder {
                             detail: "RAR4: RGB filter width underflow".into(),
                         })? as usize;
                 let pos_r = filter.init_regs[1] as usize;
-                if data_size < 3 || data_size > VM_MEM_SIZE / 2 || width > data_size || pos_r > 2 {
+                if !(3..=VM_MEM_SIZE / 2).contains(&data_size) || width > data_size || pos_r > 2 {
                     return Err(RarError::CorruptArchive {
                         detail: format!(
                             "RAR4: invalid RGB filter params size={data_size} width={width} pos_r={pos_r}"

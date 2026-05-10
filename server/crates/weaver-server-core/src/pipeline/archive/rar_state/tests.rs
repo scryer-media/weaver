@@ -535,6 +535,74 @@ fn build_plan_duplicate_sanitized_gap_is_waiting_not_ready() {
 }
 
 #[test]
+fn build_plan_blocks_ready_member_when_present_same_name_continuation_is_unintegrated() {
+    let files = build_single_member_five_volume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, file_bytes)) in files.iter().enumerate().skip(1).take(4) {
+        archive
+            .add_volume(volume, Box::new(Cursor::new(file_bytes.clone())))
+            .unwrap();
+    }
+
+    let present_volumes = [0usize, 1, 2, 3, 4];
+    let mut facts: BTreeMap<u32, RarVolumeFacts> = present_volumes
+        .iter()
+        .map(|&volume| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(files[volume].1.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    let volume_map = present_volumes
+        .iter()
+        .map(|&volume| (files[volume].0.clone(), volume as u32))
+        .collect::<HashMap<_, _>>();
+    let baseline_plan = build_plan(
+        volume_map.clone(),
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(baseline_plan.ready_members.len(), 1);
+
+    let mut unintegrated_tail =
+        RarArchive::parse_volume_facts(Cursor::new(files[4].1.clone()), None).unwrap();
+    unintegrated_tail.volume_number = 5;
+    for member in &mut unintegrated_tail.members {
+        member.split_before = true;
+        member.split_after = false;
+    }
+    facts.insert(5, unintegrated_tail);
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        plan.ready_members.is_empty(),
+        "stale cached metadata must not schedule a member with a present unintegrated continuation: {:?}",
+        plan.ready_members
+    );
+    assert!(plan.waiting_on_volumes.contains(&5));
+    assert!(
+        plan.topology
+            .unresolved_spans
+            .iter()
+            .any(|span| span.first_volume == 5 && span.last_volume == 5)
+    );
+}
+
+#[test]
 fn build_plan_boundary_orphan_continuation_has_owner() {
     // Build the standard 4-volume set (E01 on vols 0-1, E02 on vols 2-3).
     // Add only vol 0 and vol 3 to the archive. Volume 3 has an E02.mkv

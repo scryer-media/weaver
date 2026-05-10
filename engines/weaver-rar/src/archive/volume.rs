@@ -14,7 +14,11 @@ impl RarArchive {
 
         let mut readers = readers.into_iter();
         let first = readers.next().unwrap();
-        let mut archive = Self::open_boxed_inner(first, None)?;
+        let mut archive = Self::open_boxed_inner(
+            first,
+            None,
+            std::sync::Arc::new(crate::crypto::KdfCache::new()),
+        )?;
 
         for (i, reader) in readers.enumerate() {
             archive.add_volume(i + 1, reader)?;
@@ -219,6 +223,19 @@ impl RarArchive {
         self.reconcile_member_chains();
     }
 
+    pub(crate) fn sort_members_by_physical_order(&mut self) {
+        self.members.sort_by_key(Self::member_physical_order_key);
+    }
+
+    fn member_physical_order_key(member: &MemberEntry) -> (usize, u64) {
+        member
+            .segments
+            .iter()
+            .map(|segment| (segment.volume_index, segment.data_offset))
+            .min()
+            .unwrap_or((usize::MAX, member.file_header.data_offset))
+    }
+
     fn reconcile_member_chains(&mut self) {
         while let Some((left_idx, right_idx)) = self.find_mergeable_member_pair() {
             debug_assert_ne!(left_idx, right_idx);
@@ -230,6 +247,9 @@ impl RarArchive {
             };
             let left = &mut self.members[adjusted_left_idx];
             Self::merge_member_chain(left, right);
+        }
+        if self.solid_next_index == 0 {
+            self.sort_members_by_physical_order();
         }
     }
 
@@ -332,9 +352,9 @@ impl RarArchive {
         if existing.rar4_salt.is_none() && incoming_entry.rar4_salt.is_some() {
             existing.rar4_salt = incoming_entry.rar4_salt;
         }
-        if !incoming_header.split_after {
-            existing.hash = incoming_entry.hash.clone();
-        } else if existing.hash.is_none() && incoming_entry.hash.is_some() {
+        if !incoming_header.split_after
+            || (existing.hash.is_none() && incoming_entry.hash.is_some())
+        {
             existing.hash = incoming_entry.hash.clone();
         }
         if existing.redirection.is_none() && incoming_entry.redirection.is_some() {
@@ -417,6 +437,20 @@ mod tests {
         }
     }
 
+    fn test_member_with_offset(
+        name: &str,
+        first_volume: usize,
+        split_before: bool,
+        split_after: bool,
+        data_crc32: Option<u32>,
+        data_offset: u64,
+    ) -> MemberEntry {
+        let mut member = test_member(name, first_volume, split_before, split_after, data_crc32);
+        member.file_header.data_offset = data_offset;
+        member.segments[0].data_offset = data_offset;
+        member
+    }
+
     fn empty_archive(members: Vec<MemberEntry>) -> RarArchive {
         RarArchive {
             format: ArchiveFormat::Rar5,
@@ -431,7 +465,7 @@ mod tests {
             solid_next_index: 0,
             limits: Limits::default(),
             password: None,
-            kdf_cache: crate::crypto::KdfCache::new(),
+            kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),
         }
     }
 
@@ -498,5 +532,31 @@ mod tests {
             archive.members[0].hash,
             Some(FileHash::Blake2sp(final_hash))
         );
+    }
+
+    #[test]
+    fn cached_solid_multivolume_keeps_prior_member_before_split_member() {
+        let archive = empty_archive(vec![
+            test_member_with_offset("sample.mkv", 0, false, true, Some(0x1111_1111), 200),
+            test_member_with_offset("ep1.mkv", 0, false, false, Some(0x2222_2222), 100),
+        ]);
+
+        let headers = archive.serialize_headers();
+        let mut restored = RarArchive::deserialize_headers(&headers).unwrap();
+
+        assert_eq!(restored.member_names(), vec!["ep1.mkv", "sample.mkv"]);
+        assert_eq!(restored.find_member_sanitized("sample.mkv"), Some(1));
+
+        restored.integrate_member(
+            1,
+            test_member_with_offset("sample.mkv", 1, true, true, Some(0x3333_3333), 0),
+        );
+        restored.integrate_member(
+            2,
+            test_member_with_offset("sample.mkv", 2, true, false, Some(0x4444_4444), 0),
+        );
+
+        assert_eq!(restored.member_names(), vec!["ep1.mkv", "sample.mkv"]);
+        assert_eq!(restored.find_member_sanitized("sample.mkv"), Some(1));
     }
 }

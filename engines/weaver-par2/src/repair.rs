@@ -202,26 +202,34 @@ pub fn plan_repair(
             });
         }
 
-        match matrix::build_decode_matrix(&missing_global_indices, &selected, &constants) {
+        match matrix::build_decode_matrix_with_bad_row(
+            &missing_global_indices,
+            &selected,
+            &constants,
+        ) {
             Ok(decode) => break (selected, decode),
-            Err(Par2Error::ReedSolomonError { .. }) => {
-                let mut skip_idx = None;
-                for candidate_idx in &selected_indices {
-                    let trial: Vec<u32> = all_exponents
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| !skip_set.contains(idx) && idx != candidate_idx)
-                        .map(|(_, &exponent)| exponent)
-                        .take(missing_count)
-                        .collect();
-                    if trial.len() < missing_count {
-                        continue;
-                    }
-                    if matrix::build_decode_matrix(&missing_global_indices, &trial, &constants)
-                        .is_ok()
-                    {
-                        skip_idx = Some(*candidate_idx);
-                        break;
+            Err(matrix_error) => {
+                let mut skip_idx = matrix_error
+                    .bad_row
+                    .and_then(|row| selected_indices.get(row).copied());
+                if skip_idx.is_none() {
+                    for candidate_idx in &selected_indices {
+                        let trial: Vec<u32> = all_exponents
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, _)| !skip_set.contains(idx) && idx != candidate_idx)
+                            .map(|(_, &exponent)| exponent)
+                            .take(missing_count)
+                            .collect();
+                        if trial.len() < missing_count {
+                            continue;
+                        }
+                        if matrix::build_decode_matrix(&missing_global_indices, &trial, &constants)
+                            .is_ok()
+                        {
+                            skip_idx = Some(*candidate_idx);
+                            break;
+                        }
                     }
                 }
                 let skip_idx = skip_idx.unwrap_or_else(|| {
@@ -235,7 +243,6 @@ pub fn plan_repair(
                 );
                 skip_set.insert(skip_idx);
             }
-            Err(e) => return Err(e),
         }
     };
 
@@ -1128,9 +1135,13 @@ pub fn execute_repair_with_options(
             let use_grouped_xor_out = {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2")
+                    is_x86_feature_detected!("avx2")
                 }
-                #[cfg(not(target_arch = "x86_64"))]
+                #[cfg(target_arch = "aarch64")]
+                {
+                    true
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 {
                     false
                 }

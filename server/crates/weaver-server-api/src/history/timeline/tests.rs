@@ -757,3 +757,66 @@ fn legacy_download_finished_event_does_not_backfill_finalizing_lane() {
             .all(|lane| lane.stage != TimelineStage::FinalizingDownload)
     );
 }
+
+#[test]
+fn verifying_lane_stays_open_until_repair_starts() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Repairing),
+        None,
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("JobVerificationStarted", 2_000, None, ""),
+            event("JobVerificationComplete", 3_000, None, ""),
+            event("RepairStarted", 4_000, None, ""),
+            event("RepairComplete", 5_000, None, ""),
+        ],
+    );
+
+    let verifying_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Verifying)
+        .expect("verifying lane");
+    assert_eq!(verifying_lane.spans.len(), 1);
+    assert_eq!(verifying_lane.spans[0].started_at, 2_000.0);
+    assert_eq!(verifying_lane.spans[0].ended_at, Some(4_000.0));
+    assert_eq!(verifying_lane.spans[0].state, TimelineSpanState::Complete);
+}
+
+#[test]
+fn verifying_lane_splits_when_targeted_recovery_download_restarts() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Extracting),
+        None,
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("JobVerificationStarted", 2_000, None, ""),
+            event("JobVerificationComplete", 3_000, None, ""),
+            event("DownloadStarted", 4_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("JobVerificationStarted", 6_000, None, ""),
+            event("JobVerificationComplete", 7_000, None, ""),
+            event("ExtractionReady", 8_000, None, ""),
+        ],
+    );
+
+    let verifying_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Verifying)
+        .expect("verifying lane");
+    assert_eq!(verifying_lane.spans.len(), 2);
+    assert_eq!(verifying_lane.spans[0].started_at, 2_000.0);
+    assert_eq!(verifying_lane.spans[0].ended_at, Some(4_000.0));
+    assert_eq!(verifying_lane.spans[1].started_at, 6_000.0);
+    assert_eq!(verifying_lane.spans[1].ended_at, Some(8_000.0));
+
+    let download_lane = timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Downloading)
+        .expect("download lane");
+    assert_eq!(download_lane.spans.len(), 1);
+    assert_eq!(download_lane.spans[0].started_at, 4_000.0);
+    assert_eq!(download_lane.spans[0].ended_at, Some(5_000.0));
+}

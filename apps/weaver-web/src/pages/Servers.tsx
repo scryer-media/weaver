@@ -66,7 +66,7 @@ const defaultForm: ServerFormValues = {
 
 export function Servers({ embedded = false }: { embedded?: boolean }) {
   const t = useTranslate();
-  const [{ data }] = useQuery({ query: SERVERS_QUERY });
+  const [{ data }, reexecuteServers] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
   const [editingServerId, setEditingServerId] = useState<number | null>(null);
   const [{ data: editingServerData, fetching: editingServerFetching }] = useQuery<{
     server: ServerDetails | null;
@@ -152,6 +152,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
             server.id === editingServerId ? result.data.updateServer : server,
           ),
         );
+        void reexecuteServers({ requestPolicy: "network-only" });
         closeForm();
         return;
       }
@@ -169,6 +170,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
             left.priority - right.priority || left.host.localeCompare(right.host),
           ),
         );
+        void reexecuteServers({ requestPolicy: "network-only" });
         closeForm();
         return;
       }
@@ -185,6 +187,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     const result = await removeServer({ id });
     if (result.data?.removeServer) {
       setServers(result.data.removeServer);
+      void reexecuteServers({ requestPolicy: "network-only" });
     }
     setDeleteConfirmId(null);
   };

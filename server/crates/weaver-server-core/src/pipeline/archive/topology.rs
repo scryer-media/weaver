@@ -4,7 +4,9 @@ use crate::jobs::assembly::{
     ArchiveTopology as JobArchiveTopology, ArchiveType,
 };
 use crate::jobs::ids::{JobId, NzbFileId};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{
+    ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
@@ -14,7 +16,7 @@ pub(crate) type ArchivePendingSpan = JobArchivePendingSpan;
 pub(crate) type ArchiveTopology = JobArchiveTopology;
 
 #[derive(Clone, Copy)]
-enum RarTopologyRebuildSource {
+pub(crate) enum RarTopologyRebuildSource {
     CachedHeaders,
     VolumeZero,
 }
@@ -28,20 +30,31 @@ impl RarTopologyRebuildSource {
     }
 }
 
-fn cached_rar_snapshot_conflicts_with_volume_facts(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::pipeline) enum CachedRarSnapshotAlignment {
+    Consistent,
+    StaleGrowth,
+    CompletedGrowthRequiresRefresh,
+    TrueConflict,
+}
+
+pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
     facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
     archive: &weaver_rar::RarArchive,
-) -> bool {
+) -> CachedRarSnapshotAlignment {
     let metadata = archive.metadata();
+    let mut saw_stale_growth = false;
+    let mut saw_completed_growth = false;
 
-    facts.iter().any(|(&first_volume, volume_facts)| {
-        volume_facts.members.iter().any(|member| {
+    for (&first_volume, volume_facts) in facts {
+        for member in &volume_facts.members {
             if member.is_directory || member.split_before || !member.split_after {
-                return false;
+                continue;
             }
 
             let name = weaver_rar::sanitize_path(&member.name);
             let mut observed_last = first_volume;
+            let mut observed_complete = false;
             let mut next_volume = first_volume + 1;
 
             while let Some(next_facts) = facts.get(&next_volume) {
@@ -55,19 +68,42 @@ fn cached_rar_snapshot_conflicts_with_volume_facts(
 
                 observed_last = next_volume;
                 if !next_member.split_after {
+                    observed_complete = true;
                     break;
                 }
                 next_volume += 1;
             }
 
-            observed_last > first_volume
-                && !metadata.members.iter().any(|candidate| {
-                    candidate.name == name
-                        && candidate.volumes.first_volume as u32 == first_volume
-                        && candidate.volumes.last_volume as u32 >= observed_last
-                })
-        })
-    })
+            if observed_last <= first_volume {
+                continue;
+            }
+
+            let Some(candidate) = metadata.members.iter().find(|candidate| {
+                candidate.name == name && candidate.volumes.first_volume as u32 == first_volume
+            }) else {
+                return CachedRarSnapshotAlignment::TrueConflict;
+            };
+
+            let cached_last = candidate.volumes.last_volume as u32;
+            if cached_last >= observed_last {
+                continue;
+            }
+
+            if observed_complete {
+                saw_completed_growth = true;
+            } else {
+                saw_stale_growth = true;
+            }
+        }
+    }
+
+    if saw_completed_growth {
+        CachedRarSnapshotAlignment::CompletedGrowthRequiresRefresh
+    } else if saw_stale_growth {
+        CachedRarSnapshotAlignment::StaleGrowth
+    } else {
+        CachedRarSnapshotAlignment::Consistent
+    }
 }
 
 fn cached_rar_plan_is_incoherent(
@@ -113,10 +149,43 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
     volumes
 }
 
+fn present_waiting_rar_volumes(
+    plan: &RarDerivedPlan,
+    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    volume_paths: &BTreeMap<u32, PathBuf>,
+) -> Vec<u32> {
+    let mut volumes: Vec<u32> = plan
+        .waiting_on_volumes
+        .iter()
+        .copied()
+        .filter(|volume| facts.contains_key(volume) && volume_paths.contains_key(volume))
+        .collect();
+    volumes.sort_unstable();
+    volumes.dedup();
+    volumes
+}
+
 const INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER: &str =
     "produced incoherent waiting state with no missing volumes after rebuild";
 const OWNERLESS_RAR_PLAN_ERROR_MARKER: &str =
     "produced ownerless present RAR volumes after rebuild";
+
+#[derive(Clone)]
+struct RarSetComputeInput {
+    job_id: JobId,
+    set_name: String,
+    existing: RarSetState,
+    volume_map: HashMap<String, u32>,
+    volume_paths: BTreeMap<u32, PathBuf>,
+    password: Option<String>,
+    extracted: HashSet<String>,
+    failed: HashSet<String>,
+    facts: BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    verified_suspect_volumes: HashSet<u32>,
+    worker_active: bool,
+    cached_headers: Option<Vec<u8>>,
+    reason: RefreshReason,
+}
 
 pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) -> bool {
     error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
@@ -390,13 +459,32 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<(), String> {
-        let key = (job_id, set_name.to_string());
-        let Some(existing) = self.rar_sets.get(&key).cloned() else {
+        let Some(input) =
+            self.prepare_rar_set_compute_input(job_id, set_name, RefreshReason::ValidationFailure)
+        else {
             return Ok(());
         };
+        let existing = input.existing.clone();
+        match Self::run_rar_set_compute(input).await {
+            Ok(computed) => {
+                self.apply_computed_rar_set_state(job_id, set_name, computed);
+                Ok(())
+            }
+            Err(error) => self.apply_failed_rar_set_compute(job_id, set_name, existing, error),
+        }
+    }
+
+    fn prepare_rar_set_compute_input(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        reason: RefreshReason,
+    ) -> Option<RarSetComputeInput> {
+        let key = (job_id, set_name.to_string());
+        let existing = self.rar_sets.get(&key).cloned()?;
         let volume_map = self.build_rar_volume_map(job_id, set_name);
         if volume_map.is_empty() {
-            return Ok(());
+            return None;
         }
         let volume_paths = self.volume_paths_for_rar_set(job_id, set_name);
         let password = self
@@ -417,96 +505,139 @@ impl Pipeline {
         let verified_suspect_volumes = existing.verified_suspect_volumes.clone();
         let worker_active = existing.active_workers > 0;
         let cached_headers = self.load_rar_snapshot(job_id, set_name);
-        let set_name_owned = set_name.to_string();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let open_from_volume_zero = || -> Result<weaver_rar::RarArchive, String> {
-                let first_path = volume_paths.get(&0).ok_or_else(|| {
-                    format!(
-                        "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
-                    )
-                })?;
-                let first_file = std::fs::File::open(first_path).map_err(|e| {
-                    format!("failed to open RAR volume 0 for set '{set_name_owned}': {e}")
-                })?;
-                if let Some(password) = password.as_deref() {
-                    weaver_rar::RarArchive::open_with_password(first_file, password)
-                } else {
-                    weaver_rar::RarArchive::open(first_file)
-                }
-                .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}"))
-            };
+        Some(RarSetComputeInput {
+            job_id,
+            set_name: set_name.to_string(),
+            existing,
+            volume_map,
+            volume_paths,
+            password,
+            extracted,
+            failed,
+            facts,
+            verified_suspect_volumes,
+            worker_active,
+            cached_headers,
+            reason,
+        })
+    }
 
-            let attach_volumes_and_build_plan = |
-                mut archive: weaver_rar::RarArchive,
-                rebuild_source: RarTopologyRebuildSource,
-                using_cached_headers: bool,
-                force_refresh_all_volumes: bool,
-            | -> Result<_, String> {
-                for (volume_number, path) in &volume_paths {
-                    let volume_file = match std::fs::File::open(path) {
-                        Ok(file) => file,
-                        Err(error)
-                            if using_cached_headers
-                                && error.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
-                            ));
-                        }
-                    };
-                    let volume_needs_refresh = force_refresh_all_volumes
-                        || !facts.contains_key(volume_number)
-                        || verified_suspect_volumes.contains(volume_number);
-                    if using_cached_headers
-                        && volume_needs_refresh
-                        && archive.has_volume(*volume_number as usize)
-                    {
-                        archive
-                            .refresh_volume(*volume_number as usize, Box::new(volume_file))
-                            .map_err(|e| {
-                                format!(
-                                    "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
-                                )
-                            })?;
-                    } else if archive.has_volume(*volume_number as usize) {
-                        archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
-                    } else {
-                        archive
-                            .add_volume(*volume_number as usize, Box::new(volume_file))
-                            .map_err(|e| {
-                                format!(
-                                    "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
-                                )
-                            })?;
-                    }
-                }
+    async fn run_rar_set_compute(input: RarSetComputeInput) -> Result<ComputedRarSetState, String> {
+        tokio::task::spawn_blocking(move || Self::compute_rar_set_state_blocking(input))
+            .await
+            .map_err(|e| format!("RAR plan task panicked: {e}"))?
+    }
 
-                let plan = rar_state::build_plan(
-                    volume_map.clone(),
-                    &facts,
-                    &archive,
-                    &extracted,
-                    &failed,
-                    worker_active,
-                )?;
+    fn compute_rar_set_state_blocking(
+        input: RarSetComputeInput,
+    ) -> Result<ComputedRarSetState, String> {
+        let RarSetComputeInput {
+            job_id,
+            set_name: set_name_owned,
+            volume_map,
+            volume_paths,
+            password,
+            extracted,
+            failed,
+            facts,
+            verified_suspect_volumes,
+            worker_active,
+            cached_headers,
+            reason,
+            ..
+        } = input;
 
-                Ok((plan, archive.serialize_headers(), rebuild_source, using_cached_headers))
-            };
-
-            let mut rebuild_source = if cached_headers.is_some() {
-                RarTopologyRebuildSource::CachedHeaders
+        let open_from_volume_zero = || -> Result<weaver_rar::RarArchive, String> {
+            let first_path = volume_paths.get(&0).ok_or_else(|| {
+                format!(
+                    "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
+                )
+            })?;
+            let first_file = std::fs::File::open(first_path).map_err(|e| {
+                format!("failed to open RAR volume 0 for set '{set_name_owned}': {e}")
+            })?;
+            if let Some(password) = password.as_deref() {
+                weaver_rar::RarArchive::open_with_password(first_file, password)
             } else {
-                RarTopologyRebuildSource::VolumeZero
-            };
-            let has_cached_headers = cached_headers.is_some();
-            let mut using_cached_headers = has_cached_headers;
-            let mut force_refresh_all_volumes = false;
-            let mut archive = match cached_headers {
-                Some(headers) => match weaver_rar::RarArchive::deserialize_headers_with_password(
+                weaver_rar::RarArchive::open(first_file)
+            }
+            .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}"))
+        };
+
+        let attach_volumes_and_build_plan = |mut archive: weaver_rar::RarArchive,
+                                             rebuild_source: RarTopologyRebuildSource,
+                                             using_cached_headers: bool,
+                                             force_refresh_all_volumes: bool|
+         -> Result<_, String> {
+            for (volume_number, path) in &volume_paths {
+                let volume_file = match std::fs::File::open(path) {
+                    Ok(file) => file,
+                    Err(error)
+                        if using_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
+                        ));
+                    }
+                };
+                let volume_needs_refresh =
+                    force_refresh_all_volumes || !facts.contains_key(volume_number);
+                if using_cached_headers
+                    && volume_needs_refresh
+                    && archive.has_volume(*volume_number as usize)
+                {
+                    archive
+                        .refresh_volume(*volume_number as usize, Box::new(volume_file))
+                        .map_err(|e| {
+                            format!(
+                                "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                            )
+                        })?;
+                } else if archive.has_volume(*volume_number as usize) {
+                    archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
+                } else {
+                    archive
+                        .add_volume(*volume_number as usize, Box::new(volume_file))
+                        .map_err(|e| {
+                            format!(
+                                "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
+                            )
+                        })?;
+                }
+            }
+
+            let plan = rar_state::build_plan(
+                volume_map.clone(),
+                &facts,
+                &archive,
+                &extracted,
+                &failed,
+                worker_active,
+            )?;
+
+            Ok((
+                plan,
+                archive.serialize_headers(),
+                rebuild_source,
+                using_cached_headers,
+            ))
+        };
+
+        let mut rebuild_source = if cached_headers.is_some() {
+            RarTopologyRebuildSource::CachedHeaders
+        } else {
+            RarTopologyRebuildSource::VolumeZero
+        };
+        let has_cached_headers = cached_headers.is_some();
+        let mut using_cached_headers = has_cached_headers;
+        let mut force_refresh_all_volumes = false;
+        let mut archive = match cached_headers {
+            Some(headers) => {
+                match weaver_rar::RarArchive::deserialize_headers_with_password(
                     &headers,
                     password.clone(),
                 ) {
@@ -520,153 +651,355 @@ impl Pipeline {
                         rebuild_source = RarTopologyRebuildSource::VolumeZero;
                         open_from_volume_zero()?
                     }
-                },
-                None => open_from_volume_zero()?,
-            };
-
-            if using_cached_headers
-                && verified_suspect_volumes.iter().any(|volume| {
-                    volume_paths.contains_key(volume) && !archive.has_volume(*volume as usize)
-                })
-                && volume_paths.contains_key(&0)
-            {
-                archive = open_from_volume_zero()?;
-                rebuild_source = RarTopologyRebuildSource::VolumeZero;
-                using_cached_headers = false;
-            }
-
-            if using_cached_headers
-                && cached_rar_snapshot_conflicts_with_volume_facts(&facts, &archive)
-            {
-                force_refresh_all_volumes = true;
-                warn!(
-                    set_name = %set_name_owned,
-                    "cached RAR headers contradicted per-volume facts; forcing registered volume refresh"
-                );
-                if volume_paths.contains_key(&0) {
-                    archive = open_from_volume_zero()?;
-                    rebuild_source = RarTopologyRebuildSource::VolumeZero;
-                    using_cached_headers = false;
                 }
             }
+            None => open_from_volume_zero()?,
+        };
 
-            let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers) =
-                attach_volumes_and_build_plan(
-                    archive,
-                    rebuild_source,
-                    using_cached_headers,
-                    force_refresh_all_volumes,
-                )?;
+        if using_cached_headers
+            && reason >= RefreshReason::ValidationFailure
+            && verified_suspect_volumes.iter().any(|volume| {
+                volume_paths.contains_key(volume) && !archive.has_volume(*volume as usize)
+            })
+            && volume_paths.contains_key(&0)
+        {
+            archive = open_from_volume_zero()?;
+            rebuild_source = RarTopologyRebuildSource::VolumeZero;
+            using_cached_headers = false;
+        }
 
-            let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-            if used_cached_headers && !ownerless_volumes.is_empty() && volume_paths.contains_key(&0)
-            {
-                warn!(
-                    set_name = %set_name_owned,
-                    volumes = ?ownerless_volumes,
-                    "cached RAR headers produced ownerless present volumes; retrying from live volumes"
-                );
-
-                (plan, headers, rebuild_source, used_cached_headers) =
-                    attach_volumes_and_build_plan(
-                        open_from_volume_zero()?,
-                        RarTopologyRebuildSource::VolumeZero,
-                        false,
-                        false,
-                    )?;
+        if using_cached_headers {
+            match cached_rar_snapshot_alignment_with_volume_facts(&facts, &archive) {
+                CachedRarSnapshotAlignment::Consistent => {}
+                CachedRarSnapshotAlignment::StaleGrowth => {
+                    debug!(
+                        set_name = %set_name_owned,
+                        "cached RAR headers lag in-progress tail growth; deferring registered volume refresh"
+                    );
+                }
+                CachedRarSnapshotAlignment::CompletedGrowthRequiresRefresh => {
+                    force_refresh_all_volumes = true;
+                    debug!(
+                        set_name = %set_name_owned,
+                        "cached RAR headers lag completed member spans; refreshing registered volumes"
+                    );
+                }
+                CachedRarSnapshotAlignment::TrueConflict => {
+                    force_refresh_all_volumes = true;
+                    warn!(
+                        set_name = %set_name_owned,
+                        "cached RAR headers contradicted per-volume facts; forcing registered volume refresh"
+                    );
+                    if volume_paths.contains_key(&0) {
+                        archive = open_from_volume_zero()?;
+                        rebuild_source = RarTopologyRebuildSource::VolumeZero;
+                        using_cached_headers = false;
+                    }
+                }
             }
+        }
 
-            if used_cached_headers
-                && cached_rar_plan_is_incoherent(
-                    &plan,
-                    &failed,
-                    worker_active,
-                    &facts,
-                    &volume_paths,
-                )
-                && volume_paths.contains_key(&0)
-            {
-                warn!(
-                    set_name = %set_name_owned,
-                    "cached RAR headers produced incoherent waiting plan; retrying from live volumes"
-                );
+        let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers) =
+            attach_volumes_and_build_plan(
+                archive,
+                rebuild_source,
+                using_cached_headers,
+                force_refresh_all_volumes,
+            )?;
 
-                (plan, headers, rebuild_source, used_cached_headers) =
-                    attach_volumes_and_build_plan(
-                        open_from_volume_zero()?,
-                        RarTopologyRebuildSource::VolumeZero,
-                        false,
-                        false,
-                    )?;
-            }
+        let present_waiting_volumes = present_waiting_rar_volumes(&plan, &facts, &volume_paths);
+        if used_cached_headers
+            && !present_waiting_volumes.is_empty()
+            && volume_paths.contains_key(&0)
+        {
+            let mut waiting_on: Vec<u32> = plan.waiting_on_volumes.iter().copied().collect();
+            waiting_on.sort_unstable();
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name_owned,
+                waiting_on = ?waiting_on,
+                present_waiting_volumes = ?present_waiting_volumes,
+                "cached RAR headers waited on present volumes; retrying from live volumes"
+            );
 
-            let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-            if !ownerless_volumes.is_empty() {
-                return Err(ownerless_rar_plan_error(
-                    &set_name_owned,
-                    &ownerless_volumes,
-                ));
-            }
+            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+                open_from_volume_zero()?,
+                RarTopologyRebuildSource::VolumeZero,
+                false,
+                false,
+            )?;
+        }
 
-            if cached_rar_plan_is_incoherent(
-                &plan,
-                &failed,
-                worker_active,
-                &facts,
-                &volume_paths,
-            ) {
-                return Err(format!(
-                    "RAR set '{set_name_owned}' {INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER}"
-                ));
-            }
+        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
+        if used_cached_headers && !ownerless_volumes.is_empty() && volume_paths.contains_key(&0) {
+            warn!(
+                set_name = %set_name_owned,
+                volumes = ?ownerless_volumes,
+                "cached RAR headers produced ownerless present volumes; retrying from live volumes"
+            );
 
-            let _ = used_cached_headers;
-            Ok((plan, headers, rebuild_source))
+            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+                open_from_volume_zero()?,
+                RarTopologyRebuildSource::VolumeZero,
+                false,
+                false,
+            )?;
+        }
+
+        if used_cached_headers
+            && cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths)
+            && volume_paths.contains_key(&0)
+        {
+            warn!(
+                set_name = %set_name_owned,
+                "cached RAR headers produced incoherent waiting plan; retrying from live volumes"
+            );
+
+            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
+                open_from_volume_zero()?,
+                RarTopologyRebuildSource::VolumeZero,
+                false,
+                false,
+            )?;
+        }
+
+        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
+        if !ownerless_volumes.is_empty() {
+            return Err(ownerless_rar_plan_error(
+                &set_name_owned,
+                &ownerless_volumes,
+            ));
+        }
+
+        if cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths) {
+            return Err(format!(
+                "RAR set '{set_name_owned}' {INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER}"
+            ));
+        }
+
+        let _ = used_cached_headers;
+        Ok(ComputedRarSetState {
+            plan,
+            headers,
+            rebuild_source,
         })
-        .await
-        .map_err(|e| format!("RAR plan task panicked: {e}"))?;
+    }
 
-        match result {
-            Ok((plan, headers, rebuild_source)) => {
-                info!(
+    fn apply_computed_rar_set_state(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        computed: ComputedRarSetState,
+    ) {
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            rebuild_source = computed.rebuild_source.as_str(),
+            "RAR plan rebuilt"
+        );
+        let refreshed_through_volume = computed
+            .plan
+            .topology
+            .complete_volumes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        self.set_rar_snapshot(job_id, set_name, computed.headers);
+        self.apply_rar_plan(job_id, set_name, computed.plan);
+        if let Some(refresh_state) = self
+            .rar_refresh_state
+            .get_mut(&(job_id, set_name.to_string()))
+        {
+            refresh_state.refreshed_through_volume = refresh_state
+                .refreshed_through_volume
+                .max(refreshed_through_volume);
+            refresh_state.latest_completed_volume = refresh_state
+                .latest_completed_volume
+                .max(refreshed_through_volume);
+        }
+    }
+
+    fn apply_failed_rar_set_compute(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        existing: RarSetState,
+        error: String,
+    ) -> Result<(), String> {
+        if is_ownerless_rar_plan_error(&error) {
+            self.clear_rar_snapshot(job_id, set_name);
+            return Err(error);
+        }
+
+        let mut fallback = existing.plan.clone().unwrap_or_else(|| RarDerivedPlan {
+            phase: RarSetPhase::FallbackFullSet,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            waiting_on_volumes: HashSet::new(),
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology: ArchiveTopology {
+                archive_type: ArchiveType::Rar,
+                volume_map: self.build_rar_volume_map(job_id, set_name),
+                complete_volumes: existing.facts.keys().copied().collect(),
+                expected_volume_count: None,
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+            fallback_reason: Some(error.clone()),
+        });
+        fallback.phase = RarSetPhase::FallbackFullSet;
+        fallback.fallback_reason = Some(error.clone());
+        self.apply_rar_plan(job_id, set_name, fallback);
+        Err(error)
+    }
+
+    pub(in crate::pipeline) fn latest_completed_rar_volume(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> u32 {
+        self.rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .and_then(|state| state.facts.keys().copied().max())
+            .unwrap_or(0)
+    }
+
+    pub(in crate::pipeline) fn enqueue_rar_set_refresh(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        target_completed_volume: u32,
+        reason: RefreshReason,
+    ) {
+        let key = (job_id, set_name.to_string());
+        let request = RarRefreshRequest {
+            target_completed_volume,
+            reason,
+        };
+        let current_plan_through = self
+            .rar_sets
+            .get(&key)
+            .and_then(|state| state.plan.as_ref())
+            .and_then(|plan| plan.topology.complete_volumes.iter().copied().max())
+            .unwrap_or(0);
+        let mut launch = None;
+        {
+            let state = self.rar_refresh_state.entry(key.clone()).or_default();
+            state.refreshed_through_volume =
+                state.refreshed_through_volume.max(current_plan_through);
+            state.latest_completed_volume =
+                state.latest_completed_volume.max(target_completed_volume);
+            if reason >= RefreshReason::IdentityRebind {
+                state.structure_dirty = true;
+            }
+            if state.in_flight.is_some() {
+                match &mut state.queued {
+                    Some(queued) => queued.merge(request),
+                    None => state.queued = Some(request),
+                }
+                debug!(
                     job_id = job_id.0,
-                    set_name = %set_name,
-                    rebuild_source = rebuild_source.as_str(),
-                    "RAR plan rebuilt"
+                    set_name,
+                    target_completed_volume,
+                    reason = ?reason,
+                    in_flight = ?state.in_flight,
+                    queued = ?state.queued,
+                    "coalesced RAR refresh request"
                 );
-                self.set_rar_snapshot(job_id, set_name, headers);
-                self.apply_rar_plan(job_id, set_name, plan);
-                Ok(())
+            } else {
+                state.in_flight = Some(request);
+                state.last_error = None;
+                launch = Some(request);
+            }
+        }
+
+        if let Some(request) = launch {
+            self.spawn_rar_refresh(job_id, set_name.to_string(), request);
+        }
+    }
+
+    fn spawn_rar_refresh(&mut self, job_id: JobId, set_name: String, request: RarRefreshRequest) {
+        let Some(input) = self.prepare_rar_set_compute_input(job_id, &set_name, request.reason)
+        else {
+            if let Some(state) = self.rar_refresh_state.get_mut(&(job_id, set_name)) {
+                state.in_flight = None;
+            }
+            return;
+        };
+        let refresh_done_tx = self.rar_refresh_done_tx.clone();
+        tokio::spawn(async move {
+            let result = Self::run_rar_set_compute(input).await;
+            let _ = refresh_done_tx
+                .send(RarRefreshDone {
+                    job_id,
+                    set_name,
+                    request,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    pub(in crate::pipeline) async fn handle_rar_refresh_done(&mut self, done: RarRefreshDone) {
+        let key = (done.job_id, done.set_name.clone());
+        let error = match done.result {
+            Ok(computed) => {
+                self.apply_computed_rar_set_state(done.job_id, &done.set_name, computed);
+                None
             }
             Err(error) => {
-                if is_ownerless_rar_plan_error(&error) {
-                    self.clear_rar_snapshot(job_id, set_name);
-                    return Err(error);
-                }
-
-                let mut fallback = existing.plan.clone().unwrap_or_else(|| RarDerivedPlan {
-                    phase: RarSetPhase::FallbackFullSet,
-                    is_solid: false,
-                    ready_members: Vec::new(),
-                    member_names: Vec::new(),
-                    waiting_on_volumes: HashSet::new(),
-                    deletion_eligible: HashSet::new(),
-                    delete_decisions: BTreeMap::new(),
-                    topology: ArchiveTopology {
-                        archive_type: ArchiveType::Rar,
-                        volume_map: self.build_rar_volume_map(job_id, set_name),
-                        complete_volumes: existing.facts.keys().copied().collect(),
-                        expected_volume_count: None,
-                        members: Vec::new(),
-                        unresolved_spans: Vec::new(),
-                    },
-                    fallback_reason: Some(error.clone()),
-                });
-                fallback.phase = RarSetPhase::FallbackFullSet;
-                fallback.fallback_reason = Some(error.clone());
-                self.apply_rar_plan(job_id, set_name, fallback);
-                Err(error)
+                warn!(
+                    job_id = done.job_id.0,
+                    set_name = %done.set_name,
+                    reason = ?done.request.reason,
+                    error = %error,
+                    "background RAR refresh failed"
+                );
+                Some(error)
             }
+        };
+        let success = error.is_none();
+
+        let mut follow_up = None;
+        if let Some(state) = self.rar_refresh_state.get_mut(&key) {
+            state.in_flight = None;
+            if let Some(error) = error.as_ref() {
+                state.last_error = Some(error.clone());
+            } else {
+                state.last_error = None;
+            }
+
+            if let Some(queued) = state.queued.take() {
+                let still_needed = queued.target_completed_volume > state.refreshed_through_volume
+                    || queued.reason > done.request.reason
+                    || state.structure_dirty
+                    || !success;
+                if still_needed {
+                    state.in_flight = Some(queued);
+                    follow_up = Some(queued);
+                }
+            }
+
+            if follow_up.is_none() && success {
+                state.structure_dirty = false;
+            }
+        }
+
+        if let Some(request) = follow_up {
+            self.spawn_rar_refresh(done.job_id, done.set_name, request);
+            return;
+        }
+
+        if success {
+            self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+            self.try_rar_extraction(done.job_id).await;
+            if self.rar_sets.contains_key(&key) {
+                self.try_delete_volumes(done.job_id, &done.set_name);
+            }
+            self.check_job_completion(done.job_id).await;
         }
     }
 
@@ -1061,35 +1394,43 @@ impl Pipeline {
         match Self::parse_rar_volume_facts_from_path(path, password).await {
             Ok(facts) => {
                 let parsed_volume = facts.volume_number;
-                if let Err(error) = self.persist_rar_volume_facts(
+                let changed = match self.persist_rar_volume_facts(
                     job_id,
                     &set_name,
                     &filename,
                     Some(observed_volume),
                     facts,
                 ) {
-                    warn!(
-                        job_id = job_id.0,
-                        volume = parsed_volume,
-                        set_name = %set_name,
-                        error = %error,
-                        "failed to register RAR volume facts"
-                    );
-                    return;
-                }
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            volume = parsed_volume,
+                            set_name = %set_name,
+                            error = %error,
+                            "failed to register RAR volume facts"
+                        );
+                        return;
+                    }
+                };
                 debug!(
                     job_id = job_id.0,
                     volume = parsed_volume,
                     set_name = %set_name,
                     "RAR volume facts parsed"
                 );
-                if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                    warn!(
-                        job_id = job_id.0,
-                        volume = parsed_volume,
-                        set_name = %set_name,
-                        error,
-                        "failed to recompute RAR set state"
+                let topology_missing_volume = self.jobs.get(&job_id).is_some_and(|state| {
+                    state
+                        .assembly
+                        .archive_topology_for(&set_name)
+                        .is_none_or(|topology| !topology.complete_volumes.contains(&parsed_volume))
+                });
+                if changed || topology_missing_volume {
+                    self.enqueue_rar_set_refresh(
+                        job_id,
+                        &set_name,
+                        parsed_volume,
+                        RefreshReason::CoverageExpansion,
                     );
                 }
             }

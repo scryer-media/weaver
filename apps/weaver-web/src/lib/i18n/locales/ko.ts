@@ -164,6 +164,7 @@ const ko: LocaleDictionary = {
   "timeline.finalizingDownload": "다운로드 마무리 중",
   "timeline.paused": "일시정지",
   "timeline.verifying": "검증 중",
+  "timeline.verifyingDetail": "PAR2 검증 및 복구 사전 점검.",
   "timeline.repairing": "복구 중",
   "timeline.extracting": "추출 중",
   "timeline.interrupted": "중단됨",

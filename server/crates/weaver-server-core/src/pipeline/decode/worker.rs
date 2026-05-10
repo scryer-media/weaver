@@ -139,6 +139,7 @@ impl Pipeline {
                 "flushing quiescent write backlog"
             );
 
+            let mut flushed_segments = 0usize;
             for file_id in file_ids {
                 loop {
                     let candidate = self
@@ -161,7 +162,15 @@ impl Pipeline {
                         );
                         break;
                     }
+                    flushed_segments += 1;
                 }
+            }
+
+            if flushed_segments > 0 {
+                self.schedule_job_completion_check_if_download_pipeline_drained(
+                    job_id,
+                    "quiescent_write_backlog_drained",
+                );
             }
         }
     }
@@ -705,17 +714,49 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     self.file_hash_reread_required.remove(&file_id);
 
+                    let mut stage_start = Instant::now();
                     self.try_load_par2_metadata(job_id, file_id).await;
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: try_load_par2_metadata"
+                    );
+                    stage_start = Instant::now();
                     self.try_merge_par2_recovery(job_id, file_id).await;
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: try_merge_par2_recovery"
+                    );
+                    stage_start = Instant::now();
                     self.refresh_archive_state_for_completed_file(job_id, file_id, true)
                         .await;
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: refresh_archive_state_for_completed_file"
+                    );
+                    stage_start = Instant::now();
                     self.retry_par2_authoritative_identity(job_id).await;
-                    debug!(job_id = job_id.0, "post-topology");
-                    debug!(job_id = job_id.0, "entering try_rar_extraction");
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: retry_par2_authoritative_identity"
+                    );
+                    stage_start = Instant::now();
                     self.try_rar_extraction(job_id).await;
-                    debug!(job_id = job_id.0, "post-extraction");
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: try_rar_extraction"
+                    );
+                    stage_start = Instant::now();
                     self.check_job_completion(job_id).await;
-                    debug!(job_id = job_id.0, "post-completion-check");
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: check_job_completion"
+                    );
                 }
             }
             Err(e) => {

@@ -142,6 +142,18 @@ impl Pipeline {
             })
     }
 
+    pub(crate) fn job_has_pending_rar_refresh_for_current_sets(&self, job_id: JobId) -> bool {
+        let current_set_names = self.current_rar_set_names_for_job(job_id);
+
+        self.rar_refresh_state
+            .iter()
+            .any(|((refresh_job_id, set_name), refresh_state)| {
+                *refresh_job_id == job_id
+                    && (current_set_names.is_empty() || current_set_names.contains(set_name))
+                    && (refresh_state.in_flight.is_some() || refresh_state.queued.is_some())
+            })
+    }
+
     pub(crate) fn job_has_incoherent_rar_waiting_state(&self, job_id: JobId) -> bool {
         let current_set_names = self.current_rar_set_names_for_job(job_id);
 
@@ -488,11 +500,20 @@ impl Pipeline {
     }
 
     async fn run_par2_repairer(
-        &self,
+        &mut self,
         par2_set: Arc<weaver_par2::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
     ) -> Result<weaver_par2::Par2RepairOutcome, String> {
+        #[cfg(test)]
+        {
+            if repair {
+                self.par2_repairer_execute_calls += 1;
+            } else {
+                self.par2_repairer_analyze_calls += 1;
+            }
+        }
+
         let repair_result = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -528,6 +549,64 @@ impl Pipeline {
         }
     }
 
+    async fn analyze_par2_with_repairer(
+        &mut self,
+        job_id: JobId,
+        par2_set: Arc<weaver_par2::Par2FileSet>,
+        working_dir: std::path::PathBuf,
+        preserve_repairing_status: bool,
+    ) -> Result<weaver_par2::Par2RepairOutcome, String> {
+        if !preserve_repairing_status {
+            self.transition_postprocessing_status(job_id, JobStatus::Verifying, Some("verifying"));
+        } else {
+            info!(
+                job_id = job_id.0,
+                "rerunning PAR2 analysis while preserving restored repair slot"
+            );
+        }
+        self.emit_job_verification_started(job_id);
+        let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        });
+
+        self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
+        info!(job_id = job_id.0, "par2 damaged-path analysis started");
+
+        let outcome_result = self.run_par2_repairer(par2_set, working_dir, false).await;
+
+        self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
+
+        let mut outcome = outcome_result?;
+
+        let (skipped_blocks, retained_suspect_blocks) =
+            self.apply_eager_delete_exclusions(job_id, &mut outcome.verification);
+        if skipped_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                skipped_blocks, "excluded eagerly-deleted CRC-verified volumes from damage count"
+            );
+        }
+        if retained_suspect_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                retained_suspect_blocks, "retained suspect eagerly-deleted volumes in damage count"
+            );
+        }
+
+        outcome.missing_blocks = outcome.verification.total_missing_blocks;
+        self.recompute_volume_safety_from_verification(job_id, &outcome.verification);
+
+        let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
+            job_id,
+            passed: !par2_verification_needs_repair(&outcome.verification),
+        });
+
+        Ok(outcome)
+    }
+
     async fn verify_par2_with_placement(
         &mut self,
         job_id: JobId,
@@ -549,15 +628,18 @@ impl Pipeline {
                     "rerunning PAR2 verification while preserving restored repair slot"
                 );
             }
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::JobVerificationStarted { job_id });
+            self.emit_job_verification_started(job_id);
             let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
                 file_id: NzbFileId {
                     job_id,
                     file_index: 0,
                 },
             });
+        }
+
+        #[cfg(test)]
+        {
+            self.par2_authoritative_verify_calls += 1;
         }
 
         self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
@@ -617,6 +699,12 @@ impl Pipeline {
         }
 
         Ok((verification, placement_plan))
+    }
+
+    fn emit_job_verification_started(&self, job_id: JobId) {
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::JobVerificationStarted { job_id });
     }
 
     async fn quick_verify_par2_with_placement(
@@ -902,6 +990,191 @@ impl Pipeline {
         Ok(files_to_complete.len())
     }
 
+    async fn refresh_verified_complete_archive_topologies(
+        &mut self,
+        job_id: JobId,
+        verification: &weaver_par2::VerificationResult,
+    ) -> usize {
+        let file_ids =
+            self.verified_complete_archive_file_ids_needing_refresh(job_id, verification);
+        if !file_ids.is_empty() {
+            info!(
+                job_id = job_id.0,
+                files = file_ids.len(),
+                "refreshing archive topology from verified PAR2 outputs"
+            );
+        }
+        for file_id in &file_ids {
+            self.refresh_archive_state_for_completed_file(job_id, *file_id, false)
+                .await;
+        }
+        file_ids.len()
+    }
+
+    pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
+        &self,
+        job_id: JobId,
+        verification: &weaver_par2::VerificationResult,
+    ) -> Vec<NzbFileId> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+
+        let mut by_name = HashMap::<String, (NzbFileId, bool)>::new();
+        for file in state.assembly.files() {
+            if !file.is_complete() {
+                continue;
+            }
+
+            let role = self.classified_role_for_file(job_id, file);
+            if !Self::role_refreshes_archive_topology(&role) {
+                continue;
+            }
+
+            let needs_refresh = self.archive_topology_needs_refresh(job_id, file, &role);
+            let file_id = file.file_id();
+            let identity = self.effective_file_identity(job_id, file_id);
+            let current_filename = identity
+                .as_ref()
+                .map(|value| value.current_filename.clone())
+                .unwrap_or_else(|| file.filename().to_string());
+            Self::insert_par2_name_candidates(
+                &mut by_name,
+                &current_filename,
+                file_id,
+                needs_refresh,
+            );
+            if let Some(identity) = identity {
+                Self::insert_par2_name_candidates(
+                    &mut by_name,
+                    &identity.source_filename,
+                    file_id,
+                    needs_refresh,
+                );
+                if let Some(canonical) = &identity.canonical_filename {
+                    Self::insert_par2_name_candidates(
+                        &mut by_name,
+                        canonical,
+                        file_id,
+                        needs_refresh,
+                    );
+                }
+            }
+        }
+
+        let mut matched = HashSet::new();
+        for file_verification in &verification.files {
+            let renamed = matches!(
+                file_verification.status,
+                weaver_par2::verify::FileStatus::Renamed(_)
+            );
+            if !matches!(
+                file_verification.status,
+                weaver_par2::verify::FileStatus::Complete
+                    | weaver_par2::verify::FileStatus::Renamed(_)
+            ) {
+                continue;
+            }
+
+            for candidate_name in Self::par2_verification_candidate_names(file_verification) {
+                let Some((file_id, needs_refresh)) = by_name.get(&candidate_name).copied() else {
+                    continue;
+                };
+                if renamed || needs_refresh {
+                    matched.insert(file_id);
+                }
+                break;
+            }
+        }
+
+        let mut file_ids = matched.into_iter().collect::<Vec<_>>();
+        file_ids.sort_by_key(|file_id| file_id.file_index);
+        file_ids
+    }
+
+    fn role_refreshes_archive_topology(role: &weaver_model::files::FileRole) -> bool {
+        matches!(
+            role,
+            weaver_model::files::FileRole::RarVolume { .. }
+                | weaver_model::files::FileRole::SevenZipArchive
+                | weaver_model::files::FileRole::SevenZipSplit { .. }
+                | weaver_model::files::FileRole::SplitFile { .. }
+                | weaver_model::files::FileRole::ZipArchive
+                | weaver_model::files::FileRole::TarArchive
+                | weaver_model::files::FileRole::TarGzArchive
+                | weaver_model::files::FileRole::TarBz2Archive
+                | weaver_model::files::FileRole::GzArchive
+                | weaver_model::files::FileRole::DeflateArchive
+                | weaver_model::files::FileRole::BrotliArchive
+                | weaver_model::files::FileRole::ZstdArchive
+                | weaver_model::files::FileRole::Bzip2Archive
+        )
+    }
+
+    fn archive_topology_needs_refresh(
+        &self,
+        job_id: JobId,
+        file: &crate::jobs::assembly::FileAssembly,
+        role: &weaver_model::files::FileRole,
+    ) -> bool {
+        let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file) else {
+            return false;
+        };
+
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. }) {
+            return self
+                .rar_sets
+                .get(&(job_id, set_name))
+                .is_none_or(|set_state| set_state.plan.is_none());
+        }
+
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|state| state.assembly.archive_topology_for(&set_name).is_none())
+    }
+
+    fn insert_par2_name_candidates(
+        by_name: &mut HashMap<String, (NzbFileId, bool)>,
+        name: &str,
+        file_id: NzbFileId,
+        needs_refresh: bool,
+    ) {
+        for candidate in Self::name_and_basename_candidates(name) {
+            by_name.entry(candidate).or_insert((file_id, needs_refresh));
+        }
+    }
+
+    fn par2_verification_candidate_names(
+        file_verification: &weaver_par2::verify::FileVerification,
+    ) -> Vec<String> {
+        let mut candidates = Self::name_and_basename_candidates(&file_verification.filename);
+        if let weaver_par2::verify::FileStatus::Renamed(path) = &file_verification.status {
+            Self::push_name_candidate(&mut candidates, &path.to_string_lossy());
+            if let Some(filename) = path.file_name() {
+                Self::push_name_candidate(&mut candidates, &filename.to_string_lossy());
+            }
+        }
+        candidates
+    }
+
+    fn name_and_basename_candidates(name: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+        Self::push_name_candidate(&mut candidates, name);
+        if let Some(basename) = name.rsplit(['/', '\\']).next()
+            && basename != name
+        {
+            Self::push_name_candidate(&mut candidates, basename);
+        }
+        candidates
+    }
+
+    fn push_name_candidate(candidates: &mut Vec<String>, name: &str) {
+        if name.is_empty() || candidates.iter().any(|candidate| candidate == name) {
+            return;
+        }
+        candidates.push(name.to_string());
+    }
+
     async fn check_rar_job_completion(&mut self, job_id: JobId) {
         let set_names = self.rar_set_names_for_job(job_id);
         if set_names.is_empty() {
@@ -1179,6 +1452,9 @@ impl Pipeline {
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
             && only_rar_archives
             && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
+        let pending_rar_refresh = download_pipeline_exhausted
+            && only_rar_archives
+            && self.job_has_pending_rar_refresh_for_current_sets(job_id);
 
         // Step 2: Check for CRC failures that need PAR2 repair.
         let has_crc_failures = self
@@ -1243,6 +1519,7 @@ impl Pipeline {
                 par2_loaded,
                 has_crc_failures,
                 rar_waiting_for_missing_volumes,
+                pending_rar_refresh,
                 has_active_rar_workers,
                 inflight_extractions,
                 has_active_extraction_tasks,
@@ -1266,6 +1543,14 @@ impl Pipeline {
             && !download_pipeline_exhausted
             && !self.job_has_active_extraction_tasks(job_id)
         {
+            return;
+        }
+
+        if pending_rar_refresh {
+            debug!(
+                job_id = job_id.0,
+                "deferring completion — RAR topology refresh pending"
+            );
             return;
         }
 
@@ -1352,6 +1637,8 @@ impl Pipeline {
                             return;
                         }
                         self.retry_par2_authoritative_identity(job_id).await;
+                        self.refresh_verified_complete_archive_topologies(job_id, &verification)
+                            .await;
                         if let Err(error) = self
                             .reconcile_verified_par2_files(job_id, &verification)
                             .await
@@ -1466,6 +1753,295 @@ impl Pipeline {
 
             if let Some(par2_set) = par2_set {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                if authoritative_par2_verification_needed {
+                    let repair_analysis = match self
+                        .analyze_par2_with_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            matches!(current_status, JobStatus::Repairing),
+                        )
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(message) => {
+                            warn!(job_id = job_id.0, error = %message);
+                            self.fail_job(job_id, message);
+                            return;
+                        }
+                    };
+                    let verification = &repair_analysis.verification;
+                    let damaged = verification.total_missing_blocks;
+                    let recovery_now = repair_analysis.recovery_blocks_available;
+                    let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
+                    let blocks_needed = match &verification.repairable {
+                        weaver_par2::verify::Repairability::NotNeeded => 0,
+                        weaver_par2::verify::Repairability::Repairable {
+                            blocks_needed, ..
+                        }
+                        | weaver_par2::verify::Repairability::Insufficient {
+                            blocks_needed, ..
+                        } => *blocks_needed,
+                    };
+
+                    if !par2_verification_needs_repair(verification) {
+                        info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
+
+                        self.retry_par2_authoritative_identity(job_id).await;
+                        self.refresh_verified_complete_archive_topologies(job_id, verification)
+                            .await;
+                        if let Err(error) = self
+                            .reconcile_verified_par2_files(job_id, verification)
+                            .await
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
+
+                        let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
+                            state.assembly.complete_data_file_count()
+                                < state.assembly.data_file_count()
+                        });
+                        if still_incomplete && !has_crc_failures {
+                            let msg = "clean PAR2 verification but job still has incomplete data files after reconciliation".to_string();
+                            warn!(job_id = job_id.0, error = %msg);
+                            self.fail_job(job_id, msg);
+                            return;
+                        }
+                        self.par2_verified.insert(job_id);
+
+                        if has_crc_failures {
+                            if self.normalization_retried.contains(&job_id) {
+                                let msg =
+                                    "clean PAR2 verification but extraction still failing after retry"
+                                        .to_string();
+                                warn!(job_id = job_id.0, error = %msg);
+                                self.fail_job(job_id, msg);
+                                return;
+                            }
+
+                            self.set_normalization_retried_state(job_id, true);
+                            let failed_members = self
+                                .failed_extractions
+                                .get(&job_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            self.replace_failed_extraction_members(job_id, HashSet::new());
+                            let cleared = failed_members.len();
+                            self.recompute_rar_retry_frontier(job_id).await;
+                            if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
+                                if !failed_members.is_empty() {
+                                    self.replace_failed_extraction_members(job_id, failed_members);
+                                }
+                                let msg = format!(
+                                    "invalid RAR retry frontier after placement correction: {reason}"
+                                );
+                                warn!(job_id = job_id.0, error = %msg);
+                                self.fail_job(job_id, msg);
+                                return;
+                            }
+
+                            info!(
+                                job_id = job_id.0,
+                                cleared,
+                                "cleared failed extractions after PAR2 analysis — retrying"
+                            );
+
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
+                            return;
+                        }
+
+                        if archive_extraction_applicable {
+                            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                .await;
+                            return;
+                        }
+
+                        self.reconcile_job_progress(job_id).await;
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
+
+                    info!(
+                        job_id = job_id.0,
+                        damaged,
+                        blocks_needed,
+                        recovery_now,
+                        total_recovery_capacity,
+                        files_renamed = repair_analysis.files_renamed,
+                        files_damaged = repair_analysis.files_damaged,
+                        files_missing = repair_analysis.files_missing,
+                        "PAR2 analysis — repair required"
+                    );
+
+                    if total_recovery_capacity < blocks_needed {
+                        self.fail_job(
+                            job_id,
+                            format!(
+                                "not repairable: {blocks_needed} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
+                            ),
+                        );
+                        return;
+                    }
+
+                    if recovery_now < blocks_needed {
+                        let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
+                        let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+
+                        if targeted_total < blocks_needed {
+                            let msg = format!(
+                                "not repairable: {blocks_needed} damaged slices, \
+                                 only {targeted_total} recovery blocks available in NZB"
+                            );
+                            warn!(job_id = job_id.0, %msg);
+                            self.fail_job(job_id, msg);
+                            return;
+                        }
+
+                        info!(
+                            job_id = job_id.0,
+                            blocks_needed,
+                            recovery_now,
+                            targeted_total,
+                            promoted_blocks = promoted,
+                            "waiting for targeted recovery downloads before repair"
+                        );
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
+                        return;
+                    }
+
+                    if matches!(
+                        &verification.repairable,
+                        weaver_par2::verify::Repairability::Insufficient { .. }
+                    ) {
+                        let msg = format!(
+                            "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
+                        );
+                        warn!(job_id = job_id.0, error = %msg);
+                        self.fail_job(job_id, msg);
+                        return;
+                    }
+
+                    if !self.maybe_start_repair(job_id).await {
+                        return;
+                    }
+
+                    match self
+                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            self.recompute_volume_safety_from_verification(
+                                job_id,
+                                &outcome.verification,
+                            );
+                            if outcome.verification.total_missing_blocks > 0
+                                || outcome.files_renamed > 0
+                                || outcome.files_damaged > 0
+                                || outcome.files_missing > 0
+                            {
+                                let msg = format!(
+                                    "PAR2 repair completed but canonical outputs remain incomplete: missing_blocks={}, renamed={}, damaged={}, missing={}",
+                                    outcome.verification.total_missing_blocks,
+                                    outcome.files_renamed,
+                                    outcome.files_damaged,
+                                    outcome.files_missing
+                                );
+                                warn!(job_id = job_id.0, error = %msg);
+                                let _ = self.event_tx.send(PipelineEvent::RepairFailed {
+                                    job_id,
+                                    error: msg.clone(),
+                                });
+                                self.fail_job(job_id, msg);
+                                return;
+                            }
+
+                            let slices_repaired = outcome.recovery_blocks_used;
+                            info!(
+                                job_id = job_id.0,
+                                status = ?outcome.status,
+                                slices_repaired,
+                                bytes_copied = outcome.bytes_copied,
+                                bytes_reconstructed = outcome.bytes_reconstructed,
+                                files_complete = outcome.files_complete,
+                                files_renamed = outcome.files_renamed,
+                                files_damaged = outcome.files_damaged,
+                                files_missing = outcome.files_missing,
+                                "PAR2 repair complete"
+                            );
+                            let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+                                job_id,
+                                slices_repaired,
+                            });
+
+                            self.retry_par2_authoritative_identity(job_id).await;
+                            self.refresh_verified_complete_archive_topologies(
+                                job_id,
+                                &outcome.verification,
+                            )
+                            .await;
+                            if let Err(error) = self
+                                .reconcile_verified_par2_files(job_id, &outcome.verification)
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
+
+                            let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
+                                state.assembly.complete_data_file_count()
+                                    < state.assembly.data_file_count()
+                            });
+                            if still_incomplete && !has_crc_failures {
+                                let msg = "PAR2 repair completed but job still has incomplete data files after reconciliation".to_string();
+                                warn!(job_id = job_id.0, error = %msg);
+                                self.fail_job(job_id, msg);
+                                return;
+                            }
+                            self.par2_verified.insert(job_id);
+                            self.transition_postprocessing_status(
+                                job_id,
+                                JobStatus::Downloading,
+                                Some("downloading"),
+                            );
+
+                            if has_crc_failures {
+                                let cleared =
+                                    self.failed_extractions.get(&job_id).map_or(0, HashSet::len);
+                                self.replace_failed_extraction_members(job_id, HashSet::new());
+                                if cleared > 0 {
+                                    info!(
+                                        job_id = job_id.0,
+                                        cleared, "cleared failed extractions for post-repair retry"
+                                    );
+                                }
+
+                                self.retry_archive_extraction_after_verify_or_repair(job_id)
+                                    .await;
+                                return;
+                            }
+
+                            self.reconcile_job_progress(job_id).await;
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
+                        Err(error_msg) => {
+                            warn!(job_id = job_id.0, error = %error_msg, "PAR2 repair failed");
+                            let _ = self.event_tx.send(PipelineEvent::RepairFailed {
+                                job_id,
+                                error: error_msg.clone(),
+                            });
+                            self.fail_job(job_id, error_msg);
+                            return;
+                        }
+                    }
+                }
+
                 let (verification, placement_plan) = match self
                     .verify_par2_with_placement(
                         job_id,
@@ -1508,6 +2084,8 @@ impl Pipeline {
                         return;
                     }
                     self.retry_par2_authoritative_identity(job_id).await;
+                    self.refresh_verified_complete_archive_topologies(job_id, &verification)
+                        .await;
                     if let Err(error) = self
                         .reconcile_verified_par2_files(job_id, &verification)
                         .await
@@ -1569,10 +2147,7 @@ impl Pipeline {
                         return;
                     }
 
-                    if self.extraction_readiness_for_job(job_id)
-                        != ExtractionReadiness::NotApplicable
-                        || self.job_has_only_rar_archives(job_id)
-                    {
+                    if archive_extraction_applicable {
                         self.retry_archive_extraction_after_verify_or_repair(job_id)
                             .await;
                         return;
@@ -1700,6 +2275,7 @@ impl Pipeline {
                                 slices_repaired,
                             });
 
+                            self.emit_job_verification_started(job_id);
                             let (post_repair_verification, post_repair_placement_plan) = match self
                                 .verify_par2_with_placement(
                                     job_id,
@@ -1743,6 +2319,11 @@ impl Pipeline {
                                 return;
                             }
                             self.retry_par2_authoritative_identity(job_id).await;
+                            self.refresh_verified_complete_archive_topologies(
+                                job_id,
+                                &post_repair_verification,
+                            )
+                            .await;
                             if let Err(error) = self
                                 .reconcile_verified_par2_files(job_id, &post_repair_verification)
                                 .await

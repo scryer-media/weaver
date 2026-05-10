@@ -482,7 +482,7 @@ pub fn parse_file_extra_records(raw: &RawHeader) -> RarResult<Vec<extra::ExtraRe
 mod tests {
     use super::*;
     use aes::Aes256;
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
     fn encrypt_first_cbc_block(key: &[u8; 32], iv: &[u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
         let cipher = Aes256::new(key.into());
@@ -490,8 +490,10 @@ mod tests {
         for (byte, iv_byte) in block.iter_mut().zip(iv.iter()) {
             *byte ^= iv_byte;
         }
-        let block_ref = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block);
-        cipher.encrypt_block(block_ref);
+        let mut block_ref = aes::Block::default();
+        block_ref.copy_from_slice(&block);
+        cipher.encrypt_block(&mut block_ref);
+        block.copy_from_slice(&block_ref);
         block
     }
 

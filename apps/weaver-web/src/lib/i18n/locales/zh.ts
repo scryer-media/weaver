@@ -164,6 +164,7 @@ const zh: LocaleDictionary = {
   "timeline.finalizingDownload": "正在完成下载收尾",
   "timeline.paused": "已暂停",
   "timeline.verifying": "校验中",
+  "timeline.verifyingDetail": "PAR2 校验和恢复预检。",
   "timeline.repairing": "修复中",
   "timeline.extracting": "解压中",
   "timeline.interrupted": "已中断",

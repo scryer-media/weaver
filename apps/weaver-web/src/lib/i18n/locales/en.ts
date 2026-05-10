@@ -180,6 +180,7 @@ const en: LocaleDictionary = {
   "timeline.finalizingDownload": "Finalizing Download",
   "timeline.paused": "Paused",
   "timeline.verifying": "Verifying",
+  "timeline.verifyingDetail": "PAR2 verification and recovery preflight.",
   "timeline.repairing": "Repairing",
   "timeline.extracting": "Extracting",
   "timeline.interrupted": "Interrupted",

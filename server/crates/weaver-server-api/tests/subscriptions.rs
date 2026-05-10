@@ -296,14 +296,6 @@ async fn latest_queue_cursor_query_returns_encoded_cursor() {
 async fn system_metrics_updates_emit_metrics_and_global_state() {
     let h = TestHarness::new().await;
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
-    h.shared_state.refresh_metrics_snapshot();
-    let expected_speed = h.handle.get_metrics().current_download_speed;
-    assert!(expected_speed > 0);
-
     let request = Request::new(
         "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } globalState { isPaused } } }",
     )
@@ -316,14 +308,31 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         .expect("stream should stay open");
     assert!(first.errors.is_empty());
     let first_data = first.data.into_json().unwrap();
-    assert_eq!(
-        first_data["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
-            .as_u64()
-            .unwrap(),
-        expected_speed
-    );
     assert!(
         !first_data["systemMetricsUpdates"]["globalState"]["isPaused"]
+            .as_bool()
+            .unwrap()
+    );
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("metrics subscription should emit live speed without shared refresh")
+        .expect("stream should stay open");
+    assert!(second.errors.is_empty());
+    let second_data = second.data.into_json().unwrap();
+    assert!(
+        second_data["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        !second_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
             .unwrap()
     );
@@ -331,17 +340,69 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     let pause = h.execute("mutation { pauseQueue { success } }").await;
     assert!(pause.errors.is_empty());
 
-    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+    let third = tokio::time::timeout(Duration::from_secs(3), stream.next())
         .await
         .expect("metrics subscription should emit after cadence tick")
         .expect("stream should stay open");
-    assert!(second.errors.is_empty());
-    let second_data = second.data.into_json().unwrap();
+    assert!(third.errors.is_empty());
+    let third_data = third.data.into_json().unwrap();
     assert!(
-        second_data["systemMetricsUpdates"]["globalState"]["isPaused"]
+        third_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn system_metrics_updates_keep_independent_speed_samplers_per_subscriber() {
+    let h = TestHarness::new().await;
+    let query = "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } } }";
+    let mut stream_a = h
+        .schema
+        .execute_stream(Request::new(query).data(CallerScope::Read));
+    let mut stream_b = h
+        .schema
+        .execute_stream(Request::new(query).data(CallerScope::Read));
+
+    let first_a = tokio::time::timeout(Duration::from_secs(3), stream_a.next())
+        .await
+        .expect("first subscriber should emit an initial snapshot")
+        .expect("first stream should stay open");
+    assert!(first_a.errors.is_empty());
+    let first_b = tokio::time::timeout(Duration::from_secs(3), stream_b.next())
+        .await
+        .expect("second subscriber should emit an initial snapshot")
+        .expect("second stream should stay open");
+    assert!(first_b.errors.is_empty());
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+
+    let (next_a, next_b) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(3), stream_a.next()),
+        tokio::time::timeout(Duration::from_secs(3), stream_b.next()),
+    );
+    let next_a = next_a
+        .expect("first subscriber should receive a live update")
+        .expect("first stream should stay open");
+    let next_b = next_b
+        .expect("second subscriber should receive a live update")
+        .expect("second stream should stay open");
+    assert!(next_a.errors.is_empty());
+    assert!(next_b.errors.is_empty());
+
+    let speed_a =
+        next_a.data.into_json().unwrap()["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap();
+    let speed_b =
+        next_b.data.into_json().unwrap()["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
+            .as_u64()
+            .unwrap();
+    assert!(speed_a > 0, "first subscriber should observe live speed");
+    assert!(speed_b > 0, "second subscriber should observe live speed");
 }
 
 #[tokio::test]

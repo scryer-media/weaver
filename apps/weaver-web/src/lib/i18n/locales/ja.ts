@@ -164,6 +164,7 @@ const ja: LocaleDictionary = {
   "timeline.finalizingDownload": "ダウンロードを最終処理中",
   "timeline.paused": "一時停止",
   "timeline.verifying": "検証中",
+  "timeline.verifyingDetail": "PAR2 検証とリカバリー事前確認。",
   "timeline.repairing": "修復中",
   "timeline.extracting": "展開中",
   "timeline.interrupted": "中断",

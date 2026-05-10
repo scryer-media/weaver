@@ -16,6 +16,21 @@
 //! - Post-decompression filters (Delta, E8, E8E9, ARM)
 //! - Path sanitization to prevent traversal attacks
 
+#[cfg(all(
+    feature = "native-crypto",
+    not(any(
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
+        all(target_arch = "aarch64", target_os = "linux", target_env = "musl"),
+        all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
+        all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+    ))
+))]
+compile_error!(
+    "weaver-rar native-crypto only supports x86_64/aarch64 on macOS, Linux musl, and Windows MSVC"
+);
+
 pub mod archive;
 pub mod crypto;
 pub mod decompress;

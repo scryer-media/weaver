@@ -12,6 +12,21 @@
 //! - Streaming checksum computation
 //! - Graceful handling of malformed/truncated packets (scan for next valid packet)
 
+#[cfg(all(
+    feature = "native-crypto",
+    not(any(
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
+        all(target_arch = "aarch64", target_os = "linux", target_env = "musl"),
+        all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
+        all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
+    ))
+))]
+compile_error!(
+    "weaver-par2 native-crypto only supports x86_64/aarch64 on macOS, Linux musl, and Windows MSVC"
+);
+
 pub mod checksum;
 pub mod disk;
 pub mod error;

@@ -133,9 +133,9 @@ const DEFAULT_QUEUE_PREFERENCES: QueueTablePreferences = {
   statuses: [],
   priorities: [],
   categories: [],
-  sorting: [],
+  sorting: [{ id: "progress", desc: true }],
 };
-const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v2";
+const QUEUE_TABLE_PREFERENCES_KEY = "weaver.queue.table.preferences.v4";
 const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "QUEUED",
   "DOWNLOADING",
@@ -493,6 +493,20 @@ function queueStatusLabel(status: QueueStatusFilter, t: ReturnType<typeof useTra
   }
 }
 
+function queueDisplayRank(status: string): number {
+  switch (status) {
+    case "VERIFYING":
+    case "REPAIRING":
+    case "EXTRACTING":
+    case "MOVING":
+      return 0;
+    case "DOWNLOADING":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
 function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -709,21 +723,23 @@ export function JobList() {
 
   const queueRows = useMemo(
     () =>
-      jobs.filter((job) => {
-        const pending = pendingJobUpdates[job.id];
-        const matchesStatus =
-          queuePreferences.statuses.length === 0
-          || queuePreferences.statuses.includes(job.status as QueueStatusFilter);
-        const priority = resolveJobPriority(job, pending);
-        const matchesPriority =
-          queuePreferences.priorities.length === 0
-          || queuePreferences.priorities.includes(priority);
-        const category = resolveJobCategory(job, pending);
-        const matchesCategory =
-          queuePreferences.categories.length === 0
-          || (category != null && queuePreferences.categories.includes(category));
-        return matchesStatus && matchesPriority && matchesCategory;
-      }),
+      jobs
+        .filter((job) => {
+          const pending = pendingJobUpdates[job.id];
+          const matchesStatus =
+            queuePreferences.statuses.length === 0
+            || queuePreferences.statuses.includes(job.status as QueueStatusFilter);
+          const priority = resolveJobPriority(job, pending);
+          const matchesPriority =
+            queuePreferences.priorities.length === 0
+            || queuePreferences.priorities.includes(priority);
+          const category = resolveJobCategory(job, pending);
+          const matchesCategory =
+            queuePreferences.categories.length === 0
+            || (category != null && queuePreferences.categories.includes(category));
+          return matchesStatus && matchesPriority && matchesCategory;
+        })
+        .sort((left, right) => queueDisplayRank(left.status) - queueDisplayRank(right.status)),
     [jobs, pendingJobUpdates, queuePreferences.categories, queuePreferences.priorities, queuePreferences.statuses],
   );
 

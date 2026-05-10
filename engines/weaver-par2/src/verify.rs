@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 use crate::checksum;
+use crate::md5_simd;
 use crate::par2_set::Par2FileSet;
 use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressStage,
@@ -10,6 +11,9 @@ use crate::types::{
 };
 
 const VERIFY_SLICE_CHUNK_BYTES: usize = 64 * 1024;
+const VERIFY_SIMD_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
+const VERIFY_SIMD_MAX_LANES: usize = 4;
+const QUICK_CHECK_16K_BYTES: usize = 16 * 1024;
 
 /// Abstraction for file I/O during verification and repair.
 pub trait FileAccess {
@@ -27,6 +31,11 @@ pub trait FileAccess {
         let read_len = data.len().min(dst.len());
         dst[..read_len].copy_from_slice(&data[..read_len]);
         Ok(read_len)
+    }
+
+    /// Open a forward-only reader for hot paths that consume a whole file from offset 0.
+    fn open_sequential_reader(&self, _file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        Ok(None)
     }
 
     /// Check if a file exists on disk.
@@ -260,14 +269,29 @@ pub fn quick_check_16k(
     file_id: &FileId,
     access: &dyn FileAccess,
 ) -> Option<bool> {
+    let mut scratch = [0u8; QUICK_CHECK_16K_BYTES];
+    quick_check_16k_with_scratch(par2, file_id, access, &mut scratch)
+}
+
+fn quick_check_16k_with_scratch(
+    par2: &Par2FileSet,
+    file_id: &FileId,
+    access: &dyn FileAccess,
+    scratch: &mut [u8; QUICK_CHECK_16K_BYTES],
+) -> Option<bool> {
     let desc = par2.file_description(file_id)?;
 
     if !access.file_exists(file_id) {
         return Some(false);
     }
 
-    let data = access.read_file_range(file_id, 0, 16384).ok()?;
-    let hash = checksum::md5(&data);
+    let read_len = if let Some(mut reader) = access.open_sequential_reader(file_id).ok()? {
+        let scratch_len = scratch.len();
+        read_from_sequential_reader(&mut *reader, scratch, scratch_len).ok()?
+    } else {
+        access.read_file_range_into(file_id, 0, scratch).ok()?
+    };
+    let hash = checksum::md5(&scratch[..read_len]);
     Some(hash == desc.hash_16k)
 }
 
@@ -283,19 +307,35 @@ pub fn verify_full_hash(
         return Some(false);
     }
     let mut state = checksum::FileHashState::new();
-    let mut offset = 0u64;
     let mut buf = vec![0u8; 1024 * 1024];
 
-    while offset < actual_len {
-        let chunk_len = ((actual_len - offset) as usize).min(buf.len());
-        let read_len = access
-            .read_file_range_into(file_id, offset, &mut buf[..chunk_len])
-            .ok()?;
-        if read_len == 0 {
+    if let Some(mut reader) = access.open_sequential_reader(file_id).ok()? {
+        let mut total_read = 0u64;
+        loop {
+            let read_len = reader.read(&mut buf).ok()?;
+            if read_len == 0 {
+                break;
+            }
+            state.update(&buf[..read_len]);
+            total_read += read_len as u64;
+        }
+        if total_read != actual_len {
             return Some(false);
         }
-        state.update(&buf[..read_len]);
-        offset += read_len as u64;
+    } else {
+        let mut offset = 0u64;
+
+        while offset < actual_len {
+            let chunk_len = ((actual_len - offset) as usize).min(buf.len());
+            let read_len = access
+                .read_file_range_into(file_id, offset, &mut buf[..chunk_len])
+                .ok()?;
+            if read_len == 0 {
+                return Some(false);
+            }
+            state.update(&buf[..read_len]);
+            offset += read_len as u64;
+        }
     }
 
     Some(state.finalize() == desc.hash_full)
@@ -321,6 +361,12 @@ pub fn verify_slices(
         return Some(vec![false; expected_slices]);
     }
 
+    if let Some(results) =
+        verify_slices_batched_md5(file_id, desc.length, checksums, slice_size, access).ok()?
+    {
+        return Some(results);
+    }
+
     let mut results = vec![false; expected_slices];
     let mut buf = vec![0u8; VERIFY_SLICE_CHUNK_BYTES];
 
@@ -340,6 +386,174 @@ pub fn verify_slices(
     }
 
     Some(results)
+}
+
+fn verify_slices_batched_md5(
+    file_id: &FileId,
+    file_len: u64,
+    checksums: &[SliceChecksum],
+    slice_size: u64,
+    access: &dyn FileAccess,
+) -> io::Result<Option<Vec<bool>>> {
+    if checksums.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Ok(slice_size_usize) = usize::try_from(slice_size) else {
+        return Ok(None);
+    };
+    if slice_size_usize == 0 {
+        return Ok(None);
+    }
+
+    let max_lanes = (VERIFY_SIMD_BATCH_MEMORY_BYTES / slice_size_usize).min(VERIFY_SIMD_MAX_LANES);
+    if max_lanes < 2 {
+        return Ok(None);
+    }
+
+    let mut results = vec![false; checksums.len()];
+    let mut buffers = (0..max_lanes)
+        .map(|_| vec![0u8; slice_size_usize])
+        .collect::<Vec<_>>();
+
+    if let Some(mut reader) = access.open_sequential_reader(file_id)? {
+        return verify_slices_batched_md5_from_reader(
+            &mut *reader,
+            file_len,
+            checksums,
+            slice_size,
+            &mut buffers,
+        )
+        .map(Some);
+    }
+
+    let mut index = 0usize;
+
+    while index < checksums.len() {
+        let lanes = max_lanes.min(checksums.len() - index);
+        let mut read_lens = Vec::with_capacity(lanes);
+        let mut crc32s = Vec::with_capacity(lanes);
+
+        for (lane, buffer) in buffers.iter_mut().take(lanes).enumerate() {
+            let slice_index = index + lane;
+            let offset = slice_index as u64 * slice_size;
+            let expected_data_len = file_len.saturating_sub(offset).min(slice_size);
+            let read_len =
+                read_file_slice_into(file_id, offset, expected_data_len, access, buffer)?;
+            read_lens.push(read_len);
+            crc32s.push(checksum::crc32_padded(&buffer[..read_len], slice_size));
+        }
+
+        let inputs = buffers
+            .iter()
+            .take(lanes)
+            .zip(read_lens.iter())
+            .map(|(buffer, read_len)| &buffer[..*read_len])
+            .collect::<Vec<_>>();
+        let md5s = md5_simd::md5_multi(&inputs, Some(slice_size));
+
+        for lane in 0..lanes {
+            let expected = checksums[index + lane];
+            results[index + lane] = crc32s[lane] == expected.crc32 && md5s[lane] == expected.md5;
+        }
+
+        index += lanes;
+    }
+
+    Ok(Some(results))
+}
+
+fn verify_slices_batched_md5_from_reader(
+    reader: &mut dyn Read,
+    file_len: u64,
+    checksums: &[SliceChecksum],
+    slice_size: u64,
+    buffers: &mut [Vec<u8>],
+) -> io::Result<Vec<bool>> {
+    let mut results = vec![false; checksums.len()];
+    let max_lanes = buffers.len();
+    let mut index = 0usize;
+
+    while index < checksums.len() {
+        let lanes = max_lanes.min(checksums.len() - index);
+        let mut read_lens = Vec::with_capacity(lanes);
+        let mut crc32s = Vec::with_capacity(lanes);
+
+        for (lane, buffer) in buffers.iter_mut().take(lanes).enumerate() {
+            let slice_index = index + lane;
+            let offset = slice_index as u64 * slice_size;
+            let expected_data_len = file_len.saturating_sub(offset).min(slice_size) as usize;
+            let read_len = read_from_sequential_reader(reader, buffer, expected_data_len)?;
+            read_lens.push(read_len);
+            crc32s.push(checksum::crc32_padded(&buffer[..read_len], slice_size));
+        }
+
+        let inputs = buffers
+            .iter()
+            .take(lanes)
+            .zip(read_lens.iter())
+            .map(|(buffer, read_len)| &buffer[..*read_len])
+            .collect::<Vec<_>>();
+        let md5s = md5_simd::md5_multi(&inputs, Some(slice_size));
+
+        for lane in 0..lanes {
+            let expected = checksums[index + lane];
+            results[index + lane] = crc32s[lane] == expected.crc32 && md5s[lane] == expected.md5;
+        }
+
+        index += lanes;
+    }
+
+    Ok(results)
+}
+
+fn read_from_sequential_reader(
+    reader: &mut dyn Read,
+    dst: &mut [u8],
+    expected_len: usize,
+) -> io::Result<usize> {
+    let expected_len = expected_len.min(dst.len());
+    let mut read_len = 0usize;
+    while read_len < expected_len {
+        let n = reader.read(&mut dst[read_len..expected_len])?;
+        if n == 0 {
+            break;
+        }
+        read_len += n;
+    }
+    Ok(read_len)
+}
+
+fn read_file_slice_into(
+    file_id: &FileId,
+    offset: u64,
+    expected_data_len: u64,
+    access: &dyn FileAccess,
+    dst: &mut [u8],
+) -> io::Result<usize> {
+    let mut consumed = 0u64;
+
+    while consumed < expected_data_len {
+        let start = consumed as usize;
+        let remaining_capacity = dst.len().saturating_sub(start);
+        if remaining_capacity == 0 {
+            break;
+        }
+        let take = (expected_data_len - consumed).min(remaining_capacity as u64) as usize;
+        let read_len = access.read_file_range_into(
+            file_id,
+            offset + consumed,
+            &mut dst[start..start + take],
+        )?;
+        if read_len == 0 {
+            break;
+        }
+        consumed += read_len as u64;
+        if read_len < take {
+            break;
+        }
+    }
+
+    Ok(consumed as usize)
 }
 
 fn checksum_file_slice_padded(
@@ -441,6 +655,7 @@ pub fn verify_selected_file_ids_with_options(
     let mut total_missing_blocks = 0u32;
     let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
+    let mut quick_check_buf = [0u8; QUICK_CHECK_16K_BYTES];
 
     for (file_index, file_id) in file_ids.iter().enumerate() {
         // Check cancellation before each file.
@@ -548,7 +763,8 @@ pub fn verify_selected_file_ids_with_options(
         }
 
         // Quick check
-        let quick_ok = quick_check_16k(par2, file_id, access).unwrap_or(false);
+        let quick_ok = quick_check_16k_with_scratch(par2, file_id, access, &mut quick_check_buf)
+            .unwrap_or(false);
         if !quick_ok {
             // 16k hash failed; do slice-level check to find which slices are bad
             let valid =
@@ -628,6 +844,8 @@ mod tests {
     use crate::par2_set::Par2FileSet;
     use crate::types::SliceChecksum;
     use md5::{Digest, Md5};
+    use std::collections::HashMap;
+    use std::io::{self, Cursor};
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -820,6 +1038,127 @@ mod tests {
         (set, access, file_ids)
     }
 
+    struct ReadIntoOnlyAccess {
+        files: HashMap<FileId, Vec<u8>>,
+    }
+
+    impl FileAccess for ReadIntoOnlyAccess {
+        fn read_file_range(
+            &self,
+            _file_id: &FileId,
+            _offset: u64,
+            _len: u64,
+        ) -> io::Result<Vec<u8>> {
+            panic!("read_file_range should not be used by quick_check_16k")
+        }
+
+        fn read_file_range_into(
+            &self,
+            file_id: &FileId,
+            offset: u64,
+            dst: &mut [u8],
+        ) -> io::Result<usize> {
+            let data = self
+                .files
+                .get(file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            let offset = offset as usize;
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let end = (offset + dst.len()).min(data.len());
+            let read_len = end - offset;
+            dst[..read_len].copy_from_slice(&data[offset..end]);
+            Ok(read_len)
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.files.contains_key(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.files.get(file_id).map(|data| data.len() as u64)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+            self.files
+                .get(file_id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))
+        }
+
+        fn write_file_range(
+            &mut self,
+            _file_id: &FileId,
+            _offset: u64,
+            _data: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test access is read-only",
+            ))
+        }
+    }
+
+    struct SequentialOnlyAccess {
+        files: HashMap<FileId, Vec<u8>>,
+    }
+
+    impl FileAccess for SequentialOnlyAccess {
+        fn read_file_range(
+            &self,
+            _file_id: &FileId,
+            _offset: u64,
+            _len: u64,
+        ) -> io::Result<Vec<u8>> {
+            panic!("read_file_range should not be used when a sequential reader is available")
+        }
+
+        fn read_file_range_into(
+            &self,
+            _file_id: &FileId,
+            _offset: u64,
+            _dst: &mut [u8],
+        ) -> io::Result<usize> {
+            panic!("read_file_range_into should not be used when a sequential reader is available")
+        }
+
+        fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+            let data = self
+                .files
+                .get(file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            Ok(Some(Box::new(Cursor::new(data.clone()))))
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.files.contains_key(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.files.get(file_id).map(|data| data.len() as u64)
+        }
+
+        fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+            self.files
+                .get(file_id)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))
+        }
+
+        fn write_file_range(
+            &mut self,
+            _file_id: &FileId,
+            _offset: u64,
+            _data: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test access is read-only",
+            ))
+        }
+    }
+
     #[test]
     fn verify_slices_from_crcs_intact() {
         let file_data = vec![0xABu8; 2048];
@@ -940,6 +1279,131 @@ mod tests {
         let access = MemoryFileAccess::new();
 
         assert_eq!(quick_check_16k(&set, &file_id, &access), Some(false));
+    }
+
+    #[test]
+    fn quick_check_short_file_matches_and_detects_corruption() {
+        let file_data = b"short-par2-file".to_vec();
+        let (set, mut access, file_id) = setup_test_set(&file_data, 1024);
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(true));
+
+        let mut corrupted = file_data.clone();
+        corrupted[3] ^= 0xFF;
+        access.add_file(file_id, corrupted);
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(false));
+    }
+
+    #[test]
+    fn quick_check_exact_16k_boundary_matches_and_detects_corruption() {
+        let file_data = (0..QUICK_CHECK_16K_BYTES)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let (set, mut access, file_id) = setup_test_set(&file_data, 4096);
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(true));
+
+        let mut corrupted = file_data.clone();
+        corrupted[QUICK_CHECK_16K_BYTES - 1] ^= 0x55;
+        access.add_file(file_id, corrupted);
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(false));
+    }
+
+    #[test]
+    fn quick_check_uses_read_into_path() {
+        let file_data = vec![0x5Au8; 4096];
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = ReadIntoOnlyAccess {
+            files: access.files,
+        };
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(true));
+    }
+
+    #[test]
+    fn quick_check_uses_sequential_reader_when_available() {
+        let file_data = vec![0x6Bu8; 4096];
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = SequentialOnlyAccess {
+            files: access.files,
+        };
+
+        assert_eq!(quick_check_16k(&set, &file_id, &access), Some(true));
+    }
+
+    #[test]
+    fn verify_full_hash_uses_sequential_reader_when_available() {
+        let file_data = (0..(QUICK_CHECK_16K_BYTES + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = SequentialOnlyAccess {
+            files: access.files,
+        };
+
+        assert_eq!(verify_full_hash(&set, &file_id, &access), Some(true));
+    }
+
+    #[test]
+    fn verify_slices_uses_batched_sequential_reader_when_available() {
+        let file_data = (0..8192)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add(7))
+            .collect::<Vec<_>>();
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = SequentialOnlyAccess {
+            files: access.files,
+        };
+
+        let slices = verify_slices(&set, &file_id, &access).unwrap();
+        assert_eq!(slices, vec![true; 8]);
+    }
+
+    #[test]
+    fn verifier_falls_back_to_read_into_when_no_sequential_reader_exists() {
+        let file_data = (0..8192)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let access = ReadIntoOnlyAccess {
+            files: access.files,
+        };
+
+        assert_eq!(verify_full_hash(&set, &file_id, &access), Some(true));
+        assert_eq!(verify_slices(&set, &file_id, &access), Some(vec![true; 8]));
+    }
+
+    #[test]
+    fn verify_selected_file_ids_reuses_quick_check_scratch_without_allocating_reads() {
+        let file_a = vec![0x11u8; 2048];
+        let file_b = (0..(QUICK_CHECK_16K_BYTES + 257))
+            .map(|i| (i % 239) as u8)
+            .collect::<Vec<_>>();
+        let files = [
+            (file_a.as_slice(), "alpha.bin"),
+            (file_b.as_slice(), "beta.bin"),
+        ];
+        let (set, access, file_ids) = setup_test_set_multi(&files, 1024);
+        let access = ReadIntoOnlyAccess {
+            files: access.files,
+        };
+
+        let verification = verify_selected_file_ids_with_options(
+            &set,
+            &access,
+            &file_ids,
+            &VerifyOptions::default(),
+        );
+
+        assert_eq!(verification.files.len(), 2);
+        assert!(
+            verification
+                .files
+                .iter()
+                .all(|file| matches!(file.status, FileStatus::Complete))
+        );
+        assert_eq!(verification.total_missing_blocks, 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
@@ -11,7 +11,10 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use weaver_server_api::auth::{CallerIdentity, CallerScope, LoginAuthCache};
-use weaver_server_api::{RssService, SchemaContext, WeaverSchema, build_schema};
+use weaver_server_api::{
+    RssService, SchemaContext, TestDbTaskHookGuard, WeaverSchema, build_schema,
+    install_test_db_task_hook,
+};
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::jobs::handle::{JobInfo, SharedPipelineState};
@@ -296,6 +299,82 @@ pub fn assert_has_errors(response: &Response) {
 /// Extract the `data` field from a response as JSON.
 pub fn response_data(response: &Response) -> Value {
     response.data.clone().into_json().unwrap()
+}
+
+pub fn local_request(query: impl Into<String>) -> Request {
+    Request::new(query.into())
+        .data(CallerScope::Local)
+        .data(CallerIdentity::Local([7; 32]))
+}
+
+fn blocking_db_operation_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+pub struct BlockingDbOperation {
+    state: Arc<(StdMutex<BlockingDbOperationState>, Condvar)>,
+    _guard: TestDbTaskHookGuard,
+    _serialize: StdMutexGuard<'static, ()>,
+}
+
+#[derive(Default)]
+struct BlockingDbOperationState {
+    started: bool,
+    released: bool,
+}
+
+impl BlockingDbOperation {
+    pub fn new(operation: &'static str) -> Self {
+        let serialize = blocking_db_operation_lock().lock().unwrap();
+        let state = Arc::new((
+            StdMutex::new(BlockingDbOperationState::default()),
+            Condvar::new(),
+        ));
+        let hook_state = state.clone();
+        let guard = install_test_db_task_hook(move |current_operation| {
+            if current_operation != operation {
+                return;
+            }
+
+            let (lock, condvar) = &*hook_state;
+            let mut state = lock.lock().unwrap();
+            if state.started {
+                return;
+            }
+            state.started = true;
+            condvar.notify_all();
+            while !state.released {
+                state = condvar.wait(state).unwrap();
+            }
+        });
+
+        Self {
+            state,
+            _guard: guard,
+            _serialize: serialize,
+        }
+    }
+
+    pub async fn wait_until_started(&self) {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let (lock, condvar) = &*state;
+            let mut state = lock.lock().unwrap();
+            while !state.started {
+                state = condvar.wait(state).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    pub fn release(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.released = true;
+        condvar.notify_all();
+    }
 }
 
 /// Generate a minimal valid NZB XML for testing.

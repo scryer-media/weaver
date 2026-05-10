@@ -65,17 +65,21 @@ pub(super) async fn job_nzb_download_handler(
     };
 
     match load_uncompressed_nzb_bytes(job.nzb_zstd).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, "application/x-nzb".to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", download_filename(&job.title)),
-                ),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            let content_length = bytes.len().to_string();
+            (
+                [
+                    (header::CONTENT_TYPE, "application/x-nzb".to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}\"", download_filename(&job.title)),
+                    ),
+                    (header::CONTENT_LENGTH, content_length),
+                ],
+                bytes,
+            )
+        }
+        .into_response(),
         Err(status) => status.into_response(),
     }
 }

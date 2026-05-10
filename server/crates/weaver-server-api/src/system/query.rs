@@ -1,4 +1,5 @@
 use super::*;
+use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::MetricsHistoryRangeGql;
 
@@ -16,7 +17,6 @@ impl SystemQuery {
     async fn system_status(&self, ctx: &Context<'_>) -> Result<SystemStatus> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
-        let cfg = config.read().await;
         let items: Vec<QueueItem> = handle
             .list_jobs()
             .into_iter()
@@ -30,10 +30,16 @@ impl SystemQuery {
             .map(|info| queue_item_from_job(&info))
             .collect();
         let metrics = handle.get_metrics();
+        let max_download_speed = with_timed_config_read(
+            config,
+            "system.query.system_status.max_download_speed",
+            |cfg| cfg.max_download_speed.unwrap_or(0),
+        )
+        .await;
         let global_state = global_queue_state(
             handle.is_globally_paused(),
             &handle.get_download_block(),
-            cfg.max_download_speed.unwrap_or(0),
+            max_download_speed,
         );
         Ok(SystemStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -79,10 +85,12 @@ impl SystemQuery {
         path: Option<String>,
     ) -> Result<DirectoryBrowseResult> {
         let config = ctx.data::<SharedConfig>()?;
-        let default_path = {
-            let cfg = config.read().await;
-            cfg.complete_dir()
-        };
+        let default_path = with_timed_config_read(
+            config,
+            "system.query.browse_directories.default_path",
+            |cfg| cfg.complete_dir(),
+        )
+        .await;
         let requested_path = path
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())

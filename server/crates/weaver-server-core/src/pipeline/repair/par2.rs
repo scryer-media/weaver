@@ -187,6 +187,17 @@ impl Pipeline {
             })
             .collect();
         let working_dir = state.working_dir.clone();
+        let old_set_by_topology_filename: HashMap<String, String> = state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .flat_map(|(set_name, topology)| {
+                topology
+                    .volume_map
+                    .keys()
+                    .map(|filename| (filename.clone(), set_name.clone()))
+            })
+            .collect();
         let _ = state;
 
         let mut by_current = HashMap::<String, NzbFileId>::new();
@@ -230,7 +241,7 @@ impl Pipeline {
                 continue;
             };
 
-            let Some((_, identity, _, is_complete)) = files
+            let Some((_, identity, old_role, is_complete)) = files
                 .iter()
                 .find(|(candidate_file_id, _, _, _)| *candidate_file_id == file_id)
                 .cloned()
@@ -240,13 +251,34 @@ impl Pipeline {
 
             let old_current = identity.current_filename.clone();
             let filename_changed = old_current != canonical_filename;
-            let old_rar_set_name = identity.classification.as_ref().and_then(|classification| {
-                matches!(
-                    classification.kind,
-                    crate::jobs::assembly::DetectedArchiveKind::Rar
-                )
-                .then(|| classification.set_name.clone())
-            });
+            let old_rar_set_name = identity
+                .classification
+                .as_ref()
+                .and_then(|classification| {
+                    matches!(
+                        classification.kind,
+                        crate::jobs::assembly::DetectedArchiveKind::Rar
+                    )
+                    .then(|| classification.set_name.clone())
+                })
+                .or_else(|| {
+                    matches!(old_role, weaver_model::files::FileRole::RarVolume { .. })
+                        .then(|| weaver_model::files::archive_base_name(&old_current, &old_role))
+                        .flatten()
+                })
+                .or_else(|| {
+                    self.rar_sets
+                        .iter()
+                        .find(|((rar_job_id, _), state)| {
+                            *rar_job_id == job_id
+                                && state
+                                    .volume_files
+                                    .values()
+                                    .any(|filename| filename == &old_current)
+                        })
+                        .map(|((_, set_name), _)| set_name.clone())
+                })
+                .or_else(|| old_set_by_topology_filename.get(&old_current).cloned());
             let old_path = working_dir.join(&old_current);
             let new_path = working_dir.join(&canonical_filename);
             let canonical_path_exists = new_path.exists();
@@ -325,18 +357,30 @@ impl Pipeline {
             if !self.rar_sets.contains_key(&(job_id, set_name.clone())) {
                 continue;
             }
-            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    error,
-                    "failed to stabilize RAR state after PAR2 canonical rebind"
-                );
-            }
+            self.enqueue_rar_set_refresh(
+                job_id,
+                &set_name,
+                self.latest_completed_rar_volume(job_id, &set_name),
+                RefreshReason::IdentityRebind,
+            );
         }
 
         for set_name in stale_rar_sets {
             self.clear_archive_set_if_unreferenced_and_idle(job_id, &set_name);
+        }
+        let empty_idle_sets = self
+            .rar_sets
+            .iter()
+            .filter(|((rar_job_id, _), state)| {
+                *rar_job_id == job_id
+                    && state.volume_files.is_empty()
+                    && state.active_workers == 0
+                    && state.in_flight_members.is_empty()
+            })
+            .map(|((_, set_name), _)| set_name.clone())
+            .collect::<Vec<_>>();
+        for set_name in empty_idle_sets {
+            self.purge_empty_rar_set_if_idle(job_id, &set_name);
         }
 
         if rebound > 0 {

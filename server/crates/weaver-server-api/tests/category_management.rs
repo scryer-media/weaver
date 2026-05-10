@@ -1,6 +1,11 @@
 mod common;
 
-use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
+use std::time::Duration;
+
+use common::{
+    BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
+    response_data,
+};
 
 #[tokio::test]
 async fn list_categories_empty() {
@@ -285,4 +290,65 @@ async fn list_categories_multiple() {
     let data = response_data(&resp);
     let categories = data["categories"].as_array().unwrap();
     assert_eq!(categories.len(), 3);
+}
+
+#[tokio::test]
+async fn categories_query_stays_responsive_during_update_category_persist() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "tv" }) {
+                    id
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addCategory"]["id"].as_u64().unwrap();
+
+    let blocker = BlockingDbOperation::new("categories.mutation.update_category.persist");
+    let schema = h.schema.clone();
+    let mutation = tokio::spawn(async move {
+        schema
+            .execute(local_request(format!(
+                r#"mutation {{
+                    updateCategory(id: {id}, input: {{ name: "television" }}) {{
+                        id
+                        name
+                    }}
+                }}"#
+            )))
+            .await
+    });
+
+    blocker.wait_until_started().await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_millis(100),
+        h.execute(r#"{ categories { id name } }"#),
+    )
+    .await
+    .expect("categories query should stay responsive while persist is blocked");
+    assert_no_errors(&resp);
+    let categories = response_data(&resp)["categories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let category = categories
+        .iter()
+        .find(|category| category["id"].as_u64() == Some(id))
+        .expect("category should still be present");
+    assert_eq!(category["name"].as_str().unwrap(), "tv");
+
+    blocker.release();
+
+    let mutation = mutation.await.unwrap();
+    assert_no_errors(&mutation);
+    assert_eq!(
+        response_data(&mutation)["updateCategory"]["name"]
+            .as_str()
+            .unwrap(),
+        "television"
+    );
 }

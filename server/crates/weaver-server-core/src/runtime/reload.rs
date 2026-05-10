@@ -1,5 +1,6 @@
 use crate::Database;
 use crate::SchedulerHandle;
+use crate::servers::probe_server_connection;
 use crate::settings::{Config, SharedConfig};
 
 pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
@@ -15,50 +16,60 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
-pub async fn rebuild_nntp_from_config(
-    config: &SharedConfig,
-    handle: &SchedulerHandle,
-    db: &Database,
-) {
-    use weaver_nntp::client::{NntpClient, NntpClientConfig};
-    use weaver_nntp::pool::ServerPoolConfig;
+pub async fn refresh_server_capabilities_from_config(config: &SharedConfig, db: &Database) {
+    let active_servers = {
+        let cfg = config.read().await;
+        cfg.servers
+            .iter()
+            .filter(|server| server.active)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
-    {
-        let mut cfg = config.write().await;
-        for server in cfg.servers.iter_mut().filter(|server| server.active) {
-            let nntp_config = weaver_nntp::ServerConfig {
-                host: server.host.clone(),
-                port: server.port,
-                tls: server.tls,
-                username: server.username.clone(),
-                password: server.password.clone(),
-                ..Default::default()
-            };
-            match weaver_nntp::NntpConnection::connect(&nntp_config).await {
-                Ok(mut conn) => {
-                    server.supports_pipelining = conn.capabilities().supports_pipelining();
-                    tracing::info!(
-                        host = %server.host,
-                        pipelining = server.supports_pipelining,
-                        "detected server capabilities"
-                    );
-                    let _ = conn.quit().await;
-                }
-                Err(error) => {
-                    tracing::info!(
-                        host = %server.host,
-                        error = %error,
-                        "capability detection failed, assuming no pipelining"
-                    );
-                    server.supports_pipelining = false;
-                }
-            }
+    if active_servers.is_empty() {
+        return;
+    }
 
-            let persisted = server.clone();
-            let db = db.clone();
-            let _ = tokio::task::spawn_blocking(move || db.update_server(&persisted)).await;
+    let mut capability_updates = Vec::with_capacity(active_servers.len());
+    for mut server in active_servers {
+        let result = probe_server_connection(&server).await;
+        server.supports_pipelining = result.supports_pipelining;
+        if result.success {
+            tracing::info!(
+                host = %server.host,
+                pipelining = server.supports_pipelining,
+                "detected server capabilities"
+            );
+        } else {
+            tracing::info!(
+                host = %server.host,
+                error = %result.message,
+                "capability detection failed, assuming no pipelining"
+            );
+        }
+
+        capability_updates.push((server.id, server.supports_pipelining));
+
+        let persisted = server;
+        let db = db.clone();
+        if let Err(join_error) =
+            tokio::task::spawn_blocking(move || db.update_server(&persisted)).await
+        {
+            tracing::error!(error = %join_error, "failed to persist server capabilities");
         }
     }
+
+    let mut cfg = config.write().await;
+    for (server_id, supports_pipelining) in capability_updates {
+        if let Some(server) = cfg.servers.iter_mut().find(|server| server.id == server_id) {
+            server.supports_pipelining = supports_pipelining;
+        }
+    }
+}
+
+pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandle) {
+    use weaver_nntp::client::{NntpClient, NntpClientConfig};
+    use weaver_nntp::pool::ServerPoolConfig;
 
     let (client, total) = {
         let cfg = config.read().await;
@@ -74,6 +85,7 @@ pub async fn rebuild_nntp_from_config(
                     tls: server.tls,
                     username: server.username.clone(),
                     password: server.password.clone(),
+                    tls_ca_cert: server.tls_ca_cert.clone(),
                     ..Default::default()
                 },
                 max_connections: server.connections as usize,
@@ -118,7 +130,8 @@ pub async fn reload_runtime_from_db(
         *cfg = loaded.clone();
     }
 
-    rebuild_nntp_from_config(config, handle, db).await;
+    refresh_server_capabilities_from_config(config, db).await;
+    rebuild_nntp_from_config(config, handle).await;
     handle
         .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await

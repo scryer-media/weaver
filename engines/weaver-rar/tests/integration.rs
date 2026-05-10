@@ -966,7 +966,7 @@ fn build_rar4_encrypted_file_header(
 #[test]
 fn test_rar4_encrypted_stored_file() {
     use aes::Aes128;
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
 
     type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
@@ -991,7 +991,7 @@ fn test_rar4_encrypted_stored_file() {
     let mut ciphertext = plaintext_padded.clone();
     let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
     encryptor
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
         .unwrap();
 
     // Build the archive.
@@ -1036,7 +1036,7 @@ fn test_rar4_encrypted_stored_file() {
 #[test]
 fn test_rar4_encrypted_no_password_fails() {
     use aes::Aes128;
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
 
     type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
@@ -1049,7 +1049,7 @@ fn test_rar4_encrypted_no_password_fails() {
     ciphertext[..content.len()].copy_from_slice(content);
     let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
     encryptor
-        .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
+        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
         .unwrap();
 
     let mut hasher = crc32fast::Hasher::new();

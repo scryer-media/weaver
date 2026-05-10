@@ -1,6 +1,8 @@
 mod common;
 
-use common::{TestHarness, assert_no_errors, response_data};
+use std::time::Duration;
+
+use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, response_data};
 
 #[tokio::test]
 async fn get_settings_defaults() {
@@ -233,4 +235,50 @@ async fn partial_settings_update() {
     assert_eq!(s["cleanupAfterExtract"].as_bool().unwrap(), before_cleanup);
     assert_eq!(s["maxRetries"].as_u64().unwrap(), before_retries);
     assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), before_speed);
+}
+
+#[tokio::test]
+async fn settings_query_stays_responsive_during_update_settings_persist() {
+    let h = TestHarness::new().await;
+    let blocker = BlockingDbOperation::new("settings.mutation.update_settings.persist");
+    let schema = h.schema.clone();
+
+    let mutation = tokio::spawn(async move {
+        schema
+            .execute(local_request(
+                r#"mutation {
+                    updateSettings(input: { completeDir: "/tmp/blocked" }) {
+                        completeDir
+                    }
+                }"#,
+            ))
+            .await
+    });
+
+    blocker.wait_until_started().await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_millis(100),
+        h.execute(r#"{ settings { completeDir } }"#),
+    )
+    .await
+    .expect("settings query should stay responsive while persist is blocked");
+    assert_no_errors(&resp);
+    assert_ne!(
+        response_data(&resp)["settings"]["completeDir"]
+            .as_str()
+            .unwrap(),
+        "/tmp/blocked"
+    );
+
+    blocker.release();
+
+    let mutation = mutation.await.unwrap();
+    assert_no_errors(&mutation);
+    assert_eq!(
+        response_data(&mutation)["updateSettings"]["completeDir"]
+            .as_str()
+            .unwrap(),
+        "/tmp/blocked"
+    );
 }

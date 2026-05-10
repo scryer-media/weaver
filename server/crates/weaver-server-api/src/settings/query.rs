@@ -1,4 +1,5 @@
 use super::*;
+use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
 pub(crate) struct SettingsQuery;
@@ -9,16 +10,18 @@ impl SettingsQuery {
     #[graphql(guard = "AdminGuard")]
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
-        let cfg = config.read().await;
-        Ok(GeneralSettings {
-            data_dir: cfg.data_dir.clone(),
-            intermediate_dir: cfg.intermediate_dir(),
-            complete_dir: cfg.complete_dir(),
-            cleanup_after_extract: cfg.cleanup_after_extract(),
-            max_download_speed: cfg.max_download_speed.unwrap_or(0),
-            max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-            isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
-        })
+        Ok(
+            with_timed_config_read(config, "settings.query.settings", |cfg| GeneralSettings {
+                data_dir: cfg.data_dir.clone(),
+                intermediate_dir: cfg.intermediate_dir(),
+                complete_dir: cfg.complete_dir(),
+                cleanup_after_extract: cfg.cleanup_after_extract(),
+                max_download_speed: cfg.max_download_speed.unwrap_or(0),
+                max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+                isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
+            })
+            .await,
+        )
     }
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();

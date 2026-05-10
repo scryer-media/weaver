@@ -154,6 +154,37 @@ fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
     assert!(refreshed.current_download_speed < initial.current_download_speed);
 }
 
+#[test]
+fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
+    let metrics = PipelineMetrics::new();
+    let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
+
+    std::thread::sleep(Duration::from_millis(60));
+    metrics
+        .bytes_downloaded
+        .fetch_add(256 * 1024, Ordering::Relaxed);
+    shared_state.refresh_metrics_snapshot();
+
+    let initial = shared_state.metrics_snapshot();
+    assert!(initial.current_download_speed > 0);
+
+    for _ in 0..24 {
+        std::thread::sleep(Duration::from_millis(60));
+        let live = shared_state.raw_metrics_snapshot();
+        assert_eq!(live.bytes_downloaded, 256 * 1024);
+    }
+
+    let cached = shared_state.metrics_snapshot();
+    assert_eq!(
+        cached.current_download_speed,
+        initial.current_download_speed
+    );
+
+    shared_state.refresh_metrics_snapshot();
+    let refreshed = shared_state.metrics_snapshot();
+    assert!(refreshed.current_download_speed < initial.current_download_speed);
+}
+
 /// Create a test scheduler handle with a minimal background loop.
 fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(64);

@@ -1,5 +1,4 @@
-use md5::{Digest, Md5};
-
+use crate::checksum;
 use crate::error::{Par2Error, Result};
 use crate::types::RecoverySetId;
 
@@ -8,13 +7,6 @@ pub const MAGIC: &[u8; 8] = b"PAR2\x00PKT";
 
 /// Minimum packet size: 64-byte header.
 pub const HEADER_SIZE: usize = 64;
-
-/// Maximum allowed packet length (1 GiB).
-///
-/// PAR2 recovery blocks are typically at most a few hundred MiB (the largest
-/// real-world slice sizes). Anything claiming to be larger than 1 GiB is almost
-/// certainly malicious or corrupted. This prevents OOM from crafted length fields.
-pub const MAX_PACKET_LENGTH: u64 = 1 << 30; // 1 GiB
 
 /// 16-byte packet type signatures.
 pub const TYPE_MAIN: &[u8; 16] = b"PAR 2.0\x00Main\x00\x00\x00\x00";
@@ -89,10 +81,6 @@ impl PacketHeader {
         if length % 4 != 0 {
             return Err(Par2Error::InvalidPacketLength { length });
         }
-        if length > MAX_PACKET_LENGTH {
-            return Err(Par2Error::InvalidPacketLength { length });
-        }
-
         // Extract fields
         let packet_hash: [u8; 16] = data[16..32].try_into().unwrap();
         let recovery_set_id = RecoverySetId::from_bytes(data[32..48].try_into().unwrap());
@@ -119,7 +107,7 @@ impl PacketHeader {
         }
 
         let hash_input = &full_packet[32..self.length as usize];
-        let computed: [u8; 16] = Md5::digest(hash_input).into();
+        let computed = checksum::md5(hash_input);
 
         if computed != self.packet_hash {
             return Err(Par2Error::PacketHashMismatch { offset });
@@ -150,7 +138,7 @@ mod tests {
         hash_input.extend_from_slice(type_sig);
         hash_input.extend_from_slice(body);
 
-        let packet_hash: [u8; 16] = Md5::digest(&hash_input).into();
+        let packet_hash = checksum::md5(&hash_input);
 
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC);
@@ -259,23 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn reject_oversized_packet() {
+    fn accept_large_packet_length() {
         let mut data = make_header(TYPE_MAIN, &[]);
-        // Set length to 2 GiB (exceeds MAX_PACKET_LENGTH)
         let huge_len = (2u64 << 30) & !3; // aligned to 4
         data[8..16].copy_from_slice(&huge_len.to_le_bytes());
-        let err = PacketHeader::parse(&data, 0).unwrap_err();
-        assert!(matches!(err, Par2Error::InvalidPacketLength { .. }));
-    }
-
-    #[test]
-    fn accept_packet_at_max_length() {
-        let mut data = make_header(TYPE_MAIN, &[]);
-        // MAX_PACKET_LENGTH is exactly 1 GiB and is a multiple of 4
-        data[8..16].copy_from_slice(&MAX_PACKET_LENGTH.to_le_bytes());
-        // This should parse the header successfully (even though we don't have
-        // the full body data, header parsing should not fail on length).
         let header = PacketHeader::parse(&data, 0).unwrap();
-        assert_eq!(header.length, MAX_PACKET_LENGTH);
+        assert_eq!(header.length, huge_len);
     }
 }

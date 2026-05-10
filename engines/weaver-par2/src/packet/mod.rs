@@ -9,14 +9,16 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use md5::{Digest, Md5};
 use tracing::{debug, trace, warn};
 
+use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
 use crate::types::RecoverySetId;
 
-const MAX_STREAMED_NON_RECOVERY_BODY_BYTES: usize = 1024 * 1024;
-const MAX_PACKETS_PER_SCAN: usize = 65_536;
+const MAX_MAIN_BODY_BYTES: usize = 12 + 32_768 * 16;
+const MAX_FILE_DESC_BODY_BYTES: usize = 56 + 100_000;
+const MAX_IFSC_BODY_BYTES: usize = 16 + 32_768 * 20;
+const MAX_CREATOR_BODY_BYTES: usize = 100_000;
 
 pub use creator::CreatorPacket;
 pub use file_desc::FileDescriptionPacket;
@@ -113,14 +115,6 @@ fn parse_packet_internal(
         }
         PacketType::Unknown(sig) => {
             debug!("parsed Unknown packet type at offset {offset}");
-            if body.len() > MAX_STREAMED_NON_RECOVERY_BODY_BYTES {
-                return Err(Par2Error::ResourceLimitExceeded {
-                    reason: format!(
-                        "unknown packet body at offset {offset} is {} bytes; max is {MAX_STREAMED_NON_RECOVERY_BODY_BYTES}",
-                        body.len()
-                    ),
-                });
-            }
             Packet::Unknown {
                 packet_type: sig,
                 body: body.to_vec(),
@@ -179,10 +173,6 @@ fn scan_packets_internal(
         match parse_packet_internal(&data[pos..], offset, recovery_path) {
             Ok((packet, consumed)) => {
                 trace!("packet at offset {offset}, size {consumed}");
-                if packets.len() >= MAX_PACKETS_PER_SCAN {
-                    warn!("stopping PAR2 packet scan after {MAX_PACKETS_PER_SCAN} packets");
-                    break;
-                }
                 packets.push((packet, offset));
                 pos += consumed;
             }
@@ -253,14 +243,50 @@ fn validate_streamed_hash(
     body: &[u8],
     offset: u64,
 ) -> Result<()> {
-    let mut hasher = Md5::new();
+    let mut hasher = Md5State::new();
     hasher.update(&header_bytes[32..HEADER_SIZE]);
     hasher.update(body);
-    let computed: [u8; 16] = hasher.finalize().into();
+    let computed = hasher.finalize();
     if computed != header.packet_hash {
         return Err(Par2Error::PacketHashMismatch { offset });
     }
     Ok(())
+}
+
+fn validate_streamed_packet_from_reader(
+    reader: &mut BufReader<File>,
+    header: &PacketHeader,
+    header_bytes: &[u8; HEADER_SIZE],
+    body_len: usize,
+    offset: u64,
+) -> Result<()> {
+    let mut hasher = Md5State::new();
+    hasher.update(&header_bytes[32..HEADER_SIZE]);
+
+    let mut remaining = body_len;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        reader.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
+        hasher.update(&buf[..take]);
+        remaining -= take;
+    }
+
+    let computed = hasher.finalize();
+    if computed != header.packet_hash {
+        return Err(Par2Error::PacketHashMismatch { offset });
+    }
+    Ok(())
+}
+
+fn max_buffered_non_recovery_body_len(packet_type: PacketType) -> Option<usize> {
+    match packet_type {
+        PacketType::Main => Some(MAX_MAIN_BODY_BYTES),
+        PacketType::FileDescription => Some(MAX_FILE_DESC_BODY_BYTES),
+        PacketType::InputFileSliceChecksum => Some(MAX_IFSC_BODY_BYTES),
+        PacketType::Creator => Some(MAX_CREATOR_BODY_BYTES),
+        PacketType::RecoverySlice | PacketType::Unknown(_) => None,
+    }
 }
 
 fn parse_non_recovery_packet_from_reader(
@@ -268,7 +294,7 @@ fn parse_non_recovery_packet_from_reader(
     header: &PacketHeader,
     header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
-) -> Result<Packet> {
+) -> Result<Option<Packet>> {
     let body_len =
         usize::try_from(header.body_length()).map_err(|_| Par2Error::ResourceLimitExceeded {
             reason: format!(
@@ -276,17 +302,19 @@ fn parse_non_recovery_packet_from_reader(
                 header.body_length()
             ),
         })?;
-    if body_len > MAX_STREAMED_NON_RECOVERY_BODY_BYTES {
-        return Err(Par2Error::ResourceLimitExceeded {
-            reason: format!(
-                "non-recovery packet body at offset {offset} is {body_len} bytes; max is {MAX_STREAMED_NON_RECOVERY_BODY_BYTES}"
-            ),
-        });
+    let Some(max_body_len) = max_buffered_non_recovery_body_len(header.packet_type) else {
+        validate_streamed_packet_from_reader(reader, header, header_bytes, body_len, offset)?;
+        return Ok(None);
+    };
+    if body_len > max_body_len {
+        validate_streamed_packet_from_reader(reader, header, header_bytes, body_len, offset)?;
+        return Ok(None);
     }
+
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).map_err(Par2Error::Io)?;
     validate_streamed_hash(header, header_bytes, &body, offset)?;
-    parse_packet_body(header, body)
+    parse_packet_body(header, body).map(Some).or(Ok(None))
 }
 
 fn parse_recovery_packet_from_reader(
@@ -317,9 +345,9 @@ fn parse_recovery_packet_from_reader(
     let payload_len = body_len - 4;
     let payload_offset = offset + HEADER_SIZE as u64 + 4;
 
-    let mut hasher = Md5::new();
+    let mut hasher = Md5State::new();
     hasher.update(&header_bytes[32..HEADER_SIZE]);
-    hasher.update(exponent_bytes);
+    hasher.update(&exponent_bytes);
 
     let mut remaining = payload_len;
     let mut buf = [0u8; 64 * 1024];
@@ -330,7 +358,7 @@ fn parse_recovery_packet_from_reader(
         remaining -= take;
     }
 
-    let computed: [u8; 16] = hasher.finalize().into();
+    let computed: [u8; 16] = hasher.finalize();
     if computed != header.packet_hash {
         return Err(Par2Error::PacketHashMismatch { offset });
     }
@@ -343,6 +371,7 @@ fn parse_recovery_packet_from_reader(
 
 pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPacket>> {
     let file = File::open(path).map_err(Par2Error::Io)?;
+    let file_len = file.metadata().map_err(Par2Error::Io)?.len();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut packets = Vec::new();
     let mut offset = 0u64;
@@ -369,6 +398,16 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
                 continue;
             }
         };
+        if packet_offset
+            .checked_add(header.length)
+            .is_none_or(|packet_end| packet_end > file_len)
+        {
+            reader
+                .seek(SeekFrom::Start(packet_offset + 1))
+                .map_err(Par2Error::Io)?;
+            offset = packet_offset + 1;
+            continue;
+        }
 
         let packet = match header.packet_type {
             PacketType::RecoverySlice => parse_recovery_packet_from_reader(
@@ -377,7 +416,8 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
                 &header_bytes,
                 packet_offset,
                 path,
-            ),
+            )
+            .map(Some),
             _ => parse_non_recovery_packet_from_reader(
                 &mut reader,
                 &header,
@@ -388,19 +428,13 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
 
         match packet {
             Ok(packet) => {
-                if packets.len() >= MAX_PACKETS_PER_SCAN {
-                    return Err(Par2Error::ResourceLimitExceeded {
-                        reason: format!(
-                            "packet scan found more than {MAX_PACKETS_PER_SCAN} packets in {}",
-                            path.display()
-                        ),
+                if let Some(packet) = packet {
+                    packets.push(ScannedPacket {
+                        packet,
+                        offset: packet_offset,
+                        recovery_set_id: header.recovery_set_id,
                     });
                 }
-                packets.push(ScannedPacket {
-                    packet,
-                    offset: packet_offset,
-                    recovery_set_id: header.recovery_set_id,
-                });
                 offset = packet_offset + header.length;
             }
             Err(_) => {
@@ -451,6 +485,8 @@ pub fn find_recovery_set_id(packets: &[(Packet, u64)]) -> Option<RecoverySetId> 
 mod tests {
     use super::*;
     use md5::{Digest, Md5};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -608,6 +644,62 @@ mod tests {
                 assert_eq!(b.len(), 16);
             }
             other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_scanner_streams_and_ignores_large_unknown_packets() {
+        let custom_type = b"PAR 2.0\x00TestType";
+        let rsid = [0x55; 16];
+        let unknown_body = vec![0xA5; 1024 * 1024 + 4];
+        let mut stream = make_full_packet(custom_type, &unknown_body, rsid);
+        stream.extend_from_slice(&make_main_packet_bytes(4096, rsid));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&stream).unwrap();
+
+        let packets = scan_packets_from_path(file.path()).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert!(matches!(&packets[0].0, Packet::Main(_)));
+    }
+
+    #[test]
+    fn path_scanner_walks_large_valid_packet_inventory() {
+        let rsid = [0x5A; 16];
+        let creator = make_creator_packet("stress", rsid);
+        let mut stream = Vec::with_capacity(creator.len() * 70_000 + HEADER_SIZE + 12);
+        for _ in 0..70_000 {
+            stream.extend_from_slice(&creator);
+        }
+        stream.extend_from_slice(&make_main_packet_bytes(4096, rsid));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&stream).unwrap();
+
+        let packets = scan_packets_from_path(file.path()).unwrap();
+        assert_eq!(packets.len(), 70_001);
+        assert!(matches!(&packets[70_000].0, Packet::Main(_)));
+    }
+
+    #[test]
+    fn path_scanner_skips_valid_hash_oversized_known_packets_by_boundary() {
+        let rsid = [0x66; 16];
+        let embedded_rsid = [0x99; 16];
+        let embedded_main = make_main_packet_bytes(8192, embedded_rsid);
+        let mut oversized_creator_body = vec![0u8; MAX_CREATOR_BODY_BYTES + 4];
+        oversized_creator_body[..embedded_main.len()].copy_from_slice(&embedded_main);
+
+        let mut stream = make_full_packet(header::TYPE_CREATOR, &oversized_creator_body, rsid);
+        stream.extend_from_slice(&make_main_packet_bytes(4096, rsid));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&stream).unwrap();
+
+        let packets = scan_packets_from_path(file.path()).unwrap();
+        assert_eq!(packets.len(), 1);
+        match &packets[0].0 {
+            Packet::Main(main) => assert_eq!(*main.recovery_set_id.as_bytes(), rsid),
+            other => panic!("expected Main, got {other:?}"),
         }
     }
 

@@ -12,8 +12,8 @@ use weaver_server_core::{
 
 use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
-    Attribute, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobStatusGql, ParsedRelease, QueueAttention,
-    QueueFilterInput, QueueItemState, matches_attribute_filter,
+    Attribute, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobStatusGql, ParsedRelease, PreparedQueueFilter,
+    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -538,6 +538,14 @@ pub fn history_delete_operation_state_from_core(
 }
 
 pub fn matches_history_filter(item: &HistoryItem, filter: Option<&QueueFilterInput>) -> bool {
+    let prepared = PreparedQueueFilter::new(filter);
+    matches_history_filter_prepared(item, prepared.as_ref())
+}
+
+pub(crate) fn matches_history_filter_prepared(
+    item: &HistoryItem,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
     let Some(filter) = filter else {
         return true;
     };
@@ -556,7 +564,7 @@ pub fn matches_history_filter(item: &HistoryItem, filter: Option<&QueueFilterInp
     {
         return false;
     }
-    if !matches_attribute_filter(&item.attributes, filter) {
+    if !matches_attribute_filter_prepared(&item.attributes, filter) {
         return false;
     }
     true

@@ -1,7 +1,109 @@
+#[cfg(feature = "native-crypto")]
+use aws_lc_sys::{MD5_CTX, MD5_Final, MD5_Init, MD5_Update};
 use crc32fast::Hasher as Crc32Hasher;
-use md5::{Digest, Md5};
+use md5::{Digest as Md5Digest, Md5 as RustCryptoMd5};
+#[cfg(feature = "native-crypto")]
+use std::mem::MaybeUninit;
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
+
+#[cfg_attr(feature = "native-crypto", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Par2Md5Backend {
+    RustCrypto,
+    #[cfg(feature = "native-crypto")]
+    NativeAwsLc,
+}
+
+const fn default_md5_backend() -> Par2Md5Backend {
+    #[cfg(feature = "native-crypto")]
+    {
+        Par2Md5Backend::NativeAwsLc
+    }
+    #[cfg(not(feature = "native-crypto"))]
+    {
+        Par2Md5Backend::RustCrypto
+    }
+}
+
+#[cfg(feature = "native-crypto")]
+#[derive(Clone)]
+struct AwsLcMd5State {
+    ctx: MD5_CTX,
+}
+
+#[cfg(feature = "native-crypto")]
+impl AwsLcMd5State {
+    fn new() -> Self {
+        let mut ctx = MaybeUninit::<MD5_CTX>::uninit();
+        let result = unsafe { MD5_Init(ctx.as_mut_ptr()) };
+        assert_eq!(result, 1, "aws-lc MD5_Init must succeed");
+        Self {
+            ctx: unsafe { ctx.assume_init() },
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let result = unsafe { MD5_Update(&mut self.ctx, data.as_ptr().cast(), data.len()) };
+        assert_eq!(result, 1, "aws-lc MD5_Update must succeed");
+    }
+
+    fn finalize(mut self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        let result = unsafe { MD5_Final(out.as_mut_ptr(), &mut self.ctx) };
+        assert_eq!(result, 1, "aws-lc MD5_Final must succeed");
+        out
+    }
+}
+
+#[derive(Clone)]
+enum Md5StateInner {
+    RustCrypto(RustCryptoMd5),
+    #[cfg(feature = "native-crypto")]
+    NativeAwsLc(AwsLcMd5State),
+}
+
+#[derive(Clone)]
+pub(crate) struct Md5State {
+    inner: Md5StateInner,
+}
+
+impl Md5State {
+    pub(crate) fn new() -> Self {
+        Self::new_with_backend(default_md5_backend())
+    }
+
+    fn new_with_backend(backend: Par2Md5Backend) -> Self {
+        let inner = match backend {
+            Par2Md5Backend::RustCrypto => Md5StateInner::RustCrypto(RustCryptoMd5::new()),
+            #[cfg(feature = "native-crypto")]
+            Par2Md5Backend::NativeAwsLc => Md5StateInner::NativeAwsLc(AwsLcMd5State::new()),
+        };
+        Self { inner }
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        match &mut self.inner {
+            Md5StateInner::RustCrypto(state) => state.update(data),
+            #[cfg(feature = "native-crypto")]
+            Md5StateInner::NativeAwsLc(state) => state.update(data),
+        }
+    }
+
+    pub(crate) fn finalize(self) -> [u8; 16] {
+        match self.inner {
+            Md5StateInner::RustCrypto(state) => state.finalize().into(),
+            #[cfg(feature = "native-crypto")]
+            Md5StateInner::NativeAwsLc(state) => state.finalize(),
+        }
+    }
+}
+
+fn md5_with_backend(backend: Par2Md5Backend, data: &[u8]) -> [u8; 16] {
+    let mut hasher = Md5State::new_with_backend(backend);
+    hasher.update(data);
+    hasher.finalize()
+}
 
 /// Streaming CRC32 + MD5 checksum state for a single file slice.
 ///
@@ -15,7 +117,7 @@ const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
 #[derive(Clone)]
 pub struct SliceChecksumState {
     crc32: Crc32Hasher,
-    md5: Md5,
+    md5: Md5State,
     bytes_fed: u64,
 }
 
@@ -24,7 +126,7 @@ impl SliceChecksumState {
     pub fn new() -> Self {
         Self {
             crc32: Crc32Hasher::new(),
-            md5: Md5::new(),
+            md5: Md5State::new(),
             bytes_fed: 0,
         }
     }
@@ -58,7 +160,7 @@ impl SliceChecksumState {
             }
         }
         let crc = self.crc32.finalize();
-        let md5: [u8; 16] = self.md5.finalize().into();
+        let md5 = self.md5.finalize();
         (crc, md5)
     }
 }
@@ -72,14 +174,14 @@ impl Default for SliceChecksumState {
 /// Streaming full-file MD5 hash state.
 #[derive(Clone)]
 pub struct FileHashState {
-    md5: Md5,
+    md5: Md5State,
     bytes_fed: u64,
 }
 
 impl FileHashState {
     pub fn new() -> Self {
         Self {
-            md5: Md5::new(),
+            md5: Md5State::new(),
             bytes_fed: 0,
         }
     }
@@ -94,7 +196,7 @@ impl FileHashState {
     }
 
     pub fn finalize(self) -> [u8; 16] {
-        self.md5.finalize().into()
+        self.md5.finalize()
     }
 }
 
@@ -169,7 +271,51 @@ pub fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// Compute CRC32 of a byte slice, zero-padding to `pad_to` bytes.
+pub(crate) fn crc32_padded(data: &[u8], pad_to: u64) -> u32 {
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(data);
+    let mut remaining = pad_to.saturating_sub(data.len() as u64);
+    while remaining > 0 {
+        let chunk = remaining.min(ZERO_PAD_CHUNK.len() as u64) as usize;
+        hasher.update(&ZERO_PAD_CHUNK[..chunk]);
+        remaining -= chunk as u64;
+    }
+    hasher.finalize()
+}
+
 /// Compute MD5 of a byte slice.
 pub fn md5(data: &[u8]) -> [u8; 16] {
-    Md5::digest(data).into()
+    md5_with_backend(default_md5_backend(), data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn md5_default_backend_matches_reference_vector() {
+        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn md5_native_backend_matches_rustcrypto_backend() {
+        let sample = b"par2-md5-native-vs-rustcrypto";
+        let rustcrypto = md5_with_backend(Par2Md5Backend::RustCrypto, sample);
+        let native = md5_with_backend(Par2Md5Backend::NativeAwsLc, sample);
+        assert_eq!(native, rustcrypto);
+    }
+
+    #[test]
+    fn file_hash_state_matches_one_shot_md5() {
+        let mut state = FileHashState::new();
+        state.update(b"par2");
+        state.update(b"-state");
+        assert_eq!(state.finalize(), md5(b"par2-state"));
+    }
 }

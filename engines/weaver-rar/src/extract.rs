@@ -5,8 +5,6 @@
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use blake2::Blake2s256;
-use blake2::Digest;
 use tempfile::NamedTempFile;
 
 use crate::decompress;
@@ -455,10 +453,7 @@ pub fn extract_member<R: Read + Seek>(
 
 /// Verify a BLAKE2sp hash against extracted data.
 pub fn verify_blake2(data: &[u8], expected: &[u8; 32]) -> bool {
-    let mut hasher = Blake2s256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    result.as_slice() == expected
+    crate::crypto::blake2sp_hash(data) == *expected
 }
 
 pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarResult<bool> {
@@ -467,7 +462,7 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
         ExtractedMember::TempFile { file, .. } => {
             let mut reopened = file.reopen().map_err(RarError::Io)?;
             reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
-            let mut hasher = Blake2s256::new();
+            let mut hasher = crate::crypto::Blake2spHasher::new();
             let mut buf = vec![0u8; COPY_BUF_SIZE];
             loop {
                 let n = reopened.read(&mut buf).map_err(RarError::Io)?;
@@ -476,8 +471,7 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
                 }
                 hasher.update(&buf[..n]);
             }
-            let result = hasher.finalize();
-            Ok(result.as_slice() == expected)
+            Ok(hasher.finalize() == *expected)
         }
     }
 }
@@ -486,6 +480,16 @@ pub fn verify_blake2_member(data: &ExtractedMember, expected: &[u8; 32]) -> RarR
 mod tests {
     use super::*;
     use crate::types::{ArchiveFormat, CompressionInfo, FileAttributes, HostOs};
+
+    #[test]
+    fn verify_blake2_uses_blake2sp_reference_vector() {
+        let expected = [
+            0x05, 0x0d, 0xc5, 0x78, 0x60, 0x37, 0xea, 0x72, 0xcb, 0x9e, 0xd9, 0xd0, 0x32, 0x4a,
+            0xfc, 0xab, 0x03, 0xc9, 0x7e, 0xc0, 0x2e, 0x8c, 0x47, 0x36, 0x8f, 0xc5, 0xdf, 0xb4,
+            0xcf, 0x49, 0xd8, 0xc9,
+        ];
+        assert!(verify_blake2(b"foo", &expected));
+    }
 
     fn make_stored_file_header(name: &str, data: &[u8], data_offset: u64) -> FileHeader {
         let mut hasher = crc32fast::Hasher::new();

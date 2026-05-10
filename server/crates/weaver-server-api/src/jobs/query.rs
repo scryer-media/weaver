@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::jobs::types::{PreparedQueueFilter, matches_queue_filter_prepared};
+use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
 pub(crate) struct JobsQuery;
@@ -20,6 +22,7 @@ impl JobsQuery {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let limit = first.unwrap_or(u32::MAX) as usize;
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
         let items = handle
             .list_jobs()
@@ -32,7 +35,7 @@ impl JobsQuery {
                 )
             })
             .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter(item, filter.as_ref()))
+            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
             .skip(offset)
             .take(limit)
             .collect();
@@ -80,8 +83,9 @@ impl JobsQuery {
         filter: Option<QueueFilterInput>,
     ) -> Result<QueueSnapshot> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let config = ctx.data::<SharedConfig>()?.clone();
+        let config = ctx.data::<SharedConfig>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
         let items: Vec<QueueItem> = handle
             .list_jobs()
@@ -94,11 +98,16 @@ impl JobsQuery {
                 )
             })
             .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter(item, filter.as_ref()))
+            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
             .collect();
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;
-        let cfg = config.read().await;
+        let max_download_speed = with_timed_config_read(
+            config,
+            "jobs.query.queue_snapshot.max_download_speed",
+            |cfg| cfg.max_download_speed.unwrap_or(0),
+        )
+        .await;
 
         Ok(QueueSnapshot {
             summary: queue_summary(&items, &metrics),
@@ -106,7 +115,7 @@ impl JobsQuery {
             global_state: global_queue_state(
                 handle.is_globally_paused(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                max_download_speed,
             ),
             items,
             latest_cursor,
@@ -118,11 +127,16 @@ impl JobsQuery {
     async fn global_queue_state(&self, ctx: &Context<'_>) -> Result<GlobalQueueState> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
-        let cfg = config.read().await;
+        let max_download_speed = with_timed_config_read(
+            config,
+            "jobs.query.global_queue_state.max_download_speed",
+            |cfg| cfg.max_download_speed.unwrap_or(0),
+        )
+        .await;
         Ok(global_queue_state(
             handle.is_globally_paused(),
             &handle.get_download_block(),
-            cfg.max_download_speed.unwrap_or(0),
+            max_download_speed,
         ))
     }
     /// Compatibility cursor for the live-only `queueEvents` stream.

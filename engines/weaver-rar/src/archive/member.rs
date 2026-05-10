@@ -4,10 +4,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use blake2::{Blake2s256, Digest};
 use tracing::debug;
 
 use super::*;
+use crate::crypto::Blake2spHasher;
 use crate::volume::VolumeProvider;
 
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
@@ -1116,10 +1116,9 @@ impl RarArchive {
                 hash_writer.flush().map_err(RarError::Io)?;
                 let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
                 let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
-                drop(hash_writer);
-                writer.flush().map_err(RarError::Io)?;
                 (written, actual_crc, actual_blake)
             };
+            writer.flush().map_err(RarError::Io)?;
 
             Self::verify_member_crc32(&fh.name, expected_crc, actual_crc, false, None)?;
             Self::verify_member_blake2(&fh.name, expected_blake, actual_blake, false, None)?;
@@ -1311,8 +1310,8 @@ impl RarArchive {
             };
             let shared_crc =
                 expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
-            let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-                expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+            let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
+                expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
             self.advance_solid_cursor_to(index, &fh)?;
 
             let volume_tracker = Arc::new(AtomicUsize::new(
@@ -1399,7 +1398,6 @@ impl RarArchive {
                     .into_inner()
                     .unwrap()
                     .finalize()
-                    .into()
             });
             Self::verify_member_crc32(
                 &fh.name,
@@ -1439,8 +1437,8 @@ impl RarArchive {
 
         let shared_crc =
             expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
-        let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-            expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+        let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
+            expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
         let mut writer_factory = writer_factory;
 
         let chunks = if let Some(ref pwd) = member_password {
@@ -1517,7 +1515,6 @@ impl RarArchive {
                 .into_inner()
                 .unwrap()
                 .finalize()
-                .into()
         });
         Self::verify_member_crc32(
             &fh.name,
@@ -1611,7 +1608,7 @@ impl RarArchive {
         shared_transitions: Arc<std::sync::Mutex<Vec<crate::decompress::VolumeTransition>>>,
         writer_factory: F,
         shared_crc: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>>,
-        shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>>,
+        shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>>,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
@@ -1906,7 +1903,7 @@ impl RarArchive {
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        let unpacked_size = Self::decode_target_unpacked_size(fh);
 
         let (written, actual_crc, actual_blake) = {
             let mut hash_writer =
@@ -2037,7 +2034,7 @@ impl RarArchive {
             None
         };
         let mut blake_hasher = if compute_blake2 {
-            Some(Blake2s256::new())
+            Some(Blake2spHasher::new())
         } else {
             None
         };
@@ -2104,10 +2101,7 @@ impl RarArchive {
         drop(final_meta);
 
         let actual_crc = hasher.map(|h| h.finalize());
-        let actual_blake = blake_hasher.map(|h| {
-            let digest: [u8; 32] = h.finalize().into();
-            digest
-        });
+        let actual_blake = blake_hasher.map(|h| h.finalize());
         Self::verify_member_crc32(
             &fh.name,
             effective_crc,
@@ -2422,7 +2416,7 @@ impl RarArchive {
         } else {
             None
         };
-        let mut blake_hasher: Option<Blake2s256> = compute_blake2.then(Blake2s256::new);
+        let mut blake_hasher = compute_blake2.then(Blake2spHasher::new);
 
         let max_bytes = if password.is_some() {
             unpacked_size
@@ -2458,7 +2452,7 @@ impl RarArchive {
         let mut current_writer = writer_factory(current_vol)?;
         let mut chunk_bytes: u64 = 0;
         let mut total_written = 0u64;
-        let mut chunk = vec![0u8; 256 * 1024];
+        let mut chunk = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
 
         loop {
             let to_read = chunk.len().min((max_bytes - total_written) as usize);
@@ -2507,10 +2501,7 @@ impl RarArchive {
         drop(final_meta);
 
         let actual_crc = hasher.map(|h| h.finalize());
-        let actual_blake = blake_hasher.map(|h| {
-            let digest: [u8; 32] = h.finalize().into();
-            digest
-        });
+        let actual_blake = blake_hasher.map(|h| h.finalize());
         Self::verify_member_crc32(
             &fh.name,
             effective_crc,
@@ -2586,7 +2577,7 @@ impl RarArchive {
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let tracking_reader = VolumeTrackingReader::new(chained, volume_tracker)
             .with_shared_transitions(Arc::clone(&shared_transitions));
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        let unpacked_size = Self::decode_target_unpacked_size(fh);
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
             match hash {
@@ -2600,8 +2591,8 @@ impl RarArchive {
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc =
             expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
-        let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+        let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
+            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
 
         let chunks = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
@@ -2678,13 +2669,11 @@ impl RarArchive {
                 .finalize()
         });
         let actual_blake = shared_blake.map(|shared| {
-            let digest: [u8; 32] = Arc::try_unwrap(shared)
+            Arc::try_unwrap(shared)
                 .unwrap()
                 .into_inner()
                 .unwrap()
                 .finalize()
-                .into();
-            digest
         });
         Self::verify_member_crc32(
             &fh.name,
@@ -2780,8 +2769,8 @@ impl RarArchive {
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>> =
             expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
-        let shared_blake: Option<Arc<std::sync::Mutex<Blake2s256>>> =
-            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2s256::new())));
+        let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
+            compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
 
         let chunks = if self.format == ArchiveFormat::Rar5 {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2858,13 +2847,11 @@ impl RarArchive {
                 .finalize()
         });
         let actual_blake = shared_blake.map(|shared| {
-            let digest: [u8; 32] = Arc::try_unwrap(shared)
+            Arc::try_unwrap(shared)
                 .unwrap()
                 .into_inner()
                 .unwrap()
                 .finalize()
-                .into();
-            digest
         });
         Self::verify_member_crc32(
             &fh.name,
@@ -2889,7 +2876,7 @@ impl RarArchive {
 struct HashingWriter<'a, W: Write> {
     inner: &'a mut W,
     crc: Option<crc32fast::Hasher>,
-    blake2: Option<Blake2s256>,
+    blake2: Option<Blake2spHasher>,
 }
 
 impl<'a, W: Write> HashingWriter<'a, W> {
@@ -2897,7 +2884,7 @@ impl<'a, W: Write> HashingWriter<'a, W> {
         Self {
             inner,
             crc: compute_crc.then(crc32fast::Hasher::new),
-            blake2: compute_blake2.then(Blake2s256::new),
+            blake2: compute_blake2.then(Blake2spHasher::new),
         }
     }
 
@@ -2911,10 +2898,7 @@ impl<'a, W: Write> HashingWriter<'a, W> {
     fn finalize_blake2(&self) -> [u8; 32] {
         self.blake2
             .as_ref()
-            .map(|hasher| {
-                let digest: [u8; 32] = hasher.clone().finalize().into();
-                digest
-            })
+            .map(|hasher| hasher.finalize())
             .unwrap_or([0; 32])
     }
 }
@@ -2940,7 +2924,7 @@ impl<W: Write> Write for HashingWriter<'_, W> {
 struct HashTrackingWriter<W: Write> {
     inner: W,
     crc: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>>,
-    blake2: Option<Arc<std::sync::Mutex<Blake2s256>>>,
+    blake2: Option<Arc<std::sync::Mutex<Blake2spHasher>>>,
 }
 
 impl<W: Write> Write for HashTrackingWriter<W> {

@@ -7,5 +7,5 @@ pub use guards::{AdminGuard, ControlGuard, ReadGuard, graphql_error, internal_er
 pub use types::CallerIdentity;
 pub use weaver_server_core::auth::{
     CachedLoginAuth, CallerScope, LoginAuthCache, generate_api_key, hash_api_key, hash_password,
-    needs_rehash, verify_password,
+    verify_password,
 };

@@ -14,6 +14,13 @@ fn extract_options() -> weaver_rar::ExtractOptions {
     }
 }
 
+fn encrypted_extract_options() -> weaver_rar::ExtractOptions {
+    weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some("testpass123".to_string()),
+    }
+}
+
 fn bench_solid_extract_all_members(c: &mut Criterion, dir: &str, name: &str, bench_name: &str) {
     let path = fixture(dir, name);
     let options = extract_options();
@@ -79,6 +86,81 @@ fn bench_solid_lz_chunked(c: &mut Criterion) {
                     .unwrap();
                 black_box(chunks);
             }
+        });
+    });
+}
+
+fn bench_rar5_encrypted_store_chunked_multivolume(c: &mut Criterion) {
+    let ordered_volumes = (1..=7)
+        .map(|part| {
+            fixture(
+                "rar5",
+                &format!("generated_matrix_rar5_store_enc.part{part}.rar"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_volume = ordered_volumes[0].clone();
+    let options = encrypted_extract_options();
+    c.bench_function("rar5_encrypted_store_chunked_multivolume", |b| {
+        b.iter(|| {
+            let mut archive =
+                weaver_rar::RarArchive::open(std::fs::File::open(&first_volume).unwrap()).unwrap();
+            let provider = weaver_rar::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
+            let chunks = archive
+                .extract_member_streaming_chunked(0, &options, &provider, |_| {
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            black_box(chunks);
+        });
+    });
+}
+
+fn bench_rar5_reopen_kdf_multivolume(c: &mut Criterion) {
+    let ordered_volumes = (1..=7)
+        .map(|part| {
+            fixture(
+                "rar5",
+                &format!("generated_matrix_rar5_store_enc.part{part}.rar"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_volume = ordered_volumes[0].clone();
+    let options = encrypted_extract_options();
+    let provider = weaver_rar::StaticVolumeProvider::from_ordered(ordered_volumes.clone());
+    let shared_cache = std::sync::Arc::new(weaver_rar::crypto::KdfCache::new());
+
+    c.bench_function("rar5_reopen_kdf_multivolume_fresh_cache", |b| {
+        b.iter(|| {
+            let mut archive = weaver_rar::RarArchive::open_with_password_and_shared_kdf_cache(
+                std::fs::File::open(&first_volume).unwrap(),
+                "testpass123",
+                std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            )
+            .unwrap();
+            let chunks = archive
+                .extract_member_streaming_chunked(0, &options, &provider, |_| {
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            black_box(chunks);
+        });
+    });
+
+    c.bench_function("rar5_reopen_kdf_multivolume_shared_cache", |b| {
+        b.iter(|| {
+            let mut archive = weaver_rar::RarArchive::open_with_password_and_shared_kdf_cache(
+                std::fs::File::open(&first_volume).unwrap(),
+                "testpass123",
+                shared_cache.clone(),
+            )
+            .unwrap();
+            let chunks = archive
+                .extract_member_streaming_chunked(0, &options, &provider, |_| {
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            black_box(chunks);
         });
     });
 }
@@ -167,6 +249,8 @@ criterion_group!(
     benches,
     bench_non_solid_lz_chunked,
     bench_solid_lz_chunked,
+    bench_rar5_encrypted_store_chunked_multivolume,
+    bench_rar5_reopen_kdf_multivolume,
     bench_rar4_solid_extract_all_members,
     bench_rar5_solid_extract_all_members,
     bench_rar4_solid_reopen_later_member,

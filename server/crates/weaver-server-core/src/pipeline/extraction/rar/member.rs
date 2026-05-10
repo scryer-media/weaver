@@ -13,6 +13,12 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) options: &'a weaver_rar::ExtractOptions,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RarArchiveOpenMode {
+    AttachOnly,
+    RefreshProvidedVolumes,
+}
+
 fn summarize_extraction_chunks(
     chunks: &[crate::ExtractionChunk],
 ) -> Vec<(u32, u64, u64, u64, bool, bool)> {
@@ -440,17 +446,23 @@ impl Pipeline {
         volume_paths: std::collections::BTreeMap<u32, PathBuf>,
         password: Option<String>,
         cached_headers: Option<Vec<u8>>,
-        refresh_provided_volumes: bool,
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+        open_mode: RarArchiveOpenMode,
     ) -> Result<weaver_rar::RarArchive, String> {
         let has_cached_headers = cached_headers.is_some();
+        let refresh_provided_volumes =
+            matches!(open_mode, RarArchiveOpenMode::RefreshProvidedVolumes);
         let mut archive = match cached_headers {
-            Some(headers) => weaver_rar::RarArchive::deserialize_headers_with_password(
-                &headers,
-                password.clone(),
-            )
-            .map_err(|e| {
-                format!("failed to deserialize cached RAR headers for set '{set_name}': {e}")
-            })?,
+            Some(headers) => {
+                weaver_rar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
+                    &headers,
+                    password.clone(),
+                    shared_kdf_cache.clone(),
+                )
+                .map_err(|e| {
+                    format!("failed to deserialize cached RAR headers for set '{set_name}': {e}")
+                })?
+            }
             None => {
                 let first_path = volume_paths.get(&0).ok_or_else(|| {
                     format!("RAR set '{set_name}' cannot be opened without volume 0")
@@ -458,9 +470,16 @@ impl Pipeline {
                 let first_file = std::fs::File::open(first_path)
                     .map_err(|e| format!("failed to open RAR volume 0: {e}"))?;
                 if let Some(password) = password.as_deref() {
-                    weaver_rar::RarArchive::open_with_password(first_file, password)
+                    weaver_rar::RarArchive::open_with_password_and_shared_kdf_cache(
+                        first_file,
+                        password,
+                        shared_kdf_cache.clone(),
+                    )
                 } else {
-                    weaver_rar::RarArchive::open(first_file)
+                    weaver_rar::RarArchive::open_with_shared_kdf_cache(
+                        first_file,
+                        shared_kdf_cache.clone(),
+                    )
                 }
                 .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name}': {e}"))?
             }

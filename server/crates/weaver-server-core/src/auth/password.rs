@@ -27,10 +27,6 @@ fn is_argon2_hash(hash: &str) -> bool {
     hash.starts_with("$argon2")
 }
 
-fn is_legacy_scrypt_hash(hash: &str) -> bool {
-    hash.starts_with("$scrypt$")
-}
-
 pub fn verify_password(password: &str, hash: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     let Ok(parsed) = PasswordHash::new(hash) else {
@@ -40,17 +36,9 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         pinned_argon2()
             .verify_password(password.as_bytes(), &parsed)
             .is_ok()
-    } else if is_legacy_scrypt_hash(hash) {
-        scrypt::Scrypt
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
     } else {
         false
     }
-}
-
-pub fn needs_rehash(hash: &str) -> bool {
-    is_legacy_scrypt_hash(hash)
 }
 
 #[cfg(test)]

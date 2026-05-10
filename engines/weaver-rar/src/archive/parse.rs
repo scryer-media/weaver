@@ -1,9 +1,11 @@
 use super::*;
+use std::sync::Arc;
 
 impl RarArchive {
     pub(super) fn open_boxed_inner(
         mut reader: Box<dyn ReadSeek>,
         password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
     ) -> RarResult<Self> {
         // Seek to start
         reader.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
@@ -14,7 +16,7 @@ impl RarArchive {
 
         // Dispatch based on format.
         if format == ArchiveFormat::Rar4 {
-            return Self::open_rar4(reader, password);
+            return Self::open_rar4(reader, password, kdf_cache);
         }
 
         // Parse all headers (RAR5)
@@ -95,7 +97,7 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
-            kdf_cache: crate::crypto::KdfCache::new(),
+            kdf_cache,
         })
     }
 
@@ -103,6 +105,7 @@ impl RarArchive {
     pub(super) fn open_rar4(
         mut reader: Box<dyn ReadSeek>,
         password: Option<&str>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
     ) -> RarResult<Self> {
         let parsed = crate::rar4::parse_rar4_headers(&mut reader, password)?;
 
@@ -155,7 +158,7 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.map(String::from),
-            kdf_cache: crate::crypto::KdfCache::new(),
+            kdf_cache,
         })
     }
 

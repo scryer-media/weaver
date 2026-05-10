@@ -586,7 +586,32 @@ impl Pipeline {
             "starting nested archive extraction"
         );
 
-        let spawned = self.spawn_extractions(job_id, &to_extract).await;
+        let (rar_archives, non_rar_archives): (Vec<_>, Vec<_>) = to_extract
+            .into_iter()
+            .partition(|archive| matches!(&archive.1, crate::jobs::assembly::ArchiveType::Rar));
+
+        let mut spawned = self.spawn_extractions(job_id, &non_rar_archives).await;
+        if !rar_archives.is_empty() {
+            // Nested RAR uses the incremental RAR scheduler so it cannot race a
+            // generic full-set extraction over source volumes that eager-delete may
+            // have already consumed.
+            self.try_rar_extraction(job_id).await;
+            let rar_handoffs = rar_archives
+                .iter()
+                .filter(|(set_name, _)| {
+                    let key = (job_id, set_name.clone());
+                    self.rar_sets.contains_key(&key) || self.rar_refresh_state.contains_key(&key)
+                })
+                .count();
+            if rar_handoffs < rar_archives.len() {
+                warn!(
+                    job_id = job_id.0,
+                    missing = rar_archives.len() - rar_handoffs,
+                    "nested RAR archives had no scheduler state after topology refresh"
+                );
+            }
+            spawned += rar_handoffs;
+        }
         if spawned == 0 {
             return Err("nested archive extraction could not be started".to_string());
         }

@@ -164,6 +164,7 @@ const es: LocaleDictionary = {
   "timeline.finalizingDownload": "Finalizando descarga",
   "timeline.paused": "Pausado",
   "timeline.verifying": "Verificando",
+  "timeline.verifyingDetail": "Verificación PAR2 y comprobación previa de recuperación.",
   "timeline.repairing": "Reparando",
   "timeline.extracting": "Extrayendo",
   "timeline.interrupted": "Interrumpido",

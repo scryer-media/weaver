@@ -176,9 +176,10 @@ async fn run_move_to_complete(
             warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
         }
         return Err(format!(
-            "failed to move {} entr{} to complete directory",
+            "failed to move {} entr{} to complete directory: {}",
             failures.len(),
-            if failures.len() == 1 { "y" } else { "ies" }
+            if failures.len() == 1 { "y" } else { "ies" },
+            failures[0]
         ));
     }
 

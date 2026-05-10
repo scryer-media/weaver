@@ -32,7 +32,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
+import { authHeaders, getSessionToken, requestGraphqlClientRestart } from "@/graphql/client";
 import {
   useLiveConnection,
   useLiveJob,
@@ -44,7 +44,11 @@ import { cn } from "@/lib/utils";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
-import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
+import {
+  readDownloadErrorMessage,
+  saveResponseAsDownload,
+  submitFormAsDownload,
+} from "@/lib/download";
 
 interface JobDetailSnapshotData {
   queueItem?: GraphqlJobData | null;
@@ -654,6 +658,18 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   async function downloadOutputFile(file: OutputFile) {
     setDownloadingPath(file.path);
     setDownloadError(null);
+
+    const token = getSessionToken();
+    if (token) {
+      submitFormAsDownload(outputFileDownloadHref, {
+        path: file.path,
+        token,
+      });
+      window.setTimeout(() => {
+        setDownloadingPath((current) => (current === file.path ? null : current));
+      }, 1000);
+      return;
+    }
 
     try {
       const response = await fetch(outputFileDownloadHref, {

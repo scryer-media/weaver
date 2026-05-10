@@ -59,12 +59,7 @@ pub(crate) fn build_job_timeline(
         synthesize_active_download_span(collect_download_spans(events), job, started_at);
     let finalizing_download_spans = collect_finalizing_download_spans(events);
     let pause_spans = collect_pause_spans(events);
-    let verify_spans = collect_job_spans(
-        events,
-        EventKind::JobVerificationStarted,
-        EventKind::JobVerificationComplete,
-        stage_boundary_state,
-    );
+    let verify_spans = collect_verify_spans(events);
     let repair_spans = collect_job_spans(
         events,
         EventKind::RepairStarted,
@@ -214,6 +209,44 @@ fn collect_job_spans(
                 event.timestamp as f64,
                 boundary_state,
             );
+        }
+    }
+
+    spans
+}
+
+fn collect_verify_spans(events: &[StoredJobEvent]) -> Vec<JobTimelineSpan> {
+    let mut spans = Vec::new();
+    let mut open: Option<usize> = None;
+
+    for event in events {
+        let Ok(kind) = event.kind.parse::<EventKind>() else {
+            continue;
+        };
+        let at = event.timestamp as f64;
+
+        match kind {
+            EventKind::JobVerificationStarted if open.is_none() => {
+                spans.push(JobTimelineSpan {
+                    started_at: at,
+                    ended_at: None,
+                    state: TimelineSpanState::Running,
+                    label: None,
+                });
+                open = Some(spans.len() - 1);
+            }
+            EventKind::DownloadStarted
+            | EventKind::RepairStarted
+            | EventKind::ExtractionReady
+            | EventKind::MoveToCompleteStarted
+            | EventKind::JobCreated
+            | EventKind::JobCompleted => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Complete);
+            }
+            EventKind::JobFailed | EventKind::JobCancelled => {
+                close_open_job_span(&mut spans, &mut open, at, TimelineSpanState::Failed);
+            }
+            _ => {}
         }
     }
 

@@ -102,6 +102,33 @@ const JOB_STAGE_KEYS: Record<TimelineLane["stage"], string> = {
 const TIMELINE_HOVER_OPEN_DELAY_MS = 140;
 const TIMELINE_HOVER_CLOSE_DELAY_MS = 100;
 
+function stageDetail(
+  t: ReturnType<typeof useTranslate>,
+  stage: TimelineLane["stage"],
+): string | null {
+  switch (stage) {
+    case "VERIFYING":
+      return t("timeline.verifyingDetail");
+    case "INTERRUPTED":
+      return t("timeline.restartHint");
+    default:
+      return null;
+  }
+}
+
+function stageSpanSubtitle(
+  t: ReturnType<typeof useTranslate>,
+  stage: TimelineLane["stage"],
+  span: TimelineSpan,
+): string | null {
+  if (stage === "VERIFYING") {
+    return t("timeline.verifyingDetail");
+  }
+
+  const stageTitle = t(JOB_STAGE_KEYS[stage]);
+  return span.label && span.label !== stageTitle ? stageTitle : null;
+}
+
 function laneColor(stage: TimelineLane["stage"]): string {
   switch (stage) {
     case "PENDING_DOWNLOAD":
@@ -728,43 +755,44 @@ export function PipelineTimelineCard({
 
   const axisStart = timeline.startedAt;
 
-  const stageRows: PlotRow[] = timeline.lanes.map((lane) => ({
-    key: `stage:${lane.stage}`,
-    title: t(JOB_STAGE_KEYS[lane.stage]),
-    tone: "stage",
-    details: [
-      {
-        label: t("timeline.totalDuration"),
-        value: formatDuration(sumSpans(lane.spans, axisEnd)),
-      },
-      {
-        label: t("timeline.ended"),
-        value: rowTimingLabel(t, lane.spans),
-      },
-      ...(lane.stage === "INTERRUPTED"
-        ? [
-            {
-              label: t("timeline.detail"),
-              value: t("timeline.restartHint"),
-            },
-          ]
-        : []),
-    ],
-    spans: lane.spans.map((span, index) => ({
-      key: `${lane.stage}:${index}`,
-      startedAt: span.startedAt,
-      endedAt: span.endedAt,
-      state: span.state,
-      colorClass: laneColor(lane.stage),
-      title: span.label ?? t(JOB_STAGE_KEYS[lane.stage]),
-      subtitle:
-        span.label && span.label !== t(JOB_STAGE_KEYS[lane.stage])
-          ? t(JOB_STAGE_KEYS[lane.stage])
-          : null,
-      dashed: lane.stage === "INTERRUPTED",
-      details: [],
-    })),
-  }));
+  const stageRows: PlotRow[] = timeline.lanes.map((lane) => {
+    const detail = stageDetail(t, lane.stage);
+
+    return {
+      key: `stage:${lane.stage}`,
+      title: t(JOB_STAGE_KEYS[lane.stage]),
+      tone: "stage",
+      details: [
+        {
+          label: t("timeline.totalDuration"),
+          value: formatDuration(sumSpans(lane.spans, axisEnd)),
+        },
+        {
+          label: t("timeline.ended"),
+          value: rowTimingLabel(t, lane.spans),
+        },
+        ...(detail
+          ? [
+              {
+                label: t("timeline.detail"),
+                value: detail,
+              },
+            ]
+          : []),
+      ],
+      spans: lane.spans.map((span, index) => ({
+        key: `${lane.stage}:${index}`,
+        startedAt: span.startedAt,
+        endedAt: span.endedAt,
+        state: span.state,
+        colorClass: laneColor(lane.stage),
+        title: span.label ?? t(JOB_STAGE_KEYS[lane.stage]),
+        subtitle: stageSpanSubtitle(t, lane.stage, span),
+        dashed: lane.stage === "INTERRUPTED",
+        details: [],
+      })),
+    };
+  });
   const extractionRows = memberRows(t, timeline, axisEnd);
 
   return (

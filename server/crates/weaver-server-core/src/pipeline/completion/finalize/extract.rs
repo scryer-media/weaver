@@ -412,9 +412,19 @@ impl Pipeline {
         let db = self.db.clone();
         let output_dir = self.extraction_staging_dir(job_id);
         let set_name_for_result = set_name_owned.clone();
+        let shared_kdf_cache = self
+            .rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .map(|state| state.shared_kdf_cache.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()));
         let pp_pool = self.pp_pool.clone();
         let refresh_cached_headers =
             self.rar_volume_paths_need_header_refresh(job_id, set_name, &volume_paths);
+        let open_mode = if refresh_cached_headers {
+            crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes
+        } else {
+            crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly
+        };
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 if volume_paths.is_empty() {
@@ -426,7 +436,8 @@ impl Pipeline {
                     volume_paths.clone(),
                     password.clone(),
                     cached_headers,
-                    refresh_cached_headers,
+                    shared_kdf_cache.clone(),
+                    open_mode,
                 )?;
 
                 let meta = archive.metadata();

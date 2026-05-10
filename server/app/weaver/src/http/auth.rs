@@ -8,8 +8,7 @@ use weaver_server_api::auth::CallerIdentity;
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
 use weaver_server_core::auth::{
-    ApiKeyAuthRow, ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key,
-    hash_password, needs_rehash, verify_password,
+    ApiKeyAuthRow, ApiKeyCache, CallerScope, LoginAuthCache, hash_api_key, verify_password,
 };
 
 /// Extract the `weaver_jwt` cookie value from request headers.
@@ -188,7 +187,7 @@ pub(super) struct LoginRequest {
 }
 
 pub(super) async fn login_handler(
-    Extension(db): Extension<Database>,
+    Extension(_db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
@@ -213,31 +212,7 @@ pub(super) async fn login_handler(
         return super::error_response(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
 
-    // Transparent rehash: upgrade legacy scrypt hashes to argon2id on successful login.
-    let effective_auth = if needs_rehash(&creds.password_hash) {
-        let password = body.password.clone();
-        let db_rehash = db.clone();
-        let username = creds.username.clone();
-        if let Ok(new_hash) = tokio::task::spawn_blocking(move || {
-            hash_password(&password).and_then(|hash| {
-                db_rehash
-                    .set_auth_credentials(&username, &hash)
-                    .map_err(|error| format!("db update failed: {error}"))?;
-                Ok(hash)
-            })
-        })
-        .await
-        .unwrap_or(Err("task failed".into()))
-        {
-            let auth = CachedLoginAuth::new(creds.username.clone(), new_hash);
-            auth_cache.replace(Some(auth.clone()));
-            auth
-        } else {
-            creds.clone()
-        }
-    } else {
-        creds.clone()
-    };
+    let effective_auth = creds.clone();
 
     let token = jwt::create_jwt(
         &effective_auth.username,

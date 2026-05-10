@@ -43,6 +43,9 @@ impl Pipeline {
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
+        let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
+        let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
+            mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         shared_state.set_paused(initial_global_paused);
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
@@ -78,6 +81,14 @@ impl Pipeline {
             file_hash_reread_required: HashSet::new(),
             #[cfg(test)]
             try_update_archive_topology_calls: 0,
+            #[cfg(test)]
+            par2_lower_bound_preflight_calls: 0,
+            #[cfg(test)]
+            par2_authoritative_verify_calls: 0,
+            #[cfg(test)]
+            par2_repairer_analyze_calls: 0,
+            #[cfg(test)]
+            par2_repairer_execute_calls: 0,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             download_done_tx,
@@ -90,6 +101,10 @@ impl Pipeline {
             probe_result_rx,
             extract_done_tx,
             extract_done_rx,
+            rar_refresh_done_tx,
+            rar_refresh_done_rx,
+            verified_suspect_persist_done_tx,
+            verified_suspect_persist_done_rx,
             move_done_tx,
             move_done_rx,
             global_paused: initial_global_paused,
@@ -112,6 +127,8 @@ impl Pipeline {
             failed_extractions: HashMap::new(),
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
+            rar_refresh_state: HashMap::new(),
+            verified_suspect_persist_state: HashMap::new(),
             rar_waiting_members: HashMap::new(),
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
@@ -400,6 +417,12 @@ impl Pipeline {
                 }
                 Some(done) = self.extract_done_rx.recv() => {
                     self.handle_extraction_done(done).await;
+                }
+                Some(done) = self.rar_refresh_done_rx.recv() => {
+                    self.handle_rar_refresh_done(done).await;
+                }
+                Some(done) = self.verified_suspect_persist_done_rx.recv() => {
+                    self.handle_verified_suspect_persist_done(done);
                 }
                 Some(done) = self.move_done_rx.recv() => {
                     self.handle_move_to_complete_done(done);

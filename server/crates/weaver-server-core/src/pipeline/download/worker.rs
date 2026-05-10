@@ -412,20 +412,59 @@ impl Pipeline {
         }
 
         if eligible.is_empty() && self.active_downloads == 0 {
+            let mut drained_parked_recovery_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
-                    warn!(
-                        job_id = jid.0,
-                        idx = i,
-                        status = ?s.status,
-                        queue_len = s.download_queue.len(),
-                        recovery_len = s.recovery_queue.len(),
-                        parked_recovery_only =
-                            s.download_queue.is_empty() && !s.recovery_queue.is_empty(),
-                        status_allows_dispatch = Self::status_allows_download_dispatch(&s.status),
-                        "dispatch stall: job not eligible"
-                    );
+                    let parked_recovery_only =
+                        s.download_queue.is_empty() && !s.recovery_queue.is_empty();
+                    let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
+                    let extraction_only_idle = parked_recovery_only
+                        && matches!(s.status, JobStatus::QueuedExtract | JobStatus::Extracting);
+                    let should_schedule_completion = parked_recovery_only
+                        && status_allows_dispatch
+                        && !self.job_has_pending_download_pipeline_work(*jid);
+                    if extraction_only_idle {
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: extraction-only recovery queued"
+                        );
+                    } else if should_schedule_completion {
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: parked recovery queued; scheduling completion check"
+                        );
+                        drained_parked_recovery_jobs.push(*jid);
+                    } else {
+                        warn!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch stall: job not eligible"
+                        );
+                    }
                 }
+            }
+            for job_id in drained_parked_recovery_jobs {
+                self.schedule_job_completion_check_if_download_pipeline_drained(
+                    job_id,
+                    "parked_recovery_idle",
+                );
             }
         }
 

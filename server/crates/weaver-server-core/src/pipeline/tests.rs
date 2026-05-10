@@ -571,7 +571,8 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         volume_paths.clone(),
         None,
         Some(stale_headers.clone()),
-        false,
+        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
     )
     .unwrap();
     let idx_without_refresh = archive_without_refresh
@@ -606,7 +607,8 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         volume_paths.clone(),
         None,
         Some(stale_headers),
-        true,
+        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
     )
     .unwrap();
     let idx_with_refresh = archive_with_refresh
@@ -722,6 +724,46 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
         .expect("healed snapshot should contain E01");
     assert_eq!(healed_e01.volumes.first_volume, 0);
     assert_eq!(healed_e01.volumes.last_volume, 1);
+}
+
+#[test]
+fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
+    let files = build_multifile_multivolume_rar_set();
+
+    let mut cached_archive =
+        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    cached_archive
+        .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
+        .unwrap();
+    cached_archive
+        .add_volume(2, Box::new(std::io::Cursor::new(files[2].1.clone())))
+        .unwrap();
+
+    let mut facts = BTreeMap::new();
+    for (volume, (_, bytes)) in files.iter().enumerate() {
+        let mut parsed =
+            weaver_rar::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
+                .unwrap();
+        if volume == 3 {
+            parsed.more_volumes = true;
+            let member = parsed
+                .members
+                .iter_mut()
+                .find(|member| member.name == "E02.mkv")
+                .expect("volume 3 should contain E02");
+            member.split_after = true;
+            member.data_crc32 = None;
+        }
+        facts.insert(volume as u32, parsed);
+    }
+
+    assert_eq!(
+        crate::pipeline::archive::topology::cached_rar_snapshot_alignment_with_volume_facts(
+            &facts,
+            &cached_archive,
+        ),
+        crate::pipeline::archive::topology::CachedRarSnapshotAlignment::StaleGrowth
+    );
 }
 
 #[tokio::test]
@@ -1526,6 +1568,69 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     }
 }
 
+async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
+    for _ in 0..32 {
+        while let Ok(done) = pipeline.rar_refresh_done_rx.try_recv() {
+            pipeline.handle_rar_refresh_done(done).await;
+        }
+        if pipeline
+            .rar_refresh_state
+            .values()
+            .all(|state| state.in_flight.is_none())
+        {
+            return;
+        }
+        let done =
+            tokio::time::timeout(Duration::from_secs(5), pipeline.rar_refresh_done_rx.recv())
+                .await
+                .expect("RAR refresh result should arrive")
+                .expect("RAR refresh channel should stay open");
+        pipeline.handle_rar_refresh_done(done).await;
+    }
+    panic!("RAR refresh queue did not drain");
+}
+
+async fn drain_verified_suspect_persists(pipeline: &mut Pipeline) {
+    for _ in 0..32 {
+        while let Ok(done) = pipeline.verified_suspect_persist_done_rx.try_recv() {
+            pipeline.handle_verified_suspect_persist_done(done);
+        }
+        if pipeline
+            .verified_suspect_persist_state
+            .values()
+            .all(|state| state.in_flight_version.is_none())
+        {
+            return;
+        }
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline.verified_suspect_persist_done_rx.recv(),
+        )
+        .await
+        .expect("verified suspect persistence result should arrive")
+        .expect("verified suspect persistence channel should stay open");
+        pipeline.handle_verified_suspect_persist_done(done);
+    }
+    panic!("verified suspect persistence queue did not drain");
+}
+
+fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.status = status;
+    state.refresh_runtime_lanes_from_status();
+}
+
+fn pause_job_for_rar_fixture_setup(pipeline: &mut Pipeline, job_id: JobId) {
+    // UnRAR owns the active volume chain inside ExtractCurrentFile/MergeArchive.
+    // Tests that swap, delete, or surgically rewrite RAR state must not leave
+    // eager extraction workers holding those readers while they mutate fixtures.
+    set_job_status_for_test(pipeline, job_id, JobStatus::Paused);
+}
+
+fn resume_job_downloading_for_test(pipeline: &mut Pipeline, job_id: JobId) {
+    set_job_status_for_test(pipeline, job_id, JobStatus::Downloading);
+}
+
 async fn write_and_complete_rar_volume(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1552,6 +1657,7 @@ async fn write_and_complete_rar_volume(
     pipeline
         .refresh_archive_state_for_completed_file(job_id, file_id, true)
         .await;
+    drain_rar_refreshes(pipeline).await;
 }
 
 async fn write_and_complete_file(
@@ -1580,6 +1686,235 @@ async fn write_and_complete_file(
     pipeline
         .refresh_archive_state_for_completed_file(job_id, file_id, true)
         .await;
+}
+
+#[tokio::test]
+async fn completed_rar_volume_queues_refresh_without_inline_recompute() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40118);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Queued Refresh", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let (filename, bytes) = &files[0];
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    tokio::fs::write(working_dir.join(filename), bytes)
+        .await
+        .unwrap();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .file_mut(file_id)
+        .unwrap()
+        .commit_segment(0, bytes.len() as u32)
+        .unwrap();
+
+    pipeline
+        .refresh_archive_state_for_completed_file(job_id, file_id, true)
+        .await;
+
+    let key = (job_id, "show".to_string());
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("RAR refresh should be queued");
+    assert_eq!(
+        refresh.in_flight.map(|request| request.reason),
+        Some(RefreshReason::CoverageExpansion)
+    );
+    assert!(
+        pipeline
+            .rar_sets
+            .get(&key)
+            .and_then(|state| state.plan.as_ref())
+            .is_none(),
+        "file-complete RAR refresh should not rebuild the plan inline"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    assert!(
+        pipeline
+            .rar_sets
+            .get(&key)
+            .and_then(|state| state.plan.as_ref())
+            .is_some(),
+        "queued RAR refresh should apply through the orchestrator"
+    );
+}
+
+#[tokio::test]
+async fn rar_refresh_done_uses_actual_refreshed_frontier() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40119);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Refresh Frontier", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
+
+    let key = (job_id, "show".to_string());
+    let request = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 3,
+            refreshed_through_volume: 1,
+            structure_dirty: false,
+            last_error: None,
+        },
+    );
+
+    let computed = ComputedRarSetState {
+        plan: pipeline
+            .rar_sets
+            .get(&key)
+            .and_then(|state| state.plan.as_ref())
+            .cloned()
+            .expect("RAR plan should exist"),
+        headers: pipeline
+            .load_rar_snapshot(job_id, "show")
+            .expect("RAR snapshot should exist"),
+        rebuild_source: crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+    };
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            result: Ok(computed),
+        })
+        .await;
+
+    assert_eq!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .map(|state| state.refreshed_through_volume),
+        Some(1),
+        "refresh completion should keep the actual rebuilt frontier"
+    );
+}
+
+#[tokio::test]
+async fn rar_member_refresh_request_retries_after_refresh_error() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40120);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Refresh Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().take(2).enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    pipeline.rar_refresh_state.insert(
+        (job_id, "show".to_string()),
+        RarRefreshState {
+            in_flight: None,
+            queued: None,
+            latest_completed_volume: 1,
+            refreshed_through_volume: 1,
+            structure_dirty: false,
+            last_error: Some("refresh failed".to_string()),
+        },
+    );
+
+    let request = pipeline
+        .rar_member_refresh_request(job_id, "show", "E01.mkv")
+        .expect("refresh failure should keep the member blocked");
+    assert_eq!(request.reason, RefreshReason::ValidationFailure);
+    assert_eq!(request.target_completed_volume, 1);
+}
+
+#[tokio::test]
+async fn rar_member_refresh_request_ignores_verified_suspects_when_covered() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40122);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Covered Refresh Gate", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().take(2).enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: None,
+            queued: None,
+            latest_completed_volume: 1,
+            refreshed_through_volume: 1,
+            structure_dirty: false,
+            last_error: None,
+        },
+    );
+    pipeline
+        .rar_sets
+        .get_mut(&key)
+        .expect("RAR set should exist")
+        .verified_suspect_volumes = HashSet::from([0u32, 1u32]);
+
+    assert!(
+        pipeline
+            .rar_member_refresh_request(job_id, "show", "E01.mkv")
+            .is_none(),
+        "covered members should trust refreshed topology even if suspect-volume bookkeeping remains"
+    );
+}
+
+#[tokio::test]
+async fn verified_suspect_persist_serializes_latest_value_per_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40123);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Suspect Persist Queue", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([1u32]));
+    pipeline.persist_verified_suspect_volumes(job_id, "show", &HashSet::from([2u32, 3u32]));
+
+    let key = (job_id, "show".to_string());
+    let persist_state = pipeline
+        .verified_suspect_persist_state
+        .get(&key)
+        .expect("verified suspect persistence state should exist");
+    assert!(persist_state.in_flight_version.is_some());
+    assert!(persist_state.queued);
+    assert_eq!(persist_state.desired, HashSet::from([2u32, 3u32]));
+
+    drain_verified_suspect_persists(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline
+            .db
+            .load_verified_suspect_volumes(job_id)
+            .unwrap()
+            .get("show")
+            .cloned(),
+        Some(HashSet::from([2u32, 3u32]))
+    );
 }
 
 async fn persist_completed_file_hash(
@@ -2142,6 +2477,13 @@ async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
             .unwrap(),
         crate::pipeline::completion::NestedExtractionDecision::Started
     ));
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_none_or(|sets| !sets.contains("51273aad56a8b904e96928935278a627")),
+        "nested RAR should use incremental RAR scheduling, not generic full-set extraction"
+    );
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     let topology = state
@@ -2269,9 +2611,11 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
         .collect();
     let spec = rar_job_spec("Obfuscated Unknown RAR Recovery", &obfuscated_files);
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        drain_rar_refreshes(&mut pipeline).await;
         pipeline.retry_par2_authoritative_identity(job_id).await;
         pipeline.try_rar_extraction(job_id).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -2329,6 +2673,7 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
         ));
     }
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
 
@@ -2361,9 +2706,11 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
         .collect();
     let spec = rar_job_spec("Obfuscated Split RAR Recovery", &obfuscated_files);
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        drain_rar_refreshes(&mut pipeline).await;
         pipeline.retry_par2_authoritative_identity(job_id).await;
         pipeline.try_rar_extraction(job_id).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -2389,6 +2736,7 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
         .unwrap();
     assert_eq!(detected_archives.len(), obfuscated_files.len());
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
 
@@ -3507,6 +3855,14 @@ async fn dispatch_downloads_leaves_unpromoted_recovery_queue_parked_when_primary
     assert_eq!(pipeline.active_recovery, 0);
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(), 1);
+    assert_eq!(
+        pipeline
+            .pending_completion_checks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![job_id]
+    );
 }
 
 #[tokio::test]
@@ -4671,6 +5027,154 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
 }
 
 #[tokio::test]
+async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20007);
+    let payload_filename = "episode.bin";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+02.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let spec = JobSpec {
+        name: "Tail Flush PAR2 Promotion".to_string(),
+        password: None,
+        total_bytes: 128 + 16 + 32,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "data-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "data-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 16,
+                    message_id: "index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 2,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 32,
+                    message_id: "repair@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 0),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 2, false),
+        ],
+    );
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let buffered = BufferedDecodedSegment {
+        segment_id: SegmentId {
+            file_id,
+            segment_number: 1,
+        },
+        decoded_size: 64,
+        crc32: 0,
+        data: DecodedChunk::from(original_payload[64..].to_vec()),
+        yenc_name: payload_filename.to_string(),
+    };
+    let buffered_len = buffered.len_bytes();
+    pipeline
+        .write_buffers
+        .entry(file_id)
+        .or_insert_with(|| WriteReorderBuffer::new(4))
+        .insert(64, buffered);
+    pipeline.note_write_buffered(buffered_len, 1);
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 1,
+            })
+            .unwrap()
+            .commit_segment(0, 16)
+            .unwrap();
+        state.download_queue = DownloadQueue::new();
+        assert_eq!(state.recovery_queue.len(), 1);
+    }
+
+    assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
+    assert!(pipeline.pending_completion_checks.is_empty());
+
+    pipeline.flush_quiescent_write_backlog().await;
+
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_buffered_segments, 0);
+    assert_eq!(
+        pipeline
+            .pending_completion_checks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    assert!(
+        !pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .is_complete()
+    );
+
+    let queued_job = pipeline.pending_completion_checks.pop_front().unwrap();
+    pipeline.check_job_completion(queued_job).await;
+
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(state.download_queue.has_recovery_work());
+    assert!(state.recovery_queue.is_empty());
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading)
+    );
+}
+
+#[tokio::test]
 async fn out_of_order_rar_completion_keeps_pending_continuation_until_start_arrives() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -4748,6 +5252,10 @@ async fn eager_delete_preserves_later_member_volumes_after_out_of_order_completi
         .recompute_rar_set_state(job_id, "show")
         .await
         .unwrap();
+    if let Some(set_state) = pipeline.rar_sets.get_mut(&(job_id, "show".to_string())) {
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+    }
 
     pipeline.try_delete_volumes(job_id, "show");
 
@@ -4797,6 +5305,7 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
         }],
     });
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
@@ -4810,6 +5319,10 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
         .recompute_rar_set_state(job_id, "show")
         .await
         .unwrap();
+    if let Some(set_state) = pipeline.rar_sets.get_mut(&(job_id, "show".to_string())) {
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+    }
 
     pipeline.try_delete_volumes(job_id, "show");
 
@@ -4822,6 +5335,10 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
             .is_none_or(HashSet::is_empty)
     );
 
+    let par2_set = placement_par2_file_set(&files);
+    let access = weaver_par2::DiskFileAccess::new(working_dir.clone(), &par2_set);
+    let verification = weaver_par2::verify_all(&par2_set, &access);
+    pipeline.recompute_volume_safety_from_verification(job_id, &verification);
     pipeline.par2_verified.insert(job_id);
     pipeline.try_delete_volumes(job_id, "show");
 
@@ -5239,6 +5756,7 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
             },
         )
         .await;
+    drain_rar_refreshes(&mut pipeline).await;
 
     let identity = pipeline
         .file_identity(
@@ -5668,6 +6186,7 @@ async fn par2_metadata_rebinds_obfuscated_rar_after_late_content_probe() {
         .await;
         pipeline.retry_par2_authoritative_identity(job_id).await;
     }
+    drain_rar_refreshes(&mut pipeline).await;
 
     for (index, ((canonical_filename, _), (obfuscated_filename, _))) in canonical_files
         .iter()
@@ -5765,6 +6284,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
             .await;
         pipeline.retry_par2_authoritative_identity(job_id).await;
     }
+    drain_rar_refreshes(&mut pipeline).await;
 
     let cached_headers = pipeline
         .load_rar_snapshot(job_id, canonical_set_name)
@@ -5810,6 +6330,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
     )
     .await;
     pipeline.retry_par2_authoritative_identity(job_id).await;
+    drain_rar_refreshes(&mut pipeline).await;
 
     assert_eq!(
         member_span(&pipeline, job_id, canonical_set_name, member_name),
@@ -5980,11 +6501,13 @@ async fn clean_par2_verification_exits_verifying_for_rar_extraction() {
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("Clean PAR2 RAR Verify Starts Extraction", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
-        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
         persist_completed_file_hash(&pipeline, job_id, file_index as u32, filename, bytes).await;
     }
 
@@ -6096,25 +6619,26 @@ async fn clean_par2_quick_verification_exits_verifying_for_split_join() {
     pipeline.check_job_completion(job_id).await;
 
     assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
-    assert!(pipeline.par2_verified.contains(&job_id));
     assert_ne!(
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Verifying)
     );
 
     let done = next_extraction_done(&mut pipeline).await;
-    match done {
+    match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
             set_name,
             result,
         } => {
-            assert_eq!(done_job_id, job_id);
+            assert_eq!(*done_job_id, job_id);
             assert_eq!(set_name, "archive");
             assert!(result.is_ok());
         }
         _ => panic!("expected split join extraction result"),
     }
+    pipeline.handle_extraction_done(done).await;
+    assert!(pipeline.par2_verified.contains(&job_id));
 }
 
 #[tokio::test]
@@ -6144,24 +6668,27 @@ async fn clean_par2_verification_exits_verifying_for_sevenz_extraction() {
     pipeline.check_job_completion(job_id).await;
 
     assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
-    assert!(pipeline.par2_verified.contains(&job_id));
     assert_ne!(
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Verifying)
     );
 
     let done = next_extraction_done(&mut pipeline).await;
-    match done {
+    match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
             result,
             ..
         } => {
-            assert_eq!(done_job_id, job_id);
-            assert!(result.is_ok());
+            assert_eq!(*done_job_id, job_id);
+            if let Err(error) = result {
+                panic!("7z extraction failed: {error}");
+            }
         }
         _ => panic!("expected 7z extraction result"),
     }
+    pipeline.handle_extraction_done(done).await;
+    assert!(pipeline.par2_verified.contains(&job_id));
 }
 
 #[tokio::test]
@@ -6217,25 +6744,29 @@ async fn clean_par2_verification_exits_verifying_for_single_sevenz_extraction() 
     pipeline.check_job_completion(job_id).await;
 
     assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
-    assert!(pipeline.par2_verified.contains(&job_id));
     assert_ne!(
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Verifying)
     );
 
     let done = next_extraction_done(&mut pipeline).await;
-    match done {
+    match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
             set_name,
             result,
         } => {
-            assert_eq!(done_job_id, job_id);
+            assert_eq!(*done_job_id, job_id);
             assert_eq!(set_name, archive_filename);
             assert!(result.is_err());
         }
         _ => panic!("expected single 7z extraction result"),
     }
+    pipeline.handle_extraction_done(done).await;
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
 }
 
 #[tokio::test]
@@ -6353,25 +6884,26 @@ async fn clean_par2_verification_exits_verifying_for_gzip_extraction() {
     pipeline.check_job_completion(job_id).await;
 
     assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
-    assert!(pipeline.par2_verified.contains(&job_id));
     assert_ne!(
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Verifying)
     );
 
     let done = next_extraction_done(&mut pipeline).await;
-    match done {
+    match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
             set_name,
             result,
         } => {
-            assert_eq!(done_job_id, job_id);
+            assert_eq!(*done_job_id, job_id);
             assert_eq!(set_name, archive_filename);
             assert!(result.is_ok());
         }
         _ => panic!("expected gzip extraction result"),
     }
+    pipeline.handle_extraction_done(done).await;
+    assert!(pipeline.par2_verified.contains(&job_id));
 }
 
 #[tokio::test]
@@ -6925,6 +7457,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
         write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
         working_dir
     };
@@ -7655,6 +8188,7 @@ async fn non_solid_rar_incremental_uses_ready_plan_even_if_complete_volumes_lag(
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("RAR Incremental Ready Plan Wins", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
@@ -7691,6 +8225,7 @@ async fn non_solid_rar_incremental_uses_ready_plan_even_if_complete_volumes_lag(
 
     assert!(pipeline.rar_member_can_start_extraction(job_id, "show", "E02.mkv"));
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.try_rar_extraction(job_id).await;
 
     let set_state = pipeline
@@ -7738,6 +8273,7 @@ async fn solid_rar_keeps_later_members_ready_after_earlier_failure() {
         &[("solid.rar".to_string(), fixture_bytes.clone())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, "solid.rar", &fixture_bytes).await;
 
     // Rebuild with extracted + failed state that mirrors a solid archive
@@ -8042,6 +8578,7 @@ async fn rar_completion_prefers_incremental_batches_over_full_set_after_eager_de
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("RAR Completion Uses Batch", &files);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
@@ -8060,6 +8597,7 @@ async fn rar_completion_prefers_incremental_batches_over_full_set_after_eager_de
     assert!(!working_dir.join("show.part01.rar").exists());
     assert!(!working_dir.join("show.part02.rar").exists());
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
 
     let done = next_extraction_done(&mut pipeline).await;
@@ -8649,6 +9187,87 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
 }
 
 #[tokio::test]
+async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30030);
+    let filename = "archive.7z";
+    let spec = JobSpec {
+        name: "PAR2 Existing Complete Archive Refresh".to_string(),
+        password: None,
+        total_bytes: 128,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::from_filename(filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: 128,
+                message_id: "par2-existing-complete-archive@example.com".to_string(),
+            }],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, 128)
+            .unwrap();
+    }
+    let verification = weaver_par2::VerificationResult {
+        files: vec![weaver_par2::verify::FileVerification {
+            file_id: weaver_par2::FileId::from_bytes([0u8; 16]),
+            filename: filename.to_string(),
+            status: weaver_par2::verify::FileStatus::Complete,
+            valid_slices: Vec::new(),
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: weaver_par2::verify::Repairability::NotNeeded,
+    };
+
+    assert_eq!(
+        pipeline.verified_complete_archive_file_ids_needing_refresh(job_id, &verification),
+        vec![file_id],
+        "already-complete PAR2-verified archives without topology must be refreshed"
+    );
+
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology(
+            filename.to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::SevenZip,
+                volume_map: HashMap::from([(filename.to_string(), 0)]),
+                complete_volumes: [0u32].into_iter().collect(),
+                expected_volume_count: Some(1),
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+        );
+
+    assert!(
+        pipeline
+            .verified_complete_archive_file_ids_needing_refresh(job_id, &verification)
+            .is_empty(),
+        "existing topology should avoid a redundant refresh for unchanged complete files"
+    );
+}
+
+#[tokio::test]
 async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -8862,7 +9481,8 @@ async fn direct_payload_par2_copy_only_repair_does_not_require_recovery_blocks()
 async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut events = pipeline.event_tx.subscribe();
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let mut repair_events = pipeline.event_tx.subscribe();
     let job_id = JobId(30087);
     let payload_filename = "payload.mkv";
     let index_filename = "repair.par2";
@@ -8965,11 +9585,146 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)
     );
-    assert_eq!(drain_job_repair_complete(&mut events, job_id), 1);
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        2
+    );
+    assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
     let output_dir = pipeline
         .complete_dir
         .join(crate::jobs::working_dir::sanitize_dirname(
             "Complete Direct Payload PAR2 Repair",
+        ));
+    let completed_payload = tokio::fs::read(output_dir.join(payload_filename))
+        .await
+        .unwrap();
+    assert_eq!(completed_payload, original_payload);
+}
+
+#[tokio::test]
+async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pass() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let mut repair_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30187);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let recovery_bytes = vec![0xAA; 64];
+    let spec = JobSpec {
+        name: "Restored Repairing Direct Payload PAR2 Repair".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "restored-complete-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "restored-complete-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "restored-complete-payload-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: recovery_bytes.len() as u32,
+                    message_id: "restored-complete-payload-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Repairing;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(1, 64)
+            .unwrap();
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        1
+    );
+    assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
+    assert_eq!(pipeline.par2_lower_bound_preflight_calls, 0);
+    assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+
+    let output_dir = pipeline
+        .complete_dir
+        .join(crate::jobs::working_dir::sanitize_dirname(
+            "Restored Repairing Direct Payload PAR2 Repair",
         ));
     let completed_payload = tokio::fs::read(output_dir.join(payload_filename))
         .await
@@ -9516,11 +10271,30 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         }],
     });
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
-        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+        tokio::fs::write(working_dir.join(filename), bytes)
+            .await
+            .unwrap();
+        let file_id = NzbFileId {
+            job_id,
+            file_index: file_index as u32,
+        };
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state
+                .assembly
+                .file_mut(file_id)
+                .unwrap()
+                .commit_segment(0, bytes.len() as u32)
+                .unwrap();
+        }
+        pipeline
+            .refresh_archive_state_for_completed_file(job_id, file_id, false)
             .await;
     }
+    drain_rar_refreshes(&mut pipeline).await;
 
     install_test_par2_runtime(
         &mut pipeline,
@@ -9529,11 +10303,15 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         &[],
     );
 
+    let extraction_staging_dir = pipeline.extraction_staging_dir(job_id);
     for (member_name, bytes) in [
         ("E01.mkv", b"episode-a-payload".as_slice()),
         ("E02.mkv", b"episode-b-payload".as_slice()),
     ] {
-        let output_path = working_dir.join(member_name);
+        let (output_path, _) = Pipeline::member_output_paths(&extraction_staging_dir, member_name);
+        if let Some(parent) = output_path.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
         tokio::fs::write(&output_path, bytes).await.unwrap();
         pipeline
             .db
@@ -9545,11 +10323,20 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
             .or_default()
             .insert(member_name.to_string());
     }
+    // This fixture models restart recovery after extraction already completed.
+    // Do not leave the eager extraction workers spawned during setup in scope.
+    for ((rar_job_id, _), set_state) in pipeline.rar_sets.iter_mut() {
+        if *rar_job_id == job_id {
+            set_state.active_workers = 0;
+            set_state.in_flight_members.clear();
+        }
+    }
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
 
     for (filename, _) in &files {
         tokio::fs::remove_file(working_dir.join(filename))
@@ -9562,7 +10349,9 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
 
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
     );
     let output_dir = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "RAR Finalize Skips Missing PAR2 Index",
@@ -9583,6 +10372,7 @@ async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_re
         rar_job_spec("RAR Recover Stale Extracted Member", &files),
     )
     .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
@@ -9802,9 +10592,10 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
         &[(filename.to_string(), fixture_bytes.clone())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
     pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
 
-    write_and_complete_file(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
 
     let file_id = NzbFileId {
         job_id,
@@ -9838,6 +10629,7 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
         .failed_extractions
         .insert(job_id, HashSet::from([filename.to_string()]));
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
 
     {
@@ -9920,13 +10712,15 @@ async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
         &[(filename.to_string(), rar_bytes.clone())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
     pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
 
-    write_and_complete_file(&mut pipeline, job_id, 0, filename, &rar_bytes).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &rar_bytes).await;
     pipeline
         .failed_extractions
         .insert(job_id, HashSet::from([filename.to_string()]));
 
+    resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
 
     {
@@ -10001,6 +10795,7 @@ async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
         &[(filename.to_string(), fixture_bytes.clone())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
 
@@ -10020,6 +10815,7 @@ async fn re_registering_identical_rar_facts_still_recomputes_readiness() {
             true,
         )
         .await;
+    drain_rar_refreshes(&mut pipeline).await;
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     let topo = state.assembly.archive_topology_for("archive").unwrap();
@@ -10156,6 +10952,47 @@ async fn no_par2_runtime_rar_failure_requeues_owner_volumes() {
 }
 
 #[tokio::test]
+async fn exhausted_rar_failed_member_skips_lower_bound_recovery_preflight() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30191);
+    let filename = "archive.rar";
+    let files = vec![(filename.to_string(), vec![1u8; 64])];
+    let spec = rar_job_spec("Exhausted RAR Lower Bound Skip", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.assembly.set_archive_topology(
+            "archive".to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::Rar,
+                volume_map: HashMap::from([(filename.to_string(), 0)]),
+                complete_volumes: [0u32].into_iter().collect(),
+                expected_volume_count: Some(1),
+                members: vec![crate::jobs::assembly::ArchiveMember {
+                    name: "sample.mkv".to_string(),
+                    first_volume: 0,
+                    last_volume: 0,
+                    unpacked_size: 0,
+                }],
+                unresolved_spans: Vec::new(),
+            },
+        );
+    }
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    pipeline
+        .test_promote_recovery_for_failed_member(job_id, "archive", "sample.mkv")
+        .await;
+
+    assert_eq!(pipeline.par2_lower_bound_preflight_calls, 0);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+}
+
+#[tokio::test]
 async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_completion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
@@ -10199,6 +11036,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -10269,6 +11107,7 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -10345,6 +11184,7 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -10429,6 +11269,7 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::from([1u32]),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -10529,6 +11370,7 @@ async fn clean_verify_after_swap_correction_preserves_retry_frontier_after_eager
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("RAR Swap Retry Frontier", &files);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
@@ -10583,9 +11425,8 @@ async fn clean_verify_after_swap_correction_preserves_retry_frontier_after_eager
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
-        state.status = JobStatus::Downloading;
-        state.refresh_runtime_lanes_from_status();
     }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
 
     pipeline.check_job_completion(job_id).await;
 
@@ -10638,6 +11479,7 @@ async fn clean_verify_after_file_swap_refreshes_stale_rar_snapshot_without_volum
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("RAR Swap Refreshes Snapshot", &files);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
 
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
     write_and_complete_rar_volume(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
@@ -10685,9 +11527,8 @@ async fn clean_verify_after_file_swap_refreshes_stale_rar_snapshot_without_volum
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
-        state.status = JobStatus::Downloading;
-        state.refresh_runtime_lanes_from_status();
     }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
 
     pipeline.check_job_completion(job_id).await;
 
@@ -10804,6 +11645,7 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
             facts: BTreeMap::from([(0u32, stale_named_facts)]),
             volume_files: BTreeMap::from([(0u32, "show.part01.rar".to_string())]),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -10852,6 +11694,86 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
 }
 
 #[tokio::test]
+async fn rar_completion_waits_for_pending_refresh_before_terminal_decision() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30084);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Pending Refresh Barrier", &files);
+
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("show"))
+        .cloned()
+        .expect("RAR topology should exist after all volumes complete");
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&(job_id, "show".to_string()))
+            .expect("RAR set state should exist");
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes;
+        set_state.plan = Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+            phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            waiting_on_volumes: HashSet::new(),
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology,
+            fallback_reason: None,
+        });
+    }
+
+    pipeline.rar_refresh_state.insert(
+        (job_id, "show".to_string()),
+        RarRefreshState {
+            in_flight: Some(RarRefreshRequest {
+                target_completed_volume: 3,
+                reason: RefreshReason::CoverageExpansion,
+            }),
+            queued: None,
+            latest_completed_volume: 3,
+            refreshed_through_volume: 2,
+            structure_dirty: false,
+            last_error: None,
+        },
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(pipeline.job_has_pending_rar_refresh_for_current_sets(job_id));
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(
+        !matches!(
+            pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+            Some(JobStatus::Failed { .. })
+        ),
+        "completion should not fail or repair-evaluate while a current RAR refresh is pending"
+    );
+    assert!(
+        pipeline.job_has_incoherent_rar_waiting_state(job_id),
+        "pending-refresh barrier should not force an eager topology rebuild"
+    );
+}
+
+#[tokio::test]
 async fn incoherent_rar_waiting_state_heals_before_reverification() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -10861,6 +11783,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     let spec = rar_job_spec("RAR Incoherent Waiting Heals Before Verify", &files);
 
     insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
     install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
 
     for (file_index, (filename, bytes)) in files.iter().enumerate() {
@@ -10921,9 +11844,8 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
-        state.status = JobStatus::Downloading;
-        state.refresh_runtime_lanes_from_status();
     }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
 
     pipeline.check_job_completion(job_id).await;
 
@@ -11232,6 +12154,7 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
             facts: std::collections::BTreeMap::from([(1u32, dummy_rar_volume_facts(1))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -12009,6 +12932,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
             facts: std::collections::BTreeMap::from([(0u32, dummy_rar_volume_facts(0))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -12746,6 +13670,7 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -12850,7 +13775,7 @@ async fn auto_pause_ignores_stale_jobs_without_inflight_downloads() {
 }
 
 #[tokio::test]
-async fn pause_rejects_extracting_state() {
+async fn pause_allows_extracting_status_when_download_lane_is_active() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31241);
@@ -12860,12 +13785,92 @@ async fn pause_rejects_extracting_state() {
         "extracting-job",
         temp_dir.path().join("extracting-job"),
     );
-    state.status = JobStatus::Extracting;
+    state.post_state = crate::jobs::model::PostState::Extracting;
+    state.refresh_legacy_status();
     pipeline.jobs.insert(job_id, state);
+
+    pipeline.pause_job_runtime(job_id).unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.status, JobStatus::Paused);
+    assert_eq!(state.paused_resume_status, Some(JobStatus::Extracting));
+    assert_eq!(
+        state.paused_resume_download_state,
+        Some(crate::jobs::model::DownloadState::Downloading)
+    );
+    assert_eq!(
+        state.paused_resume_post_state,
+        Some(crate::jobs::model::PostState::Extracting)
+    );
+
+    pipeline.resume_job_runtime(job_id).unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.status, JobStatus::Extracting);
+    assert_eq!(
+        state.download_state,
+        crate::jobs::model::DownloadState::Downloading
+    );
+    assert_eq!(state.post_state, crate::jobs::model::PostState::Extracting);
+    assert_eq!(
+        pipeline
+            .pending_completion_checks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![job_id]
+    );
+}
+
+#[tokio::test]
+async fn pause_rejects_extracting_state_without_download_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31242);
+
+    let mut state = minimal_job_state(
+        job_id,
+        "extracting-only-job",
+        temp_dir.path().join("extracting-only-job"),
+    );
+    state.download_state = crate::jobs::model::DownloadState::Complete;
+    state.post_state = crate::jobs::model::PostState::Extracting;
+    state.refresh_legacy_status();
+    pipeline.jobs.insert(job_id, state);
+
     let error = pipeline.pause_job_runtime(job_id).unwrap_err();
     assert!(
         error
             .to_string()
             .contains("pause is only supported in queued or downloading states")
     );
+}
+
+#[tokio::test]
+async fn purge_idle_rar_set_drops_shared_kdf_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31243);
+    let set_name = "show".to_string();
+
+    pipeline.jobs.insert(
+        job_id,
+        minimal_job_state(job_id, "purge-job", temp_dir.path().join("purge-job")),
+    );
+
+    let shared_kdf_cache = std::sync::Arc::new(weaver_rar::crypto::KdfCache::new());
+    let weak_cache = std::sync::Arc::downgrade(&shared_kdf_cache);
+
+    pipeline.rar_sets.insert(
+        (job_id, set_name.clone()),
+        rar_state::RarSetState {
+            shared_kdf_cache,
+            ..Default::default()
+        },
+    );
+
+    pipeline.purge_empty_rar_set_if_idle(job_id, &set_name);
+
+    assert!(!pipeline.rar_sets.contains_key(&(job_id, set_name.clone())));
+    assert!(weak_cache.upgrade().is_none());
 }

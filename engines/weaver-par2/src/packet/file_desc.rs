@@ -156,7 +156,10 @@ mod tests {
         );
         assert_eq!(
             translate_par2_name_to_relative("C:\\Users\\evil\\file.exe").unwrap(),
-            "C%3A/Users/evil/file.exe"
+            format!(
+                "C{}Users/evil/file.exe",
+                if cfg!(windows) { "%3A/" } else { ":/" }
+            )
         );
         assert_eq!(
             translate_par2_name_to_relative("normal.par2").unwrap(),

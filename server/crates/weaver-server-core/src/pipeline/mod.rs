@@ -47,7 +47,7 @@ use weaver_nntp::NntpClient;
 use weaver_par2::checksum;
 use weaver_par2::par2_set::Par2FileSet;
 
-use self::archive::rar_state::RarSetState;
+use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -106,6 +106,67 @@ pub(super) struct ProbeUpdate {
     /// True when probe confirmation hit a non-authoritative transport/protocol
     /// failure and the round should be discarded.
     pub(super) inconclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RefreshReason {
+    CoverageExpansion,
+    PostExtraction,
+    IdentityRebind,
+    ValidationFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RarRefreshRequest {
+    pub(super) target_completed_volume: u32,
+    pub(super) reason: RefreshReason,
+}
+
+impl RarRefreshRequest {
+    fn merge(&mut self, other: Self) {
+        self.target_completed_volume = self
+            .target_completed_volume
+            .max(other.target_completed_volume);
+        self.reason = self.reason.max(other.reason);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct RarRefreshState {
+    pub(super) in_flight: Option<RarRefreshRequest>,
+    pub(super) queued: Option<RarRefreshRequest>,
+    pub(super) latest_completed_volume: u32,
+    pub(super) refreshed_through_volume: u32,
+    pub(super) structure_dirty: bool,
+    pub(super) last_error: Option<String>,
+}
+
+pub(super) struct ComputedRarSetState {
+    pub(super) plan: RarDerivedPlan,
+    pub(super) headers: Vec<u8>,
+    pub(super) rebuild_source: archive::topology::RarTopologyRebuildSource,
+}
+
+pub(super) struct RarRefreshDone {
+    pub(super) job_id: JobId,
+    pub(super) set_name: String,
+    pub(super) request: RarRefreshRequest,
+    pub(super) result: Result<ComputedRarSetState, String>,
+}
+
+pub(super) struct VerifiedSuspectPersistDone {
+    pub(super) job_id: JobId,
+    pub(super) set_name: String,
+    pub(super) version: u64,
+    pub(super) result: Result<(), String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct VerifiedSuspectPersistState {
+    pub(super) desired: HashSet<u32>,
+    pub(super) in_flight_version: Option<u64>,
+    pub(super) next_version: u64,
+    pub(super) queued: bool,
 }
 
 /// Result of a background extraction task.
@@ -267,6 +328,14 @@ pub struct Pipeline {
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]
     pub(super) try_update_archive_topology_calls: usize,
+    #[cfg(test)]
+    pub(super) par2_lower_bound_preflight_calls: usize,
+    #[cfg(test)]
+    pub(super) par2_authoritative_verify_calls: usize,
+    #[cfg(test)]
+    pub(super) par2_repairer_analyze_calls: usize,
+    #[cfg(test)]
+    pub(super) par2_repairer_execute_calls: usize,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.
@@ -285,6 +354,12 @@ pub struct Pipeline {
     /// Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,
+    /// Channel for background RAR topology refresh results.
+    pub(super) rar_refresh_done_tx: mpsc::Sender<RarRefreshDone>,
+    pub(super) rar_refresh_done_rx: mpsc::Receiver<RarRefreshDone>,
+    /// Channel for serialized verified-suspect persistence completions.
+    pub(super) verified_suspect_persist_done_tx: mpsc::Sender<VerifiedSuspectPersistDone>,
+    pub(super) verified_suspect_persist_done_rx: mpsc::Receiver<VerifiedSuspectPersistDone>,
     /// Channel for background final-move results.
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
@@ -337,6 +412,10 @@ pub struct Pipeline {
     pub(super) eagerly_deleted: HashMap<JobId, HashSet<String>>,
     /// Pipeline-owned RAR scheduling state derived from immutable completed-volume facts.
     rar_sets: HashMap<(JobId, String), RarSetState>,
+    /// Runtime-only coalescing state for background RAR topology refreshes.
+    rar_refresh_state: HashMap<(JobId, String), RarRefreshState>,
+    /// Runtime-only serialized persistence state for verified suspect volumes.
+    verified_suspect_persist_state: HashMap<(JobId, String), VerifiedSuspectPersistState>,
     /// Members currently blocked on future RAR volumes. Used to emit stable
     /// waiting-started / waiting-finished events without relying on log text.
     pub(super) rar_waiting_members: HashMap<(JobId, String, String), usize>,

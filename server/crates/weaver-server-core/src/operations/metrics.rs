@@ -164,17 +164,14 @@ impl PipelineMetrics {
         })
     }
 
-    pub fn snapshot(&self) -> MetricsSnapshot {
+    fn snapshot_with_speed(
+        &self,
+        bytes_downloaded: u64,
+        current_download_speed: u64,
+    ) -> MetricsSnapshot {
         let elapsed = self.start_time.elapsed().as_secs_f64().max(0.001);
         let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
         let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
-        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-
-        let current_download_speed = self
-            .speed_tracker
-            .lock()
-            .unwrap()
-            .update(Instant::now(), bytes_downloaded);
 
         MetricsSnapshot {
             bytes_downloaded,
@@ -203,6 +200,24 @@ impl PipelineMetrics {
             articles_per_sec: segments_downloaded as f64 / elapsed,
             decode_rate_mbps: (bytes_decoded as f64 / (1024.0 * 1024.0)) / elapsed,
         }
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
+        let current_download_speed = self
+            .speed_tracker
+            .lock()
+            .unwrap()
+            .update(Instant::now(), bytes_downloaded);
+        self.snapshot_with_speed(bytes_downloaded, current_download_speed)
+    }
+
+    /// Return a fresh atomics-based metrics snapshot without advancing the
+    /// shared speed tracker. `current_download_speed` is left at zero so
+    /// callers can derive it from their own sampling cadence when needed.
+    pub fn raw_snapshot(&self) -> MetricsSnapshot {
+        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
+        self.snapshot_with_speed(bytes_downloaded, 0)
     }
 }
 

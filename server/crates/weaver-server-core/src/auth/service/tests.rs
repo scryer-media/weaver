@@ -23,7 +23,7 @@ fn hash_different_keys() {
 
 #[test]
 fn roundtrip_create_verify() {
-    let secret = derive_jwt_secret("$scrypt$fake_hash");
+    let secret = derive_jwt_secret("fake_hash");
     let token = create_jwt("admin", &secret, 3600);
     let claims = verify_jwt(&token, &secret).unwrap();
     assert_eq!(claims.sub, "admin");

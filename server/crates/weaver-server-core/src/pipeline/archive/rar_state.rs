@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
-use weaver_rar::{RarArchive, RarVolumeFacts, archive::MemberPlannerState, sanitize_path};
+use weaver_rar::{
+    RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache, sanitize_path,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RarSetPhase {
@@ -60,6 +63,7 @@ pub(crate) struct RarSetState {
     pub(crate) facts: BTreeMap<u32, RarVolumeFacts>,
     pub(crate) volume_files: BTreeMap<u32, String>,
     pub(crate) cached_headers: Option<Vec<u8>>,
+    pub(crate) shared_kdf_cache: Arc<KdfCache>,
     pub(crate) verified_suspect_volumes: HashSet<u32>,
     pub(crate) active_workers: usize,
     pub(crate) in_flight_members: HashSet<String>,
@@ -73,6 +77,7 @@ impl Default for RarSetState {
             facts: BTreeMap::new(),
             volume_files: BTreeMap::new(),
             cached_headers: None,
+            shared_kdf_cache: Arc::new(KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -203,6 +208,43 @@ pub(crate) fn build_plan(
         }
         missing
     };
+    let present_unintegrated_continuations = |member: &weaver_rar::MemberInfo| {
+        let member_name = sanitize_path(&member.name);
+        if member_name.is_empty() {
+            return Vec::new();
+        }
+        let last_volume = member.volumes.last_volume as u32;
+        let mut volumes: Vec<u32> = facts
+            .iter()
+            .filter_map(|(&volume, volume_facts)| {
+                if volume <= last_volume {
+                    return None;
+                }
+                let metadata_already_claims_volume = metadata.members.iter().any(|known_member| {
+                    !known_member.is_directory
+                        && sanitize_path(&known_member.name) == member_name
+                        && (known_member.volumes.first_volume as u32
+                            ..=known_member.volumes.last_volume as u32)
+                            .contains(&volume)
+                });
+                if metadata_already_claims_volume {
+                    return None;
+                }
+                let has_matching_continuation = volume_facts.members.iter().any(|fact_member| {
+                    // Continuation headers are the UnRAR-grounded signal here;
+                    // RAR5 per-volume facts do not provide a stable full-member
+                    // size discriminator for every split segment shape.
+                    fact_member.split_before
+                        && (!fact_member.is_directory || fact_member.data_size > 0)
+                        && sanitize_path(&fact_member.name) == member_name
+                });
+                has_matching_continuation.then_some(volume)
+            })
+            .collect();
+        volumes.sort_unstable();
+        volumes.dedup();
+        volumes
+    };
     let mut member_names = Vec::new();
     let mut member_claims: HashMap<String, HashSet<u32>> = HashMap::new();
     for member in &topology_members {
@@ -238,12 +280,20 @@ pub(crate) fn build_plan(
                     last_volume: member.volumes.last_volume as u32,
                 });
             }
+            for volume in present_unintegrated_continuations(member) {
+                waiting_on_volumes.insert(volume);
+                topology.unresolved_spans.push(ArchivePendingSpan {
+                    first_volume: volume,
+                    last_volume: volume,
+                });
+            }
         }
 
         let mut claims: HashSet<u32> =
             (member.volumes.first_volume as u32..=member.volumes.last_volume as u32).collect();
         if !extracted.contains(&member.name) {
             claims.extend(missing_for_member(member));
+            claims.extend(present_unintegrated_continuations(member));
         }
         member_claims
             .entry(member.name.clone())
@@ -299,7 +349,8 @@ pub(crate) fn build_plan(
             let extractable = planner_states
                 .get(&member.name)
                 .is_some_and(PlannerMemberReadiness::is_extractable);
-            if extractable {
+            let unintegrated_continuations = present_unintegrated_continuations(member);
+            if extractable && unintegrated_continuations.is_empty() {
                 if !failed.contains(&member.name) {
                     push_unique_ready_member(
                         &mut ready_members,
@@ -309,6 +360,7 @@ pub(crate) fn build_plan(
                 }
             } else {
                 waiting_on_volumes.extend(missing_for_member(member));
+                waiting_on_volumes.extend(unintegrated_continuations);
                 break;
             }
         }
@@ -323,10 +375,12 @@ pub(crate) fn build_plan(
             let extractable = planner_states
                 .get(&member.name)
                 .is_some_and(PlannerMemberReadiness::is_extractable);
-            if extractable {
+            let unintegrated_continuations = present_unintegrated_continuations(member);
+            if extractable && unintegrated_continuations.is_empty() {
                 push_unique_ready_member(&mut ready_members, &mut ready_member_names, &member.name);
             } else {
                 waiting_on_volumes.extend(missing_for_member(member));
+                waiting_on_volumes.extend(unintegrated_continuations);
             }
         }
     }

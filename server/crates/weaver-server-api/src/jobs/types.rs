@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use async_graphql::{Enum, InputObject, SimpleObject, Upload};
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -28,7 +30,7 @@ pub struct AttributeInput {
 /// Public queue states collapse the internal `Checking` phase into
 /// `Verifying` so clients see one post-download verification step before
 /// extraction begins.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Enum)]
 pub enum QueueItemState {
     Queued,
     Downloading,
@@ -243,6 +245,39 @@ pub struct QueueFilterInput {
     pub category: Option<String>,
     pub has_attribute_key: Option<String>,
     pub attribute_equals: Option<AttributeInput>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreparedQueueFilter {
+    pub(crate) item_ids: Option<HashSet<u64>>,
+    pub(crate) states: Option<HashSet<QueueItemState>>,
+    pub(crate) category: Option<String>,
+    pub(crate) has_attribute_key: Option<String>,
+    pub(crate) attribute_equals: Option<AttributeInput>,
+}
+
+impl PreparedQueueFilter {
+    pub(crate) fn new(filter: Option<&QueueFilterInput>) -> Option<Self> {
+        filter.map(Self::from)
+    }
+}
+
+impl From<&QueueFilterInput> for PreparedQueueFilter {
+    fn from(filter: &QueueFilterInput) -> Self {
+        Self {
+            item_ids: filter
+                .item_ids
+                .as_ref()
+                .map(|item_ids| item_ids.iter().copied().collect()),
+            states: filter
+                .states
+                .as_ref()
+                .map(|states| states.iter().copied().collect()),
+            category: filter.category.clone(),
+            has_attribute_key: filter.has_attribute_key.clone(),
+            attribute_equals: filter.attribute_equals.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, InputObject, Default)]
@@ -639,7 +674,15 @@ pub fn queue_item_from_submission(
 }
 
 pub fn matches_queue_filter(item: &QueueItem, filter: Option<&QueueFilterInput>) -> bool {
-    matches_item_filter(
+    let prepared = PreparedQueueFilter::new(filter);
+    matches_queue_filter_prepared(item, prepared.as_ref())
+}
+
+pub(crate) fn matches_queue_filter_prepared(
+    item: &QueueItem,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
+    matches_item_filter_prepared(
         item.id,
         item.state,
         item.category.as_ref(),
@@ -649,6 +692,14 @@ pub fn matches_queue_filter(item: &QueueItem, filter: Option<&QueueFilterInput>)
 }
 
 pub fn matches_queue_event_filter(event: &QueueEvent, filter: Option<&QueueFilterInput>) -> bool {
+    let prepared = PreparedQueueFilter::new(filter);
+    matches_queue_event_filter_prepared(event, prepared.as_ref())
+}
+
+pub(crate) fn matches_queue_event_filter_prepared(
+    event: &QueueEvent,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
     let Some(filter) = filter else {
         return true;
     };
@@ -687,7 +738,7 @@ pub fn matches_queue_event_filter(event: &QueueEvent, filter: Option<&QueueFilte
         let Some(item) = &event.item else {
             return false;
         };
-        if !matches_attribute_filter(&item.attributes, filter) {
+        if !matches_attribute_filter_prepared(&item.attributes, filter) {
             return false;
         }
     }
@@ -771,12 +822,12 @@ pub fn metrics_from_snapshot(snapshot: &MetricsSnapshot) -> Metrics {
     Metrics::from(snapshot)
 }
 
-fn matches_item_filter(
+fn matches_item_filter_prepared(
     id: u64,
     state: QueueItemState,
     item_category: Option<&String>,
     attributes: &[Attribute],
-    filter: Option<&QueueFilterInput>,
+    filter: Option<&PreparedQueueFilter>,
 ) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -796,15 +847,15 @@ fn matches_item_filter(
     {
         return false;
     }
-    if !matches_attribute_filter(attributes, filter) {
+    if !matches_attribute_filter_prepared(attributes, filter) {
         return false;
     }
     true
 }
 
-pub(crate) fn matches_attribute_filter(
+pub(crate) fn matches_attribute_filter_prepared(
     attributes: &[Attribute],
-    filter: &QueueFilterInput,
+    filter: &PreparedQueueFilter,
 ) -> bool {
     if let Some(attribute_key) = &filter.has_attribute_key
         && !attributes.iter().any(|entry| entry.key == *attribute_key)

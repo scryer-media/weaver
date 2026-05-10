@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 
 impl Pipeline {
@@ -119,9 +121,13 @@ impl Pipeline {
 
     pub(crate) async fn all_output_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
+        let mut seen = HashSet::new();
         for job in &self.finished_jobs {
             if let Some(dir) = &job.output_dir {
-                dirs.push(PathBuf::from(dir));
+                let path = PathBuf::from(dir);
+                if seen.insert(path.clone()) {
+                    dirs.push(path);
+                }
             }
         }
         let db = self.db.clone();
@@ -133,7 +139,7 @@ impl Pipeline {
             for row in rows {
                 if let Some(dir) = row.output_dir {
                     let path = PathBuf::from(&dir);
-                    if !dirs.contains(&path) {
+                    if seen.insert(path.clone()) {
                         dirs.push(path);
                     }
                 }

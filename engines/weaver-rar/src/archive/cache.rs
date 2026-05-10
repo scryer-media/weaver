@@ -4,6 +4,7 @@
 //! Headers are serialized as named MessagePack maps so added metadata fields
 //! remain backward-compatible.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -266,7 +267,11 @@ impl RarArchive {
     /// with `extract_member_streaming_chunked` which obtains volumes via a
     /// `VolumeProvider` instead of pre-loaded readers.
     pub fn from_cached_headers(cached: CachedArchiveHeaders) -> Self {
-        Self::from_cached_headers_with_password(cached, None::<String>)
+        Self::from_cached_headers_with_password_and_shared_kdf_cache(
+            cached,
+            None::<String>,
+            Arc::new(crate::crypto::KdfCache::new()),
+        )
     }
 
     /// Reconstruct a `RarArchive` from cached headers and optionally restore
@@ -274,6 +279,18 @@ impl RarArchive {
     pub fn from_cached_headers_with_password(
         cached: CachedArchiveHeaders,
         password: impl Into<Option<String>>,
+    ) -> Self {
+        Self::from_cached_headers_with_password_and_shared_kdf_cache(
+            cached,
+            password,
+            Arc::new(crate::crypto::KdfCache::new()),
+        )
+    }
+
+    pub fn from_cached_headers_with_password_and_shared_kdf_cache(
+        cached: CachedArchiveHeaders,
+        password: impl Into<Option<String>>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
     ) -> Self {
         let format = match cached.format {
             4 => ArchiveFormat::Rar4,
@@ -340,8 +357,7 @@ impl RarArchive {
                 }
             })
             .collect();
-
-        RarArchive {
+        let mut archive = RarArchive {
             format,
             is_solid: cached.is_solid,
             is_encrypted: cached.is_encrypted,
@@ -354,8 +370,10 @@ impl RarArchive {
             solid_next_index: 0,
             limits: Limits::default(),
             password: password.into(),
-            kdf_cache: crate::crypto::KdfCache::new(),
-        }
+            kdf_cache,
+        };
+        archive.sort_members_by_physical_order();
+        archive
     }
 
     /// Serialize headers to MessagePack bytes.
@@ -375,8 +393,24 @@ impl RarArchive {
         data: &[u8],
         password: impl Into<Option<String>>,
     ) -> Result<Self, rmp_serde::decode::Error> {
+        Self::deserialize_headers_with_password_and_shared_kdf_cache(
+            data,
+            password,
+            Arc::new(crate::crypto::KdfCache::new()),
+        )
+    }
+
+    pub fn deserialize_headers_with_password_and_shared_kdf_cache(
+        data: &[u8],
+        password: impl Into<Option<String>>,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+    ) -> Result<Self, rmp_serde::decode::Error> {
         let cached = decode_cached_headers(data)?;
-        Ok(Self::from_cached_headers_with_password(cached, password))
+        Ok(
+            Self::from_cached_headers_with_password_and_shared_kdf_cache(
+                cached, password, kdf_cache,
+            ),
+        )
     }
 }
 

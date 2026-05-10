@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::history::types::{history_delete_row_state_from_core, history_diagnostic_run_from_core};
+use crate::history::types::{
+    history_delete_row_state_from_core, history_diagnostic_run_from_core,
+    matches_history_filter_prepared,
+};
+use crate::jobs::types::PreparedQueueFilter;
 
 #[derive(Default)]
 pub(crate) struct HistoryQuery;
@@ -23,6 +27,7 @@ impl HistoryQuery {
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let limit = first.unwrap_or(u32::MAX) as usize;
         let db = ctx.data::<Database>()?.clone();
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
         let items = tokio::task::spawn_blocking(move || {
             let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
@@ -41,7 +46,7 @@ impl HistoryQuery {
                             .map(history_delete_row_state_from_core);
                         history_item_from_row(&row, diagnostic_run, delete_state)
                     })
-                    .filter(|item| matches_history_filter(item, filter.as_ref()))
+                    .filter(|item| matches_history_filter_prepared(item, prepared_filter.as_ref()))
                     .skip(offset)
                     .take(limit)
                     .collect::<Vec<_>>(),
@@ -99,6 +104,7 @@ impl HistoryQuery {
         filter: Option<QueueFilterInput>,
     ) -> Result<u32> {
         let db = ctx.data::<Database>()?.clone();
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
         let count = tokio::task::spawn_blocking(move || {
             let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
@@ -117,7 +123,7 @@ impl HistoryQuery {
                             .map(history_delete_row_state_from_core);
                         history_item_from_row(&row, diagnostic_run, delete_state)
                     })
-                    .filter(|item| matches_history_filter(item, filter.as_ref()))
+                    .filter(|item| matches_history_filter_prepared(item, prepared_filter.as_ref()))
                     .count() as u32,
             )
         })

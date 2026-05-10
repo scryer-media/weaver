@@ -1,4 +1,5 @@
 use super::*;
+use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
 pub(crate) struct CategoriesQuery;
@@ -9,7 +10,11 @@ impl CategoriesQuery {
     #[graphql(guard = "AdminGuard")]
     async fn categories(&self, ctx: &Context<'_>) -> Result<Vec<Category>> {
         let config = ctx.data::<SharedConfig>()?;
-        let cfg = config.read().await;
-        Ok(cfg.categories.iter().map(Category::from).collect())
+        Ok(
+            with_timed_config_read(config, "categories.query.categories", |cfg| {
+                cfg.categories.iter().map(Category::from).collect()
+            })
+            .await,
+        )
     }
 }

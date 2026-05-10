@@ -609,7 +609,7 @@ mod tests {
     fn original_title_metadata_wins_over_job_name() {
         let metadata = vec![(
             "weaver.original_title".to_string(),
-            "Attack.on.Titan.S04E29.1080p.WEB-DL.H.265".to_string(),
+            "Stoneguard.S04E29.1080p.WEB-DL.H.265".to_string(),
         )];
 
         let info = release_display_info(ReleaseDisplayInput {

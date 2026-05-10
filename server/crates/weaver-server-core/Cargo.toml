@@ -48,7 +48,6 @@ aes-gcm = { workspace = true }
 base64 = { workspace = true }
 sevenz-rust2 = { workspace = true }
 argon2 = { workspace = true }
-scrypt = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 pbkdf2 = { workspace = true }

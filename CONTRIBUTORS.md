@@ -1,6 +1,6 @@
 # Contributing to Weaver
 
-This file covers contributor setup notes that sit alongside [ARCHITECTURE.md](/Users/jeremy/dev/scryer-media/weaver/ARCHITECTURE.md).
+This file covers contributor setup notes that sit alongside [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Prerequisites
 
@@ -17,4 +17,4 @@ Enable your terminal under `System Settings -> Privacy & Security -> Developer T
 
 ## Repo Automation
 
-Use `cargo xtask` as the canonical interface for repo automation. See [ARCHITECTURE.md](/Users/jeremy/dev/scryer-media/weaver/ARCHITECTURE.md) for the architectural rules and command surface.
+Use `cargo xtask` as the canonical interface for repo automation. See [ARCHITECTURE.md](ARCHITECTURE.md) for the architectural rules and command surface.

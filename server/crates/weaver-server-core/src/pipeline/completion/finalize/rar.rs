@@ -18,6 +18,7 @@ impl Pipeline {
         }
 
         self.rar_sets.remove(&set_key);
+        self.rar_refresh_state.remove(&set_key);
         self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
     }
 
@@ -65,6 +66,7 @@ impl Pipeline {
 
         if remove_empty_set {
             self.rar_sets.remove(&set_key);
+            self.rar_refresh_state.remove(&set_key);
             persisted_suspect_volumes = Some(HashSet::new());
         } else if let Some(state) = self.rar_sets.get_mut(&set_key) {
             state.phase = if state.active_workers > 0 || !state.in_flight_members.is_empty() {
@@ -154,6 +156,7 @@ impl Pipeline {
 
         self.clear_rar_snapshot(job_id, set_name);
         self.rar_sets.remove(&set_key);
+        self.rar_refresh_state.remove(&set_key);
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.assembly.archive_topologies_mut().remove(set_name);
@@ -161,8 +164,6 @@ impl Pipeline {
 
         for result in [
             self.db.delete_rar_volume_facts_for_set(job_id, set_name),
-            self.db
-                .clear_verified_suspect_volumes_for_set(job_id, set_name),
             self.db.clear_volume_status_for_set(job_id, set_name),
             self.db.clear_extraction_chunks_for_set(job_id, set_name),
         ] {
@@ -175,6 +176,7 @@ impl Pipeline {
                 );
             }
         }
+        self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
     }
 
     fn rar_volume_numbers_by_filename(&self, job_id: JobId) -> HashMap<String, u32> {
@@ -321,15 +323,16 @@ impl Pipeline {
                 .collect()
         };
 
-        self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.clear_verified_suspect_volumes(job_id) {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to clear persisted verified suspect RAR volumes"
-                );
+        let plan_names: HashSet<String> =
+            plans.iter().map(|(set_name, _)| set_name.clone()).collect();
+        for set_name in self.rar_set_names_for_job(job_id) {
+            if !plan_names.contains(&set_name) {
+                if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                    state.verified_suspect_volumes.clear();
+                }
+                self.persist_verified_suspect_volumes(job_id, &set_name, &HashSet::new());
             }
-        });
+        }
 
         for (set_name, suspect) in plans {
             if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
@@ -784,6 +787,95 @@ impl Pipeline {
     }
 
     pub(super) async fn finalize_completed_archive_job(&mut self, job_id: JobId) {
+        if !self.job_has_only_rar_archives(job_id) {
+            let already_extracted = self
+                .extracted_archives
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_default();
+            let already_spawned = self
+                .inflight_extractions
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_default();
+
+            let pending_source_files: Vec<NzbFileId> = {
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                state
+                    .assembly
+                    .files()
+                    .filter(|file| file.is_complete())
+                    .filter_map(|file| {
+                        if !matches!(
+                            self.classified_role_for_file(job_id, file),
+                            weaver_model::files::FileRole::SevenZipArchive
+                                | weaver_model::files::FileRole::SevenZipSplit { .. }
+                                | weaver_model::files::FileRole::ZipArchive
+                                | weaver_model::files::FileRole::TarArchive
+                                | weaver_model::files::FileRole::TarGzArchive
+                                | weaver_model::files::FileRole::TarBz2Archive
+                                | weaver_model::files::FileRole::GzArchive
+                                | weaver_model::files::FileRole::DeflateArchive
+                                | weaver_model::files::FileRole::BrotliArchive
+                                | weaver_model::files::FileRole::ZstdArchive
+                                | weaver_model::files::FileRole::Bzip2Archive
+                                | weaver_model::files::FileRole::SplitFile { .. }
+                        ) {
+                            return None;
+                        }
+                        let set_name = self.classified_archive_set_name_for_file(job_id, file)?;
+                        (!already_extracted.contains(&set_name)
+                            && !already_spawned.contains(&set_name))
+                        .then_some(file.file_id())
+                    })
+                    .collect()
+            };
+
+            for file_id in &pending_source_files {
+                self.refresh_archive_state_for_completed_file(job_id, *file_id, false)
+                    .await;
+            }
+
+            let pending_archives: Vec<(String, crate::jobs::assembly::ArchiveType)> = {
+                let Some(state) = self.jobs.get(&job_id) else {
+                    return;
+                };
+                state
+                    .assembly
+                    .archive_topologies()
+                    .iter()
+                    .filter(|(_, topology)| {
+                        !matches!(
+                            topology.archive_type,
+                            crate::jobs::assembly::ArchiveType::Rar
+                        )
+                    })
+                    .filter(|(name, _)| {
+                        !already_extracted.contains(*name) && !already_spawned.contains(*name)
+                    })
+                    .map(|(name, topology)| (name.clone(), topology.archive_type))
+                    .collect()
+            };
+
+            if !already_spawned.is_empty() && pending_archives.is_empty() {
+                return;
+            }
+            if !pending_archives.is_empty() {
+                if !self.maybe_start_extraction(job_id).await {
+                    return;
+                }
+                self.spawn_extractions(job_id, &pending_archives).await;
+                return;
+            }
+            if !pending_source_files.is_empty() {
+                self.reconcile_job_progress(job_id).await;
+                self.schedule_job_completion_check(job_id);
+                return;
+            }
+        }
+
         if self
             .reconcile_extracted_outputs_for_completion(job_id)
             .await

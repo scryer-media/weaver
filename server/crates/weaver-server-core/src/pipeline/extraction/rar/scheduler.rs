@@ -5,6 +5,7 @@ struct ReadyRarExtraction {
     members: Vec<String>,
     volume_paths_map: std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<Vec<u8>>,
+    shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
     password: Option<String>,
     is_solid: bool,
 }
@@ -17,6 +18,14 @@ impl Pipeline {
 
     fn rar_set_worker_limit(plan: &crate::pipeline::archive::rar_state::RarDerivedPlan) -> usize {
         if plan.is_solid { 1 } else { 2 }
+    }
+
+    fn is_stale_topology_batch_extraction_error(error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        error.contains("member not found in archive")
+            || lower.contains("not registered")
+            || lower.contains("unavailable")
+            || lower.contains("no on-disk rar volumes")
     }
 
     pub(crate) fn rar_member_can_start_extraction(
@@ -35,12 +44,59 @@ impl Pipeline {
             })
     }
 
+    pub(in crate::pipeline) fn rar_member_refresh_request(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+    ) -> Option<RarRefreshRequest> {
+        let (_, last_volume) = self.member_volume_span(job_id, set_name, member_name)?;
+        let state = self
+            .rar_refresh_state
+            .get(&(job_id, set_name.to_string()))?;
+        let target_completed_volume = state.latest_completed_volume.max(last_volume);
+        if state.last_error.is_some() {
+            return Some(RarRefreshRequest {
+                target_completed_volume,
+                reason: RefreshReason::ValidationFailure,
+            });
+        }
+        if state.structure_dirty {
+            return Some(RarRefreshRequest {
+                target_completed_volume,
+                reason: RefreshReason::IdentityRebind,
+            });
+        }
+        if last_volume > state.refreshed_through_volume {
+            return Some(RarRefreshRequest {
+                target_completed_volume,
+                reason: RefreshReason::CoverageExpansion,
+            });
+        }
+        state
+            .in_flight
+            .into_iter()
+            .chain(state.queued)
+            .filter(|request| request.reason > RefreshReason::CoverageExpansion)
+            .max_by_key(|request| request.reason)
+    }
+
     pub(crate) fn rar_volume_paths_need_header_refresh(
         &self,
         job_id: JobId,
         set_name: &str,
         volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
     ) -> bool {
+        if self
+            .active_downloads_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return false;
+        }
+
         self.rar_sets
             .get(&(job_id, set_name.to_string()))
             .is_some_and(|state| {
@@ -82,46 +138,6 @@ impl Pipeline {
         } else {
             selected
         }
-    }
-
-    fn revalidate_rar_members_from_registered_volumes(
-        set_name: &str,
-        candidates: &[String],
-        volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
-        cached_headers: Option<Vec<u8>>,
-        password: Option<String>,
-        refresh_provided_volumes: bool,
-    ) -> Result<HashSet<String>, String> {
-        let selected = candidates
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let archive = Self::open_rar_archive_from_snapshot_or_disk(
-            set_name,
-            volume_paths.clone(),
-            password,
-            cached_headers,
-            refresh_provided_volumes,
-        )?;
-        let mut grouped = HashMap::<String, (usize, bool)>::new();
-        for state in archive.planner_member_states() {
-            if !selected.contains(state.name.as_str()) {
-                continue;
-            }
-            let entry = grouped.entry(state.name).or_default();
-            entry.0 += 1;
-            entry.1 |= state.extractable;
-        }
-
-        Ok(candidates
-            .iter()
-            .filter(|member| {
-                grouped
-                    .get(member.as_str())
-                    .is_some_and(|(_, extractable)| *extractable)
-            })
-            .cloned()
-            .collect())
     }
 
     fn reconcile_waiting_members_for_set(
@@ -230,10 +246,17 @@ impl Pipeline {
             return;
         }
 
+        let generic_full_set_inflight = self
+            .inflight_extractions
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+
         let mut candidate_sets: Vec<(String, Vec<String>, bool)> = self
             .rar_sets
             .iter()
             .filter(|((jid, _), _)| *jid == job_id)
+            .filter(|((_, set_name), _)| !generic_full_set_inflight.contains(set_name))
             .filter_map(|((_, set_name), set_state)| {
                 let plan = set_state.plan.as_ref()?;
                 let is_solid = plan.is_solid;
@@ -269,6 +292,27 @@ impl Pipeline {
 
         let mut ready_sets = Vec::new();
         for (set_name, candidate_members, is_solid) in candidate_sets {
+            let mut gated_members = Vec::new();
+            let mut blocked_members = Vec::new();
+            for member in candidate_members {
+                if let Some(request) = self.rar_member_refresh_request(job_id, &set_name, &member) {
+                    self.enqueue_rar_set_refresh(
+                        job_id,
+                        &set_name,
+                        request.target_completed_volume,
+                        request.reason,
+                    );
+                    blocked_members.push(member);
+                } else {
+                    gated_members.push(member);
+                }
+            }
+            if !blocked_members.is_empty() {
+                self.reconcile_waiting_members_for_set(job_id, &set_name, &blocked_members);
+            }
+            if gated_members.is_empty() {
+                continue;
+            }
             let volume_paths_map = self.volume_paths_for_rar_set(job_id, &set_name);
             if volume_paths_map.is_empty() {
                 continue;
@@ -281,93 +325,17 @@ impl Pipeline {
             else {
                 return;
             };
-            let validation_volume_paths = self.volume_paths_for_rar_members(
-                job_id,
-                &set_name,
-                &candidate_members,
-                &volume_paths_map,
-                cached_headers.is_some(),
-                is_solid,
-            );
-            let refresh_validation_headers = self.rar_volume_paths_need_header_refresh(
-                job_id,
-                &set_name,
-                &validation_volume_paths,
-            );
-            let extractable = match Self::revalidate_rar_members_from_registered_volumes(
-                &set_name,
-                &candidate_members,
-                &validation_volume_paths,
-                cached_headers.clone(),
-                password.clone(),
-                refresh_validation_headers,
-            ) {
-                Ok(extractable) => extractable,
-                Err(error) => {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        error = %error,
-                        "skipping RAR extraction scheduling after readiness revalidation failed"
-                    );
-                    if let Err(recompute_error) =
-                        self.recompute_rar_set_state(job_id, &set_name).await
-                    {
-                        warn!(
-                            job_id = job_id.0,
-                            set_name = %set_name,
-                            error = %recompute_error,
-                            "failed to refresh RAR state after readiness revalidation failed"
-                        );
-                    }
-                    self.reconcile_waiting_members_for_set(job_id, &set_name, &candidate_members);
-                    continue;
-                }
-            };
-            let mut extractable_members = extractable.iter().cloned().collect::<Vec<_>>();
-            extractable_members.sort();
-
-            let rejected_members = candidate_members
-                .iter()
-                .filter(|member| !extractable.contains(member.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
-            info!(
-                job_id = job_id.0,
-                set_name = %set_name,
-                candidate_members = ?candidate_members,
-                extractable_members = ?extractable_members,
-                rejected_members = ?rejected_members,
-                validation_volumes = ?validation_volume_paths.keys().copied().collect::<Vec<_>>(),
-                cached_headers = cached_headers.is_some(),
-                refresh_validation_headers,
-                is_solid,
-                "RAR extraction scheduling revalidated members"
-            );
-            if !rejected_members.is_empty() {
-                if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        error = %error,
-                        "failed to refresh RAR state after readiness revalidation rejected members"
-                    );
-                }
-                self.reconcile_waiting_members_for_set(job_id, &set_name, &rejected_members);
-            }
-
-            let members = candidate_members
-                .into_iter()
-                .filter(|member| extractable.contains(member))
-                .collect::<Vec<_>>();
-            if members.is_empty() {
-                continue;
-            }
+            let shared_kdf_cache = self
+                .rar_sets
+                .get(&(job_id, set_name.clone()))
+                .map(|state| state.shared_kdf_cache.clone())
+                .unwrap_or_else(|| std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()));
             ready_sets.push(ReadyRarExtraction {
                 set_name,
-                members,
+                members: gated_members,
                 volume_paths_map,
                 cached_headers,
+                shared_kdf_cache,
                 password,
                 is_solid,
             });
@@ -388,6 +356,7 @@ impl Pipeline {
                 members: ready_members,
                 volume_paths_map,
                 cached_headers,
+                shared_kdf_cache,
                 password,
                 is_solid,
             } = ready_set;
@@ -404,11 +373,6 @@ impl Pipeline {
                     &volume_paths_map,
                     cached_headers.is_some(),
                     is_solid,
-                );
-                let refresh_member_headers = self.rar_volume_paths_need_header_refresh(
-                    job_id,
-                    &set_name,
-                    &volume_paths_for_member,
                 );
                 info!(
                     job_id = job_id.0,
@@ -454,6 +418,7 @@ impl Pipeline {
                 let volume_paths_for_task = volume_paths_for_member;
                 let cached_headers_for_task = cached_headers.clone();
                 let password_for_task = password.clone();
+                let shared_kdf_cache_for_task = shared_kdf_cache.clone();
                 let pp_pool = self.pp_pool.clone();
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
@@ -463,7 +428,8 @@ impl Pipeline {
                                 volume_paths_for_task.clone(),
                                 password_for_task.clone(),
                                 cached_headers_for_task,
-                                refresh_member_headers,
+                                shared_kdf_cache_for_task,
+                                RarArchiveOpenMode::AttachOnly,
                             )?;
 
                             let options = weaver_rar::ExtractOptions {
@@ -642,6 +608,16 @@ impl Pipeline {
             return;
         }
 
+        if !self.job_has_pending_download_pipeline_work(job_id) {
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                member = %member_name,
+                "skipping lower-bound targeted promotion because the download pipeline is already exhausted"
+            );
+            return;
+        }
+
         let (working_dir, par2_set) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -651,6 +627,11 @@ impl Pipeline {
             };
             (state.working_dir.clone(), par2_set)
         };
+
+        #[cfg(test)]
+        {
+            self.par2_lower_bound_preflight_calls += 1;
+        }
 
         let pp_pool = self.pp_pool.clone();
         let lower_bound = tokio::task::spawn_blocking(move || {
@@ -716,6 +697,55 @@ impl Pipeline {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_promote_recovery_for_failed_member(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+    ) {
+        self.promote_recovery_for_failed_member(job_id, set_name, member_name)
+            .await;
+    }
+
+    async fn settle_rar_set_after_extraction_worker(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        let key = (job_id, set_name.to_string());
+        let Some(set_state) = self.rar_sets.get(&key) else {
+            return false;
+        };
+        if set_state.active_workers > 0 || !set_state.in_flight_members.is_empty() {
+            self.enqueue_rar_set_refresh(
+                job_id,
+                set_name,
+                self.latest_completed_rar_volume(job_id, set_name),
+                RefreshReason::PostExtraction,
+            );
+            return true;
+        }
+
+        // UnRAR keeps volume readers owned by the extraction call and switches
+        // volumes from inside that call (ExtractCurrentFile -> MergeArchive).
+        // Once the worker has returned, no reader is live, so we can refresh
+        // extracted/failed ownership and run the conservative delete audit.
+        if let Err(error) = self.recompute_rar_set_state(job_id, set_name).await {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                error = %error,
+                "failed to recompute RAR set after extraction worker completed"
+            );
+            return false;
+        }
+        if self.rar_sets.contains_key(&key) {
+            self.try_delete_volumes(job_id, set_name);
+        }
+        false
+    }
+
     pub(crate) async fn handle_extraction_done(&mut self, done: ExtractionDone) {
         match done {
             ExtractionDone::Batch {
@@ -776,58 +806,96 @@ impl Pipeline {
                             self.clear_failed_extraction_member(job_id, name);
                         }
                         for (member, error) in &outcome.failed {
-                            warn!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                member = %member,
-                                error = %error,
-                                "RAR batch member failed"
+                            if Self::is_stale_topology_batch_extraction_error(error) {
+                                warn!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    member = %member,
+                                    error = %error,
+                                    "RAR batch member hit stale topology; queueing validation refresh"
+                                );
+                            } else {
+                                warn!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    member = %member,
+                                    error = %error,
+                                    "RAR batch member failed"
+                                );
+                                self.set_failed_extraction_member(job_id, member);
+                                self.promote_recovery_for_failed_member(job_id, &set_name, member)
+                                    .await;
+                            }
+                        }
+                        let refresh_retry_members = outcome
+                            .failed
+                            .iter()
+                            .filter_map(|(member, error)| {
+                                Self::is_stale_topology_batch_extraction_error(error)
+                                    .then_some(member.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        if !refresh_retry_members.is_empty() {
+                            self.enqueue_rar_set_refresh(
+                                job_id,
+                                &set_name,
+                                self.latest_completed_rar_volume(job_id, &set_name),
+                                RefreshReason::ValidationFailure,
                             );
-                            self.set_failed_extraction_member(job_id, member);
-                            self.promote_recovery_for_failed_member(job_id, &set_name, member)
-                                .await;
+                            self.reconcile_waiting_members_for_set(
+                                job_id,
+                                &set_name,
+                                &refresh_retry_members,
+                            );
                         }
                     }
                     Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            set_name = %set_name,
-                            attempted = ?attempted,
-                            error = %error,
-                            "RAR batch extraction worker failed"
-                        );
-                        for member in &attempted {
-                            self.set_failed_extraction_member(job_id, member);
-                            self.promote_recovery_for_failed_member(job_id, &set_name, member)
-                                .await;
+                        if Self::is_stale_topology_batch_extraction_error(&error) {
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                attempted = ?attempted,
+                                error = %error,
+                                "RAR batch extraction worker hit stale topology; queueing validation refresh"
+                            );
+                            self.enqueue_rar_set_refresh(
+                                job_id,
+                                &set_name,
+                                self.latest_completed_rar_volume(job_id, &set_name),
+                                RefreshReason::ValidationFailure,
+                            );
+                            self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                        } else {
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                attempted = ?attempted,
+                                error = %error,
+                                "RAR batch extraction worker failed"
+                            );
+                            for member in &attempted {
+                                self.set_failed_extraction_member(job_id, member);
+                                self.promote_recovery_for_failed_member(job_id, &set_name, member)
+                                    .await;
+                            }
                         }
                     }
                 }
 
                 self.purge_empty_rar_set_if_idle(job_id, &set_name);
-                if self.rar_sets.contains_key(&(job_id, set_name.clone()))
-                    && let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await
-                {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        error,
-                        "failed to refresh RAR set state after batch extraction"
-                    );
-                }
+                let queued_post_extraction_refresh = self
+                    .settle_rar_set_after_extraction_worker(job_id, &set_name)
+                    .await;
                 if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
                     self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
                 }
                 self.reconcile_job_progress(job_id).await;
-                if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
-                    self.try_delete_volumes(job_id, &set_name);
-                }
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
-                if all_downloaded {
+                if all_downloaded && !queued_post_extraction_refresh {
                     self.check_job_completion(job_id).await;
-                } else {
+                } else if !all_downloaded {
                     self.try_rar_extraction(job_id).await;
                 }
             }
@@ -895,14 +963,13 @@ impl Pipeline {
                         }
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
-                    if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
-                        let _ = self.recompute_rar_set_state(job_id, &set_name).await;
-                    }
+                    let queued_post_extraction_refresh = self
+                        .settle_rar_set_after_extraction_worker(job_id, &set_name)
+                        .await;
                     self.reconcile_job_progress(job_id).await;
-                    if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
-                        self.try_delete_volumes(job_id, &set_name);
+                    if !queued_post_extraction_refresh {
+                        self.check_job_completion(job_id).await;
                     }
-                    self.check_job_completion(job_id).await;
                 }
                 Err(e) => {
                     warn!(

@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["native-crypto"]
+native-crypto = ["dep:aws-lc-sys"]
 slow-tests = []
 
 [dependencies]
@@ -16,11 +18,9 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 md-5 = { workspace = true }
+aws-lc-sys = { workspace = true, optional = true }
 rayon = { workspace = true }
 memmap2 = { workspace = true }
-
-[target.'cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(target_env = "msvc")))'.dependencies]
-md-5 = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]
 tempfile = "3"

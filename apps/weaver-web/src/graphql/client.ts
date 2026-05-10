@@ -295,6 +295,11 @@ export function authHeaders(): Record<string, string> {
   return sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {};
 }
 
+/** Session token used for same-origin REST downloads that cannot set headers. */
+export function getSessionToken(): string | undefined {
+  return sessionToken;
+}
+
 /**
  * Fetch the index page from the server and extract a fresh session token.
  * After a server restart, the token embedded in the original HTML is stale —

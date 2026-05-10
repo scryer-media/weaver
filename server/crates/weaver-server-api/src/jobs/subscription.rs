@@ -1,4 +1,7 @@
 use super::*;
+use crate::jobs::types::{
+    PreparedQueueFilter, matches_queue_event_filter_prepared, matches_queue_filter_prepared,
+};
 
 #[derive(Default)]
 pub(crate) struct JobsSubscription;
@@ -56,6 +59,7 @@ impl JobsSubscription {
             .data::<weaver_server_core::settings::SharedConfig>()?
             .clone();
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
         let event_rx = handle.subscribe_events();
 
         let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
@@ -71,7 +75,7 @@ impl JobsSubscription {
             let handle = handle.clone();
             let config = config.clone();
             let replay = replay.clone();
-            let filter = filter.clone();
+            let prepared_filter = prepared_filter.clone();
             async move {
                 let items: Vec<QueueItem> = handle
                     .list_jobs()
@@ -84,7 +88,7 @@ impl JobsSubscription {
                         )
                     })
                     .map(|info| queue_item_from_job(&info))
-                    .filter(|item| matches_queue_filter(item, filter.as_ref()))
+                    .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
                     .collect();
                 let metrics = handle.get_metrics();
                 let latest_cursor = replay.latest_cursor().await;
@@ -129,13 +133,14 @@ impl JobsSubscription {
 
         Ok(async_stream::stream! {
             let mut last_seen = after.unwrap_or(0);
+            let prepared_filter = PreparedQueueFilter::new(filter_for_stream.as_ref());
 
             for notification in initial {
                 if notification.id <= last_seen {
                     continue;
                 }
                 last_seen = notification.id;
-                if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
                     yield notification.event;
                 }
             }
@@ -147,7 +152,7 @@ impl JobsSubscription {
                             continue;
                         }
                         last_seen = notification.id;
-                        if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                        if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
                             yield notification.event;
                         }
                     }
@@ -163,7 +168,7 @@ impl JobsSubscription {
                                         continue;
                                     }
                                     last_seen = notification.id;
-                                    if matches_queue_event_filter(&notification.event, filter_for_stream.as_ref()) {
+                                    if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
                                         yield notification.event;
                                     }
                                 }

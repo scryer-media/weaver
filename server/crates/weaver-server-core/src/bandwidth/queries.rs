@@ -9,7 +9,7 @@ impl Database {
         start_bucket_epoch_minute: i64,
         end_bucket_epoch_minute: i64,
     ) -> Result<u64, StateError> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let total: Option<i64> = conn
             .query_row(
                 "SELECT SUM(payload_bytes)

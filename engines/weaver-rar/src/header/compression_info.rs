@@ -25,7 +25,7 @@ fn rar5_dict_size(dict_code: u8) -> RarResult<u64> {
 
 fn rar7_dict_size(raw: u64) -> RarResult<u64> {
     let dict_code = ((raw >> 10) & 0x1F) as u8;
-    let fraction = ((raw >> 15) & 0x1F) as u64;
+    let fraction = (raw >> 15) & 0x1F;
     let base = rar5_dict_size(dict_code)?;
     Ok(base + (base / 32) * fraction)
 }

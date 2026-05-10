@@ -97,16 +97,23 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - name: Install native build deps
-        run: sudo apt-get install -y --no-install-recommends nasm
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl")" >> "$GITHUB_ENV"
       - name: Run clippy
-        run: cargo clippy --workspace --locked --lib --bins --tests --examples -- -D warnings
+        run: cargo clippy --workspace --locked --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings
 
   rust-test:
     name: rust-test
@@ -120,16 +127,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install native build deps
-        run: sudo apt-get install -y --no-install-recommends nasm
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl")" >> "$GITHUB_ENV"
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
 
   rust-test-arm:
     name: rust-test-arm
@@ -142,9 +156,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install musl target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl")" >> "$GITHUB_ENV"
       - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
-        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests
+        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
@@ -167,6 +190,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
       - name: Install Intel SDE
         run: |
@@ -175,10 +204,10 @@ jobs:
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build par2 tests (${{ matrix.name }})
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --features slow-tests --no-run --locked --target x86_64-unknown-linux-gnu --message-format=json \
+          cargo test --package weaver-par2 --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
@@ -189,14 +218,10 @@ jobs:
             echo "::endgroup::"
           done < /tmp/test-bins.txt
 
-  # ── Release packaging (tag pushes only) ──────────────────────────────────
-
-  rust-package:
-    name: rust-package-${{ matrix.platform }}
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+  rust-crypto-targets:
+    name: rust-crypto-${{ matrix.platform }}
     runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 60
-    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test, rust-test-arm, rust-test-sde]
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +240,87 @@ jobs:
             runs_on: macos-26
           - target: x86_64-pc-windows-msvc
             platform: windows-x86_64
-            runs_on: windows-latest
+            runs_on: windows-2025-vs2026
+          - target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            runs_on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold
+      - name: Install NASM (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y nasm
+      - name: Install NASM (macOS x86_64)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: brew install nasm
+      - name: Install NASM (Windows x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: crypto-${{ matrix.platform }}
+      - name: Verify target crypto config
+        run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}"
+      - name: Set target CPU flags (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}")" >> "$GITHUB_ENV"
+      - name: Set target CPU flags (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}"
+          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Check native crypto crates
+        run: cargo check --locked -p weaver-rar -p weaver-par2 --target ${{ matrix.target }}
+
+  # ── Release packaging (tag pushes only) ──────────────────────────────────
+
+  rust-package:
+    name: rust-package-${{ matrix.platform }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test, rust-test-arm, rust-test-sde, rust-crypto-targets]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux-x86_64
+            runs_on: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            platform: linux-arm64
+            runs_on: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            platform: darwin-arm64
+            runs_on: macos-26
+          - target: x86_64-apple-darwin
+            platform: darwin-x86_64
+            runs_on: macos-26
+          - target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            runs_on: windows-2025-vs2026
           - target: aarch64-pc-windows-msvc
             platform: windows-arm64
             runs_on: windows-11-arm
@@ -262,23 +367,13 @@ jobs:
       - name: Set target CPU flags (Unix)
         if: runner.os != 'Windows'
         run: |
-          case "${{ matrix.target }}" in
-            x86_64-*)
-              echo "RUSTFLAGS=-C target-cpu=haswell" >> "$GITHUB_ENV" ;;
-            aarch64-apple-*)
-              echo "RUSTFLAGS=-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
-            aarch64-*-linux-*)
-              echo "RUSTFLAGS=-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon" >> "$GITHUB_ENV" ;;
-          esac
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}")" >> "$GITHUB_ENV"
       - name: Set target CPU flags (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if ("${{ matrix.target }}" -like "x86_64-*") {
-            echo "RUSTFLAGS=-C target-cpu=haswell -C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          } else {
-            echo "RUSTFLAGS=-C target-cpu=cortex-a76 -C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          }
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}"
+          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build release binary (Unix)
         if: runner.os != 'Windows'
         run: |

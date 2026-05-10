@@ -6,7 +6,6 @@ use axum::http::{HeaderMap, HeaderValue, Request, header};
 use axum::routing::{get, post};
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
-use scrypt::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -21,14 +20,6 @@ use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SharedPipelineState};
-
-fn legacy_scrypt_hash(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
-    scrypt::Scrypt
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
 
 fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
     Router::new()
@@ -58,6 +49,7 @@ fn job_nzb_test_router(db: Database, handle: SchedulerHandle) -> Router {
             "/api/jobs/{job_id}/output-file",
             post(jobs::job_output_file_download_handler),
         )
+        .layer(super::compression_layer())
         .layer(Extension(handle))
         .layer(Extension(db))
         .layer(Extension(auth_cache))
@@ -156,12 +148,13 @@ async fn resolve_scope_accepts_cached_api_key_without_db_lookup() {
 }
 
 #[tokio::test]
-async fn login_handler_rehashes_legacy_scrypt_and_updates_cache() {
+async fn login_handler_rejects_legacy_scrypt_hash() {
     let db = Database::open_in_memory().unwrap();
-    let legacy_hash = legacy_scrypt_hash("hunter2");
+    let legacy_hash =
+        "$scrypt$ln=16,r=8,p=1$MDAwMDAwMDAwMDAwMDAwMA$MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
+            .to_string();
     db.set_auth_credentials("admin", &legacy_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
-    let old_secret = auth_cache.snapshot().unwrap().jwt_secret;
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
     let response = app
@@ -176,33 +169,17 @@ async fn login_handler_rehashes_legacy_scrypt_and_updates_cache() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap()
-        .to_string();
-    let token = set_cookie
-        .split(';')
-        .next()
-        .unwrap()
-        .strip_prefix("weaver_jwt=")
-        .unwrap();
-
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let stored = db.get_auth_credentials().unwrap().unwrap();
-    assert!(stored.password_hash.starts_with("$argon2id$"));
-    let cached = auth_cache.snapshot().unwrap();
-    assert_eq!(cached.password_hash, stored.password_hash);
-    assert!(jwt::verify_jwt(token, &cached.jwt_secret).is_ok());
-    assert!(jwt::verify_jwt(token, &old_secret).is_err());
+    assert_eq!(stored.password_hash, legacy_hash);
+    assert_eq!(auth_cache.snapshot().unwrap().password_hash, legacy_hash);
 }
 
 #[tokio::test]
-async fn login_handler_wrong_password_keeps_legacy_hash_and_cache() {
+async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
     let db = Database::open_in_memory().unwrap();
-    let legacy_hash = legacy_scrypt_hash("hunter2");
-    db.set_auth_credentials("admin", &legacy_hash).unwrap();
+    let argon2_hash = hash_password("hunter2").unwrap();
+    db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -221,7 +198,7 @@ async fn login_handler_wrong_password_keeps_legacy_hash_and_cache() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let stored = db.get_auth_credentials().unwrap().unwrap();
-    assert_eq!(stored.password_hash, legacy_hash);
+    assert_eq!(stored.password_hash, argon2_hash);
     assert_eq!(auth_cache.snapshot().unwrap(), original);
 }
 
@@ -335,6 +312,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
                 .method("GET")
                 .uri("/api/jobs/10000/nzb")
                 .header(header::AUTHORIZATION, "Bearer session-token")
+                .header(header::ACCEPT_ENCODING, "gzip")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -356,6 +334,14 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
             .and_then(|value| value.to_str().ok()),
         Some("attachment; filename=\"Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb\"")
     );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(xml.len().to_string().as_str())
+    );
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, Bytes::from(xml));
@@ -399,6 +385,7 @@ async fn job_output_file_download_handler_streams_history_file() {
                 .method("POST")
                 .uri("/api/jobs/10001/output-file")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ACCEPT_ENCODING, "gzip")
                 .body(Body::from(format!(
                     "path={}&token=session-token",
                     file_path.display()
@@ -416,6 +403,14 @@ async fn job_output_file_download_handler_streams_history_file() {
             .and_then(|value| value.to_str().ok()),
         Some("attachment; filename=\"episode-01.mkv\"")
     );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some("11")
+    );
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, Bytes::from_static(b"video-bytes"));
 }

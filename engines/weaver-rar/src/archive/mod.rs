@@ -13,6 +13,7 @@ pub use cache::CachedArchiveHeaders;
 pub use facts::{RarVolumeFacts, RarVolumeMemberFacts};
 
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::decompress::lz::LzDecoder;
 use crate::decompress::rar4::Rar4LzDecoder;
@@ -110,7 +111,7 @@ pub struct RarArchive {
     /// Password for decrypting encrypted archives/members.
     pub(super) password: Option<String>,
     /// Cache for expensive key derivation (shared across member extractions).
-    pub(super) kdf_cache: crate::crypto::KdfCache,
+    pub(super) kdf_cache: Arc<crate::crypto::KdfCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,8 +124,15 @@ pub struct MemberPlannerState {
 impl RarArchive {
     /// Open and parse a RAR archive from a reader.
     pub fn open(reader: impl Read + Seek + Send + 'static) -> RarResult<Self> {
+        Self::open_with_shared_kdf_cache(reader, Arc::new(crate::crypto::KdfCache::new()))
+    }
+
+    pub fn open_with_shared_kdf_cache(
+        reader: impl Read + Seek + Send + 'static,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<Self> {
         let reader: Box<dyn ReadSeek> = Box::new(reader);
-        Self::open_boxed_inner(reader, None)
+        Self::open_boxed_inner(reader, None, kdf_cache)
     }
 
     /// Open and parse an encrypted RAR archive with a password.
@@ -135,8 +143,20 @@ impl RarArchive {
         reader: impl Read + Seek + Send + 'static,
         password: &str,
     ) -> RarResult<Self> {
+        Self::open_with_password_and_shared_kdf_cache(
+            reader,
+            password,
+            Arc::new(crate::crypto::KdfCache::new()),
+        )
+    }
+
+    pub fn open_with_password_and_shared_kdf_cache(
+        reader: impl Read + Seek + Send + 'static,
+        password: &str,
+        kdf_cache: Arc<crate::crypto::KdfCache>,
+    ) -> RarResult<Self> {
         let reader: Box<dyn ReadSeek> = Box::new(reader);
-        Self::open_boxed_inner(reader, Some(password))
+        Self::open_boxed_inner(reader, Some(password), kdf_cache)
     }
 
     /// Set or update the password for decrypting encrypted members.
