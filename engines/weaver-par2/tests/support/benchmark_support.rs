@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use weaver_par2::Par2FileSet;
 
-pub const DEFAULT_TURBO_BINARY: &str =
-    "par2";
+pub const DEFAULT_TURBO_BINARY: &str = "par2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurboMode {

@@ -1962,7 +1962,10 @@ mod tests {
             return crate_fixture;
         }
 
-        panic!("missing slow-test fixture {name}; looked in {}", crate_fixture.display());
+        panic!(
+            "missing slow-test fixture {name}; looked in {}",
+            crate_fixture.display()
+        );
     }
 
     #[cfg(feature = "slow-tests")]
