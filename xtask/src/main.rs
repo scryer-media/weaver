@@ -34,6 +34,8 @@ const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[&str] = &["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"];
+const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &["/Users/", "/home/", "C:\\Users\\", "C:/Users/"];
+const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &["../e2e/", "..\\e2e\\"];
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -665,6 +667,81 @@ fn git_tracked_dirty_paths(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| ctx.path(line))
         .collect())
+}
+
+fn git_tracked_files(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
+    let mut command = ctx.command_in("git", &ctx.repo_root);
+    command.args(["ls-files", "-z"]);
+    let debug = format!("{command:?}");
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("command failed: {debug}\n{stderr}");
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| ctx.path(String::from_utf8_lossy(entry).as_ref()))
+        .collect())
+}
+
+fn scan_release_hygiene_content(path: &Path, content: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for (line_number, line) in content.lines().enumerate() {
+        let line_number = line_number + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if RELEASE_LOCAL_PATH_TOKENS
+            .iter()
+            .any(|token| line.contains(token))
+        {
+            violations.push(format!(
+                "{}:{line_number}: local absolute path reference: {trimmed}",
+                path.display()
+            ));
+        }
+
+        if RELEASE_SIBLING_E2E_TOKENS
+            .iter()
+            .any(|token| line.contains(token))
+        {
+            violations.push(format!(
+                "{}:{line_number}: sibling e2e repo reference: {trimmed}",
+                path.display()
+            ));
+        }
+    }
+
+    violations
+}
+
+fn release_hygiene_violations(ctx: &TaskContext) -> Result<Vec<String>> {
+    let mut violations = Vec::new();
+
+    for path in git_tracked_files(ctx)? {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(&ctx.repo_root)
+            .unwrap_or(path.as_path())
+            .to_path_buf();
+        let content = String::from_utf8_lossy(&bytes);
+        violations.extend(scan_release_hygiene_content(&relative, &content));
+    }
+
+    violations.sort();
+    Ok(violations)
 }
 
 fn current_branch(ctx: &TaskContext) -> Result<String> {
@@ -1315,7 +1392,25 @@ fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
 
 fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     run_weaver_rust_prep_validation(ctx, prefix)?;
-    run_weaver_web_validation(ctx, prefix)
+    run_weaver_web_validation(ctx, prefix)?;
+    run_weaver_release_hygiene_validation(ctx, prefix)
+}
+
+fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Checking release hygiene");
+    let violations = release_hygiene_violations(ctx)?;
+    if !violations.is_empty() {
+        bail!(
+            "release hygiene check failed:\n{}",
+            violations
+                .into_iter()
+                .map(|violation| format!("  - {violation}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    prefixed_ok(prefix, "Release hygiene check passed");
+    Ok(())
 }
 
 fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
@@ -2430,5 +2525,47 @@ mod tests {
                 .to_string()
                 .contains("unsupported native crypto target: x86_64-unknown-linux-gnu")
         );
+    }
+
+    #[test]
+    fn release_hygiene_flags_local_absolute_paths() {
+        let violations = scan_release_hygiene_content(
+            Path::new("engines/weaver-par2/tests/support/benchmark_support.rs"),
+            "const DEFAULT: &str = \"/Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2\";",
+        );
+
+        assert_eq!(
+            violations,
+            vec![
+                "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"/Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2\";"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn release_hygiene_flags_sibling_e2e_paths() {
+        let violations = scan_release_hygiene_content(
+            Path::new("engines/weaver-par2/src/repairer.rs"),
+            "let fixture = manifest_dir.join(\"../../../e2e/testdata\").join(name);",
+        );
+
+        assert_eq!(
+            violations,
+            vec![
+                "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"../../../e2e/testdata\").join(name);"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn release_hygiene_allows_repo_local_paths() {
+        let violations = scan_release_hygiene_content(
+            Path::new("engines/weaver-par2/src/repairer.rs"),
+            "let fixture = manifest_dir.join(\"tests/fixtures\").join(name);",
+        );
+
+        assert!(violations.is_empty());
     }
 }
