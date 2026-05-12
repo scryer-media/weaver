@@ -36,7 +36,7 @@ const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[&str] = &["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"];
 const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("/", "Users/"),
-    "/home/",
+    concat!("/", "home/"),
     concat!("C:\\", "Users\\"),
     concat!("C:/", "Users/"),
 ];
@@ -2567,7 +2567,8 @@ mod tests {
             Path::new("engines/weaver-par2/src/repairer.rs"),
             concat!(
                 "let fixture = manifest_dir.join(\"..",
-                "/../../e2e/testdata\").join(name);"
+                "/../..",
+                "/e2e/testdata\").join(name);"
             ),
         );
 
@@ -2576,7 +2577,8 @@ mod tests {
             vec![
                 concat!(
                     "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
-                    "/../../e2e/testdata\").join(name);"
+                    "/../..",
+                    "/e2e/testdata\").join(name);"
                 )
                     .to_string()
             ]
