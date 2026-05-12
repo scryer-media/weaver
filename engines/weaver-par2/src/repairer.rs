@@ -1268,6 +1268,16 @@ struct PendingMd5Check<'a> {
     kind: BlockLocationKind,
 }
 
+struct OrderedWindowMatch<'a> {
+    path: &'a Path,
+    kind: BlockLocationKind,
+    target_file_id: &'a FileId,
+    expected_block: Option<usize>,
+    data: &'a [u8],
+    crc: u32,
+    offset: u64,
+}
+
 struct OrderedWindowCursor<'a> {
     file: File,
     len: usize,
@@ -1470,14 +1480,16 @@ impl<'a> RollingBlockScanner<'a> {
                 .and_then(|position| ordered_full_blocks.get(position))
                 .copied();
             let selected = self.scan_ordered_window(
-                path,
-                kind,
-                target_file,
+                OrderedWindowMatch {
+                    path,
+                    kind,
+                    target_file_id: &target_file.file_id,
+                    expected_block,
+                    data: cursor.data(),
+                    crc: cursor.crc(),
+                    offset: cursor.offset() as u64,
+                },
                 blocks,
-                expected_block,
-                cursor.data(),
-                cursor.crc(),
-                cursor.offset() as u64,
             );
 
             if let Some(selected) = selected {
@@ -1536,53 +1548,51 @@ impl<'a> RollingBlockScanner<'a> {
 
     fn scan_ordered_window(
         &self,
-        path: &Path,
-        kind: BlockLocationKind,
-        target_file: &SourceFileEntry,
+        window: OrderedWindowMatch<'_>,
         blocks: &mut [SourceBlock],
-        expected_block: Option<usize>,
-        data: &[u8],
-        crc: u32,
-        offset: u64,
     ) -> Option<usize> {
         let mut selected = None;
         let mut md5 = None;
 
-        if let Some(expected_block) = expected_block {
+        if let Some(expected_block) = window.expected_block {
             let block = &blocks[expected_block];
-            if block.expected_len == self.table.slice_size && block.checksum.crc32 == crc {
-                let digest = checksum::md5(data);
+            if block.expected_len == self.table.slice_size && block.checksum.crc32 == window.crc {
+                let digest = checksum::md5(window.data);
                 md5 = Some(digest);
-                if block.checksum.md5 == digest {
-                    if can_select_ordered_match(expected_block, Some(expected_block), path, blocks)
-                    {
-                        selected = Some(expected_block);
-                    }
+                if block.checksum.md5 == digest
+                    && can_select_ordered_match(
+                        expected_block,
+                        Some(expected_block),
+                        window.path,
+                        blocks,
+                    )
+                {
+                    selected = Some(expected_block);
                 }
             }
         }
 
-        if let Some(candidates) = self.table.by_crc.get(&crc) {
+        if let Some(candidates) = self.table.by_crc.get(&window.crc) {
             for block_index in candidates {
                 let block = &blocks[*block_index];
                 if block.expected_len != self.table.slice_size {
                     continue;
                 }
-                if Some(*block_index) == expected_block && selected == Some(*block_index) {
+                if Some(*block_index) == window.expected_block && selected == Some(*block_index) {
                     continue;
                 }
 
-                let digest = *md5.get_or_insert_with(|| checksum::md5(data));
+                let digest = *md5.get_or_insert_with(|| checksum::md5(window.data));
                 if block.checksum.md5 != digest {
                     continue;
                 }
 
-                if can_select_ordered_match(*block_index, expected_block, path, blocks)
+                if can_select_ordered_match(*block_index, window.expected_block, window.path, blocks)
                     && preferred_ordered_match(
                         selected,
                         *block_index,
-                        expected_block,
-                        target_file.file_id,
+                        window.expected_block,
+                        *window.target_file_id,
                         blocks,
                     )
                 {
@@ -1597,10 +1607,10 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 selected,
                 BlockLocation {
-                    path: path.to_path_buf(),
-                    offset,
+                    path: window.path.to_path_buf(),
+                    offset: window.offset,
                     len: block.expected_len,
-                    kind,
+                    kind: window.kind,
                 },
             );
         }
@@ -2501,7 +2511,7 @@ mod tests {
 
     fn block_location_summary(
         blocks: &[SourceBlock],
-    ) -> Vec<Option<(PathBuf, u64, u64, BlockLocationKind)>> {
+    ) -> BlockLocationSummary {
         blocks
             .iter()
             .map(|block| {
@@ -2517,11 +2527,14 @@ mod tests {
             .collect()
     }
 
+            type BlockLocationSummaryEntry = (PathBuf, u64, u64, BlockLocationKind);
+            type BlockLocationSummary = Vec<Option<BlockLocationSummaryEntry>>;
+
     fn scan_with_mmap(
         state: &RepairState,
         path: &Path,
         kind: BlockLocationKind,
-    ) -> Vec<Option<(PathBuf, u64, u64, BlockLocationKind)>> {
+    ) -> BlockLocationSummary {
         let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
         let mut blocks = state.blocks.clone();
         scanner
@@ -2540,10 +2553,7 @@ mod tests {
         state: &RepairState,
         path: &Path,
         kind: BlockLocationKind,
-    ) -> (
-        Vec<Option<(PathBuf, u64, u64, BlockLocationKind)>>,
-        FileScanStats,
-    ) {
+    ) -> (BlockLocationSummary, FileScanStats) {
         let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
         let mut blocks = state.blocks.clone();
         let stats = scanner
@@ -2561,10 +2571,7 @@ mod tests {
     fn scan_with_ordered_canonical(
         state: &RepairState,
         path: &Path,
-    ) -> (
-        Vec<Option<(PathBuf, u64, u64, BlockLocationKind)>>,
-        FileScanStats,
-    ) {
+    ) -> (BlockLocationSummary, FileScanStats) {
         let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
         let mut blocks = state.blocks.clone();
         let target = state
