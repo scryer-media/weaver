@@ -1587,15 +1587,18 @@ impl<'a> RollingBlockScanner<'a> {
                     continue;
                 }
 
-                if can_select_ordered_match(*block_index, window.expected_block, window.path, blocks)
-                    && preferred_ordered_match(
-                        selected,
-                        *block_index,
-                        window.expected_block,
-                        *window.target_file_id,
-                        blocks,
-                    )
-                {
+                if can_select_ordered_match(
+                    *block_index,
+                    window.expected_block,
+                    window.path,
+                    blocks,
+                ) && preferred_ordered_match(
+                    selected,
+                    *block_index,
+                    window.expected_block,
+                    *window.target_file_id,
+                    blocks,
+                ) {
                     selected = Some(*block_index);
                 }
             }
@@ -2509,9 +2512,7 @@ mod tests {
         }
     }
 
-    fn block_location_summary(
-        blocks: &[SourceBlock],
-    ) -> BlockLocationSummary {
+    fn block_location_summary(blocks: &[SourceBlock]) -> BlockLocationSummary {
         blocks
             .iter()
             .map(|block| {
@@ -2527,8 +2528,8 @@ mod tests {
             .collect()
     }
 
-            type BlockLocationSummaryEntry = (PathBuf, u64, u64, BlockLocationKind);
-            type BlockLocationSummary = Vec<Option<BlockLocationSummaryEntry>>;
+    type BlockLocationSummaryEntry = (PathBuf, u64, u64, BlockLocationKind);
+    type BlockLocationSummary = Vec<Option<BlockLocationSummaryEntry>>;
 
     fn scan_with_mmap(
         state: &RepairState,

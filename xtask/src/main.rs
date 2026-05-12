@@ -40,10 +40,7 @@ const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("C:\\", "Users\\"),
     concat!("C:/", "Users/"),
 ];
-const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[
-    concat!("..", "/e2e/"),
-    concat!("..\\", "e2e\\"),
-];
+const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[concat!("..", "/e2e/"), concat!("..\\", "e2e\\")];
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
