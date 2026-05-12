@@ -227,6 +227,8 @@ export default defineConfig(({ mode }) => ({
   base: "./",
   define: {
     __WEAVER_ENABLE_DIAGNOSTICS__: JSON.stringify(DIAGNOSTICS_ENABLED),
+    __WEAVER_DEV_BACKEND_ORIGIN__:
+      mode === "development" ? JSON.stringify(BACKEND_ORIGIN) : "undefined",
   },
   plugins: [
     react({

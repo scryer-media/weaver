@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import { useQuery } from "urql";
-import { authHeaders } from "@/graphql/client";
+import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 
@@ -107,6 +107,15 @@ function graphqlErrorMessage(
   return payload?.errors?.find((entry) => entry.message)?.message ?? null;
 }
 
+async function parseJsonResponse<T>(response: Response): Promise<T | undefined> {
+  const text = await response.text();
+  if (!text.trim()) {
+    return undefined;
+  }
+
+  return JSON.parse(text) as T;
+}
+
 async function stageNzbUpload(
   file: File,
   signal: AbortSignal,
@@ -127,7 +136,7 @@ async function stageNzbUpload(
   form.append("map", JSON.stringify({ "0": ["variables.input.nzbUpload"] }));
   form.append("0", file, file.name);
 
-  const response = await fetch(graphqlUrl(), {
+  const response = await fetchWithSessionRetry(graphqlUrl(), {
     method: "POST",
     headers: authHeaders(),
     body: form,
@@ -135,9 +144,12 @@ async function stageNzbUpload(
     signal,
   });
 
-  const payload = (await response.json()) as StageNzbUploadResponse;
-  if (!response.ok && (!payload.errors || payload.errors.length === 0)) {
-    throw new Error(`Upload failed with status ${response.status}`);
+  const payload = await parseJsonResponse<StageNzbUploadResponse>(response);
+  if (!response.ok) {
+    throw new Error(graphqlErrorMessage(payload) ?? `Upload failed with status ${response.status}`);
+  }
+  if (!payload) {
+    throw new Error("Upload failed: empty response body");
   }
   return payload;
 }
@@ -148,7 +160,7 @@ async function submitStagedNzbs(input: {
   category: string;
   priority: string;
 }): Promise<SubmitStagedNzbsResponse> {
-  const response = await fetch(graphqlUrl(), {
+  const response = await fetchWithSessionRetry(graphqlUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -171,9 +183,12 @@ async function submitStagedNzbs(input: {
     }),
   });
 
-  const payload = (await response.json()) as SubmitStagedNzbsResponse;
-  if (!response.ok && (!payload.errors || payload.errors.length === 0)) {
-    throw new Error(`Submit failed with status ${response.status}`);
+  const payload = await parseJsonResponse<SubmitStagedNzbsResponse>(response);
+  if (!response.ok) {
+    throw new Error(graphqlErrorMessage(payload) ?? `Submit failed with status ${response.status}`);
+  }
+  if (!payload) {
+    throw new Error("Submit failed: empty response body");
   }
   return payload;
 }
@@ -186,7 +201,7 @@ async function discardStagedNzbs(
     return;
   }
 
-  const response = await fetch(graphqlUrl(), {
+  const response = await fetchWithSessionRetry(graphqlUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

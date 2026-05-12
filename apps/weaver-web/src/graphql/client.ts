@@ -139,6 +139,53 @@ function wsUrl(): string {
   return resolved.href;
 }
 
+function tokenRefreshUrl(): string {
+  if (
+    typeof __WEAVER_DEV_BACKEND_ORIGIN__ === "string" &&
+    __WEAVER_DEV_BACKEND_ORIGIN__.trim().length > 0
+  ) {
+    return new URL("/", __WEAVER_DEV_BACKEND_ORIGIN__).href;
+  }
+
+  return "/";
+}
+
+function withFreshSessionAuth(init?: RequestInit): RequestInit | undefined {
+  if (!init) {
+    return sessionToken ? { headers: { Authorization: `Bearer ${sessionToken}` } } : undefined;
+  }
+
+  const headers = new Headers(init.headers);
+  if (sessionToken) {
+    headers.set("Authorization", `Bearer ${sessionToken}`);
+  } else {
+    headers.delete("Authorization");
+  }
+
+  return {
+    ...init,
+    headers,
+  };
+}
+
+export async function fetchWithSessionRetry(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  let response = await fetch(input, withFreshSessionAuth(init));
+  if (response.status !== 401) {
+    return response;
+  }
+
+  const refreshed = await refreshSessionToken();
+  if (!refreshed) {
+    return response;
+  }
+
+  response = await fetch(input, withFreshSessionAuth(init));
+  return response;
+}
+
 function createGraphqlClientResources(): GraphqlClientResources {
   const transportId = ++nextTransportId;
   const wsClient = createTrackedWsClient(transportId);
@@ -148,6 +195,7 @@ function createGraphqlClientResources(): GraphqlClientResources {
     wsClient,
     client: new Client({
       url: graphqlUrl,
+      fetch: (input, init) => fetchWithSessionRetry(input, init),
       preferGetMethod: false,
       requestPolicy: "network-only",
       fetchOptions: () =>
@@ -307,7 +355,7 @@ export function getSessionToken(): string | undefined {
  */
 export async function refreshSessionToken(): Promise<boolean> {
   try {
-    const res = await fetch("/", { credentials: "same-origin" });
+    const res = await fetch(tokenRefreshUrl(), { credentials: "same-origin" });
     if (!res.ok) return false;
     const html = await res.text();
     const match = SESSION_TOKEN_PATTERN.exec(html);
