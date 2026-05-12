@@ -535,23 +535,45 @@ jobs:
             version "${VERSION}"
             license "MIT"
 
+            def install_support_files
+              (pkgshare/"config.env.example").write <<~EOS
+                # Homebrew-managed Weaver service overrides.
+                WEAVER_CONFIG=#{var}/weaver
+                WEAVER_PORT=9090
+                WEAVER_BASE_URL=/
+              EOS
+
+              (libexec/"weaver-service").write <<~SH
+                #!/bin/sh
+                CONFIG_FILE="#{etc}/weaver/config.env"
+
+                if [ -f "$CONFIG_FILE" ]; then
+                  set -a
+                  . "$CONFIG_FILE"
+                  set +a
+                fi
+
+                : "${WEAVER_CONFIG:=#{var}/weaver}"
+                : "${WEAVER_PORT:=9090}"
+                : "${WEAVER_BASE_URL:=/}"
+
+                exec "#{opt_bin}/weaver" --config "$WEAVER_CONFIG" serve --port "$WEAVER_PORT" --base-url "$WEAVER_BASE_URL" "$@"
+              SH
+
+              chmod 0755, libexec/"weaver-service"
+            end
+
             on_macos do
               on_arm do
                 url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-darwin-arm64.tar.gz"
                 sha256 "${DARWIN_ARM_SHA}"
 
-                def install
-                  bin.install "weaver"
-                end
               end
 
               on_intel do
                 url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-darwin-x86_64.tar.gz"
                 sha256 "${DARWIN_X86_SHA}"
 
-                def install
-                  bin.install "weaver"
-                end
               end
             end
 
@@ -560,23 +582,41 @@ jobs:
                 url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-linux-arm64.tar.gz"
                 sha256 "${LINUX_ARM_SHA}"
 
-                def install
-                  bin.install "weaver"
-                end
               end
 
               on_intel do
                 url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-linux-x86_64.tar.gz"
                 sha256 "${LINUX_X86_SHA}"
 
-                def install
-                  bin.install "weaver"
-                end
               end
             end
 
+            def install
+              bin.install "weaver"
+              install_support_files
+
+              config_dir = etc/"weaver"
+              config_dir.mkpath
+              config_file = config_dir/"config.env"
+              unless config_file.exist?
+                config_file.write <<~EOS
+                  WEAVER_CONFIG=#{var}/weaver
+                  WEAVER_PORT=9090
+                  WEAVER_BASE_URL=/
+                EOS
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Edit #{etc}/weaver/config.env to customize the Homebrew-managed service,
+                then restart it with:
+                  brew services restart weaver-usenet
+              EOS
+            end
+
             service do
-              run [opt_bin/"weaver", "--config", var/"weaver", "serve"]
+              run [opt_libexec/"weaver-service"]
               keep_alive true
               log_path var/"log/weaver.log"
               error_log_path var/"log/weaver.log"
