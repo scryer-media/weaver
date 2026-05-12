@@ -11,7 +11,6 @@
 
 <p align="center">
   <a href="https://github.com/scryer-media/weaver/releases"><img src="https://img.shields.io/github/v/release/scryer-media/weaver" alt="Release" /></a>
-  <a href="https://github.com/scryer-media/weaver/blob/main/LICENSE"><img src="https://img.shields.io/github/license/scryer-media/weaver" alt="License" /></a>
   <a href="https://ghcr.io/scryer-media/weaver"><img src="https://img.shields.io/badge/container-ghcr.io-blue" alt="Container" /></a>
 </p>
 
@@ -23,9 +22,9 @@
 
 ## What is Weaver?
 
-Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and RAR extraction — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
+Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
 
-Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
+Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
 
 ### Key Features
 

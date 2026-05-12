@@ -30,6 +30,7 @@
 
 # Internal
 .claude
+.github/copilot-instructions.md
 tasks/
 tmp/
 weaver.toml

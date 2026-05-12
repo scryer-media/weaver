@@ -13,8 +13,6 @@ If `cargo build`, `cargo xtask`, or other Rust commands stall around `build-scri
 
 Enable your terminal under `System Settings -> Privacy & Security -> Developer Tools`, then fully quit and reopen it.
 
-`spctl developer-mode enable-terminal` only helps `Terminal.app`. If you use Ghostty, iTerm, WezTerm, or another terminal, you must allow that specific app in the Developer Tools list.
-
 ## Repo Automation
 
 Use `cargo xtask` as the canonical interface for repo automation. See [ARCHITECTURE.md](ARCHITECTURE.md) for the architectural rules and command surface.
