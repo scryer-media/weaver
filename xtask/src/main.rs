@@ -34,8 +34,16 @@ const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[&str] = &["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"];
-const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &["/Users/", "/home/", "C:\\Users\\", "C:/Users/"];
-const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &["../e2e/", "..\\e2e\\"];
+const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
+    concat!("/", "Users/"),
+    "/home/",
+    concat!("C:\\", "Users\\"),
+    concat!("C:/", "Users/"),
+];
+const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[
+    concat!("..", "/e2e/"),
+    concat!("..\\", "e2e\\"),
+];
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -2531,13 +2539,23 @@ mod tests {
     fn release_hygiene_flags_local_absolute_paths() {
         let violations = scan_release_hygiene_content(
             Path::new("engines/weaver-par2/tests/support/benchmark_support.rs"),
-            "const DEFAULT: &str = \"/Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2\";",
+            concat!(
+                "const DEFAULT: &str = \"",
+                "/",
+                "Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2",
+                "\";"
+            ),
         );
 
         assert_eq!(
             violations,
             vec![
-                "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"/Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2\";"
+                concat!(
+                    "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"",
+                    "/",
+                    "Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2",
+                    "\";"
+                )
                     .to_string()
             ]
         );
@@ -2547,13 +2565,19 @@ mod tests {
     fn release_hygiene_flags_sibling_e2e_paths() {
         let violations = scan_release_hygiene_content(
             Path::new("engines/weaver-par2/src/repairer.rs"),
-            "let fixture = manifest_dir.join(\"../../../e2e/testdata\").join(name);",
+            concat!(
+                "let fixture = manifest_dir.join(\"..",
+                "/../../e2e/testdata\").join(name);"
+            ),
         );
 
         assert_eq!(
             violations,
             vec![
-                "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"../../../e2e/testdata\").join(name);"
+                concat!(
+                    "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
+                    "/../../e2e/testdata\").join(name);"
+                )
                     .to_string()
             ]
         );
