@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -4783,14 +4783,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "bytes",
  "criterion",
@@ -4810,7 +4810,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "quick-xml 0.39.4",
  "serde",
@@ -4821,7 +4821,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "aws-lc-sys 0.40.0",
  "bytes",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "aes 0.9.0",
  "aws-lc-rs",
@@ -4866,7 +4866,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "aes-gcm",
  "age",
@@ -4902,7 +4902,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4953,7 +4953,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "crc32fast",
  "memchr",
