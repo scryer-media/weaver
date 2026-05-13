@@ -394,13 +394,10 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
         }
 
         let packet = match header.packet_type {
-            PacketType::RecoverySlice => parse_recovery_packet_from_reader(
-                &mut reader,
-                &header,
-                packet_offset,
-                path,
-            )
-            .map(Some),
+            PacketType::RecoverySlice => {
+                parse_recovery_packet_from_reader(&mut reader, &header, packet_offset, path)
+                    .map(Some)
+            }
             _ => parse_non_recovery_packet_from_reader(
                 &mut reader,
                 &header,

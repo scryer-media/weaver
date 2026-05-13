@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use crate::DiskFileAccess;
 use crate::checksum::{self, Md5State};
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
@@ -29,8 +31,6 @@ use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
 };
 use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult, verify_all};
-#[cfg(test)]
-use crate::DiskFileAccess;
 use memmap2::MmapOptions;
 use tracing::{debug, warn};
 
@@ -899,8 +899,7 @@ impl RepairState {
         }
 
         let should_skip_full_hash = kind == BlockLocationKind::Canonical
-            && len
-                >= CANONICAL_COMPLETE_HASH_SKIP_BYTES.max(self.set.slice_size.saturating_mul(4))
+            && len >= CANONICAL_COMPLETE_HASH_SKIP_BYTES.max(self.set.slice_size.saturating_mul(4))
             && candidates
                 .iter()
                 .copied()

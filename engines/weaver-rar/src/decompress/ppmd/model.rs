@@ -377,7 +377,10 @@ impl Model {
             // Multi-symbol context.
             if !self.decode_symbol1(rc) {
                 if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
-                    eprintln!("PPMD decode_symbol1 failed: min_context={}", self.min_context);
+                    eprintln!(
+                        "PPMD decode_symbol1 failed: min_context={}",
+                        self.min_context
+                    );
                 }
                 return -1;
             }
@@ -457,7 +460,10 @@ impl Model {
             }
             if !self.decode_symbol2(rc) {
                 if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
-                    eprintln!("PPMD decode_symbol2 failed: min_context={}", self.min_context);
+                    eprintln!(
+                        "PPMD decode_symbol2 failed: min_context={}",
+                        self.min_context
+                    );
                 }
                 return -1;
             }
@@ -487,11 +493,7 @@ impl Model {
         if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
             eprintln!(
                 "PPMD decode_char ok: index={} symbol={} found_state={} order_fall={} min_context={}",
-                debug_output_index,
-                symbol,
-                self.found_state,
-                self.order_fall,
-                self.min_context
+                debug_output_index, symbol, self.found_state, self.order_fall, self.min_context
             );
         }
         rc.normalize();
@@ -615,10 +617,7 @@ impl Model {
             if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
                 eprintln!(
                     "PPMD decode_symbol1 count overflow: count={} sum_freq={} ctx={} found_state={}",
-                    count,
-                    sum_freq,
-                    ctx,
-                    self.found_state
+                    count, sum_freq, ctx, self.found_state
                 );
             }
             return false;
@@ -828,36 +827,24 @@ impl Model {
             }
             eprintln!(
                 "PPMD decode_symbol2: ctx={} ns={} diff={} num_masked={} esc_freq={} hi_cnt={} scale={} count={} preview={:?}",
-                ctx,
-                ns,
-                diff,
-                self.num_masked,
-                esc_freq,
-                hi_cnt,
-                scale,
-                count,
-                preview
+                ctx, ns, diff, self.num_masked, esc_freq, hi_cnt, scale, count, preview
             );
         }
         if count >= scale {
             if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
                 eprintln!(
                     "PPMD decode_symbol2 count overflow: ctx={} ns={} diff={} num_masked={} esc_count={} esc_freq={} hi_cnt={} scale={} count={}",
-                    ctx,
-                    ns,
-                    diff,
-                    self.num_masked,
-                    self.esc_count,
-                    esc_freq,
-                    hi_cnt,
-                    scale,
-                    count
+                    ctx, ns, diff, self.num_masked, self.esc_count, esc_freq, hi_cnt, scale, count
                 );
                 let stats = self.ctx_stats(ctx);
                 let mut syms = Vec::new();
                 let mut p = stats;
                 for _ in 0..ns.min(16) {
-                    syms.push((self.st_sym(p), self.st_freq(p), self.char_mask[self.st_sym(p) as usize]));
+                    syms.push((
+                        self.st_sym(p),
+                        self.st_freq(p),
+                        self.char_mask[self.st_sym(p) as usize],
+                    ));
                     p += STATE_SIZE as u32;
                 }
                 eprintln!("PPMD decode_symbol2 ctx states: {:?}", syms);
@@ -1346,7 +1333,9 @@ impl Model {
             pc = self.ctx_suffix(pc);
         }
 
-        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() && self.is_text_succ(next_min_context) {
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && self.is_text_succ(next_min_context)
+        {
             eprintln!(
                 "PPMD next_min_context still text: next={} final_succ={} fs_succ={} found_state={} min_ctx={} max_ctx={} order_fall={}",
                 next_min_context,
@@ -1516,13 +1505,7 @@ impl Model {
         {
             eprintln!(
                 "PPMD materialize_text_successor: index={} base_ctx={} state_off={} text_succ={} child={} up_sym={} up_freq={}",
-                self.debug_output_index,
-                base_ctx,
-                state_off,
-                text_succ,
-                child,
-                up_sym,
-                up_freq
+                self.debug_output_index, base_ctx, state_off, text_succ, child, up_sym, up_freq
             );
         }
         child
@@ -1644,8 +1627,7 @@ impl Model {
         {
             eprintln!(
                 "PPMD finish_create_successors result: index={} new_pc={}",
-                self.debug_output_index,
-                pc
+                self.debug_output_index, pc
             );
         }
 

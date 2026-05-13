@@ -312,10 +312,8 @@ fn imported_filter_and_arm_gap_fixtures_extract() {
     ];
 
     for (dir, filename) in passing {
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            corpus_outcome(dir, filename)
-        }))
-        .unwrap_or_else(|_| panic!("fixture panicked during decode: {dir}/{filename}"));
+        let outcome = catch_unwind(AssertUnwindSafe(|| corpus_outcome(dir, filename)))
+            .unwrap_or_else(|_| panic!("fixture panicked during decode: {dir}/{filename}"));
         assert_eq!(
             outcome,
             CorpusOutcome::Completed,

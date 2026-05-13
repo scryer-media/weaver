@@ -1182,12 +1182,8 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
         .collect();
 
     unsafe {
-        let deint_lo_128 = _mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
-        );
-        let deint_hi_128 = _mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
-        );
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 
@@ -1433,12 +1429,8 @@ unsafe fn mul_acc_input_batch_avx2_prepared(
 
     unsafe {
         let mask_0f = _mm256_set1_epi8(0x0F);
-        let deint_lo_128 = _mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
-        );
-        let deint_hi_128 = _mm_set_epi8(
-            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
-        );
+        let deint_lo_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0);
+        let deint_hi_128 = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1);
         let deint_lo = _mm256_broadcastsi128_si256(deint_lo_128);
         let deint_hi = _mm256_broadcastsi128_si256(deint_hi_128);
 

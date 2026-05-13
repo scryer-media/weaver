@@ -1144,16 +1144,15 @@ impl LzDecoder {
                 .block_start
                 .saturating_add(filter.block_length as u64);
             if block_end <= total {
-                let file_block_start =
-                    filter
-                        .block_start
-                        .checked_sub(self.current_file_base_total)
-                        .ok_or_else(|| RarError::CorruptArchive {
-                            detail: format!(
-                                "RAR5 filter block starts before current file base ({} < {})",
-                                filter.block_start, self.current_file_base_total
-                            ),
-                        })?;
+                let file_block_start = filter
+                    .block_start
+                    .checked_sub(self.current_file_base_total)
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: format!(
+                            "RAR5 filter block starts before current file base ({} < {})",
+                            filter.block_start, self.current_file_base_total
+                        ),
+                    })?;
                 let mut buf = self
                     .window
                     .copy_output(filter.block_start, filter.block_length);

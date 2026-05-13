@@ -79,15 +79,14 @@ impl<'a> RangeDecoder<'a> {
     fn normalize(&mut self) {
         while {
             let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
-            let needs_normalize = if carry {
+            if carry {
                 true
             } else if self.range < BOT {
                 self.range = self.low.wrapping_neg() & (BOT - 1);
                 true
             } else {
                 false
-            };
-            needs_normalize
+            }
         } {
             self.code = (self.code << 8) | self.read_byte() as u32;
             self.range <<= 8;
@@ -182,15 +181,14 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
     fn normalize(&mut self) {
         while {
             let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
-            let needs_normalize = if carry {
+            if carry {
                 true
             } else if self.range < BOT {
                 self.range = self.low.wrapping_neg() & (BOT - 1);
                 true
             } else {
                 false
-            };
-            needs_normalize
+            }
         } {
             self.code = (self.code << 8) | self.read_byte() as u32;
             self.range <<= 8;

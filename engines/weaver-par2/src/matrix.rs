@@ -117,7 +117,11 @@ impl Matrix {
 
     #[cfg(test)]
     fn copy_row_from_slice(&mut self, row: usize, values: &[u16]) {
-        assert_eq!(values.len(), self.cols, "row width must match matrix columns");
+        assert_eq!(
+            values.len(),
+            self.cols,
+            "row width must match matrix columns"
+        );
         self.row_mut(row).copy_from_slice(values);
     }
 
@@ -314,11 +318,12 @@ impl Matrix {
             let rhs_ptr = rhs.data.as_mut_ptr() as usize;
             let matrix_cols = self.cols;
             let rhs_cols = rhs.cols;
-            let row_group = if n >= PARALLEL_ELIMINATION_THRESHOLD && rayon::current_num_threads() > 1 {
-                PARALLEL_ELIMINATION_ROWS
-            } else {
-                SIMD_ELIMINATION_ROWS
-            };
+            let row_group =
+                if n >= PARALLEL_ELIMINATION_THRESHOLD && rayon::current_num_threads() > 1 {
+                    PARALLEL_ELIMINATION_ROWS
+                } else {
+                    SIMD_ELIMINATION_ROWS
+                };
             let eliminate_batch = |batch_start: usize, batch_end: usize| unsafe {
                 let mut matrix_pairs = Vec::with_capacity(batch_end - batch_start);
                 let mut rhs_pairs = Vec::with_capacity(batch_end - batch_start);
@@ -337,15 +342,19 @@ impl Matrix {
                     let row_len = matrix_cols - col;
                     let rhs_start = row * rhs_cols;
 
-                    let matrix_row =
-                        std::slice::from_raw_parts_mut((matrix_ptr as *mut u16).add(row_start), row_len);
+                    let matrix_row = std::slice::from_raw_parts_mut(
+                        (matrix_ptr as *mut u16).add(row_start),
+                        row_len,
+                    );
                     matrix_pairs.push(gf_simd::FactorDst {
                         factor,
                         dst: words_as_bytes_mut(matrix_row),
                     });
 
-                    let rhs_row =
-                        std::slice::from_raw_parts_mut((rhs_ptr as *mut u16).add(rhs_start), rhs_cols);
+                    let rhs_row = std::slice::from_raw_parts_mut(
+                        (rhs_ptr as *mut u16).add(rhs_start),
+                        rhs_cols,
+                    );
                     rhs_pairs.push(gf_simd::FactorDst {
                         factor,
                         dst: words_as_bytes_mut(rhs_row),

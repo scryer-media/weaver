@@ -14,6 +14,7 @@ const VERIFY_SLICE_CHUNK_BYTES: usize = 64 * 1024;
 const VERIFY_SIMD_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const VERIFY_SIMD_MAX_LANES: usize = 4;
 const QUICK_CHECK_16K_BYTES: usize = 16 * 1024;
+const VERIFY_FULL_HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Abstraction for file I/O during verification and repair.
 pub trait FileAccess {
@@ -306,8 +307,64 @@ pub fn verify_full_hash(
     if actual_len != desc.length {
         return Some(false);
     }
+    verify_full_hash_streaming(desc.hash_full, actual_len, file_id, access)
+}
+
+fn verify_quick_and_full_hash(
+    par2: &Par2FileSet,
+    file_id: &FileId,
+    access: &dyn FileAccess,
+) -> Option<(bool, bool)> {
+    let desc = par2.file_description(file_id)?;
+    let actual_len = access.file_length(file_id)?;
+    let mut quick_state = checksum::FileHashState::new();
+    let mut full_state = None;
+    let mut buf = vec![0u8; VERIFY_FULL_HASH_CHUNK_BYTES];
+    let mut total_read = 0u64;
+
+    if let Some(mut reader) = access.open_sequential_reader(file_id).ok()? {
+        loop {
+            let read_len = reader.read(&mut buf).ok()?;
+            if read_len == 0 {
+                break;
+            }
+            update_quick_and_full_hash_states(&mut quick_state, &mut full_state, &buf[..read_len]);
+            total_read += read_len as u64;
+        }
+    } else {
+        while total_read < actual_len {
+            let chunk_len = ((actual_len - total_read) as usize).min(buf.len());
+            let read_len = access
+                .read_file_range_into(file_id, total_read, &mut buf[..chunk_len])
+                .ok()?;
+            if read_len == 0 {
+                return Some((false, false));
+            }
+            update_quick_and_full_hash_states(&mut quick_state, &mut full_state, &buf[..read_len]);
+            total_read += read_len as u64;
+        }
+    }
+
+    if total_read != actual_len {
+        return Some((false, false));
+    }
+
+    let quick_hash = quick_state.finalize();
+    let full_hash = full_state.map_or(quick_hash, checksum::FileHashState::finalize);
+    Some((
+        quick_hash == desc.hash_16k,
+        actual_len == desc.length && full_hash == desc.hash_full,
+    ))
+}
+
+fn verify_full_hash_streaming(
+    expected_hash: [u8; 16],
+    actual_len: u64,
+    file_id: &FileId,
+    access: &dyn FileAccess,
+) -> Option<bool> {
     let mut state = checksum::FileHashState::new();
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; VERIFY_FULL_HASH_CHUNK_BYTES];
 
     if let Some(mut reader) = access.open_sequential_reader(file_id).ok()? {
         let mut total_read = 0u64;
@@ -324,7 +381,6 @@ pub fn verify_full_hash(
         }
     } else {
         let mut offset = 0u64;
-
         while offset < actual_len {
             let chunk_len = ((actual_len - offset) as usize).min(buf.len());
             let read_len = access
@@ -338,7 +394,32 @@ pub fn verify_full_hash(
         }
     }
 
-    Some(state.finalize() == desc.hash_full)
+    Some(state.finalize() == expected_hash)
+}
+
+fn update_quick_and_full_hash_states(
+    quick_state: &mut checksum::FileHashState,
+    full_state: &mut Option<checksum::FileHashState>,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+    if let Some(full_state) = full_state.as_mut() {
+        full_state.update(data);
+        return;
+    }
+
+    let quick_remaining = QUICK_CHECK_16K_BYTES.saturating_sub(quick_state.bytes_fed() as usize);
+    if data.len() <= quick_remaining {
+        quick_state.update(data);
+        return;
+    }
+
+    quick_state.update(&data[..quick_remaining]);
+    let mut cloned = quick_state.clone();
+    cloned.update(&data[quick_remaining..]);
+    *full_state = Some(cloned);
 }
 
 /// Perform slice-level verification of a single file.
@@ -655,7 +736,6 @@ pub fn verify_selected_file_ids_with_options(
     let mut total_missing_blocks = 0u32;
     let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
-    let mut quick_check_buf = [0u8; QUICK_CHECK_16K_BYTES];
 
     for (file_index, file_id) in file_ids.iter().enumerate() {
         // Check cancellation before each file.
@@ -691,10 +771,21 @@ pub fn verify_selected_file_ids_with_options(
             continue;
         }
 
+        let Some(actual_len) = access.file_length(file_id) else {
+            total_missing_blocks = total_missing_blocks.saturating_add(slice_count_u32);
+            files.push(FileVerification {
+                file_id: *file_id,
+                filename: desc.filename.clone(),
+                status: FileStatus::Damaged(slice_count_u32),
+                valid_slices: vec![false; slice_count],
+                missing_slice_count: slice_count_u32,
+            });
+            continue;
+        };
+
         // Empty file: PAR2 spec says 0-length files have 0 slices.
         // Just verify the file exists and has the expected length.
         if desc.length == 0 {
-            let actual_len = access.file_length(file_id).unwrap_or(1);
             let status = if actual_len == 0 {
                 FileStatus::Complete
             } else {
@@ -711,10 +802,7 @@ pub fn verify_selected_file_ids_with_options(
         }
 
         // Check for files that should have content but are empty on disk.
-        if let Some(actual_len) = access.file_length(file_id)
-            && actual_len == 0
-            && desc.length > 0
-        {
+        if actual_len == 0 && desc.length > 0 {
             total_missing_blocks = total_missing_blocks.saturating_add(slice_count_u32);
             files.push(FileVerification {
                 file_id: *file_id,
@@ -762,9 +850,23 @@ pub fn verify_selected_file_ids_with_options(
             continue;
         }
 
-        // Quick check
-        let quick_ok = quick_check_16k_with_scratch(par2, file_id, access, &mut quick_check_buf)
-            .unwrap_or(false);
+        if actual_len != desc.length {
+            let valid =
+                verify_slices(par2, file_id, access).unwrap_or_else(|| vec![false; slice_count]);
+            let damaged = valid.iter().filter(|&&v| !v).count() as u32;
+            total_missing_blocks = total_missing_blocks.saturating_add(damaged);
+            files.push(FileVerification {
+                file_id: *file_id,
+                filename: desc.filename.clone(),
+                status: FileStatus::Damaged(damaged),
+                valid_slices: valid,
+                missing_slice_count: damaged,
+            });
+            continue;
+        }
+
+        let (quick_ok, full_ok) =
+            verify_quick_and_full_hash(par2, file_id, access).unwrap_or((false, false));
         if !quick_ok {
             // 16k hash failed; do slice-level check to find which slices are bad
             let valid =
@@ -788,8 +890,6 @@ pub fn verify_selected_file_ids_with_options(
             continue;
         }
 
-        // Full hash check
-        let full_ok = verify_full_hash(par2, file_id, access).unwrap_or(false);
         if full_ok {
             files.push(FileVerification {
                 file_id: *file_id,
@@ -846,6 +946,10 @@ mod tests {
     use md5::{Digest, Md5};
     use std::collections::HashMap;
     use std::io::{self, Cursor};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     /// Helper to build a complete valid packet (header + body).
     fn make_full_packet(packet_type: &[u8; 16], body: &[u8], recovery_set_id: [u8; 16]) -> Vec<u8> {
@@ -1159,6 +1263,67 @@ mod tests {
         }
     }
 
+    struct CountingSequentialAccess {
+        files: HashMap<FileId, Vec<u8>>,
+        open_calls: Arc<AtomicUsize>,
+    }
+
+    impl FileAccess for CountingSequentialAccess {
+        fn read_file_range(
+            &self,
+            _file_id: &FileId,
+            _offset: u64,
+            _len: u64,
+        ) -> io::Result<Vec<u8>> {
+            panic!("read_file_range should not be used when a sequential reader is available")
+        }
+
+        fn read_file_range_into(
+            &self,
+            _file_id: &FileId,
+            _offset: u64,
+            _dst: &mut [u8],
+        ) -> io::Result<usize> {
+            panic!("read_file_range_into should not be used when a sequential reader is available")
+        }
+
+        fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+            self.open_calls.fetch_add(1, Ordering::Relaxed);
+            let data = self
+                .files
+                .get(file_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
+            Ok(Some(Box::new(Cursor::new(data.clone()))))
+        }
+
+        fn file_exists(&self, file_id: &FileId) -> bool {
+            self.files.contains_key(file_id)
+        }
+
+        fn file_length(&self, file_id: &FileId) -> Option<u64> {
+            self.files.get(file_id).map(|data| data.len() as u64)
+        }
+
+        fn read_file(&self, _file_id: &FileId) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "force streaming path in this test",
+            ))
+        }
+
+        fn write_file_range(
+            &mut self,
+            _file_id: &FileId,
+            _offset: u64,
+            _data: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "test access is read-only",
+            ))
+        }
+    }
+
     #[test]
     fn verify_slices_from_crcs_intact() {
         let file_data = vec![0xABu8; 2048];
@@ -1344,6 +1509,25 @@ mod tests {
         };
 
         assert_eq!(verify_full_hash(&set, &file_id, &access), Some(true));
+    }
+
+    #[test]
+    fn verify_selected_file_ids_uses_single_sequential_pass_for_healthy_file() {
+        let file_data = (0..(QUICK_CHECK_16K_BYTES + 4096))
+            .map(|i| (i % 241) as u8)
+            .collect::<Vec<_>>();
+        let (set, access, file_id) = setup_test_set(&file_data, 1024);
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let access = CountingSequentialAccess {
+            files: access.files,
+            open_calls: open_calls.clone(),
+        };
+
+        let verification = verify_selected_file_ids(&set, &access, &[file_id]);
+
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert!(matches!(verification.files[0].status, FileStatus::Complete));
+        assert_eq!(open_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -490,11 +490,7 @@ fn grouped_output_factors(plan: &RepairPlan) -> Vec<Vec<OutputFactor>> {
         .collect()
 }
 
-fn accumulate_input_to_outputs(
-    output_ptrs: &[usize],
-    output_factors: &[OutputFactor],
-    src: &[u8],
-) {
+fn accumulate_input_to_outputs(output_ptrs: &[usize], output_factors: &[OutputFactor], src: &[u8]) {
     if output_factors.is_empty() {
         return;
     }
@@ -930,7 +926,8 @@ fn reconstruct_and_write_grouped_inputs(
                 for factor_input in decode_inputs {
                     chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
                         prepared: &factor_input.1,
-                        src: &recovery_buffers[factor_input.0 as usize][byte_start..byte_start + byte_len],
+                        src: &recovery_buffers[factor_input.0 as usize]
+                            [byte_start..byte_start + byte_len],
                     });
                 }
 
@@ -1174,13 +1171,11 @@ pub fn execute_repair_with_options(
 
             for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
                 check_cancel(options)?;
-                let rs =
-                    par2_set
-                        .recovery_slices
-                        .get(&exp)
-                        .ok_or_else(|| Par2Error::ReedSolomonError {
-                            reason: format!("recovery block with exponent {exp} not found"),
-                        })?;
+                let rs = par2_set.recovery_slices.get(&exp).ok_or_else(|| {
+                    Par2Error::ReedSolomonError {
+                        reason: format!("recovery block with exponent {exp} not found"),
+                    }
+                })?;
                 let recovery_data = rs.data.to_vec().map_err(Par2Error::Io)?;
                 let copy_len = recovery_data.len().min(slice_size);
                 input_buffers[available_inputs + recovery_idx][..copy_len]
@@ -1231,7 +1226,8 @@ pub fn execute_repair_with_options(
                         for (input_idx, prepared) in decode_inputs {
                             chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
                                 prepared,
-                                src: &input_buffers[*input_idx as usize][byte_start..byte_start + byte_len],
+                                src: &input_buffers[*input_idx as usize]
+                                    [byte_start..byte_start + byte_len],
                             });
                         }
 

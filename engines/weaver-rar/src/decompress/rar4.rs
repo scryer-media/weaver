@@ -414,10 +414,7 @@ impl Rar4LzDecoder {
         if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
             eprintln!(
                 "RAR4 filter: output_size={output_size} start={} len={} type={:?} base={}",
-                block_start,
-                block_length,
-                filter_type,
-                self.current_file_base_total
+                block_start, block_length, filter_type, self.current_file_base_total
             );
         }
         self.pending_vm_filters.push(Rar4PendingVmFilter {
@@ -739,9 +736,7 @@ impl Rar4LzDecoder {
             let raw_len = next_start.saturating_sub(written_border);
             if raw_len > 0 {
                 if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
-                    eprintln!(
-                        "RAR4 flush prefix: [{written_border}, {next_start}) len={raw_len}"
-                    );
+                    eprintln!("RAR4 flush prefix: [{written_border}, {next_start}) len={raw_len}");
                 }
                 self.window
                     .write_range_to_writer(written_border, raw_len as usize, writer)
@@ -902,8 +897,12 @@ impl Rar4LzDecoder {
 
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(reader, unpacked_size, output_size, Some(flush_threshold))?;
+                    output_size = self.decode_lz_symbols(
+                        reader,
+                        unpacked_size,
+                        output_size,
+                        Some(flush_threshold),
+                    )?;
                 }
                 BlockType::Ppm => {
                     output_size = self.decode_ppm_symbols(
@@ -1017,8 +1016,12 @@ impl Rar4LzDecoder {
             let prev_output = output_size;
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(reader, unpacked_size, output_size, Some(flush_threshold))?;
+                    output_size = self.decode_lz_symbols(
+                        reader,
+                        unpacked_size,
+                        output_size,
+                        Some(flush_threshold),
+                    )?;
                 }
                 BlockType::Ppm => {
                     output_size = self.decode_ppm_symbols(
@@ -1113,8 +1116,12 @@ impl Rar4LzDecoder {
             let prev_output = output_size;
             match self.block_type {
                 BlockType::Lz => {
-                    output_size =
-                        self.decode_lz_symbols(reader, unpacked_size, output_size, Some(flush_threshold))?;
+                    output_size = self.decode_lz_symbols(
+                        reader,
+                        unpacked_size,
+                        output_size,
+                        Some(flush_threshold),
+                    )?;
                 }
                 BlockType::Ppm => {
                     output_size = self.decode_ppm_symbols(
@@ -1182,7 +1189,10 @@ impl Rar4LzDecoder {
     /// 4. Main code lengths using BC table (delta encoded)
     /// 5. Builds LD, DD, LDD, RD tables
     fn read_tables<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
-        let build_table = |name: &str, lengths: &[u8], total_written: u64| -> RarResult<HuffmanTable> {
+        let build_table = |name: &str,
+                           lengths: &[u8],
+                           total_written: u64|
+         -> RarResult<HuffmanTable> {
             HuffmanTable::build(lengths).map_err(|err| {
                 if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                     eprintln!(
@@ -1278,12 +1288,14 @@ impl Rar4LzDecoder {
             if reader.bits_remaining() < 1 {
                 break;
             }
-            let number = bc_table.decode(reader).map_err(|err| RarError::CorruptArchive {
-                detail: format!(
-                    "RAR4: BC decode failed at total_written={}: {err}",
-                    self.window.total_written()
-                ),
-            })? as usize;
+            let number = bc_table
+                .decode(reader)
+                .map_err(|err| RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR4: BC decode failed at total_written={}: {err}",
+                        self.window.total_written()
+                    ),
+                })? as usize;
             if number < 16 {
                 // Delta: add to previous value mod 16.
                 self.code_lengths[i] = ((self.code_lengths[i] as usize + number) & 0xF) as u8;

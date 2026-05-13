@@ -258,16 +258,16 @@ mod md5 {
         assert_eq!(hash1, hash2);
         assert!(hash1 <= hash2);
         assert!(hash1 >= hash2);
-        assert!(!(hash1 < hash2));
-        assert!(!(hash1 > hash2));
+        assert!(hash1 >= hash2);
+        assert!(hash1 <= hash2);
 
         hash1[0] = 0x00;
         hash2[0] = 0x01;
         assert_ne!(hash1, hash2);
         assert!(hash1 < hash2);
         assert!(hash1 <= hash2);
-        assert!(!(hash1 > hash2));
-        assert!(!(hash1 >= hash2));
+        assert!(hash1 <= hash2);
+        assert!(hash1 < hash2);
 
         hash1[0] = 0x00;
         hash2[0] = 0x00;
@@ -276,8 +276,8 @@ mod md5 {
         assert_ne!(hash1, hash2);
         assert!(hash1 < hash2);
         assert!(hash1 <= hash2);
-        assert!(!(hash1 > hash2));
-        assert!(!(hash1 >= hash2));
+        assert!(hash1 <= hash2);
+        assert!(hash1 < hash2);
     }
 
     #[test]

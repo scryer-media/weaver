@@ -702,6 +702,13 @@ impl Pipeline {
     }
 
     fn emit_job_verification_started(&self, job_id: JobId) {
+        #[cfg(test)]
+        eprintln!(
+            "emit_job_verification_started job={} status={:?}\n{:?}",
+            job_id.0,
+            self.jobs.get(&job_id).map(|state| &state.status),
+            std::backtrace::Backtrace::force_capture()
+        );
         let _ = self
             .event_tx
             .send(PipelineEvent::JobVerificationStarted { job_id });
