@@ -202,12 +202,12 @@ jobs:
           curl -Lo /tmp/sde.tar.xz https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz
           tar -xf /tmp/sde.tar.xz -C /opt
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
-      - name: Build par2 tests (${{ matrix.name }})
+      - name: Build accelerated par2 tests (${{ matrix.name }})
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
+          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
