@@ -25,8 +25,8 @@ pub(crate) fn run(ctx: &TaskContext, args: Vec<String>) -> Result<()> {
     let weaver_release = download_release_asset(
         ctx,
         "scryer-media/weaver",
-        AssetSelector::Exact("weaver-linux-x86_64.tar.gz"),
-        &weaver_tmp.join("weaver-linux-x86_64.tar.gz"),
+        AssetSelector::Exact("weaver-linux-x86_64-portable.tar.gz"),
+        &weaver_tmp.join("weaver-linux-x86_64-portable.tar.gz"),
     )?;
     let turbo_release = download_release_asset(
         ctx,
@@ -44,7 +44,7 @@ pub(crate) fn run(ctx: &TaskContext, args: Vec<String>) -> Result<()> {
     let _ = fs::remove_file(&weaver_binary);
     let _ = fs::remove_file(&turbo_binary);
 
-    let weaver_archive = weaver_tmp.join("weaver-linux-x86_64.tar.gz");
+    let weaver_archive = weaver_tmp.join("weaver-linux-x86_64-portable.tar.gz");
     let turbo_archive = turbo_tmp.join("par2cmdline-turbo-linux-amd64.zip");
 
     let mut untar = ctx.command("tar");

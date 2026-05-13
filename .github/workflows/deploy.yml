@@ -1,6 +1,8 @@
 name: ci
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     tags:
       - "weaver-v*"
@@ -111,7 +113,7 @@ jobs:
           path: apps/weaver-web/dist
       - name: Set target CPU flags
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl")" >> "$GITHUB_ENV"
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run clippy
         run: cargo clippy --workspace --locked --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings
 
@@ -141,7 +143,7 @@ jobs:
           path: apps/weaver-web/dist
       - name: Set target CPU flags
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl")" >> "$GITHUB_ENV"
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run workspace tests
         run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
 
@@ -165,7 +167,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Set target CPU flags
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl")" >> "$GITHUB_ENV"
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
         run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
 
@@ -242,23 +244,45 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64
+            platform: linux-x86_64-portable
             runs_on: ubuntu-24.04
+            lane: portable
+          - target: x86_64-unknown-linux-musl
+            platform: linux-x86_64-haswell
+            runs_on: ubuntu-24.04
+            lane: haswell
           - target: aarch64-unknown-linux-musl
-            platform: linux-arm64
+            platform: linux-arm64-portable
             runs_on: ubuntu-24.04-arm
+            lane: portable
+          - target: aarch64-unknown-linux-musl
+            platform: linux-arm64-cortex-a76
+            runs_on: ubuntu-24.04-arm
+            lane: cortex-a76
           - target: aarch64-apple-darwin
-            platform: darwin-arm64
+            platform: darwin-arm64-portable
             runs_on: macos-26
+            lane: portable
+          - target: aarch64-apple-darwin
+            platform: darwin-arm64-apple-m1
+            runs_on: macos-26
+            lane: apple-m1
           - target: x86_64-apple-darwin
-            platform: darwin-x86_64
+            platform: darwin-x86_64-portable
             runs_on: macos-26
+            lane: portable
+          - target: x86_64-apple-darwin
+            platform: darwin-x86_64-haswell
+            runs_on: macos-26
+            lane: haswell
           - target: x86_64-pc-windows-msvc
             platform: windows-x86_64
             runs_on: windows-2025-vs2026
+            lane: portable
           - target: aarch64-pc-windows-msvc
             platform: windows-arm64
             runs_on: windows-11-arm
+            lane: portable
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -295,113 +319,232 @@ jobs:
           cache-on-failure: false
           key: crypto-${{ matrix.platform }}
       - name: Verify target crypto config
-        run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}"
+        run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
       - name: Set target CPU flags (Unix)
         if: runner.os != 'Windows'
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}")" >> "$GITHUB_ENV"
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}")" >> "$GITHUB_ENV"
       - name: Set target CPU flags (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}"
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Check native crypto crates
         run: cargo check --locked -p weaver-rar -p weaver-par2 --target ${{ matrix.target }}
 
   # ── Release packaging (tag pushes only) ──────────────────────────────────
 
-  rust-package:
-    name: rust-package-${{ matrix.platform }}
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    runs-on: ${{ matrix.runs_on }}
+  rust-package-linux-x86_64-portable:
+    name: rust-package-linux-x86_64-portable
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
-    needs: [web-build, rust-fmt, rust-clippy, rust-audit, rust-test, rust-test-arm, rust-test-sde, rust-crypto-targets]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64
-            runs_on: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            platform: linux-arm64
-            runs_on: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            platform: darwin-arm64
-            runs_on: macos-26
-          - target: x86_64-apple-darwin
-            platform: darwin-x86_64
-            runs_on: macos-26
-          - target: x86_64-pc-windows-msvc
-            platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-          - target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            runs_on: windows-11-arm
+    needs: [web-build]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
-        run: rustup target add ${{ matrix.target }}
+        run: rustup target add x86_64-unknown-linux-musl
       - name: Install musl toolchain
-        if: contains(matrix.target, '-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold
-      - name: Install NASM (Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y nasm
-      - name: Install NASM (macOS x86_64)
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: brew install nasm
-      - name: Install NASM (Windows x86_64)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Exclude build dir from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
-          key: ${{ matrix.platform }}
+          key: package-linux-x86_64-portable
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags (Unix)
-        if: runner.os != 'Windows'
+      - name: Set target CPU flags
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}")" >> "$GITHUB_ENV"
-      - name: Set target CPU flags (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
+      - name: Build release binary
         run: |
-          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}"
-          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Build release binary (Unix)
-        if: runner.os != 'Windows'
+          mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
+      - name: Package tarball
         run: |
-          if [[ "${{ matrix.target }}" == *"-musl" ]]; then
-            mold -run cargo build -p weaver --release --locked --target ${{ matrix.target }}
-          else
-            cargo build -p weaver --release --locked --target ${{ matrix.target }}
-          fi
-      - name: Build release binary (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build -p weaver --release --locked --target ${{ matrix.target }}
-      - name: Codesign binary (macOS)
-        if: contains(matrix.target, '-apple-darwin')
+          mkdir -p dist/package
+          cp target/x86_64-unknown-linux-musl/release/weaver dist/package/weaver
+          tar -czf weaver-linux-x86_64-portable.tar.gz -C dist/package .
+          test -f weaver-linux-x86_64-portable.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-linux-x86_64-portable-${{ github.run_id }}
+          path: weaver-linux-x86_64-portable.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-linux-x86_64-haswell:
+    name: rust-package-linux-x86_64-haswell
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold nasm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-linux-x86_64-haswell
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane haswell)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: |
+          mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/x86_64-unknown-linux-musl/release/weaver dist/package/weaver
+          tar -czf weaver-linux-x86_64-haswell.tar.gz -C dist/package .
+          test -f weaver-linux-x86_64-haswell.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
+          path: weaver-linux-x86_64-haswell.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-linux-arm64-portable:
+    name: rust-package-linux-arm64-portable
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-linux-arm64-portable
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: |
+          mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
+          tar -czf weaver-linux-arm64-portable.tar.gz -C dist/package .
+          test -f weaver-linux-arm64-portable.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-linux-arm64-portable-${{ github.run_id }}
+          path: weaver-linux-arm64-portable.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-linux-arm64-cortex-a76:
+    name: rust-package-linux-arm64-cortex-a76
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-linux-arm64-cortex-a76
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane cortex-a76)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: |
+          mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
+          tar -czf weaver-linux-arm64-cortex-a76.tar.gz -C dist/package .
+          test -f weaver-linux-arm64-cortex-a76.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
+          path: weaver-linux-arm64-cortex-a76.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-darwin-x86_64-portable:
+    name: rust-package-darwin-x86_64-portable
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-apple-darwin
+      - name: Install NASM
+        run: brew install nasm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-darwin-x86_64-portable
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target x86_64-apple-darwin
+      - name: Codesign binary
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         env:
           CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
@@ -415,66 +558,432 @@ jobs:
           security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/${{ matrix.target }}/release/weaver
-          codesign --verify --verbose target/${{ matrix.target }}/release/weaver
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
+          codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
           rm /tmp/cert.p12
           security delete-keychain "$KEYCHAIN"
-      - name: Package tarball (Unix)
-        if: runner.os != 'Windows'
+      - name: Package tarball
         run: |
           mkdir -p dist/package
-          cp target/${{ matrix.target }}/release/weaver dist/package/weaver
-          tar -czf weaver-${{ matrix.platform }}.tar.gz -C dist/package .
-      - name: Package zip (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target\${{ matrix.target }}\release\weaver.exe -DestinationPath weaver-${{ matrix.platform }}.zip
-      - name: Upload release package (Unix)
-        if: runner.os != 'Windows'
+          cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
+          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
+          test -f weaver-darwin-x86_64-portable.tar.gz
+      - name: Upload release package
         uses: actions/upload-artifact@v7
         with:
-          name: weaver-${{ matrix.platform }}-${{ github.run_id }}
-          path: weaver-${{ matrix.platform }}.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-      - name: Upload release package (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v7
-        with:
-          name: weaver-${{ matrix.platform }}-${{ github.run_id }}
-          path: weaver-${{ matrix.platform }}.zip
+          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
+          path: weaver-darwin-x86_64-portable.tar.gz
           if-no-files-found: error
           retention-days: 14
 
-  # ── Docker + GitHub Release (tag pushes only) ────────────────────────────
+  rust-package-darwin-x86_64-haswell:
+    name: rust-package-darwin-x86_64-haswell
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-apple-darwin
+      - name: Install NASM
+        run: brew install nasm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-darwin-x86_64-haswell
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane haswell)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target x86_64-apple-darwin
+      - name: Codesign binary
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        env:
+          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          KEYCHAIN_PASS="ci-ephemeral"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
+          codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
+          rm /tmp/cert.p12
+          security delete-keychain "$KEYCHAIN"
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
+          tar -czf weaver-darwin-x86_64-haswell.tar.gz -C dist/package .
+          test -f weaver-darwin-x86_64-haswell.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-darwin-x86_64-haswell-${{ github.run_id }}
+          path: weaver-darwin-x86_64-haswell.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-darwin-arm64-portable:
+    name: rust-package-darwin-arm64-portable
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-darwin-arm64-portable
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target aarch64-apple-darwin
+      - name: Codesign binary
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        env:
+          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          KEYCHAIN_PASS="ci-ephemeral"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/release/weaver
+          codesign --verify --verbose target/aarch64-apple-darwin/release/weaver
+          rm /tmp/cert.p12
+          security delete-keychain "$KEYCHAIN"
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
+          tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package .
+          test -f weaver-darwin-arm64-portable.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-darwin-arm64-portable-${{ github.run_id }}
+          path: weaver-darwin-arm64-portable.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-darwin-arm64-apple-m1:
+    name: rust-package-darwin-arm64-apple-m1
+    runs-on: macos-26
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-darwin-arm64-apple-m1
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        run: |
+          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-apple-darwin" --lane apple-m1)" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target aarch64-apple-darwin
+      - name: Codesign binary
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        env:
+          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="build.keychain-db"
+          KEYCHAIN_PASS="ci-ephemeral"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/release/weaver
+          codesign --verify --verbose target/aarch64-apple-darwin/release/weaver
+          rm /tmp/cert.p12
+          security delete-keychain "$KEYCHAIN"
+      - name: Package tarball
+        run: |
+          mkdir -p dist/package
+          cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
+          tar -czf weaver-darwin-arm64-apple-m1.tar.gz -C dist/package .
+          test -f weaver-darwin-arm64-apple-m1.tar.gz
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-darwin-arm64-apple-m1-${{ github.run_id }}
+          path: weaver-darwin-arm64-apple-m1.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-windows-x86_64:
+    name: rust-package-windows-x86_64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-windows-x86_64
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        shell: pwsh
+        run: |
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-pc-windows-msvc" --lane portable
+          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target x86_64-pc-windows-msvc
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target\x86_64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-x86_64.zip
+          if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-windows-x86_64-${{ github.run_id }}
+          path: weaver-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-package-windows-arm64:
+    name: rust-package-windows-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    needs: [web-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-pc-windows-msvc
+      - name: Exclude build dir from Windows Defender
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: package-windows-arm64
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Set target CPU flags
+        shell: pwsh
+        run: |
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-pc-windows-msvc" --lane portable
+          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build release binary
+        run: cargo build -p weaver --release --locked --target aarch64-pc-windows-msvc
+      - name: Package zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target\aarch64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-arm64.zip
+          if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-windows-arm64-${{ github.run_id }}
+          path: weaver-windows-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Docker validation + release publish ──────────────────────────────────
+
+  docker-export:
+    name: docker-export-${{ matrix.platform_id }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - rust-fmt
+      - rust-clippy
+      - rust-audit
+      - rust-test
+      - rust-test-arm
+      - rust-test-sde
+      - rust-crypto-targets
+      - rust-package-linux-x86_64-portable
+      - rust-package-linux-x86_64-haswell
+      - rust-package-linux-arm64-portable
+      - rust-package-linux-arm64-cortex-a76
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_id: amd64
+            platform: linux/amd64
+            tar_name: weaver-linux-amd64-image.tar
+            local_tag: weaver:test-amd64
+          - platform_id: arm64
+            platform: linux/arm64
+            tar_name: weaver-linux-arm64-image.tar
+            local_tag: weaver:test-arm64
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Docker runtime selection smoke tests
+        run: sh docker/test_runtime_select.sh
+      - name: Download linux amd64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-x86_64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux amd64 haswell artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 cortex-a76 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
+          path: artifacts
+      - name: Prepare build context
+        run: sh docker/prepare-build-context.sh artifacts docker-ctx
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build downloadable image tarball
+        uses: docker/build-push-action@v7
+        with:
+          context: docker-ctx
+          file: docker/weaver.Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=docker,dest=/tmp/${{ matrix.tar_name }}
+          tags: ${{ matrix.local_tag }}
+      - name: Upload image tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-image-linux-${{ matrix.platform_id }}-${{ github.run_id }}
+          path: /tmp/${{ matrix.tar_name }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Add local test instructions
+        run: |
+          {
+            echo "### Downloadable Docker image (${{ matrix.platform }})"
+            echo
+            echo "- Artifact: \`weaver-image-linux-${{ matrix.platform_id }}-${{ github.run_id }}\`"
+            echo "- Tarball: \`${{ matrix.tar_name }}\`"
+            echo "- Load: \`docker load -i ${{ matrix.tar_name }}\`"
+            echo "- Run: \`docker run --rm -p 9090:9090 ${{ matrix.local_tag }} --config /config serve --port 9090\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   docker-publish:
     name: docker-publish
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [rust-package]
+    needs:
+      - rust-fmt
+      - rust-clippy
+      - rust-audit
+      - rust-test
+      - rust-test-arm
+      - rust-test-sde
+      - rust-crypto-targets
+      - rust-package-linux-x86_64-portable
+      - rust-package-linux-x86_64-haswell
+      - rust-package-linux-arm64-portable
+      - rust-package-linux-arm64-cortex-a76
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
-      - name: Download linux-amd64 artifact
+      - name: Run Docker runtime selection smoke tests
+        run: sh docker/test_runtime_select.sh
+      - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@v8
         with:
-          name: weaver-linux-x86_64-${{ github.run_id }}
+          name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-      - name: Download linux-arm64 artifact
+      - name: Download linux amd64 haswell artifact
         uses: actions/download-artifact@v8
         with:
-          name: weaver-linux-arm64-${{ github.run_id }}
+          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 cortex-a76 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
           path: artifacts
       - name: Prepare build context
-        run: |
-          mkdir -p docker-ctx/amd64 docker-ctx/arm64
-          tar -xzf artifacts/weaver-linux-x86_64.tar.gz -C docker-ctx/amd64
-          tar -xzf artifacts/weaver-linux-arm64.tar.gz -C docker-ctx/arm64
-          cp docker/entrypoint.sh docker-ctx/entrypoint.sh
+        run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -506,17 +1015,78 @@ jobs:
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [rust-package]
+    needs:
+      - rust-fmt
+      - rust-clippy
+      - rust-audit
+      - rust-test
+      - rust-test-arm
+      - rust-test-sde
+      - rust-crypto-targets
+      - rust-package-linux-x86_64-portable
+      - rust-package-linux-x86_64-haswell
+      - rust-package-linux-arm64-portable
+      - rust-package-linux-arm64-cortex-a76
+      - rust-package-darwin-x86_64-portable
+      - rust-package-darwin-x86_64-haswell
+      - rust-package-darwin-arm64-portable
+      - rust-package-darwin-arm64-apple-m1
+      - rust-package-windows-x86_64
+      - rust-package-windows-arm64
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
-      - name: Download all release artifacts
+      - name: Download linux x86_64 portable artifact
         uses: actions/download-artifact@v8
         with:
+          name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
-          pattern: weaver-*-${{ github.run_id }}
-          merge-multiple: true
+      - name: Download linux x86_64 haswell artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-x86_64-haswell-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download linux arm64 cortex-a76 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
+          path: artifacts
+      - name: Download darwin x86_64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download darwin x86_64 haswell artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-darwin-x86_64-haswell-${{ github.run_id }}
+          path: artifacts
+      - name: Download darwin arm64 portable artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-darwin-arm64-portable-${{ github.run_id }}
+          path: artifacts
+      - name: Download darwin arm64 apple-m1 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-darwin-arm64-apple-m1-${{ github.run_id }}
+          path: artifacts
+      - name: Download windows x86_64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-windows-x86_64-${{ github.run_id }}
+          path: artifacts
+      - name: Download windows arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-windows-arm64-${{ github.run_id }}
+          path: artifacts
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -530,25 +1100,287 @@ jobs:
         env:
           TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
         run: |
-          if [ -z "$TAP_TOKEN" ]; then
-            echo "TAP_PUSH_TOKEN not set; skipping tap update."
-            exit 0
-          fi
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#weaver-v}"
-          LINUX_X86_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64.tar.gz | cut -d ' ' -f1)
-          LINUX_ARM_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64.tar.gz | cut -d ' ' -f1)
-          DARWIN_ARM_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64.tar.gz | cut -d ' ' -f1)
-          DARWIN_X86_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64.tar.gz | cut -d ' ' -f1)
+          LINUX_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-portable.tar.gz | cut -d ' ' -f1)
+          LINUX_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-haswell.tar.gz | cut -d ' ' -f1)
+          LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
+          LINUX_ARM_CORTEX_A76_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-cortex-a76.tar.gz | cut -d ' ' -f1)
+          DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
+          DARWIN_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-haswell.tar.gz | cut -d ' ' -f1)
+          DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
+          DARWIN_ARM_APPLE_M1_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-apple-m1.tar.gz | cut -d ' ' -f1)
           REPO="${{ github.repository }}"
 
           mkdir -p formula
           cat > formula/weaver-usenet.rb << FORMULA
+          require "open3"
+          require "rbconfig"
+          require "set"
+
+          module WeaverUsenetReleaseSelection
+            X86_HASWELL_FEATURES = %w[
+              avx
+              avx2
+              bmi1
+              bmi2
+              f16c
+              fma
+              lzcnt
+              movbe
+              pclmulqdq
+              popcnt
+              rdrand
+              sse3
+              sse4.1
+              sse4.2
+              ssse3
+              xsave
+              xsaveopt
+            ].freeze
+
+            LINUX_ARM64_CORTEX_A76_FEATURES = %w[
+              aes
+              crc32
+              dotprod
+              fp16
+              lse
+              neon
+              rdm
+              sha2
+            ].freeze
+
+            MACOS_ARM64_APPLE_M1_FEATURES = %w[
+              aes
+              dotprod
+              fp16
+              lse
+              neon
+              sha2
+            ].freeze
+
+            def self.current_os
+              host_os = RbConfig::CONFIG["host_os"].to_s.downcase
+              return "macos" if host_os.include?("darwin")
+              return "linux" if host_os.include?("linux")
+
+              "unknown"
+            end
+
+            def self.current_arch
+              host_cpu = RbConfig::CONFIG["host_cpu"].to_s.downcase
+              return "arm64" if host_cpu.include?("aarch64") || host_cpu.include?("arm64")
+              return "x86_64" if host_cpu.include?("x86_64") || host_cpu.include?("amd64")
+
+              "unknown"
+            end
+
+            def self.current_lane
+              detect_lane(
+                os: current_os,
+                arch: current_arch,
+                linux_cpuinfo: current_os == "linux" ? read_linux_cpuinfo : nil,
+                sysctl_values: current_os == "macos" ? read_macos_sysctl_values(current_arch) : {},
+              )
+            end
+
+            def self.detect_lane(os:, arch:, linux_cpuinfo: nil, sysctl_values: {})
+              case [os, arch]
+              when ["macos", "x86_64"]
+                normalized = normalize_x86_features(
+                  sysctl_feature_tokens(
+                    sysctl_values["machdep.cpu.features"],
+                    sysctl_values["machdep.cpu.leaf7_features"],
+                  ),
+                )
+                normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
+              when ["linux", "x86_64"]
+                normalized = normalize_x86_features(cpuinfo_feature_tokens(linux_cpuinfo))
+                normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
+              when ["macos", "arm64"]
+                required = {
+                  "aes" => "hw.optional.arm.FEAT_AES",
+                  "dotprod" => "hw.optional.arm.FEAT_DotProd",
+                  "fp16" => "hw.optional.arm.FEAT_FP16",
+                  "lse" => "hw.optional.arm.FEAT_LSE",
+                  "neon" => "hw.optional.arm.AdvSIMD",
+                  "sha2" => "hw.optional.arm.FEAT_SHA256",
+                }
+                present = required.all? do |_feature, key|
+                  truthy_sysctl?(sysctl_values[key])
+                end
+                present ? "apple-m1" : "portable"
+              when ["linux", "arm64"]
+                normalized = normalize_linux_arm64_features(cpuinfo_feature_tokens(linux_cpuinfo))
+                normalized.superset?(LINUX_ARM64_CORTEX_A76_FEATURES.to_set) ? "cortex-a76" : "portable"
+              else
+                "portable"
+              end
+            end
+
+            def self.asset_name(os:, arch:, lane:)
+              case [os, arch, lane]
+              when ["linux", "x86_64", "portable"] then "weaver-linux-x86_64-portable.tar.gz"
+              when ["linux", "x86_64", "haswell"] then "weaver-linux-x86_64-haswell.tar.gz"
+              when ["linux", "arm64", "portable"] then "weaver-linux-arm64-portable.tar.gz"
+              when ["linux", "arm64", "cortex-a76"] then "weaver-linux-arm64-cortex-a76.tar.gz"
+              when ["macos", "x86_64", "portable"] then "weaver-darwin-x86_64-portable.tar.gz"
+              when ["macos", "x86_64", "haswell"] then "weaver-darwin-x86_64-haswell.tar.gz"
+              when ["macos", "arm64", "portable"] then "weaver-darwin-arm64-portable.tar.gz"
+              when ["macos", "arm64", "apple-m1"] then "weaver-darwin-arm64-apple-m1.tar.gz"
+              else
+                raise "unsupported asset mapping: #{[os, arch, lane].inspect}"
+              end
+            end
+
+            def self.asset_url(repo:, version:, os:, arch:, lane:)
+              "https://github.com/#{repo}/releases/download/weaver-v#{version}/#{asset_name(os: os, arch: arch, lane: lane)}"
+            end
+
+            def self.asset_sha256(os:, arch:, lane:, checksums:)
+              checksums.fetch(asset_name(os: os, arch: arch, lane: lane))
+            end
+
+            def self.read_linux_cpuinfo
+              File.read("/proc/cpuinfo")
+            rescue StandardError
+              nil
+            end
+
+            def self.read_macos_sysctl_values(arch)
+              values = {}
+              if arch == "x86_64"
+                %w[
+                  machdep.cpu.features
+                  machdep.cpu.leaf7_features
+                ].each do |key|
+                  values[key] = read_sysctl(key)
+                end
+              elsif arch == "arm64"
+                %w[
+                  hw.optional.arm.FEAT_AES
+                  hw.optional.arm.FEAT_DotProd
+                  hw.optional.arm.FEAT_FP16
+                  hw.optional.arm.FEAT_LSE
+                  hw.optional.arm.AdvSIMD
+                  hw.optional.arm.FEAT_SHA256
+                ].each do |key|
+                  values[key] = read_sysctl(key)
+                end
+              end
+              values
+            end
+
+            def self.read_sysctl(name)
+              output, status = Open3.capture2("sysctl", "-n", name)
+              status.success? ? output.strip : nil
+            rescue StandardError
+              nil
+            end
+
+            def self.cpuinfo_feature_tokens(cpuinfo_text)
+              return [] if cpuinfo_text.to_s.empty?
+
+              cpuinfo_text.each_line.filter_map do |line|
+                match = line.match(/^\s*(flags|Features)\s*:\s*(.+)$/i)
+                next unless match
+
+                match[2].split(/\s+/)
+              end.flatten
+            end
+
+            def self.sysctl_feature_tokens(*values)
+              values.compact.flat_map { |value| value.split(/\s+/) }
+            end
+
+            def self.normalize_x86_features(tokens)
+              tokens.each_with_object(Set.new) do |token, features|
+                normalized = normalize_x86_feature(token)
+                features << normalized if normalized
+              end
+            end
+
+            def self.normalize_linux_arm64_features(tokens)
+              tokens.each_with_object(Set.new) do |token, features|
+                normalized = normalize_linux_arm64_feature(token)
+                features << normalized if normalized
+              end
+            end
+
+            def self.normalize_x86_feature(token)
+              case token.to_s.downcase
+              when "avx", "avx1.0" then "avx"
+              when "avx2", "avx2.0" then "avx2"
+              when "bmi1" then "bmi1"
+              when "bmi2" then "bmi2"
+              when "f16c" then "f16c"
+              when "fma" then "fma"
+              when "abm", "lzcnt" then "lzcnt"
+              when "movbe" then "movbe"
+              when "pclmul", "pclmulqdq" then "pclmulqdq"
+              when "popcnt" then "popcnt"
+              when "rdrand" then "rdrand"
+              when "sse3" then "sse3"
+              when "sse4_1", "sse4.1" then "sse4.1"
+              when "sse4_2", "sse4.2" then "sse4.2"
+              when "ssse3" then "ssse3"
+              when "osxsave", "xsave" then "xsave"
+              when "xsaveopt" then "xsaveopt"
+              end
+            end
+
+            def self.normalize_linux_arm64_feature(token)
+              case token.to_s.downcase
+              when "aes" then "aes"
+              when "crc", "crc32" then "crc32"
+              when "asimddp", "dotprod" then "dotprod"
+              when "fphp", "asimdhp", "fp16" then "fp16"
+              when "atomics", "lse" then "lse"
+              when "asimd", "neon" then "neon"
+              when "asimdrdm", "rdm" then "rdm"
+              when "sha2" then "sha2"
+              end
+            end
+
+            def self.truthy_sysctl?(value)
+              value.to_s.strip == "1"
+            end
+          end
+
           class WeaverUsenet < Formula
             desc "Unified Usenet binary downloader, repair, and extraction engine"
             homepage "https://github.com/${REPO}"
             version "${VERSION}"
             license "MIT"
+            RELEASE_REPO = "${REPO}"
+            RELEASE_VERSION = "${VERSION}"
+            CHECKSUMS = {
+              "weaver-linux-x86_64-portable.tar.gz" => "${LINUX_X86_PORTABLE_SHA}",
+              "weaver-linux-x86_64-haswell.tar.gz" => "${LINUX_X86_HASWELL_SHA}",
+              "weaver-linux-arm64-portable.tar.gz" => "${LINUX_ARM_PORTABLE_SHA}",
+              "weaver-linux-arm64-cortex-a76.tar.gz" => "${LINUX_ARM_CORTEX_A76_SHA}",
+              "weaver-darwin-x86_64-portable.tar.gz" => "${DARWIN_X86_PORTABLE_SHA}",
+              "weaver-darwin-x86_64-haswell.tar.gz" => "${DARWIN_X86_HASWELL_SHA}",
+              "weaver-darwin-arm64-portable.tar.gz" => "${DARWIN_ARM_PORTABLE_SHA}",
+              "weaver-darwin-arm64-apple-m1.tar.gz" => "${DARWIN_ARM_APPLE_M1_SHA}",
+            }.freeze
+            SELECTED_OS = WeaverUsenetReleaseSelection.current_os
+            SELECTED_ARCH = WeaverUsenetReleaseSelection.current_arch
+            SELECTED_LANE = WeaverUsenetReleaseSelection.current_lane
+
+            url WeaverUsenetReleaseSelection.asset_url(
+              repo: RELEASE_REPO,
+              version: RELEASE_VERSION,
+              os: SELECTED_OS,
+              arch: SELECTED_ARCH,
+              lane: SELECTED_LANE,
+            )
+            sha256 WeaverUsenetReleaseSelection.asset_sha256(
+              os: SELECTED_OS,
+              arch: SELECTED_ARCH,
+              lane: SELECTED_LANE,
+              checksums: CHECKSUMS,
+            )
 
             def install_support_files
               (pkgshare/"config.env.example").write <<~EOS
@@ -562,48 +1394,20 @@ jobs:
                 #!/bin/sh
                 CONFIG_FILE="#{etc}/weaver/config.env"
 
-                if [ -f "$CONFIG_FILE" ]; then
+                if [ -f "\$CONFIG_FILE" ]; then
                   set -a
-                  . "$CONFIG_FILE"
+                  . "\$CONFIG_FILE"
                   set +a
                 fi
 
-                : "${WEAVER_CONFIG:=#{var}/weaver}"
-                : "${WEAVER_PORT:=9090}"
-                : "${WEAVER_BASE_URL:=/}"
+                : "\${WEAVER_CONFIG:=#{var}/weaver}"
+                : "\${WEAVER_PORT:=9090}"
+                : "\${WEAVER_BASE_URL:=/}"
 
-                exec "#{opt_bin}/weaver" --config "$WEAVER_CONFIG" serve --port "$WEAVER_PORT" --base-url "$WEAVER_BASE_URL" "$@"
+                exec "#{opt_bin}/weaver" --config "\$WEAVER_CONFIG" serve --port "\$WEAVER_PORT" --base-url "\$WEAVER_BASE_URL" "\$@"
               SH
 
               chmod 0755, libexec/"weaver-service"
-            end
-
-            on_macos do
-              on_arm do
-                url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-darwin-arm64.tar.gz"
-                sha256 "${DARWIN_ARM_SHA}"
-
-              end
-
-              on_intel do
-                url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-darwin-x86_64.tar.gz"
-                sha256 "${DARWIN_X86_SHA}"
-
-              end
-            end
-
-            on_linux do
-              on_arm do
-                url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-linux-arm64.tar.gz"
-                sha256 "${LINUX_ARM_SHA}"
-
-              end
-
-              on_intel do
-                url "https://github.com/${REPO}/releases/download/weaver-v${VERSION}/weaver-linux-x86_64.tar.gz"
-                sha256 "${LINUX_X86_SHA}"
-
-              end
             end
 
             def install
@@ -644,6 +1448,97 @@ jobs:
           FORMULA
 
           sed -i 's/^          //' formula/weaver-usenet.rb
+      - name: Smoke test Homebrew asset selection
+        run: |
+          ruby <<'RUBY'
+          source = File.read("formula/weaver-usenet.rb")
+          helper_source = source.split(/^class WeaverUsenet < Formula$/).first
+          eval(helper_source, TOPLEVEL_BINDING, "formula/weaver-usenet.rb")
+
+          def assert_equal(expected, actual, label)
+            raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
+          end
+
+          linux_x86_full = <<~CPUINFO
+            flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+          CPUINFO
+          linux_x86_abm = <<~CPUINFO
+            flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq popcnt rdrand xsave xsaveopt
+          CPUINFO
+          linux_x86_portable = <<~CPUINFO
+            flags : sse3 ssse3 sse4_1 sse4_2 avx bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+          CPUINFO
+          linux_arm_full = <<~CPUINFO
+            Features : fp asimd aes sha2 crc32 atomics fphp asimdrdm asimddp
+          CPUINFO
+          linux_arm_portable = <<~CPUINFO
+            Features : fp asimd aes sha2 crc32 atomics fphp asimdrdm
+          CPUINFO
+          macos_x86_full = {
+            "machdep.cpu.features" => "SSE3 SSSE3 SSE4.1 SSE4.2 FMA MOVBE POPCNT AVX1.0 RDRAND F16C XSAVE OSXSAVE",
+            "machdep.cpu.leaf7_features" => "AVX2 BMI1 BMI2 LZCNT PCLMULQDQ XSAVEOPT",
+          }
+          macos_x86_portable = {
+            "machdep.cpu.features" => "SSE3 SSSE3 SSE4.1 SSE4.2 FMA MOVBE POPCNT AVX1.0 RDRAND F16C XSAVE OSXSAVE",
+            "machdep.cpu.leaf7_features" => "BMI1 BMI2 LZCNT PCLMULQDQ XSAVEOPT",
+          }
+          macos_arm_full = {
+            "hw.optional.arm.FEAT_AES" => "1",
+            "hw.optional.arm.FEAT_DotProd" => "1",
+            "hw.optional.arm.FEAT_FP16" => "1",
+            "hw.optional.arm.FEAT_LSE" => "1",
+            "hw.optional.arm.AdvSIMD" => "1",
+            "hw.optional.arm.FEAT_SHA256" => "1",
+          }
+          macos_arm_portable = macos_arm_full.merge("hw.optional.arm.FEAT_DotProd" => "0")
+
+          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_full), "linux x86 optimized lane")
+          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_abm), "linux x86 abm optimized lane")
+          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "x86_64", linux_cpuinfo: linux_x86_portable), "linux x86 portable lane")
+          assert_equal("cortex-a76", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_full), "linux arm optimized lane")
+          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_portable), "linux arm portable lane")
+          assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_full), "macos x86 optimized lane")
+          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable), "macos x86 portable lane")
+          assert_equal("apple-m1", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_full), "macos arm optimized lane")
+          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_portable), "macos arm portable lane")
+
+          checksums = {
+            "weaver-linux-x86_64-portable.tar.gz" => "linux-x86-portable",
+            "weaver-linux-x86_64-haswell.tar.gz" => "linux-x86-haswell",
+            "weaver-linux-arm64-portable.tar.gz" => "linux-arm-portable",
+            "weaver-linux-arm64-cortex-a76.tar.gz" => "linux-arm-cortex-a76",
+            "weaver-darwin-x86_64-portable.tar.gz" => "darwin-x86-portable",
+            "weaver-darwin-x86_64-haswell.tar.gz" => "darwin-x86-haswell",
+            "weaver-darwin-arm64-portable.tar.gz" => "darwin-arm-portable",
+            "weaver-darwin-arm64-apple-m1.tar.gz" => "darwin-arm-apple-m1",
+          }
+
+          assert_equal(
+            "https://github.com/scryer-media/weaver/releases/download/weaver-v1.2.3/weaver-linux-x86_64-haswell.tar.gz",
+            WeaverUsenetReleaseSelection.asset_url(repo: "scryer-media/weaver", version: "1.2.3", os: "linux", arch: "x86_64", lane: "haswell"),
+            "linux x86 url",
+          )
+          assert_equal(
+            "linux-arm-cortex-a76",
+            WeaverUsenetReleaseSelection.asset_sha256(os: "linux", arch: "arm64", lane: "cortex-a76", checksums: checksums),
+            "linux arm sha",
+          )
+          assert_equal(
+            "darwin-x86-portable",
+            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "portable", checksums: checksums),
+            "macos x86 sha",
+          )
+          RUBY
+      - name: Publish Homebrew tap update
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "TAP_PUSH_TOKEN not set; skipping tap update."
+            exit 0
+          fi
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#weaver-v}"
 
           git clone "https://${TAP_TOKEN}@github.com/scryer-media/homebrew-weaver.git" tap-repo
           mkdir -p tap-repo/Formula

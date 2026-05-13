@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
+import { useLocation } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { authHeaders } from "@/graphql/client";
 import {
@@ -76,6 +77,30 @@ type BackupInspectResult = {
   manifest: BackupManifest;
   required_category_remaps: CategoryRemapRequirement[];
 };
+
+type ApiKeyScope = "CONTROL" | "READ" | "ADMIN";
+
+const API_KEY_GENERATE_PARAM = "apiKeyGenerate";
+const API_KEY_NAME_PARAM = "apiKeyName";
+const API_KEY_SCOPE_PARAM = "apiKeyScope";
+
+function parseApiKeyScope(value: string | null): ApiKeyScope | null {
+  switch (value?.trim().toLowerCase()) {
+    case "control":
+    case "integration":
+      return "CONTROL";
+    case "read":
+      return "READ";
+    case "admin":
+      return "ADMIN";
+    default:
+      return null;
+  }
+}
+
+function isTruthyQueryParam(value: string | null) {
+  return value === "1" || value?.trim().toLowerCase() === "true";
+}
 
 export function BackupRestoreSection({
   currentDataDir,
@@ -483,18 +508,17 @@ export function BackupRestoreSection({
 
 export function ApiKeysSection() {
   const t = useTranslate();
+  const location = useLocation();
   const [{ data }] = useQuery({ query: API_KEYS_QUERY });
   const [, createApiKey] = useMutation(CREATE_API_KEY_MUTATION);
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
 
   const [newKeyName, setNewKeyName] = useState("");
-  const [newKeyScope, setNewKeyScope] = useState<"CONTROL" | "READ" | "ADMIN">(
-    "CONTROL",
-  );
+  const [newKeyScope, setNewKeyScope] = useState<ApiKeyScope>("CONTROL");
   const [createdKey, setCreatedKey] = useState<{
     rawKey: string;
     name: string;
-    scope: "CONTROL" | "READ" | "ADMIN";
+    scope: ApiKeyScope;
   } | null>(null);
   const [createdKeyOpen, setCreatedKeyOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
@@ -527,22 +551,20 @@ export function ApiKeysSection() {
     return () => window.cancelAnimationFrame(handle);
   }, [createdKey, createdKeyOpen]);
 
-  const createKey = async (
-    name: string,
-    scope: "CONTROL" | "READ" | "ADMIN",
-  ) => {
-    if (!name.trim()) return;
+  const createKey = useCallback(async (name: string, scope: ApiKeyScope) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
     setCreateBusy(true);
     setCreateError(null);
     setCopiedRawKey(false);
     const result = await createApiKey({
-      name: name.trim(),
+      name: trimmedName,
       scope,
     });
     if (result.data?.createApiKey?.rawKey) {
       setCreatedKey({
         rawKey: result.data.createApiKey.rawKey,
-        name: name.trim(),
+        name: trimmedName,
         scope,
       });
       setCreatedKeyOpen(true);
@@ -555,7 +577,34 @@ export function ApiKeysSection() {
       setCreateError(result.error.message);
     }
     setCreateBusy(false);
-  };
+  }, [createApiKey, t]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!isTruthyQueryParam(params.get(API_KEY_GENERATE_PARAM))) {
+      return;
+    }
+
+    const name = params.get(API_KEY_NAME_PARAM)?.trim() ?? "";
+    if (!name) {
+      return;
+    }
+
+    const scope = parseApiKeyScope(params.get(API_KEY_SCOPE_PARAM)) ?? "CONTROL";
+    setNewKeyName(name);
+    setNewKeyScope(scope);
+
+    params.delete(API_KEY_GENERATE_PARAM);
+    params.delete(API_KEY_NAME_PARAM);
+    params.delete(API_KEY_SCOPE_PARAM);
+
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+
+    // Consume the deep link once so refresh doesn't silently mint another key.
+    window.history.replaceState(window.history.state, "", nextUrl);
+    void createKey(name, scope);
+  }, [createKey, location.pathname, location.search]);
 
   const handleCreate = async () => {
     await createKey(newKeyName.trim(), newKeyScope);
@@ -665,7 +714,7 @@ export function ApiKeysSection() {
             <Select
               value={newKeyScope}
               onValueChange={(value) =>
-                setNewKeyScope(value as "CONTROL" | "READ" | "ADMIN")
+                setNewKeyScope(value as ApiKeyScope)
               }
             >
               <SelectTrigger className="min-w-44">
