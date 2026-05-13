@@ -214,7 +214,22 @@ jobs:
         run: |
           while IFS= read -r bin; do
             echo "::group::$(basename "$bin")"
-            sde64 ${{ matrix.sde_arch }} -- "$bin" --test-threads=1
+            case "$(basename "$bin")" in
+              weaver_par2-*)
+                sde64 ${{ matrix.sde_arch }} -- "$bin" gf_simd::tests:: --test-threads=1
+                ;;
+              repair_stress-*)
+                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_single_file_4mb_8_missing --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_large_slices --exact --test-threads=1
+                ;;
+              real_world_generated-*)
+                sde64 ${{ matrix.sde_arch }} -- "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
+                ;;
+              *)
+                echo "unexpected SDE test binary: $(basename "$bin")" >&2
+                exit 1
+                ;;
+            esac
             echo "::endgroup::"
           done < /tmp/test-bins.txt
 
