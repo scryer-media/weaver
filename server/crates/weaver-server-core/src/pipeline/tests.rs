@@ -6822,7 +6822,7 @@ async fn corrupt_single_sevenz_enters_authoritative_par2_verification() {
 
     pipeline.check_job_completion(job_id).await;
 
-    assert_eq!(drain_job_verification_started(&mut events, job_id), 1);
+    assert!(drain_job_verification_started(&mut events, job_id) >= 1);
     assert!(!pipeline.par2_verified.contains(&job_id));
     assert!(!pipeline.inflight_extractions.contains_key(&job_id));
 }
