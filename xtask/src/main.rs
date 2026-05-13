@@ -113,6 +113,8 @@ struct PrintRustflagsArgs {
     #[arg(long)]
     target: Option<String>,
     #[arg(long)]
+    lane: Option<ReleaseLane>,
+    #[arg(long)]
     ci: bool,
 }
 
@@ -120,6 +122,29 @@ struct PrintRustflagsArgs {
 struct VerifyCryptoTargetArgs {
     #[arg(long)]
     target: String,
+    #[arg(long)]
+    lane: ReleaseLane,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReleaseLane {
+    Portable,
+    Haswell,
+    #[value(name = "cortex-a76")]
+    CortexA76,
+    #[value(name = "apple-m1")]
+    AppleM1,
+}
+
+impl ReleaseLane {
+    fn as_suffix(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Haswell => "haswell",
+            Self::CortexA76 => "cortex-a76",
+            Self::AppleM1 => "apple-m1",
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -322,8 +347,12 @@ fn run_print_rustflags(args: PrintRustflagsArgs) -> Result<()> {
             .target
             .as_deref()
             .context("--target is required with --ci")?;
-        ci_rustflags_for_target(target)?
+        let lane = args.lane.context("--lane is required with --ci")?;
+        ci_rustflags_for_target(target, lane)?
     } else {
+        if args.lane.is_some() {
+            bail!("--lane is only supported with --ci");
+        }
         host_local_rustflags()
     };
     println!("{flags}");
@@ -331,8 +360,12 @@ fn run_print_rustflags(args: PrintRustflagsArgs) -> Result<()> {
 }
 
 fn run_verify_crypto_target(args: VerifyCryptoTargetArgs) -> Result<()> {
-    verify_crypto_target(&args.target)?;
-    println!("native crypto config ok for {}", args.target);
+    verify_crypto_target(&args.target, args.lane)?;
+    println!(
+        "native crypto config ok for {} ({})",
+        args.target,
+        args.lane.as_suffix()
+    );
     Ok(())
 }
 
@@ -351,21 +384,47 @@ fn local_rustflags_for_host(host_arch: &str, host_os: &str) -> String {
     flags.join(" ")
 }
 
-fn ci_rustflags_for_target(target: &str) -> Result<String> {
-    let flags = if target.starts_with("x86_64-pc-windows-") {
-        "-C target-cpu=haswell -C linker=rust-lld"
+fn ci_rustflags_for_target(target: &str, lane: ReleaseLane) -> Result<String> {
+    if !release_lane_supported_for_target(target, lane) {
+        bail!(
+            "unsupported lane {} for rustflags target {target}",
+            lane.as_suffix()
+        );
+    }
+
+    let mut flags = Vec::new();
+    if target.starts_with("x86_64-pc-windows-") {
+        if lane == ReleaseLane::Haswell {
+            flags.push("-C target-cpu=haswell");
+        }
+        flags.push("-C linker=rust-lld");
     } else if target.starts_with("x86_64-") {
-        "-C target-cpu=haswell"
+        if lane == ReleaseLane::Haswell {
+            flags.push("-C target-cpu=haswell");
+        }
     } else if target.starts_with("aarch64-apple-") {
-        "-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon"
+        if lane == ReleaseLane::AppleM1 {
+            flags.push("-C target-cpu=apple-m1");
+        }
+        flags.push("--cfg aes_armv8");
+        flags.push("--cfg chacha20_force_neon");
     } else if target.starts_with("aarch64-") && target.contains("-windows-") {
-        "-C target-cpu=cortex-a76 --cfg aes_armv8 -C linker=rust-lld"
+        if lane == ReleaseLane::CortexA76 {
+            flags.push("-C target-cpu=cortex-a76");
+        }
+        flags.push("--cfg aes_armv8");
+        flags.push("-C linker=rust-lld");
     } else if target.starts_with("aarch64-") && target.contains("-linux-") {
-        "-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon"
+        if lane == ReleaseLane::CortexA76 {
+            flags.push("-C target-cpu=cortex-a76");
+        }
+        flags.push("--cfg aes_armv8");
+        flags.push("--cfg chacha20_force_neon");
     } else {
         bail!("unsupported target for rustflags: {target}");
-    };
-    Ok(flags.to_string())
+    }
+
+    Ok(flags.join(" "))
 }
 
 fn native_crypto_supported_target(target: &str) -> bool {
@@ -380,45 +439,83 @@ fn native_crypto_supported_target(target: &str) -> bool {
     )
 }
 
-fn verify_crypto_target(target: &str) -> Result<()> {
+fn release_lane_supported_for_target(target: &str, lane: ReleaseLane) -> bool {
+    match lane {
+        ReleaseLane::Portable => native_crypto_supported_target(target),
+        ReleaseLane::Haswell => {
+            target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl")
+        }
+        ReleaseLane::CortexA76 => target.starts_with("aarch64-unknown-linux-musl"),
+        ReleaseLane::AppleM1 => target.starts_with("aarch64-apple-"),
+    }
+}
+
+fn verify_crypto_target(target: &str, lane: ReleaseLane) -> Result<()> {
     if !native_crypto_supported_target(target) {
         bail!("unsupported native crypto target: {target}");
     }
+    if !release_lane_supported_for_target(target, lane) {
+        bail!(
+            "unsupported lane {} for native crypto target {target}",
+            lane.as_suffix()
+        );
+    }
 
-    let flags = ci_rustflags_for_target(target)?;
+    let flags = ci_rustflags_for_target(target, lane)?;
     let has = |needle: &str| flags.split_whitespace().any(|token| token == needle);
 
     if target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl") {
-        if !has("target-cpu=haswell") {
+        if lane == ReleaseLane::Haswell && !has("target-cpu=haswell") {
             bail!("missing haswell target-cpu for {target}: {flags}");
+        }
+        if lane == ReleaseLane::Portable && has("target-cpu=haswell") {
+            bail!("unexpected haswell target-cpu for portable {target}: {flags}");
         }
         if has("aes_armv8") || has("chacha20_force_neon") || has("linker=rust-lld") {
             bail!("unexpected ARM or Windows flags for {target}: {flags}");
         }
     } else if target.starts_with("x86_64-pc-windows-") {
-        if !has("target-cpu=haswell") || !has("linker=rust-lld") {
-            bail!("missing Windows x86_64 crypto/linker flags for {target}: {flags}");
+        if !has("linker=rust-lld") {
+            bail!("missing Windows x86_64 linker flag for {target}: {flags}");
+        }
+        if has("target-cpu=haswell") {
+            bail!("unexpected Windows x86_64 optimized target-cpu for {target}: {flags}");
         }
         if has("aes_armv8") || has("chacha20_force_neon") {
             bail!("unexpected ARM flags for {target}: {flags}");
         }
     } else if target.starts_with("aarch64-apple-") {
-        if !has("target-cpu=apple-m1") || !has("aes_armv8") || !has("chacha20_force_neon") {
+        if !has("aes_armv8") || !has("chacha20_force_neon") {
             bail!("missing Apple ARM crypto flags for {target}: {flags}");
+        }
+        if lane == ReleaseLane::AppleM1 && !has("target-cpu=apple-m1") {
+            bail!("missing Apple ARM crypto flags for {target}: {flags}");
+        }
+        if lane == ReleaseLane::Portable && has("target-cpu=apple-m1") {
+            bail!("unexpected Apple ARM optimized target-cpu for {target}: {flags}");
         }
         if has("linker=rust-lld") {
             bail!("unexpected Windows linker flag for {target}: {flags}");
         }
     } else if target.starts_with("aarch64-unknown-linux-musl") {
-        if !has("target-cpu=cortex-a72") || !has("aes_armv8") || !has("chacha20_force_neon") {
+        if !has("aes_armv8") || !has("chacha20_force_neon") {
             bail!("missing Linux ARM crypto flags for {target}: {flags}");
+        }
+        if lane == ReleaseLane::CortexA76 && !has("target-cpu=cortex-a76") {
+            bail!("missing Linux ARM optimized target-cpu for {target}: {flags}");
+        }
+        if lane == ReleaseLane::Portable && has("target-cpu=cortex-a76") {
+            bail!("unexpected Linux ARM optimized target-cpu for {target}: {flags}");
         }
         if has("linker=rust-lld") {
             bail!("unexpected Windows linker flag for {target}: {flags}");
         }
     } else if target.starts_with("aarch64-pc-windows-") {
-        if !has("target-cpu=cortex-a76") || !has("aes_armv8") || !has("linker=rust-lld") {
+        if !has("aes_armv8") || !has("linker=rust-lld") {
             bail!("missing Windows ARM crypto/linker flags for {target}: {flags}");
+        }
+        if has("target-cpu=cortex-a76") {
+            bail!("unexpected Windows ARM optimized target-cpu for {target}: {flags}");
         }
         if has("chacha20_force_neon") {
             bail!("unexpected non-Windows ARM neon flag for {target}: {flags}");
@@ -1047,7 +1144,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
         .unwrap_or_else(|_| "rust:1.95-bookworm".to_string());
     let linux_platform =
         std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string());
-    let linux_rustflags = ci_rustflags_for_target(linux_target)?;
+    let linux_rustflags = ci_rustflags_for_target(linux_target, ReleaseLane::Portable)?;
     let linux_rustflags_env =
         format!("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS={linux_rustflags}");
     let linux_linker_env = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc";
@@ -2453,34 +2550,63 @@ mod tests {
     }
 
     #[test]
-    fn ci_rustflags_cover_supported_arm_targets() {
-        assert_eq!(
-            ci_rustflags_for_target("aarch64-apple-darwin").unwrap(),
-            "-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon"
-        );
-        assert_eq!(
-            ci_rustflags_for_target("aarch64-unknown-linux-musl").unwrap(),
-            "-C target-cpu=cortex-a72 --cfg aes_armv8 --cfg chacha20_force_neon"
-        );
-        assert_eq!(
-            ci_rustflags_for_target("aarch64-pc-windows-msvc").unwrap(),
-            "-C target-cpu=cortex-a76 --cfg aes_armv8 -C linker=rust-lld"
-        );
+    fn ci_rustflags_cover_supported_release_lanes() {
+        for (target, lane, expected) in [
+            (
+                "aarch64-apple-darwin",
+                ReleaseLane::Portable,
+                "--cfg aes_armv8 --cfg chacha20_force_neon",
+            ),
+            (
+                "aarch64-apple-darwin",
+                ReleaseLane::AppleM1,
+                "-C target-cpu=apple-m1 --cfg aes_armv8 --cfg chacha20_force_neon",
+            ),
+            (
+                "aarch64-unknown-linux-musl",
+                ReleaseLane::Portable,
+                "--cfg aes_armv8 --cfg chacha20_force_neon",
+            ),
+            (
+                "aarch64-unknown-linux-musl",
+                ReleaseLane::CortexA76,
+                "-C target-cpu=cortex-a76 --cfg aes_armv8 --cfg chacha20_force_neon",
+            ),
+            (
+                "aarch64-pc-windows-msvc",
+                ReleaseLane::Portable,
+                "--cfg aes_armv8 -C linker=rust-lld",
+            ),
+            ("x86_64-apple-darwin", ReleaseLane::Portable, ""),
+            (
+                "x86_64-apple-darwin",
+                ReleaseLane::Haswell,
+                "-C target-cpu=haswell",
+            ),
+            ("x86_64-unknown-linux-musl", ReleaseLane::Portable, ""),
+            (
+                "x86_64-unknown-linux-musl",
+                ReleaseLane::Haswell,
+                "-C target-cpu=haswell",
+            ),
+            (
+                "x86_64-pc-windows-msvc",
+                ReleaseLane::Portable,
+                "-C linker=rust-lld",
+            ),
+        ] {
+            assert_eq!(ci_rustflags_for_target(target, lane).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn ci_rustflags_preserve_existing_x86_targets() {
-        assert_eq!(
-            ci_rustflags_for_target("x86_64-apple-darwin").unwrap(),
-            "-C target-cpu=haswell"
-        );
-        assert_eq!(
-            ci_rustflags_for_target("x86_64-unknown-linux-musl").unwrap(),
-            "-C target-cpu=haswell"
-        );
-        assert_eq!(
-            ci_rustflags_for_target("x86_64-pc-windows-msvc").unwrap(),
-            "-C target-cpu=haswell -C linker=rust-lld"
+    fn ci_rustflags_reject_unsupported_lanes() {
+        let error = ci_rustflags_for_target("aarch64-unknown-linux-musl", ReleaseLane::AppleM1)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "unsupported lane apple-m1 for rustflags target aarch64-unknown-linux-musl"
+            )
         );
     }
 
@@ -2510,25 +2636,41 @@ mod tests {
 
     #[test]
     fn verify_crypto_target_accepts_supported_release_targets() {
-        for target in [
-            "x86_64-apple-darwin",
-            "aarch64-apple-darwin",
-            "x86_64-unknown-linux-musl",
-            "aarch64-unknown-linux-musl",
-            "x86_64-pc-windows-msvc",
-            "aarch64-pc-windows-msvc",
+        for (target, lane) in [
+            ("x86_64-apple-darwin", ReleaseLane::Portable),
+            ("x86_64-apple-darwin", ReleaseLane::Haswell),
+            ("aarch64-apple-darwin", ReleaseLane::Portable),
+            ("aarch64-apple-darwin", ReleaseLane::AppleM1),
+            ("x86_64-unknown-linux-musl", ReleaseLane::Portable),
+            ("x86_64-unknown-linux-musl", ReleaseLane::Haswell),
+            ("aarch64-unknown-linux-musl", ReleaseLane::Portable),
+            ("aarch64-unknown-linux-musl", ReleaseLane::CortexA76),
+            ("x86_64-pc-windows-msvc", ReleaseLane::Portable),
+            ("aarch64-pc-windows-msvc", ReleaseLane::Portable),
         ] {
-            verify_crypto_target(target).unwrap();
+            verify_crypto_target(target, lane).unwrap();
         }
     }
 
     #[test]
     fn verify_crypto_target_rejects_unsupported_targets() {
-        let error = verify_crypto_target("x86_64-unknown-linux-gnu").unwrap_err();
+        let error =
+            verify_crypto_target("x86_64-unknown-linux-gnu", ReleaseLane::Portable).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("unsupported native crypto target: x86_64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn verify_crypto_target_rejects_unsupported_lanes() {
+        let error =
+            verify_crypto_target("x86_64-pc-windows-msvc", ReleaseLane::Haswell).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "unsupported lane haswell for native crypto target x86_64-pc-windows-msvc"
+            )
         );
     }
 

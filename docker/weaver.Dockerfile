@@ -6,9 +6,10 @@ RUN apk add --no-cache su-exec tzdata
 
 WORKDIR /app
 
-COPY ${TARGETARCH}/weaver /usr/local/bin/weaver
+COPY ${TARGETARCH}/weaver-* /opt/weaver/
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY runtime-select.sh /runtime-select.sh
+RUN chmod +x /entrypoint.sh /runtime-select.sh /opt/weaver/weaver-*
 
 EXPOSE 9090
 
