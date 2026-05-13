@@ -87,6 +87,7 @@ impl RarArchive {
                 rar4_salt: None,
                 hash: pf.hash,
                 redirection: pf.redirection,
+                owner: pf.owner,
                 segments: vec![segment],
             };
 
@@ -156,6 +157,7 @@ impl RarArchive {
                 rar4_salt: fh.salt,
                 hash: None,
                 redirection: None,
+                owner: None,
                 segments: vec![segment],
             };
 
@@ -429,6 +431,7 @@ mod tests {
             rar4_salt: None,
             hash: None,
             redirection: None,
+            owner: None,
             segments: vec![DataSegment {
                 volume_index: first_volume,
                 data_offset: 0,
@@ -456,6 +459,9 @@ mod tests {
             format: ArchiveFormat::Rar5,
             is_solid: false,
             is_encrypted: false,
+            has_recovery_record: false,
+            is_locked: false,
+            has_authenticity_verification: false,
             volume_set: VolumeSet::new(),
             members,
             more_volumes: true,

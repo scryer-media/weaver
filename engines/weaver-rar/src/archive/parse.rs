@@ -23,6 +23,8 @@ impl RarArchive {
         let parsed = header::parse_all_headers(&mut reader, password)?;
 
         let is_solid = parsed.main.as_ref().is_some_and(|m| m.is_solid);
+        let has_recovery_record = parsed.main.as_ref().is_some_and(|m| m.has_recovery_record);
+        let is_locked = parsed.main.as_ref().is_some_and(|m| m.is_locked);
 
         let is_volume = parsed.main.as_ref().is_some_and(|m| m.is_volume);
 
@@ -73,6 +75,7 @@ impl RarArchive {
                 rar4_salt: None,
                 hash: pf.hash,
                 redirection: pf.redirection,
+                owner: pf.owner,
                 segments: vec![segment],
             });
         }
@@ -88,6 +91,9 @@ impl RarArchive {
             format,
             is_solid,
             is_encrypted: parsed.is_encrypted,
+            has_recovery_record,
+            is_locked,
+            has_authenticity_verification: false,
             volume_set,
             members,
             more_volumes,
@@ -139,6 +145,7 @@ impl RarArchive {
                 rar4_salt: fh.salt,
                 hash: None,
                 redirection: None,
+                owner: None,
                 segments: vec![segment],
             });
         }
@@ -149,6 +156,9 @@ impl RarArchive {
             format: ArchiveFormat::Rar4,
             is_solid,
             is_encrypted: parsed.archive_header.is_encrypted,
+            has_recovery_record: parsed.archive_header.has_recovery_record,
+            is_locked: parsed.archive_header.is_locked,
+            has_authenticity_verification: parsed.archive_header.has_authenticity_verification,
             volume_set,
             members,
             more_volumes,

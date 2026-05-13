@@ -61,6 +61,6 @@ pub use probe::{ProbeFile, VolumeProbe, probe_volume};
 pub use progress::{NoProgress, ProgressHandler};
 pub use types::{
     ArchiveFormat, ArchiveMetadata, CompressionInfo, CompressionMethod, FileHash, HostOs,
-    MemberInfo, TopologyMemberInfo, VolumeSpan,
+    MemberInfo, TopologyMemberInfo, UnixOwnerInfo, VolumeSpan,
 };
 pub use volume::{StaticVolumeProvider, VolumeProvider, VolumeProviderError, VolumeSet};

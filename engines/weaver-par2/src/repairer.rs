@@ -8,12 +8,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::checksum::{self, Md5State};
-use crate::disk::DiskFileAccess;
 use crate::error::{Par2Error, Result};
 use crate::md5_simd;
 use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
@@ -26,6 +29,8 @@ use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
 };
 use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult, verify_all};
+#[cfg(test)]
+use crate::DiskFileAccess;
 use memmap2::MmapOptions;
 use tracing::{debug, warn};
 
@@ -34,6 +39,7 @@ const SCANNER_MD5_BATCH_LANES: usize = 4;
 const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
+const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
 const ORDERED_SCAN_SKIP_LEEWAY: usize = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
 const SCANNER_SLOW_WARN_DURATION: Duration = Duration::from_secs(5);
@@ -407,6 +413,7 @@ struct RepairExecutionAccess {
     slice_size: u64,
     repair_paths: HashMap<FileId, PathBuf>,
     source_locations: HashMap<(FileId, u32), BlockLocation>,
+    source_files: HashMap<PathBuf, File>,
 }
 
 impl RepairExecutionAccess {
@@ -416,13 +423,13 @@ impl RepairExecutionAccess {
         blocks: &[SourceBlock],
         staged_file_ids: &HashSet<FileId>,
         slice_size: u64,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let repair_paths = files
             .iter()
             .filter(|file| staged_file_ids.contains(&file.file_id))
             .map(|file| (file.file_id, install_dir.join(&file.safe_name)))
             .collect();
-        let source_locations = blocks
+        let source_locations: HashMap<(FileId, u32), BlockLocation> = blocks
             .iter()
             .filter_map(|block| {
                 block
@@ -431,12 +438,20 @@ impl RepairExecutionAccess {
                     .map(|location| ((block.file_id, block.local_index), location))
             })
             .collect();
+        let source_files = source_locations
+            .values()
+            .map(|location| location.path.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|path| File::open(&path).map(|file| (path, file)))
+            .collect::<io::Result<HashMap<_, _>>>()?;
 
-        Self {
+        Ok(Self {
             slice_size,
             repair_paths,
             source_locations,
-        }
+            source_files,
+        })
     }
 
     fn repair_path_for(&self, file_id: &FileId) -> io::Result<&Path> {
@@ -469,9 +484,10 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                     return Ok(0);
                 }
                 let len = (dst.len() as u64).min(location.len - slice_offset) as usize;
-                let mut file = File::open(&location.path)?;
-                file.seek(SeekFrom::Start(location.offset + slice_offset))?;
-                return file.read(&mut dst[..len]);
+                let file = self.source_files.get(&location.path).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
+                })?;
+                return read_file_at(file, &mut dst[..len], location.offset + slice_offset);
             }
         }
 
@@ -526,6 +542,23 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)
     }
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.read_at(dst, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.seek_read(dst, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read(dst)
 }
 
 struct RepairVerificationAccess {
@@ -865,6 +898,17 @@ impl RepairState {
             return Ok(false);
         }
 
+        let should_skip_full_hash = kind == BlockLocationKind::Canonical
+            && len
+                >= CANONICAL_COMPLETE_HASH_SKIP_BYTES.max(self.set.slice_size.saturating_mul(4))
+            && candidates
+                .iter()
+                .copied()
+                .any(|idx| self.files[idx].safe_path == path);
+        if should_skip_full_hash {
+            return Ok(false);
+        }
+
         let full = hash_file(path)?;
         let mut found_complete = false;
         for idx in candidates {
@@ -925,29 +969,44 @@ impl RepairState {
     }
 
     fn refresh_file_states(&mut self) {
-        for file in &mut self.files {
-            file.target_exists = file.safe_path.exists();
-            if !file.recoverable || file.complete_location.is_some() {
+        for file_index in 0..self.files.len() {
+            let target_exists = self.files[file_index].safe_path.exists();
+            self.files[file_index].target_exists = target_exists;
+            if !self.files[file_index].recoverable
+                || self.files[file_index].complete_location.is_some()
+            {
                 continue;
             }
-            let all_blocks = (0..file.block_count).all(|local| {
-                let idx = file.first_block + local;
-                self.blocks
-                    .get(idx)
-                    .and_then(|block| block.location.as_ref())
-                    .is_some()
-            });
-            if all_blocks && file.target_exists {
-                let access = DiskFileAccess::new(
-                    file.safe_path
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""))
-                        .to_path_buf(),
-                    &self.set,
-                );
-                let _ = access;
+            if self.file_has_canonical_block_layout(file_index) {
+                let file = &self.files[file_index];
+                self.files[file_index].complete_location = Some(BlockLocation {
+                    path: file.safe_path.clone(),
+                    offset: 0,
+                    len: file.length,
+                    kind: BlockLocationKind::Canonical,
+                });
             }
         }
+    }
+
+    fn file_has_canonical_block_layout(&self, file_index: usize) -> bool {
+        let file = &self.files[file_index];
+        if !file.target_exists {
+            return false;
+        }
+        if file.block_count == 0 {
+            return true;
+        }
+
+        (0..file.block_count).all(|local| {
+            let block = &self.blocks[file.first_block + local];
+            block.location.as_ref().is_some_and(|location| {
+                location.kind == BlockLocationKind::Canonical
+                    && location.path == file.safe_path
+                    && location.offset == local as u64 * self.set.slice_size
+                    && location.len == block.expected_len
+            })
+        })
     }
 
     fn verification_result(&self) -> VerificationResult {
@@ -1117,7 +1176,7 @@ impl RepairState {
                 &self.blocks,
                 &staged_file_ids,
                 self.set.slice_size,
-            );
+            )?;
             let plan = plan_repair(&self.set, verification)?;
             bytes_reconstructed = plan
                 .missing_slices

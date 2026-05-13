@@ -26,7 +26,7 @@ use crate::progress::ProgressHandler;
 use crate::signature;
 use crate::types::{
     ArchiveFormat, ArchiveMetadata, CompressionMethod, FileHash, MemberInfo, TopologyMemberInfo,
-    VolumeSpan,
+    UnixOwnerInfo, VolumeSpan,
 };
 use crate::volume::VolumeSet;
 
@@ -56,6 +56,8 @@ pub(super) struct MemberEntry {
     pub(super) hash: Option<FileHash>,
     /// Redirection info (symlink/hardlink) from extra records.
     pub(super) redirection: Option<header::Redirection>,
+    /// Unix owner info from the RAR5 owner extra field.
+    pub(super) owner: Option<UnixOwnerInfo>,
     /// Data segments across volumes, in order.
     pub(super) segments: Vec<DataSegment>,
 }
@@ -92,6 +94,12 @@ pub struct RarArchive {
     pub(super) is_solid: bool,
     /// Whether the archive has header-level encryption.
     pub(super) is_encrypted: bool,
+    /// Whether the archive has a recovery record.
+    pub(super) has_recovery_record: bool,
+    /// Whether the archive is locked.
+    pub(super) is_locked: bool,
+    /// Whether the archive has authenticity verification/auth info.
+    pub(super) has_authenticity_verification: bool,
     /// Volume topology.
     pub(super) volume_set: VolumeSet,
     /// All member entries (file headers + data segments).
@@ -293,6 +301,9 @@ impl RarArchive {
             format: self.format,
             is_solid: self.is_solid,
             is_encrypted: self.is_encrypted,
+            has_recovery_record: self.has_recovery_record,
+            is_locked: self.is_locked,
+            has_authenticity_verification: self.has_authenticity_verification,
             volume_count: self.volume_set.expected_count(),
             members,
         }
@@ -412,6 +423,8 @@ impl RarArchive {
             compression: fh.compression,
             is_encrypted: entry.is_encrypted,
             hash: entry.hash.clone(),
+            attributes: fh.attributes,
+            owner: entry.owner.clone(),
             volumes: VolumeSpan {
                 first_volume: first_vol,
                 last_volume: last_vol,
@@ -430,6 +443,21 @@ impl RarArchive {
     /// Returns whether the archive is solid.
     pub fn is_solid(&self) -> bool {
         self.is_solid
+    }
+
+    /// Returns whether the archive includes a recovery record.
+    pub fn has_recovery_record(&self) -> bool {
+        self.has_recovery_record
+    }
+
+    /// Returns whether the archive is locked.
+    pub fn is_locked(&self) -> bool {
+        self.is_locked
+    }
+
+    /// Returns whether the archive includes authenticity verification/auth info.
+    pub fn has_authenticity_verification(&self) -> bool {
+        self.has_authenticity_verification
     }
 
     /// Returns whether more volumes follow.

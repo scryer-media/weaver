@@ -80,6 +80,7 @@ pub struct Model {
     init_esc: u8,
     run_length: i32,
     init_rl: i32,
+    debug_output_index: u64,
 }
 
 // --- Helpers for converting between NodeRef and byte offsets ---
@@ -118,6 +119,7 @@ impl Model {
             init_esc: 0,
             run_length: 0,
             init_rl: -(max_order.min(12) as i32) - 1,
+            debug_output_index: 0,
         };
         model.build_lookup_tables();
         model.restart();
@@ -170,6 +172,7 @@ impl Model {
         self.prev_success = 0;
         self.run_length = self.init_rl;
         self.order_fall = self.max_order as i32;
+        self.debug_output_index = 0;
 
         // Initialize BinSumm.
         for i in 0..128u16 {
@@ -338,7 +341,7 @@ impl Model {
 
     /// Check if a successor value is a text pointer.
     fn is_text_succ(&self, succ: u32) -> bool {
-        succ != 0 && (succ as usize) < self.alloc.units_start_bytes()
+        succ != 0 && (succ as usize) <= self.alloc.text_position()
     }
 
     // =======================================================================
@@ -347,7 +350,24 @@ impl Model {
 
     /// Decode one character. Returns 0-255 on success, -1 on error/restart.
     pub fn decode_char<R: RangeCode>(&mut self, rc: &mut R) -> i32 {
+        let debug_output_index = self.debug_output_index;
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272340..=40272346).contains(&debug_output_index)
+        {
+            let ns = self.ctx_num_stats(self.min_context);
+            eprintln!(
+                "PPMD decode_char start: index=117 min_context={} ns={} order_fall={} found_state={}",
+                self.min_context, ns, self.order_fall, self.found_state
+            );
+        }
         if self.min_context == 0 || self.alloc.text_exhausted() {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!(
+                    "PPMD decode_char early fail: min_context={} text_exhausted={}",
+                    self.min_context,
+                    self.alloc.text_exhausted()
+                );
+            }
             return -1;
         }
 
@@ -356,6 +376,9 @@ impl Model {
         if ns != 1 {
             // Multi-symbol context.
             if !self.decode_symbol1(rc) {
+                if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                    eprintln!("PPMD decode_symbol1 failed: min_context={}", self.min_context);
+                }
                 return -1;
             }
         } else {
@@ -365,15 +388,66 @@ impl Model {
 
         // Escape loop: walk suffix chain until a symbol is found.
         while self.found_state == 0 {
+            rc.normalize();
             loop {
                 self.order_fall += 1;
+                let prev_ctx = self.min_context;
                 let suffix = self.ctx_suffix(self.min_context);
                 self.min_context = suffix;
                 if self.min_context == 0 {
+                    if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                        eprintln!(
+                            "PPMD suffix chain hit null: prev_ctx={} prev_ns={} num_masked={} max_context={} order_fall={}",
+                            prev_ctx,
+                            self.ctx_num_stats(prev_ctx),
+                            self.num_masked,
+                            self.max_context,
+                            self.order_fall
+                        );
+                        let mut chain = self.max_context;
+                        for depth in 0..8 {
+                            if chain == 0 {
+                                break;
+                            }
+                            let ns_chain = self.ctx_num_stats(chain) as usize;
+                            if ns_chain == 1 {
+                                eprintln!(
+                                    "PPMD null max one-state[{depth}]: ctx={} sym={} freq={} suffix={}",
+                                    chain,
+                                    self.one_sym(chain),
+                                    self.one_freq(chain),
+                                    self.ctx_suffix(chain)
+                                );
+                            } else {
+                                let stats = self.ctx_stats(chain);
+                                let mut syms = Vec::new();
+                                let mut p = stats;
+                                for _ in 0..ns_chain.min(8) {
+                                    syms.push((self.st_sym(p), self.st_freq(p)));
+                                    p += STATE_SIZE as u32;
+                                }
+                                eprintln!(
+                                    "PPMD null max states[{depth}]: ctx={} ns={} suffix={} states={:?}",
+                                    chain,
+                                    ns_chain,
+                                    self.ctx_suffix(chain),
+                                    syms
+                                );
+                            }
+                            chain = self.ctx_suffix(chain);
+                        }
+                    }
                     return -1;
                 }
                 // Validate context pointer.
                 if (self.min_context as usize) < self.alloc.units_start_bytes() {
+                    if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                        eprintln!(
+                            "PPMD suffix context below units_start: ctx={} units_start={}",
+                            self.min_context,
+                            self.alloc.units_start_bytes()
+                        );
+                    }
                     return -1;
                 }
                 let ns2 = self.ctx_num_stats(self.min_context) as usize;
@@ -382,6 +456,9 @@ impl Model {
                 }
             }
             if !self.decode_symbol2(rc) {
+                if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                    eprintln!("PPMD decode_symbol2 failed: min_context={}", self.min_context);
+                }
                 return -1;
             }
         }
@@ -407,6 +484,18 @@ impl Model {
             }
         }
 
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+            eprintln!(
+                "PPMD decode_char ok: index={} symbol={} found_state={} order_fall={} min_context={}",
+                debug_output_index,
+                symbol,
+                self.found_state,
+                self.order_fall,
+                self.min_context
+            );
+        }
+        rc.normalize();
+        self.debug_output_index += 1;
         symbol as i32
     }
 
@@ -435,8 +524,37 @@ impl Model {
         let idx0 = (freq as usize).saturating_sub(1).min(127);
         let idx1 = idx1.min(63);
         let bs = self.bin_summ[idx0][idx1];
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272340..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD decode_bin_symbol: ctx={} symbol={} freq={} prev={} suffix={} suffix_ns={} hi={} sym_hi={} run={} idx0={} idx1={} bs={}",
+                ctx,
+                symbol,
+                freq,
+                self.prev_success,
+                suffix,
+                suffix_ns,
+                self.hi_bits_flag,
+                self.hb2_flag[symbol as usize],
+                self.run_length,
+                idx0,
+                idx1,
+                bs
+            );
+        }
 
-        if rc.decode_binary(bs as u32, BIN_SCALE) {
+        let threshold = rc.get_threshold(BIN_SCALE);
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272340..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD decode_bin_symbol threshold: ctx={} threshold={} bs={}",
+                ctx, threshold, bs
+            );
+        }
+        if threshold < bs as u32 {
+            rc.decode(0, bs as u32, BIN_SCALE);
             // Symbol found.
             self.found_state = ctx + CTX_ONE_SYM as u32;
             let new_freq = if freq < 128 { freq + 1 } else { freq };
@@ -450,8 +568,20 @@ impl Model {
             self.run_length += 1;
         } else {
             // Escape.
+            rc.decode(bs as u32, BIN_SCALE - bs as u32, BIN_SCALE);
             let mean = ((bs as u32 + 32) >> 7) as u16;
             let new_bs = bs.wrapping_sub(mean);
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+                && (40272340..=40272346).contains(&self.debug_output_index)
+            {
+                eprintln!(
+                    "PPMD decode_bin_symbol escaped: ctx={} symbol={} new_bs={} init_esc={}",
+                    ctx,
+                    symbol,
+                    new_bs,
+                    EXP_ESCAPE[(new_bs >> 10) as usize]
+                );
+            }
             self.bin_summ[idx0][idx1] = new_bs;
 
             self.init_esc = EXP_ESCAPE[(new_bs >> 10) as usize];
@@ -473,7 +603,24 @@ impl Model {
         let stats = self.ctx_stats(ctx);
 
         let count = rc.get_current_count(sum_freq);
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272340..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD decode_symbol1: ctx={} ns={} sum_freq={} count={}",
+                ctx, ns, sum_freq, count
+            );
+        }
         if count >= sum_freq {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!(
+                    "PPMD decode_symbol1 count overflow: count={} sum_freq={} ctx={} found_state={}",
+                    count,
+                    sum_freq,
+                    ctx,
+                    self.found_state
+                );
+            }
             return false;
         }
 
@@ -498,6 +645,9 @@ impl Model {
         }
 
         if self.found_state == 0 {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!("PPMD decode_symbol1 found_state=0");
+            }
             return false;
         }
 
@@ -534,7 +684,7 @@ impl Model {
                 }
 
                 let escape_freq = sum_freq - hi_cnt;
-                rc.decode(hi_cnt, escape_freq.max(1), sum_freq);
+                rc.decode(hi_cnt, escape_freq, sum_freq);
                 return true;
             }
             p += STATE_SIZE as u32;
@@ -552,36 +702,15 @@ impl Model {
         self.set_ctx_summ_freq(ctx, sf.wrapping_add(4));
 
         let stats = self.ctx_stats(ctx);
-        // Bubble sort upward if needed.
         if p > stats {
             let prev = p - STATE_SIZE as u32;
             if new_freq > self.st_freq(prev) {
-                // Swap with predecessor(s).
-                let mut dst = p;
-                let tmp_sym = self.st_sym(p);
-                let tmp_freq = self.st_freq(p);
-                let tmp_succ = self.st_succ(p);
-                loop {
-                    self.copy_state(dst, dst - STATE_SIZE as u32);
-                    dst -= STATE_SIZE as u32;
-                    if dst == stats || tmp_freq <= self.st_freq(dst - STATE_SIZE as u32) {
-                        break;
-                    }
-                }
-                self.set_st_sym(dst, tmp_sym);
-                self.set_st_freq(dst, tmp_freq);
-                self.set_st_succ(dst, tmp_succ);
-                self.found_state = dst;
-
-                if tmp_freq > MAX_FREQ {
+                self.swap_states(p, prev);
+                self.found_state = prev;
+                if self.st_freq(prev) > MAX_FREQ {
                     self.rescale(ctx);
                 }
-                return;
             }
-        }
-
-        if new_freq > MAX_FREQ {
-            self.rescale(ctx);
         }
     }
 
@@ -592,8 +721,77 @@ impl Model {
     fn decode_symbol2<R: RangeCode>(&mut self, rc: &mut R) -> bool {
         let ctx = self.min_context;
         let ns = self.ctx_num_stats(ctx) as usize;
-        let diff = ns - self.num_masked;
+        let Some(diff) = ns.checked_sub(self.num_masked) else {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!(
+                    "PPMD decode_symbol2 masked overflow: ctx={} ns={} num_masked={} max_context={} order_fall={}",
+                    ctx, ns, self.num_masked, self.max_context, self.order_fall
+                );
+                if self.max_context != 0 {
+                    let ns_max = self.ctx_num_stats(self.max_context) as usize;
+                    if ns_max == 1 {
+                        eprintln!(
+                            "PPMD overflow max one-state: sym={} freq={}",
+                            self.one_sym(self.max_context),
+                            self.one_freq(self.max_context)
+                        );
+                    } else {
+                        let stats = self.ctx_stats(self.max_context);
+                        let mut syms = Vec::new();
+                        let mut p = stats;
+                        for _ in 0..ns_max.min(8) {
+                            syms.push((self.st_sym(p), self.st_freq(p)));
+                            p += STATE_SIZE as u32;
+                        }
+                        eprintln!(
+                            "PPMD overflow max_context: ctx={} ns={} suffix={} states={:?}",
+                            self.max_context,
+                            ns_max,
+                            self.ctx_suffix(self.max_context),
+                            syms
+                        );
+                    }
+                }
+                let mut chain = ctx;
+                for depth in 0..6 {
+                    if chain == 0 {
+                        break;
+                    }
+                    let ns_chain = self.ctx_num_stats(chain) as usize;
+                    if ns_chain == 1 {
+                        eprintln!(
+                            "PPMD overflow one-state[{depth}]: sym={} freq={}",
+                            self.one_sym(chain),
+                            self.one_freq(chain)
+                        );
+                    } else {
+                        let stats = self.ctx_stats(chain);
+                        let mut syms = Vec::new();
+                        let mut p = stats;
+                        for _ in 0..ns_chain.min(8) {
+                            syms.push((self.st_sym(p), self.st_freq(p)));
+                            p += STATE_SIZE as u32;
+                        }
+                        eprintln!("PPMD overflow states[{depth}]: {:?}", syms);
+                    }
+                    eprintln!(
+                        "PPMD overflow chain[{depth}]: ctx={} ns={} suffix={}",
+                        chain,
+                        ns_chain,
+                        self.ctx_suffix(chain)
+                    );
+                    chain = self.ctx_suffix(chain);
+                }
+            }
+            return false;
+        };
         if diff == 0 {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!(
+                    "PPMD decode_symbol2 diff=0: ctx={} ns={} num_masked={}",
+                    ctx, ns, self.num_masked
+                );
+            }
             return false;
         }
 
@@ -621,7 +819,49 @@ impl Model {
 
         let scale = esc_freq + hi_cnt;
         let count = rc.get_current_count(scale);
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272340..=40272346).contains(&self.debug_output_index)
+        {
+            let mut preview = Vec::new();
+            for &(st_off, freq) in &unmasked[..n.min(8)] {
+                preview.push((self.st_sym(st_off), freq));
+            }
+            eprintln!(
+                "PPMD decode_symbol2: ctx={} ns={} diff={} num_masked={} esc_freq={} hi_cnt={} scale={} count={} preview={:?}",
+                ctx,
+                ns,
+                diff,
+                self.num_masked,
+                esc_freq,
+                hi_cnt,
+                scale,
+                count,
+                preview
+            );
+        }
         if count >= scale {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                eprintln!(
+                    "PPMD decode_symbol2 count overflow: ctx={} ns={} diff={} num_masked={} esc_count={} esc_freq={} hi_cnt={} scale={} count={}",
+                    ctx,
+                    ns,
+                    diff,
+                    self.num_masked,
+                    self.esc_count,
+                    esc_freq,
+                    hi_cnt,
+                    scale,
+                    count
+                );
+                let stats = self.ctx_stats(ctx);
+                let mut syms = Vec::new();
+                let mut p = stats;
+                for _ in 0..ns.min(16) {
+                    syms.push((self.st_sym(p), self.st_freq(p), self.char_mask[self.st_sym(p) as usize]));
+                    p += STATE_SIZE as u32;
+                }
+                eprintln!("PPMD decode_symbol2 ctx states: {:?}", syms);
+            }
             return false;
         }
 
@@ -654,7 +894,7 @@ impl Model {
         }
         self.num_masked = ns;
 
-        false // escape — FoundState stays NULL, caller loops
+        true // escape — FoundState stays NULL and decode_char continues down the suffix chain
     }
 
     fn make_esc_freq2(&mut self, ctx: u32, diff: usize) -> u32 {
@@ -681,8 +921,6 @@ impl Model {
             let see_ctx = self.see.get(idx0, idx1);
             see_ctx.get_mean()
         } else {
-            let see_ctx = self.see.get_dummy();
-            see_ctx.get_mean(); // side effect: adjust dummy summ
             1
         }
     }
@@ -735,6 +973,9 @@ impl Model {
                 + self.hi_bits_flag as usize;
             self.see.get(idx0, idx1).summ =
                 self.see.get(idx0, idx1).summ.wrapping_add(scale as u16);
+        } else {
+            let dummy = self.see.get_dummy();
+            dummy.summ = dummy.summ.wrapping_add(scale as u16);
         }
     }
 
@@ -885,6 +1126,21 @@ impl Model {
         let fs_freq = self.st_freq(self.found_state);
         let fs_succ = self.st_succ(self.found_state);
 
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (110..=120).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD update_model: index={} fs_sym={} fs_freq={} fs_succ={} order_fall={} min_context={} max_context={}",
+                self.debug_output_index,
+                fs_sym,
+                fs_freq,
+                fs_succ,
+                self.order_fall,
+                self.min_context,
+                self.max_context
+            );
+        }
+
         // Update suffix context frequencies.
         let suffix = self.ctx_suffix(self.min_context);
         if fs_freq < MAX_FREQ / 4 && suffix != 0 {
@@ -900,6 +1156,12 @@ impl Model {
                         p += STATE_SIZE as u32;
                     }
                     if p >= end {
+                        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() {
+                            eprintln!(
+                                "PPMD update_model missing suffix symbol: fs_sym={} min_context={} suffix={} suffix_ns={}",
+                                fs_sym, self.min_context, suffix, sns
+                            );
+                        }
                         // Symbol not found in suffix — skip update.
                         self.do_update_model_core(fs_sym, fs_freq, fs_succ, 0);
                         return;
@@ -934,9 +1196,17 @@ impl Model {
     /// Core of UpdateModel after suffix freq update.
     /// `p1` is the state offset in the suffix context (0 if none).
     fn do_update_model_core(&mut self, fs_sym: u8, fs_freq: u8, fs_succ: u32, p1: u32) {
+        let mut next_min_context = fs_succ;
+
         if self.order_fall == 0 {
             // No escape: create successors.
             let new_ctx = self.create_successors(true, p1);
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() && self.is_text_succ(new_ctx) {
+                eprintln!(
+                    "PPMD order_fall=0 create_successors returned text: new_ctx={} p1={} found_state={} min_context={} max_context={}",
+                    new_ctx, p1, self.found_state, self.min_context, self.max_context
+                );
+            }
             if new_ctx == 0 {
                 self.restart();
                 self.esc_count = 0;
@@ -969,6 +1239,7 @@ impl Model {
                     return;
                 }
                 self.set_st_succ(self.found_state, new_succ);
+                next_min_context = new_succ;
             }
             self.order_fall -= 1;
             if self.order_fall == 0 {
@@ -983,13 +1254,17 @@ impl Model {
             // No successor yet: set text pointer as successor.
             self.set_st_succ(self.found_state, successor);
             final_succ = successor;
-            // For the propagation loop below, fs_succ becomes min_context.
-            // (In unrar: fs.Successor = MinContext)
+            // Match unrar: fs.Successor becomes the current MinContext even though the
+            // live FoundState successor now points into the text buffer.
+            next_min_context = self.min_context;
         }
 
         let min_ctx = self.min_context;
         let ns = self.ctx_num_stats(min_ctx) as u32;
-        let s0 = self.ctx_summ_freq(min_ctx) as u32 - ns - fs_freq as u32 + 1;
+        let s0 = (self.ctx_summ_freq(min_ctx) as u32)
+            .wrapping_sub(ns)
+            .wrapping_sub(fs_freq as u32)
+            .wrapping_add(1);
 
         let mut pc = self.max_context;
         while pc != min_ctx {
@@ -1071,14 +1346,20 @@ impl Model {
             pc = self.ctx_suffix(pc);
         }
 
-        let found_succ = self.st_succ(self.found_state);
-        if found_succ != 0 {
-            self.max_context = found_succ;
-            self.min_context = found_succ;
-        } else {
-            self.max_context = final_succ;
-            self.min_context = final_succ;
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() && self.is_text_succ(next_min_context) {
+            eprintln!(
+                "PPMD next_min_context still text: next={} final_succ={} fs_succ={} found_state={} min_ctx={} max_ctx={} order_fall={}",
+                next_min_context,
+                final_succ,
+                fs_succ,
+                self.found_state,
+                min_ctx,
+                self.max_context,
+                self.order_fall
+            );
         }
+        self.max_context = next_min_context;
+        self.min_context = next_min_context;
     }
 
     // =======================================================================
@@ -1088,6 +1369,21 @@ impl Model {
     fn create_successors(&mut self, skip: bool, p1: u32) -> u32 {
         let up_branch = self.st_succ(self.found_state);
         let found_sym = self.st_sym(self.found_state);
+
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272337..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD create_successors: index={} skip={} p1={} up_branch={} found_sym={} min_context={} max_context={}",
+                self.debug_output_index,
+                skip,
+                p1,
+                up_branch,
+                found_sym,
+                self.min_context,
+                self.max_context
+            );
+        }
 
         let mut pc = self.min_context;
         let mut ps: [u32; MAX_ORDER + 1] = [0; MAX_ORDER + 1]; // state offsets
@@ -1109,7 +1405,17 @@ impl Model {
             pc = suffix;
             // Check if p1's successor matches up_branch.
             if self.st_succ(p1) != up_branch {
-                return self.st_succ(p1);
+                let succ = self.st_succ(p1);
+                pc = if self.is_text_succ(succ) {
+                    let new_ctx = self.materialize_text_successor(pc, p1, succ);
+                    if new_ctx == 0 {
+                        return 0;
+                    }
+                    new_ctx
+                } else {
+                    succ
+                };
+                return self.finish_create_successors(&ps[..ps_len], pc, up_branch, found_sym);
             }
             if ps_len < MAX_ORDER + 1 {
                 ps[ps_len] = p1;
@@ -1121,8 +1427,12 @@ impl Model {
                 return self.finish_create_successors(&ps[..ps_len], pc, up_branch, found_sym);
             }
             pc = self.ctx_suffix(pc);
-        } else if !skip {
-            pc = self.ctx_suffix(pc);
+        } else {
+            let suffix = self.ctx_suffix(pc);
+            if suffix == 0 {
+                return self.finish_create_successors(&ps[..ps_len], pc, up_branch, found_sym);
+            }
+            pc = suffix;
         }
 
         // Walk suffix chain.
@@ -1140,10 +1450,33 @@ impl Model {
                 // Binary context.
                 p = pc + CTX_ONE_SYM as u32;
             }
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+                && (40272337..=40272346).contains(&self.debug_output_index)
+            {
+                eprintln!(
+                    "PPMD create_successors loop: index={} pc={} ns={} p={} p_succ={} p_sym={} ps_len={}",
+                    self.debug_output_index,
+                    pc,
+                    ns,
+                    p,
+                    self.st_succ(p),
+                    self.st_sym(p),
+                    ps_len
+                );
+            }
 
             if self.st_succ(p) != up_branch {
                 // Found a real successor — use it as the base.
-                pc = self.st_succ(p);
+                let succ = self.st_succ(p);
+                pc = if self.is_text_succ(succ) {
+                    let new_ctx = self.materialize_text_successor(pc, p, succ);
+                    if new_ctx == 0 {
+                        return 0;
+                    }
+                    new_ctx
+                } else {
+                    succ
+                };
                 break;
             }
             if ps_len > MAX_ORDER {
@@ -1162,6 +1495,61 @@ impl Model {
         self.finish_create_successors(&ps[..ps_len], pc, up_branch, found_sym)
     }
 
+    fn materialize_text_successor(&mut self, base_ctx: u32, state_off: u32, text_succ: u32) -> u32 {
+        let up_sym = self.alloc.read_byte_at(text_succ as usize);
+        let up_succ = text_succ + 1;
+        let up_freq = self.successor_init_freq(base_ctx, up_sym);
+
+        let child_ref = self.alloc.alloc_context();
+        if child_ref.is_null() {
+            return 0;
+        }
+        let child = ref_to_off(child_ref);
+        self.set_ctx_num_stats(child, 1);
+        self.set_one_sym(child, up_sym);
+        self.set_one_freq(child, up_freq);
+        self.set_one_succ(child, up_succ);
+        self.set_ctx_suffix(child, base_ctx);
+        self.set_st_succ(state_off, child);
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272337..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD materialize_text_successor: index={} base_ctx={} state_off={} text_succ={} child={} up_sym={} up_freq={}",
+                self.debug_output_index,
+                base_ctx,
+                state_off,
+                text_succ,
+                child,
+                up_sym,
+                up_freq
+            );
+        }
+        child
+    }
+
+    fn successor_init_freq(&self, base_ctx: u32, up_sym: u8) -> u8 {
+        let ns_pc = self.ctx_num_stats(base_ctx);
+        if ns_pc != 1 {
+            let stats = self.ctx_stats(base_ctx);
+            let p = self.find_state(stats, ns_pc as usize, up_sym);
+            if p == 0 {
+                return 1;
+            }
+            let cf = self.st_freq(p) as u32 - 1;
+            let s0 = (self.ctx_summ_freq(base_ctx) as u32)
+                .wrapping_sub(ns_pc as u32)
+                .wrapping_sub(cf);
+            if 2 * cf <= s0 {
+                1 + (if 5 * cf > s0 { 1 } else { 0 })
+            } else {
+                (1 + ((2 * cf + 3 * s0 - 1) / (2 * s0))).min(255) as u8
+            }
+        } else {
+            self.one_freq(base_ctx)
+        }
+    }
+
     fn finish_create_successors(
         &mut self,
         ps: &[u32],
@@ -1170,6 +1558,12 @@ impl Model {
         found_sym: u8,
     ) -> u32 {
         if ps.is_empty() {
+            if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some() && self.is_text_succ(pc) {
+                eprintln!(
+                    "PPMD finish_create_successors returning text pc={} up_branch={} found_sym={}",
+                    pc, up_branch, found_sym
+                );
+            }
             return pc;
         }
 
@@ -1198,11 +1592,13 @@ impl Model {
                 up_freq = 1;
             } else {
                 let cf = self.st_freq(p) as u32 - 1;
-                let s0 = self.ctx_summ_freq(pc) as u32 - ns_pc as u32 - cf;
+                let s0 = (self.ctx_summ_freq(pc) as u32)
+                    .wrapping_sub(ns_pc as u32)
+                    .wrapping_sub(cf);
                 up_freq = if 2 * cf <= s0 {
                     1 + (if 5 * cf > s0 { 1 } else { 0 })
                 } else {
-                    ((2 * cf + 3 * s0 - 1) / (2 * s0)).min(255) as u8
+                    (1 + ((2 * cf + 3 * s0 - 1) / (2 * s0))).min(255) as u8
                 };
             }
         } else {
@@ -1210,6 +1606,19 @@ impl Model {
         }
 
         // Create child contexts from ps (in reverse order).
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272337..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD finish_create_successors: index={} ps_len={} base_pc={} up_sym={} up_succ={} up_freq={}",
+                self.debug_output_index,
+                ps.len(),
+                pc,
+                up_sym,
+                up_succ,
+                up_freq
+            );
+        }
         for &state_off in ps.iter().rev() {
             let child_ref = self.alloc.alloc_context();
             if child_ref.is_null() {
@@ -1228,6 +1637,16 @@ impl Model {
             self.set_st_succ(state_off, child);
 
             pc = child;
+        }
+
+        if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
+            && (40272337..=40272346).contains(&self.debug_output_index)
+        {
+            eprintln!(
+                "PPMD finish_create_successors result: index={} new_pc={}",
+                self.debug_output_index,
+                pc
+            );
         }
 
         pc

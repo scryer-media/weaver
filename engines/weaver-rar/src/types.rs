@@ -114,6 +114,15 @@ impl VolumeSpan {
     }
 }
 
+/// Unix ownership metadata from a RAR5 owner extra field.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnixOwnerInfo {
+    pub user_name: Option<String>,
+    pub group_name: Option<String>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+}
+
 /// Metadata for a single file/directory in the archive.
 #[derive(Debug, Clone)]
 pub struct MemberInfo {
@@ -130,6 +139,8 @@ pub struct MemberInfo {
     pub compression: CompressionInfo,
     pub is_encrypted: bool,
     pub hash: Option<FileHash>,
+    pub attributes: FileAttributes,
+    pub owner: Option<UnixOwnerInfo>,
     pub volumes: VolumeSpan,
     pub is_symlink: bool,
     pub is_hardlink: bool,
@@ -155,6 +166,9 @@ pub struct ArchiveMetadata {
     pub format: ArchiveFormat,
     pub is_solid: bool,
     pub is_encrypted: bool,
+    pub has_recovery_record: bool,
+    pub is_locked: bool,
+    pub has_authenticity_verification: bool,
     pub volume_count: Option<usize>,
     pub members: Vec<MemberInfo>,
 }

@@ -12,10 +12,13 @@ use crate::error::{RarError, RarResult};
 
 /// Scale factor for frequency counts — range is normalized to [0, SCALE).
 pub const SCALE: u32 = 1 << 15; // 32768
+const TOP: u32 = 1 << 24;
+const BOT: u32 = 1 << 15;
 
 pub trait RangeCode {
-    fn get_current_count(&self, scale: u32) -> u32;
-    fn get_threshold(&self, scale: u32) -> u32;
+    fn normalize(&mut self);
+    fn get_current_count(&mut self, scale: u32) -> u32;
+    fn get_threshold(&mut self, scale: u32) -> u32;
     fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32);
     fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool;
     fn position(&self) -> usize;
@@ -71,12 +74,21 @@ impl<'a> RangeDecoder<'a> {
         }
     }
 
-    /// Normalize the range decoder state.
-    ///
-    /// When `range` drops below 2^24, shift in new bytes to keep precision.
+    /// Normalize the range decoder state using unrar's carryless TOP/BOT logic.
     #[inline]
     fn normalize(&mut self) {
-        while self.range < (1 << 24) {
+        while {
+            let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
+            let needs_normalize = if carry {
+                true
+            } else if self.range < BOT {
+                self.range = self.low.wrapping_neg() & (BOT - 1);
+                true
+            } else {
+                false
+            };
+            needs_normalize
+        } {
             self.code = (self.code << 8) | self.read_byte() as u32;
             self.range <<= 8;
             self.low <<= 8;
@@ -88,21 +100,21 @@ impl<'a> RangeDecoder<'a> {
     /// Returns `(code - low) / (range / scale)`, which indicates where the
     /// current code point falls within the probability range.
     #[inline]
-    pub fn get_current_count(&self, scale: u32) -> u32 {
+    pub fn get_current_count(&mut self, scale: u32) -> u32 {
         if scale == 0 {
             return 0;
         }
-        let r = self.range / scale;
-        if r == 0 {
+        self.range /= scale;
+        if self.range == 0 {
             return 0;
         }
-        (self.code.wrapping_sub(self.low)) / r
+        (self.code.wrapping_sub(self.low)) / self.range
     }
 
     /// Get the current "threshold" for binary symbol decisions.
     /// Used by SEE: returns (code - low) / (range / scale).
     #[inline]
-    pub fn get_threshold(&self, scale: u32) -> u32 {
+    pub fn get_threshold(&mut self, scale: u32) -> u32 {
         self.get_current_count(scale)
     }
 
@@ -113,11 +125,9 @@ impl<'a> RangeDecoder<'a> {
     /// - `cum_freq`: cumulative frequency of symbols before this one
     /// - `freq`: frequency of this symbol
     /// - `scale`: total frequency scale
-    pub fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
-        let r = self.range.checked_div(scale).unwrap_or(self.range);
-        self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
-        self.range = freq.max(1).wrapping_mul(r);
-        self.normalize();
+    pub fn decode(&mut self, cum_freq: u32, freq: u32, _scale: u32) {
+        self.low = self.low.wrapping_add(cum_freq.wrapping_mul(self.range));
+        self.range = freq.wrapping_mul(self.range);
     }
 
     /// Decode a binary symbol (used in SEE path).
@@ -170,7 +180,18 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
 
     #[inline]
     fn normalize(&mut self) {
-        while self.range < (1 << 24) {
+        while {
+            let carry = (self.low ^ self.low.wrapping_add(self.range)) < TOP;
+            let needs_normalize = if carry {
+                true
+            } else if self.range < BOT {
+                self.range = self.low.wrapping_neg() & (BOT - 1);
+                true
+            } else {
+                false
+            };
+            needs_normalize
+        } {
             self.code = (self.code << 8) | self.read_byte() as u32;
             self.range <<= 8;
             self.low <<= 8;
@@ -179,11 +200,15 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
 }
 
 impl RangeCode for RangeDecoder<'_> {
-    fn get_current_count(&self, scale: u32) -> u32 {
+    fn normalize(&mut self) {
+        RangeDecoder::normalize(self)
+    }
+
+    fn get_current_count(&mut self, scale: u32) -> u32 {
         RangeDecoder::get_current_count(self, scale)
     }
 
-    fn get_threshold(&self, scale: u32) -> u32 {
+    fn get_threshold(&mut self, scale: u32) -> u32 {
         RangeDecoder::get_threshold(self, scale)
     }
 
@@ -201,26 +226,28 @@ impl RangeCode for RangeDecoder<'_> {
 }
 
 impl<R: BitRead> RangeCode for BitReadRangeDecoder<'_, R> {
-    fn get_current_count(&self, scale: u32) -> u32 {
+    fn normalize(&mut self) {
+        BitReadRangeDecoder::normalize(self)
+    }
+
+    fn get_current_count(&mut self, scale: u32) -> u32 {
         if scale == 0 {
             return 0;
         }
-        let r = self.range / scale;
-        if r == 0 {
+        self.range /= scale;
+        if self.range == 0 {
             return 0;
         }
-        (self.code.wrapping_sub(self.low)) / r
+        (self.code.wrapping_sub(self.low)) / self.range
     }
 
-    fn get_threshold(&self, scale: u32) -> u32 {
+    fn get_threshold(&mut self, scale: u32) -> u32 {
         self.get_current_count(scale)
     }
 
-    fn decode(&mut self, cum_freq: u32, freq: u32, scale: u32) {
-        let r = self.range.checked_div(scale).unwrap_or(self.range);
-        self.low = self.low.wrapping_add(cum_freq.wrapping_mul(r));
-        self.range = freq.max(1).wrapping_mul(r);
-        self.normalize();
+    fn decode(&mut self, cum_freq: u32, freq: u32, _scale: u32) {
+        self.low = self.low.wrapping_add(cum_freq.wrapping_mul(self.range));
+        self.range = freq.wrapping_mul(self.range);
     }
 
     fn decode_binary(&mut self, freq0: u32, scale: u32) -> bool {
@@ -261,7 +288,7 @@ mod tests {
     #[test]
     fn test_get_current_count() {
         let input = [0x40, 0x00, 0x00, 0x00];
-        let rd = RangeDecoder::new(&input).unwrap();
+        let mut rd = RangeDecoder::new(&input).unwrap();
         // code = 0x40000000, range = 0xFFFFFFFF
         // get_current_count(256) = 0x40000000 / (0xFFFFFFFF / 256) = ~64
         let count = rd.get_current_count(256);
@@ -281,9 +308,9 @@ mod tests {
         use crate::decompress::lz::bitstream::BitReader;
 
         let input = [0x40, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
-        let slice = RangeDecoder::new(&input).unwrap();
+        let mut slice = RangeDecoder::new(&input).unwrap();
         let mut bit_reader = BitReader::new(&input);
-        let streaming = BitReadRangeDecoder::new(&mut bit_reader).unwrap();
+        let mut streaming = BitReadRangeDecoder::new(&mut bit_reader).unwrap();
 
         assert_eq!(
             slice.get_current_count(256),

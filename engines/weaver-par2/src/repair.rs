@@ -26,7 +26,6 @@ use crate::verify::{FileAccess, Repairability, VerificationResult};
 
 pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const XOR_OUT_PAR_CHUNK: usize = 16;
-const XOR_OUT_INPUT_GROUP: usize = 3;
 
 /// A plan for repairing missing/damaged slices.
 #[derive(Debug, Clone)]
@@ -35,10 +34,15 @@ pub struct RepairPlan {
     pub missing_slices: Vec<(FileId, u32)>,
     /// Global indices of missing slices in the concatenated input slice ordering.
     pub missing_global_indices: Vec<usize>,
+    /// Global indices of source slices that are already available and will be read as inputs.
+    pub available_input_global_indices: Vec<usize>,
     /// Which recovery block exponents to use (one per missing slice).
     pub recovery_exponents: Vec<u32>,
     /// The inverted decode matrix rows (each row has `missing_slices.len()` entries).
-    pub decode_matrix: Vec<Vec<u16>>,
+    pub decode_matrix: matrix::Matrix,
+    /// Full repair coefficients with columns ordered as
+    /// `available_input_global_indices` followed by `recovery_exponents`.
+    pub input_factors: matrix::Matrix,
     /// The PAR2 slice size in bytes.
     pub slice_size: u64,
     /// Constants for all input slices (needed for XOR-out step).
@@ -167,10 +171,12 @@ pub fn plan_repair(
             deficit: (missing_count - all_exponents.len()) as u32,
         });
     }
-    if estimated_decode_matrix_bytes(missing_count) > DEFAULT_REPAIR_MEMORY_LIMIT {
+    if estimated_repair_matrix_bytes(total_input_slices, missing_count)
+        > DEFAULT_REPAIR_MEMORY_LIMIT
+    {
         return Err(Par2Error::ResourceLimitExceeded {
             reason: format!(
-                "decode matrix for {missing_count} missing slices would exceed the {} byte repair memory limit",
+                "repair matrix for {missing_count} missing slices would exceed the {} byte repair memory limit",
                 DEFAULT_REPAIR_MEMORY_LIMIT
             ),
         });
@@ -178,10 +184,14 @@ pub fn plan_repair(
 
     // Compute constants for all input slices.
     let constants = gf::input_slice_constants(total_input_slices);
+    let missing_set: HashSet<usize> = missing_global_indices.iter().copied().collect();
+    let available_input_global_indices: Vec<usize> = (0..total_input_slices)
+        .filter(|global_idx| !missing_set.contains(global_idx))
+        .collect();
 
     // Try building the decode matrix, skipping singular recovery blocks.
     let mut skip_set: HashSet<usize> = HashSet::new();
-    let (recovery_exponents, decode) = loop {
+    let (recovery_exponents, input_factors, decode) = loop {
         let selected_indices: Vec<usize> = all_exponents
             .iter()
             .enumerate()
@@ -202,12 +212,13 @@ pub fn plan_repair(
             });
         }
 
-        match matrix::build_decode_matrix_with_bad_row(
+        match matrix::build_repair_matrix_with_bad_row(
+            &available_input_global_indices,
             &missing_global_indices,
             &selected,
             &constants,
         ) {
-            Ok(decode) => break (selected, decode),
+            Ok((input_factors, decode)) => break (selected, input_factors, decode),
             Err(matrix_error) => {
                 let mut skip_idx = matrix_error
                     .bad_row
@@ -224,8 +235,13 @@ pub fn plan_repair(
                         if trial.len() < missing_count {
                             continue;
                         }
-                        if matrix::build_decode_matrix(&missing_global_indices, &trial, &constants)
-                            .is_ok()
+                        if matrix::build_repair_matrix_with_bad_row(
+                            &available_input_global_indices,
+                            &missing_global_indices,
+                            &trial,
+                            &constants,
+                        )
+                        .is_ok()
                         {
                             skip_idx = Some(*candidate_idx);
                             break;
@@ -255,8 +271,10 @@ pub fn plan_repair(
     Ok(RepairPlan {
         missing_slices,
         missing_global_indices,
+        available_input_global_indices,
         recovery_exponents,
-        decode_matrix: decode.data,
+        decode_matrix: decode,
+        input_factors,
         slice_size: par2_set.slice_size,
         constants,
         total_input_slices,
@@ -302,6 +320,12 @@ struct FactorIndex {
     input_idx: u16,
 }
 
+#[derive(Clone, Copy)]
+struct OutputFactor {
+    factor: u16,
+    output_idx: usize,
+}
+
 #[derive(Debug, Clone)]
 struct RepairWriteTarget {
     file_id: FileId,
@@ -321,19 +345,18 @@ fn check_cancel(options: &RepairOptions) -> Result<()> {
 
 fn estimated_in_memory_repair_bytes(plan: &RepairPlan) -> usize {
     let slice_size = plan.slice_size as usize;
-    let scratch_slices = XOR_OUT_INPUT_GROUP + 1;
-    plan.missing_slices
-        .len()
+    plan.input_factors
+        .cols
         .saturating_mul(slice_size)
-        .saturating_mul(2)
-        .saturating_add(scratch_slices.saturating_mul(slice_size))
+        .saturating_add(plan.missing_slices.len().saturating_mul(slice_size))
+        .saturating_add(slice_size.saturating_mul(2))
 }
 
-fn estimated_decode_matrix_bytes(rows: usize) -> usize {
-    rows.saturating_mul(rows)
-        .saturating_mul(std::mem::size_of::<u16>())
-        // Matrix inversion keeps a working matrix plus the inverse.
-        .saturating_mul(2)
+fn estimated_repair_matrix_bytes(total_inputs: usize, missing_rows: usize) -> usize {
+    let working_words = missing_rows
+        .saturating_mul(missing_rows)
+        .saturating_add(missing_rows.saturating_mul(total_inputs));
+    working_words.saturating_mul(std::mem::size_of::<u16>())
 }
 
 fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize) -> usize {
@@ -341,7 +364,7 @@ fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize)
         return word_count.max(1);
     }
 
-    let streaming_buffers = outputs.saturating_mul(2).saturating_add(1);
+    let streaming_buffers = outputs.saturating_add(1);
     let chunk_bytes = (limit_bytes / streaming_buffers)
         .max(2)
         .min(word_count.saturating_mul(2));
@@ -428,11 +451,12 @@ fn build_write_targets(
         .collect()
 }
 
-fn grouped_input_decode_factors(plan: &RepairPlan) -> Vec<Vec<FactorIndex>> {
-    plan.decode_matrix
-        .iter()
-        .map(|row| {
-            row.iter()
+fn grouped_input_factors(coefficients: &matrix::Matrix) -> Vec<Vec<FactorIndex>> {
+    (0..coefficients.rows)
+        .map(|row_idx| {
+            coefficients
+                .row(row_idx)
+                .iter()
                 .enumerate()
                 .filter_map(|(input_idx, &factor)| {
                     if factor == 0 {
@@ -447,6 +471,52 @@ fn grouped_input_decode_factors(plan: &RepairPlan) -> Vec<Vec<FactorIndex>> {
                 .collect()
         })
         .collect()
+}
+
+fn grouped_output_factors(plan: &RepairPlan) -> Vec<Vec<OutputFactor>> {
+    (0..plan.input_factors.cols)
+        .map(|input_idx| {
+            (0..plan.input_factors.rows)
+                .filter_map(|output_idx| {
+                    let factor = plan.input_factors.get(output_idx, input_idx);
+                    if factor == 0 {
+                        None
+                    } else {
+                        Some(OutputFactor { factor, output_idx })
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn accumulate_input_to_outputs(
+    output_ptrs: &[usize],
+    output_factors: &[OutputFactor],
+    src: &[u8],
+) {
+    if output_factors.is_empty() {
+        return;
+    }
+
+    for factor_start in (0..output_factors.len()).step_by(XOR_OUT_PAR_CHUNK) {
+        let factor_end = (factor_start + XOR_OUT_PAR_CHUNK).min(output_factors.len());
+        let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> =
+            Vec::with_capacity(factor_end - factor_start);
+
+        for output_factor in &output_factors[factor_start..factor_end] {
+            let dst = unsafe {
+                let ptr = output_ptrs[output_factor.output_idx] as *mut u8;
+                std::slice::from_raw_parts_mut(ptr, src.len())
+            };
+            pairs.push(crate::gf_simd::FactorDst {
+                factor: output_factor.factor,
+                dst,
+            });
+        }
+
+        crate::gf_simd::mul_acc_multi_region(&mut pairs, src);
+    }
 }
 
 fn xor_out_known_data(
@@ -502,57 +572,6 @@ fn xor_out_known_data(
             }
         }
     });
-}
-
-fn xor_out_known_batch(
-    recovery_buffers: &mut [Vec<u8>],
-    recovery_factor_batch: &[Vec<u16>],
-    input_batch: &[Vec<u8>],
-    chunk_words: usize,
-) {
-    assert_eq!(
-        recovery_factor_batch.len(),
-        input_batch.len(),
-        "factor batch count must match input batch count"
-    );
-    if input_batch.is_empty() {
-        return;
-    }
-
-    let word_count = input_batch[0].len() / 2;
-    let chunk_words = chunk_words.max(1).min(word_count.max(1));
-    let word_chunks: Vec<usize> = (0..word_count.max(1)).step_by(chunk_words).collect();
-
-    recovery_buffers
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(recovery_idx, recovery)| {
-            let mut chunk_inputs = Vec::with_capacity(input_batch.len());
-
-            for &chunk_start in &word_chunks {
-                let chunk_end = (chunk_start + chunk_words).min(word_count);
-                let byte_start = chunk_start * 2;
-                let byte_len = (chunk_end - chunk_start) * 2;
-
-                chunk_inputs.clear();
-                for (data, factors) in input_batch.iter().zip(recovery_factor_batch.iter()) {
-                    let factor = factors[recovery_idx];
-                    if factor != 0 {
-                        chunk_inputs.push(crate::gf_simd::FactorSrc {
-                            factor,
-                            src: &data[byte_start..byte_start + byte_len],
-                        });
-                    }
-                }
-
-                if !chunk_inputs.is_empty() {
-                    crate::gf_simd::mul_acc_input_batch(
-                        &mut recovery[byte_start..byte_start + byte_len],
-                        &chunk_inputs,
-                    );
-                }
-            }
-        });
 }
 
 fn read_exact_at_cached(
@@ -772,7 +791,7 @@ pub fn reconstruct_and_write(
                 let src = &recovery[byte_start..byte_start + byte_len];
                 let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> = (0..n)
                     .filter_map(|j| {
-                        let factor = plan.decode_matrix[j][r];
+                        let factor = plan.decode_matrix.get(j, r);
                         if factor != 0 {
                             // Safe because each chunk task writes a disjoint byte
                             // range within every repaired slice, and the slices
@@ -873,7 +892,23 @@ fn reconstruct_and_write_grouped_inputs(
     );
     let word_count = slice_size / 2;
     let total_chunks_usize = word_count.div_ceil(chunk_words);
-    let output_inputs = grouped_input_decode_factors(plan);
+    let output_inputs = grouped_input_factors(&plan.decode_matrix);
+    let prepared_output_inputs: Vec<Vec<(u16, crate::gf_simd::PreparedInputFactor, u16)>> =
+        output_inputs
+            .iter()
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|factor_input| {
+                        (
+                            factor_input.input_idx,
+                            crate::gf_simd::prepare_input_factor(factor_input.factor),
+                            factor_input.factor,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
 
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
     let completed_outputs = AtomicU32::new(0);
@@ -882,7 +917,7 @@ fn reconstruct_and_write_grouped_inputs(
         |(output_idx, repaired)| -> Result<()> {
             check_cancel(options)?;
 
-            let decode_inputs = &output_inputs[output_idx];
+            let decode_inputs = &prepared_output_inputs[output_idx];
             let mut chunk_inputs = Vec::with_capacity(decode_inputs.len());
 
             for chunk_idx in 0..total_chunks_usize {
@@ -893,14 +928,13 @@ fn reconstruct_and_write_grouped_inputs(
 
                 chunk_inputs.clear();
                 for factor_input in decode_inputs {
-                    chunk_inputs.push(crate::gf_simd::FactorSrc {
-                        factor: factor_input.factor,
-                        src: &recovery_buffers[factor_input.input_idx as usize]
-                            [byte_start..byte_start + byte_len],
+                    chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
+                        prepared: &factor_input.1,
+                        src: &recovery_buffers[factor_input.0 as usize][byte_start..byte_start + byte_len],
                     });
                 }
 
-                crate::gf_simd::mul_acc_input_batch(
+                crate::gf_simd::mul_acc_input_batch_prepared(
                     &mut repaired[byte_start..byte_start + byte_len],
                     &chunk_inputs,
                 );
@@ -980,16 +1014,15 @@ fn execute_repair_streaming(
         "PAR2 slice_size must be a multiple of 2"
     );
     let word_count = slice_size / 2;
-    let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
     let total_chunks_usize = word_count.div_ceil(chunk_words);
     let total_chunks = total_chunks_usize.min(u32::MAX as usize) as u32;
     let write_targets = build_write_targets(plan, par2_set)?;
     let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     let max_byte_len = chunk_words * 2;
-    let mut recovery_chunks: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
     let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
     let mut input_chunk = vec![0u8; max_byte_len];
-    let output_inputs = grouped_input_decode_factors(plan);
+    let output_factors = grouped_output_factors(plan);
+    let available_inputs = plan.available_input_global_indices.len();
 
     info!(
         missing_slices = n,
@@ -1006,11 +1039,33 @@ fn execute_repair_streaming(
         let chunk_len = chunk_end - chunk_start;
         let byte_start = chunk_start * 2;
         let byte_len = chunk_len * 2;
-
-        for (chunk, &exp) in recovery_chunks
+        let output_ptrs: Vec<usize> = chunk_output
             .iter_mut()
-            .zip(plan.recovery_exponents.iter())
-        {
+            .map(|chunk| {
+                chunk[..byte_len].fill(0);
+                chunk.as_mut_ptr() as usize
+            })
+            .collect();
+
+        for (input_idx, &global_idx) in plan.available_input_global_indices.iter().enumerate() {
+            if input_idx % 64 == 0 {
+                check_cancel(options)?;
+            }
+
+            let (file_id, local_slice) = plan.global_to_file[global_idx];
+            let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
+            let read_len = file_access
+                .read_file_range_into(&file_id, offset, &mut input_chunk[..byte_len])
+                .map_err(Par2Error::Io)?;
+            input_chunk[read_len..byte_len].fill(0);
+            accumulate_input_to_outputs(
+                &output_ptrs,
+                &output_factors[input_idx],
+                &input_chunk[..byte_len],
+            );
+        }
+
+        for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
             let rs =
                 par2_set
                     .recovery_slices
@@ -1021,59 +1076,16 @@ fn execute_repair_streaming(
             fill_recovery_chunk(
                 &rs.data,
                 byte_start,
-                &mut chunk[..byte_len],
+                &mut input_chunk[..byte_len],
                 &mut recovery_files,
             )
             .map_err(Par2Error::Io)?;
+            accumulate_input_to_outputs(
+                &output_ptrs,
+                &output_factors[available_inputs + recovery_idx],
+                &input_chunk[..byte_len],
+            );
         }
-
-        for global_idx in 0..plan.total_input_slices {
-            if missing_set.contains(&global_idx) {
-                continue;
-            }
-
-            if global_idx % 64 == 0 {
-                check_cancel(options)?;
-            }
-
-            let (file_id, local_slice) = plan.global_to_file[global_idx];
-            let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
-            let read_len = file_access
-                .read_file_range_into(&file_id, offset, &mut input_chunk[..byte_len])
-                .map_err(Par2Error::Io)?;
-            input_chunk[read_len..byte_len].fill(0);
-
-            recovery_chunks
-                .par_chunks_mut(XOR_OUT_PAR_CHUNK)
-                .zip(plan.recovery_exponents.par_chunks(XOR_OUT_PAR_CHUNK))
-                .for_each(|(chunks, exponents)| {
-                    for (recovery, &exp) in chunks.iter_mut().zip(exponents.iter()) {
-                        let factor = gf::pow(plan.constants[global_idx], exp);
-                        if factor != 0 {
-                            crate::gf_simd::mul_acc_region(
-                                factor,
-                                &input_chunk[..byte_len],
-                                &mut recovery[..byte_len],
-                            );
-                        }
-                    }
-                });
-        }
-
-        chunk_output
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(output_idx, chunk_out)| {
-                chunk_out[..byte_len].fill(0);
-                let mut chunk_inputs = Vec::with_capacity(output_inputs[output_idx].len());
-                for factor_input in &output_inputs[output_idx] {
-                    chunk_inputs.push(crate::gf_simd::FactorSrc {
-                        factor: factor_input.factor,
-                        src: &recovery_chunks[factor_input.input_idx as usize][..byte_len],
-                    });
-                }
-                crate::gf_simd::mul_acc_input_batch(&mut chunk_out[..byte_len], &chunk_inputs);
-            });
 
         for (j, target) in write_targets.iter().enumerate() {
             let write_offset = target.offset + byte_start as u64;
@@ -1130,108 +1142,155 @@ pub fn execute_repair_with_options(
             budget,
         } => execute_repair_streaming(plan, par2_set, file_access, options, chunk_words, budget),
         RepairExecutionMode::InMemory { chunk_words } => {
-            let missing_set: HashSet<usize> = plan.missing_global_indices.iter().copied().collect();
-            let mut input_data = vec![0u8; slice_size];
-            let use_grouped_xor_out = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    is_x86_feature_detected!("avx2")
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    true
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                {
-                    false
-                }
-            };
+            info!("reconstructing {} missing slices", n);
+            let output_inputs = grouped_input_factors(&plan.input_factors);
+            let available_inputs = plan.available_input_global_indices.len();
+            let total_inputs = available_inputs + plan.recovery_exponents.len();
+            let total_inputs_u32 = total_inputs.min(u32::MAX as usize) as u32;
+            let mut input_buffers: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; total_inputs];
+            let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
 
-            // Step 1: Read recovery slice data.
-            info!("reading recovery blocks and computing adjusted syndromes");
-            let mut recovery_buffers = prepare_recovery_buffers(plan, par2_set, options)?;
-
-            // XOR out known input slice contributions from each recovery block.
-            let known_indices: Vec<usize> = (0..plan.total_input_slices)
-                .filter(|global_idx| !missing_set.contains(global_idx))
-                .collect();
-
-            if use_grouped_xor_out {
-                let mut input_batch = vec![vec![0u8; slice_size]; XOR_OUT_INPUT_GROUP];
-                let mut factor_batch: Vec<Vec<u16>> = Vec::with_capacity(XOR_OUT_INPUT_GROUP);
-
-                for known_batch in known_indices.chunks(XOR_OUT_INPUT_GROUP) {
+            for (input_idx, &global_idx) in plan.available_input_global_indices.iter().enumerate() {
+                if input_idx % 64 == 0 {
                     check_cancel(options)?;
-                    factor_batch.clear();
-
-                    for (slot, &global_idx) in known_batch.iter().enumerate() {
-                        let (file_id, local_slice) = plan.global_to_file[global_idx];
-                        let offset = local_slice as u64 * plan.slice_size;
-                        let read_len = file_access
-                            .read_file_range_into(&file_id, offset, &mut input_batch[slot])
-                            .map_err(Par2Error::Io)?;
-                        input_batch[slot][read_len..].fill(0);
-                        factor_batch.push(
-                            plan.recovery_exponents
-                                .iter()
-                                .map(|&exp| gf::pow(plan.constants[global_idx], exp))
-                                .collect(),
-                        );
-                    }
-
-                    if known_batch.len() == 1 {
-                        xor_out_known_data(
-                            &mut recovery_buffers,
-                            &factor_batch[0],
-                            &input_batch[0],
-                            chunk_words,
-                        );
-                    } else {
-                        xor_out_known_batch(
-                            &mut recovery_buffers,
-                            &factor_batch,
-                            &input_batch[..known_batch.len()],
-                            chunk_words,
-                        );
-                    }
                 }
-            } else {
-                for &global_idx in &known_indices {
-                    if global_idx % 64 == 0 {
-                        check_cancel(options)?;
-                    }
 
-                    let (file_id, local_slice) = plan.global_to_file[global_idx];
-                    let offset = local_slice as u64 * plan.slice_size;
-                    let read_len = file_access
-                        .read_file_range_into(&file_id, offset, &mut input_data)
-                        .map_err(Par2Error::Io)?;
-                    input_data[read_len..].fill(0);
+                let (file_id, local_slice) = plan.global_to_file[global_idx];
+                let offset = local_slice as u64 * plan.slice_size;
+                let read_len = file_access
+                    .read_file_range_into(&file_id, offset, &mut input_buffers[input_idx])
+                    .map_err(Par2Error::Io)?;
+                input_buffers[input_idx][read_len..].fill(0);
 
-                    let recovery_factors: Vec<u16> = plan
-                        .recovery_exponents
-                        .iter()
-                        .map(|&exp| gf::pow(plan.constants[global_idx], exp))
-                        .collect();
-
-                    xor_out_known_data(
-                        &mut recovery_buffers,
-                        &recovery_factors,
-                        &input_data,
-                        chunk_words,
-                    );
+                if let Some(ref progress) = options.progress {
+                    progress(ProgressUpdate {
+                        stage: ProgressStage::Repairing,
+                        current: input_idx as u32 + 1,
+                        total: total_inputs_u32,
+                        bytes_processed: (input_idx + 1) as u64 * slice_size as u64,
+                    });
                 }
             }
 
-            // Step 2 + 3: Multiply and write.
-            reconstruct_and_write(
-                plan,
-                par2_set,
-                recovery_buffers,
-                file_access,
-                chunk_words,
-                options,
-            )
+            for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
+                check_cancel(options)?;
+                let rs =
+                    par2_set
+                        .recovery_slices
+                        .get(&exp)
+                        .ok_or_else(|| Par2Error::ReedSolomonError {
+                            reason: format!("recovery block with exponent {exp} not found"),
+                        })?;
+                let recovery_data = rs.data.to_vec().map_err(Par2Error::Io)?;
+                let copy_len = recovery_data.len().min(slice_size);
+                input_buffers[available_inputs + recovery_idx][..copy_len]
+                    .copy_from_slice(&recovery_data[..copy_len]);
+                input_buffers[available_inputs + recovery_idx][copy_len..].fill(0);
+
+                if let Some(ref progress) = options.progress {
+                    let current = available_inputs + recovery_idx + 1;
+                    progress(ProgressUpdate {
+                        stage: ProgressStage::Repairing,
+                        current: current.min(u32::MAX as usize) as u32,
+                        total: total_inputs_u32,
+                        bytes_processed: current as u64 * slice_size as u64,
+                    });
+                }
+            }
+            let prepared_output_inputs: Vec<Vec<(u16, crate::gf_simd::PreparedInputFactor)>> =
+                output_inputs
+                    .iter()
+                    .map(|inputs| {
+                        inputs
+                            .iter()
+                            .map(|factor_input| {
+                                (
+                                    factor_input.input_idx,
+                                    crate::gf_simd::prepare_input_factor(factor_input.factor),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+            let total_chunks_usize = (slice_size / 2).div_ceil(chunk_words);
+            let completed_outputs = AtomicU32::new(0);
+
+            repaired_slices.par_iter_mut().enumerate().try_for_each(
+                |(output_idx, repaired)| -> Result<()> {
+                    check_cancel(options)?;
+                    let decode_inputs = &prepared_output_inputs[output_idx];
+                    let mut chunk_inputs = Vec::with_capacity(decode_inputs.len());
+
+                    for chunk_idx in 0..total_chunks_usize {
+                        let chunk_start = chunk_idx * chunk_words;
+                        let chunk_end = (chunk_start + chunk_words).min(slice_size / 2);
+                        let byte_start = chunk_start * 2;
+                        let byte_len = (chunk_end - chunk_start) * 2;
+
+                        chunk_inputs.clear();
+                        for (input_idx, prepared) in decode_inputs {
+                            chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
+                                prepared,
+                                src: &input_buffers[*input_idx as usize][byte_start..byte_start + byte_len],
+                            });
+                        }
+
+                        crate::gf_simd::mul_acc_input_batch_prepared(
+                            &mut repaired[byte_start..byte_start + byte_len],
+                            &chunk_inputs,
+                        );
+                    }
+
+                    if let Some(ref progress) = options.progress {
+                        let current = completed_outputs.fetch_add(1, Ordering::Relaxed) + 1;
+                        progress(ProgressUpdate {
+                            stage: ProgressStage::Repairing,
+                            current,
+                            total: n as u32,
+                            bytes_processed: current as u64 * slice_size as u64,
+                        });
+                    }
+
+                    Ok(())
+                },
+            )?;
+
+            info!("writing repaired slices to files");
+            let write_targets = build_write_targets(plan, par2_set)?;
+            for (j, target) in write_targets.iter().enumerate() {
+                check_cancel(options)?;
+
+                let slice_end = target.offset + plan.slice_size;
+                let write_len = if slice_end > target.file_end {
+                    (target.file_end - target.offset) as usize
+                } else {
+                    slice_size
+                };
+
+                file_access
+                    .write_file_range(
+                        &target.file_id,
+                        target.offset,
+                        &repaired_slices[j][..write_len],
+                    )
+                    .map_err(|e| Par2Error::RepairWriteFailed {
+                        filename: target.filename.clone(),
+                        offset: target.offset,
+                        source: e,
+                    })?;
+
+                if let Some(ref progress) = options.progress {
+                    progress(ProgressUpdate {
+                        stage: ProgressStage::WritingRepaired,
+                        current: j as u32 + 1,
+                        total: n as u32,
+                        bytes_processed: (j + 1) as u64 * slice_size as u64,
+                    });
+                }
+            }
+
+            info!("repair complete: {} slices restored", n);
+            Ok(())
         }
     }
 }
@@ -1622,8 +1681,18 @@ mod tests {
                 .map(|i| (FileId::from_bytes([i as u8; 16]), i as u32))
                 .collect(),
             missing_global_indices: (0..missing_slices).collect(),
+            available_input_global_indices: Vec::new(),
             recovery_exponents: (0..missing_slices as u32).collect(),
-            decode_matrix: vec![vec![1; missing_slices]; missing_slices],
+            decode_matrix: matrix::Matrix {
+                rows: missing_slices,
+                cols: missing_slices,
+                data: vec![1; missing_slices.saturating_mul(missing_slices)],
+            },
+            input_factors: matrix::Matrix {
+                rows: missing_slices,
+                cols: missing_slices,
+                data: vec![1; missing_slices.saturating_mul(missing_slices)],
+            },
             slice_size,
             constants: vec![1; missing_slices],
             total_input_slices: missing_slices,

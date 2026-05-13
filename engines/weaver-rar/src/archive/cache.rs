@@ -13,7 +13,10 @@ use super::{DataSegment, FileEncryptionInfo, MemberEntry, RarArchive};
 use crate::header::file::FileHeader;
 use crate::header::{Redirection, RedirectionType};
 use crate::limits::Limits;
-use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod, FileHash};
+use crate::types::{
+    ArchiveFormat, CompressionInfo, CompressionMethod, FileAttributes, FileHash, HostOs,
+    UnixOwnerInfo,
+};
 use crate::volume::VolumeSet;
 
 /// Serializable snapshot of parsed archive headers.
@@ -22,6 +25,12 @@ pub struct CachedArchiveHeaders {
     pub format: u8, // 4=Rar4, 5=Rar5
     pub is_solid: bool,
     pub is_encrypted: bool,
+    #[serde(default)]
+    pub has_recovery_record: bool,
+    #[serde(default)]
+    pub is_locked: bool,
+    #[serde(default)]
+    pub has_authenticity_verification: bool,
     pub more_volumes: bool,
     #[serde(default)]
     pub volume_presence: Vec<bool>,
@@ -62,6 +71,18 @@ pub struct CachedMember {
     pub redirection_target: Option<String>,
     #[serde(default)]
     pub redirection_target_is_directory: bool,
+    #[serde(default)]
+    pub attributes: u64,
+    #[serde(default = "default_host_os_code")]
+    pub host_os: u64,
+    #[serde(default)]
+    pub owner_user_name: Option<String>,
+    #[serde(default)]
+    pub owner_group_name: Option<String>,
+    #[serde(default)]
+    pub owner_uid: Option<u64>,
+    #[serde(default)]
+    pub owner_gid: Option<u64>,
     pub segments: Vec<CachedSegment>,
 }
 
@@ -119,6 +140,9 @@ impl From<LegacyCachedArchiveHeaders> for CachedArchiveHeaders {
             format: value.format,
             is_solid: value.is_solid,
             is_encrypted: value.is_encrypted,
+            has_recovery_record: false,
+            is_locked: false,
+            has_authenticity_verification: false,
             more_volumes: value.more_volumes,
             volume_presence: value.volume_presence,
             last_volume_seen: value.last_volume_seen,
@@ -151,9 +175,19 @@ impl From<LegacyCachedMember> for CachedMember {
             redirection_type: None,
             redirection_target: None,
             redirection_target_is_directory: false,
+            attributes: 0,
+            host_os: default_host_os_code(),
+            owner_user_name: None,
+            owner_group_name: None,
+            owner_uid: None,
+            owner_gid: None,
             segments: value.segments,
         }
     }
+}
+
+fn default_host_os_code() -> u64 {
+    1
 }
 
 fn decode_cached_headers(data: &[u8]) -> Result<CachedArchiveHeaders, rmp_serde::decode::Error> {
@@ -195,6 +229,22 @@ fn encode_redirection_type(redirection: &RedirectionType) -> u64 {
     }
 }
 
+fn encode_host_os(host_os: HostOs) -> u64 {
+    match host_os {
+        HostOs::Windows => 0,
+        HostOs::Unix => 1,
+        HostOs::Unknown(value) => value,
+    }
+}
+
+fn decode_host_os(host_os: u64) -> HostOs {
+    match host_os {
+        0 => HostOs::Windows,
+        1 => HostOs::Unix,
+        value => HostOs::Unknown(value),
+    }
+}
+
 impl RarArchive {
     /// Export parsed headers for journal persistence.
     pub fn export_headers(&self) -> CachedArchiveHeaders {
@@ -205,6 +255,9 @@ impl RarArchive {
             },
             is_solid: self.is_solid,
             is_encrypted: self.is_encrypted,
+            has_recovery_record: self.has_recovery_record,
+            is_locked: self.is_locked,
+            has_authenticity_verification: self.has_authenticity_verification,
             more_volumes: self.more_volumes,
             volume_presence: self.volume_set.presence(),
             last_volume_seen: self.volume_set.last_volume_seen(),
@@ -247,6 +300,12 @@ impl RarArchive {
                         .redirection
                         .as_ref()
                         .is_some_and(|redir| redir.target_is_directory),
+                    attributes: m.file_header.attributes.0,
+                    host_os: encode_host_os(m.file_header.host_os),
+                    owner_user_name: m.owner.as_ref().and_then(|owner| owner.user_name.clone()),
+                    owner_group_name: m.owner.as_ref().and_then(|owner| owner.group_name.clone()),
+                    owner_uid: m.owner.as_ref().and_then(|owner| owner.uid),
+                    owner_gid: m.owner.as_ref().and_then(|owner| owner.gid),
                     segments: m
                         .segments
                         .iter()
@@ -313,13 +372,13 @@ impl RarArchive {
                     file_header: FileHeader {
                         name: cm.name,
                         unpacked_size: cm.unpacked_size,
-                        attributes: crate::types::FileAttributes(0),
+                        attributes: FileAttributes(cm.attributes),
                         mtime: decode_system_time(cm.mtime_ns),
                         ctime: decode_system_time(cm.ctime_ns),
                         atime: decode_system_time(cm.atime_ns),
                         data_crc32: cm.data_crc32,
                         compression,
-                        host_os: crate::types::HostOs::Unix,
+                        host_os: decode_host_os(cm.host_os),
                         is_directory: cm.is_directory,
                         file_flags: 0,
                         data_size: 0,
@@ -345,6 +404,16 @@ impl RarArchive {
                         target: cm.redirection_target.unwrap_or_default(),
                         target_is_directory: cm.redirection_target_is_directory,
                     }),
+                    owner: (cm.owner_user_name.is_some()
+                        || cm.owner_group_name.is_some()
+                        || cm.owner_uid.is_some()
+                        || cm.owner_gid.is_some())
+                    .then_some(UnixOwnerInfo {
+                        user_name: cm.owner_user_name,
+                        group_name: cm.owner_group_name,
+                        uid: cm.owner_uid,
+                        gid: cm.owner_gid,
+                    }),
                     segments: cm
                         .segments
                         .into_iter()
@@ -361,6 +430,9 @@ impl RarArchive {
             format,
             is_solid: cached.is_solid,
             is_encrypted: cached.is_encrypted,
+            has_recovery_record: cached.has_recovery_record,
+            is_locked: cached.is_locked,
+            has_authenticity_verification: cached.has_authenticity_verification,
             volume_set: VolumeSet::from_presence(cached.volume_presence, cached.last_volume_seen),
             members,
             more_volumes: cached.more_volumes,

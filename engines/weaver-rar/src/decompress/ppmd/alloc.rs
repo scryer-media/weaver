@@ -16,12 +16,12 @@ pub const UNIT_SIZE: usize = 12;
 
 /// Index-to-units mapping for the free list bins.
 static INDEX_TO_UNITS: [u8; 38] = [
-    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 128,
-    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    1, 2, 3, 4, 6, 8, 10, 12, 15, 18, 21, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76,
+    80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128,
 ];
 
 /// Number of distinct free-list bin sizes.
-const NUM_INDEXES: usize = 24;
+const NUM_INDEXES: usize = 38;
 
 /// A reference to an allocated unit block in the arena.
 /// Stored as a unit index (byte offset = index * UNIT_SIZE).
@@ -152,17 +152,50 @@ impl SubAllocator {
     /// Map a requested number of units to a free-list bin index.
     #[allow(clippy::needless_range_loop)]
     fn units_to_index(units: usize) -> usize {
-        match units {
-            1..=8 => units - 1,
-            _ => {
-                for i in 8..NUM_INDEXES {
-                    if INDEX_TO_UNITS[i] as usize >= units {
-                        return i;
-                    }
-                }
-                NUM_INDEXES - 1
+        for i in 0..NUM_INDEXES {
+            if INDEX_TO_UNITS[i] as usize >= units {
+                return i;
             }
         }
+        NUM_INDEXES - 1
+    }
+
+    #[inline]
+    fn insert_node(&mut self, node: NodeRef, idx: usize) {
+        self.write_free_node(
+            node,
+            FreeNode {
+                next: self.free_lists[idx],
+            },
+        );
+        self.free_lists[idx] = node;
+    }
+
+    #[inline]
+    fn remove_node(&mut self, idx: usize) -> NodeRef {
+        let node = self.free_lists[idx];
+        let free_node = self.read_free_node(node);
+        self.free_lists[idx] = free_node.next;
+        node
+    }
+
+    fn split_block(&mut self, node: NodeRef, old_idx: usize, new_idx: usize) {
+        let old_units = INDEX_TO_UNITS[old_idx] as usize;
+        let new_units = INDEX_TO_UNITS[new_idx] as usize;
+        let mut u_diff = old_units.saturating_sub(new_units);
+        let mut p = NodeRef(node.0 + new_units as u32);
+
+        let mut rem_idx = Self::units_to_index(u_diff);
+        if INDEX_TO_UNITS[rem_idx] as usize != u_diff {
+            rem_idx -= 1;
+            self.insert_node(p, rem_idx);
+            let rem_units = INDEX_TO_UNITS[rem_idx] as usize;
+            p = NodeRef(p.0 + rem_units as u32);
+            u_diff -= rem_units;
+        }
+
+        let tail_idx = Self::units_to_index(u_diff);
+        self.insert_node(p, tail_idx);
     }
 
     /// Allocate a block of `units` contiguous units from lo_unit or free lists.
@@ -175,17 +208,10 @@ impl SubAllocator {
         #[allow(clippy::needless_range_loop)]
         for i in idx..NUM_INDEXES {
             if !self.free_lists[i].is_null() {
-                let node = self.free_lists[i];
-                let free_node = self.read_free_node(node);
-                self.free_lists[i] = free_node.next;
-
-                let found_units = INDEX_TO_UNITS[i] as usize;
-                if found_units > bin_units {
-                    let remainder_ref = NodeRef(node.0 + bin_units as u32);
-                    let remainder_units = found_units - bin_units;
-                    self.free_units(remainder_ref, remainder_units);
+                let node = self.remove_node(i);
+                if i != idx {
+                    self.split_block(node, i, idx);
                 }
-
                 return node;
             }
         }
@@ -250,7 +276,7 @@ impl SubAllocator {
         let dst = new_node.offset();
         let len = old_nu * UNIT_SIZE;
         self.arena.copy_within(src..src + len, dst);
-        self.free_units(node, old_nu);
+        self.insert_node(node, old_idx);
         new_node
     }
 
@@ -262,39 +288,28 @@ impl SubAllocator {
         if old_idx == new_idx {
             return node;
         }
-        let new_node = self.alloc_units(new_nu);
-        if new_node.is_null() {
-            return node; // keep old allocation
+        if !self.free_lists[new_idx].is_null() {
+            let new_node = self.remove_node(new_idx);
+            let src = node.offset();
+            let dst = new_node.offset();
+            let len = new_nu * UNIT_SIZE;
+            self.arena.copy_within(src..src + len, dst);
+            self.insert_node(node, old_idx);
+            return new_node;
         }
-        let src = node.offset();
-        let dst = new_node.offset();
-        let len = new_nu * UNIT_SIZE;
-        self.arena.copy_within(src..src + len, dst);
-        self.free_units(node, old_nu);
-        new_node
+        self.split_block(node, old_idx, new_idx);
+        node
     }
 
     /// Free a block of `units` contiguous units back to the appropriate free list.
     pub fn free_units(&mut self, node: NodeRef, units: usize) {
         let idx = Self::units_to_index(units);
-        self.write_free_node(
-            node,
-            FreeNode {
-                next: self.free_lists[idx],
-            },
-        );
-        self.free_lists[idx] = node;
+        self.insert_node(node, idx);
     }
 
     /// Free exactly 1 unit.
     pub fn free_one(&mut self, node: NodeRef) {
-        self.write_free_node(
-            node,
-            FreeNode {
-                next: self.free_lists[0],
-            },
-        );
-        self.free_lists[0] = node;
+        self.insert_node(node, 0);
     }
 
     // ---- Arena access via NodeRef (unit-aligned) ----

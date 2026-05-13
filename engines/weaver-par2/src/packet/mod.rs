@@ -320,7 +320,6 @@ fn parse_non_recovery_packet_from_reader(
 fn parse_recovery_packet_from_reader(
     reader: &mut BufReader<File>,
     header: &PacketHeader,
-    header_bytes: &[u8; HEADER_SIZE],
     offset: u64,
     path: &Path,
 ) -> Result<Packet> {
@@ -344,24 +343,9 @@ fn parse_recovery_packet_from_reader(
     let exponent = u32::from_le_bytes(exponent_bytes);
     let payload_len = body_len - 4;
     let payload_offset = offset + HEADER_SIZE as u64 + 4;
-
-    let mut hasher = Md5State::new();
-    hasher.update(&header_bytes[32..HEADER_SIZE]);
-    hasher.update(&exponent_bytes);
-
-    let mut remaining = payload_len;
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let take = remaining.min(buf.len());
-        reader.read_exact(&mut buf[..take]).map_err(Par2Error::Io)?;
-        hasher.update(&buf[..take]);
-        remaining -= take;
-    }
-
-    let computed: [u8; 16] = hasher.finalize();
-    if computed != header.packet_hash {
-        return Err(Par2Error::PacketHashMismatch { offset });
-    }
+    reader
+        .seek(SeekFrom::Start(payload_offset + payload_len as u64))
+        .map_err(Par2Error::Io)?;
 
     Ok(Packet::RecoverySlice(RecoverySlicePacket {
         exponent,
@@ -413,7 +397,6 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
             PacketType::RecoverySlice => parse_recovery_packet_from_reader(
                 &mut reader,
                 &header,
-                &header_bytes,
                 packet_offset,
                 path,
             )

@@ -82,6 +82,8 @@ pub struct LzDecoder {
     is_last_block: bool,
     /// Filters pending application to ranges of the current output.
     pending_filters: Vec<PendingFilter>,
+    /// Absolute output offset where the current file begins in the window.
+    current_file_base_total: u64,
 }
 
 impl LzDecoder {
@@ -109,11 +111,18 @@ impl LzDecoder {
             block_bits_remaining: 0,
             is_last_block: false,
             pending_filters: Vec::new(),
+            current_file_base_total: 0,
         }
     }
 
     fn flush_threshold(&self) -> usize {
         self.window.dict_size().clamp(1, UNPACK_MAX_WRITE)
+    }
+
+    fn begin_file_decode(&mut self) {
+        self.pending_filters.clear();
+        self.current_file_base_total = self.window.total_written();
+        self.window.mark_flushed(self.current_file_base_total);
     }
 
     #[inline]
@@ -354,6 +363,7 @@ impl LzDecoder {
             return Ok(Vec::new());
         }
 
+        self.begin_file_decode();
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
 
@@ -390,11 +400,12 @@ impl LzDecoder {
                 let rel_end = rel_start + f.block_length;
                 if rel_end <= output.len() {
                     let block = &mut output[rel_start..rel_end];
+                    let file_block_start = f.block_start - self.current_file_base_total;
                     match f.filter_type {
                         FilterType::Delta => filter::apply_delta(block, f.channels),
-                        FilterType::E8 => filter::apply_e8(block, f.block_start),
-                        FilterType::E8E9 => filter::apply_e8e9(block, f.block_start),
-                        FilterType::Arm => filter::apply_arm(block, f.block_start),
+                        FilterType::E8 => filter::apply_e8(block, file_block_start),
+                        FilterType::E8E9 => filter::apply_e8e9(block, file_block_start),
+                        FilterType::Arm => filter::apply_arm(block, file_block_start),
                     }
                 }
             }
@@ -602,7 +613,7 @@ impl LzDecoder {
     /// [`PendingFilter`] for later application to the output.
     fn handle_filter<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<u64> {
         let block_start_delta = Self::read_filter_data(reader)? as u64;
-        let block_start = output_size + block_start_delta;
+        let block_start = self.current_file_base_total + output_size + block_start_delta;
         let block_length = Self::read_filter_data(reader)? as usize;
         let filter_code = reader.read_bits(3)? as u8;
         let filter_type =
@@ -674,6 +685,7 @@ impl LzDecoder {
             return Ok(0);
         }
 
+        self.begin_file_decode();
         // Try parallel decode if there are enough blocks.
         if let Some(output_size) = self.try_decompress_parallel(input, unpacked_size, writer)? {
             return Ok(output_size);
@@ -733,6 +745,7 @@ impl LzDecoder {
             return self.decompress_reader_to_writer_single_thread(input, unpacked_size, writer, 0);
         }
 
+        self.begin_file_decode();
         let mut output_size = 0u64;
         let mut staged = Vec::with_capacity(STREAMING_PARALLEL_READ_BUFFER_SIZE);
         let mut read_buf = vec![0u8; STREAMING_PARALLEL_READ_BUFFER_SIZE];
@@ -849,6 +862,7 @@ impl LzDecoder {
         writer: &mut W,
         mut output_size: u64,
     ) -> RarResult<u64> {
+        self.begin_file_decode();
         let mut reader = StreamingBitReader::new(input);
         let flush_threshold = self.flush_threshold();
 
@@ -907,6 +921,7 @@ impl LzDecoder {
             return Ok(Vec::new());
         }
 
+        self.begin_file_decode();
         let mut reader = BitReader::new(input);
         let mut output_size: u64 = 0;
         let mut boundary_idx = 0;
@@ -994,6 +1009,7 @@ impl LzDecoder {
             return Ok(Vec::new());
         }
 
+        self.begin_file_decode();
         let mut reader = StreamingBitReader::new(input);
         let mut output_size: u64 = 0;
         let mut boundary_idx = 0;
@@ -1097,10 +1113,27 @@ impl LzDecoder {
 
         let flushed_total = total - unflushed;
         let mut written_up_to = flushed_total;
-        let pending_filters = std::mem::take(&mut self.pending_filters);
+        let mut pending_filters = std::mem::take(&mut self.pending_filters);
+        pending_filters.sort_by_key(|filter| filter.block_start);
         let mut remaining_filters = Vec::with_capacity(pending_filters.len());
 
-        for filter in pending_filters {
+        let mut pending_iter = pending_filters.into_iter();
+        while let Some(filter) = pending_iter.next() {
+            if filter.block_start < written_up_to {
+                return Err(RarError::CorruptArchive {
+                    detail: format!(
+                        "RAR5 filter block starts before flushed border ({} < {})",
+                        filter.block_start, written_up_to
+                    ),
+                });
+            }
+
+            if filter.block_start > total {
+                remaining_filters.push(filter);
+                remaining_filters.extend(pending_iter);
+                break;
+            }
+
             if filter.block_start > written_up_to {
                 let prefix_len = (filter.block_start - written_up_to) as usize;
                 self.write_window_range(writer, written_up_to, prefix_len)?;
@@ -1111,19 +1144,31 @@ impl LzDecoder {
                 .block_start
                 .saturating_add(filter.block_length as u64);
             if block_end <= total {
+                let file_block_start =
+                    filter
+                        .block_start
+                        .checked_sub(self.current_file_base_total)
+                        .ok_or_else(|| RarError::CorruptArchive {
+                            detail: format!(
+                                "RAR5 filter block starts before current file base ({} < {})",
+                                filter.block_start, self.current_file_base_total
+                            ),
+                        })?;
                 let mut buf = self
                     .window
                     .copy_output(filter.block_start, filter.block_length);
                 match filter.filter_type {
                     FilterType::Delta => filter::apply_delta(&mut buf, filter.channels),
-                    FilterType::E8 => filter::apply_e8(&mut buf, filter.block_start),
-                    FilterType::E8E9 => filter::apply_e8e9(&mut buf, filter.block_start),
-                    FilterType::Arm => filter::apply_arm(&mut buf, filter.block_start),
+                    FilterType::E8 => filter::apply_e8(&mut buf, file_block_start),
+                    FilterType::E8E9 => filter::apply_e8e9(&mut buf, file_block_start),
+                    FilterType::Arm => filter::apply_arm(&mut buf, file_block_start),
                 }
                 writer.write_all(&buf).map_err(RarError::Io)?;
                 written_up_to = block_end;
             } else {
                 remaining_filters.push(filter);
+                remaining_filters.extend(pending_iter);
+                break;
             }
         }
 
@@ -1151,6 +1196,7 @@ impl LzDecoder {
         self.block_bits_remaining = 0;
         self.is_last_block = false;
         self.pending_filters.clear();
+        self.current_file_base_total = 0;
     }
 
     /// Prepare for the next member in a solid archive.
@@ -1162,6 +1208,7 @@ impl LzDecoder {
         self.block_bits_remaining = 0;
         self.is_last_block = false;
         self.pending_filters.clear();
+        self.current_file_base_total = self.window.total_written();
     }
 }
 
@@ -1363,6 +1410,35 @@ mod tests {
         assert_eq!(decoder.window.total_written(), 2);
         assert_eq!(decoder.window.get_byte(1), 0xBB);
         assert_eq!(decoder.window.get_byte(2), 0xAA);
+    }
+
+    #[test]
+    fn test_flush_filters_stops_at_first_incomplete_block() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.window.put_bytes(b"abcdefghij");
+        decoder.pending_filters = vec![
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 4,
+                block_length: 8,
+                channels: 0,
+            },
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 8,
+                block_length: 1,
+                channels: 0,
+            },
+        ];
+
+        let mut out = Vec::new();
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
+        assert_eq!(out, b"abcd");
+        assert_eq!(decoder.window.total_flushed(), 4);
+        assert_eq!(decoder.pending_filters.len(), 2);
+        assert_eq!(decoder.pending_filters[0].block_start, 4);
+        assert_eq!(decoder.pending_filters[1].block_start, 8);
     }
 
     #[test]

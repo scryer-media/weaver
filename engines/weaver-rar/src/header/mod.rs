@@ -52,6 +52,7 @@ pub struct ParsedFile {
     pub file_encryption: Option<FileEncryptionParams>,
     pub hash: Option<crate::types::FileHash>,
     pub redirection: Option<Redirection>,
+    pub owner: Option<crate::types::UnixOwnerInfo>,
 }
 
 /// Redirection info from extra records (symlinks/hardlinks).
@@ -344,7 +345,7 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
         }
         HeaderType::File => {
             let mut file_hdr = file::parse(raw, data_offset)?;
-            let (is_encrypted, file_encryption, hash, redirection) =
+            let (is_encrypted, file_encryption, hash, redirection, owner) =
                 apply_extra_records(raw, extra::ExtraAreaOwner::File, &mut file_hdr);
             debug!(
                 "file: name={:?} size={:?} method={:?} encrypted={}",
@@ -356,6 +357,7 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
                 file_encryption,
                 hash,
                 redirection,
+                owner,
             });
         }
         HeaderType::Service => {
@@ -388,18 +390,20 @@ fn apply_extra_records(
     Option<FileEncryptionParams>,
     Option<crate::types::FileHash>,
     Option<Redirection>,
+    Option<crate::types::UnixOwnerInfo>,
 ) {
     let Some(ea_bytes) = common::extra_area_bytes(raw) else {
-        return (false, None, None, None);
+        return (false, None, None, None, None);
     };
     let Ok(records) = extra::parse_extra_area(ea_bytes, owner) else {
-        return (false, None, None, None);
+        return (false, None, None, None, None);
     };
 
     let mut is_encrypted = false;
     let mut file_encryption = None;
     let mut hash = None;
     let mut redirection = None;
+    let mut owner = None;
 
     for record in &records {
         match record {
@@ -454,6 +458,9 @@ fn apply_extra_records(
                     target_is_directory: *target_is_directory,
                 });
             }
+            extra::ExtraRecord::UnixOwner { owner: unix_owner } => {
+                owner = Some(unix_owner.clone());
+            }
             extra::ExtraRecord::ServiceData(data) => {
                 header.service_subdata = Some(data.clone());
             }
@@ -461,7 +468,7 @@ fn apply_extra_records(
         }
     }
 
-    (is_encrypted, file_encryption, hash, redirection)
+    (is_encrypted, file_encryption, hash, redirection, owner)
 }
 
 /// Get extra records for a file header from its raw header's extra area.

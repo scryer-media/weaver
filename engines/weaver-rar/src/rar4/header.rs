@@ -163,6 +163,9 @@ pub fn parse_archive_header(raw: &RawRar4Header) -> RarResult<Rar4ArchiveHeader>
         is_volume: raw.flags & archive_flags::VOLUME != 0,
         is_solid: raw.flags & archive_flags::SOLID != 0,
         is_encrypted: raw.flags & archive_flags::ENCRYPTED_HEADERS != 0,
+        has_recovery_record: raw.flags & archive_flags::RECOVERY != 0,
+        is_locked: raw.flags & archive_flags::LOCK != 0,
+        has_authenticity_verification: raw.flags & archive_flags::AUTH != 0,
         is_first_volume: raw.flags & archive_flags::FIRST_VOLUME != 0,
         new_naming: raw.flags & archive_flags::NEW_NUMBERING != 0,
     })

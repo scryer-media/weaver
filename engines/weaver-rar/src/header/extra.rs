@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX;
 use crate::error::RarResult;
-use crate::types::FileHash;
+use crate::types::{FileHash, UnixOwnerInfo};
 use crate::vint;
 
 /// Extra area record types.
@@ -39,6 +39,10 @@ const FHEXTRA_HTIME_UNIX_NS: u64 = 0x10;
 
 const FHEXTRA_CRYPT_PSWCHECK: u64 = 0x01;
 const FHEXTRA_REDIR_DIR: u64 = 0x01;
+const OWNER_USER_NAME: u64 = 0x01;
+const OWNER_GROUP_NAME: u64 = 0x02;
+const OWNER_USER_UID: u64 = 0x04;
+const OWNER_GROUP_GID: u64 = 0x08;
 
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 const WINDOWS_TO_UNIX_SECONDS: u64 = 11_644_473_600;
@@ -78,7 +82,7 @@ pub enum ExtraRecord {
         target_is_directory: bool,
     },
     /// Unix owner info.
-    UnixOwner { flags: u64 },
+    UnixOwner { owner: UnixOwnerInfo },
     /// Service subdata payload.
     ServiceData(Vec<u8>),
     /// Unknown record type.
@@ -161,15 +165,7 @@ pub fn parse_extra_area(data: &[u8], owner: ExtraAreaOwner) -> RarResult<Vec<Ext
             record_type::FILE_TIME => parse_file_time(record_body),
             record_type::FILE_VERSION => parse_file_version(record_body),
             record_type::REDIRECTION => parse_redirection(record_body),
-            record_type::UNIX_OWNER => ExtraRecord::UnixOwner {
-                flags: if record_body.is_empty() {
-                    0
-                } else {
-                    vint::read_vint(record_body)
-                        .map(|(value, _)| value)
-                        .unwrap_or(0)
-                },
-            },
+            record_type::UNIX_OWNER => parse_unix_owner(record_body),
             record_type::SERVICE_DATA => ExtraRecord::ServiceData(record_body.to_vec()),
             other => ExtraRecord::Unknown { record_type: other },
         };
@@ -344,6 +340,56 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
         target,
         target_is_directory: flags & FHEXTRA_REDIR_DIR != 0,
     }
+}
+
+fn parse_unix_owner(data: &[u8]) -> ExtraRecord {
+    let (flags, mut pos) = match vint::read_vint(data) {
+        Ok(value) => value,
+        Err(_) => {
+            return ExtraRecord::UnixOwner {
+                owner: UnixOwnerInfo::default(),
+            };
+        }
+    };
+
+    let mut owner = UnixOwnerInfo::default();
+
+    if flags & OWNER_USER_NAME != 0
+        && let Ok((name_len, n)) = vint::read_vint(&data[pos..])
+    {
+        pos += n;
+        let end = pos.saturating_add(name_len as usize);
+        if let Some(bytes) = data.get(pos..end) {
+            owner.user_name = Some(String::from_utf8_lossy(bytes).into_owned());
+            pos = end;
+        }
+    }
+
+    if flags & OWNER_GROUP_NAME != 0
+        && let Ok((name_len, n)) = vint::read_vint(&data[pos..])
+    {
+        pos += n;
+        let end = pos.saturating_add(name_len as usize);
+        if let Some(bytes) = data.get(pos..end) {
+            owner.group_name = Some(String::from_utf8_lossy(bytes).into_owned());
+            pos = end;
+        }
+    }
+
+    if flags & OWNER_USER_UID != 0
+        && let Ok((uid, n)) = vint::read_vint(&data[pos..])
+    {
+        owner.uid = Some(uid);
+        pos += n;
+    }
+
+    if flags & OWNER_GROUP_GID != 0
+        && let Ok((gid, _)) = vint::read_vint(&data[pos..])
+    {
+        owner.gid = Some(gid);
+    }
+
+    ExtraRecord::UnixOwner { owner }
 }
 
 fn parse_file_encryption(data: &[u8], owner: ExtraAreaOwner) -> ExtraRecord {

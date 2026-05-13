@@ -223,6 +223,8 @@ pub fn to_member_info(fh: &Rar4FileHeader, volume_index: usize) -> MemberInfo {
         },
         is_encrypted: fh.is_encrypted,
         hash: None,
+        attributes: crate::types::FileAttributes(fh.attributes as u64),
+        owner: None,
         volumes: VolumeSpan::single(volume_index),
         is_symlink: fh.is_unix_symlink,
         is_hardlink: false,

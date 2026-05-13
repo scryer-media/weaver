@@ -160,6 +160,9 @@ pub struct Rar4ArchiveHeader {
     pub is_volume: bool,
     pub is_solid: bool,
     pub is_encrypted: bool,
+    pub has_recovery_record: bool,
+    pub is_locked: bool,
+    pub has_authenticity_verification: bool,
     pub is_first_volume: bool,
     /// True if using `.partNNNN.rar` naming, false for old `.rNN` naming.
     pub new_naming: bool,

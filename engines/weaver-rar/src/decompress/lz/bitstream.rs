@@ -145,18 +145,6 @@ impl<'a> BitReader<'a> {
         if count == 0 {
             return Ok(0);
         }
-        if (self.acc_bits as usize) < count as usize && self.bits_remaining() < count as usize {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "bitstream: need {} bits but only {} remaining",
-                    count,
-                    self.bits_remaining()
-                ),
-            });
-        }
-        // If accumulator doesn't have enough, refill first.
-        // This shouldn't normally happen since refill keeps acc_bits >= 56,
-        // but handles edge cases near end of stream.
         if self.acc_bits < count {
             self.refill();
             if self.acc_bits < count {
