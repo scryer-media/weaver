@@ -1,25 +1,26 @@
-FROM alpine:latest
+FROM alpine:latest AS tzdata
+
+RUN apk add --no-cache tzdata
+
+FROM scratch
 
 ARG TARGETARCH
 
-RUN apk add --no-cache su-exec tzdata
-
+COPY --from=tzdata /usr/share/zoneinfo /usr/share/zoneinfo
 WORKDIR /app
 
-COPY ${TARGETARCH}/weaver-* /opt/weaver/
-COPY entrypoint.sh /entrypoint.sh
-COPY runtime-select.sh /runtime-select.sh
-RUN chmod +x /entrypoint.sh /runtime-select.sh /opt/weaver/weaver-*
+COPY ${TARGETARCH}/weaver-docker-launcher /weaver-docker-launcher
+COPY ${TARGETARCH}/payloads /opt/weaver/payloads
 
 EXPOSE 9090
 
-RUN mkdir -p /config
 VOLUME /config
 
 ENV PUID=1000
 ENV PGID=1000
+ENV TZ=Etc/UTC
 
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/weaver-docker-launcher"]
 CMD ["--config", "/config", "serve", "--port", "9090"]

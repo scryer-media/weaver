@@ -1,0 +1,27 @@
+[package]
+name = "weaver-docker-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "weaver-docker-launcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "payload_probe"
+path = "src/bin/payload_probe.rs"
+
+[[bin]]
+name = "payload_exec_runner"
+path = "src/bin/payload_exec_runner.rs"
+
+[dependencies]
+anyhow = "1"
+libc = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

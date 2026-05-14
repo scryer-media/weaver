@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "xtask",
+    "docker/crates/weaver-docker-launcher",
     "shared/crates/weaver-model",
     "server/app/weaver",
     "server/crates/weaver-server-core",

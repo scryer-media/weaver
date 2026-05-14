@@ -7,8 +7,8 @@ CONTEXT_DIR=${2:?context directory is required}
 rm -rf "$CONTEXT_DIR" docker-build
 
 mkdir -p \
-    "$CONTEXT_DIR/amd64" \
-    "$CONTEXT_DIR/arm64" \
+    "$CONTEXT_DIR/amd64/payloads" \
+    "$CONTEXT_DIR/arm64/payloads" \
     docker-build/amd64-portable \
     docker-build/amd64-haswell \
     docker-build/arm64-portable \
@@ -19,14 +19,19 @@ tar -xzf "$ARTIFACTS_DIR/weaver-linux-x86_64-haswell.tar.gz" -C docker-build/amd
 tar -xzf "$ARTIFACTS_DIR/weaver-linux-arm64-portable.tar.gz" -C docker-build/arm64-portable
 tar -xzf "$ARTIFACTS_DIR/weaver-linux-arm64-cortex-a76.tar.gz" -C docker-build/arm64-cortex-a76
 
-install -m 0755 docker-build/amd64-portable/weaver "$CONTEXT_DIR/amd64/weaver-portable"
-install -m 0755 docker-build/amd64-haswell/weaver "$CONTEXT_DIR/amd64/weaver-haswell"
-install -m 0755 docker-build/arm64-portable/weaver "$CONTEXT_DIR/arm64/weaver-portable"
-install -m 0755 docker-build/arm64-cortex-a76/weaver "$CONTEXT_DIR/arm64/weaver-cortex-a76"
+zstd -19 -T0 -f docker-build/amd64-portable/weaver -o "$CONTEXT_DIR/amd64/payloads/weaver-portable.zst"
+zstd -19 -T0 -f docker-build/amd64-haswell/weaver -o "$CONTEXT_DIR/amd64/payloads/weaver-haswell.zst"
+zstd -19 -T0 -f docker-build/arm64-portable/weaver -o "$CONTEXT_DIR/arm64/payloads/weaver-portable.zst"
+zstd -19 -T0 -f docker-build/arm64-cortex-a76/weaver -o "$CONTEXT_DIR/arm64/payloads/weaver-cortex-a76.zst"
 
-test -x "$CONTEXT_DIR/amd64/weaver-portable"
-test -x "$CONTEXT_DIR/amd64/weaver-haswell"
-test -x "$CONTEXT_DIR/arm64/weaver-portable"
-test -x "$CONTEXT_DIR/arm64/weaver-cortex-a76"
+install -m 0755 "$ARTIFACTS_DIR/weaver-docker-launcher-linux-amd64" "$CONTEXT_DIR/amd64/weaver-docker-launcher"
+install -m 0755 "$ARTIFACTS_DIR/weaver-docker-launcher-linux-arm64" "$CONTEXT_DIR/arm64/weaver-docker-launcher"
 
-cp docker/entrypoint.sh docker/runtime-select.sh "$CONTEXT_DIR/"
+test -x "$CONTEXT_DIR/amd64/weaver-docker-launcher"
+test -x "$CONTEXT_DIR/arm64/weaver-docker-launcher"
+test -f "$CONTEXT_DIR/amd64/payloads/weaver-portable.zst"
+test -f "$CONTEXT_DIR/amd64/payloads/weaver-haswell.zst"
+test -f "$CONTEXT_DIR/arm64/payloads/weaver-portable.zst"
+test -f "$CONTEXT_DIR/arm64/payloads/weaver-cortex-a76.zst"
+
+cp docker/test_image_runtime.sh "$CONTEXT_DIR/"

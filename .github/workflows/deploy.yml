@@ -851,12 +851,80 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  rust-build-docker-launcher-linux-amd64:
+    name: rust-build-docker-launcher-linux-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: docker-launcher-linux-amd64
+      - name: Build launcher
+        run: cargo build -p weaver-docker-launcher --release --locked --bin weaver-docker-launcher --target x86_64-unknown-linux-musl
+      - name: Package launcher artifact
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/weaver-docker-launcher dist/weaver-docker-launcher-linux-amd64
+          test -x dist/weaver-docker-launcher-linux-amd64
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-docker-launcher-linux-amd64-${{ github.run_id }}
+          path: dist/weaver-docker-launcher-linux-amd64
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-build-docker-launcher-linux-arm64:
+    name: rust-build-docker-launcher-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+          key: docker-launcher-linux-arm64
+      - name: Build launcher
+        run: cargo build -p weaver-docker-launcher --release --locked --bin weaver-docker-launcher --target aarch64-unknown-linux-musl
+      - name: Package launcher artifact
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/weaver-docker-launcher dist/weaver-docker-launcher-linux-arm64
+          test -x dist/weaver-docker-launcher-linux-arm64
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-docker-launcher-linux-arm64-${{ github.run_id }}
+          path: dist/weaver-docker-launcher-linux-arm64
+          if-no-files-found: error
+          retention-days: 14
+
   # ── Docker validation + release publish ──────────────────────────────────
 
   docker-export:
     name: docker-export-${{ matrix.platform_id }}
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 20
     needs:
       - rust-fmt
@@ -870,6 +938,8 @@ jobs:
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
       - rust-package-linux-arm64-cortex-a76
+      - rust-build-docker-launcher-linux-amd64
+      - rust-build-docker-launcher-linux-arm64
     permissions:
       contents: read
     strategy:
@@ -877,17 +947,21 @@ jobs:
       matrix:
         include:
           - platform_id: amd64
+            runs_on: ubuntu-24.04
             platform: linux/amd64
             tar_name: weaver-linux-amd64-image.tar
             local_tag: weaver:test-amd64
           - platform_id: arm64
+            runs_on: ubuntu-24.04-arm
             platform: linux/arm64
             tar_name: weaver-linux-arm64-image.tar
             local_tag: weaver:test-arm64
     steps:
       - uses: actions/checkout@v6
-      - name: Run Docker runtime selection smoke tests
-        run: sh docker/test_runtime_select.sh
+      - name: Install Docker packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
       - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@v8
         with:
@@ -908,6 +982,19 @@ jobs:
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
           path: artifacts
+      - name: Download launcher amd64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-docker-launcher-linux-amd64-${{ github.run_id }}
+          path: artifacts
+      - name: Download launcher arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-docker-launcher-linux-arm64-${{ github.run_id }}
+          path: artifacts
+      - name: Validate Docker docs contract
+        if: matrix.platform_id == 'amd64'
+        run: sh docker/test_docs_contract.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4
@@ -920,6 +1007,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           outputs: type=docker,dest=/tmp/${{ matrix.tar_name }}
           tags: ${{ matrix.local_tag }}
+      - name: Load built image
+        run: docker load -i /tmp/${{ matrix.tar_name }}
+      - name: Smoke test image runtime
+        run: sh docker/test_image_runtime.sh ${{ matrix.local_tag }} ${{ matrix.platform }}
       - name: Upload image tarball
         uses: actions/upload-artifact@v7
         with:
@@ -955,13 +1046,17 @@ jobs:
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
       - rust-package-linux-arm64-cortex-a76
+      - rust-build-docker-launcher-linux-amd64
+      - rust-build-docker-launcher-linux-arm64
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
-      - name: Run Docker runtime selection smoke tests
-        run: sh docker/test_runtime_select.sh
+      - name: Install Docker packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
       - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@v8
         with:
@@ -982,6 +1077,18 @@ jobs:
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
           path: artifacts
+      - name: Download launcher amd64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-docker-launcher-linux-amd64-${{ github.run_id }}
+          path: artifacts
+      - name: Download launcher arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: weaver-docker-launcher-linux-arm64-${{ github.run_id }}
+          path: artifacts
+      - name: Validate Docker docs contract
+        run: sh docker/test_docs_contract.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4
