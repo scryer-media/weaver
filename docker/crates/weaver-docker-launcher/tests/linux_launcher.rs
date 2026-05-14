@@ -17,6 +17,7 @@ fn launcher_can_decompress_and_exec_from_memfd_with_argv_and_env_passthrough() -
     fs::write(&payload_path, zstd::bulk::compress(&helper_binary, 3)?)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_payload_exec_runner"))
+        .env_clear()
         .arg(&payload_path)
         .arg("weaver-cortex-a76")
         .arg("download")
@@ -24,7 +25,6 @@ fn launcher_can_decompress_and_exec_from_memfd_with_argv_and_env_passthrough() -
         .arg("/config/weaver.toml")
         .env("WEAVER_LAUNCHER_PROBE_ENV", "round-trip")
         .env("WEAVER_LAUNCHER_PROBE_WRITE_PATH", &created_path)
-        .env_remove("RUST_LOG")
         .env("TZ", "America/Denver")
         .env("LOG", "weaver=debug,info")
         .env("UMASK", "027")
