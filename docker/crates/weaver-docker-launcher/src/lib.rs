@@ -258,7 +258,10 @@ pub fn launch_compressed_payload(
     argv: &[std::ffi::OsString],
     env_pairs: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<()> {
-    linux::launch_compressed_payload(payload_path, argv, env_pairs)
+    linux::configure_umask()?;
+    let mut translated_env_pairs = env_pairs.to_vec();
+    linux::translate_log_env_alias(&mut translated_env_pairs);
+    linux::launch_compressed_payload(payload_path, argv, &translated_env_pairs)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -340,7 +343,7 @@ mod linux {
         }
     }
 
-    fn configure_umask() -> Result<()> {
+    pub(super) fn configure_umask() -> Result<()> {
         match env::var("UMASK") {
             Ok(value) => {
                 let value = value.trim();
