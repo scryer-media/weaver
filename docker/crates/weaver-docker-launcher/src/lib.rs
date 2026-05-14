@@ -332,7 +332,7 @@ mod linux {
         }
     }
 
-    fn resolve_requested_owner_ids(current_uid: u32) -> Result<(u32, u32)> {
+    pub(super) fn resolve_requested_owner_ids(current_uid: u32) -> Result<(u32, u32)> {
         if current_uid == 0 {
             Ok((parse_env_u32("PUID", 1000)?, parse_env_u32("PGID", 1000)?))
         } else {
@@ -358,7 +358,7 @@ mod linux {
         }
     }
 
-    fn translate_log_env_alias(env_pairs: &mut Vec<(OsString, OsString)>) {
+    pub(super) fn translate_log_env_alias(env_pairs: &mut Vec<(OsString, OsString)>) {
         if env_pairs.iter().any(|(key, _)| key == "RUST_LOG") {
             return;
         }
@@ -865,7 +865,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn translate_log_env_alias_sets_rust_log_when_missing() {
-        let mut env_pairs = vec![(OsString::from("LOG"), OsString::from("weaver=debug,info"))];
+        let mut env_pairs = vec![(
+            std::ffi::OsString::from("LOG"),
+            std::ffi::OsString::from("weaver=debug,info"),
+        )];
 
         linux::translate_log_env_alias(&mut env_pairs);
 
@@ -880,8 +883,14 @@ mod tests {
     #[test]
     fn translate_log_env_alias_preserves_existing_rust_log() {
         let mut env_pairs = vec![
-            (OsString::from("LOG"), OsString::from("info")),
-            (OsString::from("RUST_LOG"), OsString::from("warn")),
+            (
+                std::ffi::OsString::from("LOG"),
+                std::ffi::OsString::from("info"),
+            ),
+            (
+                std::ffi::OsString::from("RUST_LOG"),
+                std::ffi::OsString::from("warn"),
+            ),
         ];
 
         linux::translate_log_env_alias(&mut env_pairs);
@@ -891,6 +900,6 @@ mod tests {
             .filter(|(key, _)| key == "RUST_LOG")
             .map(|(_, value)| value.clone())
             .collect();
-        assert_eq!(vec![OsString::from("warn")], rust_log_values);
+        assert_eq!(vec![std::ffi::OsString::from("warn")], rust_log_values);
     }
 }
