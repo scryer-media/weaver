@@ -54,7 +54,9 @@ assert_eq "portable" "$(select_linux_lane_for_arch arm64 "$tmpdir/arm64-portable
 assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/missing.cpuinfo")" "missing cpuinfo falls back to portable"
 
 assert_eq "weaver-haswell" "$(selected_payload_name amd64 "$tmpdir/amd64-haswell.cpuinfo")" "amd64 haswell payload name"
+assert_eq "weaver-haswell" "$(optimized_payload_name amd64)" "amd64 optimized payload helper"
 assert_eq "weaver-cortex-a76" "$(selected_payload_name arm64 "$tmpdir/arm64-cortex-a76.cpuinfo")" "arm64 optimized payload name"
+assert_eq "weaver-cortex-a76" "$(optimized_payload_name arm64)" "arm64 optimized payload helper"
 assert_eq "weaver-portable" "$(selected_payload_name arm64 "$tmpdir/missing.cpuinfo")" "portable payload name on unreadable cpuinfo"
 
 printf 'docker runtime selection tests passed\n'

@@ -117,11 +117,25 @@ selected_payload_name() {
     esac
 }
 
+optimized_payload_name() {
+    arch=$1
+
+    case "$arch" in
+        amd64) printf '%s\n' "weaver-haswell" ;;
+        arm64) printf '%s\n' "weaver-cortex-a76" ;;
+    esac
+}
+
 portable_payload_name() {
     printf '%s\n' "weaver-portable"
 }
 
 detect_container_arch() {
+    if [ -n "${WEAVER_CONTAINER_ARCH:-}" ]; then
+        printf '%s\n' "$WEAVER_CONTAINER_ARCH"
+        return 0
+    fi
+
     case "$(uname -m)" in
         x86_64 | amd64) printf '%s\n' "amd64" ;;
         aarch64 | arm64) printf '%s\n' "arm64" ;;
