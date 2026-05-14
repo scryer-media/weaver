@@ -68,6 +68,8 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Check formatting
         run: cargo fmt --check
 
@@ -106,6 +108,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -136,6 +140,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -165,6 +171,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Set target CPU flags
         run: |
           printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
@@ -199,6 +207,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install Intel SDE
         run: |
           curl -Lo /tmp/sde.tar.xz https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz
@@ -316,6 +326,7 @@ jobs:
         run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: crypto-${{ matrix.platform }}
       - name: Verify target crypto config
@@ -353,6 +364,7 @@ jobs:
           sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-linux-x86_64-portable
       - name: Download embedded web artifact
@@ -398,6 +410,7 @@ jobs:
           sudo apt-get install -y musl-tools mold nasm
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-linux-x86_64-haswell
       - name: Download embedded web artifact
@@ -443,6 +456,7 @@ jobs:
           sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-linux-arm64-portable
       - name: Download embedded web artifact
@@ -488,6 +502,7 @@ jobs:
           sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-linux-arm64-cortex-a76
       - name: Download embedded web artifact
@@ -531,6 +546,7 @@ jobs:
         run: brew install nasm
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-darwin-x86_64-portable
       - name: Download embedded web artifact
@@ -592,6 +608,7 @@ jobs:
         run: brew install nasm
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-darwin-x86_64-haswell
       - name: Download embedded web artifact
@@ -651,6 +668,7 @@ jobs:
         run: rustup target add aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-darwin-arm64-portable
       - name: Download embedded web artifact
@@ -710,6 +728,7 @@ jobs:
         run: rustup target add aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-darwin-arm64-apple-m1
       - name: Download embedded web artifact
@@ -780,6 +799,7 @@ jobs:
         run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-windows-x86_64
       - name: Download embedded web artifact
@@ -824,6 +844,7 @@ jobs:
         run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: package-windows-arm64
       - name: Download embedded web artifact
@@ -868,6 +889,7 @@ jobs:
           sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: docker-launcher-linux-amd64
       - name: Build launcher
@@ -902,6 +924,7 @@ jobs:
           sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: false
           key: docker-launcher-linux-arm64
       - name: Build launcher

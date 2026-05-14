@@ -24,6 +24,7 @@ fn launcher_can_decompress_and_exec_from_memfd_with_argv_and_env_passthrough() -
         .arg("/config/weaver.toml")
         .env("WEAVER_LAUNCHER_PROBE_ENV", "round-trip")
         .env("WEAVER_LAUNCHER_PROBE_WRITE_PATH", &created_path)
+        .env_remove("RUST_LOG")
         .env("TZ", "America/Denver")
         .env("LOG", "weaver=debug,info")
         .env("UMASK", "027")
