@@ -48,6 +48,7 @@ The Docker contract is intentionally small:
 - Persist app data in `/config`
 - Use `PUID` / `PGID` when you want the container to re-own `/config` and then drop privileges
 - `TZ` defaults to `Etc/UTC`
+- `LOG` maps to `RUST_LOG` and uses normal Rust log filter syntax such as `info` or `weaver=debug,info`
 - `UMASK` is optional and accepts standard octal values such as `022`
 - `--user=1000:1000` and `--read-only=true` are both supported
 
@@ -62,6 +63,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
+      - LOG=info
       - UMASK=022 # optional
     volumes:
       - /path/to/weaver/config:/config
@@ -78,12 +80,15 @@ docker run -d \
   -e PUID=1000 \
   -e PGID=1000 \
   -e TZ=Etc/UTC \
+  -e LOG=info \
   -e UMASK=022 \
   -p 9090:9090 \
   -v /path/to/weaver/config:/config \
   --restart unless-stopped \
   ghcr.io/scryer-media/weaver:latest
 ```
+
+If you already prefer `RUST_LOG`, it still works directly and takes precedence over `LOG`.
 
 If you run the container as root, the launcher will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
 

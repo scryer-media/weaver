@@ -25,6 +25,7 @@ fn launcher_can_decompress_and_exec_from_memfd_with_argv_and_env_passthrough() -
         .env("WEAVER_LAUNCHER_PROBE_ENV", "round-trip")
         .env("WEAVER_LAUNCHER_PROBE_WRITE_PATH", &created_path)
         .env("TZ", "America/Denver")
+        .env("LOG", "weaver=debug,info")
         .env("UMASK", "027")
         .output()
         .context("failed to run payload_exec_runner")?;
@@ -44,10 +45,9 @@ fn launcher_can_decompress_and_exec_from_memfd_with_argv_and_env_passthrough() -
     assert!(stdout.contains("argv3=/config/weaver.toml"));
     assert!(stdout.contains("probe_env=round-trip"));
     assert!(stdout.contains("probe_tz=America/Denver"));
-    assert!(stdout.contains("probe_file_mode=640"));
-    assert_eq!(
-        0o640,
-        fs::metadata(&created_path)?.permissions().mode() & 0o777
-    );
+    assert!(stdout.contains("probe_rust_log=weaver=debug,info"));
+    assert!(stdout.contains("probe_umask=27"));
+    let created_mode = fs::metadata(&created_path)?.permissions().mode() & 0o777;
+    assert_eq!(0o000, created_mode & 0o027);
     Ok(())
 }

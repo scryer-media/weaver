@@ -14,6 +14,16 @@ fn main() {
         "probe_tz={}",
         env::var("TZ").unwrap_or_else(|_| "<missing>".to_string())
     );
+    println!(
+        "probe_rust_log={}",
+        env::var("RUST_LOG").unwrap_or_else(|_| "<missing>".to_string())
+    );
+    let current_umask = unsafe {
+        let current = libc::umask(0);
+        libc::umask(current);
+        current
+    };
+    println!("probe_umask={current_umask:o}");
 
     if let Ok(path) = env::var("WEAVER_LAUNCHER_PROBE_WRITE_PATH") {
         fs::write(&path, b"probe").expect("payload probe should write the requested file");

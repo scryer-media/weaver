@@ -133,7 +133,7 @@ pub fn normalized_features_from_cpuinfo_text(cpuinfo: &str, arch: Arch) -> BTree
             continue;
         };
         let key = key.trim();
-        if key != "flags" && key != "Features" {
+        if !key.eq_ignore_ascii_case("flags") && !key.eq_ignore_ascii_case("features") {
             continue;
         }
         for token in value.split_whitespace() {
@@ -292,10 +292,10 @@ mod linux {
         let arch = detect_arch()?;
         let current_uid = unsafe { libc::geteuid() } as u32;
         configure_umask()?;
-        let puid = parse_env_u32("PUID", 1000)?;
-        let pgid = parse_env_u32("PGID", 1000)?;
+        let (puid, pgid) = resolve_requested_owner_ids(current_uid)?;
         let args: Vec<OsString> = env::args_os().skip(1).collect();
-        let env_pairs: Vec<(OsString, OsString)> = env::vars_os().collect();
+        let mut env_pairs: Vec<(OsString, OsString)> = env::vars_os().collect();
+        translate_log_env_alias(&mut env_pairs);
         let plan = build_launch_plan(
             Path::new(PAYLOAD_ROOT),
             arch,
@@ -318,18 +318,36 @@ mod linux {
 
     fn parse_env_u32(key: &str, default: u32) -> Result<u32> {
         match env::var(key) {
-            Ok(value) => value
-                .parse::<u32>()
-                .with_context(|| format!("{key} must be an unsigned integer")),
+            Ok(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Ok(default);
+                }
+                value
+                    .parse::<u32>()
+                    .with_context(|| format!("{key} must be an unsigned integer"))
+            }
             Err(env::VarError::NotPresent) => Ok(default),
             Err(error) => Err(anyhow!("{key} is not valid UTF-8: {error}")),
+        }
+    }
+
+    fn resolve_requested_owner_ids(current_uid: u32) -> Result<(u32, u32)> {
+        if current_uid == 0 {
+            Ok((parse_env_u32("PUID", 1000)?, parse_env_u32("PGID", 1000)?))
+        } else {
+            Ok((1000, 1000))
         }
     }
 
     fn configure_umask() -> Result<()> {
         match env::var("UMASK") {
             Ok(value) => {
-                let mask = parse_umask_value(&value)?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Ok(());
+                }
+                let mask = parse_umask_value(value)?;
                 unsafe {
                     libc::umask(mask);
                 }
@@ -340,7 +358,23 @@ mod linux {
         }
     }
 
+    fn translate_log_env_alias(env_pairs: &mut Vec<(OsString, OsString)>) {
+        if env_pairs.iter().any(|(key, _)| key == "RUST_LOG") {
+            return;
+        }
+
+        let log_value = env_pairs
+            .iter()
+            .rev()
+            .find(|(key, value)| key == "LOG" && !value.is_empty())
+            .map(|(_, value)| value.clone());
+        if let Some(log_value) = log_value {
+            env_pairs.push((OsString::from("RUST_LOG"), log_value));
+        }
+    }
+
     pub(super) fn parse_umask_value(value: &str) -> Result<libc::mode_t> {
+        let value = value.trim();
         if value.len() != 3 && value.len() != 4 {
             bail!("UMASK must be a 3- or 4-digit octal value");
         }
@@ -350,6 +384,9 @@ mod linux {
 
         let parsed = u32::from_str_radix(value, 8)
             .with_context(|| format!("failed to parse UMASK value {value}"))?;
+        if parsed > 0o777 {
+            bail!("UMASK must be between 000 and 777");
+        }
         Ok(parsed as libc::mode_t)
     }
 
@@ -441,11 +478,8 @@ mod linux {
             }
 
             let error = io::Error::last_os_error();
-            let is_compatibility_fallback = flags == preferred_flags
-                && matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-                );
+            let is_compatibility_fallback =
+                flags == preferred_flags && should_retry_without_mfd_exec(&error);
             if !is_compatibility_fallback {
                 return Err(error).context("memfd_create failed");
             }
@@ -471,7 +505,7 @@ mod linux {
         }
 
         let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENOENT) {
+        if should_try_procfd_exec_fallback(&error) {
             let fd_path =
                 CString::new(format!("/proc/self/fd/{fd}")).context("fd path contained NUL")?;
             let fallback_result =
@@ -484,6 +518,24 @@ mod linux {
         }
 
         Err(error).context("fexecve failed")
+    }
+
+    fn should_retry_without_mfd_exec(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::ENOSYS)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::EPERM)
+                | Some(libc::EACCES)
+        )
+    }
+
+    fn should_try_procfd_exec_fallback(error: &io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)
+        )
     }
 
     fn os_strings_to_cstrings(values: &[OsString]) -> Result<Vec<CString>> {
@@ -629,6 +681,16 @@ mod tests {
     }
 
     #[test]
+    fn cpuinfo_feature_keys_are_case_insensitive() {
+        let cpuinfo =
+            "processor : 0\nfeatures  : fp asimd aes sha2 crc32 atomics fphp asimdrdm asimddp\n";
+        assert_eq!(
+            Lane::CortexA76,
+            select_lane_from_cpuinfo(Arch::Arm64, Ok(cpuinfo.to_string()))
+        );
+    }
+
+    #[test]
     fn unreadable_cpuinfo_defaults_to_portable() {
         assert_eq!(
             Lane::Portable,
@@ -749,15 +811,86 @@ mod tests {
         assert_eq!(0o022, linux::parse_umask_value("022")? as u32);
         assert_eq!(0o002, linux::parse_umask_value("002")? as u32);
         assert_eq!(0o0022, linux::parse_umask_value("0022")? as u32);
+        assert_eq!(0o022, linux::parse_umask_value(" 022 ")? as u32);
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_umask_rejects_invalid_values() {
-        for invalid in ["22", "00022", "08", "abc", "0x22"] {
+        for invalid in ["22", "00022", "08", "abc", "0x22", "1777"] {
             let error = linux::parse_umask_value(invalid).expect_err("invalid UMASK should fail");
             assert!(error.to_string().contains("UMASK"));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_requested_owner_ids_ignores_env_when_non_root() -> Result<()> {
+        unsafe {
+            std::env::set_var("PUID", "not-a-number");
+            std::env::set_var("PGID", "still-not-a-number");
+        }
+
+        let ids = linux::resolve_requested_owner_ids(1000)?;
+
+        unsafe {
+            std::env::remove_var("PUID");
+            std::env::remove_var("PGID");
+        }
+
+        assert_eq!((1000, 1000), ids);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_requested_owner_ids_honors_blank_defaults_for_root() -> Result<()> {
+        unsafe {
+            std::env::set_var("PUID", "  ");
+            std::env::set_var("PGID", "");
+        }
+
+        let ids = linux::resolve_requested_owner_ids(0)?;
+
+        unsafe {
+            std::env::remove_var("PUID");
+            std::env::remove_var("PGID");
+        }
+
+        assert_eq!((1000, 1000), ids);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn translate_log_env_alias_sets_rust_log_when_missing() {
+        let mut env_pairs = vec![(OsString::from("LOG"), OsString::from("weaver=debug,info"))];
+
+        linux::translate_log_env_alias(&mut env_pairs);
+
+        assert!(
+            env_pairs
+                .iter()
+                .any(|(key, value)| key == "RUST_LOG" && value == "weaver=debug,info")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn translate_log_env_alias_preserves_existing_rust_log() {
+        let mut env_pairs = vec![
+            (OsString::from("LOG"), OsString::from("info")),
+            (OsString::from("RUST_LOG"), OsString::from("warn")),
+        ];
+
+        linux::translate_log_env_alias(&mut env_pairs);
+
+        let rust_log_values: Vec<_> = env_pairs
+            .iter()
+            .filter(|(key, _)| key == "RUST_LOG")
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(vec![OsString::from("warn")], rust_log_values);
     }
 }
