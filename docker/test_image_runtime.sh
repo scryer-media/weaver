@@ -31,7 +31,7 @@ run_help() {
 }
 
 output=$(run_help)
-assert_contains "$output" "Usenet binary downloader" "launcher should proxy --help output"
+assert_contains "$output" "Usenet binary downloader" "image should proxy --help output"
 
 output=$(docker run --rm --platform "$PLATFORM" --read-only "$IMAGE_TAG" --help)
 assert_contains "$output" "Usenet binary downloader" "read-only rootfs should still start"
@@ -60,7 +60,7 @@ docker run --rm --platform "$PLATFORM" \
 
 owner=$(owner_of "$tmpdir")
 [ "$owner" = "$current_uid:$current_gid" ] || {
-    printf 'assertion failed: root launcher path should chown /config\nexpected: %s\nactual: %s\n' \
+    printf 'assertion failed: root entrypoint path should chown /config\nexpected: %s\nactual: %s\n' \
         "$current_uid:$current_gid" "$owner" >&2
     exit 1
 }
@@ -76,7 +76,7 @@ docker run --rm --platform "$PLATFORM" \
 
 owner=$(owner_of "$tmpdir")
 [ "$owner" = "65534:65534" ] || {
-    printf 'assertion failed: non-root launcher path should skip chown\nexpected: 65534:65534\nactual: %s\n' "$owner" >&2
+    printf 'assertion failed: non-root entrypoint path should skip chown\nexpected: 65534:65534\nactual: %s\n' "$owner" >&2
     exit 1
 }
 

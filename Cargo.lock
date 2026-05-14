@@ -4782,16 +4782,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "weaver-docker-launcher"
-version = "0.4.7"
-dependencies = [
- "anyhow",
- "libc",
- "tempfile",
- "zstd",
-]
-
-[[package]]
 name = "weaver-model"
 version = "0.4.7"
 dependencies = [

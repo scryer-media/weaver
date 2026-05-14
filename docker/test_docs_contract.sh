@@ -24,8 +24,6 @@ assert_contains "$README_CONTENT" "/config" "README should document the /config 
 assert_contains "$README_CONTENT" "PUID=1000" "README should document PUID"
 assert_contains "$README_CONTENT" "PGID=1000" "README should document PGID"
 assert_contains "$README_CONTENT" "TZ=Etc/UTC" "README should document the default timezone"
-assert_contains "$README_CONTENT" "LOG=info" "README should document the LOG alias"
-assert_contains "$README_CONTENT" "RUST_LOG" "README should explain the Rust log filter compatibility"
 assert_contains "$README_CONTENT" "UMASK=022" "README should document UMASK"
 assert_contains "$README_CONTENT" "--user=1000:1000" "README should document non-root usage"
 assert_contains "$README_CONTENT" "--read-only=true" "README should document read-only support"
