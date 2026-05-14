@@ -39,6 +39,58 @@ Instead of the traditional sequential approach (download everything, then repair
 
 Installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
+## Docker
+
+Weaver publishes a first-party container image at `ghcr.io/scryer-media/weaver:latest`.
+
+The Docker contract is intentionally small:
+
+- Persist app data in `/config`
+- Use `PUID` / `PGID` when you want the container to re-own `/config` and then drop privileges
+- `TZ` defaults to `Etc/UTC`
+- `UMASK` is optional and accepts standard octal values such as `022`
+- `--user=1000:1000` and `--read-only=true` are both supported
+
+### docker-compose
+
+```yaml
+services:
+  weaver:
+    image: ghcr.io/scryer-media/weaver:latest
+    container_name: weaver
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - UMASK=022 # optional
+    volumes:
+      - /path/to/weaver/config:/config
+    ports:
+      - 9090:9090
+    restart: unless-stopped
+```
+
+### docker run
+
+```bash
+docker run -d \
+  --name=weaver \
+  -e PUID=1000 \
+  -e PGID=1000 \
+  -e TZ=Etc/UTC \
+  -e UMASK=022 \
+  -p 9090:9090 \
+  -v /path/to/weaver/config:/config \
+  --restart unless-stopped \
+  ghcr.io/scryer-media/weaver:latest
+```
+
+If you run the container as root, the entrypoint will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
+
+For hardened deployments, `weaver` supports `--read-only=true` as long as `/config` remains writable.
+
+Maintainer note: this is a first-party `weaver` image. Any future LSIO adoption is a separate track and should not change the current Docker contract without an explicit migration plan.
+
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.

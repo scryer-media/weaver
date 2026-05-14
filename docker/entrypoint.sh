@@ -1,8 +1,17 @@
 #!/bin/sh
-set -e
+set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$SCRIPT_DIR/runtime-select.sh"
+
+apply_umask() {
+    if [ -n "${UMASK:-}" ]; then
+        umask "$UMASK" || {
+            printf 'invalid UMASK: %s\n' "$UMASK" >&2
+            exit 1
+        }
+    fi
+}
 
 ARCH=$(detect_container_arch)
 PAYLOAD_ROOT=/opt/weaver
@@ -19,8 +28,8 @@ if [ ! -x "$RUNTIME_BIN" ]; then
     RUNTIME_BIN="$PORTABLE_BINARY"
 fi
 
-# If not running as root (e.g. --user flag), skip privilege setup
-# and just exec the selected binary directly.
+apply_umask
+
 if [ "$(id -u)" -ne 0 ]; then
     exec "$RUNTIME_BIN" "$@"
 fi
@@ -28,7 +37,6 @@ fi
 PUID=${PUID:-1000}
 PGID=${PGID:-1000}
 
-# Ensure directories are owned by the requested user
 mkdir -p /config
 chown -R "$PUID":"$PGID" /config
 
