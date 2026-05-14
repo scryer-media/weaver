@@ -463,7 +463,7 @@ mod linux {
             return Err(io::Error::last_os_error()).context("failed to mark memfd executable");
         }
 
-        fexecve(memfd_raw, argv, env_pairs)
+        exec_payload_fd(memfd_raw, argv, env_pairs)
     }
 
     fn create_memfd(name: &OsStr) -> Result<OwnedFd> {
@@ -491,7 +491,11 @@ mod linux {
         bail!("memfd_create did not produce a usable executable file descriptor")
     }
 
-    fn fexecve(fd: i32, argv: &[OsString], env_pairs: &[(OsString, OsString)]) -> Result<()> {
+    fn exec_payload_fd(
+        fd: i32,
+        argv: &[OsString],
+        env_pairs: &[(OsString, OsString)],
+    ) -> Result<()> {
         let argv_cstrings = os_strings_to_cstrings(argv).context("argv contains NUL bytes")?;
         let env_cstrings =
             env_pairs_to_cstrings(env_pairs).context("environment contains NUL bytes")?;
@@ -502,42 +506,63 @@ mod linux {
             env_cstrings.iter().map(|value| value.as_ptr()).collect();
         env_ptrs.push(std::ptr::null());
 
-        let result = unsafe { libc::fexecve(fd, argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
+        let empty_path = CString::new("").expect("empty CString literal should be valid");
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                fd,
+                empty_path.as_ptr(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
         if result == 0 {
-            unreachable!("fexecve returned success unexpectedly");
+            unreachable!("execveat(AT_EMPTY_PATH) returned success unexpectedly");
         }
 
         let error = io::Error::last_os_error();
         if should_try_procfd_exec_fallback(&error) {
-            let fd_path =
-                CString::new(format!("/proc/self/fd/{fd}")).context("fd path contained NUL")?;
+            let procfd = dup_fd_without_cloexec(fd).context("failed to duplicate payload fd")?;
+            let procfd_raw = procfd.as_raw_fd();
+            let fd_path = CString::new(format!("/proc/self/fd/{procfd_raw}"))
+                .context("fd path contained NUL")?;
             let fallback_result =
                 unsafe { libc::execve(fd_path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
             if fallback_result == 0 {
                 unreachable!("execve via /proc/self/fd returned success unexpectedly");
             }
             return Err(io::Error::last_os_error())
-                .context("execve via /proc/self/fd failed after fexecve fallback");
+                .context("execve via /proc/self/fd failed after execveat fallback");
         }
 
-        Err(error).context("fexecve failed")
+        Err(error).context("execveat(AT_EMPTY_PATH) failed")
+    }
+
+    fn dup_fd_without_cloexec(fd: i32) -> Result<OwnedFd> {
+        let duplicated = unsafe { libc::dup(fd) };
+        if duplicated < 0 {
+            return Err(io::Error::last_os_error()).context("dup failed");
+        }
+
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 
     fn should_retry_without_mfd_exec(error: &io::Error) -> bool {
         matches!(
             error.raw_os_error(),
-            Some(libc::EINVAL)
-                | Some(libc::ENOSYS)
-                | Some(libc::EOPNOTSUPP)
-                | Some(libc::EPERM)
-                | Some(libc::EACCES)
+            Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
         )
     }
 
     fn should_try_procfd_exec_fallback(error: &io::Error) -> bool {
         matches!(
             error.raw_os_error(),
-            Some(libc::ENOENT) | Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)
+            Some(libc::ENOENT)
+                | Some(libc::ENOSYS)
+                | Some(libc::EPERM)
+                | Some(libc::EACCES)
+                | Some(libc::EINVAL)
         )
     }
 
