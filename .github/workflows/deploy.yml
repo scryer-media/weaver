@@ -950,28 +950,6 @@ jobs:
         run: docker load -i /tmp/${{ matrix.tar_name }}
       - name: Smoke test image runtime
         run: sh docker/test_image_runtime.sh ${{ matrix.local_tag }} ${{ matrix.platform }}
-      - name: Build slim validation image
-        uses: docker/build-push-action@v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: ${{ matrix.local_tag }}-slim
-      - name: Smoke test slim image runtime
-        run: sh docker/test_image_runtime.sh ${{ matrix.local_tag }}-slim ${{ matrix.platform }}
-      - name: Build modern validation image
-        uses: docker/build-push-action@v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: ${{ matrix.platform }}
-          load: true
-          tags: ${{ matrix.local_tag }}-modern
-          build-args: |
-            WEAVER_RUNTIME_MODE=modern
-      - name: Smoke test modern image runtime
-        run: sh docker/test_modern_image_runtime.sh ${{ matrix.local_tag }}-modern ${{ matrix.platform }} ${{ matrix.platform_id }}
       - name: Upload image tarball
         uses: actions/upload-artifact@v7
         with:
@@ -1069,16 +1047,6 @@ jobs:
             echo "${IMAGE_NAME}:sha-${SHORT_SHA}"
             echo "${IMAGE_NAME}:${VERSION}"
             echo "EOF"
-            echo "slim<<EOF"
-            echo "${IMAGE_NAME}:latest-slim"
-            echo "${IMAGE_NAME}:sha-${SHORT_SHA}-slim"
-            echo "${IMAGE_NAME}:${VERSION}-slim"
-            echo "EOF"
-            echo "modern<<EOF"
-            echo "${IMAGE_NAME}:latest-modern"
-            echo "${IMAGE_NAME}:sha-${SHORT_SHA}-modern"
-            echo "${IMAGE_NAME}:${VERSION}-modern"
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
       - name: Build and push base image
         id: build_base
@@ -1094,54 +1062,6 @@ jobs:
         env:
           TAGS: ${{ steps.tags.outputs.base }}
           DIGEST: ${{ steps.build_base.outputs.digest }}
-        run: |
-          images=""
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            images="$images ${tag}@${DIGEST}"
-          done <<EOF
-          $TAGS
-          EOF
-          cosign sign --yes $images
-      - name: Build and push slim image
-        id: build_slim
-        uses: docker/build-push-action@v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.slim }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,push=true,oci-mediatypes=true,compression=zstd,compression-level=19,force-compression=true
-      - name: Sign published slim image
-        env:
-          TAGS: ${{ steps.tags.outputs.slim }}
-          DIGEST: ${{ steps.build_slim.outputs.digest }}
-        run: |
-          images=""
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            images="$images ${tag}@${DIGEST}"
-          done <<EOF
-          $TAGS
-          EOF
-          cosign sign --yes $images
-      - name: Build and push modern image
-        id: build_modern
-        uses: docker/build-push-action@v7
-        with:
-          context: docker-ctx
-          file: docker/weaver.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tags.outputs.modern }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            WEAVER_RUNTIME_MODE=modern
-          outputs: type=image,push=true,oci-mediatypes=true,compression=zstd,compression-level=19,force-compression=true
-      - name: Sign published modern image
-        env:
-          TAGS: ${{ steps.tags.outputs.modern }}
-          DIGEST: ${{ steps.build_modern.outputs.digest }}
         run: |
           images=""
           while IFS= read -r tag; do

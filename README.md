@@ -41,11 +41,9 @@ Installation instructions can be found on the [Weaver docs website](https://www.
 
 ## Docker
 
-Weaver publishes a first-party container image family:
+Weaver publishes a first-party container image:
 
-- `ghcr.io/scryer-media/weaver:latest` for the broadest compatibility with uncompressed dual-binary Linux images
-- `ghcr.io/scryer-media/weaver:latest-slim` for the same dual-binary runtime with zstd-compressed OCI image layers
-- `ghcr.io/scryer-media/weaver:latest-modern` for zstd-compressed OCI image layers plus only the optimized Linux binary per architecture
+- `ghcr.io/scryer-media/weaver:latest` with both Linux binaries bundled per architecture and a CPU-aware launcher that picks the best one at startup
 
 Published GHCR images are keyless-signed with Sigstore Cosign.
 
@@ -56,8 +54,6 @@ The Docker contract is intentionally small:
 - `TZ` defaults to `Etc/UTC`
 - `UMASK` is optional and accepts standard octal values such as `022`
 - `--user=1000:1000` and `--read-only=true` are both supported
-
-Use `latest-modern` only on hosts that satisfy the optimized CPU baseline. If the host does not qualify, the entrypoint exits with a clear error that points you back to `latest-slim` or the plain `latest` tag.
 
 ### docker-compose
 
@@ -96,8 +92,6 @@ docker run -d \
 If you run the container as root, the entrypoint will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
 
 For hardened deployments, `weaver` supports `--read-only=true` as long as `/config` remains writable.
-
-The `latest-slim` and `latest-modern` tags use zstd-compressed OCI image layers. The plain `latest` tag keeps the broadest pull compatibility by shipping the same runtime without zstd layer compression.
 
 Maintainer note: this is a first-party `weaver` image. Any future LSIO adoption is a separate track and should not change the current Docker contract without an explicit migration plan.
 
