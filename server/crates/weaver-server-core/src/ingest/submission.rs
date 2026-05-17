@@ -216,6 +216,7 @@ async fn submit_prepared_nzb(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_nzb_bytes(
     db: &Database,
     handle: &SchedulerHandle,
@@ -279,6 +280,7 @@ pub async fn fetch_nzb_from_url(
     Ok((nzb_bytes.to_vec(), filename))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_uploaded_nzb_reader<R>(
     db: &Database,
     handle: &SchedulerHandle,
@@ -325,6 +327,7 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_staged_nzb_zstd(
     db: &Database,
     handle: &SchedulerHandle,

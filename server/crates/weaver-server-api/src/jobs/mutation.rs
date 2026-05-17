@@ -685,6 +685,7 @@ async fn submit_from_facade_input(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_uploaded_nzb(
     db: &Database,
     handle: &SchedulerHandle,
