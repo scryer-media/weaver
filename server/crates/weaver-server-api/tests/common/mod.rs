@@ -458,6 +458,7 @@ fn spawn_test_scheduler(
                         runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
+                        job_hash: [0; 32],
                         spec,
                         status,
                         download_state,
@@ -578,6 +579,7 @@ fn spawn_test_scheduler(
                         runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
+                        job_hash: [0; 32],
                         spec,
                         status,
                         download_state,
@@ -693,6 +695,7 @@ fn spawn_test_scheduler(
                                 runtime_lanes_for_status(&status);
                             let state = JobState {
                                 job_id: diagnostic_job_id,
+                                job_hash: [0; 32],
                                 spec,
                                 status,
                                 download_state,
@@ -767,6 +770,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
     jobs.values()
         .map(|state| JobInfo {
             job_id: state.job_id,
+            job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
             error: if let JobStatus::Failed { error } = &state.status {
                 Some(error.clone())

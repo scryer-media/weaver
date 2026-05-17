@@ -101,6 +101,34 @@ fn open_file_database_stamps_sqlx_migration_ledger() {
 }
 
 #[test]
+fn reserve_next_job_id_remains_monotonic_across_reopen_without_history_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("weaver.db");
+
+    {
+        let db = Database::open(&db_path).unwrap();
+        assert_eq!(db.reserve_next_job_id().unwrap().0, 10_000);
+
+        let conn = db.conn();
+        conn.execute("DELETE FROM active_jobs", []).unwrap();
+        conn.execute("DELETE FROM job_history", []).unwrap();
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(db.reserve_next_job_id().unwrap().0, 10_001);
+
+    let persisted_next: String = db
+        .conn()
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'next_job_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_next, "10002");
+}
+
+#[test]
 fn migrate_v3_creates_extraction_chunks_with_appended_once() {
     let conn = Connection::open_in_memory().unwrap();
     // Create tables as they existed at v3 (no appended, no priority).

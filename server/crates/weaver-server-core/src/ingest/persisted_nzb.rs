@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use weaver_nzb::{Nzb, NzbError, parse_nzb_reader};
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -150,8 +149,8 @@ pub fn persist_decoded_nzb_reader_to_zstd<R: Read>(
 }
 
 pub fn hash_persisted_nzb(path: &Path) -> io::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
+    let mut reader = open_persisted_nzb_reader(path)?;
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; HASH_BUFFER_SIZE];
 
     loop {
@@ -162,17 +161,18 @@ pub fn hash_persisted_nzb(path: &Path) -> io::Result<[u8; 32]> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(finalize_sha256(hasher))
+    Ok(finalize_blake3(hasher))
 }
 
 pub fn hash_persisted_nzb_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    finalize_sha256(hasher)
+    let decoded = decode_persisted_nzb_bytes(bytes).unwrap_or_else(|_| bytes.to_vec());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&decoded);
+    finalize_blake3(hasher)
 }
 
 pub fn hash_persisted_nzb_or_empty(path: &Path) -> [u8; 32] {
-    hash_persisted_nzb(path).unwrap_or_else(|_| finalize_sha256(Sha256::new()))
+    hash_persisted_nzb(path).unwrap_or_else(|_| finalize_blake3(blake3::Hasher::new()))
 }
 
 pub fn cleanup_orphaned_persisted_nzbs(
@@ -216,9 +216,9 @@ fn open_persisted_nzb_reader_from_buffer(
     }
 }
 
-fn finalize_sha256(hasher: Sha256) -> [u8; 32] {
+fn finalize_blake3(hasher: blake3::Hasher) -> [u8; 32] {
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
+    out.copy_from_slice(digest.as_bytes());
     out
 }

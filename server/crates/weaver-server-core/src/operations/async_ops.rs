@@ -850,6 +850,7 @@ mod tests {
     fn history(job_id: u64, completed_at: i64) -> JobHistoryRow {
         JobHistoryRow {
             job_id,
+            job_hash: None,
             name: format!("job-{job_id}"),
             status: "complete".into(),
             error_message: None,

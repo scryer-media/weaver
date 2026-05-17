@@ -213,6 +213,7 @@ fn archive_job_moves_to_history() {
 
     let history = JobHistoryRow {
         job_id: 1,
+        job_hash: None,
         name: "test.nzb".to_string(),
         status: "complete".to_string(),
         error_message: None,
@@ -286,6 +287,7 @@ fn max_job_id_all_spans_both_tables() {
 
     let history = JobHistoryRow {
         job_id: 10,
+        job_hash: None,
         name: "old.nzb".to_string(),
         status: "complete".to_string(),
         error_message: None,
@@ -654,6 +656,7 @@ fn late_active_state_writes_noop_after_archive() {
         JobId(1),
         &JobHistoryRow {
             job_id: 1,
+            job_hash: None,
             name: "test.nzb".to_string(),
             status: "complete".to_string(),
             error_message: None,

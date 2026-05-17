@@ -121,16 +121,18 @@ impl Database {
         let tx = conn.unchecked_transaction().map_err(db_err)?;
         tx.execute(
             "INSERT OR REPLACE INTO job_history
-             (job_id, name, status, error_message, total_bytes, downloaded_bytes,
+             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
               optional_recovery_bytes, optional_recovery_downloaded_bytes,
               failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
               created_at, completed_at, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     COALESCE(?13, (SELECT nzb_path FROM active_jobs WHERE job_id = ?1)),
+             VALUES (?1, COALESCE(?2, (SELECT nzb_hash FROM active_jobs WHERE job_id = ?1)),
+                     ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     COALESCE(?14, (SELECT nzb_path FROM active_jobs WHERE job_id = ?1)),
                      (SELECT nzb_zstd FROM active_jobs WHERE job_id = ?1),
-                     ?14, ?15, ?16)",
+                     ?15, ?16, ?17)",
             rusqlite::params![
                 history.job_id as i64,
+                history.job_hash,
                 history.name,
                 history.status,
                 history.error_message,

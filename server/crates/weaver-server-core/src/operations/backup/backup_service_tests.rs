@@ -108,6 +108,7 @@ fn populate_source_db(db: &Database) {
     db.save_config(&sample_config()).unwrap();
     db.insert_job_history(&JobHistoryRow {
         job_id: 41,
+        job_hash: None,
         name: "Backup Fixture".into(),
         status: "complete".into(),
         error_message: None,

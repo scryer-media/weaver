@@ -141,6 +141,7 @@ impl Default for DownloadBlockState {
 /// Commands sent to the scheduler's main loop.
 pub struct RestoreJobRequest {
     pub job_id: JobId,
+    pub job_hash: [u8; 32],
     pub spec: JobSpec,
     pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,
@@ -266,6 +267,7 @@ pub enum SchedulerCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
+    pub job_hash: Option<[u8; 32]>,
     pub name: String,
     pub status: JobStatus,
     pub download_state: crate::jobs::model::DownloadState,

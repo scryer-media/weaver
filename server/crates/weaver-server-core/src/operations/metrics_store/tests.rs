@@ -43,6 +43,7 @@ fn sample_snapshot(
 fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
     JobInfo {
         job_id: JobId(job_id),
+        job_hash: None,
         name: format!("job-{job_id}"),
         status,
         download_state: DownloadState::Queued,

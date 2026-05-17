@@ -59,6 +59,7 @@ impl Pipeline {
                     let health = health_milli(total, state.failed_bytes);
                     let row = crate::JobHistoryRow {
                         job_id: job_id.0,
+                        job_hash: Some(state.job_hash.to_vec()),
                         name: state.spec.name.clone(),
                         status: "cancelled".to_string(),
                         error_message: None,

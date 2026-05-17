@@ -14,7 +14,7 @@ impl Database {
         let conn = self.read_conn();
         let mut stmt = conn
             .prepare(
-                "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+                "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                         optional_recovery_bytes, optional_recovery_downloaded_bytes,
                         failed_bytes, health, category, output_dir, nzb_path,
                         created_at, completed_at, metadata,
@@ -32,23 +32,24 @@ impl Database {
 
         Ok(Some(JobHistoryRow {
             job_id: row.get::<_, i64>(0).map_err(db_err)? as u64,
-            name: row.get(1).map_err(db_err)?,
-            status: row.get(2).map_err(db_err)?,
-            error_message: row.get(3).map_err(db_err)?,
-            total_bytes: row.get::<_, i64>(4).map_err(db_err)? as u64,
-            downloaded_bytes: row.get::<_, i64>(5).map_err(db_err)? as u64,
-            optional_recovery_bytes: row.get::<_, i64>(6).map_err(db_err)? as u64,
-            optional_recovery_downloaded_bytes: row.get::<_, i64>(7).map_err(db_err)? as u64,
-            failed_bytes: row.get::<_, i64>(8).map_err(db_err)? as u64,
-            health: row.get(9).map_err(db_err)?,
-            category: row.get(10).map_err(db_err)?,
-            output_dir: row.get(11).map_err(db_err)?,
-            nzb_path: row.get(12).map_err(db_err)?,
-            created_at: row.get(13).map_err(db_err)?,
-            completed_at: row.get(14).map_err(db_err)?,
-            metadata: row.get(15).map_err(db_err)?,
-            last_diagnostic_id: row.get(16).map_err(db_err)?,
-            last_diagnostic_uploaded_at_epoch_ms: row.get(17).map_err(db_err)?,
+            job_hash: row.get(1).map_err(db_err)?,
+            name: row.get(2).map_err(db_err)?,
+            status: row.get(3).map_err(db_err)?,
+            error_message: row.get(4).map_err(db_err)?,
+            total_bytes: row.get::<_, i64>(5).map_err(db_err)? as u64,
+            downloaded_bytes: row.get::<_, i64>(6).map_err(db_err)? as u64,
+            optional_recovery_bytes: row.get::<_, i64>(7).map_err(db_err)? as u64,
+            optional_recovery_downloaded_bytes: row.get::<_, i64>(8).map_err(db_err)? as u64,
+            failed_bytes: row.get::<_, i64>(9).map_err(db_err)? as u64,
+            health: row.get(10).map_err(db_err)?,
+            category: row.get(11).map_err(db_err)?,
+            output_dir: row.get(12).map_err(db_err)?,
+            nzb_path: row.get(13).map_err(db_err)?,
+            created_at: row.get(14).map_err(db_err)?,
+            completed_at: row.get(15).map_err(db_err)?,
+            metadata: row.get(16).map_err(db_err)?,
+            last_diagnostic_id: row.get(17).map_err(db_err)?,
+            last_diagnostic_uploaded_at_epoch_ms: row.get(18).map_err(db_err)?,
         }))
     }
 
@@ -59,7 +60,7 @@ impl Database {
         let conn = self.read_conn();
 
         let mut sql = String::from(
-            "SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
+            "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
                     created_at, completed_at, metadata,
@@ -94,23 +95,24 @@ impl Database {
             .query_map(param_refs.as_slice(), |row| {
                 Ok(JobHistoryRow {
                     job_id: row.get::<_, i64>(0)? as u64,
-                    name: row.get(1)?,
-                    status: row.get(2)?,
-                    error_message: row.get(3)?,
-                    total_bytes: row.get::<_, i64>(4)? as u64,
-                    downloaded_bytes: row.get::<_, i64>(5)? as u64,
-                    optional_recovery_bytes: row.get::<_, i64>(6)? as u64,
-                    optional_recovery_downloaded_bytes: row.get::<_, i64>(7)? as u64,
-                    failed_bytes: row.get::<_, i64>(8)? as u64,
-                    health: row.get(9)?,
-                    category: row.get(10)?,
-                    output_dir: row.get(11)?,
-                    nzb_path: row.get(12)?,
-                    created_at: row.get(13)?,
-                    completed_at: row.get(14)?,
-                    metadata: row.get(15)?,
-                    last_diagnostic_id: row.get(16)?,
-                    last_diagnostic_uploaded_at_epoch_ms: row.get(17)?,
+                    job_hash: row.get(1)?,
+                    name: row.get(2)?,
+                    status: row.get(3)?,
+                    error_message: row.get(4)?,
+                    total_bytes: row.get::<_, i64>(5)? as u64,
+                    downloaded_bytes: row.get::<_, i64>(6)? as u64,
+                    optional_recovery_bytes: row.get::<_, i64>(7)? as u64,
+                    optional_recovery_downloaded_bytes: row.get::<_, i64>(8)? as u64,
+                    failed_bytes: row.get::<_, i64>(9)? as u64,
+                    health: row.get(10)?,
+                    category: row.get(11)?,
+                    output_dir: row.get(12)?,
+                    nzb_path: row.get(13)?,
+                    created_at: row.get(14)?,
+                    completed_at: row.get(15)?,
+                    metadata: row.get(16)?,
+                    last_diagnostic_id: row.get(17)?,
+                    last_diagnostic_uploaded_at_epoch_ms: row.get(18)?,
                 })
             })
             .map_err(db_err)?;

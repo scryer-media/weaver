@@ -6,6 +6,7 @@ use super::*;
 fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
     JobHistoryRow {
         job_id: 42,
+        job_hash: None,
         name: "job".into(),
         status: "complete".into(),
         error_message: None,
@@ -103,6 +104,7 @@ fn job(status: JobStatus) -> JobInfo {
     };
     JobInfo {
         job_id: JobId(42),
+        job_hash: None,
         name: "job".into(),
         status,
         download_state,

@@ -111,6 +111,7 @@ impl JobsMutation {
         }
 
         let handle = ctx.data::<SchedulerHandle>()?;
+        let db = ctx.data::<Database>()?;
         let config = ctx.data::<SharedConfig>()?;
         let manager = ctx.data::<StagedUploadManager>()?;
         let caller_identity = caller_identity(ctx)?;
@@ -148,6 +149,7 @@ impl JobsMutation {
             };
 
             match submit_staged_nzb_zstd(
+                db,
                 handle,
                 config,
                 entry.nzb_zstd.clone(),
@@ -610,6 +612,7 @@ async fn submit_from_facade_input(
     input: SubmitNzbInput,
 ) -> Result<SubmissionResult> {
     let handle = ctx.data::<SchedulerHandle>()?;
+    let db = ctx.data::<Database>()?;
     let config = ctx.data::<SharedConfig>()?;
 
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
@@ -649,6 +652,7 @@ async fn submit_from_facade_input(
 
     let submitted = if let Some(upload) = upload {
         submit_uploaded_nzb(
+            db,
             handle,
             config,
             upload,
@@ -661,6 +665,7 @@ async fn submit_from_facade_input(
         .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?
     } else {
         submit_nzb_bytes(
+            db,
             handle,
             config,
             &nzb_bytes.expect("nzb bytes should be present"),
@@ -681,6 +686,7 @@ async fn submit_from_facade_input(
 }
 
 async fn submit_uploaded_nzb(
+    db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     upload: UploadValue,
@@ -690,6 +696,7 @@ async fn submit_uploaded_nzb(
     metadata: Vec<(String, String)>,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     submit_uploaded_nzb_reader(
+        db,
         handle,
         config,
         normalize_uploaded_nzb_reader(upload)?,

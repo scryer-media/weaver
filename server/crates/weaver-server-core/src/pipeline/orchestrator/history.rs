@@ -206,6 +206,7 @@ impl Pipeline {
 
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
+            job_hash: Some(state.job_hash.to_vec()),
             name: state.spec.name.clone(),
             status: status_str,
             error_message,
@@ -236,6 +237,7 @@ impl Pipeline {
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
         self.finished_jobs.push(JobInfo {
             job_id,
+            job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
             error: if let JobStatus::Failed { error } = &state.status {
                 Some(error.clone())

@@ -20,7 +20,7 @@ use crate::history::types::{
 };
 use crate::system::types::PipelineEventGql;
 use weaver_server_core::events::model::PipelineEvent;
-use weaver_server_core::ingest::{decode_persisted_nzb_bytes, next_submission_job_id};
+use weaver_server_core::ingest::decode_persisted_nzb_bytes;
 use weaver_server_core::operations::snapshot_service_logs;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{
@@ -249,7 +249,14 @@ impl DiagnosticManager {
             ));
         }
 
-        let diagnostic_job_id = next_submission_job_id().0;
+        let diagnostic_job_id = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.reserve_next_job_id())
+                .await
+                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+                .0
+        };
         let now = Utc::now().timestamp_millis();
         let row = DiagnosticRunRow {
             source_job_id,

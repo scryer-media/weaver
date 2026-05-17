@@ -79,6 +79,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
     };
     weaver_server_core::JobInfo {
         job_id: JobId(42),
+        job_hash: None,
         name: "Facade.Test.Release".to_string(),
         status,
         download_state,

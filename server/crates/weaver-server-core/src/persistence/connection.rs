@@ -28,7 +28,7 @@ pub use crate::operations::{
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
 #[cfg(test)]
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 #[cfg(test)]
 const LEGACY_SCHEMA_VERSION: i64 = 20;
 const DEFAULT_SQLITE_READ_CONNECTIONS: usize = 4;
@@ -281,6 +281,123 @@ fn backfill_persisted_nzb_blobs(conn: &Connection, table: &str) -> Result<(), St
     Ok(())
 }
 
+#[cfg(test)]
+fn refresh_active_job_hashes(conn: &Connection) -> Result<(), StateError> {
+    let mut select = conn
+        .prepare(
+            "SELECT job_id, nzb_zstd, nzb_path
+             FROM active_jobs",
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let rows = select
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let (job_id, nzb_zstd, nzb_path) = row.map_err(|e| StateError::Database(e.to_string()))?;
+        let hash = match nzb_zstd {
+            Some(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => match crate::ingest::load_persisted_nzb_storage_bytes(Path::new(&nzb_path)) {
+                Ok(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        nzb_path = %nzb_path,
+                        error = %error,
+                        "failed to refresh active job hash from filesystem"
+                    );
+                    continue;
+                }
+            },
+        };
+        updates.push((job_id, hash));
+    }
+
+    let mut update = conn
+        .prepare(
+            "UPDATE active_jobs
+             SET nzb_hash = ?1
+             WHERE job_id = ?2",
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    for (job_id, hash) in updates {
+        update
+            .execute(rusqlite::params![hash, job_id])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn backfill_job_history_hashes(conn: &Connection) -> Result<(), StateError> {
+    let mut select = conn
+        .prepare(
+            "SELECT job_id, nzb_zstd, nzb_path
+             FROM job_history
+             WHERE job_hash IS NULL
+               AND ((nzb_zstd IS NOT NULL) OR (nzb_path IS NOT NULL AND nzb_path != ''))",
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    let rows = select
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| StateError::Database(e.to_string()))?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let (job_id, nzb_zstd, nzb_path) = row.map_err(|e| StateError::Database(e.to_string()))?;
+        let hash = match nzb_zstd {
+            Some(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => {
+                let Some(path) = nzb_path else {
+                    continue;
+                };
+                match crate::ingest::load_persisted_nzb_storage_bytes(Path::new(&path)) {
+                    Ok(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id,
+                            nzb_path = %path,
+                            error = %error,
+                            "failed to backfill history job hash from filesystem"
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        updates.push((job_id, hash));
+    }
+
+    let mut update = conn
+        .prepare(
+            "UPDATE job_history
+             SET job_hash = ?1
+             WHERE job_id = ?2",
+        )
+        .map_err(|e| StateError::Database(e.to_string()))?;
+    for (job_id, hash) in updates {
+        update
+            .execute(rusqlite::params![hash, job_id])
+            .map_err(|e| StateError::Database(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// SQLite-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
@@ -389,6 +506,7 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS job_history (
                 job_id           INTEGER PRIMARY KEY NOT NULL,
+                job_hash         BLOB,
                 name             TEXT NOT NULL,
                 status           TEXT NOT NULL,
                 error_message    TEXT,
@@ -891,7 +1009,7 @@ impl Database {
                 )
                 .map_err(|e| StateError::Database(e.to_string()))?;
             }
-            Some(19) | Some(20) | Some(21) | Some(22) => {}
+            Some(19) | Some(20) | Some(21) | Some(22) | Some(23) | Some(24) => {}
             Some(v) if v == SCHEMA_VERSION => {}
             Some(v) => {
                 return Err(StateError::Database(format!(
@@ -912,6 +1030,7 @@ impl Database {
             "optional_recovery_downloaded_bytes",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "job_history", "job_hash", "BLOB")?;
         ensure_column(&conn, "job_history", "last_diagnostic_id", "TEXT")?;
         ensure_column(
             &conn,
@@ -947,10 +1066,13 @@ impl Database {
         ensure_column(&conn, "active_jobs", "paused_resume_post_state", "TEXT")?;
         ensure_column(&conn, "active_jobs", "nzb_zstd", "BLOB")?;
         ensure_column(&conn, "job_history", "nzb_zstd", "BLOB")?;
+        ensure_column(&conn, "job_history", "job_hash", "BLOB")?;
         ensure_column(&conn, "servers", "tls_ca_cert", "TEXT")?;
 
         backfill_persisted_nzb_blobs(&conn, "active_jobs")?;
         backfill_persisted_nzb_blobs(&conn, "job_history")?;
+        refresh_active_job_hashes(&conn)?;
+        backfill_job_history_hashes(&conn)?;
 
         if needs_v20_cleanup {
             cleanup_legacy_queue_event_storage(&conn)?;

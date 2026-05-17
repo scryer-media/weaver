@@ -7,6 +7,7 @@ use weaver_server_core::JobHistoryRow;
 fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) -> JobHistoryRow {
     JobHistoryRow {
         job_id,
+        job_hash: None,
         name: name.to_string(),
         status: status.to_string(),
         error_message: (status == "failed").then(|| "simulated failure".to_string()),

@@ -153,6 +153,13 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
 
     JobInfo {
         job_id: crate::jobs::ids::JobId(row.job_id),
+        job_hash: row.job_hash.as_ref().and_then(|value| {
+            (value.len() == 32).then(|| {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(value);
+                hash
+            })
+        }),
         name: row.name,
         status: status.clone(),
         download_state,
@@ -189,6 +196,7 @@ mod tests {
     fn history_snapshot_preserves_repairing_and_moving_status_shapes() {
         let repairing = job_info_from_history(crate::JobHistoryRow {
             job_id: 1,
+            job_hash: None,
             name: "repairing".into(),
             status: "repairing".into(),
             error_message: None,
@@ -213,6 +221,7 @@ mod tests {
 
         let moving = job_info_from_history(crate::JobHistoryRow {
             job_id: 2,
+            job_hash: None,
             name: "moving".into(),
             status: "moving".into(),
             error_message: None,
