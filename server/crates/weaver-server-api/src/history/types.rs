@@ -40,11 +40,8 @@ pub struct HistoryItem {
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
-    #[cfg_attr(not(weaver_diagnostics), graphql(skip))]
     pub last_diagnostic_id: Option<String>,
-    #[cfg_attr(not(weaver_diagnostics), graphql(skip))]
     pub last_diagnostic_uploaded_at: Option<DateTime<Utc>>,
-    #[cfg_attr(not(weaver_diagnostics), graphql(skip))]
     pub diagnostic_run: Option<HistoryDiagnosticRun>,
     pub attention: Option<QueueAttention>,
     pub delete_operation: Option<HistoryDeleteRowState>,

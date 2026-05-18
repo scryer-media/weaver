@@ -64,28 +64,24 @@ async fn public_facade_schema_exposes_core_surface() {
             sdl.contains("startDiagnosticRedownload("),
             "diagnostic redownload mutation should be present when diagnostics are enabled"
         );
-        assert!(
-            sdl.contains("diagnosticRun: HistoryDiagnosticRun"),
-            "history item should expose active diagnostic state when diagnostics are enabled"
-        );
-        assert!(
-            sdl.contains("lastDiagnosticId: String"),
-            "history item should expose the last diagnostic id when diagnostics are enabled"
-        );
     } else {
         assert!(
             !sdl.contains("startDiagnosticRedownload("),
             "diagnostic redownload mutation should be hidden when diagnostics are disabled"
         );
-        assert!(
-            !sdl.contains("diagnosticRun: HistoryDiagnosticRun"),
-            "history item should hide active diagnostic state when diagnostics are disabled"
-        );
-        assert!(
-            !sdl.contains("lastDiagnosticId: String"),
-            "history item should hide last diagnostic metadata when diagnostics are disabled"
-        );
     }
+    assert!(
+        sdl.contains("diagnosticRun: HistoryDiagnosticRun"),
+        "history item should always expose diagnostic run state, falling back to null when diagnostics are disabled"
+    );
+    assert!(
+        sdl.contains("lastDiagnosticId: String"),
+        "history item should always expose the last diagnostic id, falling back to null when diagnostics are disabled"
+    );
+    assert!(
+        sdl.contains("lastDiagnosticUploadedAt: DateTime"),
+        "history item should always expose the last diagnostic upload timestamp, falling back to null when diagnostics are disabled"
+    );
     assert!(
         !sdl.contains("submitNzbLegacy"),
         "legacy submitNzbLegacy mutation should not be present"
