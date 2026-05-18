@@ -560,6 +560,13 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
 
     JobInfo {
         job_id: JobId(row.job_id),
+        job_hash: row.job_hash.as_ref().and_then(|value| {
+            (value.len() == 32).then(|| {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(value);
+                hash
+            })
+        }),
         name: row.name.clone(),
         status,
         download_state,

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
 use weaver_server_core::ingest::{
     cleanup_orphaned_persisted_nzbs, hash_persisted_nzb, parse_persisted_nzb,
 };
@@ -21,12 +20,12 @@ fn minimal_nzb(name: &str) -> String {
     )
 }
 
-fn finalize_sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+fn finalize_blake3(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
+    out.copy_from_slice(digest.as_bytes());
     out
 }
 
@@ -78,12 +77,29 @@ fn parse_persisted_corrupt_zstd_fails() {
 fn hash_persisted_nzb_matches_stored_bytes_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("job.nzb");
-    let compressed = zstd::bulk::compress(minimal_nzb("persisted-hash").as_bytes(), 3).unwrap();
+    let xml = minimal_nzb("persisted-hash");
+    let compressed = zstd::bulk::compress(xml.as_bytes(), 3).unwrap();
     std::fs::write(&path, &compressed).unwrap();
 
-    let expected = finalize_sha256(&compressed);
+    let expected = finalize_blake3(xml.as_bytes());
 
     assert_eq!(hash_persisted_nzb(&path).unwrap(), expected);
+}
+
+#[test]
+fn hash_persisted_nzb_bytes_matches_plain_and_zstd_storage() {
+    let xml = minimal_nzb("persisted-hash-bytes");
+    let compressed = zstd::bulk::compress(xml.as_bytes(), 3).unwrap();
+    let expected = finalize_blake3(xml.as_bytes());
+
+    assert_eq!(
+        weaver_server_core::ingest::hash_persisted_nzb_bytes(xml.as_bytes()),
+        expected
+    );
+    assert_eq!(
+        weaver_server_core::ingest::hash_persisted_nzb_bytes(&compressed),
+        expected
+    );
 }
 
 #[test]

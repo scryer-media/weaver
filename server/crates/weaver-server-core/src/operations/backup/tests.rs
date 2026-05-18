@@ -54,6 +54,7 @@ fn export_and_import_stable_state_roundtrip() {
         .unwrap();
     src.insert_job_history(&JobHistoryRow {
         job_id: 77,
+        job_hash: None,
         name: "test".into(),
         status: "complete".into(),
         error_message: None,
@@ -178,6 +179,7 @@ fn restore_target_is_not_pristine_with_history() {
     assert!(db.restore_target_is_pristine().unwrap());
     db.insert_job_history(&JobHistoryRow {
         job_id: 1,
+        job_hash: None,
         name: "x".into(),
         status: "complete".into(),
         error_message: None,

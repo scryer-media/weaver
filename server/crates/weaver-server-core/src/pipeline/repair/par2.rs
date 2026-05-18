@@ -1048,6 +1048,7 @@ impl Pipeline {
             }
             list.push(JobInfo {
                 job_id: state.job_id,
+                job_hash: Some(state.job_hash),
                 name: state.spec.name.clone(),
                 error: if let JobStatus::Failed { error } = &state.status {
                     Some(error.clone())

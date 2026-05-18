@@ -988,8 +988,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
       - name: Download linux amd64 portable artifact
         uses: actions/download-artifact@v8
         with:
@@ -1030,17 +1033,44 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/weaver
           tags: |
             type=raw,value=latest
-            type=sha
             type=match,pattern=weaver-v(.*),group=1
-      - name: Build and push
+      - name: Compute Docker tags
+        id: tags
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/weaver
+        run: |
+          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          SHORT_SHA=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
+          {
+            echo "base<<EOF"
+            echo "${IMAGE_NAME}:latest"
+            echo "${IMAGE_NAME}:sha-${SHORT_SHA}"
+            echo "${IMAGE_NAME}:${VERSION}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push base image
+        id: build_base
         uses: docker/build-push-action@v7
         with:
           context: docker-ctx
           file: docker/weaver.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.base }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Sign published base image
+        env:
+          TAGS: ${{ steps.tags.outputs.base }}
+          DIGEST: ${{ steps.build_base.outputs.digest }}
+        run: |
+          images=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            images="$images ${tag}@${DIGEST}"
+          done <<EOF
+          $TAGS
+          EOF
+          cosign sign --yes $images
 
   github-release:
     name: github-release

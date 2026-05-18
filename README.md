@@ -41,7 +41,11 @@ Installation instructions can be found on the [Weaver docs website](https://www.
 
 ## Docker
 
-Weaver publishes a first-party container image at `ghcr.io/scryer-media/weaver:latest`.
+Weaver publishes a first-party container image:
+
+- `ghcr.io/scryer-media/weaver:latest` with both Linux binaries bundled per architecture and a CPU-aware launcher that picks the best one at startup
+
+Published GHCR images are keyless-signed with Sigstore Cosign.
 
 The Docker contract is intentionally small:
 

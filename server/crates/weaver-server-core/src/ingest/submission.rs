@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
+use crate::Database;
 use crate::SchedulerHandle;
 use crate::jobs::JobSpec;
 use crate::jobs::ids::JobId;
@@ -21,6 +22,7 @@ static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
 #[derive(Clone)]
 pub struct SubmittedJob {
     pub job_id: JobId,
+    pub job_hash: [u8; 32],
     pub spec: JobSpec,
     pub created_at_epoch_ms: f64,
 }
@@ -46,6 +48,8 @@ pub enum SubmitNzbError {
     Upload(std::io::Error),
     #[error("scheduler error: {0}")]
     Scheduler(#[from] crate::SchedulerError),
+    #[error("state error: {0}")]
+    State(#[from] crate::StateError),
     #[error("NZB fetch failed: {0}")]
     Fetch(String),
     #[error("NZB response was not valid XML")]
@@ -153,6 +157,7 @@ pub async fn resolve_submission_category(
 }
 
 async fn submit_prepared_nzb(
+    db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     nzb: Nzb,
@@ -172,7 +177,8 @@ async fn submit_prepared_nzb(
     } = prepared;
 
     let resolved_category = resolve_submission_category(config, category.as_deref()).await;
-    let job_id = next_submission_job_id();
+    let job_id = db.reserve_next_job_id()?;
+    let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let spec = nzb_to_submission_spec(
         &nzb,
         filename.as_deref(),
@@ -204,12 +210,15 @@ async fn submit_prepared_nzb(
 
     Ok(SubmittedJob {
         job_id,
+        job_hash,
         spec,
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_nzb_bytes(
+    db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     nzb_bytes: &[u8],
@@ -222,6 +231,7 @@ pub async fn submit_nzb_bytes(
     let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
     let nzb_zstd = persisted_nzb::compress_nzb_bytes(nzb_bytes).map_err(SubmitNzbError::Save)?;
     submit_prepared_nzb(
+        db,
         handle,
         config,
         nzb,
@@ -270,7 +280,9 @@ pub async fn fetch_nzb_from_url(
     Ok((nzb_bytes.to_vec(), filename))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_uploaded_nzb_reader<R>(
+    db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     source: R,
@@ -299,6 +311,7 @@ where
         }
     };
     submit_prepared_nzb(
+        db,
         handle,
         config,
         nzb,
@@ -314,7 +327,9 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_staged_nzb_zstd(
+    db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     nzb_zstd: Vec<u8>,
@@ -334,6 +349,7 @@ pub async fn submit_staged_nzb_zstd(
         }
     };
     submit_prepared_nzb(
+        db,
         handle,
         config,
         nzb,

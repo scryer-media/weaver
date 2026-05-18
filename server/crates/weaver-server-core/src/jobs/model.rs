@@ -357,6 +357,7 @@ pub fn runtime_lanes_from_status_snapshot(
 /// Internal state for a running job.
 pub struct JobState {
     pub job_id: JobId,
+    pub job_hash: [u8; 32],
     pub spec: JobSpec,
     /// Runtime status used by the pipeline choreography. The lane fields below
     /// are compatibility projections and must not drive core lifecycle logic.

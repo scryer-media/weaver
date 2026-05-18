@@ -132,6 +132,7 @@ pub struct QueueAttention {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct QueueItem {
     pub id: u64,
+    pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
     pub original_title: String,
@@ -610,6 +611,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     });
     QueueItem {
         id: info.job_id.0,
+        job_hash: info.job_hash.as_ref().map(hex::encode),
         name: info.name.clone(),
         display_title: display.display_title,
         original_title: display.original_title,
@@ -647,6 +649,7 @@ pub fn queue_item_from_submission(
     });
     QueueItem {
         id: submitted.job_id.0,
+        job_hash: Some(hex::encode(submitted.job_hash)),
         name: submitted.spec.name.clone(),
         display_title: display.display_title,
         original_title: display.original_title,

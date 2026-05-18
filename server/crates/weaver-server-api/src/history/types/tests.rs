@@ -6,6 +6,7 @@ use weaver_server_core::JobHistoryRow;
 fn history_item_roundtrips_attributes_and_client_request_id() {
     let row = JobHistoryRow {
         job_id: 77,
+        job_hash: None,
         name: "History Test".to_string(),
         status: "failed".to_string(),
         error_message: Some("extract failed".to_string()),
@@ -49,6 +50,7 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
 fn history_item_builds_when_release_parse_is_not_media() {
     let row = JobHistoryRow {
         job_id: 78,
+        job_hash: None,
         name: "ubuntu-24.04.2-live-server-amd64".to_string(),
         status: "complete".to_string(),
         error_message: None,
@@ -78,6 +80,7 @@ fn history_item_builds_when_release_parse_is_not_media() {
 fn history_filter_supports_exact_attribute_matches() {
     let row = JobHistoryRow {
         job_id: 88,
+        job_hash: None,
         name: "History Match".to_string(),
         status: "complete".to_string(),
         error_message: None,

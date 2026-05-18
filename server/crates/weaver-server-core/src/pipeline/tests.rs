@@ -165,6 +165,7 @@ fn sample_nzb_zstd() -> Vec<u8> {
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
     JobState {
         job_id,
+        job_hash: [0; 32],
         spec: JobSpec {
             name: name.to_string(),
             password: None,
@@ -213,6 +214,7 @@ fn history_row_with_output_dir(
 ) -> crate::JobHistoryRow {
     crate::JobHistoryRow {
         job_id: job_id.0,
+        job_hash: None,
         name: name.to_string(),
         status: status.to_string(),
         error_message: None,
@@ -1440,6 +1442,7 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
         job_id,
         JobState {
             job_id,
+            job_hash: [0; 32],
             spec,
             status: JobStatus::Downloading,
             download_state: crate::jobs::model::DownloadState::Downloading,
@@ -2202,6 +2205,7 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
     let submitted = tokio::time::timeout(
         Duration::from_secs(2),
         submit_nzb_bytes(
+            &harness.db,
             &harness.handle,
             &harness.config,
             &nzb_bytes,
@@ -2851,6 +2855,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
@@ -2949,6 +2954,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
@@ -5388,6 +5394,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: HashMap::new(),
@@ -5659,6 +5666,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: Pipeline::all_segment_ids(
                 job_id,
@@ -6040,6 +6048,7 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec: spec.clone(),
             committed_segments: Pipeline::all_segment_ids(job_id, &spec),
             file_progress: recovered.file_progress,
@@ -7232,6 +7241,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress,
@@ -7322,6 +7332,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: HashMap::new(),
@@ -7407,6 +7418,7 @@ async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: Pipeline::all_segment_ids(
                 job_id,
@@ -7466,6 +7478,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
     restored
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: Pipeline::all_segment_ids(
                 job_id,
@@ -10456,6 +10469,7 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
@@ -12493,6 +12507,7 @@ async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains()
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
@@ -12539,6 +12554,7 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: HashMap::new(),
@@ -12605,6 +12621,7 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments,
             file_progress: HashMap::new(),
@@ -13298,6 +13315,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
@@ -13344,6 +13362,7 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
@@ -13398,6 +13417,7 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
+            job_hash: [0; 32],
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),

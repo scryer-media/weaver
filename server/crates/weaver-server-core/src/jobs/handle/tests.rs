@@ -100,6 +100,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
     jobs.values()
         .map(|state| JobInfo {
             job_id: state.job_id,
+            job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
             error: if let JobStatus::Failed { error } = &state.status {
                 Some(error.clone())
@@ -217,6 +218,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
+                        job_hash: [0; 32],
                         spec,
                         status,
                         download_state,
@@ -337,6 +339,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         runtime_lanes_for_status(&status);
                     let state = JobState {
                         job_id,
+                        job_hash: [0; 32],
                         spec,
                         status,
                         download_state,
@@ -563,6 +566,7 @@ async fn redownload_failed_job() {
     handle
         .restore_job(RestoreJobRequest {
             job_id: JobId(1),
+            job_hash: [0; 32],
             spec: make_spec("Failed Job"),
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),

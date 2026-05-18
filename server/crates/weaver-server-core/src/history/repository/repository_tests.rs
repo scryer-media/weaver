@@ -3,6 +3,7 @@ use super::*;
 fn sample_history() -> JobHistoryRow {
     JobHistoryRow {
         job_id: 1,
+        job_hash: None,
         name: "test.nzb".to_string(),
         status: "complete".to_string(),
         error_message: None,

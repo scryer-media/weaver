@@ -145,6 +145,7 @@ impl RssService {
 
         let metadata = build_submission_metadata(feed, rule, item);
         let submitted = submit_nzb_bytes(
+            &self.inner.db,
             &self.inner.handle,
             &self.inner.config,
             &nzb_bytes,

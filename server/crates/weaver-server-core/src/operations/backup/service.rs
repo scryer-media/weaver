@@ -215,14 +215,14 @@ impl BackupService {
         let history_count = history_jobs.len();
         self.inner.handle.replace_jobs_snapshot(history_jobs);
 
-        let max_job_id = {
+        let next_job_id = {
             let db = self.inner.db.clone();
-            tokio::task::spawn_blocking(move || db.max_job_id_all())
+            tokio::task::spawn_blocking(move || db.initialize_next_job_id_counter())
                 .await
                 .map_err(|e| BackupServiceError::Io(e.to_string()))?
                 .map_err(|e| BackupServiceError::Io(e.to_string()))?
         };
-        crate::ingest::init_job_counter(max_job_id + 1);
+        crate::ingest::init_job_counter(next_job_id);
 
         Ok(RestoreReport {
             restored: true,

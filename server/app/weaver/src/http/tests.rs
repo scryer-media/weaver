@@ -278,6 +278,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         JobId(10_000),
         &weaver_server_core::JobHistoryRow {
             job_id: 10_000,
+            job_hash: None,
             name: "Friends".to_string(),
             status: "complete".to_string(),
             error_message: None,
@@ -358,6 +359,7 @@ async fn job_output_file_download_handler_streams_history_file() {
     std::fs::write(&file_path, b"video-bytes").unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
         job_id: 10_001,
+        job_hash: None,
         name: "Friends".to_string(),
         status: "complete".to_string(),
         error_message: None,
@@ -446,6 +448,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     };
     let jobs = vec![JobInfo {
         job_id: JobId(42),
+        job_hash: None,
         name: "Silver Horizon".into(),
         status: JobStatus::Downloading,
         download_state: weaver_server_core::DownloadState::Downloading,

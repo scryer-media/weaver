@@ -19,6 +19,7 @@ use crate::jobs::types::{
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct HistoryItem {
     pub id: u64,
+    pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
     pub original_title: String,
@@ -438,6 +439,7 @@ pub fn history_item_from_row(
     };
     HistoryItem {
         id: row.job_id,
+        job_hash: row.job_hash.as_ref().map(hex::encode),
         name: row.name.clone(),
         display_title: display.display_title,
         original_title: display.original_title,

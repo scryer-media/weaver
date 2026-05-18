@@ -42,7 +42,10 @@ pub async fn recover_server_state(
     if max_id > 0 {
         info!(max_id, "recovered max job ID");
     }
-    crate::ingest::init_job_counter(max_id + 1);
+    let next_job_id = db
+        .initialize_next_job_id_counter()
+        .unwrap_or_else(|_| (max_id + 1).max(10_000));
+    crate::ingest::init_job_counter(next_job_id);
 
     match db.prune_orphan_active_state() {
         Ok(counts) if counts.total_removed() > 0 => {
@@ -99,6 +102,7 @@ pub async fn recover_server_state(
                 runtime_lanes_from_status_snapshot(&status);
             initial_history.push(JobInfo {
                 job_id,
+                job_hash: Some(recovered.nzb_hash),
                 name,
                 error: if let JobStatus::Failed { error } = &status {
                     Some(error.clone())
@@ -171,6 +175,7 @@ pub async fn recover_server_state(
                         committed_count: recovered.committed_segments.len(),
                         request: RestoreJobRequest {
                             job_id,
+                            job_hash: recovered.nzb_hash,
                             spec,
                             committed_segments: recovered.committed_segments,
                             file_progress: recovered.file_progress,
@@ -234,6 +239,13 @@ pub async fn recover_server_state(
                     runtime_lanes_from_status_snapshot(&status);
                 initial_history.push(JobInfo {
                     job_id,
+                    job_hash: row.job_hash.as_ref().and_then(|value| {
+                        (value.len() == 32).then(|| {
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(value);
+                            hash
+                        })
+                    }),
                     name: row.name,
                     error: history_error,
                     status,
@@ -434,6 +446,7 @@ mod tests {
 
         db.insert_job_history(&JobHistoryRow {
             job_id: 2,
+            job_hash: None,
             name: "failed-history".to_string(),
             status: "failed".to_string(),
             error_message: Some("boom".to_string()),

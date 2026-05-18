@@ -51,6 +51,16 @@ kind = "sql"
 file = "migrations/0024_tiered_metrics_history/schema.sql"
 scope = "all"
 
+[[migration]]
+version = 25
+description = "job hash history and monotonic ids"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "upgrade_to_schema_25"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

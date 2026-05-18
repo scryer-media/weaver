@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 24;
+const CURRENT_SCHEMA_VERSION: i64 = 25;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -582,6 +582,105 @@ async fn backfill_persisted_nzb_blobs(
     Ok(())
 }
 
+async fn refresh_active_job_hashes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    let rows = sqlx::query(
+        "SELECT job_id, nzb_zstd, nzb_path
+           FROM active_jobs",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    for row in rows {
+        let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.try_get("nzb_zstd").map_err(db_err)?;
+        let nzb_path: String = row.try_get("nzb_path").map_err(db_err)?;
+        let hash = match nzb_zstd {
+            Some(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => match crate::ingest::load_persisted_nzb_storage_bytes(Path::new(&nzb_path)) {
+                Ok(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        nzb_path = %nzb_path,
+                        error = %error,
+                        "failed to refresh active job hash from filesystem"
+                    );
+                    continue;
+                }
+            },
+        };
+        sqlx::query(
+            "UPDATE active_jobs
+                SET nzb_hash = ?1
+              WHERE job_id = ?2",
+        )
+        .bind(hash)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
+async fn backfill_job_history_hashes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    let rows = sqlx::query(
+        "SELECT job_id, nzb_zstd, nzb_path
+           FROM job_history
+          WHERE job_hash IS NULL
+            AND ((nzb_zstd IS NOT NULL) OR (nzb_path IS NOT NULL AND nzb_path != ''))",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    for row in rows {
+        let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.try_get("nzb_zstd").map_err(db_err)?;
+        let nzb_path: Option<String> = row.try_get("nzb_path").map_err(db_err)?;
+        let hash = match nzb_zstd {
+            Some(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => {
+                let Some(path) = nzb_path else {
+                    continue;
+                };
+                match crate::ingest::load_persisted_nzb_storage_bytes(Path::new(&path)) {
+                    Ok(bytes) => crate::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id,
+                            nzb_path = %path,
+                            error = %error,
+                            "failed to backfill history job hash from filesystem"
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        sqlx::query(
+            "UPDATE job_history
+                SET job_hash = ?1
+              WHERE job_id = ?2",
+        )
+        .bind(hash)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
 async fn run_rust_hook(
     hook_id: &str,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -593,6 +692,7 @@ async fn run_rust_hook(
         "adopt_legacy_schema_to_21" => adopt_legacy_schema_to_21(tx, version, install_kind).await,
         "upgrade_to_schema_22" => upgrade_to_schema_22(tx).await,
         "upgrade_to_schema_23" => upgrade_to_schema_23(tx).await,
+        "upgrade_to_schema_25" => upgrade_to_schema_25(tx).await,
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
         ))),
@@ -726,6 +826,19 @@ async fn upgrade_to_schema_23(
     ensure_column(tx, "job_history", "nzb_zstd", "BLOB").await?;
     backfill_persisted_nzb_blobs(tx, "active_jobs").await?;
     backfill_persisted_nzb_blobs(tx, "job_history").await?;
+    Ok(())
+}
+
+async fn upgrade_to_schema_25(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    ensure_column(tx, "job_history", "job_hash", "BLOB").await?;
+    ensure_column(tx, "active_jobs", "nzb_zstd", "BLOB").await?;
+    ensure_column(tx, "job_history", "nzb_zstd", "BLOB").await?;
+    backfill_persisted_nzb_blobs(tx, "active_jobs").await?;
+    backfill_persisted_nzb_blobs(tx, "job_history").await?;
+    refresh_active_job_hashes(tx).await?;
+    backfill_job_history_hashes(tx).await?;
     Ok(())
 }
 

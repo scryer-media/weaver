@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub struct JobHistoryRow {
     pub job_id: u64,
+    pub job_hash: Option<Vec<u8>>,
     pub name: String,
     pub status: String,
     pub error_message: Option<String>,

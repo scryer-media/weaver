@@ -511,6 +511,7 @@ impl Pipeline {
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
+            job_hash: nzb_hash,
             spec,
             status: JobStatus::Queued,
             download_state: crate::jobs::model::DownloadState::Queued,
@@ -761,6 +762,7 @@ impl Pipeline {
             let par2_bytes = spec.par2_bytes();
             let mut state = JobState {
                 job_id,
+                job_hash: crate::ingest::hash_persisted_nzb_or_empty(&nzb_path),
                 spec,
                 status: JobStatus::Downloading,
                 download_state: crate::jobs::model::DownloadState::Downloading,
@@ -1227,6 +1229,7 @@ impl Pipeline {
     ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
+            job_hash,
             spec,
             committed_segments,
             file_progress,
@@ -1338,6 +1341,7 @@ impl Pipeline {
         let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
+            job_hash,
             spec,
             status: status.clone(),
             download_state: Self::normalize_restored_download_state(

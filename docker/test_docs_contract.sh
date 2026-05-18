@@ -20,6 +20,7 @@ assert_contains() {
 
 assert_contains "$README_CONTENT" "## Docker" "README should include a Docker section"
 assert_contains "$README_CONTENT" "ghcr.io/scryer-media/weaver:latest" "README should document the published image"
+assert_contains "$README_CONTENT" "Sigstore Cosign" "README should mention image signing"
 assert_contains "$README_CONTENT" "/config" "README should document the /config volume contract"
 assert_contains "$README_CONTENT" "PUID=1000" "README should document PUID"
 assert_contains "$README_CONTENT" "PGID=1000" "README should document PGID"
