@@ -1,0 +1,8 @@
+title = "scryer gitleaks config"
+
+[allowlist]
+description = "allow obvious examples and test placeholders"
+regexes = [
+  '''example\.com''',
+  '''(?i)(example|sample|placeholder|changeme|replace-me|replace_me|dummy|fake|test[-_]?key|test[-_]?token)''',
+]

@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+current_user="${USER:-}"
+if [ -z "$current_user" ]; then
+  current_user="$(id -un 2>/dev/null || printf '')"
+fi
+
+home_dir="${HOME:-}"
+
+if [ -z "$current_user" ] && [ -z "$home_dir" ]; then
+  exit 0
+fi
+
+tmp_output="$(mktemp "${TMPDIR:-/tmp}/scryer-pre-commit.XXXXXX")"
+trap 'rm -f "$tmp_output"' EXIT HUP INT TERM
+
+git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
+  -v current_user="$current_user" \
+  -v home_dir="$home_dir" \
+  '
+    BEGIN {
+      current_file = "unknown"
+      user_lower = tolower(current_user)
+    }
+    /^\+\+\+ b\// {
+      current_file = substr($0, 7)
+      next
+    }
+    /^\+/ && $0 !~ /^\+\+\+/ {
+      added_line = substr($0, 2)
+      added_lower = tolower(added_line)
+      if (user_lower != "" && index(added_lower, user_lower) > 0) {
+        printf "%s:%s\n", current_file, added_line
+        next
+      }
+      if (home_dir != "" && index(added_line, home_dir) > 0) {
+        printf "%s:%s\n", current_file, added_line
+      }
+    }
+  ' >"$tmp_output"
+
+if [ -s "$tmp_output" ]; then
+  echo "pre-commit blocked: staged changes contain local personal path or username references." >&2
+  echo "Remove or generalize these lines before committing:" >&2
+  sed 's/^/  - /' "$tmp_output" >&2
+  exit 1
+fi
+
+"$(dirname "$0")/scan-secrets"
