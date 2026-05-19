@@ -2681,7 +2681,7 @@ mod tests {
             concat!(
                 "const DEFAULT: &str = \"",
                 "/",
-                "Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2",
+                "Users/example/dev/supporting-codebases/par2cmdline-turbo/par2",
                 "\";"
             ),
         );
@@ -2692,7 +2692,7 @@ mod tests {
                 concat!(
                     "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"",
                     "/",
-                    "Users/jeremy/dev/supporting-codebases/par2cmdline-turbo/par2",
+                    "Users/example/dev/supporting-codebases/par2cmdline-turbo/par2",
                     "\";"
                 )
                     .to_string()
