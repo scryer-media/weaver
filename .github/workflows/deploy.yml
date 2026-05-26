@@ -191,7 +191,7 @@ jobs:
             rustflags: "-C target-feature=+avx2,+gfni,+ssse3"
             sde_arch: "-icl"
           - name: spr-gfni-avx512
-            rustflags: "-C target-feature=+avx512bw,+avx512vl,+avx2,+gfni,+ssse3"
+            rustflags: "-C target-feature=+avx512f,+avx512bw,+avx512vl,+avx512vbmi2,+avx2,+gfni,+ssse3"
             sde_arch: "-spr"
     steps:
       - uses: actions/checkout@v6
@@ -214,7 +214,7 @@ jobs:
           curl -Lo /tmp/sde.tar.xz https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz
           tar -xf /tmp/sde.tar.xz -C /opt
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
-      - name: Build accelerated par2 tests (${{ matrix.name }})
+      - name: Build accelerated SIMD tests (${{ matrix.name }})
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
@@ -222,6 +222,10 @@ jobs:
           cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
+          cargo test --package weaver-yenc --lib --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
+            | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
+            >> /tmp/test-bins.txt
+          sort -u -o /tmp/test-bins.txt /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
         run: |
           while IFS= read -r bin; do
@@ -237,6 +241,31 @@ jobs:
               real_world_generated-*)
                 sde64 ${{ matrix.sde_arch }} -- "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
                 ;;
+              weaver_yenc-*)
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
+                sde64 ${{ matrix.sde_arch }} -- "$bin" decode::tests::decode_body_rapidyenc_generic_special_pattern --exact --test-threads=1
+                ;;
               *)
                 echo "unexpected SDE test binary: $(basename "$bin")" >&2
                 exit 1
@@ -244,6 +273,44 @@ jobs:
             esac
             echo "::endgroup::"
           done < /tmp/test-bins.txt
+
+  rust-yenc-simd-targets:
+    name: rust-yenc-simd-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: armv7-neon
+            target: armv7-unknown-linux-gnueabihf
+            target_env: ARMV7_UNKNOWN_LINUX_GNUEABIHF
+            rustflags: "-C target-feature=+neon"
+          - name: riscv64gc
+            target: riscv64gc-unknown-linux-gnu
+            target_env: RISCV64GC_UNKNOWN_LINUX_GNU
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: false
+          key: yenc-simd-${{ matrix.name }}
+      - name: Check weaver-yenc target
+        env:
+          TARGET_ENV: ${{ matrix.target_env }}
+          TARGET_RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          if [ -n "$TARGET_RUSTFLAGS" ]; then
+            export "CARGO_TARGET_${TARGET_ENV}_RUSTFLAGS=$TARGET_RUSTFLAGS"
+          fi
+          cargo check --locked -p weaver-yenc --target ${{ matrix.target }}
 
   rust-crypto-targets:
     name: rust-crypto-${{ matrix.platform }}
@@ -886,6 +953,7 @@ jobs:
       - rust-test
       - rust-test-arm
       - rust-test-sde
+      - rust-yenc-simd-targets
       - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
@@ -980,6 +1048,7 @@ jobs:
       - rust-test
       - rust-test-arm
       - rust-test-sde
+      - rust-yenc-simd-targets
       - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
@@ -1063,14 +1132,14 @@ jobs:
           TAGS: ${{ steps.tags.outputs.base }}
           DIGEST: ${{ steps.build_base.outputs.digest }}
         run: |
-          images=""
+          images_file="$(mktemp)"
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            images="$images ${tag}@${DIGEST}"
+            printf '%s@%s\n' "$tag" "$DIGEST" >> "$images_file"
           done <<EOF
           $TAGS
           EOF
-          cosign sign --yes $images
+          xargs cosign sign --yes < "$images_file"
 
   github-release:
     name: github-release
@@ -1084,6 +1153,7 @@ jobs:
       - rust-test
       - rust-test-arm
       - rust-test-sde
+      - rust-yenc-simd-targets
       - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell

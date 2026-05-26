@@ -4956,6 +4956,7 @@ name = "weaver-yenc"
 version = "0.4.8"
 dependencies = [
  "crc32fast",
+ "criterion",
  "memchr",
  "thiserror 2.0.18",
 ]

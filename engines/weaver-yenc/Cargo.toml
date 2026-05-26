@@ -10,3 +10,11 @@ repository.workspace = true
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
 memchr = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "decode_simd"
+path = "benches/decode_simd.rs"
+harness = false

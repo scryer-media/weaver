@@ -21,6 +21,7 @@ use toml_edit::{DocumentMut, value};
 mod monitor;
 mod par2_kit;
 mod perf;
+mod pgo;
 mod profile_local;
 
 const BLUE: &str = "\x1b[0;34m";
@@ -68,6 +69,7 @@ enum Commands {
     Monitor,
     Profile(ProfileArgs),
     Perf(PerfArgs),
+    Pgo(PgoArgs),
     Par2(Par2Args),
     PrintRustflags(PrintRustflagsArgs),
     VerifyCryptoTarget(VerifyCryptoTargetArgs),
@@ -213,6 +215,30 @@ struct PerfArgs {
     command: PerfCommand,
 }
 
+#[derive(Args)]
+struct PgoArgs {
+    #[command(subcommand)]
+    command: PgoCommand,
+}
+
+#[derive(Subcommand)]
+enum PgoCommand {
+    Collect(PgoCollectArgs),
+}
+
+#[derive(Args)]
+struct PgoCollectArgs {
+    /// Absolute or repo-relative path to the sibling e2e checkout.
+    #[arg(long)]
+    e2e_dir: Option<PathBuf>,
+    /// Absolute or repo-relative output directory for the instrumented build,
+    /// raw profiles, merged profdata, and e2e artifacts.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
 #[derive(Subcommand)]
 enum PerfCommand {
     #[command(name = "par2-x86", disable_help_flag = true)]
@@ -332,6 +358,9 @@ fn main() -> Result<()> {
         Commands::Perf(args) => match args.command {
             PerfCommand::Par2X86(args) => perf::run_par2_x86(&ctx, args.args),
             PerfCommand::RealDownload(args) => perf::run_real_download(&ctx, args.args),
+        },
+        Commands::Pgo(args) => match args.command {
+            PgoCommand::Collect(args) => pgo::run_collect(&ctx, args),
         },
         Commands::Par2(args) => match args.command {
             Par2Command::FinalizeKit(args) => par2_kit::run(&ctx, args.args),

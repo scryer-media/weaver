@@ -364,104 +364,15 @@ pub fn decode_body(
     crc: &mut Crc32,
     options: DecodeOptions,
 ) -> Result<usize, YencError> {
-    let mut src = 0usize;
-    let mut dst = 0usize;
-    let mut at_line_start = true;
+    let written = crate::simd::decode_body_into(input, output, options.dot_unstuffing)?;
 
     // CRC is updated once at the end for better hardware utilization
     // (crc32fast's PCLMULQDQ path needs >= 128 bytes).
-    let crc_pos = 0usize;
-
-    while src < input.len() {
-        let byte = input[src];
-
-        // NNTP dot-unstuffing: if at the start of a line and byte is '.'.
-        if options.dot_unstuffing && at_line_start && byte == b'.' {
-            src += 1;
-            if src >= input.len() {
-                break;
-            }
-            // If next is also '.', this is a dot-stuffed line -- skip the first dot.
-            // If next is '\r' or '\n', this is the NNTP terminator -- stop.
-            let next = input[src];
-            if next == b'\r' || next == b'\n' {
-                // NNTP article terminator.
-                break;
-            }
-            // If next is '.', we consumed the stuffed dot, continue normally.
-            // If next is something else, the dot was data (shouldn't happen in
-            // well-formed NNTP, but handle gracefully).
-            if next != b'.' {
-                // The dot was actual encoded data.
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
-                }
-                output[dst] = b'.'.wrapping_sub(42);
-                dst += 1;
-            }
-            at_line_start = false;
-            continue;
-        }
-
-        match byte {
-            b'\r' | b'\n' => {
-                at_line_start = byte == b'\n' || (byte == b'\r');
-                src += 1;
-                if byte == b'\n' {
-                    at_line_start = true;
-                }
-            }
-            b'=' => {
-                at_line_start = false;
-                src += 1;
-                if src >= input.len() {
-                    return Err(YencError::MalformedEscape(src - 1));
-                }
-                let escaped = input[src];
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
-                }
-                // Decode: (escaped_byte - 64 - 42) mod 256 = escaped_byte - 106
-                output[dst] = escaped.wrapping_sub(106);
-                dst += 1;
-                src += 1;
-            }
-            _ => {
-                at_line_start = false;
-                // Use SIMD fast path for runs of normal bytes.
-                let (consumed, written) = crate::simd::decode_normal_run(input, src, output, dst);
-                if written == 0 {
-                    // Should not happen since byte is not a special char,
-                    // but handle output buffer being full.
-                    if dst >= output.len() {
-                        return Err(YencError::BufferTooSmall {
-                            needed: dst + 1,
-                            available: output.len(),
-                        });
-                    }
-                    output[dst] = byte.wrapping_sub(42);
-                    dst += 1;
-                    src += 1;
-                } else {
-                    src += consumed;
-                    dst += written;
-                }
-            }
-        }
+    if written > 0 {
+        crc.update(&output[..written]);
     }
 
-    // Final CRC update for any remaining decoded bytes.
-    if dst > crc_pos {
-        crc.update(&output[crc_pos..dst]);
-    }
-
-    Ok(dst)
+    Ok(written)
 }
 
 /// Persistent state for streaming yEnc decode across chunk boundaries.
@@ -478,6 +389,9 @@ pub struct DecodeState {
     /// If true, the previous chunk ended with a dot at line start (dot-unstuffing).
     /// The next byte determines whether it's a terminator, stuffed dot, or data.
     pub dot_pending: bool,
+    /// If true, the previous chunk ended after a raw CR and needs the next byte
+    /// to decide whether this is a real CRLF line boundary.
+    pub(crate) cr_pending: bool,
     /// Running CRC32 state.
     pub(crate) crc: crc32fast::Hasher,
     /// Total bytes decoded so far across all chunks.
@@ -491,6 +405,7 @@ impl DecodeState {
             escape_pending: false,
             at_line_start: true,
             dot_pending: false,
+            cr_pending: false,
             crc: crc32fast::Hasher::new(),
             bytes_decoded: 0,
         }
@@ -527,168 +442,15 @@ pub fn decode_chunk(
     state: &mut DecodeState,
     options: DecodeOptions,
 ) -> Result<usize, YencError> {
-    let mut src = 0usize;
-    let mut dst = 0usize;
-
-    // CRC is updated once at the end (or on early return) for better
-    // hardware utilization (crc32fast's PCLMULQDQ path needs >= 128 bytes).
-    let crc_pos = 0usize;
-
-    // Handle a pending escape from the previous chunk.
-    if state.escape_pending {
-        if input.is_empty() {
-            return Ok(0);
-        }
-        state.escape_pending = false;
-        let escaped = input[src];
-        if dst >= output.len() {
-            return Err(YencError::BufferTooSmall {
-                needed: dst + 1,
-                available: output.len(),
-            });
-        }
-        output[dst] = escaped.wrapping_sub(106);
-        dst += 1;
-        src += 1;
-        state.at_line_start = false;
-    }
-
-    // Handle a pending dot from previous chunk (dot at line start, chunk ended).
-    // Now we can see the next byte to determine the correct action.
-    if state.dot_pending {
-        state.dot_pending = false;
-        if src >= input.len() {
-            // Still can't resolve — emit dot as data (best effort at EOF).
-            if dst >= output.len() {
-                return Err(YencError::BufferTooSmall {
-                    needed: dst + 1,
-                    available: output.len(),
-                });
-            }
-            output[dst] = b'.'.wrapping_sub(42);
-            dst += 1;
-            state.at_line_start = false;
-        } else {
-            let next = input[src];
-            if next == b'\r' || next == b'\n' {
-                // NNTP terminator (.\r\n or .\n) — stop decoding.
-                // Update CRC and return.
-                if dst > crc_pos {
-                    state.crc.update(&output[crc_pos..dst]);
-                }
-                state.bytes_decoded += dst as u64;
-                return Ok(dst);
-            } else if next == b'.' {
-                // Dot-stuffed line: skip the stuffed dot, continue with data.
-                src += 1;
-                state.at_line_start = false;
-            } else {
-                // Dot was actual encoded data.
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
-                }
-                output[dst] = b'.'.wrapping_sub(42);
-                dst += 1;
-                state.at_line_start = false;
-            }
-        }
-    }
-
-    while src < input.len() {
-        let byte = input[src];
-
-        // NNTP dot-unstuffing: if at the start of a line and byte is '.'.
-        if options.dot_unstuffing && state.at_line_start && byte == b'.' {
-            src += 1;
-            if src >= input.len() {
-                // Chunk ended right after a dot at line start.
-                // Defer to next chunk — it will resolve via dot_pending.
-                state.dot_pending = true;
-                state.at_line_start = false;
-                break;
-            }
-            let next = input[src];
-            if next == b'\r' || next == b'\n' {
-                // NNTP article terminator.
-                break;
-            }
-            if next != b'.' {
-                // The dot was actual encoded data.
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
-                }
-                output[dst] = b'.'.wrapping_sub(42);
-                dst += 1;
-            }
-            state.at_line_start = false;
-            continue;
-        }
-
-        match byte {
-            b'\r' | b'\n' => {
-                src += 1;
-                if byte == b'\n' {
-                    state.at_line_start = true;
-                }
-                // \r also sets at_line_start for compatibility with the
-                // existing decode_body behavior.
-                if byte == b'\r' {
-                    state.at_line_start = true;
-                }
-            }
-            b'=' => {
-                state.at_line_start = false;
-                src += 1;
-                if src >= input.len() {
-                    // Chunk ended with '=' — the escaped byte is in the next chunk.
-                    state.escape_pending = true;
-                    break;
-                }
-                let escaped = input[src];
-                if dst >= output.len() {
-                    return Err(YencError::BufferTooSmall {
-                        needed: dst + 1,
-                        available: output.len(),
-                    });
-                }
-                output[dst] = escaped.wrapping_sub(106);
-                dst += 1;
-                src += 1;
-            }
-            _ => {
-                state.at_line_start = false;
-                let (consumed, written) = crate::simd::decode_normal_run(input, src, output, dst);
-                if written == 0 {
-                    if dst >= output.len() {
-                        return Err(YencError::BufferTooSmall {
-                            needed: dst + 1,
-                            available: output.len(),
-                        });
-                    }
-                    output[dst] = byte.wrapping_sub(42);
-                    dst += 1;
-                    src += 1;
-                } else {
-                    src += consumed;
-                    dst += written;
-                }
-            }
-        }
-    }
+    let written = crate::simd::decode_chunk_into(input, output, state, options.dot_unstuffing)?;
 
     // Final CRC update for any remaining decoded bytes in this chunk.
-    if dst > crc_pos {
-        state.crc.update(&output[crc_pos..dst]);
+    if written > 0 {
+        state.crc.update(&output[..written]);
     }
 
-    state.bytes_decoded += dst as u64;
-    Ok(dst)
+    state.bytes_decoded += written as u64;
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -713,6 +475,101 @@ mod tests {
             out.extend(yenc_encode_byte(b));
         }
         out
+    }
+
+    fn decode_body_bytes(input: &[u8], opts: DecodeOptions) -> Result<Vec<u8>, YencError> {
+        let mut output = vec![0u8; input.len().saturating_add(64)];
+        let mut crc = Crc32::new();
+        let written = decode_body(input, &mut output, &mut crc, opts)?;
+        output.truncate(written);
+        Ok(output)
+    }
+
+    fn decode_chunked_bytes(
+        input: &[u8],
+        opts: DecodeOptions,
+        splits: &[usize],
+    ) -> Result<Vec<u8>, YencError> {
+        let mut state = DecodeState::new();
+        let mut output = vec![0u8; input.len().saturating_add(64)];
+        let mut written = 0usize;
+        let mut start = 0usize;
+
+        for &end in splits {
+            let end = end.min(input.len());
+            let n = decode_chunk(&input[start..end], &mut output[written..], &mut state, opts)?;
+            written += n;
+            start = end;
+        }
+
+        if start < input.len() {
+            let n = decode_chunk(&input[start..], &mut output[written..], &mut state, opts)?;
+            written += n;
+        }
+
+        output.truncate(written);
+        Ok(output)
+    }
+
+    fn reference_decode_body(input: &[u8], dot_unstuffing: bool) -> Result<Vec<u8>, YencError> {
+        let mut output = Vec::with_capacity(input.len());
+        let mut src = 0usize;
+        let mut at_crlf = true;
+
+        while src < input.len() {
+            let byte = input[src];
+
+            if dot_unstuffing && at_crlf && byte == b'.' {
+                src += 1;
+                if src >= input.len() {
+                    break;
+                }
+
+                let next = input[src];
+                if matches!(next, b'\r' | b'\n') {
+                    break;
+                }
+                at_crlf = false;
+                continue;
+            }
+
+            match byte {
+                b'\r' => {
+                    src += 1;
+                    if src < input.len() && input[src] == b'\n' {
+                        src += 1;
+                        at_crlf = true;
+                    } else {
+                        at_crlf = false;
+                    }
+                }
+                b'\n' => {
+                    src += 1;
+                    at_crlf = false;
+                }
+                b'=' => {
+                    src += 1;
+                    if src >= input.len() {
+                        return Err(YencError::MalformedEscape(src - 1));
+                    }
+                    output.push(input[src].wrapping_sub(106));
+                    src += 1;
+                    at_crlf = false;
+                }
+                _ => {
+                    output.push(byte.wrapping_sub(42));
+                    src += 1;
+                    at_crlf = false;
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn lcg_next(seed: &mut u64) -> u8 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*seed >> 32) as u8
     }
 
     #[test]
@@ -1402,16 +1259,16 @@ mod tests {
         assert!(!state.dot_pending);
 
         let total = n1 + n2;
-        assert_eq!(total, 2); // 'A' and 'B'
+        assert_eq!(total, 3); // 'A', dot-unstuffed '.', and 'B'
         assert_eq!(output[0], b'A');
-        assert_eq!(output[1], b'B');
+        assert_eq!(output[1], b'.'.wrapping_sub(42));
+        assert_eq!(output[2], b'B');
     }
 
     #[test]
     fn decode_chunk_dot_pending_data() {
         // Chunk1 ends with \r\n + '.', chunk2 starts with a normal byte.
-        // The dot was actual encoded data (shouldn't normally happen in NNTP,
-        // but we handle it gracefully).
+        // rapidyenc treats the dot as NNTP stuffing and strips it.
         let opts = DecodeOptions {
             dot_unstuffing: true,
         };
@@ -1425,16 +1282,181 @@ mod tests {
         let n1 = decode_chunk(&chunk1, &mut output, &mut state, opts).unwrap();
         assert!(state.dot_pending);
 
-        // Chunk 2: starts with 'k' — dot was data.
+        // Chunk 2 starts with encoded 'B'; the pending dot is stripped.
         let mut chunk2 = Vec::new();
         chunk2.extend(yenc_encode_byte(b'B'));
 
         let n2 = decode_chunk(&chunk2, &mut output[n1..], &mut state, opts).unwrap();
 
         let total = n1 + n2;
-        assert_eq!(total, 3); // 'A', decoded dot, 'B'
+        assert_eq!(total, 2); // 'A', stripped stuffed dot, 'B'
         assert_eq!(output[0], b'A');
-        assert_eq!(output[1], b'.'.wrapping_sub(42)); // dot decoded as data
-        assert_eq!(output[2], b'B');
+        assert_eq!(output[1], b'B');
+    }
+
+    #[test]
+    fn decode_body_dense_escape_clusters() {
+        let input = b"=====\r\n==A=B=C===\n==";
+        let expected = reference_decode_body(input, false).unwrap();
+        let decoded = decode_body_bytes(input, DecodeOptions::default()).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_body_raw_escaped_cr_carries_into_crlf_dot_state() {
+        let input = b"A=\r\n.B";
+        let decoded = decode_body_bytes(
+            input,
+            DecodeOptions {
+                dot_unstuffing: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded,
+            vec![
+                b'A'.wrapping_sub(42),
+                b'\r'.wrapping_sub(106),
+                b'B'.wrapping_sub(42),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_body_rapidyenc_generic_special_pattern() {
+        // Ported from rapidyenc's generic decode fixture: dots decode to 0x04,
+        // CRLF is skipped, and =n decodes to the same byte.
+        let input = b"\x2e\x2e\x2e\x2e\x2e\x2e\x0d\x0a\x3d\x6e\x2e\x2e\x2e";
+        let decoded = decode_body_bytes(input, DecodeOptions::default()).unwrap();
+
+        assert_eq!(decoded, vec![0x04; 10]);
+    }
+
+    #[test]
+    fn decode_body_crlf_dot_and_nntp_terminator() {
+        let input = b"AB\r\n..CD\r\n.\r\nEF";
+        let expected = reference_decode_body(input, true).unwrap();
+        let decoded = decode_body_bytes(
+            input,
+            DecodeOptions {
+                dot_unstuffing: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            decoded,
+            vec![
+                b'A'.wrapping_sub(42),
+                b'B'.wrapping_sub(42),
+                b'.'.wrapping_sub(42),
+                b'C'.wrapping_sub(42),
+                b'D'.wrapping_sub(42),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_body_crlf_control_boundaries() {
+        for input in [
+            b"AB\r\n=yignored".as_slice(),
+            b"AB\r\n.=yignored".as_slice(),
+        ] {
+            let decoded = decode_body_bytes(
+                input,
+                DecodeOptions {
+                    dot_unstuffing: true,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(decoded, vec![b'A'.wrapping_sub(42), b'B'.wrapping_sub(42)]);
+        }
+    }
+
+    #[test]
+    fn decode_chunk_splits_at_critical_boundaries() {
+        let input = b"AB=\r\n..CD\r\n.EF";
+        let opts = DecodeOptions {
+            dot_unstuffing: true,
+        };
+
+        for split in 0..=input.len() {
+            let mut state = DecodeState::new();
+            let mut output = vec![0u8; 128];
+            let n1 = decode_chunk(&input[..split], &mut output, &mut state, opts).unwrap();
+            let n2 = decode_chunk(&input[split..], &mut output[n1..], &mut state, opts).unwrap();
+            let mut decoded = output;
+            decoded.truncate(n1 + n2);
+
+            let expected = decode_chunked_bytes(input, opts, &[input.len()]).unwrap();
+            assert_eq!(decoded, expected, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn decode_chunked_matches_whole_body_for_many_split_patterns() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"clean-clean-clean");
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(b"..dotstuffed");
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(b"==A=B=C");
+        input.extend_from_slice(b"\n");
+        input.extend_from_slice(b"tail");
+
+        let opts = DecodeOptions {
+            dot_unstuffing: true,
+        };
+        let whole = decode_body_bytes(&input, opts).unwrap();
+
+        for stride in 1..=9 {
+            let splits = (stride..input.len()).step_by(stride).collect::<Vec<_>>();
+            let chunked = decode_chunked_bytes(&input, opts, &splits).unwrap();
+            assert_eq!(chunked, whole, "stride {stride}");
+        }
+    }
+
+    #[test]
+    fn decode_body_randomized_reference_cross_check() {
+        let mut seed = 0x1234_5678_90ab_cdefu64;
+
+        for len in [0usize, 1, 2, 3, 7, 16, 31, 64, 257, 1024] {
+            let mut input = Vec::with_capacity(len);
+            for idx in 0..len {
+                let byte = match lcg_next(&mut seed) % 17 {
+                    0 => b'=',
+                    1 => b'\r',
+                    2 => b'\n',
+                    3 if idx % 11 == 0 => b'.',
+                    _ => {
+                        let candidate = 33u8.wrapping_add(lcg_next(&mut seed) % 90);
+                        if matches!(candidate, b'=' | b'\r' | b'\n') {
+                            b'X'
+                        } else {
+                            candidate
+                        }
+                    }
+                };
+                input.push(byte);
+            }
+
+            if input.last() == Some(&b'=') {
+                input.push(b'A');
+            }
+
+            for dot_unstuffing in [false, true] {
+                let opts = DecodeOptions { dot_unstuffing };
+                let expected = reference_decode_body(&input, dot_unstuffing).unwrap();
+                let decoded = decode_body_bytes(&input, opts).unwrap();
+                assert_eq!(
+                    decoded, expected,
+                    "len {len}, dot_unstuffing {dot_unstuffing}"
+                );
+            }
+        }
     }
 }
