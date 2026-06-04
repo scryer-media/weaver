@@ -8,7 +8,7 @@ use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use std::io::Write;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tower::ServiceExt;
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
@@ -19,7 +19,11 @@ use weaver_server_core::auth::{
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
-use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SharedPipelineState};
+use weaver_server_core::settings::model::{Config, SharedConfig};
+use weaver_server_core::{
+    JobInfo, JobSpec, JobStatus, MetricsSnapshot, SchedulerCommand, SchedulerError,
+    SharedPipelineState,
+};
 
 fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
     Router::new()
@@ -75,6 +79,762 @@ fn test_scheduler_handle() -> SchedulerHandle {
     let (event_tx, _) = broadcast::channel(1);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     SchedulerHandle::new(cmd_tx, event_tx, shared_state)
+}
+
+fn test_config() -> SharedConfig {
+    Arc::new(RwLock::new(Config {
+        data_dir: "/tmp/weaver".to_string(),
+        intermediate_dir: None,
+        complete_dir: None,
+        buffer_pool: None,
+        tuner: None,
+        servers: vec![],
+        categories: vec![],
+        retry: None,
+        max_download_speed: None,
+        cleanup_after_extract: None,
+        isp_bandwidth_cap: None,
+        diagnostic_upload_url: None,
+        config_path: None,
+    }))
+}
+
+fn nzbget_test_router(
+    db: Database,
+    handle: SchedulerHandle,
+    config: SharedConfig,
+    api_key_cache: ApiKeyCache,
+) -> Router {
+    let auth_cache = LoginAuthCache::default();
+    let session_token = SessionToken(Arc::new("session-token".to_string()));
+    let context = nzbget::NzbgetFacadeContext::new(
+        db,
+        handle,
+        config,
+        auth_cache,
+        api_key_cache,
+        session_token,
+    );
+
+    Router::new()
+        .route("/jsonrpc", post(nzbget::jsonrpc_handler))
+        .layer(Extension(context))
+}
+
+fn api_key_cache(raw_key: &str, scope: &str) -> ApiKeyCache {
+    let cache = ApiKeyCache::default();
+    cache.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(raw_key),
+        id: 42,
+        scope: scope.to_string(),
+    });
+    cache
+}
+
+fn scheduler_handle_with_mock_commands(jobs: Vec<JobInfo>) -> SchedulerHandle {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+    let (event_tx, _) = broadcast::channel(16);
+    let shared_state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+    let state = shared_state.clone();
+    tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            match command {
+                SchedulerCommand::AddJob {
+                    job_id,
+                    spec,
+                    reply,
+                    ..
+                } => {
+                    let mut jobs = state.list_jobs();
+                    jobs.push(job_info_from_spec(job_id, spec));
+                    state.publish_jobs(jobs);
+                    let _ = reply.send(Ok(()));
+                }
+                SchedulerCommand::PauseJob { job_id, reply } => {
+                    let result = update_mock_job(&state, job_id, |job| {
+                        job.status = JobStatus::Paused;
+                        job.download_state = weaver_server_core::DownloadState::Queued;
+                    });
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::CancelJob { job_id, reply } => {
+                    let mut jobs = state.list_jobs();
+                    let original_len = jobs.len();
+                    jobs.retain(|job| job.job_id != job_id);
+                    let result = if jobs.len() == original_len {
+                        Err(SchedulerError::JobNotFound(job_id))
+                    } else {
+                        state.publish_jobs(jobs);
+                        Ok(())
+                    };
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::DeleteHistory { reply, .. }
+                | SchedulerCommand::RedownloadJob { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                _ => {}
+            }
+        }
+    });
+    SchedulerHandle::new(cmd_tx, event_tx, shared_state)
+}
+
+fn update_mock_job(
+    state: &SharedPipelineState,
+    job_id: JobId,
+    update: impl FnOnce(&mut JobInfo),
+) -> Result<(), SchedulerError> {
+    let mut jobs = state.list_jobs();
+    let Some(job) = jobs.iter_mut().find(|job| job.job_id == job_id) else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    update(job);
+    state.publish_jobs(jobs);
+    Ok(())
+}
+
+fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
+    JobInfo {
+        job_id,
+        job_hash: None,
+        name: spec.name,
+        status: JobStatus::Queued,
+        download_state: weaver_server_core::DownloadState::Queued,
+        post_state: weaver_server_core::PostState::Idle,
+        run_state: weaver_server_core::RunState::Active,
+        progress: 0.0,
+        total_bytes: spec.total_bytes,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        password: spec.password,
+        category: spec.category,
+        metadata: spec.metadata,
+        output_dir: None,
+        error: None,
+        created_at_epoch_ms: 1_700_000_000_000.0,
+    }
+}
+
+async fn post_nzbget(
+    app: Router,
+    request: serde_json::Value,
+    auth_value: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::AUTHORIZATION, auth_value)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload = serde_json::from_slice(&body).unwrap();
+    (status, payload)
+}
+
+fn basic_auth(password: &str) -> String {
+    use base64::Engine as _;
+
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("arr:{password}"))
+    )
+}
+
+fn nzbget_test_job(
+    job_id: u64,
+    status: JobStatus,
+    download_state: weaver_server_core::DownloadState,
+    total_bytes: u64,
+    downloaded_bytes: u64,
+    metadata: Vec<(String, String)>,
+) -> JobInfo {
+    JobInfo {
+        job_id: JobId(job_id),
+        job_hash: None,
+        name: "Friends.S05.720p.BluRay.DD5.1.x264-NTb".into(),
+        status,
+        download_state,
+        post_state: weaver_server_core::PostState::Idle,
+        run_state: weaver_server_core::RunState::Active,
+        progress: if total_bytes == 0 {
+            0.0
+        } else {
+            downloaded_bytes as f64 / total_bytes as f64
+        },
+        total_bytes,
+        downloaded_bytes,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        password: None,
+        category: Some("tv".into()),
+        metadata,
+        output_dir: Some("/downloads/tv/Friends".into()),
+        error: None,
+        created_at_epoch_ms: 1_700_000_000_000.0,
+    }
+}
+
+#[tokio::test]
+async fn nzbget_version_uses_jsonrpc_11_envelope_and_echoes_id() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "version",
+            "params": [],
+            "id": "arr-version"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["version"], "1.1");
+    assert_eq!(payload["id"], "arr-version");
+    assert_eq!(payload["result"], "16.0-weaver");
+}
+
+#[tokio::test]
+async fn nzbget_unknown_method_returns_nzbget_error_envelope() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "loadlog",
+            "params": [],
+            "id": 12
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["version"], "1.1");
+    assert_eq!(payload["id"], 12);
+    assert_eq!(payload["error"]["name"], "JSONRPCError");
+    assert_eq!(payload["error"]["code"], 1);
+}
+
+#[tokio::test]
+async fn nzbget_rbac_allows_read_keys_and_rejects_read_key_mutations() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "status",
+            "params": [],
+            "id": "read-ok"
+        }),
+        "Bearer read-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload.get("result").is_some());
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [],
+            "id": "read-denied"
+        }),
+        "Bearer read-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["error"]["code"], 401);
+}
+
+#[tokio::test]
+async fn nzbget_auth_accepts_basic_password_as_weaver_token() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "version",
+            "params": [],
+            "id": "basic"
+        }),
+        &basic_auth("session-token"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], "16.0-weaver");
+}
+
+#[tokio::test]
+async fn nzbget_auth_rejects_missing_and_invalid_basic_auth() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let request = serde_json::json!({
+        "method": "version",
+        "params": [],
+        "id": "auth"
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, payload) = post_nzbget(app, request, "Basic not-base64").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"]["code"], 401);
+}
+
+#[tokio::test]
+async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD
+        .encode(minimal_nzb("Friends.S05.720p.BluRay.DD5.1.x264-NTb"));
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb",
+                nzb_b64,
+                "tv",
+                50,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["drone", "sonarrdroneid"]
+            ],
+            "id": "append"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].category.as_deref(), Some("tv"));
+    assert!(jobs[0].metadata.iter().any(|(key, value)| {
+        key == weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY && value == "sonarrdroneid"
+    }));
+    assert!(
+        jobs[0].metadata.iter().any(|(key, value)| key
+            == weaver_server_api::PRIORITY_ATTRIBUTE_KEY
+            && value == "HIGH")
+    );
+}
+
+#[tokio::test]
+async fn nzbget_append_fetches_url_payloads_for_prowlarr_shape() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let xml = minimal_nzb("Prowlarr.Release.2026.1080p");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-nzb\r\n\
+             Content-Disposition: attachment; filename=\"Prowlarr.Release.2026.1080p.nzb\"\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            xml.len(),
+            xml
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "",
+                format!("http://{addr}/download.nzb"),
+                "Prowlarr",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["drone", "prowlarrdroneid"]
+            ],
+            "id": "append-url"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    server.await.unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].category.as_deref(), Some("Prowlarr"));
+    assert!(jobs[0].metadata.iter().any(|(key, value)| {
+        key == weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY && value == "prowlarrdroneid"
+    }));
+}
+
+#[tokio::test]
+async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
+    let job = nzbget_test_job(
+        42,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        6_000_000_000,
+        1_500_000_000,
+        vec![
+            (
+                weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                "drone-progress".to_string(),
+            ),
+            (
+                weaver_server_api::PRIORITY_ATTRIBUTE_KEY.to_string(),
+                "HIGH".to_string(),
+            ),
+            ("drone".to_string(), "spoofed-drone".to_string()),
+        ],
+    );
+    let metrics = PipelineMetrics::new();
+    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+    let (event_tx, _) = broadcast::channel(1);
+    let shared_state = SharedPipelineState::new(metrics.clone(), vec![job]);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    metrics
+        .bytes_downloaded
+        .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
+    shared_state.refresh_metrics_snapshot();
+    let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, status_payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "status",
+            "params": [],
+            "id": "status"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_payload["result"]["RemainingSizeHi"], 1);
+    assert_eq!(status_payload["result"]["DownloadPaused"], false);
+    assert!(
+        status_payload["result"]["DownloadRate"].as_u64().unwrap() > 0,
+        "status should use the speed-bearing metrics snapshot"
+    );
+
+    let (status, groups_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "listgroups",
+            "params": [],
+            "id": "listgroups"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let group = &groups_payload["result"][0];
+    assert_eq!(group["NZBID"], 42);
+    assert_eq!(group["NZBName"], "Friends.S05.720p.BluRay.DD5.1.x264-NTb");
+    assert_eq!(group["FileSizeHi"], 1);
+    assert_eq!(group["RemainingSizeHi"], 1);
+    assert_eq!(group["PausedSizeLo"], 0);
+    assert_eq!(group["ActiveDownloads"], 1);
+    assert_eq!(group["Status"], "DOWNLOADING");
+    let parameters = group["Parameters"].as_array().unwrap();
+    let drone_parameters = parameters
+        .iter()
+        .filter(|parameter| parameter["Name"] == "drone")
+        .collect::<Vec<_>>();
+    assert_eq!(drone_parameters.len(), 1);
+    assert_eq!(drone_parameters[0]["Value"], "drone-progress");
+}
+
+#[tokio::test]
+async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
+    let db = Database::open_in_memory().unwrap();
+    let metadata = serde_json::to_string(&vec![(
+        weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+        "drone-history".to_string(),
+    )])
+    .unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 100,
+        job_hash: None,
+        name: "Complete.Release".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".into()),
+        output_dir: Some("/downloads/tv/Complete.Release".into()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(metadata),
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    })
+    .unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 101,
+        job_hash: None,
+        name: "Failed.Release".into(),
+        status: "failed".into(),
+        error_message: Some("article failures".into()),
+        total_bytes: 456,
+        downloaded_bytes: 100,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 356,
+        health: 100,
+        category: Some("tv".into()),
+        output_dir: Some("/downloads/tv/Failed.Release".into()),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_200,
+        metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "history",
+            "params": [],
+            "id": "history"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = payload["result"].as_array().unwrap();
+    let complete = items.iter().find(|item| item["ID"] == 100).unwrap();
+    let failed = items.iter().find(|item| item["ID"] == 101).unwrap();
+    assert_eq!(complete["ParStatus"], "SUCCESS");
+    assert_eq!(complete["UnpackStatus"], "SUCCESS");
+    assert_eq!(complete["Parameters"][0]["Name"], "drone");
+    assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
+    assert_eq!(failed["ParStatus"], "FAILURE");
+    assert_eq!(failed["Message"], "article failures");
+}
+
+#[tokio::test]
+async fn nzbget_config_exposes_real_categories_and_keep_history() {
+    let config = test_config();
+    {
+        let mut config_write = config.write().await;
+        config_write
+            .categories
+            .push(weaver_server_core::categories::CategoryConfig {
+                id: 1,
+                name: "tv".into(),
+                dest_dir: Some("/media/tv".into()),
+                aliases: "series,shows".into(),
+            });
+    }
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        config,
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "config",
+            "params": [],
+            "id": "config"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    let value_for = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["Name"] == name)
+            .and_then(|entry| entry["Value"].as_str())
+            .unwrap()
+    };
+    assert_eq!(value_for("KeepHistory"), "7");
+    assert_eq!(value_for("Category1.Name"), "tv");
+    assert_eq!(value_for("Category1.DestDir"), "/media/tv");
+    assert_eq!(value_for("Category1.Aliases"), "series,shows");
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_maps_arr_actions() {
+    let job = nzbget_test_job(
+        77,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupFinalDelete", 0, "", 77],
+            "id": "delete"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert!(handle.list_jobs().is_empty());
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["HistoryDelete", 0, "", 77],
+            "id": "history-delete"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["HistoryRedownload", 0, "", 77],
+            "id": "history-redownload"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["UnsupportedAction", 0, "", 77],
+            "id": "unsupported"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 3);
 }
 
 #[tokio::test]

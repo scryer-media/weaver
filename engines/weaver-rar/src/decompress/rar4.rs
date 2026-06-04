@@ -466,35 +466,10 @@ impl Rar4LzDecoder {
                     });
                 }
 
-                let cmp_byte2 = if filter.filter_type == Rar4StandardFilter::E8E9 {
-                    0xE9
+                if filter.filter_type == Rar4StandardFilter::E8E9 {
+                    super::lz::filter::apply_rar4_e8e9(data, file_offset);
                 } else {
-                    0xE8
-                };
-                let file_size = 0x0100_0000u32;
-                let mut cur_pos = 0usize;
-                while cur_pos + 4 < data_size {
-                    let cur_byte = data[cur_pos];
-                    cur_pos += 1;
-                    if cur_byte == 0xE8 || cur_byte == cmp_byte2 {
-                        let offset = file_offset.wrapping_add(cur_pos as u32);
-                        let addr = u32::from_le_bytes([
-                            data[cur_pos],
-                            data[cur_pos + 1],
-                            data[cur_pos + 2],
-                            data[cur_pos + 3],
-                        ]);
-                        if (addr & 0x8000_0000) != 0 {
-                            if ((addr.wrapping_add(offset)) & 0x8000_0000) == 0 {
-                                let bytes = addr.wrapping_add(file_size).to_le_bytes();
-                                data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
-                            }
-                        } else if ((addr.wrapping_sub(file_size)) & 0x8000_0000) != 0 {
-                            let bytes = addr.wrapping_sub(offset).to_le_bytes();
-                            data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
-                        }
-                        cur_pos += 4;
-                    }
+                    super::lz::filter::apply_rar4_e8(data, file_offset);
                 }
             }
             Rar4StandardFilter::Itanium => {

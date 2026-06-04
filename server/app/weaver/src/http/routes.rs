@@ -15,6 +15,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         api_key_cache,
         backup,
         metrics_exporter,
+        config,
         base_url,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
@@ -25,9 +26,18 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         api_key_cache: api_key_cache.clone(),
         session_token: session_token.clone(),
     };
+    let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
+        db.clone(),
+        handle.clone(),
+        config,
+        auth_cache.clone(),
+        api_key_cache.clone(),
+        session_token.clone(),
+    );
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
+        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
         .route(
@@ -65,6 +75,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(db))
         .layer(Extension(auth_cache))
         .layer(Extension(api_key_cache))
+        .layer(Extension(nzbget_context))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))

@@ -4,6 +4,7 @@ mod backup;
 mod graphql;
 mod jobs;
 mod metrics;
+mod nzbget;
 mod routes;
 
 use std::net::SocketAddr;
@@ -24,6 +25,7 @@ use weaver_server_api::{BackupService, WeaverSchema};
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
+use weaver_server_core::settings::model::SharedConfig;
 
 pub(crate) use self::metrics::PrometheusMetricsExporter;
 
@@ -46,6 +48,7 @@ pub struct ServerRuntime {
     pub api_key_cache: ApiKeyCache,
     pub backup: BackupService,
     pub metrics_exporter: PrometheusMetricsExporter,
+    pub config: SharedConfig,
     pub base_url: String,
 }
 

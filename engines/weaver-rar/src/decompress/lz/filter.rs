@@ -71,20 +71,47 @@ pub fn apply_delta(data: &mut [u8], channels: u8) {
 /// `file_offset` is the absolute position in the output stream where this
 /// block starts.
 pub fn apply_e8(data: &mut [u8], file_offset: u64) {
-    apply_e8e9_inner(data, file_offset, false);
+    apply_e8e9_inner(data, X86FilterOffsetMode::Rar5 { file_offset }, false);
 }
 
 /// Apply the E8E9 filter in-place (x86 CALL + JMP instruction fixup).
 ///
 /// Same as E8 but also processes 0xE9 (JMP) instructions.
 pub fn apply_e8e9(data: &mut [u8], file_offset: u64) {
-    apply_e8e9_inner(data, file_offset, true);
+    apply_e8e9_inner(data, X86FilterOffsetMode::Rar5 { file_offset }, true);
+}
+
+pub(crate) fn apply_rar4_e8(data: &mut [u8], file_offset: u32) {
+    apply_e8e9_inner(data, X86FilterOffsetMode::Rar4 { file_offset }, false);
+}
+
+pub(crate) fn apply_rar4_e8e9(data: &mut [u8], file_offset: u32) {
+    apply_e8e9_inner(data, X86FilterOffsetMode::Rar4 { file_offset }, true);
+}
+
+#[derive(Clone, Copy)]
+enum X86FilterOffsetMode {
+    Rar5 { file_offset: u64 },
+    Rar4 { file_offset: u32 },
+}
+
+impl X86FilterOffsetMode {
+    #[inline]
+    fn address_offset(self, address_start: usize) -> u32 {
+        const FILE_SIZE: u32 = 0x01_00_00_00;
+
+        match self {
+            Self::Rar5 { file_offset } => (address_start as u64 + file_offset) as u32 % FILE_SIZE,
+            Self::Rar4 { file_offset } => file_offset.wrapping_add(address_start as u32),
+        }
+    }
 }
 
 /// Shared implementation for E8 and E8E9 filters.
 ///
-/// RAR5 uses a fixed 16 MiB address window for E8/E9 fixups.
-fn apply_e8e9_inner(data: &mut [u8], file_offset: u64, include_e9: bool) {
+/// Uses `memchr`'s portable safe API for candidate search. Any SIMD dispatch
+/// happens inside `memchr` behind its runtime CPU feature checks and fallback.
+fn apply_e8e9_inner(data: &mut [u8], offset_mode: X86FilterOffsetMode, include_e9: bool) {
     const FILE_SIZE: u32 = 0x01_00_00_00;
     if data.len() < 5 {
         return;
@@ -105,7 +132,7 @@ fn apply_e8e9_inner(data: &mut [u8], file_offset: u64, include_e9: bool) {
         i += found;
 
         let addr = u32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
-        let offset = (((i + 1) as u64) + file_offset) as u32 % FILE_SIZE;
+        let offset = offset_mode.address_offset(i + 1);
 
         if addr & 0x8000_0000 != 0 {
             if addr.wrapping_add(offset) & 0x8000_0000 == 0 {
@@ -228,6 +255,114 @@ mod tests {
 
         let r2 = i32::from_le_bytes([data[11], data[12], data[13], data[14]]);
         assert_eq!(r2, 69); // 80 - 11
+    }
+
+    fn apply_rar4_e8e9_scalar(data: &mut [u8], file_offset: u32, include_e9: bool) {
+        const FILE_SIZE: u32 = 0x01_00_00_00;
+
+        let cmp_byte2 = if include_e9 { 0xE9 } else { 0xE8 };
+        let data_size = data.len();
+        let mut cur_pos = 0usize;
+        while cur_pos + 4 < data_size {
+            let cur_byte = data[cur_pos];
+            cur_pos += 1;
+            if cur_byte == 0xE8 || cur_byte == cmp_byte2 {
+                let offset = file_offset.wrapping_add(cur_pos as u32);
+                let addr = u32::from_le_bytes([
+                    data[cur_pos],
+                    data[cur_pos + 1],
+                    data[cur_pos + 2],
+                    data[cur_pos + 3],
+                ]);
+                if (addr & 0x8000_0000) != 0 {
+                    if ((addr.wrapping_add(offset)) & 0x8000_0000) == 0 {
+                        let bytes = addr.wrapping_add(FILE_SIZE).to_le_bytes();
+                        data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
+                    }
+                } else if ((addr.wrapping_sub(FILE_SIZE)) & 0x8000_0000) != 0 {
+                    let bytes = addr.wrapping_sub(offset).to_le_bytes();
+                    data[cur_pos..cur_pos + 4].copy_from_slice(&bytes);
+                }
+                cur_pos += 4;
+            }
+        }
+    }
+
+    fn rar4_dense_candidate_data() -> Vec<u8> {
+        let mut data = vec![0x11; 96];
+        for (index, pos) in (0..80).step_by(5).enumerate() {
+            data[pos] = if index % 2 == 0 { 0xE8 } else { 0xE9 };
+            let addr = match index % 4 {
+                0 => 0x0000_1234u32,
+                1 => 0x00FF_FF00u32,
+                2 => 0x8000_0010u32,
+                _ => 0xFFFF_FF00u32,
+            };
+            data[pos + 1..pos + 5].copy_from_slice(&addr.to_le_bytes());
+        }
+        data
+    }
+
+    fn rar4_sparse_candidate_data() -> Vec<u8> {
+        let mut data = vec![0x31; 257];
+        for (pos, opcode, addr) in [
+            (3usize, 0xE8u8, 0x0000_2000u32),
+            (64, 0xE9, 0x00FF_FFF0),
+            (129, 0xE8, 0xFFFF_FFF0),
+            (240, 0xE9, 0x0200_0000),
+        ] {
+            data[pos] = opcode;
+            data[pos + 1..pos + 5].copy_from_slice(&addr.to_le_bytes());
+        }
+        data
+    }
+
+    fn assert_rar4_filter_matches_scalar(mut data: Vec<u8>, file_offset: u32, include_e9: bool) {
+        let mut expected = data.clone();
+        apply_rar4_e8e9_scalar(&mut expected, file_offset, include_e9);
+
+        if include_e9 {
+            apply_rar4_e8e9(&mut data, file_offset);
+        } else {
+            apply_rar4_e8(&mut data, file_offset);
+        }
+
+        assert_eq!(
+            data, expected,
+            "include_e9={include_e9} file_offset={file_offset:#010x}"
+        );
+    }
+
+    #[test]
+    fn test_rar4_e8_filter_matches_scalar_reference() {
+        for file_offset in [0, 0x00FF_FFFC, 0x0100_0000, 0xFFFF_FFF0] {
+            assert_rar4_filter_matches_scalar(rar4_dense_candidate_data(), file_offset, false);
+            assert_rar4_filter_matches_scalar(rar4_sparse_candidate_data(), file_offset, false);
+        }
+    }
+
+    #[test]
+    fn test_rar4_e8e9_filter_matches_scalar_reference() {
+        for file_offset in [0, 0x00FF_FFFC, 0x0100_0000, 0xFFFF_FFF0] {
+            assert_rar4_filter_matches_scalar(rar4_dense_candidate_data(), file_offset, true);
+            assert_rar4_filter_matches_scalar(rar4_sparse_candidate_data(), file_offset, true);
+        }
+    }
+
+    #[test]
+    fn test_rar4_short_and_no_candidate_filters_match_scalar_reference() {
+        for data in [
+            Vec::new(),
+            vec![0xE8],
+            vec![0xE8, 0x01, 0x00],
+            vec![0xE9, 0x01, 0x00, 0x00],
+            vec![0x22; 64],
+        ] {
+            for file_offset in [0, 0x0100_0000, 0xFFFF_FFF0] {
+                assert_rar4_filter_matches_scalar(data.clone(), file_offset, false);
+                assert_rar4_filter_matches_scalar(data.clone(), file_offset, true);
+            }
+        }
     }
 
     #[test]

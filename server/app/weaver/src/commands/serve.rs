@@ -93,7 +93,7 @@ pub(crate) async fn run(
     let pipeline_config = shared_config.clone();
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
         handle: handle.clone(),
-        config: shared_config,
+        config: shared_config.clone(),
         db: db.clone(),
         auth_cache: login_auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
@@ -147,6 +147,7 @@ pub(crate) async fn run(
         api_key_cache,
         backup,
         metrics_exporter,
+        config: shared_config.clone(),
         base_url,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
