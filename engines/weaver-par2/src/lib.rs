@@ -30,8 +30,6 @@ compile_error!(
 pub mod checksum;
 pub mod disk;
 pub mod error;
-pub mod gf;
-pub mod gf_simd;
 pub mod matrix;
 pub mod md5_simd;
 pub mod packet;
@@ -84,3 +82,4 @@ pub use verify::{
     verify_selected_file_ids, verify_selected_file_ids_with_options, verify_slices,
     verify_slices_from_crcs,
 };
+pub use weaver_reed_solomon::{gf, gf_simd};

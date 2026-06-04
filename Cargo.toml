@@ -8,6 +8,7 @@ members = [
     "engines/weaver-nntp",
     "engines/weaver-nzb",
     "engines/weaver-yenc",
+    "engines/weaver-reed-solomon",
     "engines/weaver-par2",
     "engines/weaver-rar",
 ]

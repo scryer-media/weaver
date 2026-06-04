@@ -89,6 +89,13 @@ impl DownloadQueue {
         self.heap.iter().any(|item| item.0.work.is_recovery)
     }
 
+    pub fn count_matching(&self, mut predicate: impl FnMut(&DownloadWork) -> bool) -> usize {
+        self.heap
+            .iter()
+            .filter(|item| predicate(&item.0.work))
+            .count()
+    }
+
     pub fn has_primary_work(&self) -> bool {
         self.heap.iter().any(|item| !item.0.work.is_recovery)
     }

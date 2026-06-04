@@ -1159,8 +1159,23 @@ fn write_workspace_version(path: &Path, version: &Version) -> Result<()> {
     Ok(())
 }
 
+fn linux_clippy_defaults(host_target: &str) -> (&'static str, &'static str) {
+    if host_target.starts_with("aarch64-") {
+        ("aarch64-unknown-linux-musl", "linux/arm64")
+    } else {
+        ("x86_64-unknown-linux-musl", "linux/amd64")
+    }
+}
+
+fn cargo_target_env_key(target: &str, suffix: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_{}",
+        target.replace('-', "_").to_ascii_uppercase(),
+        suffix
+    )
+}
+
 fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
-    let linux_target = "x86_64-unknown-linux-musl";
     let mut rustc = ctx.command("rustc");
     rustc.arg("-vV");
     let host_target = run_capture(&mut rustc)?
@@ -1169,14 +1184,22 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("failed to determine host target"))?
         .trim()
         .to_string();
+    let (default_linux_target, default_linux_platform) = linux_clippy_defaults(&host_target);
+    let linux_target =
+        std::env::var("WEAVER_LINUX_CLIPPY_TARGET").unwrap_or_else(|_| default_linux_target.into());
     let linux_image = std::env::var("WEAVER_LINUX_CLIPPY_IMAGE")
         .unwrap_or_else(|_| "rust:1.95-bookworm".to_string());
-    let linux_platform =
-        std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string());
-    let linux_rustflags = ci_rustflags_for_target(linux_target, ReleaseLane::Portable)?;
-    let linux_rustflags_env =
-        format!("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS={linux_rustflags}");
-    let linux_linker_env = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc";
+    let linux_platform = std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM")
+        .unwrap_or_else(|_| default_linux_platform.into());
+    let linux_rustflags = ci_rustflags_for_target(&linux_target, ReleaseLane::Portable)?;
+    let linux_rustflags_env = format!(
+        "{}={linux_rustflags}",
+        cargo_target_env_key(&linux_target, "RUSTFLAGS")
+    );
+    let linux_linker_env = format!("{}=musl-gcc", cargo_target_env_key(&linux_target, "LINKER"));
+    let linux_clippy_script = format!(
+        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --target {linux_target} -- -D warnings"
+    );
 
     if !args.linux_only {
         println!("Running cargo clippy for host target: {host_target}");
@@ -1217,24 +1240,24 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "-e",
                 &linux_rustflags_env,
                 "-e",
-                linux_linker_env,
+                &linux_linker_env,
                 &linux_image,
                 "bash",
                 "-lc",
-                "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add x86_64-unknown-linux-musl; cargo clippy --workspace --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings",
+                &linux_clippy_script,
             ]);
             run_checked(&mut command)?;
         } else if command_available("musl-gcc")? {
             let mut target_add = ctx.command("rustup");
-            target_add.args(["target", "add", linux_target]);
+            target_add.args(["target", "add", &linux_target]);
             run_checked(&mut target_add)?;
 
             let mut command = ctx.command_in("cargo", &ctx.repo_root);
             command.env(
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+                cargo_target_env_key(&linux_target, "RUSTFLAGS"),
                 &linux_rustflags,
             );
-            command.env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "musl-gcc");
+            command.env(cargo_target_env_key(&linux_target, "LINKER"), "musl-gcc");
             command.args([
                 "clippy",
                 "--workspace",
@@ -1243,7 +1266,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 "--tests",
                 "--examples",
                 "--target",
-                linux_target,
+                &linux_target,
                 "--",
                 "-D",
                 "warnings",
@@ -2576,6 +2599,34 @@ mod tests {
         let reason =
             release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn linux_clippy_defaults_follow_host_architecture() {
+        assert_eq!(
+            linux_clippy_defaults("aarch64-apple-darwin"),
+            ("aarch64-unknown-linux-musl", "linux/arm64")
+        );
+        assert_eq!(
+            linux_clippy_defaults("aarch64-unknown-linux-gnu"),
+            ("aarch64-unknown-linux-musl", "linux/arm64")
+        );
+        assert_eq!(
+            linux_clippy_defaults("x86_64-apple-darwin"),
+            ("x86_64-unknown-linux-musl", "linux/amd64")
+        );
+    }
+
+    #[test]
+    fn cargo_target_env_key_matches_cargo_target_config_names() {
+        assert_eq!(
+            cargo_target_env_key("aarch64-unknown-linux-musl", "RUSTFLAGS"),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
+        );
+        assert_eq!(
+            cargo_target_env_key("x86_64-unknown-linux-musl", "LINKER"),
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+        );
     }
 
     #[test]

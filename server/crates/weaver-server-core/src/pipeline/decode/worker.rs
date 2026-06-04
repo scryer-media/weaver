@@ -71,17 +71,28 @@ impl Pipeline {
             .map_err(|error| format!("failed to hash completed file: {error}"))
     }
 
-    pub(crate) fn note_decode_started(&mut self, job_id: JobId) {
+    pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
         *self.active_decodes_by_job.entry(job_id).or_default() += 1;
+        *self
+            .active_decodes_by_file
+            .entry(segment_id.file_id)
+            .or_default() += 1;
     }
 
-    fn note_decode_finished(&mut self, job_id: JobId) {
-        let Some(active) = self.active_decodes_by_job.get_mut(&job_id) else {
-            return;
-        };
-        *active = active.saturating_sub(1);
-        if *active == 0 {
-            self.active_decodes_by_job.remove(&job_id);
+    fn note_decode_finished(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        if let Some(active) = self.active_decodes_by_job.get_mut(&job_id) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.active_decodes_by_job.remove(&job_id);
+            }
+        }
+        if let Some(active) = self.active_decodes_by_file.get_mut(&segment_id.file_id) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.active_decodes_by_file.remove(&segment_id.file_id);
+            }
         }
     }
 
@@ -179,11 +190,11 @@ impl Pipeline {
     pub(crate) async fn handle_decode_done(&mut self, result: DecodeDone) {
         self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
 
-        let job_id = match &result {
-            DecodeDone::Success(result) => result.segment_id.file_id.job_id,
-            DecodeDone::Failed { segment_id, .. } => segment_id.file_id.job_id,
+        let segment_id = match &result {
+            DecodeDone::Success(result) => result.segment_id,
+            DecodeDone::Failed { segment_id, .. } => *segment_id,
         };
-        self.note_decode_finished(job_id);
+        self.note_decode_finished(segment_id);
 
         match result {
             DecodeDone::Success(result) => self.handle_decode_success(result).await,
@@ -259,6 +270,7 @@ impl Pipeline {
                     state.failed_bytes += seg_spec.bytes as u64;
                 }
             }
+            self.mark_promoted_recovery_segment_unavailable(segment_id);
             self.check_health(job_id);
             return;
         }
@@ -288,7 +300,7 @@ impl Pipeline {
                     .segments_retried
                     .fetch_add(1, Ordering::Relaxed);
                 let delay = std::time::Duration::from_secs(1 << (retry_count - 1));
-                self.note_retry_scheduled(job_id);
+                self.note_retry_scheduled(segment_id);
                 warn!(
                     segment = %segment_id,
                     error,
@@ -611,6 +623,8 @@ impl Pipeline {
 
                 if file_complete {
                     self.note_file_progress_floor(file_id, total_bytes, true);
+                    self.unavailable_promoted_recovery_segments
+                        .retain(|segment_id| segment_id.file_id != file_id);
                     let file_path = working_dir.join(filename);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let leftovers = write_buf.flush_all();

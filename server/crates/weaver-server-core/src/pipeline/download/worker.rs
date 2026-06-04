@@ -48,17 +48,29 @@ impl Pipeline {
             .sum()
     }
 
-    pub(crate) fn note_retry_scheduled(&mut self, job_id: JobId) {
+    pub(crate) fn note_retry_scheduled(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
+        *self
+            .pending_retries_by_segment
+            .entry(segment_id)
+            .or_default() += 1;
     }
 
-    pub(crate) fn note_retry_requeued(&mut self, job_id: JobId) {
+    pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
         let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) else {
             return;
         };
         *pending = pending.saturating_sub(1);
         if *pending == 0 {
             self.pending_retries_by_job.remove(&job_id);
+        }
+        if let Some(pending) = self.pending_retries_by_segment.get_mut(&segment_id) {
+            *pending = pending.saturating_sub(1);
+            if *pending == 0 {
+                self.pending_retries_by_segment.remove(&segment_id);
+            }
         }
     }
 
@@ -285,7 +297,7 @@ impl Pipeline {
             }
 
             if work.raw.len() > crate::runtime::buffers::BufferTier::Large.size_bytes() {
-                self.note_decode_started(job_id);
+                self.note_decode_started(work.segment_id);
                 self.spawn_decode_task(work, None);
                 continue;
             }
@@ -296,7 +308,7 @@ impl Pipeline {
                 continue;
             };
 
-            self.note_decode_started(job_id);
+            self.note_decode_started(work.segment_id);
             self.spawn_decode_task(work, Some(output));
         }
 
@@ -555,6 +567,10 @@ impl Pipeline {
             self.active_recovery += 1;
         }
         *self.active_downloads_by_job.entry(job_id).or_default() += 1;
+        *self
+            .active_downloads_by_file
+            .entry(work.segment_id.file_id)
+            .or_default() += 1;
         self.mark_download_pass_started(job_id);
 
         let nntp = Arc::clone(&self.nntp);
@@ -612,6 +628,16 @@ impl Pipeline {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
                 self.active_downloads_by_job.remove(&job_id);
+            }
+        }
+        if let Some(in_flight) = self
+            .active_downloads_by_file
+            .get_mut(&result.segment_id.file_id)
+        {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                self.active_downloads_by_file
+                    .remove(&result.segment_id.file_id);
             }
         }
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
@@ -726,6 +752,7 @@ impl Pipeline {
                             state.failed_bytes += seg_spec.bytes as u64;
                         }
                     }
+                    self.mark_promoted_recovery_segment_unavailable(seg_id);
                     self.check_health(job_id);
                 } else {
                     // Transient failure — re-queue for retry if under limit.
@@ -755,6 +782,7 @@ impl Pipeline {
                                 state.failed_bytes += seg_spec.bytes as u64;
                             }
                         }
+                        self.mark_promoted_recovery_segment_unavailable(seg_id);
                         self.check_health(job_id);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
@@ -779,7 +807,7 @@ impl Pipeline {
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
                             let delay = std::time::Duration::from_secs(1 << (next_retry - 1));
-                            self.note_retry_scheduled(job_id);
+                            self.note_retry_scheduled(seg_id);
                             debug!(
                                 segment = %seg_id,
                                 error = %e,

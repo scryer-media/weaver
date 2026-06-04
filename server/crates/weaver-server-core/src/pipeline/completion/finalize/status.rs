@@ -854,5 +854,7 @@ impl Pipeline {
     pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
         self.par2_runtime.remove(&job_id);
         self.par2_verified.remove(&job_id);
+        self.unavailable_promoted_recovery_segments
+            .retain(|segment_id| segment_id.file_id.job_id != job_id);
     }
 }

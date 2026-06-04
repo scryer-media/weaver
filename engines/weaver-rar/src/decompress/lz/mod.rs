@@ -84,6 +84,8 @@ pub struct LzDecoder {
     pending_filters: Vec<PendingFilter>,
     /// Absolute output offset where the current file begins in the window.
     current_file_base_total: u64,
+    /// Reusable decoded-item buffers for RAR5 multithreaded block decode.
+    parallel_item_buffers: Vec<Vec<parallel::DecodedItem>>,
 }
 
 impl LzDecoder {
@@ -112,6 +114,7 @@ impl LzDecoder {
             is_last_block: false,
             pending_filters: Vec::new(),
             current_file_base_total: 0,
+            parallel_item_buffers: Vec::new(),
         }
     }
 

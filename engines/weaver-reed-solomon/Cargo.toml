@@ -1,0 +1,10 @@
+[package]
+name = "weaver-reed-solomon"
+description = "Shared Reed-Solomon finite-field kernels for Weaver repair engines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon = { workspace = true }

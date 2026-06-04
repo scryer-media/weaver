@@ -12,6 +12,7 @@ native-crypto = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
 slow-tests = []
 
 [dependencies]
+weaver-reed-solomon = { path = "../weaver-reed-solomon" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }

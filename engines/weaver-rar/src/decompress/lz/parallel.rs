@@ -106,8 +106,11 @@ struct TableSet {
 }
 
 pub(super) fn parallel_enabled() -> bool {
-    std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").is_none()
-        && std::env::var_os("WEAVER_RAR_ENABLE_PARALLEL").is_some()
+    parallel_enabled_from_disable_env(std::env::var_os("WEAVER_RAR_DISABLE_PARALLEL").as_deref())
+}
+
+fn parallel_enabled_from_disable_env(disable_env: Option<&std::ffi::OsStr>) -> bool {
+    disable_env.is_none()
 }
 
 pub(super) fn is_truncated_input_error(error: &RarError) -> bool {
@@ -614,21 +617,36 @@ fn adjust_length_for_distance(length: usize, distance: usize) -> usize {
 // ─── Phase 4: Parallel dispatch ──────────────────────────────────────────────
 
 /// Decode a batch of (non-large) blocks in parallel using rayon.
-fn parallel_decode_batch(
+fn decoded_item_buffers(
+    buffers: &mut Vec<Vec<DecodedItem>>,
+    active_len: usize,
+) -> &mut [Vec<DecodedItem>] {
+    if buffers.len() < active_len {
+        buffers.resize_with(active_len, || Vec::with_capacity(DECODED_ITEMS_CAPACITY));
+    }
+
+    for buffer in buffers.iter_mut() {
+        buffer.clear();
+    }
+
+    &mut buffers[..active_len]
+}
+
+fn parallel_decode_batch_into(
     input: &[u8],
     blocks: &[BlockInfo],
     table_sets: &[TableSet],
     extra_dist: bool,
-) -> RarResult<Vec<Vec<DecodedItem>>> {
+    items: &mut [Vec<DecodedItem>],
+) -> RarResult<()> {
+    debug_assert_eq!(blocks.len(), items.len());
     blocks
         .par_iter()
-        .map(|block| {
+        .zip(items.par_iter_mut())
+        .try_for_each(|(block, items)| {
             let tables = &table_sets[block.table_set_index];
-            let mut items = Vec::with_capacity(DECODED_ITEMS_CAPACITY);
-            decode_block_symbols(input, block, tables, extra_dist, &mut items)?;
-            Ok(items)
+            decode_block_symbols(input, block, tables, extra_dist, items)
         })
-        .collect::<RarResult<Vec<_>>>()
 }
 
 fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
@@ -651,6 +669,38 @@ fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: us
 // ─── Public entry point ──────────────────────────────────────────────────────
 
 impl LzDecoder {
+    fn decode_and_apply_parallel_batch<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        block_batch: &[BlockInfo],
+        table_sets: &[TableSet],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let mut item_buffers = std::mem::take(&mut self.parallel_item_buffers);
+        let result = {
+            let active_buffers = decoded_item_buffers(&mut item_buffers, block_batch.len());
+            parallel_decode_batch_into(
+                input,
+                block_batch,
+                table_sets,
+                self.extra_dist,
+                active_buffers,
+            )
+            .and_then(|()| {
+                self.apply_decoded_items_parallel(
+                    active_buffers,
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )
+            })
+        };
+        self.parallel_item_buffers = item_buffers;
+        result
+    }
+
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
         &mut self,
         input: &[u8],
@@ -705,13 +755,14 @@ impl LzDecoder {
             let batch_end = next_small_block_batch_end(&preparsed.blocks, block_index, batch_size);
             let block_batch = &preparsed.blocks[block_index..batch_end];
             if block_batch.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
-                let all_items = parallel_decode_batch(
+                self.decode_and_apply_parallel_batch(
                     input,
                     block_batch,
                     &preparsed.table_sets,
-                    self.extra_dist,
+                    unpacked_size,
+                    output_size,
+                    writer,
                 )?;
-                self.apply_decoded_items_parallel(&all_items, unpacked_size, output_size, writer)?;
             } else {
                 for block in block_batch {
                     let tables = &preparsed.table_sets[block.table_set_index];
@@ -963,10 +1014,10 @@ impl LzDecoder {
             } else {
                 let batch_end = next_small_block_batch_end(&blocks, block_index, batch_size);
                 let block_batch = &blocks[block_index..batch_end];
-                let all_items =
-                    parallel_decode_batch(input, block_batch, &table_sets, self.extra_dist)?;
-                self.apply_decoded_items_parallel(
-                    &all_items,
+                self.decode_and_apply_parallel_batch(
+                    input,
+                    block_batch,
+                    &table_sets,
                     unpacked_size,
                     &mut output_size,
                     writer,
@@ -1018,6 +1069,34 @@ mod tests {
     fn parallel_batch_size_never_exceeds_available_blocks() {
         assert_eq!(parallel_batch_size(8, 3), 3);
         assert_eq!(parallel_batch_size(2, 2), 2);
+    }
+
+    #[test]
+    fn parallel_enabled_defaults_on() {
+        assert!(parallel_enabled_from_disable_env(None));
+    }
+
+    #[test]
+    fn parallel_disable_env_turns_off_parallel_path() {
+        assert!(!parallel_enabled_from_disable_env(Some(
+            std::ffi::OsStr::new("1")
+        )));
+    }
+
+    #[test]
+    fn decoded_item_buffers_reuse_allocations() {
+        let mut buffers = Vec::new();
+        let first_ptr = {
+            let active = decoded_item_buffers(&mut buffers, 2);
+            active[0].push(DecodedItem::RepeatPrev);
+            active[0].as_ptr()
+        };
+
+        let active = decoded_item_buffers(&mut buffers, 2);
+        assert_eq!(active.len(), 2);
+        assert!(active[0].is_empty());
+        assert!(active[0].capacity() >= DECODED_ITEMS_CAPACITY);
+        assert_eq!(active[0].as_ptr(), first_ptr);
     }
 
     #[test]

@@ -9779,6 +9779,12 @@ async fn complete_payload_does_not_finalize_while_promoted_recovery_is_pending()
             exclude_servers: Vec::new(),
         });
     }
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(1)
+        .or_default()
+        .promoted = true;
 
     pipeline.check_job_completion(job_id).await;
     settle_inflight_moves(&mut pipeline).await;
@@ -9930,6 +9936,12 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
             exclude_servers: Vec::new(),
         });
     }
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(1)
+        .or_default()
+        .promoted = true;
 
     pipeline.check_job_completion(job_id).await;
 
@@ -9938,6 +9950,140 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
         Some(JobStatus::Downloading)
     );
     assert!(!pipeline.inflight_extractions.contains_key(&job_id));
+}
+
+#[tokio::test]
+async fn cancel_job_clears_promoted_recovery_runtime_state() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30092);
+    let recovery_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let spec = JobSpec {
+        name: "Cancel Promoted Recovery Runtime".to_string(),
+        password: None,
+        total_bytes: 192,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::from_filename("payload.bin"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "cancel-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.vol00+01.par2".to_string(),
+                role: FileRole::from_filename("payload.vol00+01.par2"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "cancel-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: recovery_file_id,
+                segment_number: 0,
+            },
+            message_id: MessageId::new("cancel-promoted-queued@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 2,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+        });
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: recovery_file_id,
+                segment_number: 1,
+            },
+            message_id: MessageId::new("cancel-promoted-parked@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+        });
+    }
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(1)
+        .or_default()
+        .promoted = true;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(recovery_file_id, 1);
+    pipeline.active_decodes_by_job.insert(job_id, 1);
+    pipeline.active_decodes_by_file.insert(recovery_file_id, 1);
+    pipeline.pending_retries_by_job.insert(job_id, 1);
+    pipeline.pending_retries_by_segment.insert(
+        SegmentId {
+            file_id: recovery_file_id,
+            segment_number: 2,
+        },
+        1,
+    );
+    pipeline
+        .unavailable_promoted_recovery_segments
+        .insert(SegmentId {
+            file_id: recovery_file_id,
+            segment_number: 3,
+        });
+    pipeline.schedule_job_completion_check(job_id);
+
+    let (reply, result) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJob { job_id, reply })
+        .await;
+    result.await.unwrap().unwrap();
+
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.job_order.contains(&job_id));
+    assert!(pipeline.par2_runtime(job_id).is_none());
+    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(
+        !pipeline
+            .active_downloads_by_file
+            .contains_key(&recovery_file_id)
+    );
+    assert!(!pipeline.active_decodes_by_job.contains_key(&job_id));
+    assert!(
+        !pipeline
+            .active_decodes_by_file
+            .contains_key(&recovery_file_id)
+    );
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert!(
+        !pipeline
+            .pending_retries_by_segment
+            .keys()
+            .any(|segment_id| segment_id.file_id.job_id == job_id)
+    );
+    assert!(
+        !pipeline
+            .unavailable_promoted_recovery_segments
+            .iter()
+            .any(|segment_id| segment_id.file_id.job_id == job_id)
+    );
+    assert!(!pipeline.pending_completion_checks.contains(&job_id));
 }
 
 #[tokio::test]
@@ -10051,6 +10197,325 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Downloading)
     );
+
+    let queued_recovery = {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue.drain_all()
+    };
+    assert_eq!(queued_recovery.len(), 1);
+    assert_eq!(
+        queued_recovery[0].segment_id.file_id.file_index, 2,
+        "promoted recovery should be the only queued work"
+    );
+
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &vec![0xAA; 64]).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+}
+
+#[tokio::test]
+async fn promoted_recovery_retry_reenters_dispatchable_queue() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30093);
+    let recovery_file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let segment_id = SegmentId {
+        file_id: recovery_file_id,
+        segment_number: 0,
+    };
+    let spec = JobSpec {
+        name: "Promoted Recovery Retry Routing".to_string(),
+        password: None,
+        total_bytes: 192,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "payload.bin".to_string(),
+                role: FileRole::from_filename("payload.bin"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 128,
+                    message_id: "retry-routing-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.vol00+01.par2".to_string(),
+                role: FileRole::from_filename("payload.vol00+01.par2"),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "retry-routing-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .files
+        .entry(1)
+        .or_default()
+        .promoted = true;
+
+    pipeline.note_retry_scheduled(segment_id);
+    pipeline.requeue_retry_work(DownloadWork {
+        segment_id,
+        message_id: MessageId::new("retry-routing-recovery@example.com"),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: 1000,
+        byte_estimate: 64,
+        retry_count: 1,
+        is_recovery: true,
+        exclude_servers: Vec::new(),
+    });
+
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert!(
+        !pipeline
+            .pending_retries_by_segment
+            .contains_key(&segment_id)
+    );
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    assert!(state.recovery_queue.is_empty());
+    let queued = state
+        .download_queue
+        .pop()
+        .expect("promoted recovery retry should be dispatchable");
+    assert_eq!(queued.segment_id, segment_id);
+    assert_eq!(queued.priority, super::repair::PROMOTED_RECOVERY_PRIORITY);
+}
+
+#[tokio::test]
+async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30094);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let first_recovery_filename = "repair.vol00+01.par2";
+    let second_recovery_filename = "repair.vol01+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let first_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        segment_number: 0,
+    };
+    let second_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 3,
+        },
+        segment_number: 0,
+    };
+    let spec = JobSpec {
+        name: "Promoted Recovery Candidate Fallback".to_string(),
+        password: None,
+        total_bytes: original_payload.len() as u64 + par2_bytes.len() as u64 + 96,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "fallback-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "fallback-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "fallback-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: first_recovery_filename.to_string(),
+                role: FileRole::from_filename(first_recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 32,
+                    message_id: "fallback-recovery-small@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: second_recovery_filename.to_string(),
+                role: FileRole::from_filename(second_recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "fallback-recovery-large@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: first_segment,
+            message_id: MessageId::new("fallback-recovery-small@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 32,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+        });
+        state.recovery_queue.push(DownloadWork {
+            segment_id: second_segment,
+            message_id: MessageId::new("fallback-recovery-large@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+        });
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 0),
+        &[
+            (1, index_filename, 0, false),
+            (2, first_recovery_filename, 1, false),
+            (3, second_recovery_filename, 1, false),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(pipeline.is_promoted_recovery_file(job_id, 2));
+    assert!(!pipeline.is_promoted_recovery_file(job_id, 3));
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let queued = state.download_queue.drain_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].segment_id, first_segment);
+    }
+
+    pipeline.mark_promoted_recovery_segment_unavailable(first_segment);
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading)
+    );
+    assert!(pipeline.is_promoted_recovery_file(job_id, 3));
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let queued = state.download_queue.drain_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].segment_id, second_segment);
+    }
+
+    pipeline.mark_promoted_recovery_segment_unavailable(second_segment);
+    pipeline.check_job_completion(job_id).await;
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!("job should fail only after promoted recovery candidates are exhausted");
+    };
+    assert!(error.contains("only 0 recovery blocks available in NZB"));
+}
+
+#[tokio::test]
+async fn active_recovery_from_another_job_does_not_satisfy_promoted_recovery_wait() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let waiting_job_id = JobId(30095);
+    let other_job_id = JobId(30096);
+    let spec = segmented_job_spec("Promoted Recovery Isolation", "payload.bin", &[128]);
+    insert_active_job(&mut pipeline, waiting_job_id, spec.clone()).await;
+    insert_active_job(&mut pipeline, other_job_id, spec).await;
+    pipeline
+        .ensure_par2_runtime(waiting_job_id)
+        .files
+        .entry(1)
+        .or_default()
+        .promoted = true;
+
+    pipeline.active_downloads_by_file.insert(
+        NzbFileId {
+            job_id: other_job_id,
+            file_index: 1,
+        },
+        1,
+    );
+    assert!(!pipeline.promoted_recovery_file_has_pending_work(waiting_job_id, 1));
+
+    pipeline.active_downloads_by_file.insert(
+        NzbFileId {
+            job_id: waiting_job_id,
+            file_index: 1,
+        },
+        1,
+    );
+    assert!(pipeline.promoted_recovery_file_has_pending_work(waiting_job_id, 1));
 }
 
 #[tokio::test]

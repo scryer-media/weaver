@@ -328,14 +328,14 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     .await
     .map_err(|error| RpcError::invalid_parameter(error.to_string()))?;
 
-    if request.add_paused {
-        if let Err(error) = ctx.handle.pause_job(submitted.job_id).await {
-            warn!(
-                job_id = submitted.job_id.0,
-                error = %error,
-                "accepted NZBGet append but could not apply AddPaused"
-            );
-        }
+    if request.add_paused
+        && let Err(error) = ctx.handle.pause_job(submitted.job_id).await
+    {
+        warn!(
+            job_id = submitted.job_id.0,
+            error = %error,
+            "accepted NZBGet append but could not apply AddPaused"
+        );
     }
 
     Ok(json!(submitted.job_id.0))

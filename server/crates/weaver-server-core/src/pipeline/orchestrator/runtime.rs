@@ -68,9 +68,12 @@ impl Pipeline {
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
+            active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
+            active_decodes_by_file: HashMap::new(),
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
+            pending_retries_by_segment: HashMap::new(),
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -134,6 +137,7 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
+            unavailable_promoted_recovery_segments: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
             db,
@@ -272,6 +276,8 @@ impl Pipeline {
     fn release_stalled_download_runtime(&mut self, job_id: JobId) -> usize {
         let in_flight = self.active_downloads_by_job.remove(&job_id).unwrap_or(0);
         self.active_downloads = self.active_downloads.saturating_sub(in_flight);
+        self.active_downloads_by_file
+            .retain(|file_id, _| file_id.job_id != job_id);
 
         let reserved_segments: Vec<_> = self
             .bandwidth_reservations
@@ -428,15 +434,7 @@ impl Pipeline {
                     self.handle_move_to_complete_done(done);
                 }
                 Some(work) = self.retry_rx.recv() => {
-                    let job_id = work.segment_id.file_id.job_id;
-                    self.note_retry_requeued(job_id);
-                    if let Some(state) = self.jobs.get_mut(&job_id) {
-                        if work.is_recovery {
-                            state.recovery_queue.push(work);
-                        } else {
-                            state.download_queue.push(work);
-                        }
-                    }
+                    self.requeue_retry_work(work);
                 }
                 _ = metrics_snapshot_interval.tick() => {
                     self.shared_state.refresh_metrics_snapshot();
@@ -505,6 +503,25 @@ impl Pipeline {
     pub(crate) fn publish_snapshot(&mut self) {
         let _ = self.refresh_bandwidth_cap_window();
         self.shared_state.publish_jobs(self.list_jobs());
+    }
+
+    pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {
+        let job_id = work.segment_id.file_id.job_id;
+        let segment_id = work.segment_id;
+        self.note_retry_requeued(segment_id);
+        let promoted_recovery = work.is_recovery
+            && self.is_promoted_recovery_file(job_id, segment_id.file_id.file_index);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            if promoted_recovery {
+                let mut work = work;
+                work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
+                state.download_queue.push(work);
+            } else if work.is_recovery {
+                state.recovery_queue.push(work);
+            } else {
+                state.download_queue.push(work);
+            }
+        }
     }
 
     async fn drain(&mut self) {

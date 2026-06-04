@@ -12,26 +12,27 @@ enum CleanPar2IntegrityGate {
 struct PromotedRecoveryPipelineState {
     download_queue_len: usize,
     download_queue_has_recovery: bool,
+    download_queue_promoted_recovery: usize,
     recovery_queue_len: usize,
+    parked_promoted_recovery: usize,
     promoted_par2_files: usize,
     incomplete_promoted_par2_files: usize,
-    active_downloads_for_job: usize,
-    active_recovery_global: usize,
+    active_promoted_downloads: usize,
+    pending_promoted_retries: usize,
     pending_promoted_decode: usize,
+    active_promoted_decodes: usize,
+    write_buffered_promoted_recovery: usize,
+    unavailable_promoted_recovery_segments: usize,
 }
 
 impl PromotedRecoveryPipelineState {
-    fn has_inflight_promoted_recovery(self) -> bool {
-        self.promoted_par2_files > 0
-            && self.active_recovery_global > 0
-            && self.active_downloads_for_job > 0
-    }
-
     fn has_pending_work(self) -> bool {
-        self.download_queue_has_recovery
-            || self.incomplete_promoted_par2_files > 0
-            || self.has_inflight_promoted_recovery()
+        self.download_queue_promoted_recovery > 0
+            || self.active_promoted_downloads > 0
+            || self.pending_promoted_retries > 0
             || self.pending_promoted_decode > 0
+            || self.active_promoted_decodes > 0
+            || self.write_buffered_promoted_recovery > 0
     }
 }
 
@@ -215,17 +216,6 @@ impl Pipeline {
     }
 
     fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {
-        let (download_queue_len, download_queue_has_recovery, recovery_queue_len) = self
-            .jobs
-            .get(&job_id)
-            .map(|state| {
-                (
-                    state.download_queue.len(),
-                    state.download_queue.has_recovery_work(),
-                    state.recovery_queue.len(),
-                )
-            })
-            .unwrap_or((0, false, 0));
         let promoted_files: HashSet<u32> = self
             .par2_runtime(job_id)
             .map(|runtime| {
@@ -236,6 +226,31 @@ impl Pipeline {
                     .collect()
             })
             .unwrap_or_default();
+        let (
+            download_queue_len,
+            download_queue_has_recovery,
+            download_queue_promoted_recovery,
+            recovery_queue_len,
+            parked_promoted_recovery,
+        ) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                (
+                    state.download_queue.len(),
+                    state.download_queue.has_recovery_work(),
+                    state.download_queue.count_matching(|work| {
+                        work.is_recovery
+                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                    }),
+                    state.recovery_queue.len(),
+                    state.recovery_queue.count_matching(|work| {
+                        work.is_recovery
+                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                    }),
+                )
+            })
+            .unwrap_or((0, false, 0, 0, 0));
         let incomplete_promoted_par2_files = self
             .jobs
             .get(&job_id)
@@ -262,26 +277,93 @@ impl Pipeline {
                     && promoted_files.contains(&work.segment_id.file_id.file_index)
             })
             .count();
+        let active_promoted_downloads = self
+            .active_downloads_by_file
+            .iter()
+            .filter(|(file_id, _)| {
+                file_id.job_id == job_id && promoted_files.contains(&file_id.file_index)
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        let pending_promoted_retries = self
+            .pending_retries_by_segment
+            .iter()
+            .filter(|(segment_id, _)| {
+                segment_id.file_id.job_id == job_id
+                    && promoted_files.contains(&segment_id.file_id.file_index)
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        let active_promoted_decodes = self
+            .active_decodes_by_file
+            .iter()
+            .filter(|(file_id, _)| {
+                file_id.job_id == job_id && promoted_files.contains(&file_id.file_index)
+            })
+            .map(|(_, count)| *count)
+            .sum();
+        let write_buffered_promoted_recovery = self
+            .write_buffers
+            .iter()
+            .filter(|(file_id, buffer)| {
+                file_id.job_id == job_id
+                    && promoted_files.contains(&file_id.file_index)
+                    && buffer.buffered_len() > 0
+            })
+            .count();
+        let unavailable_promoted_recovery_segments = self
+            .unavailable_promoted_recovery_segments
+            .iter()
+            .filter(|segment_id| {
+                segment_id.file_id.job_id == job_id
+                    && promoted_files.contains(&segment_id.file_id.file_index)
+            })
+            .count();
 
         PromotedRecoveryPipelineState {
             download_queue_len,
             download_queue_has_recovery,
+            download_queue_promoted_recovery,
             recovery_queue_len,
+            parked_promoted_recovery,
             promoted_par2_files: promoted_files.len(),
             incomplete_promoted_par2_files,
-            active_downloads_for_job: self
-                .active_downloads_by_job
-                .get(&job_id)
-                .copied()
-                .unwrap_or(0),
-            active_recovery_global: self.active_recovery,
+            active_promoted_downloads,
+            pending_promoted_retries,
             pending_promoted_decode,
+            active_promoted_decodes,
+            write_buffered_promoted_recovery,
+            unavailable_promoted_recovery_segments,
         }
     }
 
-    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId) -> bool {
-        self.promoted_recovery_pipeline_state(job_id)
-            .has_pending_work()
+    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId, action: &'static str) -> bool {
+        let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+        if promoted_recovery.has_pending_work() {
+            debug!(
+                job_id = job_id.0,
+                action,
+                queued_downloads = promoted_recovery.download_queue_len,
+                download_queue_has_recovery = promoted_recovery.download_queue_has_recovery,
+                queued_promoted_recovery = promoted_recovery.download_queue_promoted_recovery,
+                parked_recovery = promoted_recovery.recovery_queue_len,
+                parked_promoted_recovery = promoted_recovery.parked_promoted_recovery,
+                promoted_par2_files = promoted_recovery.promoted_par2_files,
+                incomplete_promoted_par2_files = promoted_recovery.incomplete_promoted_par2_files,
+                active_promoted_downloads = promoted_recovery.active_promoted_downloads,
+                pending_promoted_retries = promoted_recovery.pending_promoted_retries,
+                pending_promoted_decode = promoted_recovery.pending_promoted_decode,
+                active_promoted_decodes = promoted_recovery.active_promoted_decodes,
+                write_buffered_promoted_recovery =
+                    promoted_recovery.write_buffered_promoted_recovery,
+                unavailable_promoted_recovery_segments =
+                    promoted_recovery.unavailable_promoted_recovery_segments,
+                "deferring completion work — promoted PAR2 recovery work is pending"
+            );
+            return true;
+        }
+
+        false
     }
 }
 
@@ -1444,6 +1526,8 @@ impl Pipeline {
             return;
         }
 
+        self.reapply_promoted_recovery_queue(job_id);
+
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
         let par2_loaded = self.par2_set(job_id).is_some();
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
@@ -1532,13 +1616,20 @@ impl Pipeline {
                 has_active_extraction_tasks,
                 only_archive_residuals,
                 queued_downloads = promoted_recovery.download_queue_len,
-                queued_promoted_recovery = promoted_recovery.download_queue_has_recovery,
+                download_queue_has_recovery = promoted_recovery.download_queue_has_recovery,
+                queued_promoted_recovery = promoted_recovery.download_queue_promoted_recovery,
                 parked_recovery = promoted_recovery.recovery_queue_len,
+                parked_promoted_recovery = promoted_recovery.parked_promoted_recovery,
                 promoted_par2_files = promoted_recovery.promoted_par2_files,
                 incomplete_promoted_par2_files = promoted_recovery.incomplete_promoted_par2_files,
-                active_downloads_for_job = promoted_recovery.active_downloads_for_job,
-                active_recovery_global = promoted_recovery.active_recovery_global,
+                active_promoted_downloads = promoted_recovery.active_promoted_downloads,
+                pending_promoted_retries = promoted_recovery.pending_promoted_retries,
                 pending_promoted_decode = promoted_recovery.pending_promoted_decode,
+                active_promoted_decodes = promoted_recovery.active_promoted_decodes,
+                write_buffered_promoted_recovery =
+                    promoted_recovery.write_buffered_promoted_recovery,
+                unavailable_promoted_recovery_segments =
+                    promoted_recovery.unavailable_promoted_recovery_segments,
                 promoted_recovery_pending = promoted_recovery.has_pending_work(),
                 failed_extractions = ?failed_extractions,
                 rar_set_state = ?rar_set_state,
@@ -1597,11 +1688,7 @@ impl Pipeline {
         }
 
         if needs_completion_repair_evaluation && !par2_bypassed {
-            if self.job_has_promoted_recovery_pipeline_work(job_id) {
-                debug!(
-                    job_id = job_id.0,
-                    "deferring verify — promoted PAR2 recovery work is pending"
-                );
+            if self.job_has_promoted_recovery_pipeline_work(job_id, "verify") {
                 return;
             }
 
@@ -2469,11 +2556,7 @@ impl Pipeline {
             return;
         }
 
-        if self.job_has_promoted_recovery_pipeline_work(job_id) {
-            debug!(
-                job_id = job_id.0,
-                "deferring extraction — promoted PAR2 recovery work is pending"
-            );
+        if self.job_has_promoted_recovery_pipeline_work(job_id, "extraction") {
             return;
         }
 
@@ -2485,11 +2568,7 @@ impl Pipeline {
                 // promoted PAR2 recovery segments in flight. Do not let stale
                 // completion checks finalize damaged direct/gzip/etc. payloads
                 // before those recovery files are decoded and repaired.
-                if self.job_has_promoted_recovery_pipeline_work(job_id) {
-                    debug!(
-                        job_id = job_id.0,
-                        "deferring completion — pending download pipeline work"
-                    );
+                if self.job_has_promoted_recovery_pipeline_work(job_id, "completion") {
                     return;
                 }
                 if self
@@ -2684,5 +2763,63 @@ impl Pipeline {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_promoted_recovery_without_concrete_work_is_not_pending() {
+        let state = PromotedRecoveryPipelineState {
+            promoted_par2_files: 1,
+            incomplete_promoted_par2_files: 1,
+            ..Default::default()
+        };
+
+        assert!(!state.has_pending_work());
+    }
+
+    #[test]
+    fn concrete_promoted_recovery_work_is_pending() {
+        for state in [
+            PromotedRecoveryPipelineState {
+                download_queue_promoted_recovery: 1,
+                ..Default::default()
+            },
+            PromotedRecoveryPipelineState {
+                active_promoted_downloads: 1,
+                ..Default::default()
+            },
+            PromotedRecoveryPipelineState {
+                pending_promoted_retries: 1,
+                ..Default::default()
+            },
+            PromotedRecoveryPipelineState {
+                pending_promoted_decode: 1,
+                ..Default::default()
+            },
+            PromotedRecoveryPipelineState {
+                active_promoted_decodes: 1,
+                ..Default::default()
+            },
+            PromotedRecoveryPipelineState {
+                write_buffered_promoted_recovery: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(state.has_pending_work(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn parked_promoted_recovery_is_not_pending_until_reapplied() {
+        let state = PromotedRecoveryPipelineState {
+            parked_promoted_recovery: 1,
+            ..Default::default()
+        };
+
+        assert!(!state.has_pending_work());
     }
 }

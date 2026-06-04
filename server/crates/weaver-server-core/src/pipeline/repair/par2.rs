@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::jobs::record::FileIdentitySource;
 
-const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
+pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
 
@@ -773,21 +773,91 @@ impl Pipeline {
         })
     }
 
-    fn available_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
+    pub(crate) fn is_promoted_recovery_file(&self, job_id: JobId, file_index: u32) -> bool {
+        self.par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&file_index))
+            .is_some_and(|file| file.promoted)
+    }
+
+    fn promoted_recovery_file_is_complete(&self, job_id: JobId, file_index: u32) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        state
+            .assembly
+            .file(NzbFileId { job_id, file_index })
+            .is_some_and(|file| file.is_complete())
+    }
+
+    pub(crate) fn promoted_recovery_file_has_unavailable_segment(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+    ) -> bool {
+        self.unavailable_promoted_recovery_segments
+            .iter()
+            .any(|segment_id| {
+                segment_id.file_id.job_id == job_id && segment_id.file_id.file_index == file_index
+            })
+    }
+
+    pub(crate) fn mark_promoted_recovery_segment_unavailable(&mut self, segment_id: SegmentId) {
+        if !self.is_promoted_recovery_file(segment_id.file_id.job_id, segment_id.file_id.file_index)
+        {
+            return;
+        }
+        if self
+            .unavailable_promoted_recovery_segments
+            .insert(segment_id)
+        {
+            warn!(
+                segment = %segment_id,
+                "promoted PAR2 recovery segment became unavailable"
+            );
+            self.schedule_job_completion_check(segment_id.file_id.job_id);
+        }
+    }
+
+    pub(crate) fn promoted_recovery_file_has_pending_work(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+    ) -> bool {
+        let file_id = NzbFileId { job_id, file_index };
+        let queued_download = self.jobs.get(&job_id).is_some_and(|state| {
+            state
+                .download_queue
+                .count_matching(|work| work.is_recovery && work.segment_id.file_id == file_id)
+                > 0
+        });
+        let active_download = self.active_downloads_by_file.contains_key(&file_id);
+        let delayed_retry = self
+            .pending_retries_by_segment
+            .keys()
+            .any(|segment_id| segment_id.file_id == file_id);
+        let pending_decode = self
+            .pending_decode
+            .iter()
+            .any(|work| work.segment_id.file_id == file_id);
+        let active_decode = self.active_decodes_by_file.contains_key(&file_id);
+        let write_buffered = self
+            .write_buffers
+            .get(&file_id)
+            .is_some_and(|buffer| buffer.buffered_len() > 0);
+
+        queued_download
+            || active_download
+            || delayed_retry
+            || pending_decode
+            || active_decode
+            || write_buffered
+    }
+
+    fn loaded_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
         let Some(state) = self.jobs.get(&job_id) else {
             return HashSet::new();
         };
-
-        let mut file_indices = self
-            .par2_runtime(job_id)
-            .map(|runtime| {
-                runtime
-                    .files
-                    .iter()
-                    .filter_map(|(&file_index, file)| file.promoted.then_some(file_index))
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let mut file_indices = HashSet::new();
 
         for file in state.assembly.files() {
             if file.is_complete()
@@ -806,6 +876,28 @@ impl Pipeline {
         file_indices
     }
 
+    fn targeted_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
+        self.par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| {
+                        if !file.promoted
+                            || self.promoted_recovery_file_is_complete(job_id, file_index)
+                            || self
+                                .promoted_recovery_file_has_unavailable_segment(job_id, file_index)
+                        {
+                            return None;
+                        }
+                        self.promoted_recovery_file_has_pending_work(job_id, file_index)
+                            .then_some(file_index)
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn total_recovery_block_capacity(&self, job_id: JobId) -> u32 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
@@ -822,7 +914,9 @@ impl Pipeline {
     }
 
     pub(crate) fn recovery_blocks_available_or_targeted(&self, job_id: JobId) -> u32 {
-        self.available_recovery_file_indices(job_id)
+        let mut file_indices = self.loaded_recovery_file_indices(job_id);
+        file_indices.extend(self.targeted_recovery_file_indices(job_id));
+        file_indices
             .into_iter()
             .filter_map(|file_index| self.recovery_block_count_for(job_id, file_index))
             .map(|(blocks, _)| blocks)
@@ -984,7 +1078,7 @@ impl Pipeline {
         promoted_blocks
     }
 
-    pub(crate) fn reapply_promoted_recovery_queue(&mut self, job_id: JobId) {
+    pub(crate) fn reapply_promoted_recovery_queue(&mut self, job_id: JobId) -> usize {
         let promoted: HashSet<u32> = self
             .par2_runtime(job_id)
             .map(|runtime| {
@@ -996,11 +1090,11 @@ impl Pipeline {
             })
             .unwrap_or_default();
         if promoted.is_empty() {
-            return;
+            return 0;
         }
 
         let Some(state) = self.jobs.get_mut(&job_id) else {
-            return;
+            return 0;
         };
 
         let queued = state.recovery_queue.drain_all();
@@ -1027,6 +1121,8 @@ impl Pipeline {
             );
             self.update_queue_metrics();
         }
+
+        moved_segments
     }
 
     /// List all jobs.

@@ -2793,6 +2793,87 @@ fn test_rar4_recovery_record_extract() {
     assert_eq!(r1, original("second.txt"));
 }
 
+#[test]
+fn test_rar5_recovery_volumes_restore_missing_part() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar5_recovery_volumes.part01.rar",
+        "rar5_recovery_volumes.part02.rar",
+        "rar5_recovery_volumes.part03.rar",
+        "rar5_recovery_volumes.part04.rar",
+        "rar5_recovery_volumes.part06.rar",
+        "rar5_recovery_volumes.part07.rar",
+        "rar5_recovery_volumes.part08.rar",
+        "rar5_recovery_volumes.part09.rar",
+        "rar5_recovery_volumes.part10.rar",
+        "rar5_recovery_volumes.part01.rev",
+        "rar5_recovery_volumes.part02.rev",
+    ];
+
+    let mut paths = Vec::new();
+    for name in present {
+        let src = fixture("rar5", name);
+        let dst = temp_dir.path().join(name);
+        std::fs::copy(src, &dst).unwrap();
+        paths.push(dst);
+    }
+
+    let expected_path = temp_dir.path().join("rar5_recovery_volumes.part05.rar");
+    let options = weaver_rar::RecoveryOptions {
+        output_dir: Some(temp_dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let report = weaver_rar::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_eq!(report.format, weaver_rar::ArchiveFormat::Rar5);
+    assert_eq!(report.missing_volume_numbers, vec![4]);
+    assert_eq!(report.restored_paths, vec![expected_path.clone()]);
+    assert_eq!(report.used_recovery_paths.len(), 2);
+
+    let expected = std::fs::read(fixture("rar5", "rar5_recovery_volumes.part05.rar")).unwrap();
+    let restored = std::fs::read(expected_path).unwrap();
+    assert_eq!(restored, expected);
+}
+
+#[test]
+fn test_rar3_recovery_volumes_restore_missing_part() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let present = [
+        "rar3_recovery_volumes.part1.rar",
+        "rar3_recovery_volumes.part2.rar",
+        "rar3_recovery_volumes.part4.rar",
+        "rar3_recovery_volumes.part5.rar",
+        "rar3_recovery_volumes.part1.rev",
+        "rar3_recovery_volumes.part2.rev",
+    ];
+
+    let mut paths = Vec::new();
+    for name in present {
+        let src = fixture("rar4", name);
+        let dst = temp_dir.path().join(name);
+        std::fs::copy(src, &dst).unwrap();
+        paths.push(dst);
+    }
+
+    let expected_path = temp_dir.path().join("rar3_recovery_volumes.part3.rar");
+    let options = weaver_rar::RecoveryOptions {
+        output_dir: Some(temp_dir.path().to_path_buf()),
+        overwrite_existing: false,
+        verify_restored: true,
+    };
+    let report = weaver_rar::restore_volumes_from_paths(&paths, &options).unwrap();
+
+    assert_eq!(report.format, weaver_rar::ArchiveFormat::Rar4);
+    assert_eq!(report.missing_volume_numbers, vec![2]);
+    assert_eq!(report.restored_paths, vec![expected_path.clone()]);
+    assert_eq!(report.used_recovery_paths.len(), 2);
+
+    let expected = std::fs::read(fixture("rar4", "rar3_recovery_volumes.part3.rar")).unwrap();
+    let restored = std::fs::read(expected_path).unwrap();
+    assert_eq!(restored, expected);
+}
+
 // -- Comment archives ---------------------------------------------------------
 
 #[test]

@@ -304,12 +304,18 @@ pub struct Pipeline {
     pub(super) jobs_finalizing_download: HashSet<JobId>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
+    /// In-flight article download count per file.
+    pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
     /// In-flight decode task count per job.
     pub(super) active_decodes_by_job: HashMap<JobId, usize>,
+    /// In-flight decode task count per file.
+    pub(super) active_decodes_by_file: HashMap<NzbFileId, usize>,
     /// Last time a job made observable progress in the download stage.
     pub(super) job_last_download_activity: HashMap<JobId, Instant>,
     /// Delayed retry tasks that have been scheduled but not yet re-queued.
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
+    /// Delayed retry tasks by exact segment.
+    pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
     /// Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).
@@ -430,6 +436,8 @@ pub struct Pipeline {
     pub(super) par2_bypassed: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
+    /// Promoted PAR2 recovery segments that can no longer be fetched or decoded.
+    pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
     pub(super) finished_jobs: Vec<JobInfo>,
     /// Shared state for control plane reads (API handlers read without channel round-trip).
