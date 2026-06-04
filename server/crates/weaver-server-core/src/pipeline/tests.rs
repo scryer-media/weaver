@@ -10208,7 +10208,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
         "promoted recovery should be the only queued work"
     );
 
-    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &vec![0xAA; 64]).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &[0xAA; 64]).await;
     install_test_par2_runtime(
         &mut pipeline,
         job_id,
