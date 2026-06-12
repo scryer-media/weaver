@@ -487,14 +487,30 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
                 let file = self.source_files.get(&location.path).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "source file handle not cached")
                 })?;
-                return read_file_at(file, &mut dst[..len], location.offset + slice_offset);
+                let read_offset = location.offset + slice_offset;
+                let read = read_file_at(file, &mut dst[..len], read_offset)?;
+                let file_len = file
+                    .metadata()
+                    .ok()
+                    .map_or(location.len, |metadata| metadata.len());
+                crate::file_cache::drop_touched_file_cache(
+                    file,
+                    &location.path,
+                    file_len,
+                    read_offset,
+                    read as u64,
+                );
+                return Ok(read);
             }
         }
 
         let path = self.repair_path_for(file_id)?;
         let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
-        file.read(dst)
+        let read = file.read(dst)?;
+        crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read as u64);
+        Ok(read)
     }
 
     fn open_sequential_reader(
@@ -509,7 +525,9 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
             return Ok(None);
         }
 
-        Ok(Some(Box::new(File::open(self.repair_path_for(file_id)?)?)))
+        Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
+            self.repair_path_for(file_id)?,
+        )?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -526,7 +544,7 @@ impl crate::verify::FileAccess for RepairExecutionAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
-        fs::read(self.repair_path_for(file_id)?)
+        crate::file_cache::read_to_vec(self.repair_path_for(file_id)?)
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -596,10 +614,13 @@ impl RepairVerificationAccess {
 
 impl crate::verify::FileAccess for RepairVerificationAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        let mut file = File::open(self.path_for(file_id)?)?;
+        let path = self.path_for(file_id)?;
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len as usize];
         let read_len = file.read(&mut buf)?;
+        crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read_len as u64);
         buf.truncate(read_len);
         Ok(buf)
     }
@@ -610,16 +631,22 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
         offset: u64,
         dst: &mut [u8],
     ) -> io::Result<usize> {
-        let mut file = File::open(self.path_for(file_id)?)?;
+        let path = self.path_for(file_id)?;
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
-        file.read(dst)
+        let read = file.read(dst)?;
+        crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, read as u64);
+        Ok(read)
     }
 
     fn open_sequential_reader(
         &self,
         file_id: &FileId,
     ) -> io::Result<Option<Box<dyn std::io::Read>>> {
-        Ok(Some(Box::new(File::open(self.path_for(file_id)?)?)))
+        Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
+            self.path_for(file_id)?,
+        )?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -634,7 +661,7 @@ impl crate::verify::FileAccess for RepairVerificationAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
-        fs::read(self.path_for(file_id)?)
+        crate::file_cache::read_to_vec(self.path_for(file_id)?)
     }
 
     fn write_file_range(
@@ -1219,9 +1246,11 @@ impl RepairState {
             }
             if dst.exists() {
                 let backup = unique_backup_path(dst);
-                fs::rename(dst, backup)?;
+                fs::rename(dst, &backup)?;
+                crate::file_cache::drop_path_cache(&backup);
             }
             fs::rename(src, dst)?;
+            crate::file_cache::drop_path_cache(dst);
         }
         Ok(())
     }
@@ -1338,6 +1367,7 @@ struct OrderedWindowMatch<'a> {
 
 struct OrderedWindowCursor<'a> {
     file: File,
+    path: PathBuf,
     len: usize,
     block_size: usize,
     buffer: Vec<u8>,
@@ -1354,11 +1384,13 @@ impl<'a> OrderedWindowCursor<'a> {
     fn new(path: &Path, block_size: usize, window_table: &'a [u32; 256]) -> io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
+        crate::file_cache::advise_sequential(&file, path, len as u64);
         let buffer_len = block_size.checked_mul(2).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "scanner buffer overflow")
         })?;
         let mut cursor = Self {
             file,
+            path: path.to_path_buf(),
             len,
             block_size,
             buffer: vec![0u8; buffer_len],
@@ -1474,6 +1506,18 @@ impl<'a> OrderedWindowCursor<'a> {
             self.buffer[self.tail_index..].fill(0);
         }
         Ok(())
+    }
+}
+
+impl Drop for OrderedWindowCursor<'_> {
+    fn drop(&mut self) {
+        crate::file_cache::drop_touched_file_cache(
+            &self.file,
+            &self.path,
+            self.len as u64,
+            0,
+            self.read_offset as u64,
+        );
     }
 }
 
@@ -1690,11 +1734,13 @@ impl<'a> RollingBlockScanner<'a> {
     ) -> Result<FileScanStats> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
+        crate::file_cache::advise_sequential(&file, path, len as u64);
         let mut stats = FileScanStats::new(FileScanMode::RollingGeneric, len as u64);
         if len == 0 {
             return Ok(stats);
         }
 
+        let mut total_read = 0usize;
         let slice_size = self.table.slice_size as usize;
         if slice_size > 0 && len >= slice_size {
             let overlap = slice_size - 1;
@@ -1716,6 +1762,7 @@ impl<'a> RollingBlockScanner<'a> {
                 }
 
                 let read_len = file.read(&mut buffer[valid_len..])?;
+                total_read += read_len;
                 valid_len += read_len;
 
                 stats.windows_stepped += scan_buffered_windows(
@@ -1735,7 +1782,17 @@ impl<'a> RollingBlockScanner<'a> {
         }
 
         stats.max_consecutive_steps = stats.windows_stepped;
-        scan_short_blocks_from_file(self.table, path, kind, files, file_index_by_id, blocks, len)?;
+        let short_result = scan_short_blocks_from_file(
+            self.table,
+            path,
+            kind,
+            files,
+            file_index_by_id,
+            blocks,
+            len,
+        );
+        crate::file_cache::drop_touched_file_cache(&file, path, len as u64, 0, total_read as u64);
+        short_result?;
 
         Ok(stats)
     }
@@ -1750,6 +1807,7 @@ impl<'a> RollingBlockScanner<'a> {
     ) -> Result<FileScanStats> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
+        crate::file_cache::advise_sequential(&file, path, len as u64);
         let mut stats = FileScanStats::new(FileScanMode::RollingGeneric, len as u64);
         if len == 0 {
             return Ok(stats);
@@ -1865,6 +1923,8 @@ impl<'a> RollingBlockScanner<'a> {
             }
         }
 
+        drop(map);
+        crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         Ok(stats)
     }
 }
@@ -2109,9 +2169,11 @@ fn scan_short_blocks_from_file(
 
 fn read_exact_file_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     file.seek(SeekFrom::Start(offset))?;
     let mut data = vec![0u8; len];
     file.read_exact(&mut data)?;
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, offset, len as u64);
     Ok(data)
 }
 
@@ -2253,23 +2315,30 @@ fn should_skip_candidate(path: &Path) -> bool {
 
 fn read_first_16k(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut buf = vec![0u8; 16_384];
     let read = file.read(&mut buf)?;
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, read as u64);
     buf.truncate(read);
     Ok(buf)
 }
 
 fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    crate::file_cache::advise_sequential(&file, path, file_len);
     let mut hasher = Md5State::new();
     let mut buf = [0u8; 1024 * 1024];
+    let mut total_read = 0u64;
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
         }
         hasher.update(&buf[..read]);
+        total_read += read as u64;
     }
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, total_read);
     Ok(hasher.finalize())
 }
 
@@ -2281,6 +2350,8 @@ fn copy_range(
     len: u64,
 ) -> io::Result<()> {
     let mut input = File::open(src)?;
+    let source_len = input.metadata()?.len();
+    crate::file_cache::advise_range_sequential(&input, src, src_offset, len);
     input.seek(SeekFrom::Start(src_offset))?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -2296,6 +2367,10 @@ fn copy_range(
         output.write_all(&buf[..take])?;
         remaining -= take as u64;
     }
+    output.flush()?;
+    crate::file_cache::drop_touched_file_cache(&input, src, source_len, src_offset, len);
+    // Destination advice remains opportunistic; avoid forced writeback for large repairs.
+    crate::file_cache::drop_file_cache(&output, dst, dst_offset, len);
     Ok(())
 }
 
@@ -2501,6 +2576,39 @@ mod tests {
         data.extend_from_slice(packet_type);
         data.extend_from_slice(body);
         data
+    }
+
+    #[test]
+    fn copy_range_preserves_small_range_from_large_source() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("dest.bin");
+        let payload = b"small range from a sparse large source";
+        let source_offset = 4096u64;
+        let dest_offset = 128u64;
+
+        let mut source = File::create(&src).unwrap();
+        source.set_len(64 * 1024 * 1024 + 4096).unwrap();
+        source.seek(SeekFrom::Start(source_offset)).unwrap();
+        source.write_all(payload).unwrap();
+        drop(source);
+
+        let dest = File::create(&dst).unwrap();
+        dest.set_len(1024).unwrap();
+        drop(dest);
+
+        copy_range(&src, source_offset, &dst, dest_offset, payload.len() as u64).unwrap();
+
+        let bytes = fs::read(&dst).unwrap();
+        assert_eq!(
+            &bytes[..dest_offset as usize],
+            vec![0u8; dest_offset as usize]
+        );
+        assert_eq!(
+            &bytes[dest_offset as usize..dest_offset as usize + payload.len()],
+            payload
+        );
+        assert_eq!(fs::metadata(&src).unwrap().len(), 64 * 1024 * 1024 + 4096);
     }
 
     #[cfg(feature = "slow-tests")]

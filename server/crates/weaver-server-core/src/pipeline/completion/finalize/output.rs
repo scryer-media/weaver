@@ -2,6 +2,7 @@ use super::*;
 use std::path::PathBuf;
 
 use crate::jobs::working_dir::WORKING_DIR_MARKER;
+use crate::runtime::file_cache;
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -29,7 +30,7 @@ fn move_path_with_copy_fallback(
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(src, dst)?;
+    file_cache::copy_large_file(src, dst)?;
     std::fs::remove_file(src)?;
     Ok(())
 }
@@ -430,3 +431,6 @@ impl Pipeline {
         Some(working_path)
     }
 }
+
+#[cfg(test)]
+mod tests;

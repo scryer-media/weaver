@@ -5,8 +5,8 @@
 //! MD5 hash, which can be used to identify and rename obfuscated files.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
@@ -239,10 +239,11 @@ pub fn detect_split_files(dir: &Path) -> io::Result<Vec<SplitFileGroup>> {
 
 /// Read up to `n` bytes from the start of a file.
 fn read_first_n_bytes(path: &Path, n: usize) -> io::Result<Vec<u8>> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut buf = vec![0u8; n];
     let bytes_read = file.read(&mut buf)?;
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, bytes_read as u64);
     buf.truncate(bytes_read);
     Ok(buf)
 }

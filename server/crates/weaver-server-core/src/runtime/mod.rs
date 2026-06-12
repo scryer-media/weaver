@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod buffers;
+pub(crate) mod file_cache;
 pub mod log_buffer;
 pub mod postprocess_pool;
 pub mod reload;

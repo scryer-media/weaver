@@ -30,6 +30,7 @@ compile_error!(
 pub mod checksum;
 pub mod disk;
 pub mod error;
+mod file_cache;
 pub mod matrix;
 pub mod md5_simd;
 pub mod packet;

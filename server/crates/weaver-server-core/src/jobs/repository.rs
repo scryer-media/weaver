@@ -44,6 +44,15 @@ pub(crate) fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
 
+const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
+
+fn run_inline_incremental_vacuum(conn: &rusqlite::Connection) -> Result<(), StateError> {
+    conn.execute_batch(&format!(
+        "PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"
+    ))
+    .map_err(db_err)
+}
+
 fn delete_orphan_rows(
     tx: &rusqlite::Transaction<'_>,
     table: &'static str,
@@ -153,8 +162,7 @@ impl Database {
         .map_err(db_err)?;
         delete_active_job_rows(&tx, job_id.0 as i64)?;
         tx.commit().map_err(db_err)?;
-        conn.execute_batch("PRAGMA incremental_vacuum")
-            .map_err(db_err)?;
+        run_inline_incremental_vacuum(&conn)?;
         Ok(())
     }
 
@@ -163,8 +171,7 @@ impl Database {
         let tx = conn.unchecked_transaction().map_err(db_err)?;
         delete_active_job_rows(&tx, job_id.0 as i64)?;
         tx.commit().map_err(db_err)?;
-        conn.execute_batch("PRAGMA incremental_vacuum")
-            .map_err(db_err)?;
+        run_inline_incremental_vacuum(&conn)?;
         Ok(())
     }
 
@@ -189,8 +196,7 @@ impl Database {
         };
         tx.commit().map_err(db_err)?;
         if counts.total_removed() > 0 {
-            conn.execute_batch("PRAGMA incremental_vacuum")
-                .map_err(db_err)?;
+            run_inline_incremental_vacuum(&conn)?;
         }
         Ok(counts)
     }

@@ -77,7 +77,19 @@ impl RecoverySliceData {
 
                 let read_len = dst.len().min(*len - start);
                 let mut file = File::open(path)?;
-                read_exact_at_fallback(&mut file, offset + start as u64, &mut dst[..read_len])
+                read_exact_at_fallback(&mut file, offset + start as u64, &mut dst[..read_len])?;
+                let file_len = file
+                    .metadata()
+                    .ok()
+                    .map_or(*len as u64, |metadata| metadata.len());
+                crate::file_cache::drop_touched_file_cache(
+                    &file,
+                    path,
+                    file_len,
+                    offset + start as u64,
+                    read_len as u64,
+                );
+                Ok(())
             }
         }
     }

@@ -73,7 +73,9 @@ impl FileAccess for DiskFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        Ok(Some(Box::new(File::open(&path)?)))
+        Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
+            &path,
+        )?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -89,7 +91,7 @@ impl FileAccess for DiskFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        fs::read(&path)
+        crate::file_cache::read_to_vec(&path)
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -191,7 +193,9 @@ impl FileAccess for PlacementFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        Ok(Some(Box::new(File::open(&path)?)))
+        Ok(Some(Box::new(crate::file_cache::CacheAdvisedReader::open(
+            &path,
+        )?)))
     }
 
     fn file_exists(&self, file_id: &FileId) -> bool {
@@ -207,7 +211,7 @@ impl FileAccess for PlacementFileAccess {
         let path = self
             .path_for(file_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown file ID"))?;
-        fs::read(&path)
+        crate::file_cache::read_to_vec(&path)
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {

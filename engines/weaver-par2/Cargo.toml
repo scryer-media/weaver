@@ -22,10 +22,10 @@ md-5 = { workspace = true }
 aws-lc-sys = { workspace = true, optional = true }
 rayon = { workspace = true }
 memmap2 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-libc = { workspace = true }
 weaver-rar = { path = "../weaver-rar" }
 criterion = "0.5"
 

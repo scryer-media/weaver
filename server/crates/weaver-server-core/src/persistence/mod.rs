@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod encryption;
 pub mod error;
+pub(crate) mod maintenance;
 pub mod migrations;
 pub mod setup;
 

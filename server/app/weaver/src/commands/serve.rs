@@ -108,6 +108,7 @@ pub(crate) async fn run(
     }
 
     // Create and start the pipeline.
+    let maintenance_complete_dir = complete_dir.clone();
     let mut pipeline = Pipeline::new(
         cmd_rx,
         event_tx,
@@ -136,6 +137,10 @@ pub(crate) async fn run(
 
     let rss_task = rss.start_background_loop();
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
+        db.clone(),
+        maintenance_complete_dir,
+    );
 
     // Run HTTP server.
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -175,6 +180,7 @@ pub(crate) async fn run(
             server_task.abort();
             rss_task.abort();
             metrics_history_task.abort();
+            maintenance_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
@@ -182,6 +188,7 @@ pub(crate) async fn run(
             server_task.abort();
             rss_task.abort();
             metrics_history_task.abort();
+            maintenance_task.abort();
             Err(error.into())
         }
         result = &mut server_task => {
@@ -191,6 +198,7 @@ pub(crate) async fn run(
             }
             rss_task.abort();
             metrics_history_task.abort();
+            maintenance_task.abort();
             match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),

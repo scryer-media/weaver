@@ -11,7 +11,7 @@
 //! each holds the other's data.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -131,18 +131,18 @@ pub fn scan_placement(dir: &Path, par2_set: &Par2FileSet) -> io::Result<Placemen
             };
 
             // Confirm with full-file MD5.
-            let full_data = fs::read(&path)?;
-            if full_data.len() as u64 != desc.length {
+            let actual_len = fs::metadata(&path)?.len();
+            if actual_len != desc.length {
                 debug!(
                     file = %file_name,
                     expected_len = desc.length,
-                    actual_len = full_data.len(),
+                    actual_len,
                     "16k hash matched but file length differs — skipping"
                 );
                 continue;
             }
 
-            let full_hash = checksum::md5(&full_data);
+            let full_hash = hash_file(&path)?;
             if full_hash != desc.hash_full {
                 debug!(
                     file = %file_name,
@@ -367,11 +367,32 @@ pub fn apply_placement_plan(dir: &Path, plan: &PlacementPlan) -> io::Result<u32>
 
 /// Read up to `n` bytes from the start of a file.
 fn read_first_n_bytes(path: &Path, n: usize) -> io::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut buf = vec![0u8; n];
     let bytes_read = file.read(&mut buf)?;
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, bytes_read as u64);
     buf.truncate(bytes_read);
     Ok(buf)
+}
+
+fn hash_file(path: &Path) -> io::Result<[u8; 16]> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    crate::file_cache::advise_sequential(&file, path, file_len);
+    let mut hasher = checksum::FileHashState::new();
+    let mut buf = [0u8; 1024 * 1024];
+    let mut total_read = 0u64;
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        total_read += read as u64;
+    }
+    crate::file_cache::drop_touched_file_cache(&file, path, file_len, 0, total_read);
+    Ok(hasher.finalize())
 }
 
 #[cfg(test)]

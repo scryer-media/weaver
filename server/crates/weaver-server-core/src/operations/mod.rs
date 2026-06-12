@@ -3,6 +3,7 @@ pub mod backup;
 pub mod diagnostics;
 pub mod health;
 pub mod logs;
+pub mod maintenance;
 pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
@@ -27,6 +28,7 @@ pub use health::{
     create_directory,
 };
 pub use logs::snapshot_service_logs;
+pub use maintenance::spawn_maintenance_worker;
 pub use metrics_store::{
     COUNTER_METRIC_KEYS, CounterRollupValue, GAUGE_METRIC_KEYS, GaugeRollupValue, JOB_STATUS_KEYS,
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier,

@@ -356,6 +356,7 @@ fn parse_recovery_packet_from_reader(
 pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPacket>> {
     let file = File::open(path).map_err(Par2Error::Io)?;
     let file_len = file.metadata().map_err(Par2Error::Io)?.len();
+    crate::file_cache::advise_sequential(&file, path, file_len);
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut packets = Vec::new();
     let mut offset = 0u64;
@@ -426,6 +427,13 @@ pub fn scan_packets_from_path_with_set_ids(path: &Path) -> Result<Vec<ScannedPac
         }
     }
 
+    crate::file_cache::drop_touched_file_cache(
+        reader.get_ref(),
+        path,
+        file_len,
+        0,
+        offset.min(file_len),
+    );
     Ok(packets)
 }
 
