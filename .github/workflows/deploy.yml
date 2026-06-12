@@ -211,8 +211,10 @@ jobs:
           cache-bin: false
       - name: Install Intel SDE
         run: |
-          curl -Lo /tmp/sde.tar.xz https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-lin.tar.xz
-          tar -xf /tmp/sde.tar.xz -C /opt
+          SDE_ARCHIVE="ci/vendor/intel-sde/sde-external-9.48.0-2024-11-25-lin.tar.xz"
+          echo "3173d2a5369e3385226b488d8b75403951bc14af601435fe707d9f83e0b533e6  ${SDE_ARCHIVE}" > /tmp/sde.sha256
+          sha256sum -c /tmp/sde.sha256
+          tar -xf "${SDE_ARCHIVE}" -C /opt
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build accelerated SIMD tests (${{ matrix.name }})
         env:

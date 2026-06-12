@@ -1,3 +1,4 @@
+ci/vendor/intel-sde/*.tar.xz filter=lfs diff=lfs merge=lfs -text
 engines/weaver-rar/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable
 engines/weaver-rar/tests/fixtures/**/*.exe filter=lfs diff=lfs merge=lfs -text
 engines/weaver-rar/tests/fixtures/**/*.bin filter=lfs diff=lfs merge=lfs -text
