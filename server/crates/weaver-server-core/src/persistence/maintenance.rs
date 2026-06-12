@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::{Database, StateError};
 use crate::jobs::repository::db_err;
@@ -14,6 +14,15 @@ pub(crate) const DB_MAINTENANCE_INCREMENTAL_BATCH_PAGES: u64 = 4096;
 pub(crate) const DB_MAINTENANCE_MAX_INCREMENTAL_PAGES: u64 = 65_536;
 pub(crate) const DB_MAINTENANCE_MAX_VACUUM_DURATION: Duration = Duration::from_secs(5);
 pub(crate) const DB_MAINTENANCE_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DB_MAINTENANCE_FULL_VACUUM_MIN_INTERVAL: Duration =
+    Duration::from_secs(24 * 60 * 60);
+
+const INTERNAL_METADATA_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS weaver_internal_metadata (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);";
+const LAST_FULL_VACUUM_KEY: &str = "sqlite_full_vacuum_success_epoch_secs";
+const INCREMENTAL_NO_PROGRESS_LIMIT: u64 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DbMaintenanceOptions {
@@ -23,6 +32,7 @@ pub(crate) struct DbMaintenanceOptions {
     pub max_incremental_pages: u64,
     pub max_vacuum_duration: Duration,
     pub wal_truncate_threshold_bytes: u64,
+    pub full_vacuum_min_interval: Duration,
 }
 
 impl Default for DbMaintenanceOptions {
@@ -34,6 +44,28 @@ impl Default for DbMaintenanceOptions {
             max_incremental_pages: DB_MAINTENANCE_MAX_INCREMENTAL_PAGES,
             max_vacuum_duration: DB_MAINTENANCE_MAX_VACUUM_DURATION,
             wal_truncate_threshold_bytes: DB_MAINTENANCE_WAL_TRUNCATE_THRESHOLD_BYTES,
+            full_vacuum_min_interval: DB_MAINTENANCE_FULL_VACUUM_MIN_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullVacuumDecision {
+    NotNeeded,
+    Ran,
+    SkippedActiveJobs,
+    SkippedRecentSuccess,
+    Failed,
+}
+
+impl FullVacuumDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "not_needed",
+            Self::Ran => "ran",
+            Self::SkippedActiveJobs => "skipped_active_jobs",
+            Self::SkippedRecentSuccess => "skipped_recent_success",
+            Self::Failed => "failed",
         }
     }
 }
@@ -43,6 +75,10 @@ pub(crate) struct DbMaintenanceReport {
     pub before: DbMaintenanceSnapshot,
     pub after: DbMaintenanceSnapshot,
     pub active_job_count: u64,
+    pub full_vacuum_ran: bool,
+    pub full_vacuum_decision: FullVacuumDecision,
+    pub full_vacuum_last_success_epoch_secs: Option<i64>,
+    pub full_vacuum_error: Option<String>,
     pub incremental_vacuum_ran: bool,
     pub vacuum_iterations: u64,
     pub reclaimed_pages_estimate: u64,
@@ -130,37 +166,79 @@ impl Database {
         let mut vacuum_iterations = 0u64;
         let mut budget_limited = false;
         let mut page_budget = options.max_incremental_pages;
+        let mut full_vacuum_decision = FullVacuumDecision::NotNeeded;
+        let mut full_vacuum_last_success_epoch_secs = None;
+        let mut full_vacuum_error = None;
 
         if before.reclaimable_bytes() > options.reclaim_threshold_bytes
             && before.freelist_ratio() > options.freelist_ratio_threshold
         {
-            loop {
-                if current.reclaimable_bytes() <= options.reclaim_threshold_bytes {
-                    break;
+            if active_job_count == 0 {
+                let now_epoch_secs = current_epoch_secs();
+                full_vacuum_last_success_epoch_secs =
+                    read_last_full_vacuum_success_epoch_secs(&conn)?;
+
+                if full_vacuum_is_due(
+                    full_vacuum_last_success_epoch_secs,
+                    options.full_vacuum_min_interval,
+                    now_epoch_secs,
+                ) {
+                    match conn.execute_batch("VACUUM") {
+                        Ok(()) => {
+                            write_last_full_vacuum_success_epoch_secs(&conn, now_epoch_secs)?;
+                            full_vacuum_last_success_epoch_secs = Some(now_epoch_secs);
+                            full_vacuum_decision = FullVacuumDecision::Ran;
+                        }
+                        Err(error) => {
+                            full_vacuum_decision = FullVacuumDecision::Failed;
+                            full_vacuum_error = Some(error.to_string());
+                            tracing::warn!(
+                                error = %error,
+                                "failed to run sqlite full vacuum during idle maintenance"
+                            );
+                        }
+                    }
+                } else {
+                    full_vacuum_decision = FullVacuumDecision::SkippedRecentSuccess;
                 }
-                if started.elapsed() >= options.max_vacuum_duration || page_budget == 0 {
+            } else {
+                full_vacuum_decision = FullVacuumDecision::SkippedActiveJobs;
+
+                let mut no_progress_iterations = 0u64;
+                loop {
+                    if current.reclaimable_bytes() <= options.reclaim_threshold_bytes {
+                        break;
+                    }
+                    if started.elapsed() >= options.max_vacuum_duration || page_budget == 0 {
+                        budget_limited = true;
+                        break;
+                    }
+
+                    let batch = options.incremental_batch_pages.max(1).min(page_budget);
+                    let previous_freelist = current.freelist_count;
+                    conn.execute_batch(&format!("PRAGMA incremental_vacuum({batch})"))
+                        .map_err(db_err)?;
+                    incremental_vacuum_ran = true;
+                    vacuum_iterations += 1;
+                    current = read_page_stats(&conn)?;
+
+                    let reclaimed_pages = previous_freelist.saturating_sub(current.freelist_count);
+                    if reclaimed_pages == 0 {
+                        no_progress_iterations += 1;
+                        if no_progress_iterations >= INCREMENTAL_NO_PROGRESS_LIMIT {
+                            break;
+                        }
+                    } else {
+                        no_progress_iterations = 0;
+                        page_budget = page_budget.saturating_sub(reclaimed_pages);
+                    }
+                }
+
+                if current.reclaimable_bytes() > options.reclaim_threshold_bytes
+                    && (started.elapsed() >= options.max_vacuum_duration || page_budget == 0)
+                {
                     budget_limited = true;
-                    break;
                 }
-
-                let batch = options.incremental_batch_pages.max(1).min(page_budget);
-                let previous_freelist = current.freelist_count;
-                conn.execute_batch(&format!("PRAGMA incremental_vacuum({batch})"))
-                    .map_err(db_err)?;
-                incremental_vacuum_ran = true;
-                vacuum_iterations += 1;
-                page_budget = page_budget.saturating_sub(batch);
-                current = read_page_stats(&conn)?;
-
-                if current.freelist_count >= previous_freelist {
-                    break;
-                }
-            }
-
-            if current.reclaimable_bytes() > options.reclaim_threshold_bytes
-                && (started.elapsed() >= options.max_vacuum_duration || page_budget == 0)
-            {
-                budget_limited = true;
             }
         }
 
@@ -189,6 +267,10 @@ impl Database {
             before,
             after,
             active_job_count,
+            full_vacuum_ran: matches!(full_vacuum_decision, FullVacuumDecision::Ran),
+            full_vacuum_decision,
+            full_vacuum_last_success_epoch_secs,
+            full_vacuum_error,
             incremental_vacuum_ran,
             vacuum_iterations,
             reclaimed_pages_estimate,
@@ -249,6 +331,10 @@ fn log_report(report: &DbMaintenanceReport) {
             .wal_truncate_result
             .map(|result| result.checkpointed_frames),
         active_job_count = report.active_job_count,
+        full_vacuum_ran = report.full_vacuum_ran,
+        full_vacuum_decision = report.full_vacuum_decision.as_str(),
+        full_vacuum_last_success_epoch_secs = report.full_vacuum_last_success_epoch_secs,
+        full_vacuum_error = report.full_vacuum_error.as_deref(),
         incremental_vacuum_ran = report.incremental_vacuum_ran,
         vacuum_iterations = report.vacuum_iterations,
         budget_limited = report.budget_limited,
@@ -289,6 +375,59 @@ fn active_job_count(conn: &Connection) -> Result<u64, StateError> {
         row.get::<_, i64>(0)
     })
     .map(|value| value.max(0) as u64)
+    .map_err(db_err)
+}
+
+fn current_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn full_vacuum_is_due(
+    last_success_epoch_secs: Option<i64>,
+    min_interval: Duration,
+    now_epoch_secs: i64,
+) -> bool {
+    let Some(last_success_epoch_secs) = last_success_epoch_secs else {
+        return true;
+    };
+    let min_interval_secs = i64::try_from(min_interval.as_secs()).unwrap_or(i64::MAX);
+    now_epoch_secs.saturating_sub(last_success_epoch_secs) >= min_interval_secs
+}
+
+fn ensure_internal_metadata_table(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(INTERNAL_METADATA_TABLE_SQL)
+        .map_err(db_err)
+}
+
+fn read_last_full_vacuum_success_epoch_secs(conn: &Connection) -> Result<Option<i64>, StateError> {
+    ensure_internal_metadata_table(conn)?;
+    let value = conn
+        .query_row(
+            "SELECT value FROM weaver_internal_metadata WHERE key = ?1",
+            [LAST_FULL_VACUUM_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+
+    Ok(value.and_then(|value| value.parse::<i64>().ok()))
+}
+
+fn write_last_full_vacuum_success_epoch_secs(
+    conn: &Connection,
+    epoch_secs: i64,
+) -> Result<(), StateError> {
+    ensure_internal_metadata_table(conn)?;
+    conn.execute(
+        "INSERT INTO weaver_internal_metadata (key, value)
+         VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (LAST_FULL_VACUUM_KEY, epoch_secs.to_string()),
+    )
+    .map(|_| ())
     .map_err(db_err)
 }
 

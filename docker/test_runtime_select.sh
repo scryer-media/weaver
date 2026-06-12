@@ -21,19 +21,43 @@ trap 'rm -rf "$tmpdir"' EXIT INT TERM
 cat <<'EOF' > "$tmpdir/amd64-haswell.cpuinfo"
 processor : 0
 vendor_id : GenuineIntel
-flags     : fpu sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+flags     : fpu fxsr sse sse2 pni ssse3 sse4_1 sse4_2 cx16 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+EOF
+
+cat <<'EOF' > "$tmpdir/amd64-haswell-explicit-sse3.cpuinfo"
+processor : 0
+vendor_id : GenuineIntel
+flags     : fpu fxsr sse sse2 sse3 ssse3 sse4_1 sse4_2 cmpxchg16b avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
 EOF
 
 cat <<'EOF' > "$tmpdir/amd64-haswell-abm.cpuinfo"
 processor : 0
 vendor_id : GenuineIntel
-flags     : fpu sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq popcnt rdrand xsave xsaveopt
+flags     : fpu fxsr sse sse2 pni ssse3 sse4_1 sse4_2 cx16 avx avx2 bmi1 bmi2 f16c fma abm movbe pclmulqdq popcnt rdrand xsave xsaveopt
 EOF
 
 cat <<'EOF' > "$tmpdir/amd64-portable.cpuinfo"
 processor : 0
 vendor_id : GenuineIntel
-flags     : fpu sse3 ssse3 sse4_1 sse4_2 avx bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+flags     : fpu fxsr sse sse2 pni ssse3 sse4_1 sse4_2 cx16 avx bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+EOF
+
+cat <<'EOF' > "$tmpdir/amd64-missing-sse3.cpuinfo"
+processor : 0
+vendor_id : GenuineIntel
+flags     : fpu fxsr sse sse2 ssse3 sse4_1 sse4_2 cx16 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+EOF
+
+cat <<'EOF' > "$tmpdir/amd64-missing-bmi2.cpuinfo"
+processor : 0
+vendor_id : GenuineIntel
+flags     : fpu fxsr sse sse2 pni ssse3 sse4_1 sse4_2 cx16 avx avx2 bmi1 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
+EOF
+
+cat <<'EOF' > "$tmpdir/amd64-missing-xsaveopt.cpuinfo"
+processor : 0
+vendor_id : GenuineIntel
+flags     : fpu fxsr sse sse2 pni ssse3 sse4_1 sse4_2 cx16 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave
 EOF
 
 cat <<'EOF' > "$tmpdir/arm64-cortex-a76.cpuinfo"
@@ -47,8 +71,12 @@ Features  : fp asimd aes sha2 crc32 atomics fphp asimdrdm
 EOF
 
 assert_eq "haswell" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-haswell.cpuinfo")" "amd64 selects haswell when all required features are present"
+assert_eq "haswell" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-haswell-explicit-sse3.cpuinfo")" "amd64 selects haswell with explicit sse3 and cmpxchg16b features"
 assert_eq "haswell" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-haswell-abm.cpuinfo")" "amd64 treats abm as lzcnt for haswell selection"
-assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-portable.cpuinfo")" "amd64 falls back to portable when a required feature is missing"
+assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-portable.cpuinfo")" "amd64 falls back to portable when avx2 is missing"
+assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-missing-sse3.cpuinfo")" "amd64 falls back to portable when pni/sse3 is missing"
+assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-missing-bmi2.cpuinfo")" "amd64 falls back to portable when bmi2 is missing"
+assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/amd64-missing-xsaveopt.cpuinfo")" "amd64 falls back to portable when xsaveopt is missing"
 assert_eq "cortex-a76" "$(select_linux_lane_for_arch arm64 "$tmpdir/arm64-cortex-a76.cpuinfo")" "arm64 selects cortex-a76 when all required features are present"
 assert_eq "portable" "$(select_linux_lane_for_arch arm64 "$tmpdir/arm64-portable.cpuinfo")" "arm64 falls back to portable when a required feature is missing"
 assert_eq "portable" "$(select_linux_lane_for_arch amd64 "$tmpdir/missing.cpuinfo")" "missing cpuinfo falls back to portable"

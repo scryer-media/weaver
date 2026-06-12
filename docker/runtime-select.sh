@@ -1,6 +1,8 @@
 #!/bin/sh
 
-WEAVER_X86_64_REQUIRED_FEATURES="avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand sse3 sse4.1 sse4.2 ssse3 xsave xsaveopt"
+# Derived from:
+# rustc --print cfg --target x86_64-unknown-linux-musl -C target-cpu=haswell
+WEAVER_X86_64_REQUIRED_FEATURES="avx avx2 bmi1 bmi2 cmpxchg16b f16c fma fxsr lzcnt movbe pclmulqdq popcnt rdrand sse sse2 sse3 sse4.1 sse4.2 ssse3 xsave xsaveopt"
 WEAVER_ARM64_REQUIRED_FEATURES="aes crc32 dotprod fp16 lse neon rdm sha2"
 
 to_lower() {
@@ -13,14 +15,18 @@ normalize_x86_feature() {
         avx2 | avx2.0) printf '%s\n' "avx2" ;;
         bmi1) printf '%s\n' "bmi1" ;;
         bmi2) printf '%s\n' "bmi2" ;;
+        cx16 | cmpxchg16b) printf '%s\n' "cmpxchg16b" ;;
         f16c) printf '%s\n' "f16c" ;;
         fma) printf '%s\n' "fma" ;;
+        fxsr) printf '%s\n' "fxsr" ;;
         abm | lzcnt) printf '%s\n' "lzcnt" ;;
         movbe) printf '%s\n' "movbe" ;;
         pclmul | pclmulqdq) printf '%s\n' "pclmulqdq" ;;
         popcnt) printf '%s\n' "popcnt" ;;
         rdrand) printf '%s\n' "rdrand" ;;
-        sse3) printf '%s\n' "sse3" ;;
+        sse) printf '%s\n' "sse" ;;
+        sse2) printf '%s\n' "sse2" ;;
+        pni | sse3) printf '%s\n' "sse3" ;;
         sse4_1 | sse4.1) printf '%s\n' "sse4.1" ;;
         sse4_2 | sse4.2) printf '%s\n' "sse4.2" ;;
         ssse3) printf '%s\n' "ssse3" ;;
