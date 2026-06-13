@@ -14308,10 +14308,44 @@ async fn pause_allows_extracting_status_when_download_lane_is_active() {
 }
 
 #[tokio::test]
-async fn pause_rejects_extracting_state_without_download_lane() {
+async fn pause_allows_extracting_status_with_runtime_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31242);
+
+    let mut state = minimal_job_state(
+        job_id,
+        "extracting-with-active-download",
+        temp_dir.path().join("extracting-with-active-download"),
+    );
+    state.download_state = crate::jobs::model::DownloadState::Complete;
+    state.post_state = crate::jobs::model::PostState::Extracting;
+    state.refresh_legacy_status();
+    pipeline.jobs.insert(job_id, state);
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline.pause_job_runtime(job_id).unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.status, JobStatus::Paused);
+    assert_eq!(state.paused_resume_status, Some(JobStatus::Extracting));
+    assert_eq!(
+        state.paused_resume_download_state,
+        Some(crate::jobs::model::DownloadState::Complete)
+    );
+    assert_eq!(
+        state.paused_resume_post_state,
+        Some(crate::jobs::model::PostState::Extracting)
+    );
+}
+
+#[tokio::test]
+async fn pause_rejects_extracting_state_without_download_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31243);
 
     let mut state = minimal_job_state(
         job_id,
@@ -14335,7 +14369,7 @@ async fn pause_rejects_extracting_state_without_download_lane() {
 async fn purge_idle_rar_set_drops_shared_kdf_cache() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31243);
+    let job_id = JobId(31244);
     let set_name = "show".to_string();
 
     pipeline.jobs.insert(

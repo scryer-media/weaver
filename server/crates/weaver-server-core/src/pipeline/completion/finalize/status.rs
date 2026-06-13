@@ -591,11 +591,17 @@ impl Pipeline {
         if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
-        if !matches!(
+        let pauseable_download_lane = matches!(
             previous_download_state,
             crate::jobs::model::DownloadState::Queued
                 | crate::jobs::model::DownloadState::Downloading
-        ) {
+        );
+        let extracting_with_download_work = matches!(
+            previous_post_state,
+            crate::jobs::model::PostState::Extracting
+        ) && self
+            .job_has_pending_download_pipeline_work(job_id);
+        if !(pauseable_download_lane || extracting_with_download_work) {
             return Err(crate::SchedulerError::Conflict(format!(
                 "pause is only supported in queued or downloading states (current: {:?})",
                 previous_status
