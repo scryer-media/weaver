@@ -111,6 +111,33 @@ fn open_sql_services_blocking(
     })
 }
 
+#[derive(Clone)]
+pub(crate) struct DatabaseWriterExecutor {
+    sql_services: DatabaseServices,
+    sql_worker: DatabaseRuntimeWorker,
+}
+
+impl DatabaseWriterExecutor {
+    fn from_database(db: &Database) -> Self {
+        Self {
+            sql_services: db.sql_services.clone(),
+            sql_worker: db.sql_worker.clone(),
+        }
+    }
+
+    pub(crate) fn datastore(&self) -> StoreDatastore {
+        self.sql_services.datastore()
+    }
+
+    pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        self.sql_worker.block_on(future)
+    }
+}
+
 enum DbWriteCommand {
     ArchiveJob {
         job_id: crate::jobs::ids::JobId,
@@ -236,14 +263,14 @@ impl Database {
     }
 
     fn spawn_writer_task(&self, mut rx: mpsc::Receiver<DbWriteCommand>) {
-        let db = self.clone();
+        let writer = DatabaseWriterExecutor::from_database(self);
         let worker = async move {
             while let Some(command) = rx.recv().await {
                 match command {
                     DbWriteCommand::ArchiveJob { job_id, history } => {
-                        let db = db.clone();
+                        let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(error) = db.archive_job(job_id, history.as_ref()) {
+                            if let Err(error) = writer.archive_job(job_id, history.as_ref()) {
                                 tracing::warn!(
                                     job_id = job_id.0,
                                     error = %error,
@@ -255,9 +282,9 @@ impl Database {
                         .ok();
                     }
                     DbWriteCommand::InsertJobEvents { events } => {
-                        let db = db.clone();
+                        let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(error) = db.insert_job_events(&events) {
+                            if let Err(error) = writer.insert_job_events(&events) {
                                 tracing::warn!(
                                     count = events.len(),
                                     error = %error,

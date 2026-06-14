@@ -173,6 +173,13 @@ impl Database {
     }
 
     pub fn export_stable_state(&self, dest: &Path) -> Result<StableStateExport, StateError> {
+        let datastore = self.datastore();
+        if datastore.engine() != SqlEngine::Sqlite {
+            return Err(StateError::Database(
+                "stable-state backup export currently requires sqlite datastore".to_string(),
+            ));
+        }
+
         let snapshot_dir = tempfile::tempdir().map_err(db_err)?;
         let snapshot_path = snapshot_dir.path().join("snapshot.db");
         let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
@@ -180,12 +187,6 @@ impl Database {
         let schema_version = self.schema_version()?;
         let max_job_id = self.max_job_id_all()?;
 
-        let datastore = self.datastore();
-        if datastore.engine() != SqlEngine::Sqlite {
-            return Err(StateError::Database(
-                "stable-state backup export currently requires sqlite datastore".to_string(),
-            ));
-        }
         self.run_sql_blocking_local({
             let snapshot_path_str = snapshot_path_str.clone();
             move || async move {

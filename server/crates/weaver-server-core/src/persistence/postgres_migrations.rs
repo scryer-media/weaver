@@ -31,6 +31,8 @@ struct MigrationLedgerRow {
     success: bool,
     checksum_algo: String,
     checksum: Vec<u8>,
+    runtime_version: String,
+    error_message: Option<String>,
 }
 
 fn db_err(error: impl std::fmt::Display) -> StateError {
@@ -88,6 +90,9 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
     validate_known_migrations(&applied, &catalog)?;
     let pending = list_pending_migrations_from_applied(&applied, &catalog);
     if pending.is_empty() {
+        if !matches!(mode, MigrationMode::ValidateOnly) {
+            mirror_schema_version_to_latest_successful_migration(pool).await?;
+        }
         return Ok(());
     }
 
@@ -134,6 +139,7 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
         }
     }
 
+    mirror_schema_version_to_latest_successful_migration(pool).await?;
     Ok(())
 }
 
@@ -156,6 +162,17 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
     .execute(pool)
     .await
     .map_err(db_err)?;
+
+    for sql in [
+        "ALTER TABLE _sqlx_migrations
+             ADD COLUMN IF NOT EXISTS checksum_algo TEXT NOT NULL DEFAULT 'blake3'",
+        "ALTER TABLE _sqlx_migrations
+             ADD COLUMN IF NOT EXISTS runtime_version TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE _sqlx_migrations
+             ADD COLUMN IF NOT EXISTS error_message TEXT",
+    ] {
+        sqlx::raw_sql(sql).execute(pool).await.map_err(db_err)?;
+    }
 
     Ok(())
 }
@@ -183,12 +200,14 @@ async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<MigrationLedgerRow
         "SELECT
              version,
              description,
-             installed_on::TEXT AS installed_on,
-             success,
-             checksum,
-             COALESCE(NULLIF(BTRIM(checksum_algo), ''), 'blake3') AS checksum_algo
-         FROM _sqlx_migrations
-         ORDER BY version",
+	             installed_on::TEXT AS installed_on,
+	             success,
+	             checksum,
+	             COALESCE(NULLIF(BTRIM(checksum_algo), ''), 'blake3') AS checksum_algo,
+	             COALESCE(runtime_version, '') AS runtime_version,
+	             error_message
+	         FROM _sqlx_migrations
+	         ORDER BY version",
     )
     .fetch_all(pool)
     .await
@@ -203,9 +222,46 @@ async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<MigrationLedgerRow
                 success: row.try_get("success").map_err(db_err)?,
                 checksum: row.try_get("checksum").map_err(db_err)?,
                 checksum_algo: row.try_get("checksum_algo").map_err(db_err)?,
+                runtime_version: row.try_get("runtime_version").map_err(db_err)?,
+                error_message: row.try_get("error_message").map_err(db_err)?,
             })
         })
         .collect()
+}
+
+async fn mirror_schema_version_to_latest_successful_migration(
+    pool: &PgPool,
+) -> Result<(), StateError> {
+    let Some(version) = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(version) FROM _sqlx_migrations WHERE success = TRUE",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?
+    else {
+        return Ok(());
+    };
+
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version BIGINT NOT NULL
+        )",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    sqlx::query("DELETE FROM schema_version")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query("INSERT INTO schema_version (version) VALUES ($1)")
+        .bind(version)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(())
 }
 
 fn list_pending_migrations_from_applied(
@@ -422,6 +478,10 @@ async fn run_postgres_rust_hook(
     )))
 }
 
+fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
+    &[]
+}
+
 async fn insert_applied_migration(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     migration: &CompiledMigration,
@@ -461,10 +521,54 @@ pub(crate) async fn list_applied_migrations(
             migration_checksum: migration_assets::checksum_hex(&row.checksum),
             applied_at: row.installed_on,
             success: row.success,
-            error_message: None,
-            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            error_message: row.error_message,
+            runtime_version: row.runtime_version,
         });
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn future_postgres_rust_migrations_require_implemented_hooks() {
+        let catalog = crate::schema_migrations::embedded_catalog().unwrap();
+        let baseline = catalog
+            .latest_baseline_at_or_below_for_engine(catalog.max_version(), EngineScope::Postgres)
+            .unwrap();
+        let implemented_hooks = implemented_postgres_rust_hooks();
+        let mut offenders = Vec::new();
+
+        for migration in catalog
+            .migrations
+            .iter()
+            .filter(|migration| migration.version > baseline.through_version)
+        {
+            for step in &migration.steps {
+                let CompiledMigrationStep::Rust {
+                    hook_id, engine, ..
+                } = step
+                else {
+                    continue;
+                };
+                if engine.applies_to(EngineScope::Postgres)
+                    && !implemented_hooks.contains(&hook_id.as_str())
+                {
+                    offenders.push(format!(
+                        "{} uses unimplemented PostgreSQL hook {hook_id}",
+                        migration.key
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "PostgreSQL-applicable Rust migration hooks need explicit implementations: {}",
+            offenders.join(", ")
+        );
+    }
 }

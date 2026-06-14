@@ -2,6 +2,10 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version BIGINT NOT NULL
 );
 
+INSERT INTO schema_version (version)
+SELECT 25
+WHERE NOT EXISTS (SELECT 1 FROM schema_version);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL

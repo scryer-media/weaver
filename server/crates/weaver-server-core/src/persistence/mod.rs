@@ -11,5 +11,6 @@ pub(crate) mod sql_services;
 pub(crate) mod sqlite_writer;
 
 pub use connection::Database;
+pub(crate) use connection::DatabaseWriterExecutor;
 pub use error::StateError;
 pub use setup::{bootstrap_encryption, open_db_and_config, resolve_database_paths};

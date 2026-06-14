@@ -1,8 +1,8 @@
 use crate::StateError;
 use crate::history;
 use crate::jobs::ids::JobId;
-use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::{Database, DatabaseWriterExecutor};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OrphanActiveStateCounts {
@@ -131,6 +131,57 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
     ]
 }
 
+async fn archive_job_sql(
+    datastore: StoreDatastore,
+    job_id: JobId,
+    args: Vec<SqlArg>,
+) -> Result<(), StateError> {
+    SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
+        let args = args.clone();
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO job_history
+                 (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+                  optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                  failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                  created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                 VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
+                         {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                         COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
+                         (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
+                         {}, {}, {}, {}, {})
+                 ON CONFLICT(job_id) DO UPDATE SET
+                    job_hash = excluded.job_hash,
+                    name = excluded.name,
+                    status = excluded.status,
+                    error_message = excluded.error_message,
+                    total_bytes = excluded.total_bytes,
+                    downloaded_bytes = excluded.downloaded_bytes,
+                    optional_recovery_bytes = excluded.optional_recovery_bytes,
+                    optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
+                    failed_bytes = excluded.failed_bytes,
+                    health = excluded.health,
+                    category = excluded.category,
+                    output_dir = excluded.output_dir,
+                    nzb_path = excluded.nzb_path,
+                    nzb_zstd = excluded.nzb_zstd,
+                    created_at = excluded.created_at,
+                    completed_at = excluded.completed_at,
+                    metadata = excluded.metadata,
+                    last_diagnostic_id = excluded.last_diagnostic_id,
+                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                &args,
+            )
+            .await?;
+            delete_active_job_rows(tx, job_id.0 as i64).await?;
+            Ok(())
+        })
+    })
+    .await?;
+    run_inline_incremental_vacuum(&datastore).await?;
+    Ok(())
+}
+
 impl Database {
     pub fn archive_job(
         &self,
@@ -139,52 +190,7 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
-                let args = args.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "INSERT INTO job_history
-                         (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-                          optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                          failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                          created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
-                         VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
-                                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                                 COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
-                                 (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
-                                 {}, {}, {}, {}, {})
-                         ON CONFLICT(job_id) DO UPDATE SET
-                            job_hash = excluded.job_hash,
-                            name = excluded.name,
-                            status = excluded.status,
-                            error_message = excluded.error_message,
-                            total_bytes = excluded.total_bytes,
-                            downloaded_bytes = excluded.downloaded_bytes,
-                            optional_recovery_bytes = excluded.optional_recovery_bytes,
-                            optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
-                            failed_bytes = excluded.failed_bytes,
-                            health = excluded.health,
-                            category = excluded.category,
-                            output_dir = excluded.output_dir,
-                            nzb_path = excluded.nzb_path,
-                            nzb_zstd = excluded.nzb_zstd,
-                            created_at = excluded.created_at,
-                            completed_at = excluded.completed_at,
-                            metadata = excluded.metadata,
-                            last_diagnostic_id = excluded.last_diagnostic_id,
-                            last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
-                        &args,
-                    )
-                    .await?;
-                    delete_active_job_rows(tx, job_id.0 as i64).await?;
-                    Ok(())
-                })
-            })
-            .await?;
-            run_inline_incremental_vacuum(&datastore).await?;
-            Ok(())
-        })
+        self.run_sql_blocking(archive_job_sql(datastore, job_id, args))
     }
 
     pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
@@ -263,6 +269,18 @@ impl Database {
             }
             Ok(counts)
         })
+    }
+}
+
+impl DatabaseWriterExecutor {
+    pub(crate) fn archive_job(
+        &self,
+        job_id: JobId,
+        history: &history::JobHistoryRow,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = history_args(history, job_id);
+        self.run_sql_blocking(archive_job_sql(datastore, job_id, args))
     }
 }
 

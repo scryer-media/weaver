@@ -1,6 +1,6 @@
 use crate::StateError;
-use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore};
+use crate::persistence::{Database, DatabaseWriterExecutor};
 
 /// A persisted job event.
 #[derive(Debug, Clone)]
@@ -13,6 +13,33 @@ pub struct JobEvent {
 }
 
 pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
+
+async fn insert_job_events_sql(
+    datastore: StoreDatastore,
+    events: Vec<JobEvent>,
+) -> Result<(), StateError> {
+    SqlRuntime::run_in_transaction(&datastore, "insert_job_events", |tx| {
+        let events = events.clone();
+        Box::pin(async move {
+            for event in events {
+                tx.execute(
+                    "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
+                     VALUES ({}, {}, {}, {}, {})",
+                    &[
+                        SqlArg::I64(event.job_id as i64),
+                        SqlArg::I64(event.timestamp),
+                        SqlArg::Text(event.kind),
+                        SqlArg::Text(event.message),
+                        SqlArg::OptText(event.file_id),
+                    ],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
 
 impl Database {
     /// Insert a single job event.
@@ -54,29 +81,7 @@ impl Database {
 
         let datastore = self.datastore();
         let events = events.to_vec();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "insert_job_events", |tx| {
-                let events = events.clone();
-                Box::pin(async move {
-                    for event in events {
-                        tx.execute(
-                            "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
-                             VALUES ({}, {}, {}, {}, {})",
-                            &[
-                                SqlArg::I64(event.job_id as i64),
-                                SqlArg::I64(event.timestamp),
-                                SqlArg::Text(event.kind),
-                                SqlArg::Text(event.message),
-                                SqlArg::OptText(event.file_id),
-                            ],
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await
-        })
+        self.run_sql_blocking(insert_job_events_sql(datastore, events))
     }
 
     /// Load all events for a specific job, ordered by insertion order.
@@ -127,6 +132,18 @@ impl Database {
             SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_events", &[]).await?;
             Ok(())
         })
+    }
+}
+
+impl DatabaseWriterExecutor {
+    pub(crate) fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let events = events.to_vec();
+        self.run_sql_blocking(insert_job_events_sql(datastore, events))
     }
 }
 

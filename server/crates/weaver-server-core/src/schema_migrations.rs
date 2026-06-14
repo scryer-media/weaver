@@ -9,7 +9,7 @@ use sqlx::{Row, SqlitePool};
 use crate::StateError;
 use crate::migration_assets::{
     CompiledBaseline, CompiledMigration, CompiledMigrationCatalog, CompiledMigrationStep,
-    MigrationInstallKind,
+    EngineScope, MigrationInstallKind,
 };
 use crate::migration_hook_ids;
 
@@ -443,6 +443,9 @@ async fn apply_single_migration(
     let start = Instant::now();
     let mut tx = pool.begin().await.map_err(db_err)?;
     for step in &migration.steps {
+        if !step.engine().applies_to(EngineScope::Sqlite) {
+            continue;
+        }
         if !step.scope().applies_to(install_kind) {
             continue;
         }
@@ -845,7 +848,10 @@ async fn upgrade_to_schema_25(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration_assets::ChecksumAlgorithm;
+    use crate::migration_assets::{
+        ChecksumAlgorithm, CompiledMigration, CompiledMigrationStep, EngineScope, PayloadSlice,
+        StepScope,
+    };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1238,6 +1244,62 @@ mod tests {
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
         validate_payload_checksum(&catalog, &payload).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_replay_skips_postgres_only_steps() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        ensure_migration_ledger_shape(&pool).await.unwrap();
+
+        let payload = b"CREATE TABLE postgres_only_marker (id INTEGER PRIMARY KEY);";
+        let migration = CompiledMigration {
+            version: 9_999,
+            description: "postgres only synthetic step".to_string(),
+            key: "9999_postgres_only_synthetic_step".to_string(),
+            filename: "synthetic.sql".to_string(),
+            checksum_algo: ChecksumAlgorithm::Blake3,
+            checksum: ChecksumAlgorithm::Blake3.digest(payload),
+            steps: vec![CompiledMigrationStep::Sql {
+                file: "synthetic.sql".to_string(),
+                engine: EngineScope::Postgres,
+                scope: StepScope::All,
+                payload: PayloadSlice {
+                    start: 0,
+                    len: payload.len() as u64,
+                },
+            }],
+        };
+
+        apply_single_migration(
+            &pool,
+            &migration,
+            payload,
+            MigrationInstallKind::FreshInstall,
+        )
+        .await
+        .unwrap();
+
+        let marker_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM sqlite_master
+              WHERE type = 'table'
+                AND name = 'postgres_only_marker'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marker_tables, 0);
+
+        let stamped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 9999")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stamped, 1);
     }
 
     #[tokio::test]
