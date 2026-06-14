@@ -7,6 +7,7 @@ use crate::Database;
 use crate::ingest::submit_nzb_bytes;
 use crate::jobs::FileIdentitySource;
 use crate::jobs::ids::MessageId;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
 use crate::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
@@ -15,6 +16,7 @@ use crate::runtime::system_profile::{
 use crate::settings::{Config, SharedConfig};
 use crate::{FileSpec, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState};
 use chrono::Timelike;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, oneshot};
 use weaver_model::files::FileRole;
@@ -237,11 +239,18 @@ fn history_row_with_output_dir(
 
 fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, nzb_zstd: &[u8]) {
     db.insert_job_history(row).unwrap();
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE job_history SET nzb_zstd = ?2 WHERE job_id = ?1",
-        rusqlite::params![row.job_id as i64, nzb_zstd],
-    )
+    let datastore = db.datastore();
+    let job_id = row.job_id as i64;
+    let nzb_zstd = nzb_zstd.to_vec();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.read_exec(),
+            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
+            &[SqlArg::Bytes(nzb_zstd), SqlArg::I64(job_id)],
+        )
+        .await?;
+        Ok(())
+    })
     .unwrap();
 }
 
@@ -5455,14 +5464,21 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
         .await
         .unwrap();
 
-    let conn = rusqlite::Connection::open(temp_dir.path().join("weaver.db")).unwrap();
-    let stored_hash: Vec<u8> = conn
-        .query_row(
-            "SELECT nzb_hash FROM active_jobs WHERE job_id = ?1",
-            rusqlite::params![job_id.0 as i64],
-            |row| row.get(0),
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp_dir.path().join("weaver.db"))
+                .create_if_missing(false),
         )
+        .await
         .unwrap();
+    let stored_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT nzb_hash FROM active_jobs WHERE job_id = ?")
+            .bind(job_id.0 as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(stored_hash, expected_hash);
 }
 

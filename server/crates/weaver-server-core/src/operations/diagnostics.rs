@@ -1,6 +1,6 @@
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::{Database, StateError};
 
 pub const DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY: &str = "__weaver_diagnostic_source_job_id";
@@ -72,10 +72,6 @@ pub enum DiagnosticRunInsertError {
     State(#[from] StateError),
 }
 
-fn db_err(error: impl std::fmt::Display) -> StateError {
-    StateError::Database(error.to_string())
-}
-
 pub fn diagnostic_source_job_id(metadata: &[(String, String)]) -> Option<u64> {
     metadata
         .iter()
@@ -120,178 +116,163 @@ impl Database {
         &self,
         row: &DiagnosticRunRow,
     ) -> Result<(), DiagnosticRunInsertError> {
-        let conn = self.conn();
-
-        let source_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM job_history WHERE job_id = ?1)",
-                [row.source_job_id as i64],
-                |result| result.get(0),
+        let datastore = self.datastore();
+        let row = row.clone();
+        self.run_sql_blocking(async move {
+            let source_exists = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 FROM job_history WHERE job_id = {} LIMIT 1",
+                &[SqlArg::I64(row.source_job_id as i64)],
             )
-            .map_err(db_err)?;
-        if !source_exists {
-            return Err(DiagnosticRunInsertError::MissingSourceJob(
-                row.source_job_id,
-            ));
-        }
+            .await?
+            .is_some();
+            if !source_exists {
+                return Ok(Err(DiagnosticRunInsertError::MissingSourceJob(
+                    row.source_job_id,
+                )));
+            }
 
-        let existing = conn
-            .query_row(
-                "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
-                        rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
-                 FROM diagnostic_runs
-                 WHERE source_job_id = ?1",
-                [row.source_job_id as i64],
-                diagnostic_run_from_row,
+            let existing = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                DIAGNOSTIC_RUN_SELECT_BY_SOURCE,
+                &[SqlArg::I64(row.source_job_id as i64)],
             )
-            .optional()
-            .map_err(db_err)
-            .map_err(DiagnosticRunInsertError::State)?;
-        if existing
-            .as_ref()
-            .is_some_and(|current| current.stage.is_active())
-        {
-            return Err(DiagnosticRunInsertError::ActiveRunExists(row.source_job_id));
-        }
+            .await?
+            .map(diagnostic_run_from_row)
+            .transpose()?;
+            if existing
+                .as_ref()
+                .is_some_and(|current| current.stage.is_active())
+            {
+                return Ok(Err(DiagnosticRunInsertError::ActiveRunExists(
+                    row.source_job_id,
+                )));
+            }
 
-        conn.execute(
-            "INSERT INTO diagnostic_runs
-             (source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
-              rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(source_job_id) DO UPDATE SET
-               diagnostic_job_id = excluded.diagnostic_job_id,
-               smg_diagnostic_id = excluded.smg_diagnostic_id,
-               stage = excluded.stage,
-               include_server_hostnames = excluded.include_server_hostnames,
-               rerun_succeeded = excluded.rerun_succeeded,
-               error_message = excluded.error_message,
-               created_at_epoch_ms = excluded.created_at_epoch_ms,
-               updated_at_epoch_ms = excluded.updated_at_epoch_ms,
-               last_activity_at_epoch_ms = excluded.last_activity_at_epoch_ms",
-            params![
-                row.source_job_id as i64,
-                row.diagnostic_job_id as i64,
-                row.diagnostic_id,
-                row.stage.as_str(),
-                row.include_server_hostnames,
-                row.rerun_succeeded,
-                row.error_message,
-                row.created_at_epoch_ms,
-                row.updated_at_epoch_ms,
-                row.last_activity_at_epoch_ms,
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO diagnostic_runs
+                 (source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
+                  rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                 ON CONFLICT(source_job_id) DO UPDATE SET
+                   diagnostic_job_id = excluded.diagnostic_job_id,
+                   smg_diagnostic_id = excluded.smg_diagnostic_id,
+                   stage = excluded.stage,
+                   include_server_hostnames = excluded.include_server_hostnames,
+                   rerun_succeeded = excluded.rerun_succeeded,
+                   error_message = excluded.error_message,
+                   created_at_epoch_ms = excluded.created_at_epoch_ms,
+                   updated_at_epoch_ms = excluded.updated_at_epoch_ms,
+                   last_activity_at_epoch_ms = excluded.last_activity_at_epoch_ms",
+                &diagnostic_args(&row),
+            )
+            .await?;
+            Ok(Ok(()))
+        })?
     }
 
     pub fn get_diagnostic_run_for_source(
         &self,
         source_job_id: u64,
     ) -> Result<Option<DiagnosticRunRow>, StateError> {
-        let conn = self.read_conn();
-        conn.query_row(
-            "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
-                    rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
-             FROM diagnostic_runs
-             WHERE source_job_id = ?1",
-            [source_job_id as i64],
-            diagnostic_run_from_row,
-        )
-        .optional()
-        .map_err(db_err)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                DIAGNOSTIC_RUN_SELECT_BY_SOURCE,
+                &[SqlArg::I64(source_job_id as i64)],
+            )
+            .await?
+            .map(diagnostic_run_from_row)
+            .transpose()
+        })
     }
 
     pub fn get_diagnostic_run_by_job(
         &self,
         diagnostic_job_id: u64,
     ) -> Result<Option<DiagnosticRunRow>, StateError> {
-        let conn = self.read_conn();
-        conn.query_row(
-            "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
-                    rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
-             FROM diagnostic_runs
-             WHERE diagnostic_job_id = ?1",
-            [diagnostic_job_id as i64],
-            diagnostic_run_from_row,
-        )
-        .optional()
-        .map_err(db_err)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                DIAGNOSTIC_RUN_SELECT_BY_JOB,
+                &[SqlArg::I64(diagnostic_job_id as i64)],
+            )
+            .await?
+            .map(diagnostic_run_from_row)
+            .transpose()
+        })
     }
 
     pub fn list_pending_diagnostic_runs(&self) -> Result<Vec<DiagnosticRunRow>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
                         rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
                  FROM diagnostic_runs
                  WHERE stage IN ('queued', 'running', 'collecting', 'uploading')
                  ORDER BY created_at_epoch_ms ASC",
+                &[],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([], diagnostic_run_from_row)
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+            .await?;
+            rows.into_iter().map(diagnostic_run_from_row).collect()
+        })
     }
 
     pub fn list_stale_diagnostic_runs(
         &self,
         cutoff_epoch_ms: i64,
     ) -> Result<Vec<DiagnosticRunRow>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
                         rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
                  FROM diagnostic_runs
-                 WHERE last_activity_at_epoch_ms < ?1",
+                 WHERE last_activity_at_epoch_ms < {}",
+                &[SqlArg::I64(cutoff_epoch_ms)],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([cutoff_epoch_ms], diagnostic_run_from_row)
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+            .await?;
+            rows.into_iter().map(diagnostic_run_from_row).collect()
+        })
     }
 
     pub fn update_diagnostic_run(&self, row: &DiagnosticRunRow) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute(
+        let datastore = self.datastore();
+        let row = row.clone();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
                 "UPDATE diagnostic_runs
-                 SET diagnostic_job_id = ?2,
-                     smg_diagnostic_id = ?3,
-                     stage = ?4,
-                     include_server_hostnames = ?5,
-                     rerun_succeeded = ?6,
-                     error_message = ?7,
-                     updated_at_epoch_ms = ?8,
-                     last_activity_at_epoch_ms = ?9
-                 WHERE source_job_id = ?1",
-                params![
-                    row.source_job_id as i64,
-                    row.diagnostic_job_id as i64,
-                    row.diagnostic_id,
-                    row.stage.as_str(),
-                    row.include_server_hostnames,
-                    row.rerun_succeeded,
-                    row.error_message,
-                    row.updated_at_epoch_ms,
-                    row.last_activity_at_epoch_ms,
+                 SET diagnostic_job_id = {},
+                     smg_diagnostic_id = {},
+                     stage = {},
+                     include_server_hostnames = {},
+                     rerun_succeeded = {},
+                     error_message = {},
+                     updated_at_epoch_ms = {},
+                     last_activity_at_epoch_ms = {}
+                 WHERE source_job_id = {}",
+                &[
+                    SqlArg::I64(row.diagnostic_job_id as i64),
+                    SqlArg::OptText(row.diagnostic_id),
+                    SqlArg::Text(row.stage.as_str().to_string()),
+                    SqlArg::Bool(row.include_server_hostnames),
+                    SqlArg::OptBool(row.rerun_succeeded),
+                    SqlArg::OptText(row.error_message),
+                    SqlArg::I64(row.updated_at_epoch_ms),
+                    SqlArg::I64(row.last_activity_at_epoch_ms),
+                    SqlArg::I64(row.source_job_id as i64),
                 ],
             )
-            .map_err(db_err)?;
-        Ok(changed > 0)
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     pub fn touch_diagnostic_run(
@@ -299,28 +280,36 @@ impl Database {
         source_job_id: u64,
         updated_at_epoch_ms: i64,
     ) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
                 "UPDATE diagnostic_runs
-                 SET updated_at_epoch_ms = ?2,
-                     last_activity_at_epoch_ms = ?2
-                 WHERE source_job_id = ?1",
-                params![source_job_id as i64, updated_at_epoch_ms],
+                 SET updated_at_epoch_ms = {},
+                     last_activity_at_epoch_ms = {}
+                 WHERE source_job_id = {}",
+                &[
+                    SqlArg::I64(updated_at_epoch_ms),
+                    SqlArg::I64(updated_at_epoch_ms),
+                    SqlArg::I64(source_job_id as i64),
+                ],
             )
-            .map_err(db_err)?;
-        Ok(changed > 0)
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     pub fn delete_diagnostic_run(&self, source_job_id: u64) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute(
-                "DELETE FROM diagnostic_runs WHERE source_job_id = ?1",
-                [source_job_id as i64],
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM diagnostic_runs WHERE source_job_id = {}",
+                &[SqlArg::I64(source_job_id as i64)],
             )
-            .map_err(db_err)?;
-        Ok(changed > 0)
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     pub fn persist_job_history_diagnostic_receipt(
@@ -329,39 +318,63 @@ impl Database {
         diagnostic_id: &str,
         uploaded_at_epoch_ms: i64,
     ) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute(
+        let datastore = self.datastore();
+        let diagnostic_id = diagnostic_id.to_string();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
                 "UPDATE job_history
-                 SET last_diagnostic_id = ?2,
-                     last_diagnostic_uploaded_at_epoch_ms = ?3
-                 WHERE job_id = ?1",
-                params![source_job_id as i64, diagnostic_id, uploaded_at_epoch_ms],
+                 SET last_diagnostic_id = {},
+                     last_diagnostic_uploaded_at_epoch_ms = {}
+                 WHERE job_id = {}",
+                &[
+                    SqlArg::Text(diagnostic_id),
+                    SqlArg::I64(uploaded_at_epoch_ms),
+                    SqlArg::I64(source_job_id as i64),
+                ],
             )
-            .map_err(db_err)?;
-        Ok(changed > 0)
+            .await?;
+            Ok(changed > 0)
+        })
     }
 }
 
-fn diagnostic_run_from_row(row: &rusqlite::Row<'_>) -> Result<DiagnosticRunRow, rusqlite::Error> {
-    let stage = row.get::<_, String>(3)?;
-    let rerun_succeeded = row.get::<_, Option<bool>>(5)?;
+const DIAGNOSTIC_RUN_SELECT_BY_SOURCE: &str = "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
+        rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
+ FROM diagnostic_runs
+ WHERE source_job_id = {}";
+
+const DIAGNOSTIC_RUN_SELECT_BY_JOB: &str = "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
+        rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
+ FROM diagnostic_runs
+ WHERE diagnostic_job_id = {}";
+
+fn diagnostic_args(row: &DiagnosticRunRow) -> Vec<SqlArg> {
+    vec![
+        SqlArg::I64(row.source_job_id as i64),
+        SqlArg::I64(row.diagnostic_job_id as i64),
+        SqlArg::OptText(row.diagnostic_id.clone()),
+        SqlArg::Text(row.stage.as_str().to_string()),
+        SqlArg::Bool(row.include_server_hostnames),
+        SqlArg::OptBool(row.rerun_succeeded),
+        SqlArg::OptText(row.error_message.clone()),
+        SqlArg::I64(row.created_at_epoch_ms),
+        SqlArg::I64(row.updated_at_epoch_ms),
+        SqlArg::I64(row.last_activity_at_epoch_ms),
+    ]
+}
+
+fn diagnostic_run_from_row(row: SqlRow) -> Result<DiagnosticRunRow, StateError> {
     Ok(DiagnosticRunRow {
-        source_job_id: row.get::<_, i64>(0)? as u64,
-        diagnostic_job_id: row.get::<_, i64>(1)? as u64,
-        diagnostic_id: row.get(2)?,
-        stage: DiagnosticRunStage::parse(&stage).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
-        include_server_hostnames: row.get(4)?,
-        rerun_succeeded,
-        error_message: row.get(6)?,
-        created_at_epoch_ms: row.get(7)?,
-        updated_at_epoch_ms: row.get(8)?,
-        last_activity_at_epoch_ms: row.get(9)?,
+        source_job_id: row.i64("source_job_id")? as u64,
+        diagnostic_job_id: row.i64("diagnostic_job_id")? as u64,
+        diagnostic_id: row.opt_text("smg_diagnostic_id")?,
+        stage: DiagnosticRunStage::parse(&row.text("stage")?)?,
+        include_server_hostnames: row.bool("include_server_hostnames")?,
+        rerun_succeeded: row.opt_bool("rerun_succeeded")?,
+        error_message: row.opt_text("error_message")?,
+        created_at_epoch_ms: row.i64("created_at_epoch_ms")?,
+        updated_at_epoch_ms: row.i64("updated_at_epoch_ms")?,
+        last_activity_at_epoch_ms: row.i64("last_activity_at_epoch_ms")?,
     })
 }

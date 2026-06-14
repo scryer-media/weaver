@@ -1,9 +1,14 @@
 pub mod connection;
+pub(crate) mod database_target;
 pub mod encryption;
 pub mod error;
 pub(crate) mod maintenance;
 pub mod migrations;
+pub(crate) mod postgres_migrations;
 pub mod setup;
+pub(crate) mod sql_runtime;
+pub(crate) mod sql_services;
+pub(crate) mod sqlite_writer;
 
 pub use connection::Database;
 pub use error::StateError;

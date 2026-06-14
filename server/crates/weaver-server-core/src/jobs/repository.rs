@@ -2,6 +2,7 @@ use crate::StateError;
 use crate::history;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OrphanActiveStateCounts {
@@ -40,23 +41,39 @@ impl OrphanActiveStateCounts {
     }
 }
 
-pub(crate) fn db_err(e: impl std::fmt::Display) -> StateError {
-    StateError::Database(e.to_string())
-}
-
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-fn run_inline_incremental_vacuum(conn: &rusqlite::Connection) -> Result<(), StateError> {
-    conn.execute_batch(&format!(
-        "PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"
-    ))
-    .map_err(db_err)
+const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
+    "active_segments",
+    "active_file_progress",
+    "active_files",
+    "active_file_identities",
+    "active_par2",
+    "active_par2_files",
+    "active_extracted",
+    "active_failed_extractions",
+    "active_extraction_chunks",
+    "active_archive_headers",
+    "active_rar_volume_facts",
+    "active_detected_archives",
+    "active_volume_status",
+    "active_rar_verified_suspect",
+];
+
+async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
+    if datastore.engine() != SqlEngine::Sqlite {
+        return Ok(());
+    }
+    SqlRuntime::execute(
+        datastore.read_exec(),
+        &format!("PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"),
+        &[],
+    )
+    .await?;
+    Ok(())
 }
 
-fn delete_orphan_rows(
-    tx: &rusqlite::Transaction<'_>,
-    table: &'static str,
-) -> Result<usize, StateError> {
+async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {
     let deleted = tx
         .execute(
             &format!(
@@ -65,59 +82,53 @@ fn delete_orphan_rows(
                      SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
                  )"
             ),
-            [],
+            &[],
         )
-        .map_err(db_err)?;
-    Ok(deleted)
+        .await?;
+    Ok(deleted as usize)
 }
 
-fn delete_active_job_rows(tx: &rusqlite::Transaction<'_>, id: i64) -> Result<(), StateError> {
-    tx.execute("DELETE FROM active_segments WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_file_progress WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_files WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_file_identities WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_par2 WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_par2_files WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute("DELETE FROM active_extracted WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
+async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+    for table in ACTIVE_JOB_CHILD_TABLES {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+            &[SqlArg::I64(id)],
+        )
+        .await?;
+    }
     tx.execute(
-        "DELETE FROM active_failed_extractions WHERE job_id = ?1",
-        [id],
+        "DELETE FROM active_jobs WHERE job_id = {}",
+        &[SqlArg::I64(id)],
     )
-    .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM active_extraction_chunks WHERE job_id = ?1",
-        [id],
-    )
-    .map_err(db_err)?;
-    tx.execute("DELETE FROM active_archive_headers WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM active_rar_volume_facts WHERE job_id = ?1",
-        [id],
-    )
-    .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM active_detected_archives WHERE job_id = ?1",
-        [id],
-    )
-    .map_err(db_err)?;
-    tx.execute("DELETE FROM active_volume_status WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
-    tx.execute(
-        "DELETE FROM active_rar_verified_suspect WHERE job_id = ?1",
-        [id],
-    )
-    .map_err(db_err)?;
-    tx.execute("DELETE FROM active_jobs WHERE job_id = ?1", [id])
-        .map_err(db_err)?;
+    .await?;
     Ok(())
+}
+
+fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> {
+    vec![
+        SqlArg::I64(history.job_id as i64),
+        SqlArg::OptBytes(history.job_hash.clone()),
+        SqlArg::I64(job_id.0 as i64),
+        SqlArg::Text(history.name.clone()),
+        SqlArg::Text(history.status.clone()),
+        SqlArg::OptText(history.error_message.clone()),
+        SqlArg::I64(history.total_bytes as i64),
+        SqlArg::I64(history.downloaded_bytes as i64),
+        SqlArg::I64(history.optional_recovery_bytes as i64),
+        SqlArg::I64(history.optional_recovery_downloaded_bytes as i64),
+        SqlArg::I64(history.failed_bytes as i64),
+        SqlArg::I64(history.health as i64),
+        SqlArg::OptText(history.category.clone()),
+        SqlArg::OptText(history.output_dir.clone()),
+        SqlArg::OptText(history.nzb_path.clone()),
+        SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(history.created_at),
+        SqlArg::I64(history.completed_at),
+        SqlArg::OptText(history.metadata.clone()),
+        SqlArg::OptText(history.last_diagnostic_id.clone()),
+        SqlArg::OptI64(history.last_diagnostic_uploaded_at_epoch_ms),
+    ]
 }
 
 impl Database {
@@ -126,79 +137,132 @@ impl Database {
         job_id: JobId,
         history: &history::JobHistoryRow,
     ) -> Result<(), StateError> {
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO job_history
-             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-              optional_recovery_bytes, optional_recovery_downloaded_bytes,
-              failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-              created_at, completed_at, metadata)
-             VALUES (?1, COALESCE(?2, (SELECT nzb_hash FROM active_jobs WHERE job_id = ?1)),
-                     ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     COALESCE(?14, (SELECT nzb_path FROM active_jobs WHERE job_id = ?1)),
-                     (SELECT nzb_zstd FROM active_jobs WHERE job_id = ?1),
-                     ?15, ?16, ?17)",
-            rusqlite::params![
-                history.job_id as i64,
-                history.job_hash,
-                history.name,
-                history.status,
-                history.error_message,
-                history.total_bytes as i64,
-                history.downloaded_bytes as i64,
-                history.optional_recovery_bytes as i64,
-                history.optional_recovery_downloaded_bytes as i64,
-                history.failed_bytes as i64,
-                history.health,
-                history.category,
-                history.output_dir,
-                history.nzb_path,
-                history.created_at,
-                history.completed_at,
-                history.metadata,
-            ],
-        )
-        .map_err(db_err)?;
-        delete_active_job_rows(&tx, job_id.0 as i64)?;
-        tx.commit().map_err(db_err)?;
-        run_inline_incremental_vacuum(&conn)?;
-        Ok(())
+        let datastore = self.datastore();
+        let args = history_args(history, job_id);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
+                let args = args.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO job_history
+                         (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+                          optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                          failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                          created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                         VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
+                                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                                 COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
+                                 (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
+                                 {}, {}, {}, {}, {})
+                         ON CONFLICT(job_id) DO UPDATE SET
+                            job_hash = excluded.job_hash,
+                            name = excluded.name,
+                            status = excluded.status,
+                            error_message = excluded.error_message,
+                            total_bytes = excluded.total_bytes,
+                            downloaded_bytes = excluded.downloaded_bytes,
+                            optional_recovery_bytes = excluded.optional_recovery_bytes,
+                            optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
+                            failed_bytes = excluded.failed_bytes,
+                            health = excluded.health,
+                            category = excluded.category,
+                            output_dir = excluded.output_dir,
+                            nzb_path = excluded.nzb_path,
+                            nzb_zstd = excluded.nzb_zstd,
+                            created_at = excluded.created_at,
+                            completed_at = excluded.completed_at,
+                            metadata = excluded.metadata,
+                            last_diagnostic_id = excluded.last_diagnostic_id,
+                            last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                        &args,
+                    )
+                    .await?;
+                    delete_active_job_rows(tx, job_id.0 as i64).await?;
+                    Ok(())
+                })
+            })
+            .await?;
+            run_inline_incremental_vacuum(&datastore).await?;
+            Ok(())
+        })
     }
 
     pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-        delete_active_job_rows(&tx, job_id.0 as i64)?;
-        tx.commit().map_err(db_err)?;
-        run_inline_incremental_vacuum(&conn)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "delete_active_job", |tx| {
+                Box::pin(async move {
+                    delete_active_job_rows(tx, job_id.0 as i64).await?;
+                    Ok(())
+                })
+            })
+            .await?;
+            run_inline_incremental_vacuum(&datastore).await?;
+            Ok(())
+        })
     }
 
     pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-        let counts = OrphanActiveStateCounts {
-            active_segments: delete_orphan_rows(&tx, "active_segments")?,
-            active_file_progress: delete_orphan_rows(&tx, "active_file_progress")?,
-            active_files: delete_orphan_rows(&tx, "active_files")?,
-            active_file_identities: delete_orphan_rows(&tx, "active_file_identities")?,
-            active_par2: delete_orphan_rows(&tx, "active_par2")?,
-            active_par2_files: delete_orphan_rows(&tx, "active_par2_files")?,
-            active_extracted: delete_orphan_rows(&tx, "active_extracted")?,
-            active_failed_extractions: delete_orphan_rows(&tx, "active_failed_extractions")?,
-            active_extraction_chunks: delete_orphan_rows(&tx, "active_extraction_chunks")?,
-            active_archive_headers: delete_orphan_rows(&tx, "active_archive_headers")?,
-            active_rar_volume_facts: delete_orphan_rows(&tx, "active_rar_volume_facts")?,
-            active_detected_archives: delete_orphan_rows(&tx, "active_detected_archives")?,
-            active_volume_status: delete_orphan_rows(&tx, "active_volume_status")?,
-            active_rar_verified_suspect: delete_orphan_rows(&tx, "active_rar_verified_suspect")?,
-        };
-        tx.commit().map_err(db_err)?;
-        if counts.total_removed() > 0 {
-            run_inline_incremental_vacuum(&conn)?;
-        }
-        Ok(counts)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let counts =
+                SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
+                    Box::pin(async move {
+                        Ok(OrphanActiveStateCounts {
+                            active_segments: delete_orphan_rows(tx, "active_segments").await?,
+                            active_file_progress: delete_orphan_rows(tx, "active_file_progress")
+                                .await?,
+                            active_files: delete_orphan_rows(tx, "active_files").await?,
+                            active_file_identities: delete_orphan_rows(
+                                tx,
+                                "active_file_identities",
+                            )
+                            .await?,
+                            active_par2: delete_orphan_rows(tx, "active_par2").await?,
+                            active_par2_files: delete_orphan_rows(tx, "active_par2_files").await?,
+                            active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
+                            active_failed_extractions: delete_orphan_rows(
+                                tx,
+                                "active_failed_extractions",
+                            )
+                            .await?,
+                            active_extraction_chunks: delete_orphan_rows(
+                                tx,
+                                "active_extraction_chunks",
+                            )
+                            .await?,
+                            active_archive_headers: delete_orphan_rows(
+                                tx,
+                                "active_archive_headers",
+                            )
+                            .await?,
+                            active_rar_volume_facts: delete_orphan_rows(
+                                tx,
+                                "active_rar_volume_facts",
+                            )
+                            .await?,
+                            active_detected_archives: delete_orphan_rows(
+                                tx,
+                                "active_detected_archives",
+                            )
+                            .await?,
+                            active_volume_status: delete_orphan_rows(tx, "active_volume_status")
+                                .await?,
+                            active_rar_verified_suspect: delete_orphan_rows(
+                                tx,
+                                "active_rar_verified_suspect",
+                            )
+                            .await?,
+                        })
+                    })
+                })
+                .await?;
+
+            if counts.total_removed() > 0 {
+                run_inline_incremental_vacuum(&datastore).await?;
+            }
+            Ok(counts)
+        })
     }
 }
 

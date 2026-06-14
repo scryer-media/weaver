@@ -1,10 +1,26 @@
 use super::*;
+use std::path::Path;
+
 use crate::categories::CategoryConfig;
 use crate::servers::ServerConfig;
 use crate::settings::{Config, RetryOverrides};
 use crate::{
     HistoryFilter, JobEvent, JobHistoryRow, RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow,
 };
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(false)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap()
+}
 
 fn sample_config() -> Config {
     Config {
@@ -45,8 +61,8 @@ fn sample_config() -> Config {
     }
 }
 
-#[test]
-fn export_and_import_stable_state_roundtrip() {
+#[tokio::test]
+async fn export_and_import_stable_state_roundtrip() {
     let src = Database::open_in_memory().unwrap();
     src.save_config(&sample_config()).unwrap();
     let hash = [7u8; 32];
@@ -139,15 +155,15 @@ fn export_and_import_stable_state_roundtrip() {
             .any(|t| t == "integration_events")
     );
 
-    let export_conn = Connection::open(temp.path()).unwrap();
-    let integration_events_tables: i64 = export_conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'integration_events'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let export_pool = open_artifact_pool(temp.path()).await;
+    let integration_events_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'integration_events'",
+    )
+    .fetch_one(&export_pool)
+    .await
+    .unwrap();
     assert_eq!(integration_events_tables, 0);
+    export_pool.close().await;
 
     let dest = Database::open_in_memory().unwrap();
     assert!(dest.restore_target_is_pristine().unwrap());
@@ -202,34 +218,39 @@ fn restore_target_is_not_pristine_with_history() {
     assert!(!db.restore_target_is_pristine().unwrap());
 }
 
-#[test]
-fn import_stable_state_ignores_legacy_integration_events_table() {
+#[tokio::test]
+async fn import_stable_state_ignores_legacy_integration_events_table() {
     let src = Database::open_in_memory().unwrap();
     src.save_config(&sample_config()).unwrap();
 
     let temp = tempfile::NamedTempFile::new().unwrap();
     src.export_stable_state(temp.path()).unwrap();
 
-    let legacy_conn = Connection::open(temp.path()).unwrap();
-    legacy_conn
-        .execute_batch(
-            "CREATE TABLE integration_events (
-                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp    INTEGER NOT NULL,
-                 kind         TEXT NOT NULL,
-                 item_id      INTEGER,
-                 payload_json TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-    legacy_conn
-        .execute(
-            "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![1_i64, "ITEM_CREATED", 77_i64, "{}"],
-        )
-        .unwrap();
-    drop(legacy_conn);
+    let legacy_pool = open_artifact_pool(temp.path()).await;
+    sqlx::query(
+        "CREATE TABLE integration_events (
+             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+             timestamp    INTEGER NOT NULL,
+             kind         TEXT NOT NULL,
+             item_id      INTEGER,
+             payload_json TEXT NOT NULL
+         )",
+    )
+    .execute(&legacy_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(1_i64)
+    .bind("ITEM_CREATED")
+    .bind(77_i64)
+    .bind("{}")
+    .execute(&legacy_pool)
+    .await
+    .unwrap();
+    legacy_pool.close().await;
 
     let dest = Database::open_in_memory().unwrap();
     dest.import_stable_state(temp.path()).unwrap();

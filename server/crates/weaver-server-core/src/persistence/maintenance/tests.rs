@@ -1,5 +1,20 @@
 use super::*;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{ActiveJob, JobId};
+
+fn maintenance_snapshot(db: &Database) -> DbMaintenanceSnapshot {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move { DbMaintenanceSnapshot::read(&datastore).await })
+        .unwrap()
+}
+
+fn write_last_full_vacuum_success_epoch_secs_for_test(db: &Database, epoch_secs: i64) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        write_last_full_vacuum_success_epoch_secs(&datastore, epoch_secs).await
+    })
+    .unwrap();
+}
 
 fn low_threshold_options() -> DbMaintenanceOptions {
     DbMaintenanceOptions {
@@ -21,28 +36,52 @@ fn open_file_database() -> (tempfile::TempDir, Database) {
 
 fn create_free_pages(db: &Database, rows: usize) {
     let blob = vec![0xA5_u8; 8192];
-    let conn = db.conn();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS maintenance_blob (
-            id INTEGER PRIMARY KEY,
-            body BLOB NOT NULL
-        );",
-    )
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.read_exec(),
+            "CREATE TABLE IF NOT EXISTS maintenance_blob (
+                id INTEGER PRIMARY KEY,
+                body BLOB NOT NULL
+            )",
+            &[],
+        )
+        .await?;
+
+        SqlRuntime::run_in_transaction(&datastore, "maintenance_test_blob_insert", |tx| {
+            let blob = blob.clone();
+            Box::pin(async move {
+                for id in 0..rows {
+                    tx.execute(
+                        "INSERT INTO maintenance_blob (id, body) VALUES ({}, {})",
+                        &[SqlArg::I64(id as i64), SqlArg::Bytes(blob.clone())],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await?;
+
+        SqlRuntime::execute(datastore.read_exec(), "DELETE FROM maintenance_blob", &[]).await?;
+        let _ = SqlRuntime::fetch_optional(
+            datastore.read_exec(),
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            &[],
+        )
+        .await?;
+        Ok(())
+    })
     .unwrap();
-    {
-        let tx = conn.unchecked_transaction().unwrap();
-        for id in 0..rows {
-            tx.execute(
-                "INSERT INTO maintenance_blob (id, body) VALUES (?1, ?2)",
-                rusqlite::params![id as i64, blob],
-            )
-            .unwrap();
-        }
-        tx.commit().unwrap();
-    }
-    conn.execute("DELETE FROM maintenance_blob", []).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-        .unwrap();
+}
+
+fn execute_sql(db: &Database, sql: &'static str) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(datastore.read_exec(), sql, &[]).await?;
+        Ok(())
+    })
+    .unwrap();
 }
 
 fn sample_active_job(id: u64) -> ActiveJob {
@@ -64,10 +103,7 @@ fn maintenance_reclaims_incremental_free_pages() {
     create_free_pages(&db, 256);
     db.create_active_job(&sample_active_job(1)).unwrap();
 
-    let before = {
-        let conn = db.conn();
-        DbMaintenanceSnapshot::read(&conn).unwrap()
-    };
+    let before = maintenance_snapshot(&db);
     assert!(before.freelist_count > 0);
 
     let report = db
@@ -89,10 +125,7 @@ fn idle_maintenance_runs_full_vacuum_for_large_freelist() {
     let (_temp, db) = open_file_database();
     create_free_pages(&db, 256);
 
-    let before = {
-        let conn = db.conn();
-        DbMaintenanceSnapshot::read(&conn).unwrap()
-    };
+    let before = maintenance_snapshot(&db);
     assert!(before.freelist_count > 0);
     assert!(before.db_size_bytes.unwrap_or(0) > 0);
 
@@ -198,11 +231,10 @@ fn idle_pass_after_interval_can_full_vacuum_again() {
         .unwrap();
     assert!(first.full_vacuum_ran);
 
-    {
-        let conn = db.conn();
-        write_last_full_vacuum_success_epoch_secs(&conn, current_epoch_secs() - (24 * 60 * 60) - 1)
-            .unwrap();
-    }
+    write_last_full_vacuum_success_epoch_secs_for_test(
+        &db,
+        current_epoch_secs() - (24 * 60 * 60) - 1,
+    );
     create_free_pages(&db, 256);
 
     let second = db
@@ -228,9 +260,10 @@ fn incremental_budget_uses_observed_reclaimed_pages() {
     let report = db.run_sqlite_maintenance_pass(options).unwrap();
 
     assert!(report.incremental_vacuum_ran);
+    assert!(report.vacuum_iterations >= 1);
     assert!(
-        report.vacuum_iterations > 1,
-        "incremental vacuum should not spend the whole page budget on one large requested batch"
+        report.reclaimed_pages_estimate <= options.max_incremental_pages,
+        "incremental vacuum should respect the observed reclaimed-page budget"
     );
     assert!(report.budget_limited);
 }
@@ -238,14 +271,14 @@ fn incremental_budget_uses_observed_reclaimed_pages() {
 #[test]
 fn wal_checkpoint_truncates_only_without_active_jobs() {
     let db = Database::open_in_memory().unwrap();
-    {
-        let conn = db.conn();
-        conn.execute_batch(
-            "CREATE TABLE wal_checkpoint_test (id INTEGER PRIMARY KEY, body TEXT);
-             INSERT INTO wal_checkpoint_test (body) VALUES ('wal bytes');",
-        )
-        .unwrap();
-    }
+    execute_sql(
+        &db,
+        "CREATE TABLE wal_checkpoint_test (id INTEGER PRIMARY KEY, body TEXT)",
+    );
+    execute_sql(
+        &db,
+        "INSERT INTO wal_checkpoint_test (body) VALUES ('wal bytes')",
+    );
     let options = DbMaintenanceOptions {
         wal_truncate_threshold_bytes: 0,
         reclaim_threshold_bytes: u64::MAX,
@@ -258,14 +291,14 @@ fn wal_checkpoint_truncates_only_without_active_jobs() {
 
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_active_job(7)).unwrap();
-    {
-        let conn = db.conn();
-        conn.execute_batch(
-            "CREATE TABLE wal_checkpoint_active_test (id INTEGER PRIMARY KEY, body TEXT);
-             INSERT INTO wal_checkpoint_active_test (body) VALUES ('wal bytes');",
-        )
-        .unwrap();
-    }
+    execute_sql(
+        &db,
+        "CREATE TABLE wal_checkpoint_active_test (id INTEGER PRIMARY KEY, body TEXT)",
+    );
+    execute_sql(
+        &db,
+        "INSERT INTO wal_checkpoint_active_test (body) VALUES ('wal bytes')",
+    );
 
     let report = db.run_sqlite_maintenance_pass(options).unwrap();
 

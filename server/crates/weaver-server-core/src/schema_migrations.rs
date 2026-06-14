@@ -187,7 +187,7 @@ pub fn embedded_catalog() -> Result<CompiledMigrationCatalog, StateError> {
     crate::migration_assets::decode_catalog(&bytes).map_err(StateError::Database)
 }
 
-fn embedded_payload_bytes() -> Result<Vec<u8>, StateError> {
+pub(crate) fn embedded_payload_bytes() -> Result<Vec<u8>, StateError> {
     zstd::stream::decode_all(EMBEDDED_MIGRATION_PAYLOAD).map_err(|error| {
         StateError::Database(format!("failed to decompress migration payload: {error}"))
     })
@@ -720,7 +720,7 @@ async fn adopt_legacy_schema_to_21(
 
     match legacy_version {
         1 => {
-            // The legacy rusqlite path used VACUUM here to retroactively apply
+            // The legacy synchronous SQLite path used VACUUM here to retroactively apply
             // incremental auto_vacuum. Transactional sqlx adoption cannot issue
             // VACUUM, so we preserve the schema/data transition and let runtime
             // maintenance handle compaction separately.
@@ -846,9 +846,22 @@ async fn upgrade_to_schema_25(
 mod tests {
     use super::*;
     use crate::migration_assets::ChecksumAlgorithm;
-    use rusqlite::Connection;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn open_test_pool(path: &Path) -> sqlx::SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlite_connect_options(path))
+            .await
+            .unwrap()
+    }
+
+    async fn execute_batch(pool: &sqlx::SqlitePool, sql: &str) {
+        let mut tx = pool.begin().await.unwrap();
+        execute_sql(&mut tx, sql).await.unwrap();
+        tx.commit().await.unwrap();
+    }
 
     #[tokio::test]
     async fn fresh_install_uses_baseline_and_stamps_version() {
@@ -927,12 +940,13 @@ mod tests {
         assert_eq!(nzb_cols, 1);
     }
 
-    #[test]
-    fn direct_upgrade_from_v3_adds_legacy_columns() {
+    #[tokio::test]
+    async fn direct_upgrade_from_v3_adds_legacy_columns() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy-v3.db");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
+        let pool = open_test_pool(&db_path).await;
+        execute_batch(
+            &pool,
             "CREATE TABLE schema_version (version INTEGER NOT NULL);
              INSERT INTO schema_version (version) VALUES (3);
              CREATE TABLE servers (
@@ -955,35 +969,37 @@ mod tests {
                  temp_path     TEXT NOT NULL,
                  verified      INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (job_id, set_name, member_name, volume_index)
-             ) WITHOUT ROWID;",
+              ) WITHOUT ROWID;",
         )
-        .unwrap();
-        drop(conn);
+        .await;
+        pool.close().await;
 
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
-        let conn = Connection::open(&db_path).unwrap();
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        let pool = open_test_pool(&db_path).await;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         assert_eq!(
-            pragma_column_count(&conn, "servers", &["priority", "tls_ca_cert"]),
+            pragma_column_count(&pool, "servers", &["priority", "tls_ca_cert"]).await,
             2
         );
         assert_eq!(
             pragma_column_count(
-                &conn,
+                &pool,
                 "active_extraction_chunks",
                 &["appended", "start_offset", "end_offset"]
-            ),
+            )
+            .await,
             3
         );
     }
 
-    #[test]
-    fn direct_upgrade_from_v20_runs_cleanup_and_backfill() {
+    #[tokio::test]
+    async fn direct_upgrade_from_v20_runs_cleanup_and_backfill() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy-v20.db");
         let nzb_path = temp.path().join("fixture.nzb");
@@ -996,8 +1012,9 @@ mod tests {
         let metrics_cutoff_epoch_sec =
             now - crate::operations::metrics_store::RAW_METRICS_RETENTION_SECS;
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
+        let pool = open_test_pool(&db_path).await;
+        execute_batch(
+            &pool,
             "PRAGMA journal_mode=WAL;
              CREATE TABLE schema_version (version INTEGER NOT NULL);
              INSERT INTO schema_version (version) VALUES (20);
@@ -1047,118 +1064,127 @@ mod tests {
                  item_id      INTEGER,
                  payload_json TEXT NOT NULL
              );
-             CREATE TABLE metrics_scrapes (
-                 scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
-                 body_zstd            BLOB NOT NULL
-             ) WITHOUT ROWID;",
+              CREATE TABLE metrics_scrapes (
+                  scraped_at_epoch_sec INTEGER PRIMARY KEY NOT NULL,
+                  body_zstd            BLOB NOT NULL
+              ) WITHOUT ROWID;",
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        sqlx::query(
             "INSERT INTO servers (
                  id, host, port, tls, username, password, connections, active, supports_pipelining, priority
-             ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7, ?8)",
-            rusqlite::params![1_i64, "news.example.com", 563_i64, 1_i64, 20_i64, 1_i64, 1_i64, 0_i64],
+             ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
         )
+        .bind(1_i64)
+        .bind("news.example.com")
+        .bind(563_i64)
+        .bind(1_i64)
+        .bind(20_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
         .unwrap();
-        conn.execute(
+        sqlx::query(
             "INSERT INTO job_history (
                  job_id, name, status, error_message, total_bytes, downloaded_bytes,
                  failed_bytes, health, category, output_dir, nzb_path, created_at,
                  completed_at, metadata
              ) VALUES (
-                 ?1, ?2, ?3, NULL, 0, 0, 0, 1000, NULL, NULL, ?4, ?5, ?6, NULL
+                 ?, ?, ?, NULL, 0, 0, 0, 1000, NULL, NULL, ?, ?, ?, NULL
              )",
-            rusqlite::params![
-                41_i64,
-                "history",
-                "complete",
-                nzb_path.to_string_lossy(),
-                now - 120,
-                now - 60
-            ],
         )
+        .bind(41_i64)
+        .bind("history")
+        .bind("complete")
+        .bind(nzb_path.to_string_lossy().to_string())
+        .bind(now - 120)
+        .bind(now - 60)
+        .execute(&pool)
+        .await
         .unwrap();
-        conn.execute(
+        sqlx::query(
             "INSERT INTO active_jobs (
                  job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL)",
-            rusqlite::params![
-                42_i64,
-                vec![1_u8, 2_u8, 3_u8],
-                nzb_path.to_string_lossy(),
-                temp.path().join("out").to_string_lossy(),
-                "downloading",
-                now - 30
-            ],
+             ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL)",
         )
+        .bind(42_i64)
+        .bind(vec![1_u8, 2_u8, 3_u8])
+        .bind(nzb_path.to_string_lossy().to_string())
+        .bind(temp.path().join("out").to_string_lossy().to_string())
+        .bind("downloading")
+        .bind(now - 30)
+        .execute(&pool)
+        .await
         .unwrap();
-        conn.execute(
+        sqlx::query(
             "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                now * 1000,
-                "ITEM_CREATED",
-                7_i64,
-                "{\"kind\":\"ITEM_CREATED\"}"
-            ],
+             VALUES (?, ?, ?, ?)",
         )
+        .bind(now * 1000)
+        .bind("ITEM_CREATED")
+        .bind(7_i64)
+        .bind("{\"kind\":\"ITEM_CREATED\"}")
+        .execute(&pool)
+        .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?1, ?2)",
-            rusqlite::params![metrics_cutoff_epoch_sec - 60, vec![1_u8]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?1, ?2)",
-            rusqlite::params![metrics_cutoff_epoch_sec + 60, vec![2_u8]],
-        )
-        .unwrap();
-        drop(conn);
+        sqlx::query("INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?, ?)")
+            .bind(metrics_cutoff_epoch_sec - 60)
+            .bind(vec![1_u8])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO metrics_scrapes (scraped_at_epoch_sec, body_zstd) VALUES (?, ?)")
+            .bind(metrics_cutoff_epoch_sec + 60)
+            .bind(vec![2_u8])
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
 
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let expected_nzb_bytes =
             crate::ingest::load_persisted_nzb_storage_bytes(&nzb_path).unwrap();
-        let conn = Connection::open(&db_path).unwrap();
+        let pool = open_test_pool(&db_path).await;
 
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
-        let stamped: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |row| {
-                row.get(0)
-            })
+        let stamped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(stamped, embedded_catalog().unwrap().migrations.len() as i64);
 
-        let integration_events: i64 = conn
-            .query_row("SELECT COUNT(*) FROM integration_events", [], |row| {
-                row.get(0)
-            })
+        let integration_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_events")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(integration_events, 0);
 
-        let legacy_metrics_tables: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_scrapes'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let legacy_metrics_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics_scrapes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(legacy_metrics_tables, 0);
 
-        let retained_metrics_history_chunks: i64 = conn
-            .query_row("SELECT COUNT(*) FROM metrics_history_chunks", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
+        let retained_metrics_history_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM metrics_history_chunks")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(retained_metrics_history_chunks, 0);
 
         assert_eq!(
             pragma_column_count(
-                &conn,
+                &pool,
                 "job_history",
                 &[
                     "optional_recovery_bytes",
@@ -1167,12 +1193,13 @@ mod tests {
                     "last_diagnostic_uploaded_at_epoch_ms",
                     "nzb_zstd"
                 ]
-            ),
+            )
+            .await,
             5
         );
         assert_eq!(
             pragma_column_count(
-                &conn,
+                &pool,
                 "active_jobs",
                 &[
                     "normalization_retried",
@@ -1186,26 +1213,23 @@ mod tests {
                     "paused_resume_post_state",
                     "nzb_zstd"
                 ]
-            ),
+            )
+            .await,
             10
         );
 
-        let job_history_nzb: Vec<u8> = conn
-            .query_row(
-                "SELECT nzb_zstd FROM job_history WHERE job_id = 41",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let job_history_nzb: Vec<u8> =
+            sqlx::query_scalar("SELECT nzb_zstd FROM job_history WHERE job_id = 41")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(job_history_nzb, expected_nzb_bytes);
 
-        let active_job_nzb: Vec<u8> = conn
-            .query_row(
-                "SELECT nzb_zstd FROM active_jobs WHERE job_id = 42",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let active_job_nzb: Vec<u8> =
+            sqlx::query_scalar("SELECT nzb_zstd FROM active_jobs WHERE job_id = 42")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(active_job_nzb, expected_nzb_bytes);
     }
 
@@ -1253,17 +1277,17 @@ mod tests {
         assert_eq!(ChecksumAlgorithm::Blake3.as_str(), "blake3");
     }
 
-    fn pragma_column_count(conn: &Connection, table: &str, columns: &[&str]) -> i64 {
+    async fn pragma_column_count(pool: &sqlx::SqlitePool, table: &str, columns: &[&str]) -> i64 {
         let joined = columns
             .iter()
             .map(|column| format!("'{column}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name IN ({joined})"),
-            [],
-            |row| row.get(0),
-        )
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name IN ({joined})"
+        ))
+        .fetch_one(pool)
+        .await
         .unwrap()
     }
 }

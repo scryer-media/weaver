@@ -1,16 +1,14 @@
 use std::fmt::Display;
 use std::io::Cursor;
 
-use rusqlite::OptionalExtension;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, StoreDatastore};
 use crate::{JobInfo, JobStatus, MetricsSnapshot, StateError};
 
 const METRICS_HISTORY_COMPRESSION_LEVEL: i32 = 3;
-#[cfg(test)]
-pub(crate) const LEGACY_METRICS_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub const RAW_METRICS_RESOLUTION_SECS: i64 = 10;
 pub const ROLLUP_5M_RESOLUTION_SECS: i64 = 5 * 60;
 pub const ROLLUP_1H_RESOLUTION_SECS: i64 = 60 * 60;
@@ -219,18 +217,33 @@ impl Database {
         let raw_point =
             RawMetricsHistoryPoint::from_snapshot(recorded_at_epoch_sec, snapshot, jobs);
 
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-
-        upsert_raw_point(&tx, raw_point.clone())?;
-        refresh_rollup_5m_bucket(&tx, recorded_at_epoch_sec)?;
-        refresh_rollup_1h_bucket(&tx, recorded_at_epoch_sec)?;
-        prune_metrics_history(&tx, MetricsHistoryTier::Raw10s, recorded_at_epoch_sec)?;
-        prune_metrics_history(&tx, MetricsHistoryTier::Rollup5m, recorded_at_epoch_sec)?;
-        prune_metrics_history(&tx, MetricsHistoryTier::Rollup1h, recorded_at_epoch_sec)?;
-
-        tx.commit().map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_metrics_history_sample", |tx| {
+                let raw_point = raw_point.clone();
+                Box::pin(async move {
+                    upsert_raw_point_tx(tx, raw_point).await?;
+                    refresh_rollup_5m_bucket_tx(tx, recorded_at_epoch_sec).await?;
+                    refresh_rollup_1h_bucket_tx(tx, recorded_at_epoch_sec).await?;
+                    prune_metrics_history_tx(tx, MetricsHistoryTier::Raw10s, recorded_at_epoch_sec)
+                        .await?;
+                    prune_metrics_history_tx(
+                        tx,
+                        MetricsHistoryTier::Rollup5m,
+                        recorded_at_epoch_sec,
+                    )
+                    .await?;
+                    prune_metrics_history_tx(
+                        tx,
+                        MetricsHistoryTier::Rollup1h,
+                        recorded_at_epoch_sec,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     pub fn read_metrics_history(
@@ -239,26 +252,31 @@ impl Database {
         since_epoch_sec: i64,
         until_epoch_sec: i64,
     ) -> Result<MetricsHistoryQueryResult, StateError> {
-        let conn = self.read_conn();
+        let datastore = self.datastore();
         match tier {
-            MetricsHistoryTier::Raw10s => Ok(MetricsHistoryQueryResult {
-                resolution_sec: tier.resolution_sec(),
-                data: MetricsHistoryQueryData::Raw(load_raw_points_between(
-                    &conn,
-                    tier,
-                    since_epoch_sec,
-                    until_epoch_sec,
-                )?),
-            }),
-            MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
+            MetricsHistoryTier::Raw10s => self.run_sql_blocking(async move {
                 Ok(MetricsHistoryQueryResult {
                     resolution_sec: tier.resolution_sec(),
-                    data: MetricsHistoryQueryData::Rollup(load_rollup_points_between(
-                        &conn,
-                        tier,
-                        since_epoch_sec,
-                        until_epoch_sec,
-                    )?),
+                    data: MetricsHistoryQueryData::Raw(
+                        load_raw_points_between(&datastore, tier, since_epoch_sec, until_epoch_sec)
+                            .await?,
+                    ),
+                })
+            }),
+            MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
+                self.run_sql_blocking(async move {
+                    Ok(MetricsHistoryQueryResult {
+                        resolution_sec: tier.resolution_sec(),
+                        data: MetricsHistoryQueryData::Rollup(
+                            load_rollup_points_between(
+                                &datastore,
+                                tier,
+                                since_epoch_sec,
+                                until_epoch_sec,
+                            )
+                            .await?,
+                        ),
+                    })
                 })
             }
         }
@@ -268,36 +286,32 @@ impl Database {
         &self,
         tier: MetricsHistoryTier,
     ) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
                  FROM metrics_history_chunks
-                 WHERE resolution_sec = ?1
+                 WHERE resolution_sec = {}
                  ORDER BY chunk_start_epoch_sec ASC",
+                &[SqlArg::I64(tier.resolution_sec())],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([tier.resolution_sec()], |row| {
-                Ok(MetricsHistoryChunkRow {
-                    resolution_sec: row.get(0)?,
-                    chunk_start_epoch_sec: row.get(1)?,
-                    body_zstd: row.get(2)?,
-                })
-            })
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+            .await?;
+            rows.into_iter().map(metrics_chunk_row_from_row).collect()
+        })
     }
 
     pub fn delete_all_metrics_history(&self) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM metrics_history_chunks", [])
-            .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM metrics_history_chunks",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
     }
 }
 
@@ -332,81 +346,93 @@ fn deserialize_chunk<T: DeserializeOwned>(blob: &[u8]) -> Result<T, StateError> 
     rmp_serde::from_slice(&decoded).map_err(db_err)
 }
 
-fn load_chunk_blob(
-    conn: &rusqlite::Connection,
+async fn load_chunk_blob_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     chunk_start_epoch_sec: i64,
 ) -> Result<Option<Vec<u8>>, StateError> {
-    conn.query_row(
+    tx.fetch_optional(
         "SELECT body_zstd
          FROM metrics_history_chunks
-         WHERE resolution_sec = ?1 AND chunk_start_epoch_sec = ?2",
-        rusqlite::params![tier.resolution_sec(), chunk_start_epoch_sec],
-        |row| row.get(0),
+         WHERE resolution_sec = {} AND chunk_start_epoch_sec = {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+        ],
     )
-    .optional()
-    .map_err(db_err)
+    .await?
+    .map(|row| row.bytes("body_zstd"))
+    .transpose()
 }
 
-fn load_raw_chunk(
-    conn: &rusqlite::Connection,
+async fn load_raw_chunk_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     chunk_start_epoch_sec: i64,
 ) -> Result<RawMetricsHistoryChunk, StateError> {
     debug_assert!(matches!(tier, MetricsHistoryTier::Raw10s));
-    match load_chunk_blob(conn, tier, chunk_start_epoch_sec)? {
+    match load_chunk_blob_tx(tx, tier, chunk_start_epoch_sec).await? {
         Some(blob) => deserialize_chunk(&blob),
         None => Ok(RawMetricsHistoryChunk::default()),
     }
 }
 
-fn load_rollup_chunk(
-    conn: &rusqlite::Connection,
+async fn load_rollup_chunk_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     chunk_start_epoch_sec: i64,
 ) -> Result<RollupMetricsHistoryChunk, StateError> {
     debug_assert!(!matches!(tier, MetricsHistoryTier::Raw10s));
-    match load_chunk_blob(conn, tier, chunk_start_epoch_sec)? {
+    match load_chunk_blob_tx(tx, tier, chunk_start_epoch_sec).await? {
         Some(blob) => deserialize_chunk(&blob),
         None => Ok(RollupMetricsHistoryChunk::default()),
     }
 }
 
-fn store_chunk<T: Serialize>(
-    conn: &rusqlite::Connection,
+async fn store_chunk_tx<T: Serialize>(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     chunk_start_epoch_sec: i64,
     payload: &T,
 ) -> Result<(), StateError> {
     let body_zstd = serialize_chunk(payload)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metrics_history_chunks (
+    tx.execute(
+        "INSERT INTO metrics_history_chunks (
              resolution_sec,
              chunk_start_epoch_sec,
              body_zstd
-         ) VALUES (?1, ?2, ?3)",
-        rusqlite::params![tier.resolution_sec(), chunk_start_epoch_sec, body_zstd],
+         ) VALUES ({}, {}, {})
+         ON CONFLICT(resolution_sec, chunk_start_epoch_sec) DO UPDATE SET
+            body_zstd = excluded.body_zstd",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+            SqlArg::Bytes(body_zstd),
+        ],
     )
-    .map_err(db_err)?;
+    .await?;
     Ok(())
 }
 
-fn delete_chunk(
-    conn: &rusqlite::Connection,
+async fn delete_chunk_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     chunk_start_epoch_sec: i64,
 ) -> Result<(), StateError> {
-    conn.execute(
+    tx.execute(
         "DELETE FROM metrics_history_chunks
-         WHERE resolution_sec = ?1 AND chunk_start_epoch_sec = ?2",
-        rusqlite::params![tier.resolution_sec(), chunk_start_epoch_sec],
+         WHERE resolution_sec = {} AND chunk_start_epoch_sec = {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+        ],
     )
-    .map_err(db_err)?;
+    .await?;
     Ok(())
 }
 
-fn select_chunk_rows_between(
-    conn: &rusqlite::Connection,
+async fn select_chunk_rows_between(
+    datastore: &StoreDatastore,
     tier: MetricsHistoryTier,
     since_epoch_sec: i64,
     until_epoch_sec: i64,
@@ -417,66 +443,84 @@ fn select_chunk_rows_between(
 
     let first_chunk_start = chunk_start_for_timestamp(since_epoch_sec, tier);
     let last_chunk_start = chunk_start_for_timestamp(until_epoch_sec, tier);
-    let mut stmt = conn
-        .prepare(
-            "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
-             FROM metrics_history_chunks
-             WHERE resolution_sec = ?1
-               AND chunk_start_epoch_sec >= ?2
-               AND chunk_start_epoch_sec <= ?3
-             ORDER BY chunk_start_epoch_sec ASC",
-        )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map(
-            rusqlite::params![tier.resolution_sec(), first_chunk_start, last_chunk_start],
-            |row| {
-                Ok(MetricsHistoryChunkRow {
-                    resolution_sec: row.get(0)?,
-                    chunk_start_epoch_sec: row.get(1)?,
-                    body_zstd: row.get(2)?,
-                })
-            },
-        )
-        .map_err(db_err)?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(db_err)?);
-    }
-    Ok(out)
+    let rows = SqlRuntime::fetch_all(
+        datastore.read_exec(),
+        "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
+         FROM metrics_history_chunks
+         WHERE resolution_sec = {}
+           AND chunk_start_epoch_sec >= {}
+           AND chunk_start_epoch_sec <= {}
+         ORDER BY chunk_start_epoch_sec ASC",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(first_chunk_start),
+            SqlArg::I64(last_chunk_start),
+        ],
+    )
+    .await?;
+    rows.into_iter().map(metrics_chunk_row_from_row).collect()
 }
 
-fn upsert_raw_point(
-    conn: &rusqlite::Connection,
+async fn select_chunk_rows_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
+    if until_epoch_sec < since_epoch_sec {
+        return Ok(Vec::new());
+    }
+
+    let first_chunk_start = chunk_start_for_timestamp(since_epoch_sec, tier);
+    let last_chunk_start = chunk_start_for_timestamp(until_epoch_sec, tier);
+    let rows = tx
+        .fetch_all(
+            "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
+             FROM metrics_history_chunks
+             WHERE resolution_sec = {}
+               AND chunk_start_epoch_sec >= {}
+               AND chunk_start_epoch_sec <= {}
+             ORDER BY chunk_start_epoch_sec ASC",
+            &[
+                SqlArg::I64(tier.resolution_sec()),
+                SqlArg::I64(first_chunk_start),
+                SqlArg::I64(last_chunk_start),
+            ],
+        )
+        .await?;
+    rows.into_iter().map(metrics_chunk_row_from_row).collect()
+}
+
+async fn upsert_raw_point_tx(
+    tx: &mut SqlTx<'_>,
     point: RawMetricsHistoryPoint,
 ) -> Result<(), StateError> {
     let tier = MetricsHistoryTier::Raw10s;
     let chunk_start_epoch_sec = chunk_start_for_timestamp(point.timestamp_epoch_sec, tier);
-    let mut chunk = load_raw_chunk(conn, tier, chunk_start_epoch_sec)?;
+    let mut chunk = load_raw_chunk_tx(tx, tier, chunk_start_epoch_sec).await?;
     upsert_sorted_point(
         &mut chunk.points,
         point,
         |value| value.timestamp_epoch_sec,
         replace_raw_point,
     );
-    store_chunk(conn, tier, chunk_start_epoch_sec, &chunk)
+    store_chunk_tx(tx, tier, chunk_start_epoch_sec, &chunk).await
 }
 
-fn upsert_rollup_point(
-    conn: &rusqlite::Connection,
+async fn upsert_rollup_point_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     point: RollupMetricsHistoryPoint,
 ) -> Result<(), StateError> {
     let chunk_start_epoch_sec = chunk_start_for_timestamp(point.timestamp_epoch_sec, tier);
-    let mut chunk = load_rollup_chunk(conn, tier, chunk_start_epoch_sec)?;
+    let mut chunk = load_rollup_chunk_tx(tx, tier, chunk_start_epoch_sec).await?;
     upsert_sorted_point(
         &mut chunk.points,
         point,
         |value| value.timestamp_epoch_sec,
         replace_rollup_point,
     );
-    store_chunk(conn, tier, chunk_start_epoch_sec, &chunk)
+    store_chunk_tx(tx, tier, chunk_start_epoch_sec, &chunk).await
 }
 
 fn upsert_sorted_point<T, F, R>(points: &mut Vec<T>, point: T, timestamp: F, replace: R)
@@ -498,18 +542,19 @@ fn replace_rollup_point(current: &mut RollupMetricsHistoryPoint, next: RollupMet
     *current = next;
 }
 
-fn refresh_rollup_5m_bucket(
-    conn: &rusqlite::Connection,
+async fn refresh_rollup_5m_bucket_tx(
+    tx: &mut SqlTx<'_>,
     recorded_at_epoch_sec: i64,
 ) -> Result<(), StateError> {
     let bucket_end_epoch_sec = align_up_epoch(recorded_at_epoch_sec, ROLLUP_5M_RESOLUTION_SECS);
     let bucket_start_epoch_sec = bucket_end_epoch_sec - ROLLUP_5M_RESOLUTION_SECS;
-    let raw_points = load_raw_points_between(
-        conn,
+    let raw_points = load_raw_points_between_tx(
+        tx,
         MetricsHistoryTier::Raw10s,
         bucket_start_epoch_sec + 1,
         bucket_end_epoch_sec,
-    )?;
+    )
+    .await?;
     if raw_points.is_empty() {
         return Ok(());
     }
@@ -520,21 +565,22 @@ fn refresh_rollup_5m_bucket(
         gauge_values: aggregate_gauge_rollups(&raw_points),
         job_status_values: aggregate_job_status_rollups(&raw_points),
     };
-    upsert_rollup_point(conn, MetricsHistoryTier::Rollup5m, point)
+    upsert_rollup_point_tx(tx, MetricsHistoryTier::Rollup5m, point).await
 }
 
-fn refresh_rollup_1h_bucket(
-    conn: &rusqlite::Connection,
+async fn refresh_rollup_1h_bucket_tx(
+    tx: &mut SqlTx<'_>,
     recorded_at_epoch_sec: i64,
 ) -> Result<(), StateError> {
     let bucket_end_epoch_sec = align_up_epoch(recorded_at_epoch_sec, ROLLUP_1H_RESOLUTION_SECS);
     let bucket_start_epoch_sec = bucket_end_epoch_sec - ROLLUP_1H_RESOLUTION_SECS;
-    let rollup_points = load_rollup_points_between(
-        conn,
+    let rollup_points = load_rollup_points_between_tx(
+        tx,
         MetricsHistoryTier::Rollup5m,
         bucket_start_epoch_sec + 1,
         bucket_end_epoch_sec,
-    )?;
+    )
+    .await?;
     if rollup_points.is_empty() {
         return Ok(());
     }
@@ -545,46 +591,49 @@ fn refresh_rollup_1h_bucket(
         gauge_values: aggregate_gauge_rollups_from_rollups(&rollup_points),
         job_status_values: aggregate_job_rollups_from_rollups(&rollup_points),
     };
-    upsert_rollup_point(conn, MetricsHistoryTier::Rollup1h, point)
+    upsert_rollup_point_tx(tx, MetricsHistoryTier::Rollup1h, point).await
 }
 
-fn prune_metrics_history(
-    conn: &rusqlite::Connection,
+async fn prune_metrics_history_tx(
+    tx: &mut SqlTx<'_>,
     tier: MetricsHistoryTier,
     now_epoch_sec: i64,
 ) -> Result<(), StateError> {
     let cutoff_epoch_sec = now_epoch_sec - tier.retention_sec();
     let boundary_chunk_start = chunk_start_for_timestamp(cutoff_epoch_sec, tier);
 
-    conn.execute(
+    tx.execute(
         "DELETE FROM metrics_history_chunks
-         WHERE resolution_sec = ?1
-           AND chunk_start_epoch_sec < ?2",
-        rusqlite::params![tier.resolution_sec(), boundary_chunk_start],
+         WHERE resolution_sec = {}
+           AND chunk_start_epoch_sec < {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(boundary_chunk_start),
+        ],
     )
-    .map_err(db_err)?;
+    .await?;
 
     match tier {
         MetricsHistoryTier::Raw10s => {
-            let mut chunk = load_raw_chunk(conn, tier, boundary_chunk_start)?;
+            let mut chunk = load_raw_chunk_tx(tx, tier, boundary_chunk_start).await?;
             chunk
                 .points
                 .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
             if chunk.points.is_empty() {
-                delete_chunk(conn, tier, boundary_chunk_start)?;
+                delete_chunk_tx(tx, tier, boundary_chunk_start).await?;
             } else {
-                store_chunk(conn, tier, boundary_chunk_start, &chunk)?;
+                store_chunk_tx(tx, tier, boundary_chunk_start, &chunk).await?;
             }
         }
         MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
-            let mut chunk = load_rollup_chunk(conn, tier, boundary_chunk_start)?;
+            let mut chunk = load_rollup_chunk_tx(tx, tier, boundary_chunk_start).await?;
             chunk
                 .points
                 .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
             if chunk.points.is_empty() {
-                delete_chunk(conn, tier, boundary_chunk_start)?;
+                delete_chunk_tx(tx, tier, boundary_chunk_start).await?;
             } else {
-                store_chunk(conn, tier, boundary_chunk_start, &chunk)?;
+                store_chunk_tx(tx, tier, boundary_chunk_start, &chunk).await?;
             }
         }
     }
@@ -592,13 +641,13 @@ fn prune_metrics_history(
     Ok(())
 }
 
-fn load_raw_points_between(
-    conn: &rusqlite::Connection,
+async fn load_raw_points_between(
+    datastore: &StoreDatastore,
     tier: MetricsHistoryTier,
     since_epoch_sec: i64,
     until_epoch_sec: i64,
 ) -> Result<Vec<RawMetricsHistoryPoint>, StateError> {
-    let rows = select_chunk_rows_between(conn, tier, since_epoch_sec, until_epoch_sec)?;
+    let rows = select_chunk_rows_between(datastore, tier, since_epoch_sec, until_epoch_sec).await?;
     let mut points = Vec::new();
     for row in rows {
         let chunk: RawMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
@@ -611,13 +660,32 @@ fn load_raw_points_between(
     Ok(points)
 }
 
-fn load_rollup_points_between(
-    conn: &rusqlite::Connection,
+async fn load_raw_points_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RawMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between_tx(tx, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RawMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+async fn load_rollup_points_between(
+    datastore: &StoreDatastore,
     tier: MetricsHistoryTier,
     since_epoch_sec: i64,
     until_epoch_sec: i64,
 ) -> Result<Vec<RollupMetricsHistoryPoint>, StateError> {
-    let rows = select_chunk_rows_between(conn, tier, since_epoch_sec, until_epoch_sec)?;
+    let rows = select_chunk_rows_between(datastore, tier, since_epoch_sec, until_epoch_sec).await?;
     let mut points = Vec::new();
     for row in rows {
         let chunk: RollupMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
@@ -628,6 +696,33 @@ fn load_rollup_points_between(
     }
     points.sort_by_key(|point| point.timestamp_epoch_sec);
     Ok(points)
+}
+
+async fn load_rollup_points_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RollupMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between_tx(tx, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RollupMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+fn metrics_chunk_row_from_row(row: SqlRow) -> Result<MetricsHistoryChunkRow, StateError> {
+    Ok(MetricsHistoryChunkRow {
+        resolution_sec: row.i64("resolution_sec")?,
+        chunk_start_epoch_sec: row.i64("chunk_start_epoch_sec")?,
+        body_zstd: row.bytes("body_zstd")?,
+    })
 }
 
 fn aggregate_counter_rollups(

@@ -66,8 +66,7 @@ mime_guess = "2"
 async-graphql-axum = "7.0"
 socket2 = { version = "0.5", features = ["all"] }
 memchr = "2"
-rusqlite = { version = "0.32.1", features = ["bundled"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "json", "macros", "migrate"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres", "chrono", "json", "macros", "migrate"] }
 tempfile = "3"
 memmap2 = "0.9"
 zstd = "0.13"

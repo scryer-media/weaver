@@ -40,7 +40,6 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 bzip2 = { workspace = true }
-rusqlite = { workspace = true }
 sqlx = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = { workspace = true }

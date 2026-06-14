@@ -64,3 +64,9 @@ scope = "all"
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"
+engine = "sqlite"
+
+[[baseline]]
+through_version = 25
+file = "postgres/baselines/0025_baseline.sql"
+engine = "postgres"

@@ -1,7 +1,6 @@
 use crate::StateError;
 use crate::persistence::Database;
-
-use super::repository::db_err;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 impl Database {
     pub fn sum_bandwidth_usage_minutes(
@@ -9,16 +8,25 @@ impl Database {
         start_bucket_epoch_minute: i64,
         end_bucket_epoch_minute: i64,
     ) -> Result<u64, StateError> {
-        let conn = self.read_conn();
-        let total: Option<i64> = conn
-            .query_row(
-                "SELECT SUM(payload_bytes)
-                 FROM bandwidth_usage_minute_buckets
-                 WHERE bucket_epoch_minute >= ?1 AND bucket_epoch_minute < ?2",
-                rusqlite::params![start_bucket_epoch_minute, end_bucket_epoch_minute],
-                |row| row.get(0),
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT SUM(payload_bytes) AS total
+                   FROM bandwidth_usage_minute_buckets
+                  WHERE bucket_epoch_minute >= {} AND bucket_epoch_minute < {}",
+                &[
+                    SqlArg::I64(start_bucket_epoch_minute),
+                    SqlArg::I64(end_bucket_epoch_minute),
+                ],
             )
-            .map_err(db_err)?;
-        Ok(total.unwrap_or(0) as u64)
+            .await?;
+            let total = row
+                .map(|row| row.opt_i64("total"))
+                .transpose()?
+                .flatten()
+                .unwrap_or(0);
+            Ok(total as u64)
+        })
     }
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tracing::{error, info};
 
 use crate::Database;
+use crate::persistence::database_target::DatabaseTarget;
 use crate::settings::Config;
 
 fn is_explicit_config_file(config_path: &Path) -> bool {
@@ -31,16 +32,19 @@ pub fn resolve_database_paths(config_path: &Path) -> (PathBuf, Option<PathBuf>) 
 pub fn open_db_and_config(
     config_path: &Path,
 ) -> Result<(Database, Config), Box<dyn std::error::Error>> {
-    let (db_path, toml_path) = resolve_database_paths(config_path);
+    let (_db_path, toml_path) = resolve_database_paths(config_path);
+    let target = DatabaseTarget::resolve(config_path)?;
 
-    if let Some(parent) = db_path.parent() {
+    if let DatabaseTarget::SqlitePath(path) = &target
+        && let Some(parent) = path.parent()
+    {
         std::fs::create_dir_all(parent)?;
     }
-    let db = Database::open(&db_path)?;
+    let db = Database::open_target(target)?;
 
     if let Some(ref toml) = toml_path {
         match db.migrate_from_toml(toml) {
-            Ok(true) => info!(toml = %toml.display(), "migrated config from TOML to SQLite"),
+            Ok(true) => info!(toml = %toml.display(), "migrated config from TOML to database"),
             Ok(false) => {}
             Err(e) => error!(error = %e, "TOML migration failed"),
         }

@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+use sqlx::{Connection, Sqlite, Transaction};
+
 use super::manifest::{BackupServiceError, RestoreOptions};
 use crate::settings::Config;
 use crate::{
@@ -52,50 +55,13 @@ pub(crate) fn rewrite_backup_db_for_restore(
         ));
     }
 
-    let conn = rusqlite::Connection::open(backup_db_path)
-        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-
-    set_or_insert_setting(&tx, "data_dir", &options.data_dir)?;
-
-    match &options.intermediate_dir {
-        Some(value) if !value.trim().is_empty() => {
-            set_or_insert_setting(&tx, "intermediate_dir", value.trim())?
-        }
-        _ => {
-            tx.execute("DELETE FROM settings WHERE key = ?1", ["intermediate_dir"])
-                .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-        }
-    }
-
-    match &options.complete_dir {
-        Some(value) if !value.trim().is_empty() => {
-            set_or_insert_setting(&tx, "complete_dir", value.trim())?
-        }
-        _ => {
-            tx.execute("DELETE FROM settings WHERE key = ?1", ["complete_dir"])
-                .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-        }
-    }
-
-    for (category_id, new_dest) in category_updates {
-        let updated = tx
-            .execute(
-                "UPDATE categories SET dest_dir = ?1 WHERE id = ?2",
-                rusqlite::params![new_dest, category_id],
-            )
-            .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-        if updated == 0 {
-            return Err(BackupServiceError::Validation(format!(
-                "category id {category_id} not found in backup"
-            )));
-        }
-    }
-
-    tx.commit()
-        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+    rewrite_backup_db_artifact_blocking(
+        backup_db_path.to_path_buf(),
+        options.data_dir.clone(),
+        options.intermediate_dir.clone(),
+        options.complete_dir.clone(),
+        category_updates,
+    )?;
 
     let backup_db = Database::open(backup_db_path)
         .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
@@ -109,23 +75,116 @@ pub(crate) fn rewrite_backup_db_for_restore(
     Ok(())
 }
 
-fn set_or_insert_setting(
-    conn: &rusqlite::Transaction<'_>,
+fn rewrite_backup_db_artifact_blocking(
+    backup_db_path: PathBuf,
+    data_dir: String,
+    intermediate_dir: Option<String>,
+    complete_dir: Option<String>,
+    category_updates: Vec<(u32, String)>,
+) -> Result<(), BackupServiceError> {
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+        runtime.block_on(rewrite_backup_db_artifact(
+            backup_db_path,
+            data_dir,
+            intermediate_dir,
+            complete_dir,
+            category_updates,
+        ))
+    });
+    handle.join().map_err(|_| {
+        BackupServiceError::Validation("backup rewrite worker thread panicked".to_string())
+    })?
+}
+
+async fn rewrite_backup_db_artifact(
+    backup_db_path: PathBuf,
+    data_dir: String,
+    intermediate_dir: Option<String>,
+    complete_dir: Option<String>,
+    category_updates: Vec<(u32, String)>,
+) -> Result<(), BackupServiceError> {
+    let options = SqliteConnectOptions::new()
+        .filename(&backup_db_path)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_millis(5_000));
+    let mut conn = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+
+    set_or_insert_setting(&mut tx, "data_dir", &data_dir).await?;
+
+    match &intermediate_dir {
+        Some(value) if !value.trim().is_empty() => {
+            set_or_insert_setting(&mut tx, "intermediate_dir", value.trim()).await?
+        }
+        _ => {
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind("intermediate_dir")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+        }
+    }
+
+    match &complete_dir {
+        Some(value) if !value.trim().is_empty() => {
+            set_or_insert_setting(&mut tx, "complete_dir", value.trim()).await?
+        }
+        _ => {
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind("complete_dir")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+        }
+    }
+
+    for (category_id, new_dest) in category_updates {
+        let updated = sqlx::query("UPDATE categories SET dest_dir = ? WHERE id = ?")
+            .bind(new_dest)
+            .bind(i64::from(category_id))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+        if updated.rows_affected() == 0 {
+            return Err(BackupServiceError::Validation(format!(
+                "category id {category_id} not found in backup"
+            )));
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| BackupServiceError::Validation(e.to_string()))
+}
+
+async fn set_or_insert_setting(
+    conn: &mut Transaction<'_, Sqlite>,
     key: &str,
     value: &str,
 ) -> Result<(), BackupServiceError> {
-    let updated = conn
-        .execute(
-            "UPDATE settings SET value = ?1 WHERE key = ?2",
-            rusqlite::params![value, key],
-        )
+    let updated = sqlx::query("UPDATE settings SET value = ? WHERE key = ?")
+        .bind(value)
+        .bind(key)
+        .execute(&mut **conn)
+        .await
         .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
-    if updated == 0 {
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, value],
-        )
-        .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
+    if updated.rows_affected() == 0 {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut **conn)
+            .await
+            .map_err(|e| BackupServiceError::Validation(e.to_string()))?;
     }
     Ok(())
 }

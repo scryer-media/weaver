@@ -1,12 +1,48 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
     HistoryFilter, JobHistoryRow, JobId,
 };
+
+fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
+    let datastore = db.datastore();
+    let sql = sql.into();
+    db.run_sql_blocking(async move {
+        let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
+            .await?
+            .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
+        row.i64_at(0)
+    })
+    .unwrap()
+}
+
+fn fetch_i64_pair(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> (i64, i64) {
+    let datastore = db.datastore();
+    let sql = sql.into();
+    db.run_sql_blocking(async move {
+        let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
+            .await?
+            .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
+        Ok((row.i64_at(0)?, row.i64_at(1)?))
+    })
+    .unwrap()
+}
+
+fn execute_sql(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) {
+    let datastore = db.datastore();
+    let sql = sql.into();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+        Ok(())
+    })
+    .unwrap()
+}
 
 fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(
@@ -355,14 +391,11 @@ fn par2_metadata_roundtrip() {
     // Overwrite should work (INSERT OR REPLACE).
     db.set_par2_metadata(JobId(1), 768000, 16).unwrap();
 
-    let conn = db.conn();
-    let (slice, blocks): (i64, u32) = conn
-        .query_row(
-            "SELECT slice_size, recovery_block_count FROM active_par2 WHERE job_id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
+    let (slice, blocks) = fetch_i64_pair(
+        &db,
+        "SELECT slice_size, recovery_block_count FROM active_par2 WHERE job_id = 1",
+        vec![],
+    );
     assert_eq!(slice, 768000);
     assert_eq!(blocks, 16);
 }
@@ -467,14 +500,11 @@ fn extracted_member_roundtrip() {
     db.add_extracted_member(JobId(1), "movie.mkv", Path::new("/tmp/output_1/movie.mkv"))
         .unwrap();
 
-    let conn = db.conn();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM active_extracted WHERE job_id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_extracted WHERE job_id = 1",
+        vec![],
+    );
     assert_eq!(count, 1);
 }
 
@@ -731,7 +761,6 @@ fn late_active_state_writes_noop_after_archive() {
     db.set_volume_status(JobId(1), "set", 0, true, true, true)
         .unwrap();
 
-    let conn = db.conn();
     for table in [
         "active_segments",
         "active_file_progress",
@@ -747,11 +776,7 @@ fn late_active_state_writes_noop_after_archive() {
         "active_detected_archives",
         "active_volume_status",
     ] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
+        let count = fetch_i64(&db, format!("SELECT COUNT(*) FROM {table}"), vec![]);
         assert_eq!(count, 0, "{table} should remain empty after late writes");
     }
 }
@@ -768,36 +793,33 @@ fn prune_orphan_active_state_removes_only_orphans() {
     }])
     .unwrap();
 
-    {
-        let conn = db.conn();
-        conn.execute(
-            "INSERT INTO active_segments
-             (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
-             VALUES (99, 0, 0, 0, 10, 123)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO active_file_progress
-             (job_id, file_index, contiguous_bytes_written)
-             VALUES (100, 0, 1024)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO active_archive_headers (job_id, set_name, headers)
-             VALUES (101, 'set', x'0102')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO active_detected_archives
-             (job_id, file_index, kind, set_name, volume_index)
-             VALUES (102, 0, 'rar', 'set', 0)",
-            [],
-        )
-        .unwrap();
-    }
+    execute_sql(
+        &db,
+        "INSERT INTO active_segments
+         (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
+         VALUES (99, 0, 0, 0, 10, 123)",
+        vec![],
+    );
+    execute_sql(
+        &db,
+        "INSERT INTO active_file_progress
+         (job_id, file_index, contiguous_bytes_written)
+         VALUES (100, 0, 1024)",
+        vec![],
+    );
+    execute_sql(
+        &db,
+        "INSERT INTO active_archive_headers (job_id, set_name, headers)
+         VALUES (101, 'set', x'0102')",
+        vec![],
+    );
+    execute_sql(
+        &db,
+        "INSERT INTO active_detected_archives
+         (job_id, file_index, kind, set_name, volume_index)
+         VALUES (102, 0, 'rar', 'set', 0)",
+        vec![],
+    );
 
     let counts = db.prune_orphan_active_state().unwrap();
     assert_eq!(counts.active_segments, 1);
@@ -806,21 +828,16 @@ fn prune_orphan_active_state_removes_only_orphans() {
     assert_eq!(counts.active_detected_archives, 1);
     assert_eq!(counts.total_removed(), 4);
 
-    let conn = db.conn();
-    let remaining_segments: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM active_segments WHERE job_id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let remaining_progress: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let remaining_segments = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_segments WHERE job_id = 1",
+        vec![],
+    );
+    let remaining_progress = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1",
+        vec![],
+    );
     assert_eq!(remaining_segments, 1);
     assert_eq!(remaining_progress, 1);
 }

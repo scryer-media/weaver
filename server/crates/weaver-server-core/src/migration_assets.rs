@@ -54,6 +54,21 @@ impl StepScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineScope {
+    #[default]
+    All,
+    Sqlite,
+    Postgres,
+}
+
+impl EngineScope {
+    pub fn applies_to(self, engine: EngineScope) -> bool {
+        matches!(self, Self::All) || self == engine
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceMigrationManifest {
     #[serde(default = "default_manifest_version")]
@@ -81,19 +96,41 @@ pub enum SourceMigrationStep {
     Sql {
         file: String,
         #[serde(default)]
+        engine: Option<EngineScope>,
+        #[serde(default)]
         scope: StepScope,
     },
     Rust {
         hook_id: String,
         #[serde(default)]
+        engine: Option<EngineScope>,
+        #[serde(default)]
         scope: StepScope,
     },
+}
+
+impl SourceMigrationStep {
+    fn resolved_engine(&self) -> EngineScope {
+        match self {
+            Self::Sql { engine, .. } | Self::Rust { engine, .. } => {
+                engine.unwrap_or(EngineScope::All)
+            }
+        }
+    }
+
+    fn explicit_engine(&self) -> Option<EngineScope> {
+        match self {
+            Self::Sql { engine, .. } | Self::Rust { engine, .. } => *engine,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBaseline {
     pub through_version: i64,
     pub file: String,
+    #[serde(default)]
+    pub engine: EngineScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,9 +164,18 @@ impl CompiledMigrationCatalog {
     }
 
     pub fn latest_baseline_at_or_below(&self, version: i64) -> Option<&CompiledBaseline> {
+        self.latest_baseline_at_or_below_for_engine(version, EngineScope::All)
+    }
+
+    pub fn latest_baseline_at_or_below_for_engine(
+        &self,
+        version: i64,
+        engine: EngineScope,
+    ) -> Option<&CompiledBaseline> {
         self.baselines
             .iter()
             .filter(|baseline| baseline.through_version <= version)
+            .filter(|baseline| baseline.engine.applies_to(engine))
             .max_by_key(|baseline| baseline.through_version)
     }
 }
@@ -150,11 +196,13 @@ pub struct CompiledMigration {
 pub enum CompiledMigrationStep {
     Sql {
         file: String,
+        engine: EngineScope,
         scope: StepScope,
         payload: PayloadSlice,
     },
     Rust {
         hook_id: String,
+        engine: EngineScope,
         scope: StepScope,
     },
 }
@@ -165,12 +213,19 @@ impl CompiledMigrationStep {
             Self::Sql { scope, .. } | Self::Rust { scope, .. } => *scope,
         }
     }
+
+    pub fn engine(&self) -> EngineScope {
+        match self {
+            Self::Sql { engine, .. } | Self::Rust { engine, .. } => *engine,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledBaseline {
     pub through_version: i64,
     pub file: String,
+    pub engine: EngineScope,
     pub payload: PayloadSlice,
 }
 
@@ -209,10 +264,14 @@ struct CanonicalMigration {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CanonicalStep {
     Sql {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine: Option<EngineScope>,
         scope: StepScope,
         sql_blake3: String,
     },
     Rust {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engine: Option<EngineScope>,
         scope: StepScope,
         hook_id: String,
     },
@@ -267,10 +326,10 @@ pub fn compile_source_bundle(db_root: &Path) -> Result<CompiledMigrationBundle, 
     let mut baselines = Vec::new();
     let mut baseline_versions = std::collections::HashSet::new();
     for baseline in manifest.baselines {
-        if !baseline_versions.insert(baseline.through_version) {
+        if !baseline_versions.insert((baseline.through_version, baseline.engine)) {
             return Err(format!(
-                "duplicate baseline entry for version {:04}",
-                baseline.through_version
+                "duplicate baseline entry for version {:04} and engine {:?}",
+                baseline.through_version, baseline.engine
             ));
         }
         if compiled_migrations
@@ -289,6 +348,7 @@ pub fn compile_source_bundle(db_root: &Path) -> Result<CompiledMigrationBundle, 
         baselines.push(CompiledBaseline {
             through_version: baseline.through_version,
             file: baseline.file,
+            engine: baseline.engine,
             payload,
         });
     }
@@ -322,28 +382,34 @@ fn compile_migration(
     let mut canonical_steps = Vec::with_capacity(migration.steps.len());
     for step in &migration.steps {
         match step {
-            SourceMigrationStep::Sql { file, scope } => {
+            SourceMigrationStep::Sql { file, scope, .. } => {
+                let engine = step.resolved_engine();
                 let path = db_root.join(file);
                 let sql = fs::read(&path)
                     .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
                 let payload = push_payload(&sql, payload_bytes);
                 compiled_steps.push(CompiledMigrationStep::Sql {
                     file: file.clone(),
+                    engine,
                     scope: *scope,
                     payload,
                 });
                 canonical_steps.push(CanonicalStep::Sql {
+                    engine: step.explicit_engine(),
                     scope: *scope,
                     sql_blake3: checksum_hex(&ChecksumAlgorithm::Blake3.digest(&sql)),
                 });
             }
-            SourceMigrationStep::Rust { hook_id, scope } => {
+            SourceMigrationStep::Rust { hook_id, scope, .. } => {
+                let engine = step.resolved_engine();
                 migration_hook_ids::validate_migration_hook_id(hook_id)?;
                 compiled_steps.push(CompiledMigrationStep::Rust {
                     hook_id: hook_id.clone(),
+                    engine,
                     scope: *scope,
                 });
                 canonical_steps.push(CanonicalStep::Rust {
+                    engine: step.explicit_engine(),
                     scope: *scope,
                     hook_id: hook_id.clone(),
                 });
@@ -424,5 +490,98 @@ mod tests {
         assert!(!StepScope::NewInstallOnly.applies_to(MigrationInstallKind::Upgrade));
         assert!(StepScope::UpgradeOnly.applies_to(MigrationInstallKind::Upgrade));
         assert!(!StepScope::UpgradeOnly.applies_to(MigrationInstallKind::FreshInstall));
+    }
+
+    #[test]
+    fn engine_scope_matches_requested_engine() {
+        assert!(EngineScope::All.applies_to(EngineScope::Sqlite));
+        assert!(EngineScope::All.applies_to(EngineScope::Postgres));
+        assert!(EngineScope::Sqlite.applies_to(EngineScope::Sqlite));
+        assert!(!EngineScope::Sqlite.applies_to(EngineScope::Postgres));
+        assert!(EngineScope::Postgres.applies_to(EngineScope::Postgres));
+        assert!(!EngineScope::Postgres.applies_to(EngineScope::Sqlite));
+    }
+
+    #[test]
+    fn source_step_defaults_missing_engine_to_all() {
+        let manifest = r#"
+format_version = 1
+starting_version = 21
+
+[[migration]]
+version = 21
+description = "missing engine"
+
+[[migration.steps]]
+kind = "sql"
+file = "0021.sql"
+"#;
+        let parsed = toml::from_str::<SourceMigrationManifest>(manifest).unwrap();
+        match &parsed.migrations[0].steps[0] {
+            SourceMigrationStep::Sql { engine, scope, .. } => {
+                assert_eq!(*engine, None);
+                assert_eq!(*scope, StepScope::All);
+                assert_eq!(
+                    parsed.migrations[0].steps[0].resolved_engine(),
+                    EngineScope::All
+                );
+            }
+            other => panic!("expected sql step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_baseline_lookup_filters_by_engine() {
+        let sqlite_payload = PayloadSlice { start: 0, len: 1 };
+        let postgres_payload = PayloadSlice { start: 1, len: 1 };
+        let catalog = CompiledMigrationCatalog {
+            format_version: DEFAULT_MANIFEST_VERSION,
+            starting_version: 21,
+            payload_checksum_algo: ChecksumAlgorithm::Blake3,
+            payload_checksum: Vec::new(),
+            migrations: Vec::new(),
+            baselines: vec![
+                CompiledBaseline {
+                    through_version: 25,
+                    file: "sqlite.sql".into(),
+                    engine: EngineScope::Sqlite,
+                    payload: sqlite_payload,
+                },
+                CompiledBaseline {
+                    through_version: 25,
+                    file: "postgres.sql".into(),
+                    engine: EngineScope::Postgres,
+                    payload: postgres_payload,
+                },
+            ],
+        };
+
+        assert_eq!(
+            catalog
+                .latest_baseline_at_or_below_for_engine(25, EngineScope::Sqlite)
+                .unwrap()
+                .file,
+            "sqlite.sql"
+        );
+        assert_eq!(
+            catalog
+                .latest_baseline_at_or_below_for_engine(25, EngineScope::Postgres)
+                .unwrap()
+                .file,
+            "postgres.sql"
+        );
+    }
+
+    #[test]
+    fn source_bundle_registers_postgres_current_baseline() {
+        let db_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db");
+        let bundle = compile_source_bundle(&db_root).unwrap();
+        let baseline = bundle
+            .catalog
+            .latest_baseline_at_or_below_for_engine(25, EngineScope::Postgres)
+            .unwrap();
+
+        assert_eq!(baseline.through_version, 25);
+        assert_eq!(baseline.file, "postgres/baselines/0025_baseline.sql");
     }
 }

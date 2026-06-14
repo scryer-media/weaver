@@ -1,6 +1,7 @@
 use crate::StateError;
 #[cfg(test)]
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::SqlRow;
 use crate::rss::record::{RssRuleAction, RssSeenItemRow};
 #[cfg(test)]
 use crate::rss::{RssFeedRow, RssRuleRow};
@@ -35,33 +36,22 @@ pub(crate) fn decode_categories(raw: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(crate) fn parse_action_sql(
-    value: String,
-    column_index: usize,
-) -> rusqlite::Result<RssRuleAction> {
-    match value.as_str() {
-        "accept" => Ok(RssRuleAction::Accept),
-        "reject" => Ok(RssRuleAction::Reject),
-        other => Err(rusqlite::Error::FromSqlConversionFailure(
-            column_index,
-            rusqlite::types::Type::Text,
-            format!("invalid RSS rule action: {other}").into(),
-        )),
-    }
+pub(crate) fn parse_action_sql(value: String) -> Result<RssRuleAction, StateError> {
+    RssRuleAction::parse(&value)
 }
 
-pub(crate) fn map_seen_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSeenItemRow> {
+pub(crate) fn map_seen_item_row(row: SqlRow) -> Result<RssSeenItemRow, StateError> {
     Ok(RssSeenItemRow {
-        feed_id: row.get::<_, u32>(0)?,
-        item_id: row.get(1)?,
-        item_title: row.get(2)?,
-        published_at: row.get(3)?,
-        size_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-        decision: row.get(5)?,
-        seen_at: row.get(6)?,
-        job_id: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
-        item_url: row.get(8)?,
-        error: row.get(9)?,
+        feed_id: row.i32("feed_id")? as u32,
+        item_id: row.text("item_id")?,
+        item_title: row.text("item_title")?,
+        published_at: row.opt_i64("published_at")?,
+        size_bytes: row.opt_i64("size_bytes")?.map(|value| value as u64),
+        decision: row.text("decision")?,
+        seen_at: row.i64("seen_at")?,
+        job_id: row.opt_i64("job_id")?.map(|value| value as u64),
+        item_url: row.opt_text("item_url")?,
+        error: row.opt_text("error")?,
     })
 }
 
