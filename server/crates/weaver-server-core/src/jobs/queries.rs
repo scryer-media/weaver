@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
@@ -30,6 +30,51 @@ fn nzb_hash_from_bytes(bytes: Vec<u8>) -> [u8; 32] {
 fn metadata_from_json(raw: Option<String>) -> Vec<(String, String)> {
     raw.and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default()
+}
+
+fn extracted_member_marker_valid(
+    job_id: JobId,
+    member_name: &str,
+    output_path: &str,
+    output_size: i64,
+) -> bool {
+    if output_size < 0 || output_path.is_empty() {
+        tracing::debug!(
+            job_id = job_id.0,
+            member = %member_name,
+            output_path = %output_path,
+            output_size,
+            "discarding unvalidated extracted member marker"
+        );
+        return false;
+    }
+
+    match std::fs::metadata(Path::new(output_path)) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == output_size as u64 => true,
+        Ok(metadata) => {
+            tracing::debug!(
+                job_id = job_id.0,
+                member = %member_name,
+                output_path = %output_path,
+                output_size,
+                actual_size = metadata.len(),
+                is_file = metadata.is_file(),
+                "discarding stale extracted member marker"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::debug!(
+                job_id = job_id.0,
+                member = %member_name,
+                output_path = %output_path,
+                output_size,
+                error = %error,
+                "discarding missing extracted member marker"
+            );
+            false
+        }
+    }
 }
 
 fn detected_from_row(
@@ -324,16 +369,50 @@ impl Database {
                 }
             }
 
+            for job in jobs.values_mut() {
+                let completed_indices = job
+                    .complete_files
+                    .iter()
+                    .map(|file_id| file_id.file_index)
+                    .collect::<HashSet<_>>();
+                let before_detected = job.detected_archives.len();
+                job.detected_archives
+                    .retain(|file_index, _| completed_indices.contains(file_index));
+                for identity in job.file_identities.values_mut() {
+                    if !completed_indices.contains(&identity.file_index) {
+                        identity.classification = None;
+                    }
+                }
+                let discarded_detected = before_detected.saturating_sub(job.detected_archives.len());
+                if discarded_detected > 0 {
+                    tracing::debug!(
+                        job_id = job.job_id.0,
+                        discarded_detected,
+                        "discarded stale archive discovery cache entries for incomplete files"
+                    );
+                }
+            }
+
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, member_name FROM active_extracted",
+                "SELECT job_id, member_name, output_path, output_size FROM active_extracted",
                 &[],
             )
             .await?;
             for row in rows {
                 let job_id = JobId(row.i64("job_id")? as u64);
                 if let Some(job) = jobs.get_mut(&job_id) {
-                    job.extracted_members.insert(row.text("member_name")?);
+                    let member_name = row.text("member_name")?;
+                    let output_path = row.text("output_path")?;
+                    let output_size = row.i64("output_size")?;
+                    if extracted_member_marker_valid(
+                        job_id,
+                        &member_name,
+                        &output_path,
+                        output_size,
+                    ) {
+                        job.extracted_members.insert(member_name);
+                    }
                 }
             }
 

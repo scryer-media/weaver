@@ -178,6 +178,7 @@ pub async fn recover_server_state(
                             job_hash: recovered.nzb_hash,
                             spec,
                             committed_segments: recovered.committed_segments,
+                            complete_files: recovered.complete_files,
                             file_progress: recovered.file_progress,
                             detected_archives: recovered.detected_archives,
                             file_identities: recovered.file_identities,
@@ -350,7 +351,7 @@ mod tests {
     use crate::StateError;
     use crate::jobs::working_dir::working_dir_marker_path;
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId};
+    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId, NzbFileId};
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
@@ -442,6 +443,8 @@ mod tests {
             crc32: 42,
         }])
         .unwrap();
+        db.complete_file(JobId(1), 0, "sample", &[0xBB; 16])
+            .unwrap();
 
         execute_sql(
             &db,
@@ -493,6 +496,15 @@ mod tests {
         assert!(!orphan_output_dir.exists());
         assert!(unrelated_output_dir.exists());
         assert_eq!(recovered.to_restore.len(), 1);
+        assert!(
+            recovered.to_restore[0]
+                .request
+                .complete_files
+                .contains(&NzbFileId {
+                    job_id: JobId(1),
+                    file_index: 0,
+                })
+        );
     }
 
     #[tokio::test]

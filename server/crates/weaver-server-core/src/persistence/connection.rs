@@ -1,9 +1,12 @@
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::time::Instant;
 
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::StateError;
 use crate::persistence::database_target::DatabaseTarget;
@@ -24,20 +27,81 @@ pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
 
-type DatabaseRuntimeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+type SqliteDatabaseRuntimeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+enum PostgresDatabaseRuntimeJob {
+    Send(Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>),
+    Local(Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>),
+}
 
 #[derive(Clone)]
-struct DatabaseRuntimeWorker {
-    tx: std_mpsc::Sender<DatabaseRuntimeJob>,
+enum DatabaseRuntimeWorker {
+    Sqlite(SqliteDatabaseRuntimeWorker),
+    Postgres(PostgresDatabaseRuntimeWorker),
 }
 
 impl DatabaseRuntimeWorker {
+    fn start(target: &DatabaseTarget) -> Result<Self, StateError> {
+        match target {
+            DatabaseTarget::PostgresUrl(_) => {
+                PostgresDatabaseRuntimeWorker::start(postgres_db_concurrency_from_env())
+                    .map(Self::Postgres)
+            }
+            DatabaseTarget::SqlitePath(_) | DatabaseTarget::SqliteUrl(_) => {
+                SqliteDatabaseRuntimeWorker::start().map(Self::Sqlite)
+            }
+        }
+    }
+
+    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        match self {
+            Self::Sqlite(worker) => worker.block_on(future),
+            Self::Postgres(worker) => worker.block_on(future),
+        }
+    }
+
+    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Build: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + 'static,
+    {
+        match self {
+            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Postgres(_) => Err(StateError::Database(
+                "run_sql_blocking_local requires sqlite datastore".to_string(),
+            )),
+        }
+    }
+
+    fn block_on_startup_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Build: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + 'static,
+    {
+        match self {
+            Self::Sqlite(worker) => worker.block_on_local(build),
+            Self::Postgres(worker) => worker.block_on_local(build),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SqliteDatabaseRuntimeWorker {
+    tx: std_mpsc::Sender<SqliteDatabaseRuntimeJob>,
+}
+
+impl SqliteDatabaseRuntimeWorker {
     fn start() -> Result<Self, StateError> {
-        let (tx, rx) = std_mpsc::channel::<DatabaseRuntimeJob>();
+        let (tx, rx) = std_mpsc::channel::<SqliteDatabaseRuntimeJob>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
         std::thread::Builder::new()
-            .name("weaver-db-runtime".to_string())
+            .name("weaver-sqlite-db-runtime".to_string())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -71,42 +135,242 @@ impl DatabaseRuntimeWorker {
     fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
         T: Send + 'static,
-        Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        let started = Instant::now();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
                 let _ = reply_tx.send(runtime.block_on(future));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
-        reply_rx
+        let result = reply_rx
             .recv()
-            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?
+            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on", started.elapsed());
+        result
     }
 
     fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
     where
         T: Send + 'static,
         Build: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<T, StateError>> + 'static,
+        Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        let started = Instant::now();
         let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
         self.tx
             .send(Box::new(move |runtime| {
                 let _ = reply_tx.send(runtime.block_on(build()));
             }))
             .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?;
-        reply_rx
+        let result = reply_rx
             .recv()
-            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?
+            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.sqlite.block_on_local", started.elapsed());
+        result
     }
+}
+
+#[derive(Clone)]
+struct PostgresDatabaseRuntimeWorker {
+    tx: std_mpsc::SyncSender<PostgresDatabaseRuntimeJob>,
+    in_flight: Arc<AtomicUsize>,
+    blocked_submissions: Arc<AtomicUsize>,
+    concurrency: usize,
+}
+
+impl PostgresDatabaseRuntimeWorker {
+    fn start(concurrency: usize) -> Result<Self, StateError> {
+        let concurrency = concurrency.max(1);
+        let (tx, rx) = std_mpsc::sync_channel::<PostgresDatabaseRuntimeJob>(concurrency);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let blocked_submissions = Arc::new(AtomicUsize::new(0));
+        let worker_in_flight = in_flight.clone();
+
+        std::thread::Builder::new()
+            .name("weaver-postgres-db-dispatch".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("weaver-postgres-db-runtime")
+                    .build()
+                    .map_err(|error| error.to_string());
+                let runtime = match runtime {
+                    Ok(runtime) => {
+                        let _ = ready_tx.send(Ok(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        PostgresDatabaseRuntimeJob::Local(job) => job(&runtime),
+                        PostgresDatabaseRuntimeJob::Send(job) => {
+                            let permit = match runtime.block_on(semaphore.clone().acquire_owned()) {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            };
+                            let in_flight = worker_in_flight.clone();
+                            let active = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                            tracing::trace!(
+                                db_executor = "postgres",
+                                db_in_flight = active,
+                                db_concurrency = concurrency,
+                                "starting postgres database runtime job"
+                            );
+                            runtime.spawn(async move {
+                                let _permit = permit;
+                                job().await;
+                                let remaining =
+                                    in_flight.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+                                tracing::trace!(
+                                    db_executor = "postgres",
+                                    db_in_flight = remaining,
+                                    db_concurrency = concurrency,
+                                    "finished postgres database runtime job"
+                                );
+                            });
+                        }
+                    }
+                }
+            })
+            .map_err(|error| StateError::Database(error.to_string()))?;
+
+        ready_rx
+            .recv()
+            .map_err(|_| StateError::Database("database runtime worker stopped".to_string()))?
+            .map_err(StateError::Database)?;
+
+        Ok(Self {
+            tx,
+            in_flight,
+            blocked_submissions,
+            concurrency,
+        })
+    }
+
+    fn block_on<T, Fut>(&self, future: Fut) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + Send + 'static,
+    {
+        let started = Instant::now();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        let job = PostgresDatabaseRuntimeJob::Send(Box::new(move || {
+            Box::pin(async move {
+                let _ = reply_tx.send(future.await);
+            })
+        }));
+
+        match self.tx.try_send(job) {
+            Ok(()) => {}
+            Err(std_mpsc::TrySendError::Full(job)) => {
+                let blocked_started = Instant::now();
+                let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
+                tracing::debug!(
+                    db_executor = "postgres",
+                    db_in_flight = self.in_flight.load(Ordering::Acquire),
+                    db_concurrency = self.concurrency,
+                    db_blocked_submissions = blocked,
+                    "postgres database executor queue full; blocking caller"
+                );
+                self.tx.send(job).map_err(|_| {
+                    StateError::Database("database runtime worker stopped".to_string())
+                })?;
+                crate::runtime::perf_probe::record(
+                    "db.runtime.postgres.submit_blocked",
+                    blocked_started.elapsed(),
+                );
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    db_executor = "postgres",
+                    db_in_flight = self.in_flight.load(Ordering::Acquire),
+                    db_concurrency = self.concurrency,
+                    "postgres database executor rejected job because queue is closed"
+                );
+                return Err(StateError::Database(
+                    "database runtime worker stopped".to_string(),
+                ));
+            }
+        }
+
+        let result = reply_rx
+            .recv()
+            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on", started.elapsed());
+        result
+    }
+
+    fn block_on_local<T, Build, Fut>(&self, build: Build) -> Result<T, StateError>
+    where
+        T: Send + 'static,
+        Build: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, StateError>> + 'static,
+    {
+        let started = Instant::now();
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        let job = PostgresDatabaseRuntimeJob::Local(Box::new(move |runtime| {
+            let _ = reply_tx.send(runtime.block_on(build()));
+        }));
+
+        match self.tx.try_send(job) {
+            Ok(()) => {}
+            Err(std_mpsc::TrySendError::Full(job)) => {
+                let blocked_started = Instant::now();
+                let blocked = self.blocked_submissions.fetch_add(1, Ordering::AcqRel) + 1;
+                tracing::debug!(
+                    db_executor = "postgres",
+                    db_in_flight = self.in_flight.load(Ordering::Acquire),
+                    db_concurrency = self.concurrency,
+                    db_blocked_submissions = blocked,
+                    "postgres database executor queue full; blocking startup caller"
+                );
+                self.tx.send(job).map_err(|_| {
+                    StateError::Database("database runtime worker stopped".to_string())
+                })?;
+                crate::runtime::perf_probe::record(
+                    "db.runtime.postgres.submit_blocked_local",
+                    blocked_started.elapsed(),
+                );
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                return Err(StateError::Database(
+                    "database runtime worker stopped".to_string(),
+                ));
+            }
+        }
+
+        let result = reply_rx
+            .recv()
+            .map_err(|_| StateError::Database("database runtime worker panicked".to_string()))?;
+        crate::runtime::perf_probe::record("db.runtime.postgres.block_on_local", started.elapsed());
+        result
+    }
+}
+
+fn postgres_db_concurrency_from_env() -> usize {
+    let pool_max = crate::persistence::sql_services::postgres_max_connections_from_env() as usize;
+    std::env::var("WEAVER_POSTGRES_DB_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(pool_max)
+        .clamp(1, pool_max.max(1))
 }
 
 fn open_sql_services_blocking(
     sql_worker: &DatabaseRuntimeWorker,
     target: DatabaseTarget,
 ) -> Result<DatabaseServices, StateError> {
-    sql_worker.block_on_local(move || {
+    sql_worker.block_on_startup_local(move || {
         DatabaseServices::open(target, crate::schema_migrations::MigrationMode::Apply)
     })
 }
@@ -171,7 +435,7 @@ impl Database {
     }
 
     pub(crate) fn open_target(target: DatabaseTarget) -> Result<Self, StateError> {
-        let sql_worker = DatabaseRuntimeWorker::start()?;
+        let sql_worker = DatabaseRuntimeWorker::start(&target)?;
         let sql_services = open_sql_services_blocking(&sql_worker, target)?;
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
@@ -193,9 +457,9 @@ impl Database {
         let tempdir =
             Arc::new(tempfile::tempdir().map_err(|e| StateError::Database(e.to_string()))?);
         let path = tempdir.path().join("weaver.db");
-        let sql_worker = DatabaseRuntimeWorker::start()?;
-        let sql_services =
-            open_sql_services_blocking(&sql_worker, DatabaseTarget::SqlitePath(path.clone()))?;
+        let target = DatabaseTarget::SqlitePath(path.clone());
+        let sql_worker = DatabaseRuntimeWorker::start(&target)?;
+        let sql_services = open_sql_services_blocking(&sql_worker, target)?;
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {

@@ -570,6 +570,7 @@ async fn redownload_failed_job() {
             spec: make_spec("Failed Job"),
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),

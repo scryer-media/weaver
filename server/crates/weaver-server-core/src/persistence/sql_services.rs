@@ -291,7 +291,7 @@ fn sqlite_max_connections_from_env() -> u32 {
         .clamp(1, MAX_SQLITE_CONNECTIONS_CAP)
 }
 
-fn postgres_max_connections_from_env() -> u32 {
+pub(crate) fn postgres_max_connections_from_env() -> u32 {
     std::env::var("WEAVER_POSTGRES_MAX_CONNECTIONS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())

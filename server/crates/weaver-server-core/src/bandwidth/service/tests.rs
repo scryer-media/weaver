@@ -61,3 +61,27 @@ fn monthly_window_rolls_forward_after_clamped_anchor() {
         NaiveDate::from_ymd_opt(2026, 3, 31).unwrap()
     );
 }
+
+#[test]
+fn download_usage_is_counted_immediately_but_ledger_flushes_lazily() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.update_for_now(&db).unwrap();
+
+    let now_minute = Local::now().timestamp().div_euclid(60);
+    runtime.record_download_bytes(&db, 512).unwrap();
+
+    assert_eq!(runtime.used_bytes, 512);
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        0
+    );
+
+    runtime.flush_pending_usage(&db).unwrap();
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        512
+    );
+}

@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::time::{Duration as StdDuration, Instant};
+
 use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
 };
@@ -8,6 +11,8 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
+const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BandwidthCapWindow {
@@ -22,6 +27,9 @@ pub(crate) struct BandwidthCapRuntime {
     used_bytes: u64,
     reserved_bytes: u64,
     last_pruned_bucket_epoch_minute: Option<i64>,
+    pending_usage_by_minute: BTreeMap<i64, u64>,
+    pending_usage_bytes: u64,
+    pending_usage_started_at: Option<Instant>,
 }
 
 impl BandwidthCapRuntime {
@@ -69,6 +77,7 @@ impl BandwidthCapRuntime {
         let next_window = compute_window(now, policy);
         let should_reload = self.window.as_ref() != Some(&next_window);
         if should_reload {
+            self.flush_pending_usage(db)?;
             let start_minute = next_window.starts_at.timestamp().div_euclid(60);
             let end_minute = next_window.ends_at.timestamp().div_euclid(60);
             self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
@@ -110,16 +119,60 @@ impl BandwidthCapRuntime {
         payload_bytes: u64,
     ) -> Result<(), crate::StateError> {
         let now = Local::now();
-        db.add_bandwidth_usage_minute(now.timestamp().div_euclid(60), payload_bytes)?;
+        let bucket_epoch_minute = now.timestamp().div_euclid(60);
+        self.record_pending_usage(bucket_epoch_minute, payload_bytes);
         if let Some(window) = &self.window
             && now >= window.starts_at
             && now < window.ends_at
         {
             self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
         } else {
+            self.flush_pending_usage(db)?;
             self.update_for_now(db)?;
         }
+        if self.should_flush_pending_usage() {
+            self.flush_pending_usage(db)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn flush_pending_usage(
+        &mut self,
+        db: &crate::Database,
+    ) -> Result<(), crate::StateError> {
+        if self.pending_usage_by_minute.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let entries = self
+            .pending_usage_by_minute
+            .iter()
+            .map(|(bucket, bytes)| (*bucket, *bytes))
+            .collect::<Vec<_>>();
+        db.add_bandwidth_usage_minutes(&entries)?;
+        self.pending_usage_by_minute.clear();
+        self.pending_usage_bytes = 0;
+        self.pending_usage_started_at = None;
+        crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
+        Ok(())
+    }
+
+    fn record_pending_usage(&mut self, bucket_epoch_minute: i64, payload_bytes: u64) {
+        if self.pending_usage_by_minute.is_empty() {
+            self.pending_usage_started_at = Some(Instant::now());
+        }
+        self.pending_usage_by_minute
+            .entry(bucket_epoch_minute)
+            .and_modify(|bytes| *bytes = bytes.saturating_add(payload_bytes))
+            .or_insert(payload_bytes);
+        self.pending_usage_bytes = self.pending_usage_bytes.saturating_add(payload_bytes);
+    }
+
+    fn should_flush_pending_usage(&self) -> bool {
+        self.pending_usage_bytes >= BANDWIDTH_USAGE_FLUSH_BYTES
+            || self
+                .pending_usage_started_at
+                .is_some_and(|started| started.elapsed() >= BANDWIDTH_USAGE_FLUSH_INTERVAL)
     }
 
     pub(crate) fn to_download_block_state(&self, global_paused: bool) -> DownloadBlockState {
@@ -392,6 +445,15 @@ impl Pipeline {
     ) -> Result<(), SchedulerError> {
         self.bandwidth_cap
             .record_download_bytes(&self.db, payload_bytes)?;
+        self.shared_state.set_download_block(
+            self.bandwidth_cap
+                .to_download_block_state(self.global_paused),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
+        self.bandwidth_cap.flush_pending_usage(&self.db)?;
         self.shared_state.set_download_block(
             self.bandwidth_cap
                 .to_download_block_state(self.global_paused),

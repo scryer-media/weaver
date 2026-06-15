@@ -1,7 +1,69 @@
 use crate::StateError;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use sqlx::{Postgres, QueryBuilder, Sqlite};
+
+const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
+
+fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
+    let bind_limit = match tx {
+        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
+        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
+    };
+    (bind_limit / binds_per_row.max(1)).max(1)
+}
+
+async fn bulk_insert_integration_events_tx(
+    tx: &mut SqlTx<'_>,
+    events: &[IntegrationEventRow],
+) -> Result<(), StateError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let chunk_size = max_rows_for_tx(tx, 4);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "INSERT INTO integration_events (timestamp, kind, item_id, payload_json) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(event.item_id.map(|value| value as i64))
+                        .push_bind(&event.payload_json);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Postgres>::new(
+                    "INSERT INTO integration_events (timestamp, kind, item_id, payload_json) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(event.item_id.map(|value| value as i64))
+                        .push_bind(&event.payload_json);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
@@ -79,19 +141,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
                 let events = events.clone();
                 Box::pin(async move {
-                    for event in events {
-                        tx.execute(
-                            "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-                             VALUES ({}, {}, {}, {})",
-                            &[
-                                SqlArg::I64(event.timestamp),
-                                SqlArg::Text(event.kind),
-                                SqlArg::OptI64(event.item_id.map(|value| value as i64)),
-                                SqlArg::Text(event.payload_json),
-                            ],
-                        )
-                        .await?;
-                    }
+                    bulk_insert_integration_events_tx(tx, &events).await?;
                     Ok(())
                 })
             })

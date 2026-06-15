@@ -2868,6 +2868,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
+            complete_files: HashSet::new(),
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -2967,6 +2968,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
+            complete_files: HashSet::new(),
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -3911,7 +3913,6 @@ async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty
             segment_number: 99,
         },
         decoded_size: 4096,
-        crc32: 0,
         data: DecodedChunk::from(vec![7u8; 4096]),
         yenc_name: "queued.bin".to_string(),
     };
@@ -4910,7 +4911,6 @@ async fn fail_job_clears_write_backlog_accounting() {
             segment_number: 0,
         },
         decoded_size: 4096,
-        crc32: 0,
         data: DecodedChunk::from(vec![3u8; 4096]),
         yenc_name: "stalled.bin".to_string(),
     };
@@ -5005,7 +5005,6 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
             segment_number: 0,
         },
         decoded_size: 64,
-        crc32: 0,
         data: DecodedChunk::from(vec![9u8; 64]),
         yenc_name: "episode.bin".to_string(),
     };
@@ -5123,7 +5122,6 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
             segment_number: 1,
         },
         decoded_size: 64,
-        crc32: 0,
         data: DecodedChunk::from(original_payload[64..].to_vec()),
         yenc_name: payload_filename.to_string(),
     };
@@ -5407,6 +5405,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: ["E01.mkv".to_string()].into_iter().collect(),
@@ -5705,6 +5704,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
                 },
             ),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -6068,6 +6068,7 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
             spec: spec.clone(),
             committed_segments: Pipeline::all_segment_ids(job_id, &spec),
             file_progress: recovered.file_progress,
+            complete_files: HashSet::new(),
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -7244,6 +7245,9 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     );
     let working_dir = temp_dir.path().join("restore-progress-floor");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    tokio::fs::write(working_dir.join("b.bin"), vec![0u8; 100])
+        .await
+        .unwrap();
 
     let committed_segments = HashSet::from([SegmentId {
         file_id: NzbFileId {
@@ -7252,7 +7256,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         },
         segment_number: 0,
     }]);
-    let file_progress = HashMap::from([(0u32, 40u64), (1u32, 80u64)]);
+    let file_progress = HashMap::from([(0u32, 40u64), (1u32, 100u64)]);
 
     pipeline
         .restore_job(RestoreJobRequest {
@@ -7261,6 +7265,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
             spec,
             committed_segments,
             file_progress,
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -7279,10 +7284,10 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         .unwrap();
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.downloaded_bytes, 100);
-    assert_eq!(state.restored_download_floor_bytes, 180);
-    assert_eq!(Pipeline::effective_downloaded_bytes(state), 180);
-    assert!((Pipeline::effective_progress(state) - 0.9).abs() < f64::EPSILON);
+    assert_eq!(state.downloaded_bytes, 200);
+    assert_eq!(state.restored_download_floor_bytes, 200);
+    assert_eq!(Pipeline::effective_downloaded_bytes(state), 200);
+    assert!((Pipeline::effective_progress(state) - 1.0).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -7352,6 +7357,7 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -7441,6 +7447,7 @@ async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
                 &rar_job_spec("RAR Restart Runtime Restore", &files),
             ),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -7501,6 +7508,7 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
                 &rar_job_spec("RAR Ownerless Restore", &files),
             ),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -10954,6 +10962,7 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -12992,6 +13001,7 @@ async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains()
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -13039,6 +13049,7 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -13106,6 +13117,7 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
             spec,
             committed_segments,
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -13800,6 +13812,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -13847,6 +13860,7 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -13902,6 +13916,7 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
             spec,
             committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
+            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),

@@ -1,0 +1,2 @@
+ALTER TABLE active_extracted
+    ADD COLUMN IF NOT EXISTS output_size BIGINT NOT NULL DEFAULT -1;

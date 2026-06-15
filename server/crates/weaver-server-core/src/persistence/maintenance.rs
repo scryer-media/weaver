@@ -213,18 +213,30 @@ async fn run_sqlite_maintenance_pass(
                 options.full_vacuum_min_interval,
                 now_epoch_secs,
             ) {
+                let full_vacuum_started = Instant::now();
+                tracing::info!(
+                    active_job_count,
+                    reclaimable_bytes_before = before.reclaimable_bytes(),
+                    freelist_count_before = before.freelist_count,
+                    "starting sqlite full vacuum during idle maintenance"
+                );
                 match SqlRuntime::execute(datastore.read_exec(), "VACUUM", &[]).await {
                     Ok(_) => {
                         write_last_full_vacuum_success_epoch_secs(datastore, now_epoch_secs)
                             .await?;
                         full_vacuum_last_success_epoch_secs = Some(now_epoch_secs);
                         full_vacuum_decision = FullVacuumDecision::Ran;
+                        tracing::info!(
+                            elapsed_ms = full_vacuum_started.elapsed().as_millis() as u64,
+                            "completed sqlite full vacuum during idle maintenance"
+                        );
                     }
                     Err(error) => {
                         full_vacuum_decision = FullVacuumDecision::Failed;
                         full_vacuum_error = Some(error.to_string());
                         tracing::warn!(
                             error = %error,
+                            elapsed_ms = full_vacuum_started.elapsed().as_millis() as u64,
                             "failed to run sqlite full vacuum during idle maintenance"
                         );
                     }

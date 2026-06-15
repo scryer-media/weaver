@@ -49,3 +49,28 @@ fn insert_and_list_events_after_cursor() {
     assert_eq!(limited.len(), 1);
     assert_eq!(limited[0].kind, "ITEM_CREATED");
 }
+
+#[test]
+fn insert_integration_events_preserves_order_across_chunks() {
+    let db = Database::open_in_memory().unwrap();
+    let events = (0..250)
+        .map(|index| IntegrationEventRow {
+            id: 0,
+            timestamp: 1000 + index,
+            kind: format!("ITEM_PROGRESS_{index:03}"),
+            item_id: Some(index as u64),
+            payload_json: format!("{{\"index\":{index}}}"),
+        })
+        .collect::<Vec<_>>();
+
+    db.insert_integration_events(&events).unwrap();
+
+    let listed = db
+        .list_integration_events_after(None, None, Some(300))
+        .unwrap();
+    assert_eq!(listed.len(), events.len());
+    for (index, event) in listed.iter().enumerate() {
+        assert_eq!(event.kind, format!("ITEM_PROGRESS_{index:03}"));
+        assert_eq!(event.item_id, Some(index as u64));
+    }
+}

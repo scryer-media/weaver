@@ -1,6 +1,6 @@
 use crate::StateError;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime};
 
 impl Database {
     pub fn sum_bandwidth_usage_minutes(
@@ -10,11 +10,21 @@ impl Database {
     ) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
+            let sql = match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    "SELECT SUM(payload_bytes) AS total
+                       FROM bandwidth_usage_minute_buckets
+                      WHERE bucket_epoch_minute >= {} AND bucket_epoch_minute < {}"
+                }
+                SqlEngine::Postgres => {
+                    "SELECT COALESCE(SUM(payload_bytes), 0)::BIGINT AS total
+                       FROM bandwidth_usage_minute_buckets
+                      WHERE bucket_epoch_minute >= {} AND bucket_epoch_minute < {}"
+                }
+            };
             let row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT SUM(payload_bytes) AS total
-                   FROM bandwidth_usage_minute_buckets
-                  WHERE bucket_epoch_minute >= {} AND bucket_epoch_minute < {}",
+                sql,
                 &[
                     SqlArg::I64(start_bucket_epoch_minute),
                     SqlArg::I64(end_bucket_epoch_minute),

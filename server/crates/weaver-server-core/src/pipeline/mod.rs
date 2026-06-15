@@ -16,8 +16,8 @@ use orchestrator::{is_terminal_status, write_segment_to_disk};
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use std::collections::HashSet;
 
+use crate::ActiveFileProgress;
 #[cfg(test)]
 use crate::RestoreJobRequest;
 use crate::bandwidth::service::BandwidthCapRuntime;
@@ -37,7 +38,6 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
-use crate::{ActiveFileProgress, CommittedSegment};
 use crate::{
     DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
     RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState, TokenBucket,
@@ -51,9 +51,20 @@ use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
-const FILE_PROGRESS_FLUSH_DELTA_BYTES: u64 = 4 * 1024 * 1024;
+const DOWNLOAD_RESTART_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALLED_DOWNLOAD_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+fn download_restart_checkpoint_bytes() -> u64 {
+    static CHECKPOINT_BYTES: OnceLock<u64> = OnceLock::new();
+    *CHECKPOINT_BYTES.get_or_init(|| {
+        std::env::var("WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(DOWNLOAD_RESTART_CHECKPOINT_BYTES)
+    })
+}
 
 fn health_milli(total: u64, failed_bytes: u64) -> u32 {
     total
@@ -225,7 +236,6 @@ pub(super) struct DecodeResult {
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
-    pub(super) crc32: u32,
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
@@ -264,7 +274,6 @@ impl From<Vec<u8>> for DecodedChunk {
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
     pub(super) decoded_size: u32,
-    pub(super) crc32: u32,
     pub(super) data: DecodedChunk,
     pub(super) yenc_name: String,
 }
@@ -322,8 +331,6 @@ pub struct Pipeline {
     pub(super) complete_dir: PathBuf,
     /// Legacy logical NZB path base retained for compatibility with existing rows and tests.
     pub(super) nzb_dir: PathBuf,
-    /// Pending segment commits (flushed to SQLite in batches).
-    pub(super) segment_batch: Vec<CommittedSegment>,
     /// Per-file contiguous write floors awaiting persistence.
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
     /// Last queued/persisted contiguous write floor per file.

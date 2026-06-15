@@ -1,8 +1,8 @@
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
@@ -46,6 +46,59 @@ fn current_schema_version() -> i64 {
         .map(|migration| migration.version)
         .max()
         .unwrap()
+}
+
+fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
+    ActiveJob {
+        job_id,
+        nzb_hash: [0xA5; 32],
+        nzb_path: PathBuf::from(format!("/tmp/postgres-{}.nzb", job_id.0)),
+        nzb_zstd: crate::ingest::compress_nzb_bytes(
+            br#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"/>"#,
+        )
+        .unwrap(),
+        output_dir: PathBuf::from(format!("/tmp/postgres-{}", job_id.0)),
+        created_at: 1_700_000_000 + job_id.0,
+        category: Some("postgres".to_string()),
+        metadata: vec![("engine".to_string(), "postgres".to_string())],
+    }
+}
+
+fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id: job_id.0,
+        job_hash: Some(vec![0xA5; 32]),
+        name: format!("postgres-{}", job_id.0),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("postgres".to_string()),
+        output_dir: Some(format!("/tmp/postgres-{}", job_id.0)),
+        nzb_path: Some(format!("/tmp/postgres-{}.nzb", job_id.0)),
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    }
+}
+
+fn postgres_sample_segments(job_id: crate::jobs::ids::JobId, count: u32) -> Vec<CommittedSegment> {
+    (0..count)
+        .map(|index| CommittedSegment {
+            job_id,
+            file_index: 0,
+            segment_number: index,
+            file_offset: u64::from(index) * 768_000,
+            decoded_size: 768_000,
+            crc32: 0x1234 + index,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -853,6 +906,311 @@ fn canonical_schema_comparison_rejects_intentional_drift() {
 }
 
 #[tokio::test]
+async fn postgres_bulk_hot_paths_when_configured() {
+    let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("postgres_bulk").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let job_id = crate::jobs::ids::JobId(314);
+    let file_identities = vec![
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 0,
+            source_filename: "archive.rar".to_string(),
+            current_filename: "archive.rar".to_string(),
+            canonical_filename: None,
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Declared,
+        },
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 1,
+            source_filename: "archive.r00".to_string(),
+            current_filename: "archive.r00".to_string(),
+            canonical_filename: Some("archive.part02.rar".to_string()),
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Probe,
+        },
+    ];
+    db.create_active_job_with_file_identities(&postgres_sample_job(job_id), &file_identities)
+        .unwrap();
+
+    let segments = postgres_sample_segments(job_id, 225);
+    db.commit_segments(&segments).unwrap();
+    db.commit_segments(&segments).unwrap();
+
+    let high_progress = (0..325)
+        .map(|file_index| ActiveFileProgress {
+            job_id,
+            file_index,
+            contiguous_bytes_written: 2048 + u64::from(file_index),
+        })
+        .collect::<Vec<_>>();
+    let low_progress = (0..325)
+        .map(|file_index| ActiveFileProgress {
+            job_id,
+            file_index,
+            contiguous_bytes_written: 1024,
+        })
+        .collect::<Vec<_>>();
+    db.upsert_file_progress_batch(&high_progress).unwrap();
+    db.upsert_file_progress_batch(&low_progress).unwrap();
+
+    let job_events = (0..250)
+        .map(|index| JobEvent {
+            job_id: job_id.0,
+            timestamp: 1000 + index,
+            kind: format!("EVENT_{index:03}"),
+            message: format!("message {index}"),
+            file_id: Some(format!("{}:{index}", job_id.0)),
+        })
+        .collect::<Vec<_>>();
+    db.insert_job_events(&job_events).unwrap();
+
+    let integration_events = (0..250)
+        .map(|index| IntegrationEventRow {
+            id: 0,
+            timestamp: 2000 + index,
+            kind: format!("ITEM_PROGRESS_{index:03}"),
+            item_id: Some(index as u64),
+            payload_json: format!("{{\"index\":{index}}}"),
+        })
+        .collect::<Vec<_>>();
+    db.insert_integration_events(&integration_events).unwrap();
+
+    db.replace_failed_extractions(
+        job_id,
+        &HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()]),
+    )
+    .unwrap();
+    db.replace_verified_suspect_volumes(job_id, "set", &HashSet::from([37_u32, 38_u32]))
+        .unwrap();
+    db.replace_member_chunks(
+        job_id,
+        "set",
+        "movie.mkv",
+        &[
+            ExtractionChunk {
+                member_name: "movie.mkv".to_string(),
+                volume_index: 0,
+                bytes_written: 111,
+                temp_path: "/tmp/chunk0".to_string(),
+                start_offset: 0,
+                end_offset: 111,
+                verified: true,
+                appended: false,
+            },
+            ExtractionChunk {
+                member_name: "movie.mkv".to_string(),
+                volume_index: 1,
+                bytes_written: 222,
+                temp_path: "/tmp/chunk1".to_string(),
+                start_offset: 111,
+                end_offset: 333,
+                verified: true,
+                appended: false,
+            },
+        ],
+    )
+    .unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    let job = jobs.get(&job_id).unwrap();
+    assert_eq!(job.file_identities.len(), 2);
+    assert_eq!(job.file_identities.get(&0), Some(&file_identities[0]));
+    assert_eq!(job.file_identities.get(&1), Some(&file_identities[1]));
+    assert_eq!(job.committed_segments.len(), 225);
+    assert_eq!(job.file_progress.len(), 325);
+    assert_eq!(job.file_progress.get(&0).copied(), Some(2048));
+    assert_eq!(job.file_progress.get(&324).copied(), Some(2048 + 324));
+    assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 250);
+    assert_eq!(
+        db.list_integration_events_after(None, None, Some(300))
+            .unwrap()
+            .len(),
+        250
+    );
+    assert_eq!(
+        db.load_failed_extractions(job_id).unwrap(),
+        HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()])
+    );
+    assert_eq!(
+        db.load_verified_suspect_volumes(job_id)
+            .unwrap()
+            .get("set")
+            .cloned(),
+        Some(HashSet::from([37_u32, 38_u32]))
+    );
+    assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
+
+    drop(db);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_active_write_lock").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
+    let job_id = crate::jobs::ids::JobId(501);
+    db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+
+    let lock_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&target_url)
+        .await
+        .unwrap();
+    let mut lock_tx = lock_pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(job_id.0 as i64)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer_db = db.clone();
+    std::thread::spawn(move || {
+        let result = writer_db.commit_segments(&[CommittedSegment {
+            job_id,
+            file_index: 0,
+            segment_number: 1,
+            file_offset: 0,
+            decoded_size: 123,
+            crc32: 0x1234,
+        }]);
+        let _ = done_tx.send(result);
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "active-state writer should wait for the advisory lock"
+    );
+
+    sqlx::query("DELETE FROM active_segments WHERE job_id = $1")
+        .bind(job_id.0 as i64)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM active_jobs WHERE job_id = $1")
+        .bind(job_id.0 as i64)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+    lock_tx.commit().await.unwrap();
+    lock_pool.close().await;
+
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_segments WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        0
+    );
+
+    drop(db);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_archive_delete_lock").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
+
+    for (job_id, operation) in [
+        (crate::jobs::ids::JobId(601), "archive"),
+        (crate::jobs::ids::JobId(602), "delete"),
+    ] {
+        db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+        db.commit_segments(&postgres_sample_segments(job_id, 1))
+            .unwrap();
+
+        let lock_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&target_url)
+            .await
+            .unwrap();
+        let mut lock_tx = lock_pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(job_id.0 as i64)
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let operation_db = db.clone();
+        let history = postgres_sample_history(job_id);
+        std::thread::spawn(move || {
+            let result = if operation == "archive" {
+                operation_db.archive_job(job_id, &history)
+            } else {
+                operation_db.delete_active_job(job_id)
+            };
+            let _ = done_tx.send(result);
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "{operation} should wait for the advisory lock"
+        );
+
+        lock_tx.commit().await.unwrap();
+        lock_pool.close().await;
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            fetch_i64(
+                &db,
+                "SELECT COUNT(*) AS value FROM active_jobs WHERE job_id = {}",
+                vec![SqlArg::I64(job_id.0 as i64)],
+            ),
+            0
+        );
+        assert_eq!(
+            fetch_i64(
+                &db,
+                "SELECT COUNT(*) AS value FROM active_segments WHERE job_id = {}",
+                vec![SqlArg::I64(job_id.0 as i64)],
+            ),
+            0
+        );
+    }
+
+    drop(db);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+}
+
+#[tokio::test]
 async fn schema_parity_when_postgres_configured() {
     let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("schema_parity").await
     else {
@@ -875,6 +1233,66 @@ async fn schema_parity_when_postgres_configured() {
         .await
         .unwrap();
     admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_executor_concurrency").await
+    else {
+        return;
+    };
+
+    if postgres_db_concurrency_from_env() < 4 {
+        eprintln!(
+            "skipping postgres executor concurrency test; WEAVER_POSTGRES_DB_CONCURRENCY is below 4"
+        );
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
+        return;
+    }
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let started = Instant::now();
+    let handles = (0..4)
+        .map(|_| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let datastore = db.datastore();
+                db.run_sql_blocking(async move {
+                    SqlRuntime::fetch_optional(
+                        datastore.read_exec(),
+                        "SELECT pg_sleep({})",
+                        &[SqlArg::F64(0.5)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+                .unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let elapsed = started.elapsed();
+
+    drop(db);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "Postgres DB calls appear serialized; elapsed = {elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -917,6 +1335,11 @@ async fn postgres_runtime_smoke_when_configured() {
         db.get_setting("postgres_smoke").unwrap(),
         Some("ok".to_string())
     );
+    db.add_bandwidth_usage_minute(100, 10).unwrap();
+    db.add_bandwidth_usage_minute(100, 5).unwrap();
+    db.add_bandwidth_usage_minute(101, 20).unwrap();
+    assert_eq!(db.sum_bandwidth_usage_minutes(100, 102).unwrap(), 35);
+    assert_eq!(db.sum_bandwidth_usage_minutes(102, 103).unwrap(), 0);
     assert_eq!(db.reserve_next_job_id().unwrap().0, 10_000);
 
     let api_key_id = db

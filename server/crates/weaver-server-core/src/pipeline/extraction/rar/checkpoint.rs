@@ -88,7 +88,6 @@ impl Drop for DirectOutputWriter {
 }
 
 pub(crate) struct ExtractionCheckpointState {
-    pub(crate) db: crate::Database,
     pub(crate) job_id: JobId,
     pub(crate) set_name: String,
     pub(crate) member_name: String,
@@ -121,9 +120,6 @@ impl ExtractionCheckpointState {
             appended: false,
         });
         manifest.sort_by_key(|chunk| (chunk.start_offset, chunk.volume_index));
-        self.db
-            .replace_member_chunks(self.job_id, &self.set_name, &self.member_name, &manifest)
-            .map_err(|error| format!("failed to persist extraction chunks: {error}"))?;
         info!(
             job_id = self.job_id.0,
             set_name = %self.set_name,
@@ -133,7 +129,7 @@ impl ExtractionCheckpointState {
             start_offset,
             end_offset,
             manifest_rows = manifest.len(),
-            "persisted RAR extraction checkpoint volume"
+            "recorded lossy RAR extraction checkpoint volume"
         );
         crate::e2e_failpoint::maybe_trip("extract.after_volume_checkpoint");
         Ok(())
@@ -213,24 +209,6 @@ impl Pipeline {
         partial_path: &std::path::Path,
         chunk_dir: &std::path::Path,
     ) -> Result<(), String> {
-        let existing = db
-            .get_extraction_chunks(job_id, set_name)
-            .map_err(|e| format!("failed to load existing extraction chunks: {e}"))?;
-        for chunk in existing
-            .into_iter()
-            .filter(|chunk| chunk.member_name == member_name)
-        {
-            match std::fs::remove_file(&chunk.temp_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed to remove stale extraction chunk {}: {error}",
-                        chunk.temp_path
-                    ));
-                }
-            }
-        }
         match std::fs::remove_file(partial_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

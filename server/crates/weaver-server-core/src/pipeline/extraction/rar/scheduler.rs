@@ -535,14 +535,6 @@ impl Pipeline {
         if remove_entry {
             self.failed_extractions.remove(&job_id);
         }
-        if let Err(error) = self.db.remove_failed_extraction(job_id, member_name) {
-            error!(
-                job_id = job_id.0,
-                member = %member_name,
-                error = %error,
-                "failed to clear persisted failed extraction member"
-            );
-        }
     }
 
     fn suspect_par2_file_ids_for_member(

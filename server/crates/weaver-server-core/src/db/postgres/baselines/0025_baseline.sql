@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS active_extracted (
     job_id      BIGINT NOT NULL,
     member_name TEXT NOT NULL,
     output_path TEXT NOT NULL,
+    output_size BIGINT NOT NULL DEFAULT -1,
     PRIMARY KEY (job_id, member_name)
 );
 

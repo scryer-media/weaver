@@ -1,6 +1,7 @@
 use crate::StateError;
 use crate::history;
 use crate::jobs::ids::JobId;
+use crate::jobs::persistence::lock_active_job_for_write_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 
@@ -89,6 +90,22 @@ async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<u
 }
 
 async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+    if matches!(&*tx, SqlTx::Postgres(_)) {
+        let mut sql = String::from("WITH ");
+        for (idx, table) in ACTIVE_JOB_CHILD_TABLES.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "d{idx} AS (DELETE FROM {table} WHERE job_id = {{}})"
+            ));
+        }
+        sql.push_str(", d_job AS (DELETE FROM active_jobs WHERE job_id = {}) SELECT 1");
+        let args = vec![SqlArg::I64(id); ACTIVE_JOB_CHILD_TABLES.len() + 1];
+        tx.execute(&sql, &args).await?;
+        return Ok(());
+    }
+
     for table in ACTIVE_JOB_CHILD_TABLES {
         tx.execute(
             &format!("DELETE FROM {table} WHERE job_id = {{}}"),
@@ -106,7 +123,7 @@ async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), State
 
 fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> {
     vec![
-        SqlArg::I64(history.job_id as i64),
+        SqlArg::I64(job_id.0 as i64),
         SqlArg::OptBytes(history.job_hash.clone()),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::Text(history.name.clone()),
@@ -139,6 +156,7 @@ async fn archive_job_sql(
     SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
         let args = args.clone();
         Box::pin(async move {
+            lock_active_job_for_write_tx(tx, job_id).await?;
             tx.execute(
                 "INSERT INTO job_history
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
@@ -198,6 +216,7 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_active_job", |tx| {
                 Box::pin(async move {
+                    lock_active_job_for_write_tx(tx, job_id).await?;
                     delete_active_job_rows(tx, job_id.0 as i64).await?;
                     Ok(())
                 })

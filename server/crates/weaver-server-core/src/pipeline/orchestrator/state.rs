@@ -94,17 +94,6 @@ impl Pipeline {
             .entry(job_id)
             .or_default()
             .insert(member_name.to_string());
-        let member_owned = member_name.to_string();
-        self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.add_failed_extraction(job_id, &member_owned) {
-                error!(
-                    job_id = job_id.0,
-                    member = %member_owned,
-                    error = %error,
-                    "failed to persist failed extraction member"
-                );
-            }
-        });
     }
 
     pub(crate) fn replace_failed_extraction_members(
@@ -117,16 +106,6 @@ impl Pipeline {
         } else {
             self.failed_extractions.insert(job_id, members.clone());
         }
-        let members_clone = members.clone();
-        self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.replace_failed_extractions(job_id, &members_clone) {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to persist failed extraction member set"
-                );
-            }
-        });
     }
 
     pub(crate) fn set_normalization_retried_state(
@@ -189,23 +168,10 @@ impl Pipeline {
         version: u64,
         volumes: HashSet<u32>,
     ) {
-        let db = self.db.clone();
         let done_tx = self.verified_suspect_persist_done_tx.clone();
-        let set_name_for_db = set_name.clone();
         tokio::spawn(async move {
-            let result = match tokio::task::spawn_blocking(move || {
-                db.replace_verified_suspect_volumes(job_id, &set_name_for_db, &volumes)
-                    .map_err(|error| {
-                        format!("failed to persist verified suspect RAR volumes: {error}")
-                    })
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(format!(
-                    "verified suspect persistence task panicked: {error}"
-                )),
-            };
+            let _ = volumes;
+            let result = Ok(());
 
             let _ = done_tx
                 .send(crate::pipeline::VerifiedSuspectPersistDone {

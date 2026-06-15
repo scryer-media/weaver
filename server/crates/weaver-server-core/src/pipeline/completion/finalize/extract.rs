@@ -1060,30 +1060,6 @@ impl Pipeline {
                 );
             }
 
-            let deleted = self
-                .eagerly_deleted
-                .get(&job_id)
-                .is_some_and(|deleted| deleted.contains(&filename));
-            let par2_clean = claim_clean && !verification_blocked;
-            let set_name_owned = set_name.to_string();
-            let eligible = decision.ownership_eligible;
-            self.db_fire_and_forget(move |db| {
-                if let Err(error) = db.set_volume_status(
-                    job_id,
-                    &set_name_owned,
-                    volume,
-                    eligible,
-                    par2_clean,
-                    deleted,
-                ) {
-                    tracing::error!(
-                        job_id = job_id.0,
-                        volume,
-                        error = %error,
-                        "failed to persist RAR volume eligibility"
-                    );
-                }
-            });
         }
 
         info!(

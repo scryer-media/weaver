@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -58,6 +58,15 @@ impl StoreDatastore {
 pub(crate) enum SqlEngine {
     Sqlite,
     Postgres,
+}
+
+impl SqlEngine {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
 }
 
 pub(crate) enum SqlTarget<'a> {
@@ -128,8 +137,11 @@ impl SqlRuntime {
             )));
         };
 
+        let started = Instant::now();
         let _guard = writer_gate.lock().await;
-        run_with_sqlite_busy_retries(op_name, || op(pool.clone())).await
+        let result = run_with_sqlite_busy_retries(op_name, || op(pool.clone())).await;
+        crate::runtime::perf_probe::record_sql_op("sqlite", op_name, started.elapsed());
+        result
     }
 
     pub(crate) async fn run_serialized_sqlite_connection<T, Op, Fut>(
@@ -147,9 +159,12 @@ impl SqlRuntime {
             )));
         };
 
+        let started = Instant::now();
         let _guard = writer_gate.lock().await;
         let conn = pool.acquire().await.map_err(db_err)?;
-        op(conn).await
+        let result = op(conn).await;
+        crate::runtime::perf_probe::record_sql_op("sqlite", op_name, started.elapsed());
+        result
     }
 
     pub(crate) async fn execute(
@@ -159,15 +174,31 @@ impl SqlRuntime {
     ) -> SqlResult<u64> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                let result = query.execute(pool).await.map_err(db_err)?;
+                let result = query.execute(pool).await.map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "execute",
+                    template,
+                    started.elapsed(),
+                );
+                let result = result?;
                 Ok(result.rows_affected())
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                let result = query.execute(pool).await.map_err(db_err)?;
+                let result = query.execute(pool).await.map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "execute",
+                    template,
+                    started.elapsed(),
+                );
+                let result = result?;
                 Ok(result.rows_affected())
             }
             SqlExec::Tx(tx) => tx.execute(template, args).await,
@@ -181,22 +212,38 @@ impl SqlRuntime {
     ) -> SqlResult<Option<SqlRow>> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_optional(pool)
                     .await
                     .map(|row| row.map(SqlRow::Sqlite))
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "fetch_optional",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_optional(pool)
                     .await
                     .map(|row| row.map(SqlRow::Postgres))
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "fetch_optional",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlExec::Tx(tx) => tx.fetch_optional(template, args).await,
         }
@@ -209,22 +256,38 @@ impl SqlRuntime {
     ) -> SqlResult<Vec<SqlRow>> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_all(pool)
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "fetch_all",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_all(pool)
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "fetch_all",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlExec::Tx(tx) => tx.fetch_all(template, args).await,
         }
@@ -239,7 +302,9 @@ impl SqlRuntime {
         T: Send,
         F: for<'tx, 'db> Fn(&'tx mut SqlTx<'db>) -> TxFuture<'tx, T> + Send + Sync,
     {
-        match datastore {
+        let started = Instant::now();
+        let engine = datastore.engine().as_str();
+        let result = match datastore {
             StoreDatastore::Sqlite { pool, writer_gate } => {
                 let _guard = writer_gate.lock().await;
                 run_with_sqlite_busy_retries(op_name, || {
@@ -266,7 +331,9 @@ impl SqlRuntime {
                 tx.commit().await?;
                 Ok(result)
             }
-        }
+        };
+        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+        result
     }
 }
 
@@ -274,15 +341,31 @@ impl<'db> SqlTx<'db> {
     pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlTx::Sqlite(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                let result = query.execute(&mut **tx).await.map_err(db_err)?;
+                let result = query.execute(&mut **tx).await.map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "tx_execute",
+                    template,
+                    started.elapsed(),
+                );
+                let result = result?;
                 Ok(result.rows_affected())
             }
             SqlTx::Postgres(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                let result = query.execute(&mut **tx).await.map_err(db_err)?;
+                let result = query.execute(&mut **tx).await.map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "tx_execute",
+                    template,
+                    started.elapsed(),
+                );
+                let result = result?;
                 Ok(result.rows_affected())
             }
         }
@@ -295,22 +378,38 @@ impl<'db> SqlTx<'db> {
     ) -> SqlResult<Option<SqlRow>> {
         match self {
             SqlTx::Sqlite(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_optional(&mut **tx)
                     .await
                     .map(|row| row.map(SqlRow::Sqlite))
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "tx_fetch_optional",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlTx::Postgres(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_optional(&mut **tx)
                     .await
                     .map(|row| row.map(SqlRow::Postgres))
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "tx_fetch_optional",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
         }
     }
@@ -322,22 +421,38 @@ impl<'db> SqlTx<'db> {
     ) -> SqlResult<Vec<SqlRow>> {
         match self {
             SqlTx::Sqlite(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_all(&mut **tx)
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "tx_fetch_all",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
             SqlTx::Postgres(tx) => {
+                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(&sql), args);
-                query
+                let result = query
                     .fetch_all(&mut **tx)
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
-                    .map_err(db_err)
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "postgres",
+                    "tx_fetch_all",
+                    template,
+                    started.elapsed(),
+                );
+                result
             }
         }
     }
