@@ -409,7 +409,6 @@ impl Pipeline {
         let set_name_owned = set_name.to_string();
         let set_name_for_task = set_name.to_string();
         let event_tx = self.event_tx.clone();
-        let db = self.db.clone();
         let output_dir = self.extraction_staging_dir(job_id);
         let set_name_for_result = set_name_owned.clone();
         let shared_kdf_cache = self
@@ -458,7 +457,6 @@ impl Pipeline {
                         &mut archive,
                         crate::pipeline::extraction::RarExtractionContext::new(
                             &volume_paths,
-                            &db,
                             &event_tx,
                             job_id,
                             &set_name_for_task,
@@ -1059,7 +1057,6 @@ impl Pipeline {
                     "RAR eager delete retained volume"
                 );
             }
-
         }
 
         info!(

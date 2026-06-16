@@ -5,7 +5,6 @@ use super::*;
 
 pub(crate) struct RarExtractionContext<'a> {
     pub(crate) volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
-    pub(crate) db: &'a crate::Database,
     pub(crate) event_tx: &'a broadcast::Sender<PipelineEvent>,
     pub(crate) job_id: JobId,
     pub(crate) set_name: &'a str,
@@ -22,7 +21,6 @@ pub(crate) enum RarArchiveOpenMode {
 impl<'a> RarExtractionContext<'a> {
     pub(crate) fn new(
         volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
-        db: &'a crate::Database,
         event_tx: &'a broadcast::Sender<PipelineEvent>,
         job_id: JobId,
         set_name: &'a str,
@@ -31,7 +29,6 @@ impl<'a> RarExtractionContext<'a> {
     ) -> Self {
         Self {
             volume_paths,
-            db,
             event_tx,
             job_id,
             set_name,
@@ -49,7 +46,6 @@ impl Pipeline {
     ) -> Result<(String, u64, u64), String> {
         let RarExtractionContext {
             volume_paths,
-            db,
             event_tx,
             job_id,
             set_name,
@@ -106,14 +102,7 @@ impl Pipeline {
         );
 
         if partial_path.exists() || chunk_dir.exists() {
-            Self::clear_member_extraction_artifacts(
-                db,
-                job_id,
-                set_name,
-                &member_name,
-                &partial_path,
-                &chunk_dir,
-            )?;
+            Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
         }
 
         let mut partial_file_options = std::fs::OpenOptions::new();
@@ -257,7 +246,6 @@ impl Pipeline {
         drop(shared);
 
         let bytes_written = match Self::finalize_member_output(FinalizeMemberContext {
-            db,
             event_tx,
             job_id,
             set_name,

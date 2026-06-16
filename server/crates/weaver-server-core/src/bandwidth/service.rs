@@ -11,8 +11,10 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
-const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
-const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(10);
+const BANDWIDTH_CAP_USAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+const BANDWIDTH_CAP_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(10);
+const BANDWIDTH_DISPLAY_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
+const BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BandwidthCapWindow {
@@ -169,10 +171,21 @@ impl BandwidthCapRuntime {
     }
 
     fn should_flush_pending_usage(&self) -> bool {
-        self.pending_usage_bytes >= BANDWIDTH_USAGE_FLUSH_BYTES
+        let (bytes, interval) = if self.cap_enabled() {
+            (
+                BANDWIDTH_CAP_USAGE_FLUSH_BYTES,
+                BANDWIDTH_CAP_USAGE_FLUSH_INTERVAL,
+            )
+        } else {
+            (
+                BANDWIDTH_DISPLAY_USAGE_FLUSH_BYTES,
+                BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL,
+            )
+        };
+        self.pending_usage_bytes >= bytes
             || self
                 .pending_usage_started_at
-                .is_some_and(|started| started.elapsed() >= BANDWIDTH_USAGE_FLUSH_INTERVAL)
+                .is_some_and(|started| started.elapsed() >= interval)
     }
 
     pub(crate) fn to_download_block_state(&self, global_paused: bool) -> DownloadBlockState {

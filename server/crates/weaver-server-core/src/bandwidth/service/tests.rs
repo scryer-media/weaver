@@ -85,3 +85,41 @@ fn download_usage_is_counted_immediately_but_ledger_flushes_lazily() {
         512
     );
 }
+
+#[test]
+fn display_only_bandwidth_usage_uses_coarser_flush_threshold() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.update_for_now(&db).unwrap();
+
+    let now_minute = Local::now().timestamp().div_euclid(60);
+    runtime
+        .record_download_bytes(&db, BANDWIDTH_CAP_USAGE_FLUSH_BYTES)
+        .unwrap();
+
+    assert_eq!(runtime.used_bytes, BANDWIDTH_CAP_USAGE_FLUSH_BYTES);
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn enabled_cap_keeps_conservative_bandwidth_flush_threshold() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.set_policy(Some(cap(IspBandwidthCapPeriod::Monthly)));
+    runtime.update_for_now(&db).unwrap();
+
+    let now_minute = Local::now().timestamp().div_euclid(60);
+    runtime
+        .record_download_bytes(&db, BANDWIDTH_CAP_USAGE_FLUSH_BYTES)
+        .unwrap();
+
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        BANDWIDTH_CAP_USAGE_FLUSH_BYTES
+    );
+}

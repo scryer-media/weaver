@@ -1,7 +1,7 @@
 use crate::StateError;
 use crate::history;
 use crate::jobs::ids::JobId;
-use crate::jobs::persistence::lock_active_job_for_write_tx;
+use crate::jobs::persistence::lock_active_job_for_delete_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 
@@ -152,12 +152,13 @@ async fn archive_job_sql(
     datastore: StoreDatastore,
     job_id: JobId,
     args: Vec<SqlArg>,
-) -> Result<(), StateError> {
-    SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
+) -> Result<Option<history::JobHistoryRow>, StateError> {
+    let archived = SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
         let args = args.clone();
         Box::pin(async move {
-            lock_active_job_for_write_tx(tx, job_id).await?;
-            tx.execute(
+            lock_active_job_for_delete_tx(tx, job_id).await?;
+            let archived = tx
+                .fetch_optional(
                 "INSERT INTO job_history
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
@@ -187,17 +188,24 @@ async fn archive_job_sql(
                     completed_at = excluded.completed_at,
                     metadata = excluded.metadata,
                     last_diagnostic_id = excluded.last_diagnostic_id,
-                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms
+                 RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+                    optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                    failed_bytes, health, category, output_dir, nzb_path,
+                    created_at, completed_at, metadata,
+                    last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms",
                 &args,
             )
-            .await?;
+            .await?
+            .map(history::queries::job_history_row_from_sql)
+            .transpose()?;
             delete_active_job_rows(tx, job_id.0 as i64).await?;
-            Ok(())
+            Ok(archived)
         })
     })
     .await?;
     run_inline_incremental_vacuum(&datastore).await?;
-    Ok(())
+    Ok(archived)
 }
 
 impl Database {
@@ -208,7 +216,11 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
-        self.run_sql_blocking(archive_job_sql(datastore, job_id, args))
+        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args));
+        if let Ok(Some(row)) = &result {
+            self.cache_job_history(row.clone());
+        }
+        result.map(|_| ())
     }
 
     pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
@@ -216,7 +228,7 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_active_job", |tx| {
                 Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
+                    lock_active_job_for_delete_tx(tx, job_id).await?;
                     delete_active_job_rows(tx, job_id.0 as i64).await?;
                     Ok(())
                 })
@@ -296,7 +308,7 @@ impl DatabaseWriterExecutor {
         &self,
         job_id: JobId,
         history: &history::JobHistoryRow,
-    ) -> Result<(), StateError> {
+    ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
         self.run_sql_blocking(archive_job_sql(datastore, job_id, args))

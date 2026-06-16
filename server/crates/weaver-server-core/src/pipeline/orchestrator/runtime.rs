@@ -223,17 +223,23 @@ impl Pipeline {
         let threshold_flush =
             contiguous_bytes_written.saturating_sub(current) >= download_restart_checkpoint_bytes();
         if force_flush || threshold_flush {
-            self.flush_file_progress_batch();
+            let label = if force_flush {
+                "download.file_progress.flush.force"
+            } else {
+                "download.file_progress.flush.threshold"
+            };
+            self.flush_file_progress_batch(label);
             if threshold_flush {
                 crate::e2e_failpoint::maybe_delay("download.after_progress_floor_flush");
             }
         }
     }
 
-    pub(crate) fn flush_file_progress_batch(&mut self) {
+    pub(crate) fn flush_file_progress_batch(&mut self, label: &'static str) {
         if self.pending_file_progress.is_empty() {
             return;
         }
+        let _probe = crate::runtime::perf_probe::scope(label);
         let pending = std::mem::take(&mut self.pending_file_progress);
         for (file_id, bytes) in &pending {
             self.persisted_file_progress.insert(*file_id, *bytes);
@@ -550,7 +556,7 @@ impl Pipeline {
                 "draining in-flight downloads"
             );
         }
-        self.flush_file_progress_batch();
+        self.flush_file_progress_batch("download.file_progress.flush.drain");
         if let Err(error) = self.flush_download_bandwidth_usage() {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }

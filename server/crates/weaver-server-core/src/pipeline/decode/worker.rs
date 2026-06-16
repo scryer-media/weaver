@@ -602,7 +602,10 @@ impl Pipeline {
                 self.note_file_hash_chunk(file_id, file_offset, segment.data.as_slice());
 
                 if file_complete {
-                    self.note_file_progress_floor(file_id, total_bytes, true);
+                    crate::runtime::perf_probe::record(
+                        "download.file_progress.complete_file_row_covers_restart",
+                        std::time::Duration::ZERO,
+                    );
                     self.unavailable_promoted_recovery_segments
                         .retain(|segment_id| segment_id.file_id != file_id);
                     let file_path = working_dir.join(filename);

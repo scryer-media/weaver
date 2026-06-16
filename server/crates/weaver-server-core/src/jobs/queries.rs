@@ -376,6 +376,8 @@ impl Database {
                     .map(|file_id| file_id.file_index)
                     .collect::<HashSet<_>>();
                 let before_detected = job.detected_archives.len();
+                job.file_progress
+                    .retain(|file_index, _| !completed_indices.contains(file_index));
                 job.detected_archives
                     .retain(|file_index, _| completed_indices.contains(file_index));
                 for identity in job.file_identities.values_mut() {

@@ -955,6 +955,8 @@ async fn postgres_bulk_hot_paths_when_configured() {
         .collect::<Vec<_>>();
     db.upsert_file_progress_batch(&high_progress).unwrap();
     db.upsert_file_progress_batch(&low_progress).unwrap();
+    db.complete_file(job_id, 0, "archive.rar", &[0x44; 16])
+        .unwrap();
 
     let job_events = (0..250)
         .map(|index| JobEvent {
@@ -1020,8 +1022,9 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(job.file_identities.get(&0), Some(&file_identities[0]));
     assert_eq!(job.file_identities.get(&1), Some(&file_identities[1]));
     assert_eq!(job.committed_segments.len(), 225);
-    assert_eq!(job.file_progress.len(), 325);
-    assert_eq!(job.file_progress.get(&0).copied(), Some(2048));
+    assert_eq!(job.complete_files.len(), 1);
+    assert_eq!(job.file_progress.len(), 324);
+    assert_eq!(job.file_progress.get(&0).copied(), None);
     assert_eq!(job.file_progress.get(&324).copied(), Some(2048 + 324));
     assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 250);
     assert_eq!(
@@ -1069,7 +1072,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
         .await
         .unwrap();
     let mut lock_tx = lock_pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    sqlx::query("SELECT 1 FROM active_jobs WHERE job_id = $1 FOR UPDATE")
         .bind(job_id.0 as i64)
         .execute(&mut *lock_tx)
         .await
@@ -1092,7 +1095,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(
         done_rx.try_recv().is_err(),
-        "active-state writer should wait for the advisory lock"
+        "active-state writer should wait for the parent row lock"
     );
 
     sqlx::query("DELETE FROM active_segments WHERE job_id = $1")
@@ -1153,7 +1156,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
             .await
             .unwrap();
         let mut lock_tx = lock_pool.begin().await.unwrap();
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        sqlx::query("SELECT 1 FROM active_jobs WHERE job_id = $1 FOR UPDATE")
             .bind(job_id.0 as i64)
             .execute(&mut *lock_tx)
             .await
@@ -1174,7 +1177,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             done_rx.try_recv().is_err(),
-            "{operation} should wait for the advisory lock"
+            "{operation} should wait for the parent row lock"
         );
 
         lock_tx.commit().await.unwrap();

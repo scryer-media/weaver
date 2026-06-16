@@ -1,6 +1,6 @@
 use crate::StateError;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime};
 
 impl Database {
     pub fn add_bandwidth_usage_minute(
@@ -21,26 +21,61 @@ impl Database {
         let datastore = self.datastore();
         let entries = entries.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "add_bandwidth_usage_minutes", |tx| {
-                let entries = entries.clone();
-                Box::pin(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "add_bandwidth_usage_minutes",
+                        |tx| {
+                            let entries = entries.clone();
+                            Box::pin(async move {
+                                for (bucket_epoch_minute, payload_bytes) in entries {
+                                    tx.execute(
+                                        "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
+                                         VALUES ({}, {})
+                                         ON CONFLICT(bucket_epoch_minute)
+                                         DO UPDATE SET payload_bytes = bandwidth_usage_minute_buckets.payload_bytes + excluded.payload_bytes",
+                                        &[
+                                            SqlArg::I64(bucket_epoch_minute),
+                                            SqlArg::I64(payload_bytes as i64),
+                                        ],
+                                    )
+                                    .await?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let placeholders = vec!["({}, {})"; entries.len()].join(", ");
+                    let mut args = Vec::with_capacity(entries.len() * 2);
                     for (bucket_epoch_minute, payload_bytes) in entries {
-                        tx.execute(
-                            "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
-                             VALUES ({}, {})
-                             ON CONFLICT(bucket_epoch_minute)
-                             DO UPDATE SET payload_bytes = bandwidth_usage_minute_buckets.payload_bytes + excluded.payload_bytes",
-                            &[
-                                SqlArg::I64(bucket_epoch_minute),
-                                SqlArg::I64(payload_bytes as i64),
-                            ],
-                        )
-                        .await?;
+                        args.push(SqlArg::I64(bucket_epoch_minute));
+                        args.push(SqlArg::I64(payload_bytes as i64));
                     }
-                    Ok(())
-                })
-            })
-            .await
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        &format!(
+                            "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, payload_bytes)
+                             VALUES {placeholders}
+                             ON CONFLICT(bucket_epoch_minute)
+                             DO UPDATE SET payload_bytes = bandwidth_usage_minute_buckets.payload_bytes + excluded.payload_bytes"
+                        ),
+                        &args,
+                    )
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "add_bandwidth_usage_minutes",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 

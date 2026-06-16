@@ -1,22 +1,6 @@
 use super::*;
 
 impl Pipeline {
-    fn member_artifact_root_for_restart_reconcile(&self, job_id: JobId) -> Option<PathBuf> {
-        let state = self.jobs.get(&job_id)?;
-        if let Some(staging_dir) = state.staging_dir.as_ref()
-            && staging_dir.exists()
-        {
-            return Some(staging_dir.clone());
-        }
-
-        let deterministic_staging_dir = self.deterministic_extraction_staging_dir(job_id);
-        if deterministic_staging_dir.exists() {
-            return Some(deterministic_staging_dir);
-        }
-
-        Some(state.working_dir.clone())
-    }
-
     #[cfg(test)]
     pub(crate) fn status_enter_failpoint_for_transition(
         old_post_state: crate::jobs::model::PostState,
@@ -229,6 +213,23 @@ impl Pipeline {
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
     ) {
+        fn should_persist_runtime_to_db(
+            old_run_state: crate::jobs::model::RunState,
+            new_status: &JobStatus,
+            new_run_state: crate::jobs::model::RunState,
+        ) -> bool {
+            matches!(
+                new_status,
+                JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Paused
+            ) || matches!(
+                (old_run_state, new_run_state),
+                (
+                    crate::jobs::model::RunState::Paused,
+                    crate::jobs::model::RunState::Active
+                )
+            )
+        }
+
         let failpoint_name = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -253,7 +254,15 @@ impl Pipeline {
                 }
             }
         };
-        let (transitioned, released_repair, released_extract, entered_repair, entered_extract) = {
+        let (
+            transitioned,
+            persisted_snapshot_changed,
+            persist_runtime_to_db,
+            released_repair,
+            released_extract,
+            entered_repair,
+            entered_extract,
+        ) = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -261,8 +270,12 @@ impl Pipeline {
             let old_download_state = state.download_state;
             let old_post_state = state.post_state;
             let old_run_state = state.run_state;
+            let old_failure_error = state.failure_error.clone();
             let queued_repair_at = state.queued_repair_at_epoch_ms;
             let queued_extract_at = state.queued_extract_at_epoch_ms;
+            let old_paused_resume_status = state.paused_resume_status.clone();
+            let old_paused_resume_download_state = state.paused_resume_download_state;
+            let old_paused_resume_post_state = state.paused_resume_post_state;
             let transitioned = old_status != new_status
                 || old_download_state != new_download_state
                 || old_post_state != new_post_state
@@ -320,8 +333,19 @@ impl Pipeline {
             state.download_state = new_download_state;
             state.post_state = new_post_state;
             state.run_state = new_run_state;
+            let persisted_snapshot_changed = transitioned
+                || state.failure_error != old_failure_error
+                || state.queued_repair_at_epoch_ms != queued_repair_at
+                || state.queued_extract_at_epoch_ms != queued_extract_at
+                || state.paused_resume_status != old_paused_resume_status
+                || state.paused_resume_download_state != old_paused_resume_download_state
+                || state.paused_resume_post_state != old_paused_resume_post_state;
+            let persist_runtime_to_db =
+                should_persist_runtime_to_db(old_run_state, &state.status, state.run_state);
             (
                 transitioned,
+                persisted_snapshot_changed,
+                persist_runtime_to_db,
                 released_repair,
                 released_extract,
                 entered_repair,
@@ -341,8 +365,26 @@ impl Pipeline {
         if entered_extract {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
         }
-        if persist_status.is_some() {
-            self.persist_active_runtime(job_id);
+        if let Some(persist_status) = persist_status {
+            let changed_label = if persisted_snapshot_changed {
+                "changed"
+            } else {
+                "unchanged"
+            };
+            crate::runtime::perf_probe::record_owned(
+                format!(
+                    "pipeline.persist_active_runtime.requested.{changed_label}.{persist_status}"
+                ),
+                std::time::Duration::from_nanos(1),
+            );
+            if persist_runtime_to_db {
+                self.persist_active_runtime(job_id);
+            } else {
+                crate::runtime::perf_probe::record_owned(
+                    format!("pipeline.persist_active_runtime.skipped.transient.{persist_status}"),
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         if let (true, Some(name)) = (transitioned, failpoint_name) {
             crate::e2e_failpoint::maybe_delay(name);

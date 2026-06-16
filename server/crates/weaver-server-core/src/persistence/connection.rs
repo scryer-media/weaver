@@ -1,9 +1,10 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
@@ -26,6 +27,7 @@ pub use crate::operations::{
 pub use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 
 const SQLITE_WRITE_QUEUE_CAPACITY: usize = 128;
+const JOB_HISTORY_CACHE_CAPACITY: usize = 1024;
 
 type SqliteDatabaseRuntimeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
 enum PostgresDatabaseRuntimeJob {
@@ -379,6 +381,7 @@ fn open_sql_services_blocking(
 pub(crate) struct DatabaseWriterExecutor {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
+    job_history_cache: Arc<Mutex<JobHistoryCache>>,
 }
 
 impl DatabaseWriterExecutor {
@@ -386,6 +389,7 @@ impl DatabaseWriterExecutor {
         Self {
             sql_services: db.sql_services.clone(),
             sql_worker: db.sql_worker.clone(),
+            job_history_cache: db.job_history_cache.clone(),
         }
     }
 
@@ -399,6 +403,13 @@ impl DatabaseWriterExecutor {
         Fut: std::future::Future<Output = Result<T, StateError>> + Send + 'static,
     {
         self.sql_worker.block_on(future)
+    }
+
+    pub(crate) fn cache_job_history(&self, row: JobHistoryRow) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .insert(row);
     }
 }
 
@@ -415,6 +426,42 @@ enum DbWriteCommand {
     },
 }
 
+#[derive(Default)]
+struct JobHistoryCache {
+    rows: BTreeMap<u64, JobHistoryRow>,
+    insertion_order: VecDeque<u64>,
+}
+
+impl JobHistoryCache {
+    fn get(&self, job_id: u64) -> Option<JobHistoryRow> {
+        self.rows.get(&job_id).cloned()
+    }
+
+    fn insert(&mut self, row: JobHistoryRow) {
+        if !self.rows.contains_key(&row.job_id) {
+            self.insertion_order.push_back(row.job_id);
+        }
+        self.rows.insert(row.job_id, row);
+        while self.rows.len() > JOB_HISTORY_CACHE_CAPACITY {
+            let Some(job_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.rows.remove(&job_id);
+        }
+    }
+
+    fn remove(&mut self, job_id: u64) {
+        self.rows.remove(&job_id);
+        self.insertion_order
+            .retain(|cached_id| *cached_id != job_id);
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.insertion_order.clear();
+    }
+}
+
 /// SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
@@ -423,6 +470,7 @@ pub struct Database {
     writer_tx: mpsc::Sender<DbWriteCommand>,
     pending_archive_retries: Arc<AtomicUsize>,
     pending_archive_notify: Arc<Notify>,
+    job_history_cache: Arc<Mutex<JobHistoryCache>>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
 }
@@ -445,6 +493,7 @@ impl Database {
             writer_tx,
             pending_archive_retries: Arc::new(AtomicUsize::new(0)),
             pending_archive_notify: Arc::new(Notify::new()),
+            job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
             _ephemeral_dir: None,
         };
@@ -468,6 +517,7 @@ impl Database {
             writer_tx,
             pending_archive_retries: Arc::new(AtomicUsize::new(0)),
             pending_archive_notify: Arc::new(Notify::new()),
+            job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
             _ephemeral_dir: Some(tempdir),
         };
@@ -477,6 +527,34 @@ impl Database {
 
     pub(crate) fn datastore(&self) -> StoreDatastore {
         self.sql_services.datastore()
+    }
+
+    pub(crate) fn get_cached_job_history(&self, job_id: u64) -> Option<JobHistoryRow> {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .get(job_id)
+    }
+
+    pub(crate) fn cache_job_history(&self, row: JobHistoryRow) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .insert(row);
+    }
+
+    pub(crate) fn invalidate_job_history_cache(&self, job_id: u64) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .remove(job_id);
+    }
+
+    pub(crate) fn clear_job_history_cache(&self) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .clear();
     }
 
     pub(crate) fn run_sql_blocking<T, Fut>(&self, future: Fut) -> Result<T, StateError>
@@ -534,12 +612,16 @@ impl Database {
                     DbWriteCommand::ArchiveJob { job_id, history } => {
                         let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
-                            if let Err(error) = writer.archive_job(job_id, history.as_ref()) {
-                                tracing::warn!(
-                                    job_id = job_id.0,
-                                    error = %error,
-                                    "failed to archive job on database writer path"
-                                );
+                            match writer.archive_job(job_id, history.as_ref()) {
+                                Ok(Some(row)) => writer.cache_job_history(row),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        job_id = job_id.0,
+                                        error = %error,
+                                        "failed to archive job on database writer path"
+                                    );
+                                }
                             }
                         })
                         .await

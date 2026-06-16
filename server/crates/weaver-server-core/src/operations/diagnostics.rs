@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
@@ -206,6 +208,49 @@ impl Database {
         })
     }
 
+    pub fn list_pending_diagnostic_runs_for_sources(
+        &self,
+        source_job_ids: &[u64],
+    ) -> Result<Vec<DiagnosticRunRow>, StateError> {
+        let mut seen = HashSet::with_capacity(source_job_ids.len());
+        let mut ids = Vec::with_capacity(source_job_ids.len());
+        for &id in source_job_ids {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut result = Vec::new();
+            for chunk in ids.chunks(900) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT source_job_id, diagnostic_job_id, smg_diagnostic_id, stage, include_server_hostnames,
+                            rerun_succeeded, error_message, created_at_epoch_ms, updated_at_epoch_ms, last_activity_at_epoch_ms
+                       FROM diagnostic_runs
+                      WHERE source_job_id IN ({placeholders})
+                        AND stage IN ('queued', 'running', 'collecting', 'uploading')
+                      ORDER BY created_at_epoch_ms ASC"
+                );
+                let args = chunk
+                    .iter()
+                    .map(|id| SqlArg::I64(*id as i64))
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                result.extend(
+                    rows.into_iter()
+                        .map(diagnostic_run_from_row)
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            Ok(result)
+        })
+    }
+
     pub fn list_pending_diagnostic_runs(&self) -> Result<Vec<DiagnosticRunRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -320,7 +365,7 @@ impl Database {
     ) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let diagnostic_id = diagnostic_id.to_string();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE job_history
@@ -335,7 +380,11 @@ impl Database {
             )
             .await?;
             Ok(changed > 0)
-        })
+        });
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.invalidate_job_history_cache(source_job_id);
+        }
+        result
     }
 }
 
@@ -377,4 +426,86 @@ fn diagnostic_run_from_row(row: SqlRow) -> Result<DiagnosticRunRow, StateError> 
         updated_at_epoch_ms: row.i64("updated_at_epoch_ms")?,
         last_activity_at_epoch_ms: row.i64("last_activity_at_epoch_ms")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::JobHistoryRow;
+
+    fn history_row(job_id: u64) -> JobHistoryRow {
+        JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("job-{job_id}.nzb"),
+            status: "failed".to_string(),
+            error_message: Some("simulated".to_string()),
+            total_bytes: 1000,
+            downloaded_bytes: 900,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 100,
+            health: 900,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1000 + job_id as i64,
+            completed_at: 2000 + job_id as i64,
+            metadata: None,
+            last_diagnostic_id: None,
+            last_diagnostic_uploaded_at_epoch_ms: None,
+        }
+    }
+
+    fn diagnostic_row(
+        source_job_id: u64,
+        diagnostic_job_id: u64,
+        stage: DiagnosticRunStage,
+    ) -> DiagnosticRunRow {
+        DiagnosticRunRow {
+            source_job_id,
+            diagnostic_job_id,
+            diagnostic_id: None,
+            stage,
+            include_server_hostnames: true,
+            rerun_succeeded: None,
+            error_message: None,
+            created_at_epoch_ms: 10_000 + source_job_id as i64,
+            updated_at_epoch_ms: 10_000 + source_job_id as i64,
+            last_activity_at_epoch_ms: 10_000 + source_job_id as i64,
+        }
+    }
+
+    #[test]
+    fn list_pending_diagnostic_runs_for_sources_filters_requested_active_rows() {
+        let db = Database::open_in_memory().unwrap();
+        for job_id in 1..=3 {
+            db.insert_job_history(&history_row(job_id)).unwrap();
+        }
+        db.insert_diagnostic_run(&diagnostic_row(1, 101, DiagnosticRunStage::Queued))
+            .unwrap();
+        db.insert_diagnostic_run(&diagnostic_row(2, 102, DiagnosticRunStage::Complete))
+            .unwrap();
+        db.insert_diagnostic_run(&diagnostic_row(3, 103, DiagnosticRunStage::Running))
+            .unwrap();
+
+        let rows = db
+            .list_pending_diagnostic_runs_for_sources(&[3, 2, 3, 99])
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_job_id, 3);
+        assert_eq!(rows[0].diagnostic_job_id, 103);
+    }
+
+    #[test]
+    fn list_pending_diagnostic_runs_for_sources_returns_empty_for_empty_input() {
+        let db = Database::open_in_memory().unwrap();
+
+        assert!(
+            db.list_pending_diagnostic_runs_for_sources(&[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

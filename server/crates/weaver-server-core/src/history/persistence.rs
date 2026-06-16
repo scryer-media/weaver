@@ -68,8 +68,9 @@ async fn bulk_insert_integration_events_tx(
 impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let datastore = self.datastore();
+        let cache_entry = entry.clone();
         let args = job_history_args(entry);
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "INSERT INTO job_history
@@ -102,12 +103,16 @@ impl Database {
             )
             .await?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.cache_job_history(cache_entry);
+        }
+        result
     }
 
     pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "DELETE FROM job_history WHERE job_id = {}",
@@ -115,16 +120,24 @@ impl Database {
             )
             .await?;
             Ok(changed > 0)
-        })
+        });
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.invalidate_job_history_cache(job_id);
+        }
+        result
     }
 
     pub fn delete_all_job_history(&self) -> Result<usize, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             let changed =
                 SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_history", &[]).await?;
             Ok(changed as usize)
-        })
+        });
+        if result.as_ref().is_ok_and(|changed| *changed > 0) {
+            self.clear_job_history_cache();
+        }
+        result
     }
 
     pub fn insert_integration_events(

@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,7 @@ struct Bucket {
 
 struct Profiler {
     started: Instant,
+    started_cpu: Option<CpuUsage>,
     last_emit: Mutex<Instant>,
     buckets: Mutex<BTreeMap<String, Bucket>>,
     interval: Duration,
@@ -42,6 +45,13 @@ pub(crate) fn record(label: &'static str, elapsed: Duration) {
         return;
     }
     profiler().record(label.to_string(), elapsed);
+}
+
+pub(crate) fn record_owned(label: String, elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    profiler().record(label, elapsed);
 }
 
 pub(crate) fn scope(label: &'static str) -> Scope {
@@ -103,6 +113,7 @@ fn profiler() -> &'static Profiler {
         let now = Instant::now();
         Profiler {
             started: now,
+            started_cpu: process_cpu_usage(),
             last_emit: Mutex::new(now),
             buckets: Mutex::new(BTreeMap::new()),
             interval,
@@ -148,13 +159,34 @@ impl Profiler {
                 .then_with(|| right.max_ns.cmp(&left.max_ns))
         });
 
-        tracing::info!(
-            target: "weaver::perf_probe",
-            elapsed_secs = now.duration_since(self.started).as_secs(),
-            bucket_count = rows.len(),
-            top_n = self.top_n,
-            "weaver hot-path profile summary"
-        );
+        let wall = now.duration_since(self.started);
+        if let Some(cpu) = self
+            .started_cpu
+            .and_then(|started| process_cpu_usage().map(|current| current.saturating_sub(started)))
+        {
+            let cpu_total = cpu.total();
+            tracing::info!(
+                target: "weaver::perf_probe",
+                elapsed_secs = wall.as_secs(),
+                bucket_count = rows.len(),
+                top_n = self.top_n,
+                cpu_sample_available = true,
+                cpu_user_ms = duration_ms(cpu.user),
+                cpu_system_ms = duration_ms(cpu.system),
+                cpu_total_ms = duration_ms(cpu_total),
+                cpu_util_pct = cpu_util_pct(cpu_total, wall),
+                "weaver hot-path profile summary"
+            );
+        } else {
+            tracing::info!(
+                target: "weaver::perf_probe",
+                elapsed_secs = wall.as_secs(),
+                bucket_count = rows.len(),
+                top_n = self.top_n,
+                cpu_sample_available = false,
+                "weaver hot-path profile summary"
+            );
+        }
         for (label, bucket) in rows.into_iter().take(self.top_n) {
             let avg_ns = if bucket.count == 0 {
                 0
@@ -182,52 +214,178 @@ fn ns_to_us(ns: u128) -> u64 {
     u64::try_from(ns / 1_000).unwrap_or(u64::MAX)
 }
 
-fn classify_sql(template: &str) -> &'static str {
+#[derive(Clone, Copy)]
+struct CpuUsage {
+    user: Duration,
+    system: Duration,
+}
+
+impl CpuUsage {
+    fn total(self) -> Duration {
+        self.user.saturating_add(self.system)
+    }
+
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            user: self.user.saturating_sub(earlier.user),
+            system: self.system.saturating_sub(earlier.system),
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn cpu_util_pct(cpu: Duration, wall: Duration) -> u64 {
+    let wall_ms = wall.as_millis();
+    if wall_ms == 0 {
+        return 0;
+    }
+    u64::try_from(cpu.as_millis().saturating_mul(100) / wall_ms).unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn process_cpu_usage() -> Option<CpuUsage> {
+    let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some(CpuUsage {
+        user: timeval_to_duration(usage.ru_utime),
+        system: timeval_to_duration(usage.ru_stime),
+    })
+}
+
+#[cfg(unix)]
+fn timeval_to_duration(timeval: libc::timeval) -> Duration {
+    let seconds = u64::try_from(timeval.tv_sec).unwrap_or(0);
+    let micros = u32::try_from(timeval.tv_usec).unwrap_or(0).min(999_999);
+    Duration::new(seconds, micros.saturating_mul(1_000))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_usage() -> Option<CpuUsage> {
+    None
+}
+
+fn classify_sql(template: &str) -> String {
     let lower = template.to_ascii_lowercase();
+    if lower.contains("update active_jobs") && lower.contains("download_state") {
+        return "active_jobs_runtime".to_string();
+    }
+    if lower.contains("with active_file_complete_active") {
+        return "complete_file".to_string();
+    }
+    if lower.contains("with d0 as (delete from active_segments")
+        && lower.contains("d_job as (delete from active_jobs")
+    {
+        return "active_job_rows.delete".to_string();
+    }
+    if lower.contains("with active_extracted_member_active") {
+        return "add_extracted_member".to_string();
+    }
+
     for (needle, label) in [
         ("pg_advisory_xact_lock", "advisory_lock"),
-        ("active_file_progress", "active_file_progress"),
-        ("active_file_identities", "active_file_identities"),
-        ("active_segments", "active_segments"),
-        ("active_par2_files", "active_par2_files"),
-        ("active_par2_metadata", "active_par2_metadata"),
-        ("active_failed_extractions", "active_failed_extractions"),
-        ("active_extracted_members", "active_extracted_members"),
-        ("active_extraction_chunks", "active_extraction_chunks"),
-        ("active_rar_verified_suspect", "active_rar_verified_suspect"),
-        ("active_rar_volume_facts", "active_rar_volume_facts"),
-        ("active_detected_archives", "active_detected_archives"),
-        ("active_files", "active_files"),
-        ("active_jobs", "active_jobs"),
         (
             "bandwidth_usage_minute_buckets",
             "bandwidth_usage_minute_buckets",
         ),
-        ("job_events", "job_events"),
-        ("integration_events", "integration_events"),
-        ("job_history", "job_history"),
-        ("diagnostic_runs", "diagnostic_runs"),
-        ("settings", "settings"),
-        ("servers", "servers"),
-        ("rss_", "rss"),
         ("pragma", "pragma"),
     ] {
         if lower.contains(needle) {
-            return label;
+            return label.to_string();
         }
     }
 
-    match lower.split_whitespace().next() {
-        Some("select") => "select",
-        Some("insert") => "insert",
-        Some("update") => "update",
-        Some("delete") => "delete",
-        Some("with") => "with",
-        Some("pragma") => "pragma",
-        Some("vacuum") => "vacuum",
-        Some("create") => "create",
-        Some("alter") => "alter",
-        Some("drop") => "drop",
-        _ => "other",
+    for table in [
+        "active_file_progress",
+        "active_file_identities",
+        "active_segments",
+        "active_par2_files",
+        "active_par2_metadata",
+        "active_failed_extractions",
+        "active_extracted_members",
+        "active_extraction_chunks",
+        "active_rar_verified_suspect",
+        "active_rar_volume_facts",
+        "active_detected_archives",
+        "active_archive_headers",
+        "active_volume_status",
+        "active_files",
+        "active_jobs",
+        "job_events",
+        "integration_events",
+        "job_history",
+        "diagnostic_runs",
+        "settings",
+        "servers",
+    ] {
+        if lower.contains(table) {
+            return table_operation_label(&lower, table);
+        }
     }
+    if lower.contains("rss_") {
+        return "rss".to_string();
+    }
+
+    match lower.split_whitespace().next() {
+        Some("select") => dynamic_sql_label(&lower, "select"),
+        Some("insert") => dynamic_sql_label(&lower, "insert"),
+        Some("update") => dynamic_sql_label(&lower, "update"),
+        Some("delete") => dynamic_sql_label(&lower, "delete"),
+        Some("with") => dynamic_sql_label(&lower, "with"),
+        Some("pragma") => "pragma".to_string(),
+        Some("vacuum") => "vacuum".to_string(),
+        Some("create") => "create".to_string(),
+        Some("alter") => "alter".to_string(),
+        Some("drop") => "drop".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+fn table_operation_label(lower_sql: &str, table: &str) -> String {
+    let operation = if lower_sql.contains(&format!("insert into {table}")) {
+        "insert"
+    } else if lower_sql.contains(&format!("update {table}")) {
+        "update"
+    } else if lower_sql.contains(&format!("delete from {table}")) {
+        "delete"
+    } else if lower_sql.contains(&format!("from {table}")) {
+        "select"
+    } else {
+        "touch"
+    };
+    format!("{table}.{operation}")
+}
+
+fn dynamic_sql_label(lower_sql: &str, operation: &'static str) -> String {
+    if let Some(table) = first_table_after(lower_sql, "insert into") {
+        return format!("insert.{table}");
+    }
+    if let Some(table) = first_table_after(lower_sql, "update") {
+        return format!("update.{table}");
+    }
+    if let Some(table) = first_table_after(lower_sql, "delete from") {
+        return format!("delete.{table}");
+    }
+    if let Some(table) = first_table_after(lower_sql, "from") {
+        return format!("{operation}.{table}");
+    }
+    operation.to_string()
+}
+
+fn first_table_after(lower_sql: &str, marker: &str) -> Option<String> {
+    let index = lower_sql.find(marker)?;
+    let rest = lower_sql[index + marker.len()..].trim_start();
+    let token = rest.split_whitespace().next()?;
+    let table = token
+        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+        .trim_start_matches("only.")
+        .trim_start_matches("public.")
+        .to_string();
+    if table.is_empty() { None } else { Some(table) }
 }

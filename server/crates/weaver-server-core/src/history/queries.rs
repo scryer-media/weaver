@@ -18,8 +18,32 @@ const JOB_HISTORY_SELECT: &str =
 
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+        self.get_job_history_inner(job_id)
+    }
+
+    pub fn get_job_history_profiled(
+        &self,
+        job_id: u64,
+        label: &'static str,
+    ) -> Result<Option<JobHistoryRow>, StateError> {
+        let _probe = crate::runtime::perf_probe::scope(label);
+        self.get_job_history_inner(job_id)
+    }
+
+    fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+        if let Some(row) = self.get_cached_job_history(job_id) {
+            crate::runtime::perf_probe::record(
+                "db.get_job_history.cache_hit",
+                std::time::Duration::ZERO,
+            );
+            return Ok(Some(row));
+        }
+        crate::runtime::perf_probe::record(
+            "db.get_job_history.cache_miss",
+            std::time::Duration::ZERO,
+        );
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        let row = self.run_sql_blocking(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 &format!("{JOB_HISTORY_SELECT} WHERE job_id = {{}} LIMIT 1"),
@@ -28,7 +52,11 @@ impl Database {
             .await?
             .map(job_history_row_from_sql)
             .transpose()
-        })
+        })?;
+        if let Some(row) = &row {
+            self.cache_job_history(row.clone());
+        }
+        Ok(row)
     }
 
     pub fn list_job_history(
@@ -173,7 +201,7 @@ impl Database {
     }
 }
 
-fn job_history_row_from_sql(
+pub(crate) fn job_history_row_from_sql(
     row: crate::persistence::sql_runtime::SqlRow,
 ) -> Result<JobHistoryRow, StateError> {
     Ok(JobHistoryRow {

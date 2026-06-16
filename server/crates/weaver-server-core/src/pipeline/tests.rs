@@ -593,7 +593,6 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         &mut archive_without_refresh,
         crate::pipeline::extraction::RarExtractionContext::new(
             &volume_paths,
-            &pipeline.db,
             &pipeline.event_tx,
             JobId(40100),
             "show",
@@ -629,7 +628,6 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         &mut archive_with_refresh,
         crate::pipeline::extraction::RarExtractionContext::new(
             &volume_paths,
-            &pipeline.db,
             &pipeline.event_tx,
             JobId(40101),
             "show",
@@ -1918,14 +1916,12 @@ async fn verified_suspect_persist_serializes_latest_value_per_set() {
 
     drain_verified_suspect_persists(&mut pipeline).await;
 
-    assert_eq!(
+    assert!(
         pipeline
             .db
             .load_verified_suspect_volumes(job_id)
             .unwrap()
-            .get("show")
-            .cloned(),
-        Some(HashSet::from([2u32, 3u32]))
+            .is_empty()
     );
 }
 
@@ -2868,7 +2864,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
-            complete_files: HashSet::new(),
+            complete_files: recovered.complete_files,
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -2968,7 +2964,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
             spec,
             committed_segments,
             file_progress: recovered.file_progress,
-            complete_files: HashSet::new(),
+            complete_files: recovered.complete_files,
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -5286,13 +5282,8 @@ async fn eager_delete_preserves_later_member_volumes_after_out_of_order_completi
     assert!(!working_dir.join("show.part02.rar").exists());
     assert!(working_dir.join("show.part03.rar").exists());
     assert!(working_dir.join("show.part04.rar").exists());
-    // Wait for fire-and-forget spawn_blocking db writes to complete.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let deleted_rows = pipeline.db.load_deleted_volume_statuses(job_id).unwrap();
-    assert_eq!(
-        deleted_rows,
-        vec![("show".to_string(), 0), ("show".to_string(), 1)]
-    );
+    assert!(deleted_rows.is_empty());
 }
 
 #[tokio::test]
@@ -5388,6 +5379,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
         pipeline
             .extracted_members
             .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
+        std::fs::write(working_dir.join("E01.mkv"), b"episode-one").unwrap();
         pipeline
             .db
             .add_extracted_member(job_id, "E01.mkv", &working_dir.join("E01.mkv"))
@@ -5423,7 +5415,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
         .await
         .unwrap();
 
-    assert_eq!(restored.try_update_archive_topology_calls, 0);
+    assert_eq!(restored.try_update_archive_topology_calls, 4);
 
     assert_eq!(
         member_span(&restored, job_id, "show", "E01.mkv"),
@@ -7291,7 +7283,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
 }
 
 #[tokio::test]
-async fn restore_job_reapplies_only_promoted_recovery_segments() {
+async fn restore_job_reparses_par2_without_promoted_recovery_state() {
     let temp_dir = tempfile::tempdir().unwrap();
     let index_filename = "repair.par2";
     let recovery_filename = "repair.vol00+01.par2";
@@ -7381,19 +7373,18 @@ async fn restore_job_reapplies_only_promoted_recovery_segments() {
             .par2_runtime(job_id)
             .and_then(|runtime| runtime.files.get(&1))
             .map(|file| (file.recovery_blocks, file.promoted)),
-        Some((1, true))
+        None
     );
 
     let state = restored.jobs.get_mut(&job_id).unwrap();
     let mut queued = state.download_queue.drain_all();
     queued.sort_by_key(|work| work.segment_id.file_id.file_index);
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].segment_id.file_id.file_index, 1);
-    assert!(state.recovery_queue.is_empty());
+    assert!(queued.is_empty());
+    assert!(state.recovery_queue.has_recovery_work());
 }
 
 #[tokio::test]
-async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
+async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
     let temp_dir = tempfile::tempdir().unwrap();
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("RAR Restart Runtime Restore", &files);
@@ -7465,20 +7456,13 @@ async fn restore_job_rehydrates_failed_members_and_verified_suspect_state() {
         .await
         .unwrap();
 
-    assert_eq!(
-        restored.failed_extractions.get(&job_id).cloned(),
-        Some(HashSet::from([
-            "E10.mkv".to_string(),
-            "E15.mkv".to_string(),
-        ]))
-    );
+    assert!(!restored.failed_extractions.contains_key(&job_id));
     assert!(restored.normalization_retried.contains(&job_id));
-    assert_eq!(
+    assert!(
         restored
             .rar_sets
             .get(&(job_id, "show".to_string()))
-            .map(|state| state.verified_suspect_volumes.clone()),
-        Some(HashSet::from([1u32, 2u32]))
+            .is_none_or(|state| state.verified_suspect_volumes.is_empty())
     );
 }
 
@@ -10863,7 +10847,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
 }
 
 #[tokio::test]
-async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_reconcile() {
+async fn stale_extracted_member_checkpoint_is_discarded_during_completion_reconcile() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30085);
@@ -10871,7 +10855,7 @@ async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_re
     let _working_dir = insert_active_job(
         &mut pipeline,
         job_id,
-        rar_job_spec("RAR Recover Stale Extracted Member", &files),
+        rar_job_spec("RAR Discard Stale Extracted Member", &files),
     )
     .await;
     pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
@@ -10888,10 +10872,6 @@ async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_re
     std::fs::create_dir_all(&chunk_dir).unwrap();
     std::fs::write(&partial_path, b"episode-a-payload").unwrap();
 
-    pipeline
-        .db
-        .add_extracted_member(job_id, &member_name, &out_path)
-        .unwrap();
     pipeline
         .extracted_members
         .entry(job_id)
@@ -10921,10 +10901,9 @@ async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_re
         .reconcile_extracted_outputs_for_completion(job_id)
         .await;
 
-    assert!(!reconciled);
-    assert!(out_path.exists());
-    assert!(!partial_path.exists());
-    assert_eq!(std::fs::read(&out_path).unwrap(), b"episode-a-payload");
+    assert!(reconciled);
+    assert!(!out_path.exists());
+    assert!(partial_path.exists());
     assert!(
         pipeline
             .db
@@ -10933,12 +10912,7 @@ async fn stale_extracted_member_checkpoint_is_recovered_before_rar_completion_re
             .into_iter()
             .all(|chunk| chunk.member_name != member_name)
     );
-    assert!(
-        pipeline
-            .extracted_members
-            .get(&job_id)
-            .is_some_and(|members| members.contains(&member_name))
-    );
+    assert!(!pipeline.extracted_members.contains_key(&job_id));
 }
 
 #[tokio::test]
@@ -14241,14 +14215,6 @@ async fn completion_reconciliation_clears_missing_extracted_outputs() {
     pipeline
         .extracted_members
         .insert(job_id, ["missing.mkv".to_string()].into_iter().collect());
-    pipeline
-        .db
-        .add_extracted_member(
-            job_id,
-            "missing.mkv",
-            std::path::Path::new("/nonexistent/missing.mkv"),
-        )
-        .unwrap();
 
     assert!(
         pipeline

@@ -588,13 +588,17 @@ impl DiagnosticManager {
             if !live {
                 let db = self.db.clone();
                 let diagnostic_job_id = row.diagnostic_job_id;
-                let history_exists =
-                    tokio::task::spawn_blocking(move || db.get_job_history(diagnostic_job_id))
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .flatten()
-                        .is_some();
+                let history_exists = tokio::task::spawn_blocking(move || {
+                    db.get_job_history_profiled(
+                        diagnostic_job_id,
+                        "db.get_job_history.api_diagnostics_history_exists",
+                    )
+                })
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+                .is_some();
                 if history_exists
                     || matches!(
                         row.stage,
@@ -1046,7 +1050,8 @@ impl DiagnosticManager {
         job_id: u64,
     ) -> std::result::Result<JobDetailSnapshot, DiagnosticBundleError> {
         for _ in 0..20 {
-            match load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id).await {
+            match load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id, true).await
+            {
                 Ok(snapshot)
                     if snapshot.history_item.is_some() || snapshot.queue_item.is_some() =>
                 {
@@ -1057,7 +1062,7 @@ impl DiagnosticManager {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id)
+        load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id, true)
             .await
             .map_err(|error| DiagnosticBundleError::State(format!("{error:?}")))
     }
@@ -1067,10 +1072,12 @@ impl DiagnosticManager {
         job_id: u64,
     ) -> std::result::Result<Option<JobHistoryRow>, DiagnosticBundleError> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.get_job_history(job_id))
-            .await
-            .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
-            .map_err(|error| DiagnosticBundleError::State(error.to_string()))
+        tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(job_id, "db.get_job_history.api_diagnostics_bundle")
+        })
+        .await
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))
     }
 
     async fn load_raw_nzb_text(
@@ -1219,10 +1226,6 @@ impl DiagnosticManager {
         {
             return Ok(None);
         }
-        if let Some(row) = self.load_run_by_job(diagnostic_job_id).await? {
-            self.track_run(&row).await;
-            return Ok(Some(TrackedDiagnosticRun::from_row(&row)));
-        }
         let live_job = self.handle.get_job(JobId(diagnostic_job_id)).ok();
         if let Some(job) = live_job
             && let Some(source_job_id) = diagnostic_source_job_id(&job.metadata)
@@ -1241,6 +1244,10 @@ impl DiagnosticManager {
                 .remove(diagnostic_job_id);
             return Ok(Some(run));
         }
+        // Event processing is hot enough that persistent diagnostic recovery must
+        // stay out of this path. Startup/housekeeping recovery tracks durable
+        // diagnostic rows; live diagnostic jobs can still be discovered from
+        // metadata above.
         self.non_diagnostic_jobs
             .write()
             .await
@@ -1261,6 +1268,10 @@ impl DiagnosticManager {
 
     async fn active_runs(&self) -> Vec<TrackedDiagnosticRun> {
         self.tracked.read().await.values().cloned().collect()
+    }
+
+    pub(crate) async fn has_active_runs(&self) -> bool {
+        !self.tracked.read().await.is_empty()
     }
 
     async fn current_upload_url(&self) -> Option<String> {

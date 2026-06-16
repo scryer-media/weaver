@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::StateError;
@@ -131,6 +131,10 @@ fn create_active_job_with_file_identities_roundtrips_initial_state() {
     ];
 
     db.create_active_job_with_file_identities(&sample_job(1), &identities)
+        .unwrap();
+    db.complete_file(JobId(1), 0, "archive.rar", &[0x10; 16])
+        .unwrap();
+    db.complete_file(JobId(1), 1, "archive.r00", &[0x11; 16])
         .unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
@@ -342,6 +346,8 @@ fn set_runtime_state_roundtrip() {
 fn detected_archive_identities_roundtrip() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
+    db.complete_file(JobId(1), 4, "split.003", &[0x44; 16])
+        .unwrap();
     db.save_detected_archive_identity(
         JobId(1),
         4,
@@ -349,6 +355,16 @@ fn detected_archive_identities_roundtrip() {
             kind: DetectedArchiveKind::SevenZipSplit,
             set_name: "51273aad56a8b904e96928935278a627".to_string(),
             volume_index: Some(2),
+        },
+    )
+    .unwrap();
+    db.save_detected_archive_identity(
+        JobId(1),
+        5,
+        &DetectedArchiveIdentity {
+            kind: DetectedArchiveKind::Rar,
+            set_name: "incomplete".to_string(),
+            volume_index: Some(0),
         },
     )
     .unwrap();
@@ -364,7 +380,17 @@ fn detected_archive_identities_roundtrip() {
     );
 
     let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].detected_archives, loaded);
+    assert_eq!(
+        jobs[&JobId(1)].detected_archives,
+        HashMap::from([(
+            4,
+            DetectedArchiveIdentity {
+                kind: DetectedArchiveKind::SevenZipSplit,
+                set_name: "51273aad56a8b904e96928935278a627".to_string(),
+                volume_index: Some(2),
+            }
+        )])
+    );
 }
 
 #[test]
@@ -550,6 +576,8 @@ fn par2_file_roundtrip() {
 fn active_file_identity_roundtrip() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
+    db.complete_file(JobId(1), 7, "show.part001.rar", &[0x77; 16])
+        .unwrap();
     db.save_file_identity(
         JobId(1),
         &ActiveFileIdentity {
@@ -635,6 +663,17 @@ fn extracted_member_roundtrip() {
         vec![],
     );
     assert_eq!(count, 1);
+
+    let jobs = db.load_active_jobs().unwrap();
+    assert!(jobs[&JobId(1)].extracted_members.contains("movie.mkv"));
+
+    std::fs::write(&output_path, b"movie-with-extra-bytes").unwrap();
+    let jobs = db.load_active_jobs().unwrap();
+    assert!(!jobs[&JobId(1)].extracted_members.contains("movie.mkv"));
+
+    std::fs::remove_file(&output_path).unwrap();
+    let jobs = db.load_active_jobs().unwrap();
+    assert!(!jobs[&JobId(1)].extracted_members.contains("movie.mkv"));
 }
 
 #[test]

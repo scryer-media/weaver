@@ -17,12 +17,12 @@ const SQLITE_BATCH_BIND_LIMIT: usize = 900;
 const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 async fn active_job_exists_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Result<bool, StateError> {
-    lock_active_job_for_write_tx(tx, job_id).await?;
+    let sql = match tx {
+        SqlTx::Postgres(_) => "SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE",
+        SqlTx::Sqlite(_) => "SELECT 1 FROM active_jobs WHERE job_id = {} LIMIT 1",
+    };
     Ok(tx
-        .fetch_optional(
-            "SELECT 1 FROM active_jobs WHERE job_id = {} LIMIT 1",
-            &[SqlArg::I64(job_id.0 as i64)],
-        )
+        .fetch_optional(sql, &[SqlArg::I64(job_id.0 as i64)])
         .await?
         .is_some())
 }
@@ -32,8 +32,8 @@ pub(super) async fn lock_active_job_for_write_tx(
     job_id: JobId,
 ) -> Result<(), StateError> {
     if matches!(tx, SqlTx::Postgres(_)) {
-        tx.execute(
-            "SELECT pg_advisory_xact_lock({})",
+        tx.fetch_optional(
+            "SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE",
             &[SqlArg::I64(job_id.0 as i64)],
         )
         .await?;
@@ -41,14 +41,16 @@ pub(super) async fn lock_active_job_for_write_tx(
     Ok(())
 }
 
-pub(super) async fn lock_active_jobs_for_write_tx(
+pub(super) async fn lock_active_job_for_delete_tx(
     tx: &mut SqlTx<'_>,
-    job_ids: &HashSet<JobId>,
+    job_id: JobId,
 ) -> Result<(), StateError> {
-    let mut job_ids = job_ids.iter().copied().collect::<Vec<_>>();
-    job_ids.sort_unstable();
-    for job_id in job_ids {
-        lock_active_job_for_write_tx(tx, job_id).await?;
+    if matches!(tx, SqlTx::Postgres(_)) {
+        tx.fetch_optional(
+            "SELECT 1 FROM active_jobs WHERE job_id = {} FOR UPDATE",
+            &[SqlArg::I64(job_id.0 as i64)],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -85,12 +87,20 @@ async fn active_job_ids_tx(
         .iter()
         .map(|job_id| job_id.0 as i64)
         .collect::<Vec<_>>();
-    lock_active_jobs_for_write_tx(tx, job_ids).await?;
     let chunk_size = max_rows_for_tx(tx, 1);
     let mut active = HashSet::new();
     for chunk in ids.chunks(chunk_size) {
         let placeholders = vec!["{}"; chunk.len()].join(", ");
-        let sql = format!("SELECT job_id FROM active_jobs WHERE job_id IN ({placeholders})");
+        let sql = match tx {
+            SqlTx::Postgres(_) => {
+                format!(
+                    "SELECT job_id FROM active_jobs WHERE job_id IN ({placeholders}) FOR KEY SHARE"
+                )
+            }
+            SqlTx::Sqlite(_) => {
+                format!("SELECT job_id FROM active_jobs WHERE job_id IN ({placeholders})")
+            }
+        };
         let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
         for row in tx.fetch_all(&sql, &args).await? {
             let id = row.i64("job_id")?;
@@ -448,7 +458,6 @@ async fn bulk_upsert_file_identities_tx(
 impl Database {
     pub fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let job_id = job.job_id;
         let args = vec![
             SqlArg::I64(job.job_id.0 as i64),
             SqlArg::Bytes(job.nzb_hash.to_vec()),
@@ -463,7 +472,6 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
                 let args = args.clone();
                 Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
                     tx.execute(
                         "INSERT INTO active_jobs
                          (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
@@ -504,7 +512,6 @@ impl Database {
                     let args = args.clone();
                     let identities = identities.clone();
                     Box::pin(async move {
-                        lock_active_job_for_write_tx(tx, job_id).await?;
                         tx.execute(
                             "INSERT INTO active_jobs
                              (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
@@ -528,7 +535,6 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
                 Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
                     match update.category {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -623,7 +629,6 @@ impl Database {
                     SqlRuntime::run_in_transaction(&datastore, "set_active_job_runtime", |tx| {
                         let args = args.clone();
                         Box::pin(async move {
-                            lock_active_job_for_write_tx(tx, job_id).await?;
                             tx.execute(
                                 "UPDATE active_jobs
                                  SET status = {},
@@ -646,15 +651,9 @@ impl Database {
                     .await
                 }
                 SqlEngine::Postgres => {
-                    let mut pg_args = Vec::with_capacity(args.len() + 1);
-                    pg_args.push(SqlArg::I64(job_id.0 as i64));
-                    pg_args.extend(args);
                     SqlRuntime::execute(
                         datastore.read_exec(),
-                        "WITH active_job_lock AS (
-                             SELECT pg_advisory_xact_lock({})
-                         )
-                         UPDATE active_jobs
+                        "UPDATE active_jobs
                          SET status = {},
                              download_state = {},
                              post_state = {},
@@ -665,9 +664,8 @@ impl Database {
                              paused_resume_status = {},
                              paused_resume_download_state = {},
                              paused_resume_post_state = {}
-                         FROM active_job_lock
                          WHERE job_id = {}",
-                        &pg_args,
+                        &args,
                     )
                     .await?;
                     Ok(())
@@ -768,33 +766,63 @@ impl Database {
         let filename = filename.to_string();
         let md5 = md5.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "complete_file", |tx| {
-                let filename = filename.clone();
-                let md5 = md5.clone();
-                Box::pin(async move {
-                    if active_job_exists_tx(tx, job_id).await? {
-                        tx.execute(
-                            "INSERT INTO active_files (job_id, file_index, filename, md5)
-                             VALUES ({}, {}, {}, {})
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "complete_file", |tx| {
+                        let filename = filename.clone();
+                        let md5 = md5.clone();
+                        Box::pin(async move {
+                            if active_job_exists_tx(tx, job_id).await? {
+                                tx.execute(
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5)
+                                     VALUES ({}, {}, {}, {})
+                                     ON CONFLICT(job_id, file_index) DO NOTHING",
+                                    &[
+                                        SqlArg::I64(job_id.0 as i64),
+                                        SqlArg::I64(file_index as i64),
+                                        SqlArg::Text(filename),
+                                        SqlArg::Bytes(md5),
+                                    ],
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "WITH active_file_complete_active AS (
+                             SELECT 1
+                             FROM active_jobs
+                             WHERE job_id = {}
+                             FOR KEY SHARE
+                         )
+                             INSERT INTO active_files (job_id, file_index, filename, md5)
+                             SELECT {}, {}, {}, {}
+                             FROM active_file_complete_active
                              ON CONFLICT(job_id, file_index) DO NOTHING",
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::I64(file_index as i64),
-                                SqlArg::Text(filename),
-                                SqlArg::Bytes(md5),
-                            ],
-                        )
-                        .await?;
-                    }
-                    tx.execute(
-                        "DELETE FROM active_file_progress WHERE job_id = {} AND file_index = {}",
-                        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
+                        &[
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(file_index as i64),
+                            SqlArg::Text(filename),
+                            SqlArg::Bytes(md5),
+                        ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "complete_file",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -836,9 +864,25 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_file_identity", |tx| {
                 let identity = identity.clone();
                 Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
-                        "INSERT INTO active_file_identities
+                    let sql = match tx {
+                        SqlTx::Postgres(_) => {
+                            "INSERT INTO active_file_identities
+                         (job_id, file_index, source_filename, current_filename, canonical_filename,
+                          classification_kind, classification_set_name, classification_volume_index,
+                          classification_source)
+                         SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_file_identity_parent
+                         ON CONFLICT(job_id, file_index) DO UPDATE SET
+                            source_filename = excluded.source_filename,
+                            current_filename = excluded.current_filename,
+                            canonical_filename = excluded.canonical_filename,
+                            classification_kind = excluded.classification_kind,
+                            classification_set_name = excluded.classification_set_name,
+                            classification_volume_index = excluded.classification_volume_index,
+                            classification_source = excluded.classification_source"
+                        }
+                        SqlTx::Sqlite(_) => {
+                            "INSERT INTO active_file_identities
                          (job_id, file_index, source_filename, current_filename, canonical_filename,
                           classification_kind, classification_set_name, classification_volume_index,
                           classification_source)
@@ -851,7 +895,11 @@ impl Database {
                             classification_kind = excluded.classification_kind,
                             classification_set_name = excluded.classification_set_name,
                             classification_volume_index = excluded.classification_volume_index,
-                            classification_source = excluded.classification_source",
+                            classification_source = excluded.classification_source"
+                        }
+                    };
+                    tx.execute(
+                        sql,
                         &[
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(identity.file_index as i64),
@@ -1189,29 +1237,63 @@ impl Database {
         })?;
         let output_path = output_path.to_string_lossy().to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "add_extracted_member", |tx| {
-                let member_name = member_name.clone();
-                let output_path = output_path.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
-                        "INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "add_extracted_member", |tx| {
+                        let member_name = member_name.clone();
+                        let output_path = output_path.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
+                                 SELECT {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, member_name) DO NOTHING",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::Text(member_name),
+                                    SqlArg::Text(output_path),
+                                    SqlArg::I64(output_size),
+                                    SqlArg::I64(job_id.0 as i64),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "WITH active_extracted_member_active AS (
+                             SELECT 1
+                             FROM active_jobs
+                             WHERE job_id = {}
+                             FOR KEY SHARE
+                         )
+                         INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
                          SELECT {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         FROM active_extracted_member_active
                          ON CONFLICT(job_id, member_name) DO NOTHING",
                         &[
+                            SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::Text(member_name),
                             SqlArg::Text(output_path),
                             SqlArg::I64(output_size),
-                            SqlArg::I64(job_id.0 as i64),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "add_extracted_member",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1425,20 +1507,39 @@ impl Database {
                 let set_name = set_name.clone();
                 let headers = headers.clone();
                 Box::pin(async move {
-                    if !active_job_exists_tx(tx, job_id).await? {
-                        return Ok(());
-                    }
-                    tx.execute(
-                        "INSERT INTO active_archive_headers (job_id, set_name, headers)
-                         VALUES ({}, {}, {})
-                         ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(set_name),
-                            SqlArg::Bytes(headers),
-                        ],
-                    )
-                    .await?;
+                    let sql = match tx {
+                        SqlTx::Postgres(_) => {
+                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
+                         SELECT {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_archive_headers_parent
+                         ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
+                         WHERE active_archive_headers.headers <> excluded.headers"
+                        }
+                        SqlTx::Sqlite(_) => {
+                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
+                         SELECT {}, {}, {}
+                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
+                         WHERE active_archive_headers.headers <> excluded.headers"
+                        }
+                    };
+                    let affected = tx
+                        .execute(
+                            sql,
+                            &[
+                                SqlArg::I64(job_id.0 as i64),
+                                SqlArg::Text(set_name),
+                                SqlArg::Bytes(headers),
+                                SqlArg::I64(job_id.0 as i64),
+                            ],
+                        )
+                        .await?;
+                    let label = if affected == 0 {
+                        "persistence.archive_headers.upsert.unchanged"
+                    } else {
+                        "persistence.archive_headers.upsert.changed"
+                    };
+                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
                     Ok(())
                 })
             })
@@ -1481,22 +1582,42 @@ impl Database {
                 let set_name = set_name.clone();
                 let facts_blob = facts_blob.clone();
                 Box::pin(async move {
-                    if !active_job_exists_tx(tx, job_id).await? {
-                        return Ok(());
-                    }
-                    tx.execute(
-                        "INSERT INTO active_rar_volume_facts
+                    let sql = match tx {
+                        SqlTx::Postgres(_) => {
+                            "INSERT INTO active_rar_volume_facts
                          (job_id, set_name, volume_index, facts_blob)
-                         VALUES ({}, {}, {}, {})
-                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(set_name),
-                            SqlArg::I64(volume_index as i64),
-                            SqlArg::Bytes(facts_blob),
-                        ],
-                    )
-                    .await?;
+                         SELECT {}, {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_rar_volume_facts_parent
+                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
+                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
+                        }
+                        SqlTx::Sqlite(_) => {
+                            "INSERT INTO active_rar_volume_facts
+                         (job_id, set_name, volume_index, facts_blob)
+                         SELECT {}, {}, {}, {}
+                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
+                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
+                        }
+                    };
+                    let affected = tx
+                        .execute(
+                            sql,
+                            &[
+                                SqlArg::I64(job_id.0 as i64),
+                                SqlArg::Text(set_name),
+                                SqlArg::I64(volume_index as i64),
+                                SqlArg::Bytes(facts_blob),
+                                SqlArg::I64(job_id.0 as i64),
+                            ],
+                        )
+                        .await?;
+                    let label = if affected == 0 {
+                        "persistence.rar_volume_facts.upsert.unchanged"
+                    } else {
+                        "persistence.rar_volume_facts.upsert.changed"
+                    };
+                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
                     Ok(())
                 })
             })
@@ -1516,23 +1637,37 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_detected_archive_identity", |tx| {
                 let detected = detected.clone();
                 Box::pin(async move {
-                    if !active_job_exists_tx(tx, job_id).await? {
-                        return Ok(());
-                    }
-                    tx.execute(
-                        "INSERT INTO active_detected_archives
+                    let sql = match tx {
+                        SqlTx::Postgres(_) => {
+                            "INSERT INTO active_detected_archives
                          (job_id, file_index, kind, set_name, volume_index)
-                         VALUES ({}, {}, {}, {}, {})
+                         SELECT {}, {}, {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_detected_archive_parent
                          ON CONFLICT(job_id, file_index) DO UPDATE SET
                             kind = excluded.kind,
                             set_name = excluded.set_name,
-                            volume_index = excluded.volume_index",
+                            volume_index = excluded.volume_index"
+                        }
+                        SqlTx::Sqlite(_) => {
+                            "INSERT INTO active_detected_archives
+                         (job_id, file_index, kind, set_name, volume_index)
+                         SELECT {}, {}, {}, {}, {}
+                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         ON CONFLICT(job_id, file_index) DO UPDATE SET
+                            kind = excluded.kind,
+                            set_name = excluded.set_name,
+                            volume_index = excluded.volume_index"
+                        }
+                    };
+                    tx.execute(
+                        sql,
                         &[
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(file_index as i64),
                             SqlArg::Text(detected.kind.as_str().to_string()),
                             SqlArg::Text(detected.set_name),
                             SqlArg::OptI64(detected.volume_index.map(|value| value as i64)),
+                            SqlArg::I64(job_id.0 as i64),
                         ],
                     )
                     .await?;

@@ -108,7 +108,6 @@ CREATE TABLE IF NOT EXISTS active_extracted (
     job_id      INTEGER NOT NULL,
     member_name TEXT NOT NULL,
     output_path TEXT NOT NULL,
-    output_size INTEGER NOT NULL DEFAULT -1,
     PRIMARY KEY (job_id, member_name)
 ) WITHOUT ROWID;
 

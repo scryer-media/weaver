@@ -203,14 +203,17 @@ impl Pipeline {
         job_id: JobId,
     ) -> Result<Option<crate::JobHistoryRow>, crate::SchedulerError> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
-            .await
-            .map_err(|error| {
-                crate::SchedulerError::Internal(format!(
-                    "failed to join history lookup task: {error}"
-                ))
-            })?
-            .map_err(crate::SchedulerError::State)
+        tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(
+                job_id.0,
+                "db.get_job_history.jobs_service_load_history_row",
+            )
+        })
+        .await
+        .map_err(|error| {
+            crate::SchedulerError::Internal(format!("failed to join history lookup task: {error}"))
+        })?
+        .map_err(crate::SchedulerError::State)
     }
 
     fn persisted_nzb_path_for_job(
@@ -1309,17 +1312,7 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            state
-                .assembly
-                .files()
-                .filter(|file| {
-                    !matches!(
-                        self.classified_role_for_file(job_id, file),
-                        weaver_model::files::FileRole::RarVolume { .. }
-                    )
-                })
-                .map(|file| file.file_id())
-                .collect()
+            state.assembly.files().map(|file| file.file_id()).collect()
         };
 
         for file_id in files {

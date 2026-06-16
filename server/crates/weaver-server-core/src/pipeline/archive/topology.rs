@@ -7,7 +7,7 @@ use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::{
     ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
@@ -1062,10 +1062,18 @@ impl Pipeline {
     }
 
     fn set_rar_snapshot(&mut self, job_id: JobId, set_name: &str, headers: Vec<u8>) {
-        self.rar_sets
+        let state = self
+            .rar_sets
             .entry((job_id, set_name.to_string()))
-            .or_default()
-            .cached_headers = Some(headers.clone());
+            .or_default();
+        if state.cached_headers.as_deref() == Some(headers.as_slice()) {
+            crate::runtime::perf_probe::record(
+                "pipeline.rar_snapshot.persist.skipped_unchanged",
+                std::time::Duration::ZERO,
+            );
+            return;
+        }
+        state.cached_headers = Some(headers.clone());
         if let Err(e) = self.db.save_archive_headers(job_id, set_name, &headers) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to persist RAR headers");
         }
@@ -1211,11 +1219,25 @@ impl Pipeline {
             }
         }
 
-        let set_names: Vec<String> = self
+        let mut set_names: BTreeSet<String> = self
             .rar_sets
             .keys()
             .filter_map(|(jid, set_name)| (*jid == job_id).then_some(set_name.clone()))
             .collect();
+        if let Some(state) = self.jobs.get(&job_id) {
+            for file_asm in state.assembly.files() {
+                if matches!(
+                    self.classified_role_for_file(job_id, file_asm),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                ) && file_asm.is_complete()
+                    && let Some(set_name) =
+                        self.classified_archive_set_name_for_file(job_id, file_asm)
+                {
+                    set_names.insert(set_name);
+                }
+            }
+        }
+        let set_names: Vec<String> = set_names.into_iter().collect();
 
         for set_name in &set_names {
             let volume_files = {
@@ -1266,18 +1288,36 @@ impl Pipeline {
                     }
                 }
             }
-            if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                let before = state.facts.len();
-                state.facts.retain(|volume, _| live_volumes.contains(volume));
-                let discarded = before.saturating_sub(state.facts.len());
-                if discarded > 0 {
-                    debug!(
+            let remove_empty_set =
+                if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                    let before = state.facts.len();
+                    state
+                        .facts
+                        .retain(|volume, _| live_volumes.contains(volume));
+                    let discarded = before.saturating_sub(state.facts.len());
+                    if discarded > 0 {
+                        debug!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            discarded,
+                            "discarded stale RAR discovery facts without matching completed files"
+                        );
+                    }
+                    state.facts.is_empty() && state.volume_files.is_empty()
+                } else {
+                    false
+                };
+            if remove_empty_set {
+                self.rar_sets.remove(&(job_id, set_name.clone()));
+                if let Err(error) = self.db.delete_rar_volume_facts_for_set(job_id, set_name) {
+                    warn!(
                         job_id = job_id.0,
                         set_name = %set_name,
-                        discarded,
-                        "discarded stale RAR discovery facts without matching completed files"
+                        error = %error,
+                        "failed to delete invalidated RAR discovery facts"
                     );
                 }
+                continue;
             }
             let _ = self.recompute_rar_set_state(job_id, set_name).await;
         }

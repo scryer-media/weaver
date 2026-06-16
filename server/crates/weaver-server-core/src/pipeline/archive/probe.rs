@@ -207,6 +207,10 @@ impl Pipeline {
             .and_then(|identity| identity.classification.as_ref())
             .map(|detected| detected.set_name.clone())
             .or_else(|| {
+                self.detected_archive_identity(job_id, file.file_id())
+                    .map(|detected| detected.set_name.clone())
+            })
+            .or_else(|| {
                 weaver_model::files::archive_base_name(
                     &current_filename,
                     &self.classified_role_for_file(job_id, file),
