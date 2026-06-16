@@ -11,17 +11,17 @@ name = "weaver"
 path = "src/main.rs"
 
 [dependencies]
-weaver-server-core = { path = "../../crates/weaver-server-core" }
-weaver-nntp = { path = "../../../engines/weaver-nntp" }
-weaver-nzb = { path = "../../../engines/weaver-nzb" }
-weaver-yenc = { path = "../../../engines/weaver-yenc" }
+weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false }
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
 weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
     "native-crypto",
 ] }
 weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
     "native-crypto",
 ] }
-weaver-server-api = { path = "../../crates/weaver-server-api" }
+weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -29,18 +29,18 @@ clap = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rmp-serde = { workspace = true }
+rmp-serde = { workspace = true, default-features = false }
 bytes = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
-tower-http = { workspace = true }
+tower-http = { workspace = true, default-features = false }
 async-graphql = { workspace = true }
-async-graphql-axum = { workspace = true }
+async-graphql-axum = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 libc = { workspace = true }
-rayon = { workspace = true }
-rust-embed = { workspace = true }
+rayon = { workspace = true, default-features = false }
+rust-embed = { workspace = true, default-features = false }
 mime_guess = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 zstd = { workspace = true }
@@ -53,4 +53,4 @@ bzip2 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-tower = { workspace = true }
+tower = { workspace = true, default-features = false }

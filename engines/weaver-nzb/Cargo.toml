@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-weaver-model = { path = "../../shared/crates/weaver-model" }
+weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 serde = { workspace = true }
 thiserror = { workspace = true }
-quick-xml = { workspace = true }
+quick-xml = { workspace = true, default-features = false }
 tracing = { workspace = true }

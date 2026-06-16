@@ -12,16 +12,16 @@ native-crypto = ["dep:aws-lc-sys"]
 slow-tests = []
 
 [dependencies]
-weaver-reed-solomon = { path = "../weaver-reed-solomon" }
-weaver-model = { path = "../../shared/crates/weaver-model" }
+weaver-reed-solomon = { path = "../weaver-reed-solomon", default-features = false }
+weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 md-5 = { workspace = true }
 aws-lc-sys = { workspace = true, optional = true }
-rayon = { workspace = true }
-memmap2 = { workspace = true }
+rayon = { workspace = true, default-features = false }
+memmap2 = { workspace = true, default-features = false }
 libc = { workspace = true }
 
 [dev-dependencies]
