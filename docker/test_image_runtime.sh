@@ -48,7 +48,8 @@ assert_contains "$output" "Usenet binary downloader" "noexec tmpfs should still 
 current_uid=$(id -u)
 current_gid=$(id -g)
 tmpdir=$(mktemp -d)
-trap 'sudo rm -rf "$tmpdir"' EXIT INT TERM
+payload_dir=$(mktemp -d)
+trap 'sudo rm -rf "$tmpdir" "$payload_dir"' EXIT INT TERM
 
 sudo chown 65534:65534 "$tmpdir"
 docker run --rm --platform "$PLATFORM" \
@@ -62,6 +63,28 @@ owner=$(owner_of "$tmpdir")
 [ "$owner" = "$current_uid:$current_gid" ] || {
     printf 'assertion failed: root entrypoint path should chown /config\nexpected: %s\nactual: %s\n' \
         "$current_uid:$current_gid" "$owner" >&2
+    exit 1
+}
+
+cat >"$payload_dir/weaver-portable" <<'EOF'
+#!/bin/sh
+id -G
+EOF
+chmod +x "$payload_dir/weaver-portable"
+
+groups_output=$(
+    docker run --rm --platform "$PLATFORM" \
+        -e PUID=12345 \
+        -e PGID=12345 \
+        -e WEAVER_PAYLOAD_ROOT=/payload \
+        -e WEAVER_CPUINFO_PATH=/missing-cpuinfo \
+        -v "$payload_dir:/payload:ro" \
+        "$IMAGE_TAG"
+)
+groups=$(printf '%s\n' "$groups_output" | tail -n 1 | tr -d '\r')
+[ "$groups" = "12345" ] || {
+    printf 'assertion failed: root entrypoint path should clear supplementary groups\nexpected groups: 12345\nactual groups: %s\nfull output:\n%s\n' \
+        "$groups" "$groups_output" >&2
     exit 1
 }
 

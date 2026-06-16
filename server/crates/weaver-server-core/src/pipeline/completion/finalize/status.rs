@@ -455,6 +455,17 @@ impl Pipeline {
         }
         self.extracted_archives.remove(&job_id);
         self.clear_persisted_extracted_members(job_id);
+        let set_names = self.rar_set_names_for_job(job_id);
+        for member in &missing_members {
+            if let Err(error) = self.db.clear_member_chunks_for_all_sets(job_id, member) {
+                warn!(
+                    job_id = job_id.0,
+                    member = %member,
+                    error = %error,
+                    "failed to clear stale extracted member chunks after reconciliation"
+                );
+            }
+        }
 
         if let Some(remaining_members) = self.extracted_members.get(&job_id) {
             for member in remaining_members {
@@ -471,7 +482,7 @@ impl Pipeline {
             }
         }
 
-        for set_name in self.rar_set_names_for_job(job_id) {
+        for set_name in set_names {
             if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
                 warn!(
                     job_id = job_id.0,

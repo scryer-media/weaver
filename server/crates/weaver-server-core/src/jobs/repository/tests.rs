@@ -234,6 +234,29 @@ fn bulk_file_progress_cross_sqlite_bind_chunk_boundary_and_keeps_max() {
 }
 
 #[test]
+fn bulk_file_progress_same_batch_duplicates_keep_max() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+
+    db.upsert_file_progress_batch(&[
+        ActiveFileProgress {
+            job_id: JobId(1),
+            file_index: 0,
+            contiguous_bytes_written: 2048,
+        },
+        ActiveFileProgress {
+            job_id: JobId(1),
+            file_index: 0,
+            contiguous_bytes_written: 1024,
+        },
+    ])
+    .unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(jobs[&JobId(1)].file_progress.get(&0).copied(), Some(2048));
+}
+
+#[test]
 #[ignore = "performance guard; run explicitly when comparing DB write throughput"]
 fn perf_commit_10k_segments() {
     let db = Database::open_in_memory().unwrap();

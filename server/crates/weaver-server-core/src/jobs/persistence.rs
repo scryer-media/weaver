@@ -713,7 +713,14 @@ impl Database {
         let datastore = self.datastore();
         let mut deduped = HashMap::<(JobId, u32), ActiveFileProgress>::new();
         for entry in progress {
-            deduped.insert((entry.job_id, entry.file_index), entry.clone());
+            deduped
+                .entry((entry.job_id, entry.file_index))
+                .and_modify(|existing| {
+                    if entry.contiguous_bytes_written > existing.contiguous_bytes_written {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert_with(|| entry.clone());
         }
         let progress = deduped.into_values().collect::<Vec<_>>();
         self.run_sql_blocking(async move {
@@ -1484,6 +1491,31 @@ impl Database {
                             SqlArg::Text(set_name),
                             SqlArg::Text(member_name),
                         ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    pub fn clear_member_chunks_for_all_sets(
+        &self,
+        job_id: JobId,
+        member_name: &str,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let member_name = member_name.to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "clear_member_chunks_for_all_sets", |tx| {
+                let member_name = member_name.clone();
+                Box::pin(async move {
+                    lock_active_job_for_write_tx(tx, job_id).await?;
+                    tx.execute(
+                        "DELETE FROM active_extraction_chunks
+                         WHERE job_id = {} AND member_name = {}",
+                        &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(member_name)],
                     )
                     .await?;
                     Ok(())

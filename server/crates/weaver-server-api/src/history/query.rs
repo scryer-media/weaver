@@ -417,10 +417,10 @@ fn load_history_diagnostic_states(
         .collect())
 }
 
-async fn history_diagnostics_active(ctx: &Context<'_>) -> bool {
+async fn history_diagnostics_active(_ctx: &Context<'_>) -> bool {
     #[cfg(weaver_diagnostics)]
     {
-        if let Some(manager) = ctx.data_opt::<crate::history::diagnostics::DiagnosticManager>() {
+        if let Some(manager) = _ctx.data_opt::<crate::history::diagnostics::DiagnosticManager>() {
             return manager.has_active_runs().await;
         }
     }

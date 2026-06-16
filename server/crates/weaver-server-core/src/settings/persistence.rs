@@ -66,16 +66,7 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "reserve_next_job_id", |tx| {
                 Box::pin(async move {
-                    let next_job_id = next_job_id_floor_tx(tx).await?;
-                    tx.execute(
-                        "INSERT INTO settings (key, value) VALUES ({}, {})
-                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        &[
-                            SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string()),
-                            SqlArg::Text((next_job_id + 1).to_string()),
-                        ],
-                    )
-                    .await?;
+                    let next_job_id = reserve_next_job_id_tx(tx).await?;
                     Ok(JobId(next_job_id))
                 })
             })
@@ -114,17 +105,7 @@ async fn next_job_id_floor_target(datastore: &StoreDatastore) -> Result<u64, Sta
     Ok(persisted.max(max_seen as u64 + 1).max(10_000))
 }
 
-async fn next_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
-    let persisted = tx
-        .fetch_optional(
-            "SELECT value FROM settings WHERE key = {}",
-            &[SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string())],
-        )
-        .await?
-        .and_then(|row| row.text("value").ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(10_000);
-
+async fn max_seen_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
     let row = tx
         .fetch_optional(
             "SELECT MAX(id) AS id FROM (
@@ -141,5 +122,43 @@ async fn next_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
         .flatten()
         .unwrap_or(0);
 
-    Ok(persisted.max(max_seen as u64 + 1).max(10_000))
+    Ok((max_seen as u64 + 1).max(10_000))
+}
+
+async fn reserve_next_job_id_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
+    let floor = max_seen_job_id_floor_tx(tx).await?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES ({}, {})
+         ON CONFLICT(key) DO NOTHING",
+        &[
+            SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string()),
+            SqlArg::Text(floor.to_string()),
+        ],
+    )
+    .await?;
+
+    let select_sql = match tx {
+        SqlTx::Postgres(_) => "SELECT value FROM settings WHERE key = {} FOR UPDATE",
+        SqlTx::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
+    };
+    let persisted = tx
+        .fetch_optional(
+            select_sql,
+            &[SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string())],
+        )
+        .await?
+        .and_then(|row| row.text("value").ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(floor);
+    let next_job_id = persisted.max(floor).max(10_000);
+    tx.execute(
+        "UPDATE settings SET value = {} WHERE key = {}",
+        &[
+            SqlArg::Text((next_job_id + 1).to_string()),
+            SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string()),
+        ],
+    )
+    .await?;
+
+    Ok(next_job_id)
 }

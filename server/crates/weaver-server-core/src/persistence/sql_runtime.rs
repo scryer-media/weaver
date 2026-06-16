@@ -642,8 +642,8 @@ fn bind_postgres<'q>(mut query: PostgresQuery<'q>, values: &'q [SqlArg]) -> Post
             SqlArg::OptBool(value) => query.bind(*value),
             SqlArg::Timestamp(value) => query.bind(*value),
             SqlArg::OptTimestamp(value) => query.bind(*value),
-            SqlArg::Json(value) => query.bind(Json(value.clone())),
-            SqlArg::OptJson(value) => query.bind(value.clone().map(Json)),
+            SqlArg::Json(value) => query.bind(value.to_string()),
+            SqlArg::OptJson(value) => query.bind(value.as_ref().map(JsonValue::to_string)),
             SqlArg::Bytes(value) => query.bind(value),
             SqlArg::OptBytes(value) => query.bind(value),
         };

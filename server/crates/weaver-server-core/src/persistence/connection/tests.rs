@@ -4,8 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+use crate::categories::CategoryConfig;
 use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
+use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
+use crate::servers::ServerConfig;
+use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
@@ -595,10 +600,14 @@ fn normalize_default(
 
     let value = value.trim();
     if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        Some(format!(
-            "text:{}",
-            value[1..value.len() - 1].replace("''", "'")
-        ))
+        let unquoted = value[1..value.len() - 1].replace("''", "'");
+        if data_type == "integer" && unquoted.parse::<i64>().is_ok() {
+            Some(unquoted)
+        } else if data_type == "float" && unquoted.parse::<f64>().is_ok() {
+            Some(unquoted.to_ascii_lowercase())
+        } else {
+            Some(format!("text:{unquoted}"))
+        }
     } else {
         Some(value.to_ascii_lowercase())
     }
@@ -778,9 +787,63 @@ fn strip_unquoted_pg_cast(value: &str) -> String {
 }
 
 #[test]
+fn normalizes_quoted_numeric_defaults_as_numeric() {
+    assert_eq!(
+        normalize_default(
+            "active_extracted",
+            "output_size",
+            "integer",
+            Some("-1".into())
+        ),
+        Some("-1".to_string())
+    );
+    assert_eq!(
+        normalize_default(
+            "active_extracted",
+            "output_size",
+            "integer",
+            Some("'-1'::bigint".into())
+        ),
+        Some("-1".to_string())
+    );
+}
+
+fn assert_json_arg_binds_as_text(db: &Database) {
+    execute(
+        db,
+        "CREATE TABLE json_text_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+        vec![],
+    );
+    let value = serde_json::json!({
+        "kind": "probe",
+        "nested": [true, null, 7],
+    });
+    let expected = value.to_string();
+    execute(
+        db,
+        "INSERT INTO json_text_probe (id, value) VALUES ({}, {})",
+        vec![SqlArg::I32(1), SqlArg::Json(value)],
+    );
+    assert_eq!(
+        fetch_text(
+            db,
+            "SELECT value FROM json_text_probe WHERE id = {}",
+            vec![SqlArg::I32(1)],
+        ),
+        expected
+    );
+}
+
+#[test]
 fn open_in_memory_creates_schema() {
     let db = Database::open_in_memory().unwrap();
     assert!(db.is_empty().unwrap());
+}
+
+#[test]
+fn sqlite_json_arg_binds_as_text() {
+    let db = Database::open_in_memory().unwrap();
+    assert_json_arg_binds_as_text(&db);
 }
 
 #[test]
@@ -1307,6 +1370,7 @@ async fn postgres_runtime_smoke_when_configured() {
     };
 
     let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    assert_json_arg_binds_as_text(&db);
 
     let latest_version = fetch_i64(
         &db,
@@ -1338,6 +1402,144 @@ async fn postgres_runtime_smoke_when_configured() {
         db.get_setting("postgres_smoke").unwrap(),
         Some("ok".to_string())
     );
+
+    let config = Config {
+        data_dir: "/tmp/weaver-pg".to_string(),
+        intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
+        complete_dir: Some("/tmp/weaver-pg/complete".to_string()),
+        buffer_pool: Some(BufferPoolOverrides {
+            small_count: Some(4),
+            medium_count: Some(3),
+            large_count: Some(2),
+        }),
+        tuner: Some(TunerOverrides {
+            max_concurrent_downloads: Some(8),
+            max_decode_queue: Some(16),
+            decode_thread_count: Some(2),
+            extract_thread_count: Some(1),
+        }),
+        servers: vec![ServerConfig {
+            id: 7,
+            host: "news.example.com".to_string(),
+            port: 563,
+            tls: true,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            connections: 12,
+            active: true,
+            supports_pipelining: true,
+            priority: 2,
+            tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
+        }],
+        categories: vec![CategoryConfig {
+            id: 3,
+            name: "TV".to_string(),
+            dest_dir: Some("/media/tv".to_string()),
+            aliases: "television,tv-*".to_string(),
+        }],
+        retry: Some(RetryOverrides {
+            max_retries: Some(9),
+            base_delay_secs: Some(4.0),
+            multiplier: Some(1.5),
+        }),
+        max_download_speed: Some(12_345),
+        cleanup_after_extract: Some(false),
+        isp_bandwidth_cap: Some(IspBandwidthCapConfig {
+            enabled: true,
+            period: IspBandwidthCapPeriod::Weekly,
+            limit_bytes: 9_999_999,
+            reset_time_minutes_local: 6 * 60,
+            weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
+            monthly_reset_day: 7,
+        }),
+        diagnostic_upload_url: Some("https://diagnostics.example.test".to_string()),
+        config_path: None,
+    };
+    db.save_config(&config).unwrap();
+    let loaded_config = db.load_config().unwrap();
+    assert_eq!(loaded_config.data_dir, config.data_dir);
+    assert_eq!(loaded_config.intermediate_dir, config.intermediate_dir);
+    assert_eq!(loaded_config.complete_dir, config.complete_dir);
+    assert_eq!(loaded_config.max_download_speed, config.max_download_speed);
+    assert_eq!(loaded_config.cleanup_after_extract, Some(false));
+    assert_eq!(
+        loaded_config.diagnostic_upload_url.as_deref(),
+        Some("https://diagnostics.example.test")
+    );
+    assert_eq!(
+        loaded_config
+            .isp_bandwidth_cap
+            .as_ref()
+            .map(|cap| cap.period),
+        Some(IspBandwidthCapPeriod::Weekly)
+    );
+    assert_eq!(loaded_config.servers.len(), 1);
+    assert_eq!(loaded_config.servers[0].host, "news.example.com");
+    assert_eq!(loaded_config.servers[0].password.as_deref(), Some("pass"));
+    assert_eq!(
+        loaded_config.servers[0].tls_ca_cert.as_deref(),
+        Some(PathBuf::from("/tmp/ca.pem").as_path())
+    );
+    assert_eq!(loaded_config.categories.len(), 1);
+    assert_eq!(loaded_config.categories[0].name, "TV");
+    assert_eq!(db.next_server_id().unwrap(), 8);
+    assert_eq!(db.next_category_id().unwrap(), 4);
+
+    let rss_feed = RssFeedRow {
+        id: 1,
+        name: "Feed 1".to_string(),
+        url: "https://example.com/feed.xml".to_string(),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: Some("rss-user".to_string()),
+        password: Some("rss-pass".to_string()),
+        default_category: Some("TV".to_string()),
+        default_metadata: vec![("source".to_string(), "rss".to_string())],
+        etag: Some("etag".to_string()),
+        last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+        last_polled_at: Some(100),
+        last_success_at: Some(90),
+        last_error: None,
+        consecutive_failures: 0,
+    };
+    db.insert_rss_feed(&rss_feed).unwrap();
+    assert_eq!(db.get_rss_feed(1).unwrap(), Some(rss_feed.clone()));
+
+    let rss_rule = RssRuleRow {
+        id: 10,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some("Example".to_string()),
+        item_categories: vec!["tv".to_string()],
+        min_size_bytes: Some(100),
+        max_size_bytes: Some(1000),
+        category_override: Some("TV".to_string()),
+        metadata: vec![("quality".to_string(), "hd".to_string())],
+    };
+    db.insert_rss_rule(&rss_rule).unwrap();
+    assert_eq!(db.list_rss_rules(1).unwrap(), vec![rss_rule]);
+
+    let rss_seen_item = RssSeenItemRow {
+        feed_id: 1,
+        item_id: "guid-1".to_string(),
+        item_title: "Example".to_string(),
+        published_at: Some(123),
+        size_bytes: Some(456),
+        decision: "accepted".to_string(),
+        seen_at: 1000,
+        job_id: Some(42),
+        item_url: Some("https://example.com/item.nzb".to_string()),
+        error: None,
+    };
+    db.insert_rss_seen_item(&rss_seen_item).unwrap();
+    assert!(db.rss_seen_item_exists(1, "guid-1").unwrap());
+    assert_eq!(
+        db.list_rss_seen_items(Some(1), Some(10)).unwrap(),
+        vec![rss_seen_item]
+    );
+
     db.add_bandwidth_usage_minute(100, 10).unwrap();
     db.add_bandwidth_usage_minute(100, 5).unwrap();
     db.add_bandwidth_usage_minute(101, 20).unwrap();
@@ -1410,6 +1612,42 @@ async fn postgres_runtime_smoke_when_configured() {
         backup_error
             .to_string()
             .contains("requires sqlite datastore")
+    );
+
+    drop(db);
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_reserve_next_job_id").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let handles = (0..16)
+        .map(|_| {
+            let db = db.clone();
+            std::thread::spawn(move || db.reserve_next_job_id().unwrap().0)
+        })
+        .collect::<Vec<_>>();
+
+    let mut ids = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+
+    assert_eq!(ids, (10_000..10_016).collect::<Vec<_>>());
+    assert_eq!(
+        db.get_setting("next_job_id").unwrap(),
+        Some("10016".to_string())
     );
 
     drop(db);
