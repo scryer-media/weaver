@@ -11,7 +11,7 @@ use sqlx::postgres::{PgArguments, PgPool, PgRow};
 use sqlx::query::Query;
 use sqlx::sqlite::{SqliteArguments, SqlitePool, SqliteRow};
 use sqlx::types::Json;
-use sqlx::{Postgres, Row, Sqlite, Transaction};
+use sqlx::{AssertSqlSafe, Postgres, Row, Sqlite, Transaction};
 use tokio::sync::Mutex;
 
 use crate::persistence::StateError;
@@ -176,7 +176,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(pool).await.map_err(db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "sqlite",
@@ -190,7 +190,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(pool).await.map_err(db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "postgres",
@@ -214,7 +214,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_optional(pool)
                     .await
@@ -231,7 +231,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_optional(pool)
                     .await
@@ -258,7 +258,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_all(pool)
                     .await
@@ -275,7 +275,7 @@ impl SqlRuntime {
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_all(pool)
                     .await
@@ -343,7 +343,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Sqlite(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(&mut **tx).await.map_err(db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "sqlite",
@@ -357,7 +357,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Postgres(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query.execute(&mut **tx).await.map_err(db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "postgres",
@@ -380,7 +380,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Sqlite(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_optional(&mut **tx)
                     .await
@@ -397,7 +397,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Postgres(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_optional(&mut **tx)
                     .await
@@ -423,7 +423,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Sqlite(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
-                let query = bind_sqlite(sqlx::query(&sql), args);
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_all(&mut **tx)
                     .await
@@ -440,7 +440,7 @@ impl<'db> SqlTx<'db> {
             SqlTx::Postgres(tx) => {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(&sql), args);
+                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
                 let result = query
                     .fetch_all(&mut **tx)
                     .await
@@ -598,7 +598,7 @@ impl SqlRow {
     }
 }
 
-type SqliteQuery<'q> = Query<'q, Sqlite, SqliteArguments<'q>>;
+type SqliteQuery<'q> = Query<'q, Sqlite, SqliteArguments>;
 type PostgresQuery<'q> = Query<'q, Postgres, PgArguments>;
 
 fn bind_sqlite<'q>(mut query: SqliteQuery<'q>, values: &'q [SqlArg]) -> SqliteQuery<'q> {

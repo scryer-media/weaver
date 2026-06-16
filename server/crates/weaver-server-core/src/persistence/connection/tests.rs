@@ -1110,10 +1110,7 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1188,10 +1185,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
     );
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1269,10 +1263,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
     }
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1294,10 +1285,7 @@ async fn schema_parity_when_postgres_configured() {
     );
 
     drop(postgres_db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1313,10 +1301,7 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
         eprintln!(
             "skipping postgres executor concurrency test; WEAVER_POSTGRES_DB_CONCURRENCY is below 4"
         );
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&admin_pool)
-            .await
-            .unwrap();
+        execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
         admin_pool.close().await;
         return;
     }
@@ -1349,10 +1334,7 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
     let elapsed = started.elapsed();
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 
     assert!(
@@ -1615,10 +1597,7 @@ async fn postgres_runtime_smoke_when_configured() {
     );
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1651,10 +1630,7 @@ async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configure
     );
 
     drop(db);
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
 }
 
@@ -1678,17 +1654,22 @@ async fn create_postgres_test_schema(test_name: &str) -> Option<(sqlx::PgPool, S
         .connect(&base_url)
         .await
         .unwrap();
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
+    execute_schema_ddl(
+        &admin_pool,
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+    )
+    .await;
+    execute_schema_ddl(&admin_pool, format!("CREATE SCHEMA {schema}")).await;
 
     let target_url = postgres_url_for_schema(&base_url, &schema);
     Some((admin_pool, schema, target_url))
+}
+
+async fn execute_schema_ddl(pool: &sqlx::PgPool, sql: String) {
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 fn postgres_url_for_schema(base_url: &str, schema: &str) -> String {

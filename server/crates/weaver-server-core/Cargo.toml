@@ -14,8 +14,12 @@ weaver-model = { path = "../../../shared/crates/weaver-model" }
 weaver-nntp = { path = "../../../engines/weaver-nntp" }
 weaver-nzb = { path = "../../../engines/weaver-nzb" }
 weaver-yenc = { path = "../../../engines/weaver-yenc" }
-weaver-par2 = { path = "../../../engines/weaver-par2" }
-weaver-rar = { path = "../../../engines/weaver-rar" }
+weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
+    "native-crypto",
+] }
+weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
+    "native-crypto",
+] }
 serde = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }

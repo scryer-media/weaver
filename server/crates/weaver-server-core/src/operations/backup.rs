@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fs::File;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
-use sqlx::{Acquire, ConnectOptions, Row};
+use sqlx::{Acquire, AssertSqlSafe, ConnectOptions, Row};
 
 use crate::StateError;
 use crate::persistence::Database;
@@ -94,7 +94,8 @@ async fn table_has_column(
     table: &'static str,
     column: &'static str,
 ) -> Result<bool, StateError> {
-    let rows = sqlx::query(&format!("PRAGMA {schema}.table_info({table})"))
+    let sql = format!("PRAGMA {schema}.table_info({table})");
+    let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
         .fetch_all(conn)
         .await
         .map_err(db_err)?;
@@ -126,7 +127,7 @@ async fn copy_stable_tables_to_backup(
 
     for table in STABLE_TABLES {
         let sql = format!("CREATE TABLE {table} AS SELECT * FROM src.{table}");
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
             .execute(&mut export_conn)
             .await
             .map_err(db_err)?;
@@ -272,13 +273,13 @@ impl Database {
                             let mut tx = conn.begin().await.map_err(db_err)?;
                             for table in CLEAR_IMPORT_TABLES {
                                 let sql = format!("DELETE FROM {table}");
-                                sqlx::raw_sql(&sql)
+                                sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                                     .execute(&mut *tx)
                                     .await
                                     .map_err(db_err)?;
                             }
 
-                            sqlx::raw_sql(&format!(
+                            let import_sql = format!(
                                 "INSERT INTO settings (key, value)
                                      SELECT key, value FROM src.settings;
                                  INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
@@ -317,7 +318,8 @@ impl Database {
                                  INSERT INTO sqlite_sequence (name, seq)
                                      SELECT 'job_events', COALESCE(MAX(id), 0) FROM job_events;
                                  ",
-                            ))
+                            );
+                            sqlx::raw_sql(AssertSqlSafe(import_sql.as_str()))
                             .execute(&mut *tx)
                             .await
                             .map_err(db_err)?;

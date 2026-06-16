@@ -25,8 +25,10 @@ memmap2 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-weaver-rar = { path = "../weaver-rar" }
+tempfile = { version = "3", default-features = false, features = ["getrandom"] }
+weaver-rar = { path = "../weaver-rar", default-features = false, features = [
+    "native-crypto",
+] }
 criterion = "0.5"
 
 [[bench]]

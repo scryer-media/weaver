@@ -15,8 +15,12 @@ weaver-server-core = { path = "../../crates/weaver-server-core" }
 weaver-nntp = { path = "../../../engines/weaver-nntp" }
 weaver-nzb = { path = "../../../engines/weaver-nzb" }
 weaver-yenc = { path = "../../../engines/weaver-yenc" }
-weaver-par2 = { path = "../../../engines/weaver-par2" }
-weaver-rar = { path = "../../../engines/weaver-rar" }
+weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
+    "native-crypto",
+] }
+weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
+    "native-crypto",
+] }
 weaver-server-api = { path = "../../crates/weaver-server-api" }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -29,7 +29,8 @@ use aws_lc_sys::{
 use blake2s_simd::blake2sp;
 #[cfg(not(feature = "native-crypto"))]
 use cbc::cipher::KeyIvInit;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
 #[cfg(feature = "native-crypto")]

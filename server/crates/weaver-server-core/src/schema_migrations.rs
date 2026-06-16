@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlitePool};
 
 use crate::StateError;
 use crate::migration_assets::{
@@ -214,7 +214,7 @@ async fn execute_sql(
     if sql.trim().is_empty() {
         return Ok(());
     }
-    sqlx::raw_sql(sql)
+    sqlx::raw_sql(AssertSqlSafe(sql))
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
@@ -237,7 +237,7 @@ async fn ensure_column(
     definition: &str,
 ) -> Result<(), StateError> {
     let exists_sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
-    let exists: i64 = sqlx::query_scalar(&exists_sql)
+    let exists: i64 = sqlx::query_scalar(AssertSqlSafe(exists_sql.as_str()))
         .bind(column)
         .fetch_one(&mut **tx)
         .await
@@ -388,7 +388,7 @@ async fn apply_baseline(
         .to_owned();
     let mut tx = pool.begin().await.map_err(db_err)?;
     if !sql.trim().is_empty() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -456,7 +456,7 @@ async fn apply_single_migration(
                     .map_err(StateError::Database)?
                     .to_owned();
                 if !sql.trim().is_empty() {
-                    sqlx::raw_sql(&sql)
+                    sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                         .execute(&mut *tx)
                         .await
                         .map_err(db_err)?;
@@ -544,7 +544,7 @@ async fn backfill_persisted_nzb_blobs(
             AND nzb_path IS NOT NULL
             AND nzb_path != ''"
     );
-    let rows = sqlx::query(&select_sql)
+    let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
         .fetch_all(&mut **tx)
         .await
         .map_err(db_err)?;
@@ -574,7 +574,7 @@ async fn backfill_persisted_nzb_blobs(
           WHERE job_id = ?2"
     );
     for (job_id, bytes) in updates {
-        sqlx::query(&update_sql)
+        sqlx::query(AssertSqlSafe(update_sql.as_str()))
             .bind(bytes)
             .bind(job_id)
             .execute(&mut **tx)
@@ -1345,11 +1345,11 @@ mod tests {
             .map(|column| format!("'{column}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name IN ({joined})"
-        ))
-        .fetch_one(pool)
-        .await
-        .unwrap()
+        let sql =
+            format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name IN ({joined})");
+        sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 }

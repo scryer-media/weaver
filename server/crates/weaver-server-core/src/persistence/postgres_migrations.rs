@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use crate::StateError;
 use crate::migration_assets::{
@@ -375,7 +375,7 @@ async fn apply_postgres_baseline(
         .text(payload_bytes)
         .map_err(StateError::Database)?;
 
-    sqlx::raw_sql(baseline_sql)
+    sqlx::raw_sql(AssertSqlSafe(baseline_sql))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -444,7 +444,7 @@ async fn apply_single_migration(
                 if sql.trim().is_empty() {
                     continue;
                 }
-                sqlx::raw_sql(&sql)
+                sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                     .execute(&mut *tx)
                     .await
                     .map_err(|error| {
