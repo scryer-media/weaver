@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::range::Range;
 
 use crate::migration_hook_ids;
 use serde::{Deserialize, Serialize};
@@ -239,11 +240,14 @@ impl PayloadSlice {
     pub fn bytes<'a>(&self, payload_bytes: &'a [u8]) -> Result<&'a [u8], String> {
         let start = usize::try_from(self.start).map_err(|_| "payload start out of range")?;
         let len = usize::try_from(self.len).map_err(|_| "payload length out of range")?;
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| "payload slice overflow".to_string())?;
+        let range = Range {
+            start,
+            end: start
+                .checked_add(len)
+                .ok_or_else(|| "payload slice overflow".to_string())?,
+        };
         payload_bytes
-            .get(start..end)
+            .get(range)
             .ok_or_else(|| "payload slice outside bundle".to_string())
     }
 

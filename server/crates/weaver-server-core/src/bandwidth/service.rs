@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::range::Range;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{
@@ -18,8 +19,27 @@ const BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_se
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BandwidthCapWindow {
-    starts_at: DateTime<Local>,
-    ends_at: DateTime<Local>,
+    period: Range<DateTime<Local>>,
+}
+
+impl BandwidthCapWindow {
+    fn new(start: DateTime<Local>, end: DateTime<Local>) -> Self {
+        Self {
+            period: Range { start, end },
+        }
+    }
+
+    fn starts_at(&self) -> DateTime<Local> {
+        self.period.start
+    }
+
+    fn ends_at(&self) -> DateTime<Local> {
+        self.period.end
+    }
+
+    fn contains(&self, now: &DateTime<Local>) -> bool {
+        self.period.contains(now)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,8 +100,8 @@ impl BandwidthCapRuntime {
         let should_reload = self.window.as_ref() != Some(&next_window);
         if should_reload {
             self.flush_pending_usage(db)?;
-            let start_minute = next_window.starts_at.timestamp().div_euclid(60);
-            let end_minute = next_window.ends_at.timestamp().div_euclid(60);
+            let start_minute = next_window.starts_at().timestamp().div_euclid(60);
+            let end_minute = next_window.ends_at().timestamp().div_euclid(60);
             self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
             self.window = Some(next_window);
             self.reserved_bytes = 0;
@@ -124,8 +144,7 @@ impl BandwidthCapRuntime {
         let bucket_epoch_minute = now.timestamp().div_euclid(60);
         self.record_pending_usage(bucket_epoch_minute, payload_bytes);
         if let Some(window) = &self.window
-            && now >= window.starts_at
-            && now < window.ends_at
+            && window.contains(&now)
         {
             self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
         } else {
@@ -217,11 +236,11 @@ impl BandwidthCapRuntime {
             window_starts_at_epoch_ms: self
                 .window
                 .as_ref()
-                .map(|window| window.starts_at.timestamp_millis() as f64),
+                .map(|window| window.starts_at().timestamp_millis() as f64),
             window_ends_at_epoch_ms: self
                 .window
                 .as_ref()
-                .map(|window| window.ends_at.timestamp_millis() as f64),
+                .map(|window| window.ends_at().timestamp_millis() as f64),
             timezone_name,
             scheduled_speed_limit: 0,
         }
@@ -319,10 +338,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> BandwidthCa
         next_day.day(),
         reset_minutes,
     );
-    BandwidthCapWindow {
-        starts_at: start,
-        ends_at: end,
-    }
+    BandwidthCapWindow::new(start, end)
 }
 
 fn compute_weekly_window(
@@ -356,10 +372,7 @@ fn compute_weekly_window(
         end_date.day(),
         reset_minutes,
     );
-    BandwidthCapWindow {
-        starts_at: start,
-        ends_at: end,
-    }
+    BandwidthCapWindow::new(start, end)
 }
 
 fn compute_monthly_window(
@@ -381,10 +394,7 @@ fn compute_monthly_window(
     let (end_year, end_month) = shift_month(start_year, start_month, 1);
     let end_day = clamp_day(end_year, end_month, reset_day);
     let end = local_datetime(end_year, end_month, end_day, reset_minutes);
-    BandwidthCapWindow {
-        starts_at: start,
-        ends_at: end,
-    }
+    BandwidthCapWindow::new(start, end)
 }
 
 fn compute_window(now: DateTime<Local>, policy: &IspBandwidthCapConfig) -> BandwidthCapWindow {
