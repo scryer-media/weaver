@@ -50,6 +50,7 @@ current_gid=$(id -g)
 tmpdir=$(mktemp -d)
 payload_dir=$(mktemp -d)
 trap 'sudo rm -rf "$tmpdir" "$payload_dir"' EXIT INT TERM
+chmod 0755 "$payload_dir"
 
 sudo chown 65534:65534 "$tmpdir"
 docker run --rm --platform "$PLATFORM" \
