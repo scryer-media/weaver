@@ -1,12 +1,6 @@
-use rusqlite::OptionalExtension;
-
 use crate::StateError;
-
 use crate::persistence::Database;
-
-fn db_err(e: rusqlite::Error) -> StateError {
-    StateError::Database(e.to_string())
-}
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 /// Stored login credentials (single user).
 #[derive(Debug, Clone)]
@@ -20,21 +14,24 @@ pub struct AuthCredentials {
 impl Database {
     /// Get the stored login credentials, if any.
     pub fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
-        let conn = self.read_conn();
-        conn.query_row(
-            "SELECT username, password_hash, created_at, updated_at FROM auth_credentials WHERE id = 1",
-            [],
-            |row| {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT username, password_hash, created_at, updated_at FROM auth_credentials WHERE id = 1",
+                &[],
+            )
+            .await?
+            .map(|row| {
                 Ok(AuthCredentials {
-                    username: row.get(0)?,
-                    password_hash: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
+                    username: row.text("username")?,
+                    password_hash: row.text("password_hash")?,
+                    created_at: row.i64("created_at")?,
+                    updated_at: row.i64("updated_at")?,
                 })
-            },
-        )
-        .optional()
-        .map_err(db_err)
+            })
+            .transpose()
+        })
     }
 
     /// Set (insert or replace) login credentials.
@@ -43,26 +40,42 @@ impl Database {
         username: &str,
         password_hash: &str,
     ) -> Result<(), StateError> {
-        let conn = self.conn();
+        let datastore = self.datastore();
+        let username = username.to_string();
+        let password_hash = password_hash.to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        conn.execute(
-            "INSERT INTO auth_credentials (id, username, password_hash, created_at, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?3)
-             ON CONFLICT(id) DO UPDATE SET username = ?1, password_hash = ?2, updated_at = ?3",
-            rusqlite::params![username, password_hash, now],
-        )
-        .map_err(db_err)?;
-        Ok(())
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO auth_credentials (id, username, password_hash, created_at, updated_at)
+                 VALUES (1, {}, {}, {}, {})
+                 ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, updated_at = excluded.updated_at",
+                &[
+                    SqlArg::Text(username),
+                    SqlArg::Text(password_hash),
+                    SqlArg::I64(now),
+                    SqlArg::I64(now),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     /// Clear login credentials (disable login).
     pub fn clear_auth_credentials(&self) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM auth_credentials WHERE id = 1", [])
-            .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM auth_credentials WHERE id = 1",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
     }
 }

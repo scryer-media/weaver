@@ -5,7 +5,6 @@ use super::*;
 
 pub(crate) struct RarExtractionContext<'a> {
     pub(crate) volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
-    pub(crate) db: &'a crate::Database,
     pub(crate) event_tx: &'a broadcast::Sender<PipelineEvent>,
     pub(crate) job_id: JobId,
     pub(crate) set_name: &'a str,
@@ -19,28 +18,9 @@ pub(crate) enum RarArchiveOpenMode {
     RefreshProvidedVolumes,
 }
 
-fn summarize_extraction_chunks(
-    chunks: &[crate::ExtractionChunk],
-) -> Vec<(u32, u64, u64, u64, bool, bool)> {
-    chunks
-        .iter()
-        .map(|chunk| {
-            (
-                chunk.volume_index,
-                chunk.bytes_written,
-                chunk.start_offset,
-                chunk.end_offset,
-                chunk.verified,
-                chunk.appended,
-            )
-        })
-        .collect()
-}
-
 impl<'a> RarExtractionContext<'a> {
     pub(crate) fn new(
         volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
-        db: &'a crate::Database,
         event_tx: &'a broadcast::Sender<PipelineEvent>,
         job_id: JobId,
         set_name: &'a str,
@@ -49,7 +29,6 @@ impl<'a> RarExtractionContext<'a> {
     ) -> Self {
         Self {
             volume_paths,
-            db,
             event_tx,
             job_id,
             set_name,
@@ -67,7 +46,6 @@ impl Pipeline {
     ) -> Result<(String, u64, u64), String> {
         let RarExtractionContext {
             volume_paths,
-            db,
             event_tx,
             job_id,
             set_name,
@@ -105,13 +83,6 @@ impl Pipeline {
         crate::e2e_failpoint::maybe_delay("extract.member_start");
 
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
-        let existing_chunks: Vec<crate::ExtractionChunk> = db
-            .get_extraction_chunks(job_id, set_name)
-            .map_err(|e| format!("failed to load existing extraction chunks: {e}"))?
-            .into_iter()
-            .filter(|chunk| chunk.member_name == member_name)
-            .collect();
-        let existing_chunk_summary = summarize_extraction_chunks(&existing_chunks);
         let partial_size = std::fs::metadata(&partial_path).ok().map(|meta| meta.len());
         let out_size = std::fs::metadata(&out_path).ok().map(|meta| meta.len());
         info!(
@@ -123,8 +94,6 @@ impl Pipeline {
             last_volume,
             is_solid,
             available_volumes = ?volume_paths.keys().copied().collect::<Vec<_>>(),
-            existing_chunk_rows = existing_chunks.len(),
-            existing_chunks = ?existing_chunk_summary,
             partial_exists = partial_path.exists(),
             partial_size,
             out_exists = out_path.exists(),
@@ -132,113 +101,12 @@ impl Pipeline {
             "RAR member extraction begin"
         );
 
-        if out_path.exists()
-            && let Ok(Some(checkpoint)) = Self::validate_member_extraction_manifest(
-                &existing_chunks,
-                first_volume,
-                last_volume,
-            )
-        {
-            let finalized_size = std::fs::metadata(&out_path)
-                .map_err(|e| {
-                    format!(
-                        "failed to stat finalized output {}: {e}",
-                        out_path.display()
-                    )
-                })?
-                .len();
-            if checkpoint.next_offset >= unpacked_size && finalized_size == unpacked_size {
-                info!(
-                    job_id = job_id.0,
-                    set_name,
-                    member = %member_name,
-                    next_offset = checkpoint.next_offset,
-                    completed_volumes = ?checkpoint.completed_volumes,
-                    finalized_size,
-                    unpacked_size,
-                    "RAR member manifest already matches finalized output"
-                );
-                db.clear_member_chunks(job_id, set_name, &member_name)
-                    .map_err(|e| format!("failed to clear extraction chunk rows: {e}"))?;
-                match std::fs::remove_dir_all(&chunk_dir) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            path = %chunk_dir.display(),
-                            error = %error,
-                            "failed to remove legacy chunk dir during checkpoint reconcile"
-                        );
-                    }
-                }
-                return Ok((member_name, finalized_size, unpacked_size));
-            }
-        }
-
-        let mut cleared_stale_artifacts = false;
-        let resume_checkpoint = match Self::validate_member_extraction_checkpoint(
-            &existing_chunks,
-            &partial_path,
-            first_volume,
-            last_volume,
-        ) {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    set_name,
-                    member = %member_name,
-                    error = %error,
-                    "discarding invalid extraction checkpoint and restarting member extraction"
-                );
-                Self::clear_member_extraction_artifacts(
-                    db,
-                    job_id,
-                    set_name,
-                    &member_name,
-                    &partial_path,
-                    &chunk_dir,
-                )?;
-                cleared_stale_artifacts = true;
-                None
-            }
-        };
-
-        if let Some(checkpoint) = &resume_checkpoint {
-            info!(
-                job_id = job_id.0,
-                set_name,
-                member = %member_name,
-                temp_path = %partial_path.display(),
-                resumed_offset = checkpoint.next_offset,
-                completed_volumes = ?checkpoint.completed_volumes,
-                manifest = ?summarize_extraction_chunks(&checkpoint.manifest),
-                "resuming extraction from persisted checkpoint"
-            );
-        }
-
-        if resume_checkpoint.is_none()
-            && !cleared_stale_artifacts
-            && (!existing_chunks.is_empty() || partial_path.exists())
-        {
-            Self::clear_member_extraction_artifacts(
-                db,
-                job_id,
-                set_name,
-                &member_name,
-                &partial_path,
-                &chunk_dir,
-            )?;
+        if partial_path.exists() || chunk_dir.exists() {
+            Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
         }
 
         let mut partial_file_options = std::fs::OpenOptions::new();
-        partial_file_options.create(true).write(true);
-        if resume_checkpoint.is_some() {
-            partial_file_options.append(true);
-        } else {
-            partial_file_options.truncate(true);
-        }
+        partial_file_options.create(true).write(true).truncate(true);
         let partial_file = partial_file_options.open(&partial_path).map_err(|e| {
             format!(
                 "failed to create partial output {}: {e}",
@@ -248,33 +116,19 @@ impl Pipeline {
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
-        let resumed_manifest = resume_checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.manifest.clone())
-            .unwrap_or_default();
-        let resumed_offset = resume_checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.next_offset)
-            .unwrap_or(0);
-        let completed_volumes = resume_checkpoint
-            .as_ref()
-            .map(|checkpoint| checkpoint.completed_volumes.clone())
-            .unwrap_or_default();
         let checkpoint = Arc::new(ExtractionCheckpointState {
-            db: db.clone(),
             job_id,
             set_name: set_name.to_string(),
             member_name: member_name.clone(),
             temp_path: partial_path.to_string_lossy().to_string(),
-            manifest: Mutex::new(resumed_manifest),
-            next_offset: AtomicU64::new(resumed_offset),
+            manifest: Mutex::new(Vec::new()),
+            next_offset: AtomicU64::new(0),
             error: Mutex::new(None),
         });
 
         let chunk_records: Result<Vec<(u32, u64)>, weaver_rar::RarError> = if is_solid {
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
-            let completed_volumes = completed_volumes.clone();
             archive
                 .extract_member_solid_chunked(idx, options, |absolute_volume| {
                     let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
@@ -284,20 +138,11 @@ impl Pipeline {
                             ),
                         }
                     })?;
-                    let already_completed = completed_volumes.contains(&absolute_volume);
                     Ok(Box::new(DirectOutputWriter {
-                        shared: if already_completed {
-                            None
-                        } else {
-                            Some(Rc::clone(&shared_ref))
-                        },
+                        shared: Some(Rc::clone(&shared_ref)),
                         bytes_written: 0,
                         volume_index: absolute_volume,
-                        checkpoint: if already_completed {
-                            None
-                        } else {
-                            Some(Arc::clone(&checkpoint_ref))
-                        },
+                        checkpoint: Some(Arc::clone(&checkpoint_ref)),
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -328,24 +173,14 @@ impl Pipeline {
             let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
-            let completed_volumes = completed_volumes.clone();
             archive
                 .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
                     let volume_index = first_volume + local_volume as u32;
-                    let already_completed = completed_volumes.contains(&volume_index);
                     Ok(Box::new(DirectOutputWriter {
-                        shared: if already_completed {
-                            None
-                        } else {
-                            Some(Rc::clone(&shared_ref))
-                        },
+                        shared: Some(Rc::clone(&shared_ref)),
                         bytes_written: 0,
                         volume_index,
-                        checkpoint: if already_completed {
-                            None
-                        } else {
-                            Some(Arc::clone(&checkpoint_ref))
-                        },
+                        checkpoint: Some(Arc::clone(&checkpoint_ref)),
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -411,7 +246,6 @@ impl Pipeline {
         drop(shared);
 
         let bytes_written = match Self::finalize_member_output(FinalizeMemberContext {
-            db,
             event_tx,
             job_id,
             set_name,

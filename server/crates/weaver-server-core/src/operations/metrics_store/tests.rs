@@ -2,6 +2,56 @@ use super::*;
 
 use crate::{DownloadState, JobId, PostState, RunState};
 
+fn upsert_raw_point_for_test(db: &Database, point: RawMetricsHistoryPoint) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_upsert_raw_point", |tx| {
+            let point = point.clone();
+            Box::pin(async move { upsert_raw_point_tx(tx, point).await })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+fn upsert_rollup_point_for_test(
+    db: &Database,
+    tier: MetricsHistoryTier,
+    point: RollupMetricsHistoryPoint,
+) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_upsert_rollup_point", |tx| {
+            let point = point.clone();
+            Box::pin(async move { upsert_rollup_point_tx(tx, tier, point).await })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+fn refresh_rollup_1h_bucket_for_test(db: &Database, recorded_at_epoch_sec: i64) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_refresh_rollup_1h_bucket", |tx| {
+            Box::pin(async move { refresh_rollup_1h_bucket_tx(tx, recorded_at_epoch_sec).await })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+fn prune_metrics_history_for_test(db: &Database, tier: MetricsHistoryTier, now_epoch_sec: i64) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&datastore, "test_prune_metrics_history", |tx| {
+            Box::pin(async move { prune_metrics_history_tx(tx, tier, now_epoch_sec).await })
+        })
+        .await
+    })
+    .unwrap();
+}
+
 fn sample_snapshot(
     bytes_downloaded: u64,
     bytes_decoded: u64,
@@ -172,59 +222,55 @@ fn record_metrics_history_sample_builds_avg_and_peak_rollups() {
 #[test]
 fn hourly_rollups_weight_sparse_buckets_by_coverage() {
     let db = Database::open_in_memory().unwrap();
-    {
-        let conn = db.conn();
+    let mut sparse_bucket = RollupMetricsHistoryPoint {
+        timestamp_epoch_sec: 300,
+        counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+        gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+        job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+    };
+    sparse_bucket.counter_values[0] = CounterRollupValue {
+        end: 100.0,
+        avg_rate: 100.0,
+        peak_rate: 100.0,
+        avg_rate_weight_sec: 10.0,
+    };
+    sparse_bucket.gauge_values[0] = GaugeRollupValue {
+        avg: 50.0,
+        peak: 50.0,
+        sample_count: 1,
+    };
+    sparse_bucket.job_status_values[0] = GaugeRollupValue {
+        avg: 4.0,
+        peak: 4.0,
+        sample_count: 1,
+    };
+    upsert_rollup_point_for_test(&db, MetricsHistoryTier::Rollup5m, sparse_bucket);
 
-        let mut sparse_bucket = RollupMetricsHistoryPoint {
-            timestamp_epoch_sec: 300,
-            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-        };
-        sparse_bucket.counter_values[0] = CounterRollupValue {
-            end: 100.0,
-            avg_rate: 100.0,
-            peak_rate: 100.0,
-            avg_rate_weight_sec: 10.0,
-        };
-        sparse_bucket.gauge_values[0] = GaugeRollupValue {
-            avg: 50.0,
-            peak: 50.0,
-            sample_count: 1,
-        };
-        sparse_bucket.job_status_values[0] = GaugeRollupValue {
-            avg: 4.0,
-            peak: 4.0,
-            sample_count: 1,
-        };
-        upsert_rollup_point(&conn, MetricsHistoryTier::Rollup5m, sparse_bucket).unwrap();
+    let mut dense_bucket = RollupMetricsHistoryPoint {
+        timestamp_epoch_sec: 600,
+        counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+        gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+        job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+    };
+    dense_bucket.counter_values[0] = CounterRollupValue {
+        end: 390.0,
+        avg_rate: 10.0,
+        peak_rate: 20.0,
+        avg_rate_weight_sec: 290.0,
+    };
+    dense_bucket.gauge_values[0] = GaugeRollupValue {
+        avg: 10.0,
+        peak: 12.0,
+        sample_count: 29,
+    };
+    dense_bucket.job_status_values[0] = GaugeRollupValue {
+        avg: 1.0,
+        peak: 2.0,
+        sample_count: 29,
+    };
+    upsert_rollup_point_for_test(&db, MetricsHistoryTier::Rollup5m, dense_bucket);
 
-        let mut dense_bucket = RollupMetricsHistoryPoint {
-            timestamp_epoch_sec: 600,
-            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-        };
-        dense_bucket.counter_values[0] = CounterRollupValue {
-            end: 390.0,
-            avg_rate: 10.0,
-            peak_rate: 20.0,
-            avg_rate_weight_sec: 290.0,
-        };
-        dense_bucket.gauge_values[0] = GaugeRollupValue {
-            avg: 10.0,
-            peak: 12.0,
-            sample_count: 29,
-        };
-        dense_bucket.job_status_values[0] = GaugeRollupValue {
-            avg: 1.0,
-            peak: 2.0,
-            sample_count: 29,
-        };
-        upsert_rollup_point(&conn, MetricsHistoryTier::Rollup5m, dense_bucket).unwrap();
-
-        refresh_rollup_1h_bucket(&conn, 600).unwrap();
-    }
+    refresh_rollup_1h_bucket_for_test(&db, 600);
 
     let MetricsHistoryQueryData::Rollup(hourly_points) = db
         .read_metrics_history(MetricsHistoryTier::Rollup1h, 0, 3_600)
@@ -247,28 +293,23 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
     let db = Database::open_in_memory().unwrap();
     let now = 10 * 24 * 60 * 60;
 
-    {
-        let conn = db.conn();
-        upsert_raw_point(
-            &conn,
-            RawMetricsHistoryPoint::from_snapshot(
-                now - RAW_METRICS_RETENTION_SECS - RAW_METRICS_RESOLUTION_SECS,
-                &sample_snapshot(100, 50, 25, 10, 1, 1.0, 0.5),
-                &[],
-            ),
-        )
-        .unwrap();
-        upsert_raw_point(
-            &conn,
-            RawMetricsHistoryPoint::from_snapshot(
-                now,
-                &sample_snapshot(200, 100, 50, 20, 1, 1.0, 0.5),
-                &[],
-            ),
-        )
-        .unwrap();
-        prune_metrics_history(&conn, MetricsHistoryTier::Raw10s, now).unwrap();
-    }
+    upsert_raw_point_for_test(
+        &db,
+        RawMetricsHistoryPoint::from_snapshot(
+            now - RAW_METRICS_RETENTION_SECS - RAW_METRICS_RESOLUTION_SECS,
+            &sample_snapshot(100, 50, 25, 10, 1, 1.0, 0.5),
+            &[],
+        ),
+    );
+    upsert_raw_point_for_test(
+        &db,
+        RawMetricsHistoryPoint::from_snapshot(
+            now,
+            &sample_snapshot(200, 100, 50, 20, 1, 1.0, 0.5),
+            &[],
+        ),
+    );
+    prune_metrics_history_for_test(&db, MetricsHistoryTier::Raw10s, now);
 
     let MetricsHistoryQueryData::Raw(raw_points) = db
         .read_metrics_history(MetricsHistoryTier::Raw10s, 0, now)
@@ -280,32 +321,27 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
     assert_eq!(raw_points.len(), 1);
     assert_eq!(raw_points[0].timestamp_epoch_sec, now);
 
-    {
-        let conn = db.conn();
-        upsert_rollup_point(
-            &conn,
-            MetricsHistoryTier::Rollup5m,
-            RollupMetricsHistoryPoint {
-                timestamp_epoch_sec: now - ROLLUP_5M_RETENTION_SECS - ROLLUP_5M_RESOLUTION_SECS,
-                counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-                gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-                job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-            },
-        )
-        .unwrap();
-        upsert_rollup_point(
-            &conn,
-            MetricsHistoryTier::Rollup5m,
-            RollupMetricsHistoryPoint {
-                timestamp_epoch_sec: now,
-                counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-                gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-                job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-            },
-        )
-        .unwrap();
-        prune_metrics_history(&conn, MetricsHistoryTier::Rollup5m, now).unwrap();
-    }
+    upsert_rollup_point_for_test(
+        &db,
+        MetricsHistoryTier::Rollup5m,
+        RollupMetricsHistoryPoint {
+            timestamp_epoch_sec: now - ROLLUP_5M_RETENTION_SECS - ROLLUP_5M_RESOLUTION_SECS,
+            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+        },
+    );
+    upsert_rollup_point_for_test(
+        &db,
+        MetricsHistoryTier::Rollup5m,
+        RollupMetricsHistoryPoint {
+            timestamp_epoch_sec: now,
+            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+        },
+    );
+    prune_metrics_history_for_test(&db, MetricsHistoryTier::Rollup5m, now);
 
     let MetricsHistoryQueryData::Rollup(five_minute_points) = db
         .read_metrics_history(MetricsHistoryTier::Rollup5m, 0, now)
@@ -317,32 +353,27 @@ fn prune_metrics_history_discards_expired_points_per_tier() {
     assert_eq!(five_minute_points.len(), 1);
     assert_eq!(five_minute_points[0].timestamp_epoch_sec, now);
 
-    {
-        let conn = db.conn();
-        upsert_rollup_point(
-            &conn,
-            MetricsHistoryTier::Rollup1h,
-            RollupMetricsHistoryPoint {
-                timestamp_epoch_sec: now - ROLLUP_1H_RETENTION_SECS - ROLLUP_1H_RESOLUTION_SECS,
-                counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-                gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-                job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-            },
-        )
-        .unwrap();
-        upsert_rollup_point(
-            &conn,
-            MetricsHistoryTier::Rollup1h,
-            RollupMetricsHistoryPoint {
-                timestamp_epoch_sec: now,
-                counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
-                gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
-                job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
-            },
-        )
-        .unwrap();
-        prune_metrics_history(&conn, MetricsHistoryTier::Rollup1h, now).unwrap();
-    }
+    upsert_rollup_point_for_test(
+        &db,
+        MetricsHistoryTier::Rollup1h,
+        RollupMetricsHistoryPoint {
+            timestamp_epoch_sec: now - ROLLUP_1H_RETENTION_SECS - ROLLUP_1H_RESOLUTION_SECS,
+            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+        },
+    );
+    upsert_rollup_point_for_test(
+        &db,
+        MetricsHistoryTier::Rollup1h,
+        RollupMetricsHistoryPoint {
+            timestamp_epoch_sec: now,
+            counter_values: [CounterRollupValue::default(); NUM_COUNTER_METRICS],
+            gauge_values: [GaugeRollupValue::default(); NUM_GAUGE_METRICS],
+            job_status_values: [GaugeRollupValue::default(); NUM_JOB_STATUS_METRICS],
+        },
+    );
+    prune_metrics_history_for_test(&db, MetricsHistoryTier::Rollup1h, now);
 
     let MetricsHistoryQueryData::Rollup(hourly_points) = db
         .read_metrics_history(MetricsHistoryTier::Rollup1h, 0, now)

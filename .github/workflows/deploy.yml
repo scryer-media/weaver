@@ -17,7 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "25"
-  RUST_TOOLCHAIN: "1.95"
+  RUST_TOOLCHAIN: "1.96"
   WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
 
@@ -392,7 +392,12 @@ jobs:
       - name: Exclude build dir from Windows Defender
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -865,7 +870,12 @@ jobs:
           echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Exclude build dir from Windows Defender
         shell: pwsh
-        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -910,7 +920,12 @@ jobs:
         run: rustup target add aarch64-pc-windows-msvc
       - name: Exclude build dir from Windows Defender
         shell: pwsh
-        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false

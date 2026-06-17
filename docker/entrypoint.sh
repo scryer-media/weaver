@@ -50,4 +50,4 @@ echo "
 ───────────────────────────────────
 "
 
-exec su-exec "$PUID":"$PGID" "$RUNTIME_BIN" "$@"
+exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups "$RUNTIME_BIN" "$@"

@@ -53,10 +53,8 @@ mod tests {
         std::fs::write(&out_path, b"already-finalized").unwrap();
         std::fs::create_dir_all(&chunk_dir).unwrap();
 
-        let db = crate::Database::open_in_memory().unwrap();
         let (event_tx, _event_rx) = broadcast::channel(8);
         let bytes = Pipeline::finalize_member_output(FinalizeMemberContext {
-            db: &db,
             event_tx: &event_tx,
             job_id: JobId(42),
             set_name: "set",
@@ -88,7 +86,6 @@ impl Drop for DirectOutputWriter {
 }
 
 pub(crate) struct ExtractionCheckpointState {
-    pub(crate) db: crate::Database,
     pub(crate) job_id: JobId,
     pub(crate) set_name: String,
     pub(crate) member_name: String,
@@ -121,9 +118,6 @@ impl ExtractionCheckpointState {
             appended: false,
         });
         manifest.sort_by_key(|chunk| (chunk.start_offset, chunk.volume_index));
-        self.db
-            .replace_member_chunks(self.job_id, &self.set_name, &self.member_name, &manifest)
-            .map_err(|error| format!("failed to persist extraction chunks: {error}"))?;
         info!(
             job_id = self.job_id.0,
             set_name = %self.set_name,
@@ -133,7 +127,7 @@ impl ExtractionCheckpointState {
             start_offset,
             end_offset,
             manifest_rows = manifest.len(),
-            "persisted RAR extraction checkpoint volume"
+            "recorded lossy RAR extraction checkpoint volume"
         );
         crate::e2e_failpoint::maybe_trip("extract.after_volume_checkpoint");
         Ok(())
@@ -153,7 +147,6 @@ impl ExtractionCheckpointState {
 }
 
 pub(crate) struct FinalizeMemberContext<'a> {
-    pub(crate) db: &'a crate::Database,
     pub(crate) event_tx: &'a broadcast::Sender<PipelineEvent>,
     pub(crate) job_id: JobId,
     pub(crate) set_name: &'a str,
@@ -163,13 +156,14 @@ pub(crate) struct FinalizeMemberContext<'a> {
     pub(crate) chunk_dir: &'a std::path::Path,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ValidatedExtractionCheckpoint {
-    pub(crate) manifest: Vec<crate::ExtractionChunk>,
     pub(crate) completed_volumes: HashSet<u32>,
     pub(crate) next_offset: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ValidatedExtractionManifest {
     pub(crate) manifest: Vec<crate::ExtractionChunk>,
@@ -206,31 +200,9 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_member_extraction_artifacts(
-        db: &crate::Database,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
         partial_path: &std::path::Path,
         chunk_dir: &std::path::Path,
     ) -> Result<(), String> {
-        let existing = db
-            .get_extraction_chunks(job_id, set_name)
-            .map_err(|e| format!("failed to load existing extraction chunks: {e}"))?;
-        for chunk in existing
-            .into_iter()
-            .filter(|chunk| chunk.member_name == member_name)
-        {
-            match std::fs::remove_file(&chunk.temp_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "failed to remove stale extraction chunk {}: {error}",
-                        chunk.temp_path
-                    ));
-                }
-            }
-        }
         match std::fs::remove_file(partial_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -241,8 +213,6 @@ impl Pipeline {
                 ));
             }
         }
-        db.clear_member_chunks(job_id, set_name, member_name)
-            .map_err(|e| format!("failed to clear extraction chunk rows: {e}"))?;
         match std::fs::remove_dir_all(chunk_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -256,6 +226,7 @@ impl Pipeline {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_member_extraction_manifest(
         chunks: &[crate::ExtractionChunk],
         first_volume: u32,
@@ -321,6 +292,7 @@ impl Pipeline {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_member_extraction_checkpoint(
         chunks: &[crate::ExtractionChunk],
         partial_path: &std::path::Path,
@@ -360,7 +332,6 @@ impl Pipeline {
         }
 
         Ok(Some(ValidatedExtractionCheckpoint {
-            manifest: validated.manifest,
             completed_volumes: validated.completed_volumes,
             next_offset: validated.next_offset,
         }))
@@ -368,7 +339,6 @@ impl Pipeline {
 
     pub(crate) fn finalize_member_output(ctx: FinalizeMemberContext<'_>) -> Result<u64, String> {
         let FinalizeMemberContext {
-            db,
             event_tx,
             job_id,
             set_name,
@@ -405,15 +375,6 @@ impl Pipeline {
                             "failed to remove legacy chunk dir during idempotent finalize"
                         );
                     }
-                }
-                if let Err(error) = db.clear_member_chunks(job_id, set_name, member_name) {
-                    warn!(
-                        job_id = job_id.0,
-                        set_name,
-                        member = member_name,
-                        error = %error,
-                        "failed to clear extraction checkpoint manifest after idempotent finalize"
-                    );
                 }
                 let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendFinished {
                     job_id,
@@ -472,16 +433,6 @@ impl Pipeline {
             }
         }
 
-        if let Err(error) = db.clear_member_chunks(job_id, set_name, member_name) {
-            warn!(
-                job_id = job_id.0,
-                set_name,
-                member = member_name,
-                error = %error,
-                "failed to clear extraction checkpoint manifest after finalize"
-            );
-        }
-
         let _ = event_tx.send(PipelineEvent::ExtractionMemberAppendFinished {
             job_id,
             set_name: set_name.to_string(),
@@ -498,31 +449,5 @@ impl Pipeline {
         );
 
         Ok(size)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "thin wrapper around finalized checkpoint path components"
-    )]
-    pub(crate) fn finalize_member_output_paths(
-        db: &crate::Database,
-        event_tx: &broadcast::Sender<PipelineEvent>,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-        partial_path: &std::path::Path,
-        out_path: &std::path::Path,
-        chunk_dir: &std::path::Path,
-    ) -> Result<u64, String> {
-        Self::finalize_member_output(FinalizeMemberContext {
-            db,
-            event_tx,
-            job_id,
-            set_name,
-            member_name,
-            partial_path,
-            out_path,
-            chunk_dir,
-        })
     }
 }

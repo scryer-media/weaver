@@ -7,4 +7,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rayon = { workspace = true }
+rayon = { workspace = true, default-features = false }

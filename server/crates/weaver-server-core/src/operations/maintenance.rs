@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::Database;
 use crate::persistence::maintenance::DbMaintenanceOptions;
+use crate::persistence::sql_runtime::SqlEngine;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -31,19 +32,23 @@ pub fn spawn_maintenance_worker(
 }
 
 async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
-    let sqlite_db = db.clone();
-    match tokio::task::spawn_blocking(move || {
-        sqlite_db.run_sqlite_maintenance_pass(DbMaintenanceOptions::default())
-    })
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "sqlite maintenance pass failed");
+    if db.datastore().engine() == SqlEngine::Sqlite {
+        let sqlite_db = db.clone();
+        match tokio::task::spawn_blocking(move || {
+            sqlite_db.run_sqlite_maintenance_pass(DbMaintenanceOptions::default())
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "sqlite maintenance pass failed");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "sqlite maintenance worker panicked");
+            }
         }
-        Err(error) => {
-            tracing::warn!(error = %error, "sqlite maintenance worker panicked");
-        }
+    } else {
+        tracing::debug!("skipping sqlite maintenance for non-sqlite datastore");
     }
 
     match tokio::task::spawn_blocking(move || run_staging_cleanup(&db, &complete_dir)).await {

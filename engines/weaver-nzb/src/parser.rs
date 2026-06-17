@@ -1,7 +1,7 @@
 use std::io::{BufRead, Cursor};
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::error::NzbError;
 use crate::types::{Nzb, NzbFile, NzbMeta, NzbSegment};
@@ -64,9 +64,12 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                             match attr.key.as_ref() {
                                 b"poster" => {
                                     poster = Some(
-                                        attr.decode_and_unescape_value(reader.decoder())
-                                            .map_err(|e| NzbError::Xml(e.to_string()))?
-                                            .into_owned(),
+                                        attr.decoded_and_normalized_value(
+                                            XmlVersion::Implicit1_0,
+                                            reader.decoder(),
+                                        )
+                                        .map_err(|e| NzbError::Xml(e.to_string()))?
+                                        .into_owned(),
                                     );
                                 }
                                 b"date" => {
@@ -81,9 +84,12 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                                 }
                                 b"subject" => {
                                     subject = Some(
-                                        attr.decode_and_unescape_value(reader.decoder())
-                                            .map_err(|e| NzbError::Xml(e.to_string()))?
-                                            .into_owned(),
+                                        attr.decoded_and_normalized_value(
+                                            XmlVersion::Implicit1_0,
+                                            reader.decoder(),
+                                        )
+                                        .map_err(|e| NzbError::Xml(e.to_string()))?
+                                        .into_owned(),
                                     );
                                 }
                                 _ => {}

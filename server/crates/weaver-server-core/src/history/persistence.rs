@@ -1,59 +1,143 @@
 use crate::StateError;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-use super::repository::db_err;
+const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
+
+fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
+    let bind_limit = match tx {
+        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
+        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
+    };
+    (bind_limit / binds_per_row.max(1)).max(1)
+}
+
+async fn bulk_insert_integration_events_tx(
+    tx: &mut SqlTx<'_>,
+    events: &[IntegrationEventRow],
+) -> Result<(), StateError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let chunk_size = max_rows_for_tx(tx, 4);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "INSERT INTO integration_events (timestamp, kind, item_id, payload_json) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(event.item_id.map(|value| value as i64))
+                        .push_bind(&event.payload_json);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Postgres>::new(
+                    "INSERT INTO integration_events (timestamp, kind, item_id, payload_json) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(event.item_id.map(|value| value as i64))
+                        .push_bind(&event.payload_json);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT OR REPLACE INTO job_history
-             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-              optional_recovery_bytes, optional_recovery_downloaded_bytes,
-              failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-              created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19)",
-            rusqlite::params![
-                entry.job_id as i64,
-                entry.job_hash,
-                entry.name,
-                entry.status,
-                entry.error_message,
-                entry.total_bytes as i64,
-                entry.downloaded_bytes as i64,
-                entry.optional_recovery_bytes as i64,
-                entry.optional_recovery_downloaded_bytes as i64,
-                entry.failed_bytes as i64,
-                entry.health,
-                entry.category,
-                entry.output_dir,
-                entry.nzb_path,
-                entry.created_at,
-                entry.completed_at,
-                entry.metadata,
-                entry.last_diagnostic_id,
-                entry.last_diagnostic_uploaded_at_epoch_ms,
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        let cache_entry = entry.clone();
+        let args = job_history_args(entry);
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO job_history
+                    (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                     failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                     created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                 ON CONFLICT(job_id) DO UPDATE SET
+                    job_hash = excluded.job_hash,
+                    name = excluded.name,
+                    status = excluded.status,
+                    error_message = excluded.error_message,
+                    total_bytes = excluded.total_bytes,
+                    downloaded_bytes = excluded.downloaded_bytes,
+                    optional_recovery_bytes = excluded.optional_recovery_bytes,
+                    optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
+                    failed_bytes = excluded.failed_bytes,
+                    health = excluded.health,
+                    category = excluded.category,
+                    output_dir = excluded.output_dir,
+                    nzb_path = excluded.nzb_path,
+                    nzb_zstd = excluded.nzb_zstd,
+                    created_at = excluded.created_at,
+                    completed_at = excluded.completed_at,
+                    metadata = excluded.metadata,
+                    last_diagnostic_id = excluded.last_diagnostic_id,
+                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                &args,
+            )
+            .await?;
+            Ok(())
+        });
+        if result.is_ok() {
+            self.cache_job_history(cache_entry);
+        }
+        result
     }
 
     pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute("DELETE FROM job_history WHERE job_id = ?1", [job_id as i64])
-            .map_err(db_err)?;
-        Ok(changed > 0)
+        let datastore = self.datastore();
+        let result = self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM job_history WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?;
+            Ok(changed > 0)
+        });
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.invalidate_job_history_cache(job_id);
+        }
+        result
     }
 
     pub fn delete_all_job_history(&self) -> Result<usize, StateError> {
-        let conn = self.conn();
-        let changed = conn
-            .execute("DELETE FROM job_history", [])
-            .map_err(db_err)?;
-        Ok(changed)
+        let datastore = self.datastore();
+        let result = self.run_sql_blocking(async move {
+            let changed =
+                SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_history", &[]).await?;
+            Ok(changed as usize)
+        });
+        if result.as_ref().is_ok_and(|changed| *changed > 0) {
+            self.clear_job_history_cache();
+        }
+        result
     }
 
     pub fn insert_integration_events(
@@ -64,33 +148,51 @@ impl Database {
             return Ok(());
         }
 
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
-                .map_err(db_err)?;
-            for event in events {
-                stmt.execute(rusqlite::params![
-                    event.timestamp,
-                    event.kind,
-                    event.item_id.map(|value| value as i64),
-                    event.payload_json,
-                ])
-                .map_err(db_err)?;
-            }
-        }
-        tx.commit().map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        let events = events.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
+                let events = events.clone();
+                Box::pin(async move {
+                    bulk_insert_integration_events_tx(tx, &events).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     pub fn delete_all_integration_events(&self) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM integration_events", [])
-            .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(datastore.read_exec(), "DELETE FROM integration_events", &[])
+                .await?;
+            Ok(())
+        })
     }
+}
+
+fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
+    vec![
+        SqlArg::I64(entry.job_id as i64),
+        SqlArg::OptBytes(entry.job_hash.clone()),
+        SqlArg::Text(entry.name.clone()),
+        SqlArg::Text(entry.status.clone()),
+        SqlArg::OptText(entry.error_message.clone()),
+        SqlArg::I64(entry.total_bytes as i64),
+        SqlArg::I64(entry.downloaded_bytes as i64),
+        SqlArg::I64(entry.optional_recovery_bytes as i64),
+        SqlArg::I64(entry.optional_recovery_downloaded_bytes as i64),
+        SqlArg::I64(entry.failed_bytes as i64),
+        SqlArg::I64(i64::from(entry.health)),
+        SqlArg::OptText(entry.category.clone()),
+        SqlArg::OptText(entry.output_dir.clone()),
+        SqlArg::OptText(entry.nzb_path.clone()),
+        SqlArg::OptBytes(None),
+        SqlArg::I64(entry.created_at),
+        SqlArg::I64(entry.completed_at),
+        SqlArg::OptText(entry.metadata.clone()),
+        SqlArg::OptText(entry.last_diagnostic_id.clone()),
+        SqlArg::OptI64(entry.last_diagnostic_uploaded_at_epoch_ms),
+    ]
 }

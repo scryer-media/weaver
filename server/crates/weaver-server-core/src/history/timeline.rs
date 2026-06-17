@@ -1,5 +1,10 @@
 use crate::StateError;
-use crate::persistence::Database;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::{Database, DatabaseWriterExecutor};
+use sqlx::{Postgres, QueryBuilder, Sqlite};
+
+const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 /// A persisted job event.
 #[derive(Debug, Clone)]
@@ -13,8 +18,78 @@ pub struct JobEvent {
 
 pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
 
-fn db_err(e: impl std::fmt::Display) -> StateError {
-    StateError::Database(e.to_string())
+fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
+    let bind_limit = match tx {
+        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
+        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
+    };
+    (bind_limit / binds_per_row.max(1)).max(1)
+}
+
+async fn bulk_insert_job_events_tx(
+    tx: &mut SqlTx<'_>,
+    events: &[JobEvent],
+) -> Result<(), StateError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let chunk_size = max_rows_for_tx(tx, 5);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "INSERT INTO job_events (job_id, timestamp, kind, message, file_id) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.job_id as i64)
+                        .push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(&event.message)
+                        .push_bind(&event.file_id);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for chunk in events.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Postgres>::new(
+                    "INSERT INTO job_events (job_id, timestamp, kind, message, file_id) ",
+                );
+                builder.push_values(chunk, |mut row, event| {
+                    row.push_bind(event.job_id as i64)
+                        .push_bind(event.timestamp)
+                        .push_bind(&event.kind)
+                        .push_bind(&event.message)
+                        .push_bind(&event.file_id);
+                });
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn insert_job_events_sql(
+    datastore: StoreDatastore,
+    events: Vec<JobEvent>,
+) -> Result<(), StateError> {
+    SqlRuntime::run_in_transaction(&datastore, "insert_job_events", |tx| {
+        let events = events.clone();
+        Box::pin(async move {
+            bulk_insert_job_events_tx(tx, &events).await?;
+            Ok(())
+        })
+    })
+    .await
 }
 
 impl Database {
@@ -27,14 +102,26 @@ impl Database {
         message: &str,
         file_id: Option<&str>,
     ) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![job_id as i64, timestamp, kind, message, file_id],
-        )
-        .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        let kind = kind.to_string();
+        let message = message.to_string();
+        let file_id = file_id.map(str::to_string);
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
+                 VALUES ({}, {}, {}, {}, {})",
+                &[
+                    SqlArg::I64(job_id as i64),
+                    SqlArg::I64(timestamp),
+                    SqlArg::Text(kind),
+                    SqlArg::Text(message),
+                    SqlArg::OptText(file_id),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     /// Batch-insert job events in a single transaction.
@@ -42,72 +129,72 @@ impl Database {
         if events.is_empty() {
             return Ok(());
         }
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction().map_err(db_err)?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(db_err)?;
-            for event in events {
-                stmt.execute(rusqlite::params![
-                    event.job_id as i64,
-                    event.timestamp,
-                    event.kind,
-                    event.message,
-                    event.file_id,
-                ])
-                .map_err(db_err)?;
-            }
-        }
-        tx.commit().map_err(db_err)?;
-        Ok(())
+
+        let datastore = self.datastore();
+        let events = events.to_vec();
+        self.run_sql_blocking(insert_job_events_sql(datastore, events))
     }
 
-    /// Load all events for a specific job, ordered by timestamp ascending.
+    /// Load all events for a specific job, ordered by insertion order.
     pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT job_id, timestamp, kind, message, file_id
-                 FROM job_events
-                 WHERE job_id = ?1
-                 ORDER BY id ASC",
+                   FROM job_events
+                  WHERE job_id = {}
+                  ORDER BY id ASC",
+                &[SqlArg::I64(job_id as i64)],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([job_id as i64], |row| {
-                Ok(JobEvent {
-                    job_id: row.get::<_, i64>(0)? as u64,
-                    timestamp: row.get(1)?,
-                    kind: row.get(2)?,
-                    message: row.get(3)?,
-                    file_id: row.get(4)?,
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    })
                 })
-            })
-            .map_err(db_err)?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(row.map_err(db_err)?);
-        }
-        Ok(events)
+                .collect()
+        })
     }
 
     /// Delete all events for a job.
     pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM job_events WHERE job_id = ?1", [job_id as i64])
-            .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM job_events WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     /// Delete all job events across all jobs.
     pub fn delete_all_job_events(&self) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute("DELETE FROM job_events", []).map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_events", &[]).await?;
+            Ok(())
+        })
+    }
+}
+
+impl DatabaseWriterExecutor {
+    pub(crate) fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let events = events.to_vec();
+        self.run_sql_blocking(insert_job_events_sql(datastore, events))
     }
 }
 

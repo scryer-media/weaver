@@ -1188,7 +1188,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     let linux_target =
         std::env::var("WEAVER_LINUX_CLIPPY_TARGET").unwrap_or_else(|_| default_linux_target.into());
     let linux_image = std::env::var("WEAVER_LINUX_CLIPPY_IMAGE")
-        .unwrap_or_else(|_| "rust:1.95-bookworm".to_string());
+        .unwrap_or_else(|_| "rust:1.96-bookworm".to_string());
     let linux_platform = std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM")
         .unwrap_or_else(|_| default_linux_platform.into());
     let linux_rustflags = ci_rustflags_for_target(&linux_target, ReleaseLane::Portable)?;

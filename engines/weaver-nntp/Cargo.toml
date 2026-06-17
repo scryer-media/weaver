@@ -7,16 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-weaver-yenc = { path = "../weaver-yenc" }
+weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 rustls-pemfile = { workspace = true }
-webpki-roots = { workspace = true }
+webpki-roots = { workspace = true, default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-pin-project-lite = { workspace = true }
+pin-project-lite = { workspace = true, default-features = false }
 socket2 = { workspace = true }
 memchr = { workspace = true }
 rand = { workspace = true }

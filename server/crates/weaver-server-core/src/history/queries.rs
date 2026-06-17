@@ -4,124 +4,95 @@ use crate::StateError;
 use crate::history::model::HistoryFilter;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
-
-use super::repository::db_err;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 
+const JOB_HISTORY_SELECT: &str =
+    "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+        optional_recovery_bytes, optional_recovery_downloaded_bytes,
+        failed_bytes, health, category, output_dir, nzb_path,
+        created_at, completed_at, metadata,
+        last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
+   FROM job_history";
+
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-                        optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                        failed_bytes, health, category, output_dir, nzb_path,
-                        created_at, completed_at, metadata,
-                        last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
-                 FROM job_history
-                 WHERE job_id = ?1
-                 LIMIT 1",
+        self.get_job_history_inner(job_id)
+    }
+
+    pub fn get_job_history_profiled(
+        &self,
+        job_id: u64,
+        label: &'static str,
+    ) -> Result<Option<JobHistoryRow>, StateError> {
+        let _probe = crate::runtime::perf_probe::scope(label);
+        self.get_job_history_inner(job_id)
+    }
+
+    fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+        if let Some(row) = self.get_cached_job_history(job_id) {
+            crate::runtime::perf_probe::record(
+                "db.get_job_history.cache_hit",
+                std::time::Duration::ZERO,
+            );
+            return Ok(Some(row));
+        }
+        crate::runtime::perf_probe::record(
+            "db.get_job_history.cache_miss",
+            std::time::Duration::ZERO,
+        );
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                &format!("{JOB_HISTORY_SELECT} WHERE job_id = {{}} LIMIT 1"),
+                &[SqlArg::I64(job_id as i64)],
             )
-            .map_err(db_err)?;
-
-        let mut rows = stmt.query([job_id as i64]).map_err(db_err)?;
-        let Some(row) = rows.next().map_err(db_err)? else {
-            return Ok(None);
-        };
-
-        Ok(Some(JobHistoryRow {
-            job_id: row.get::<_, i64>(0).map_err(db_err)? as u64,
-            job_hash: row.get(1).map_err(db_err)?,
-            name: row.get(2).map_err(db_err)?,
-            status: row.get(3).map_err(db_err)?,
-            error_message: row.get(4).map_err(db_err)?,
-            total_bytes: row.get::<_, i64>(5).map_err(db_err)? as u64,
-            downloaded_bytes: row.get::<_, i64>(6).map_err(db_err)? as u64,
-            optional_recovery_bytes: row.get::<_, i64>(7).map_err(db_err)? as u64,
-            optional_recovery_downloaded_bytes: row.get::<_, i64>(8).map_err(db_err)? as u64,
-            failed_bytes: row.get::<_, i64>(9).map_err(db_err)? as u64,
-            health: row.get(10).map_err(db_err)?,
-            category: row.get(11).map_err(db_err)?,
-            output_dir: row.get(12).map_err(db_err)?,
-            nzb_path: row.get(13).map_err(db_err)?,
-            created_at: row.get(14).map_err(db_err)?,
-            completed_at: row.get(15).map_err(db_err)?,
-            metadata: row.get(16).map_err(db_err)?,
-            last_diagnostic_id: row.get(17).map_err(db_err)?,
-            last_diagnostic_uploaded_at_epoch_ms: row.get(18).map_err(db_err)?,
-        }))
+            .await?
+            .map(job_history_row_from_sql)
+            .transpose()
+        })?;
+        if let Some(row) = &row {
+            self.cache_job_history(row.clone());
+        }
+        Ok(row)
     }
 
     pub fn list_job_history(
         &self,
         filter: &HistoryFilter,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
-        let conn = self.read_conn();
+        let datastore = self.datastore();
+        let status = filter.status.clone();
+        let category = filter.category.clone();
+        let limit = filter.limit;
+        let offset = filter.offset;
+        self.run_sql_blocking(async move {
+            let mut sql = format!("{JOB_HISTORY_SELECT} WHERE 1=1");
+            let mut args = Vec::new();
 
-        let mut sql = String::from(
-            "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-                    optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                    failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata,
-                    last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
-             FROM job_history WHERE 1=1",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(status) = status {
+                sql.push_str(" AND status = {}");
+                args.push(SqlArg::Text(status));
+            }
+            if let Some(category) = category {
+                sql.push_str(" AND category = {}");
+                args.push(SqlArg::Text(category));
+            }
 
-        if let Some(ref status) = filter.status {
-            sql.push_str(&format!(" AND status = ?{}", params.len() + 1));
-            params.push(Box::new(status.clone()));
-        }
-        if let Some(ref category) = filter.category {
-            sql.push_str(&format!(" AND category = ?{}", params.len() + 1));
-            params.push(Box::new(category.clone()));
-        }
+            sql.push_str(" ORDER BY completed_at DESC");
 
-        sql.push_str(" ORDER BY completed_at DESC");
+            if let Some(limit) = limit {
+                sql.push_str(&format!(" LIMIT {}", limit));
+            }
+            if let Some(offset) = offset {
+                sql.push_str(&format!(" OFFSET {}", offset));
+            }
 
-        if let Some(limit) = filter.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-        if let Some(offset) = filter.offset {
-            sql.push_str(&format!(" OFFSET {offset}"));
-        }
-
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(JobHistoryRow {
-                    job_id: row.get::<_, i64>(0)? as u64,
-                    job_hash: row.get(1)?,
-                    name: row.get(2)?,
-                    status: row.get(3)?,
-                    error_message: row.get(4)?,
-                    total_bytes: row.get::<_, i64>(5)? as u64,
-                    downloaded_bytes: row.get::<_, i64>(6)? as u64,
-                    optional_recovery_bytes: row.get::<_, i64>(7)? as u64,
-                    optional_recovery_downloaded_bytes: row.get::<_, i64>(8)? as u64,
-                    failed_bytes: row.get::<_, i64>(9)? as u64,
-                    health: row.get(10)?,
-                    category: row.get(11)?,
-                    output_dir: row.get(12)?,
-                    nzb_path: row.get(13)?,
-                    created_at: row.get(14)?,
-                    completed_at: row.get(15)?,
-                    metadata: row.get(16)?,
-                    last_diagnostic_id: row.get(17)?,
-                    last_diagnostic_uploaded_at_epoch_ms: row.get(18)?,
-                })
-            })
-            .map_err(db_err)?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row.map_err(db_err)?);
-        }
-        Ok(entries)
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter().map(job_history_row_from_sql).collect()
+        })
     }
 
     pub fn list_integration_events_after(
@@ -130,93 +101,129 @@ impl Database {
         item_id: Option<u64>,
         limit: Option<u32>,
     ) -> Result<Vec<IntegrationEventRow>, StateError> {
-        let conn = self.read_conn();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut sql = String::from(
+                "SELECT id, timestamp, kind, item_id, payload_json
+                   FROM integration_events
+                  WHERE 1=1",
+            );
+            let mut args = Vec::new();
 
-        let mut sql = String::from(
-            "SELECT id, timestamp, kind, item_id, payload_json
-             FROM integration_events
-             WHERE 1=1",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            if let Some(after_id) = after_id {
+                sql.push_str(" AND id > {}");
+                args.push(SqlArg::I64(after_id));
+            }
 
-        if let Some(after_id) = after_id {
-            sql.push_str(&format!(" AND id > ?{}", params.len() + 1));
-            params.push(Box::new(after_id));
-        }
+            if let Some(item_id) = item_id {
+                sql.push_str(" AND item_id = {}");
+                args.push(SqlArg::I64(item_id as i64));
+            }
 
-        if let Some(item_id) = item_id {
-            sql.push_str(&format!(" AND item_id = ?{}", params.len() + 1));
-            params.push(Box::new(item_id as i64));
-        }
+            sql.push_str(" ORDER BY id ASC");
 
-        sql.push_str(" ORDER BY id ASC");
+            if let Some(limit) = limit {
+                sql.push_str(" LIMIT {}");
+                args.push(SqlArg::I64(i64::from(limit)));
+            }
 
-        if let Some(limit) = limit {
-            sql.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-            params.push(Box::new(limit as i64));
-        }
-
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|value| value.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(IntegrationEventRow {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    kind: row.get(2)?,
-                    item_id: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                    payload_json: row.get(4)?,
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(IntegrationEventRow {
+                        id: row.i64("id")?,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        item_id: row.opt_i64("item_id")?.map(|value| value as u64),
+                        payload_json: row.text("payload_json")?,
+                    })
                 })
-            })
-            .map_err(db_err)?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+                .collect()
+        })
     }
 
     pub fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError> {
-        let conn = self.read_conn();
-        conn.query_row("SELECT MAX(id) FROM integration_events", [], |row| {
-            row.get(0)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT MAX(id) AS id FROM integration_events",
+                &[],
+            )
+            .await?
+            .map(|row| row.opt_i64("id"))
+            .transpose()
+            .map(Option::flatten)
         })
-        .map_err(db_err)
     }
 
     pub fn max_job_id(&self) -> Result<u64, StateError> {
-        let conn = self.read_conn();
-        let max: Option<i64> = conn
-            .query_row("SELECT MAX(job_id) FROM job_history", [], |row| row.get(0))
-            .map_err(db_err)?;
-        Ok(max.unwrap_or(0) as u64)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let max = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT MAX(job_id) AS job_id FROM job_history",
+                &[],
+            )
+            .await?
+            .map(|row| row.opt_i64("job_id"))
+            .transpose()?
+            .flatten()
+            .unwrap_or(0);
+            Ok(max as u64)
+        })
     }
 
     pub fn load_history_job_persisted_nzb(
         &self,
         job_id: u64,
     ) -> Result<Option<PersistedNzbRecord>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
                 "SELECT nzb_path, nzb_zstd
-                 FROM job_history
-                 WHERE job_id = ?1
-                 LIMIT 1",
+                   FROM job_history
+                  WHERE job_id = {}
+                  LIMIT 1",
+                &[SqlArg::I64(job_id as i64)],
             )
-            .map_err(db_err)?;
-        let mut rows = stmt.query([job_id as i64]).map_err(db_err)?;
-        let Some(row) = rows.next().map_err(db_err)? else {
-            return Ok(None);
-        };
-        let path: Option<String> = row.get(0).map_err(db_err)?;
-        let nzb_zstd: Option<Vec<u8>> = row.get(1).map_err(db_err)?;
-        let path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("job-{job_id}.nzb")));
-        Ok(Some((path, nzb_zstd)))
+            .await?
+            .map(|row| {
+                let path = row
+                    .opt_text("nzb_path")?
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("job-{job_id}.nzb")));
+                Ok((path, row.opt_bytes("nzb_zstd")?))
+            })
+            .transpose()
+        })
     }
+}
+
+pub(crate) fn job_history_row_from_sql(
+    row: crate::persistence::sql_runtime::SqlRow,
+) -> Result<JobHistoryRow, StateError> {
+    Ok(JobHistoryRow {
+        job_id: row.i64("job_id")? as u64,
+        job_hash: row.opt_bytes("job_hash")?,
+        name: row.text("name")?,
+        status: row.text("status")?,
+        error_message: row.opt_text("error_message")?,
+        total_bytes: row.i64("total_bytes")? as u64,
+        downloaded_bytes: row.i64("downloaded_bytes")? as u64,
+        optional_recovery_bytes: row.i64("optional_recovery_bytes")? as u64,
+        optional_recovery_downloaded_bytes: row.i64("optional_recovery_downloaded_bytes")? as u64,
+        failed_bytes: row.i64("failed_bytes")? as u64,
+        health: row.i32("health")? as u32,
+        category: row.opt_text("category")?,
+        output_dir: row.opt_text("output_dir")?,
+        nzb_path: row.opt_text("nzb_path")?,
+        created_at: row.i64("created_at")?,
+        completed_at: row.i64("completed_at")?,
+        metadata: row.opt_text("metadata")?,
+        last_diagnostic_id: row.opt_text("last_diagnostic_id")?,
+        last_diagnostic_uploaded_at_epoch_ms: row
+            .opt_i64("last_diagnostic_uploaded_at_epoch_ms")?,
+    })
 }

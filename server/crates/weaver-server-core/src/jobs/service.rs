@@ -14,6 +14,23 @@ use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
 use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest, with_diagnostic_metadata};
 
+#[derive(Debug, Default)]
+struct RestoreSkipStats {
+    legacy_segments: usize,
+    complete_files: usize,
+    complete_file_segments: usize,
+    checkpoint_segments: usize,
+    checkpoint_floor_bytes: u64,
+    clamped_checkpoint_files: usize,
+    missing_checkpoint_files: usize,
+}
+
+struct RestoreSkipPlan {
+    skip: HashSet<SegmentId>,
+    file_progress: HashMap<u32, u64>,
+    stats: RestoreSkipStats,
+}
+
 impl Pipeline {
     fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
         let events = match self.db.get_job_events(job_id.0) {
@@ -186,14 +203,17 @@ impl Pipeline {
         job_id: JobId,
     ) -> Result<Option<crate::JobHistoryRow>, crate::SchedulerError> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
-            .await
-            .map_err(|error| {
-                crate::SchedulerError::Internal(format!(
-                    "failed to join history lookup task: {error}"
-                ))
-            })?
-            .map_err(crate::SchedulerError::State)
+        tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(
+                job_id.0,
+                "db.get_job_history.jobs_service_load_history_row",
+            )
+        })
+        .await
+        .map_err(|error| {
+            crate::SchedulerError::Internal(format!("failed to join history lookup task: {error}"))
+        })?
+        .map_err(crate::SchedulerError::State)
     }
 
     fn persisted_nzb_path_for_job(
@@ -205,6 +225,23 @@ impl Pipeline {
             .and_then(|row| row.nzb_path.as_deref())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("job-{}.nzb", job_id.0)))
+    }
+
+    fn persist_file_identities(
+        &self,
+        job_id: JobId,
+        identities: &HashMap<u32, ActiveFileIdentity>,
+    ) {
+        for identity in identities.values() {
+            if let Err(error) = self.db.save_file_identity(job_id, identity) {
+                warn!(
+                    job_id = job_id.0,
+                    file_index = identity.file_index,
+                    error = %error,
+                    "failed to persist file identity"
+                );
+            }
+        }
     }
 
     fn map_restart_nzb_error(
@@ -413,20 +450,108 @@ impl Pipeline {
             .collect()
     }
 
-    fn persist_file_identities(
-        &self,
+    fn restore_current_filename<'a>(
+        file_index: u32,
+        file_spec: &'a crate::jobs::model::FileSpec,
+        file_identities: &'a HashMap<u32, ActiveFileIdentity>,
+    ) -> &'a str {
+        file_identities
+            .get(&file_index)
+            .map(|identity| identity.current_filename.as_str())
+            .unwrap_or(file_spec.filename.as_str())
+    }
+
+    async fn build_restore_skip_plan(
         job_id: JobId,
+        spec: &JobSpec,
+        legacy_segments: &HashSet<SegmentId>,
+        complete_files: &HashSet<NzbFileId>,
+        recovered_file_progress: &HashMap<u32, u64>,
         file_identities: &HashMap<u32, ActiveFileIdentity>,
-    ) {
-        for identity in file_identities.values() {
-            if let Err(error) = self.db.save_file_identity(job_id, identity) {
-                error!(
-                    job_id = job_id.0,
-                    file_index = identity.file_index,
-                    error = %error,
-                    "db write failed for save_file_identity"
-                );
+        working_dir: &std::path::Path,
+    ) -> RestoreSkipPlan {
+        let mut skip = legacy_segments.clone();
+        let mut file_progress = HashMap::new();
+        let mut stats = RestoreSkipStats {
+            legacy_segments: legacy_segments.len(),
+            ..RestoreSkipStats::default()
+        };
+
+        for (file_index, file_spec) in spec.files.iter().enumerate() {
+            let file_index = file_index as u32;
+            let file_id = NzbFileId { job_id, file_index };
+            let file_total_bytes = file_spec
+                .segments
+                .iter()
+                .map(|segment| segment.bytes as u64)
+                .sum::<u64>();
+
+            if complete_files.contains(&file_id) {
+                stats.complete_files += 1;
+                for segment in &file_spec.segments {
+                    let segment_id = SegmentId {
+                        file_id,
+                        segment_number: segment.ordinal,
+                    };
+                    if skip.insert(segment_id) {
+                        stats.complete_file_segments += 1;
+                    }
+                }
+                file_progress.insert(file_index, file_total_bytes);
+                continue;
             }
+
+            let Some(raw_floor) = recovered_file_progress.get(&file_index).copied() else {
+                continue;
+            };
+            if raw_floor == 0 {
+                file_progress.insert(file_index, 0);
+                continue;
+            }
+
+            let filename = Self::restore_current_filename(file_index, file_spec, file_identities);
+            let metadata = match tokio::fs::metadata(working_dir.join(filename)).await {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) | Err(_) => {
+                    stats.missing_checkpoint_files += 1;
+                    file_progress.insert(file_index, 0);
+                    continue;
+                }
+            };
+
+            let clamped_floor = raw_floor.min(file_total_bytes).min(metadata.len());
+            if clamped_floor < raw_floor.min(file_total_bytes) {
+                stats.clamped_checkpoint_files += 1;
+            }
+
+            let mut segment_end = 0u64;
+            let mut checkpoint_floor = 0u64;
+            for segment in &file_spec.segments {
+                segment_end = segment_end.saturating_add(segment.bytes as u64);
+                if segment_end > clamped_floor {
+                    break;
+                }
+
+                let segment_id = SegmentId {
+                    file_id,
+                    segment_number: segment.ordinal,
+                };
+                if skip.insert(segment_id) {
+                    stats.checkpoint_segments += 1;
+                }
+                checkpoint_floor = segment_end;
+            }
+
+            stats.checkpoint_floor_bytes = stats
+                .checkpoint_floor_bytes
+                .saturating_add(checkpoint_floor);
+            file_progress.insert(file_index, checkpoint_floor);
+        }
+
+        RestoreSkipPlan {
+            skip,
+            file_progress,
+            stats,
         }
     }
 
@@ -449,6 +574,8 @@ impl Pipeline {
         nzb_zstd: Vec<u8>,
     ) -> Result<(), crate::SchedulerError> {
         let started = std::time::Instant::now();
+        let _profile_scope = crate::runtime::perf_probe::scope("pipeline.add_job.total");
+        let mut stage_start = std::time::Instant::now();
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
@@ -460,6 +587,10 @@ impl Pipeline {
         tokio::fs::write(working_dir_marker_path(&working_dir), [])
             .await
             .map_err(crate::SchedulerError::Io)?;
+        crate::runtime::perf_probe::record(
+            "pipeline.add_job.working_dir_ready",
+            stage_start.elapsed(),
+        );
         info!(
             job_id = job_id.0,
             working_dir = %working_dir.display(),
@@ -468,23 +599,41 @@ impl Pipeline {
             "pipeline add_job stage"
         );
 
+        stage_start = std::time::Instant::now();
         let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Err(error) = self.db.create_active_job(&crate::ActiveJob {
-            job_id,
-            nzb_hash,
-            nzb_path,
-            nzb_zstd,
-            output_dir: working_dir.clone(),
-            created_at,
-            category: spec.category.clone(),
-            metadata: spec.metadata.clone(),
-        }) {
-            error!(error = %error, "db write failed for create_active_job");
+        let (assembly, download_queue, recovery_queue) =
+            Self::build_job_assembly(job_id, &spec, &HashSet::new());
+        let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
+        let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
+        crate::runtime::perf_probe::record(
+            "pipeline.add_job.build_runtime_inputs",
+            stage_start.elapsed(),
+        );
+
+        stage_start = std::time::Instant::now();
+        if let Err(error) = self.db.create_active_job_with_file_identities(
+            &crate::ActiveJob {
+                job_id,
+                nzb_hash,
+                nzb_path,
+                nzb_zstd,
+                output_dir: working_dir.clone(),
+                created_at,
+                category: spec.category.clone(),
+                metadata: spec.metadata.clone(),
+            },
+            &initial_file_identities,
+        ) {
+            error!(error = %error, "db write failed for create_active_job_with_file_identities");
         }
+        crate::runtime::perf_probe::record(
+            "pipeline.add_job.persist_active_job",
+            stage_start.elapsed(),
+        );
         info!(
             job_id = job_id.0,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -492,15 +641,11 @@ impl Pipeline {
             "pipeline add_job stage"
         );
 
-        let (assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &HashSet::new());
-        let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
-        self.persist_file_identities(job_id, &file_identities);
-
         check_disk_space(&self.intermediate_dir, spec.total_bytes);
 
         let queue_depth = download_queue.len() + recovery_queue.len();
 
+        stage_start = std::time::Instant::now();
         let _ = self.event_tx.send(PipelineEvent::JobCreated {
             job_id,
             name: spec.name.clone(),
@@ -548,6 +693,10 @@ impl Pipeline {
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
 
+        crate::runtime::perf_probe::record(
+            "pipeline.add_job.runtime_state_inserted",
+            stage_start.elapsed(),
+        );
         info!(
             job_id = job_id.0,
             queue_depth,
@@ -1115,30 +1264,6 @@ impl Pipeline {
 
         self.par2_runtime.remove(&job_id);
 
-        match self.db.load_par2_files(job_id) {
-            Ok(files) if !files.is_empty() => {
-                let runtime = self.ensure_par2_runtime(job_id);
-                for (file_index, file) in files {
-                    runtime.files.insert(
-                        file_index,
-                        crate::pipeline::Par2FileRuntime {
-                            filename: file.filename,
-                            recovery_blocks: file.recovery_block_count,
-                            promoted: file.promoted,
-                        },
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted PAR2 file state"
-                );
-            }
-        }
-
         for (file_id, role) in &files {
             if matches!(
                 role,
@@ -1187,17 +1312,7 @@ impl Pipeline {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
-            state
-                .assembly
-                .files()
-                .filter(|file| {
-                    !matches!(
-                        self.classified_role_for_file(job_id, file),
-                        weaver_model::files::FileRole::RarVolume { .. }
-                    )
-                })
-                .map(|file| file.file_id())
-                .collect()
+            state.assembly.files().map(|file| file.file_id()).collect()
         };
 
         for file_id in files {
@@ -1232,6 +1347,7 @@ impl Pipeline {
             job_hash,
             spec,
             committed_segments,
+            complete_files,
             file_progress,
             detected_archives,
             file_identities,
@@ -1263,11 +1379,28 @@ impl Pipeline {
         }
 
         let committed_count = committed_segments.len();
+        let mut file_identities = if file_identities.is_empty() {
+            Self::build_initial_file_identities(&spec, &detected_archives)
+        } else {
+            file_identities
+        };
+        let (stale_rar_sets, refreshed_rar_files) =
+            Self::scrub_restored_par2_file_identities(&mut file_identities);
+        let restore_skip_plan = Self::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &committed_segments,
+            &complete_files,
+            &file_progress,
+            &file_identities,
+            &working_dir,
+        )
+        .await;
         let (assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &committed_segments);
+            Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
         let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
 
-        let committed_ref = &committed_segments;
+        let skip_ref = &restore_skip_plan.skip;
         let mut downloaded_bytes = 0u64;
         let mut restored_download_floor_bytes = 0u64;
         for (fi, file_spec) in spec.files.iter().enumerate() {
@@ -1283,12 +1416,13 @@ impl Pipeline {
                         file_id,
                         segment_number: seg.ordinal,
                     };
-                    committed_ref.contains(&sid).then_some(seg.bytes as u64)
+                    skip_ref.contains(&sid).then_some(seg.bytes as u64)
                 })
                 .sum();
             downloaded_bytes += committed_bytes_for_file;
             let file_total_bytes: u64 = file_spec.segments.iter().map(|seg| seg.bytes as u64).sum();
-            let file_progress_floor = file_progress
+            let file_progress_floor = restore_skip_plan
+                .file_progress
                 .get(&(fi as u32))
                 .copied()
                 .unwrap_or(0)
@@ -1299,13 +1433,6 @@ impl Pipeline {
         }
 
         let queue_depth = download_queue.len() + recovery_queue.len();
-        let mut file_identities = if file_identities.is_empty() {
-            Self::build_initial_file_identities(&spec, &detected_archives)
-        } else {
-            file_identities
-        };
-        let (stale_rar_sets, refreshed_rar_files) =
-            Self::scrub_restored_par2_file_identities(&mut file_identities);
         let paused_resume_status = matches!(status, JobStatus::Paused)
             .then(|| {
                 paused_resume_status.clone().or_else(|| {
@@ -1439,19 +1566,6 @@ impl Pipeline {
         if !extracted_members.is_empty() {
             self.extracted_members.insert(job_id, extracted_members);
         }
-        match self.db.load_failed_extractions(job_id) {
-            Ok(failed_members) if !failed_members.is_empty() => {
-                self.failed_extractions.insert(job_id, failed_members);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted failed extraction members"
-                );
-            }
-        }
         match self.db.load_active_job_normalization_retried(job_id) {
             Ok(true) => {
                 self.normalization_retried.insert(job_id);
@@ -1511,6 +1625,14 @@ impl Pipeline {
             queued_repair_at_epoch_ms = queued_repair_at_epoch_ms.unwrap_or(0.0),
             queued_extract_at_epoch_ms = queued_extract_at_epoch_ms.unwrap_or(0.0),
             queue_depth,
+            restore_skip_segments = restore_skip_plan.skip.len(),
+            legacy_restore_segments = restore_skip_plan.stats.legacy_segments,
+            complete_restore_files = restore_skip_plan.stats.complete_files,
+            complete_restore_segments = restore_skip_plan.stats.complete_file_segments,
+            checkpoint_restore_segments = restore_skip_plan.stats.checkpoint_segments,
+            checkpoint_floor_bytes = restore_skip_plan.stats.checkpoint_floor_bytes,
+            clamped_checkpoint_files = restore_skip_plan.stats.clamped_checkpoint_files,
+            missing_checkpoint_files = restore_skip_plan.stats.missing_checkpoint_files,
             "job restored from journal"
         );
         if self.jobs.get(&job_id).is_some_and(|state| {
@@ -1530,10 +1652,10 @@ impl Pipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId};
+    use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
     use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
     use weaver_model::files::FileRole;
 
@@ -1570,6 +1692,146 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    fn sparse_segment_id(job_id: JobId, segment_number: u32) -> SegmentId {
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_skip_plan_uses_complete_files_without_segment_rows() {
+        let job_id = JobId(43);
+        let spec = sparse_segment_job_spec();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let complete_files = HashSet::from([NzbFileId {
+            job_id,
+            file_index: 0,
+        }]);
+
+        let plan = Pipeline::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            &complete_files,
+            &HashMap::new(),
+            &HashMap::new(),
+            temp_dir.path(),
+        )
+        .await;
+
+        assert_eq!(plan.skip.len(), 3);
+        assert!(plan.skip.contains(&sparse_segment_id(job_id, 0)));
+        assert!(plan.skip.contains(&sparse_segment_id(job_id, 1)));
+        assert!(plan.skip.contains(&sparse_segment_id(job_id, 2)));
+        assert_eq!(plan.file_progress.get(&0), Some(&60));
+        assert_eq!(plan.stats.complete_files, 1);
+        assert_eq!(plan.stats.complete_file_segments, 3);
+    }
+
+    #[tokio::test]
+    async fn restore_skip_plan_uses_checkpointed_full_segments() {
+        let job_id = JobId(44);
+        let spec = sparse_segment_job_spec();
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 60])
+            .await
+            .unwrap();
+
+        let plan = Pipeline::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::from([(0u32, 30u64)]),
+            &HashMap::new(),
+            temp_dir.path(),
+        )
+        .await;
+
+        assert_eq!(plan.skip.len(), 2);
+        assert!(plan.skip.contains(&sparse_segment_id(job_id, 0)));
+        assert!(plan.skip.contains(&sparse_segment_id(job_id, 1)));
+        assert!(!plan.skip.contains(&sparse_segment_id(job_id, 2)));
+        assert_eq!(plan.file_progress.get(&0), Some(&30));
+        assert_eq!(plan.stats.checkpoint_segments, 2);
+    }
+
+    #[tokio::test]
+    async fn restore_skip_plan_does_not_skip_partial_segment_floor() {
+        let job_id = JobId(45);
+        let spec = sparse_segment_job_spec();
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 60])
+            .await
+            .unwrap();
+
+        let plan = Pipeline::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::from([(0u32, 25u64)]),
+            &HashMap::new(),
+            temp_dir.path(),
+        )
+        .await;
+
+        assert_eq!(plan.skip, HashSet::from([sparse_segment_id(job_id, 0)]));
+        assert_eq!(plan.file_progress.get(&0), Some(&10));
+        assert_eq!(plan.stats.checkpoint_segments, 1);
+    }
+
+    #[tokio::test]
+    async fn restore_skip_plan_clamps_progress_to_partial_file_size() {
+        let job_id = JobId(46);
+        let spec = sparse_segment_job_spec();
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 15])
+            .await
+            .unwrap();
+
+        let plan = Pipeline::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::from([(0u32, 50u64)]),
+            &HashMap::new(),
+            temp_dir.path(),
+        )
+        .await;
+
+        assert_eq!(plan.skip, HashSet::from([sparse_segment_id(job_id, 0)]));
+        assert_eq!(plan.file_progress.get(&0), Some(&10));
+        assert_eq!(plan.stats.clamped_checkpoint_files, 1);
+    }
+
+    #[tokio::test]
+    async fn restore_skip_plan_discards_progress_when_partial_file_is_missing() {
+        let job_id = JobId(47);
+        let spec = sparse_segment_job_spec();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let plan = Pipeline::build_restore_skip_plan(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::from([(0u32, 50u64)]),
+            &HashMap::new(),
+            temp_dir.path(),
+        )
+        .await;
+
+        assert!(plan.skip.is_empty());
+        assert_eq!(plan.file_progress.get(&0), Some(&0));
+        assert_eq!(plan.stats.missing_checkpoint_files, 1);
     }
 
     #[test]

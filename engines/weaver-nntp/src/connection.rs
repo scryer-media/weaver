@@ -668,6 +668,18 @@ impl NntpConnection {
     {
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         let initial = self.send_command(&cmd).await?;
+        let initial = if initial.code.raw() == 480 {
+            if let Some((user, pass)) = self.credentials.clone() {
+                debug!("server requested re-authentication (480), re-authenticating");
+                self.authenticate(&user, &pass).await?;
+                self.current_group = None;
+                self.send_command(&cmd).await?
+            } else {
+                return Err(NntpError::AuthenticationRequired);
+            }
+        } else {
+            initial
+        };
 
         if initial.code.is_error() {
             return Err(NntpError::from_status(initial.code, &initial.message));
@@ -739,6 +751,18 @@ impl NntpConnection {
     {
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
         let initial = self.send_command(&cmd).await?;
+        let initial = if initial.code.raw() == 480 {
+            if let Some((user, pass)) = self.credentials.clone() {
+                debug!("server requested re-authentication (480), re-authenticating");
+                self.authenticate(&user, &pass).await?;
+                self.current_group = None;
+                self.send_command(&cmd).await?
+            } else {
+                return Err(NntpError::AuthenticationRequired);
+            }
+        } else {
+            initial
+        };
 
         if initial.code.is_error() {
             return Err(NntpError::from_status(initial.code, &initial.message));
@@ -1098,6 +1122,78 @@ mod tests {
         let mut conn = NntpConnection::connect(&config).await.unwrap();
         let response = conn.body_by_id("<test@example.com>").await.unwrap();
         assert_eq!(&response.data[..], b"hello\r\n");
+    }
+
+    #[tokio::test]
+    async fn stream_body_chunked_raw_reauthenticates_on_mid_session_480() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"480 authentication required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\nhello\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.username = Some("user".into());
+        config.password = Some("pass".into());
+
+        let mut conn = NntpConnection::connect(&config).await.unwrap();
+        let mut chunks = Vec::new();
+        let total = conn
+            .stream_body_chunked_raw("<test@example.com>", |chunk| {
+                chunks.push(chunk.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(total, b"hello\r\n".len() as u64);
+        assert_eq!(chunks, vec![b"hello\r\n".to_vec()]);
     }
 
     #[tokio::test]

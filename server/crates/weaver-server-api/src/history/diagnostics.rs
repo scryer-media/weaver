@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +36,7 @@ const LOG_FILE: &str = "diagnostic_attempt/runtime.log";
 const SERVER_ATTEMPTS_FILE: &str = "diagnostic_attempt/server_attempts.ndjson";
 const UPLOAD_SESSION_FILE: &str = "upload_session.json";
 const UPLOAD_RECEIPT_FILE: &str = "upload_receipt.json";
+const DIAGNOSTIC_NON_RUN_CACHE_LIMIT: usize = 8192;
 
 #[derive(Clone)]
 pub(crate) struct DiagnosticManager {
@@ -46,12 +47,54 @@ pub(crate) struct DiagnosticManager {
     http_client: reqwest::Client,
     wake: Arc<Notify>,
     tracked: Arc<RwLock<HashMap<u64, TrackedDiagnosticRun>>>,
+    non_diagnostic_jobs: Arc<RwLock<BoundedJobIdCache>>,
 }
 
 #[derive(Debug, Clone)]
 struct TrackedDiagnosticRun {
     source_job_id: u64,
     diagnostic_job_id: u64,
+}
+
+#[derive(Debug)]
+struct BoundedJobIdCache {
+    limit: usize,
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl BoundedJobIdCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, job_id: u64) -> bool {
+        self.set.contains(&job_id)
+    }
+
+    fn insert(&mut self, job_id: u64) {
+        if self.limit == 0 || !self.set.insert(job_id) {
+            return;
+        }
+        self.order.push_back(job_id);
+        while self.set.len() > self.limit {
+            if let Some(expired) = self.order.pop_front() {
+                self.set.remove(&expired);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove(&mut self, job_id: u64) {
+        if self.set.remove(&job_id) {
+            self.order.retain(|candidate| *candidate != job_id);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +247,9 @@ impl DiagnosticManager {
             http_client,
             wake: Arc::new(Notify::new()),
             tracked: Arc::new(RwLock::new(HashMap::new())),
+            non_diagnostic_jobs: Arc::new(RwLock::new(BoundedJobIdCache::new(
+                DIAGNOSTIC_NON_RUN_CACHE_LIMIT,
+            ))),
         }
     }
 
@@ -542,13 +588,17 @@ impl DiagnosticManager {
             if !live {
                 let db = self.db.clone();
                 let diagnostic_job_id = row.diagnostic_job_id;
-                let history_exists =
-                    tokio::task::spawn_blocking(move || db.get_job_history(diagnostic_job_id))
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .flatten()
-                        .is_some();
+                let history_exists = tokio::task::spawn_blocking(move || {
+                    db.get_job_history_profiled(
+                        diagnostic_job_id,
+                        "db.get_job_history.api_diagnostics_history_exists",
+                    )
+                })
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+                .is_some();
                 if history_exists
                     || matches!(
                         row.stage,
@@ -1000,7 +1050,8 @@ impl DiagnosticManager {
         job_id: u64,
     ) -> std::result::Result<JobDetailSnapshot, DiagnosticBundleError> {
         for _ in 0..20 {
-            match load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id).await {
+            match load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id, true).await
+            {
                 Ok(snapshot)
                     if snapshot.history_item.is_some() || snapshot.queue_item.is_some() =>
                 {
@@ -1011,7 +1062,7 @@ impl DiagnosticManager {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id)
+        load_job_detail_snapshot(self.handle.clone(), self.db.clone(), job_id, true)
             .await
             .map_err(|error| DiagnosticBundleError::State(format!("{error:?}")))
     }
@@ -1021,10 +1072,12 @@ impl DiagnosticManager {
         job_id: u64,
     ) -> std::result::Result<Option<JobHistoryRow>, DiagnosticBundleError> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.get_job_history(job_id))
-            .await
-            .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
-            .map_err(|error| DiagnosticBundleError::State(error.to_string()))
+        tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(job_id, "db.get_job_history.api_diagnostics_bundle")
+        })
+        .await
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))?
+        .map_err(|error| DiagnosticBundleError::State(error.to_string()))
     }
 
     async fn load_raw_nzb_text(
@@ -1165,9 +1218,13 @@ impl DiagnosticManager {
         if let Some(run) = self.tracked.read().await.get(&diagnostic_job_id).cloned() {
             return Ok(Some(run));
         }
-        if let Some(row) = self.load_run_by_job(diagnostic_job_id).await? {
-            self.track_run(&row).await;
-            return Ok(Some(TrackedDiagnosticRun::from_row(&row)));
+        if self
+            .non_diagnostic_jobs
+            .read()
+            .await
+            .contains(diagnostic_job_id)
+        {
+            return Ok(None);
         }
         let live_job = self.handle.get_job(JobId(diagnostic_job_id)).ok();
         if let Some(job) = live_job
@@ -1181,12 +1238,28 @@ impl DiagnosticManager {
                 .write()
                 .await
                 .insert(diagnostic_job_id, run.clone());
+            self.non_diagnostic_jobs
+                .write()
+                .await
+                .remove(diagnostic_job_id);
             return Ok(Some(run));
         }
+        // Event processing is hot enough that persistent diagnostic recovery must
+        // stay out of this path. Startup/housekeeping recovery tracks durable
+        // diagnostic rows; live diagnostic jobs can still be discovered from
+        // metadata above.
+        self.non_diagnostic_jobs
+            .write()
+            .await
+            .insert(diagnostic_job_id);
         Ok(None)
     }
 
     async fn track_run(&self, row: &DiagnosticRunRow) {
+        self.non_diagnostic_jobs
+            .write()
+            .await
+            .remove(row.diagnostic_job_id);
         self.tracked
             .write()
             .await
@@ -1195,6 +1268,10 @@ impl DiagnosticManager {
 
     async fn active_runs(&self) -> Vec<TrackedDiagnosticRun> {
         self.tracked.read().await.values().cloned().collect()
+    }
+
+    pub(crate) async fn has_active_runs(&self) -> bool {
+        !self.tracked.read().await.is_empty()
     }
 
     async fn current_upload_url(&self) -> Option<String> {
@@ -1580,7 +1657,41 @@ fn bundle_graphql_error(error: DiagnosticBundleError) -> async_graphql::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_DIAGNOSTIC_UPLOAD_URL, resolved_diagnostic_upload_url};
+    use super::{BoundedJobIdCache, DEFAULT_DIAGNOSTIC_UPLOAD_URL, resolved_diagnostic_upload_url};
+
+    #[test]
+    fn bounded_job_id_cache_evicts_old_entries_and_removes() {
+        let mut cache = BoundedJobIdCache::new(2);
+
+        cache.insert(10);
+        cache.insert(11);
+        assert!(cache.contains(10));
+        assert!(cache.contains(11));
+
+        cache.insert(12);
+        assert!(!cache.contains(10));
+        assert!(cache.contains(11));
+        assert!(cache.contains(12));
+
+        cache.remove(11);
+        assert!(!cache.contains(11));
+
+        cache.insert(13);
+        assert!(cache.contains(12));
+        assert!(cache.contains(13));
+    }
+
+    #[test]
+    fn bounded_job_id_cache_ignores_duplicate_inserts() {
+        let mut cache = BoundedJobIdCache::new(2);
+
+        cache.insert(10);
+        cache.insert(10);
+        cache.insert(11);
+
+        assert!(cache.contains(10));
+        assert!(cache.contains(11));
+    }
 
     #[test]
     fn defaults_to_public_diagnostics_service_when_unset() {

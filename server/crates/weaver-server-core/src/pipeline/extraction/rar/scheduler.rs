@@ -409,7 +409,6 @@ impl Pipeline {
 
                 let output_dir = self.extraction_staging_dir(job_id);
                 let event_tx = self.event_tx.clone();
-                let db = self.db.clone();
                 let attempted = members_to_extract.clone();
                 let extract_done_tx = self.extract_done_tx.clone();
                 let set_name_owned = set_name.clone();
@@ -454,7 +453,6 @@ impl Pipeline {
                                     &mut archive,
                                     RarExtractionContext {
                                         volume_paths: &volume_paths_for_task,
-                                        db: &db,
                                         event_tx: &event_tx,
                                         job_id,
                                         set_name: &set_name_for_task,
@@ -534,14 +532,6 @@ impl Pipeline {
         }
         if remove_entry {
             self.failed_extractions.remove(&job_id);
-        }
-        if let Err(error) = self.db.remove_failed_extraction(job_id, member_name) {
-            error!(
-                job_id = job_id.0,
-                member = %member_name,
-                error = %error,
-                "failed to clear persisted failed extraction member"
-            );
         }
     }
 

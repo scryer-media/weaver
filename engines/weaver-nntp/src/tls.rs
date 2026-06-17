@@ -106,7 +106,7 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         }
     }
 
-    let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .unwrap()

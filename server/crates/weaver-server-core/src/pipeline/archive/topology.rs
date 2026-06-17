@@ -7,7 +7,7 @@ use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::{
     ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
@@ -357,33 +357,6 @@ impl Pipeline {
             .get(&key)
             .map(|state| state.verified_suspect_volumes.clone())
             .unwrap_or_default();
-
-        for volume in self
-            .rar_sets
-            .get(&key)
-            .map(|state| state.facts.keys().copied().collect::<Vec<_>>())
-            .unwrap_or_default()
-        {
-            let eligible = plan.deletion_eligible.contains(&volume);
-            let par2_clean = plan
-                .delete_decisions
-                .get(&volume)
-                .is_some_and(Self::claim_clean_rar_volume)
-                && !verified_suspect_volumes.contains(&volume);
-            let deleted = self.is_rar_volume_deleted(job_id, &plan.topology.volume_map, volume);
-            if let Err(error) = self
-                .db
-                .set_volume_status(job_id, set_name, volume, eligible, par2_clean, deleted)
-            {
-                error!(
-                    job_id = job_id.0,
-                    set_name,
-                    volume,
-                    error = %error,
-                    "failed to persist RAR volume status"
-                );
-            }
-        }
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state
@@ -1089,10 +1062,18 @@ impl Pipeline {
     }
 
     fn set_rar_snapshot(&mut self, job_id: JobId, set_name: &str, headers: Vec<u8>) {
-        self.rar_sets
+        let state = self
+            .rar_sets
             .entry((job_id, set_name.to_string()))
-            .or_default()
-            .cached_headers = Some(headers.clone());
+            .or_default();
+        if state.cached_headers.as_deref() == Some(headers.as_slice()) {
+            crate::runtime::perf_probe::record(
+                "pipeline.rar_snapshot.persist.skipped_unchanged",
+                std::time::Duration::ZERO,
+            );
+            return;
+        }
+        state.cached_headers = Some(headers.clone());
         if let Err(e) = self.db.save_archive_headers(job_id, set_name, &headers) {
             error!(job_id = job_id.0, set_name, error = %e, "failed to persist RAR headers");
         }
@@ -1238,29 +1219,25 @@ impl Pipeline {
             }
         }
 
-        match self.db.load_verified_suspect_volumes(job_id) {
-            Ok(verified_suspect_by_set) => {
-                for (set_name, verified_suspect_volumes) in verified_suspect_by_set {
-                    self.rar_sets
-                        .entry((job_id, set_name))
-                        .or_default()
-                        .verified_suspect_volumes = verified_suspect_volumes;
-                }
-            }
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted verified suspect RAR volumes"
-                );
-            }
-        }
-
-        let set_names: Vec<String> = self
+        let mut set_names: BTreeSet<String> = self
             .rar_sets
             .keys()
             .filter_map(|(jid, set_name)| (*jid == job_id).then_some(set_name.clone()))
             .collect();
+        if let Some(state) = self.jobs.get(&job_id) {
+            for file_asm in state.assembly.files() {
+                if matches!(
+                    self.classified_role_for_file(job_id, file_asm),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                ) && file_asm.is_complete()
+                    && let Some(set_name) =
+                        self.classified_archive_set_name_for_file(job_id, file_asm)
+                {
+                    set_names.insert(set_name);
+                }
+            }
+        }
+        let set_names: Vec<String> = set_names.into_iter().collect();
 
         for set_name in &set_names {
             let volume_files = {
@@ -1290,9 +1267,11 @@ impl Pipeline {
                     })
                     .collect::<Vec<_>>()
             };
+            let mut live_volumes = HashSet::new();
             for (filename, path) in volume_files {
                 match Self::parse_rar_volume_facts_from_path(path, password.clone()).await {
                     Ok(facts) => {
+                        live_volumes.insert(facts.volume_number);
                         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                             Self::register_rar_volume_file(state, facts.volume_number, filename);
                             state.facts.entry(facts.volume_number).or_insert(facts);
@@ -1309,28 +1288,38 @@ impl Pipeline {
                     }
                 }
             }
-            let _ = self.recompute_rar_set_state(job_id, set_name).await;
-        }
-
-        match self.db.load_deleted_volume_statuses(job_id) {
-            Ok(deleted_rows) => {
-                for (set_name, volume_index) in deleted_rows {
-                    let volume_map = self.build_rar_volume_map(job_id, &set_name);
-                    if let Some(filename) = Self::rar_volume_filename(&volume_map, volume_index) {
-                        self.eagerly_deleted
-                            .entry(job_id)
-                            .or_default()
-                            .insert(filename.to_string());
+            let remove_empty_set =
+                if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                    let before = state.facts.len();
+                    state
+                        .facts
+                        .retain(|volume, _| live_volumes.contains(volume));
+                    let discarded = before.saturating_sub(state.facts.len());
+                    if discarded > 0 {
+                        debug!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            discarded,
+                            "discarded stale RAR discovery facts without matching completed files"
+                        );
                     }
+                    state.facts.is_empty() && state.volume_files.is_empty()
+                } else {
+                    false
+                };
+            if remove_empty_set {
+                self.rar_sets.remove(&(job_id, set_name.clone()));
+                if let Err(error) = self.db.delete_rar_volume_facts_for_set(job_id, set_name) {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error = %error,
+                        "failed to delete invalidated RAR discovery facts"
+                    );
                 }
+                continue;
             }
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load deleted RAR volume status"
-                );
-            }
+            let _ = self.recompute_rar_set_state(job_id, set_name).await;
         }
 
         for set_name in set_names {

@@ -77,7 +77,6 @@ impl Pipeline {
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
-            segment_batch: Vec::new(),
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
@@ -154,9 +153,17 @@ impl Pipeline {
         R: Send + 'static,
     {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || f(&db))
-            .await
-            .expect("db task panicked")
+        let started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            let task_started = Instant::now();
+            let result = f(&db);
+            crate::runtime::perf_probe::record("pipeline.db_blocking.task", task_started.elapsed());
+            result
+        })
+        .await
+        .expect("db task panicked");
+        crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
+        result
     }
 
     pub(crate) fn db_fire_and_forget<F>(&self, f: F)
@@ -164,7 +171,16 @@ impl Pipeline {
         F: FnOnce(&crate::Database) + Send + 'static,
     {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || f(&db));
+        let started = Instant::now();
+        tokio::task::spawn_blocking(move || {
+            let task_started = Instant::now();
+            f(&db);
+            crate::runtime::perf_probe::record(
+                "pipeline.db_fire_and_forget.task",
+                task_started.elapsed(),
+            );
+        });
+        crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
     }
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
@@ -204,17 +220,26 @@ impl Pipeline {
         }
         self.pending_file_progress
             .insert(file_id, contiguous_bytes_written);
-        if force_flush
-            || contiguous_bytes_written.saturating_sub(current) >= FILE_PROGRESS_FLUSH_DELTA_BYTES
-        {
-            self.flush_file_progress_batch();
+        let threshold_flush =
+            contiguous_bytes_written.saturating_sub(current) >= download_restart_checkpoint_bytes();
+        if force_flush || threshold_flush {
+            let label = if force_flush {
+                "download.file_progress.flush.force"
+            } else {
+                "download.file_progress.flush.threshold"
+            };
+            self.flush_file_progress_batch(label);
+            if threshold_flush {
+                crate::e2e_failpoint::maybe_delay("download.after_progress_floor_flush");
+            }
         }
     }
 
-    pub(crate) fn flush_file_progress_batch(&mut self) {
+    pub(crate) fn flush_file_progress_batch(&mut self, label: &'static str) {
         if self.pending_file_progress.is_empty() {
             return;
         }
+        let _probe = crate::runtime::perf_probe::scope(label);
         let pending = std::mem::take(&mut self.pending_file_progress);
         for (file_id, bytes) in &pending {
             self.persisted_file_progress.insert(*file_id, *bytes);
@@ -531,23 +556,10 @@ impl Pipeline {
                 "draining in-flight downloads"
             );
         }
-        self.flush_segment_batch();
-        self.flush_file_progress_batch();
-    }
-
-    pub(crate) fn flush_segment_batch(&mut self) {
-        if self.segment_batch.is_empty() {
-            return;
+        self.flush_file_progress_batch("download.file_progress.flush.drain");
+        if let Err(error) = self.flush_download_bandwidth_usage() {
+            warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
-        let batch = std::mem::take(&mut self.segment_batch);
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db.commit_segments(&batch) {
-                tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
-            } else {
-                crate::e2e_failpoint::maybe_trip("download.after_batch_commit_before_ack");
-            }
-        });
     }
 }
 
@@ -558,7 +570,9 @@ pub(crate) async fn write_segment_to_disk(
 ) -> Result<(), std::io::Error> {
     let path = path.to_owned();
     let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let task_started = Instant::now();
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
         use std::io::{Seek, Write};
@@ -569,10 +583,14 @@ pub(crate) async fn write_segment_to_disk(
             .open(&path)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
         file.write_all(&data)?;
-        Ok(())
+        let result = Ok::<(), std::io::Error>(());
+        crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
+        result
     })
     .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
+    result
 }
 
 pub(crate) fn compute_write_backlog_budget_bytes(

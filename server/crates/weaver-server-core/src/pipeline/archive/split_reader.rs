@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::range::Range;
 
 /// Presents multiple files as a single contiguous `Read + Seek` stream.
 ///
 /// Used for split archives (e.g., `.7z.001`, `.7z.002`) where the archive
 /// parser expects a single seekable source.
 pub struct SplitFileReader {
-    /// (file handle, cumulative start offset, size).
+    /// Ordered file parts and their byte spans in the virtual stream.
     parts: Vec<Part>,
     total_size: u64,
     position: u64,
@@ -15,9 +16,8 @@ pub struct SplitFileReader {
 
 struct Part {
     file: File,
-    /// Cumulative byte offset where this part starts in the virtual stream.
-    start: u64,
-    size: u64,
+    /// Half-open byte span owned by this part in the virtual stream.
+    span: Range<u64>,
 }
 
 impl SplitFileReader {
@@ -39,12 +39,14 @@ impl SplitFileReader {
         for path in paths {
             let file = File::open(path.as_ref())?;
             let size = file.metadata()?.len();
+            let end = offset.checked_add(size).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "split file size overflow")
+            })?;
             parts.push(Part {
                 file,
-                start: offset,
-                size,
+                span: Range { start: offset, end },
             });
-            offset += size;
+            offset = end;
         }
 
         Ok(Self {
@@ -62,9 +64,11 @@ impl SplitFileReader {
         // Binary search: find the last part whose start <= position.
         let idx = self
             .parts
-            .partition_point(|p| p.start <= self.position)
+            .partition_point(|p| p.span.start <= self.position)
             .saturating_sub(1);
-        let local_offset = self.position - self.parts[idx].start;
+        let part = &self.parts[idx];
+        debug_assert!(part.span.contains(&self.position));
+        let local_offset = self.position - part.span.start;
         Some((idx, local_offset))
     }
 }
@@ -86,7 +90,7 @@ impl Read for SplitFileReader {
             part.file.seek(SeekFrom::Start(local_offset))?;
 
             // Limit read to remaining bytes in this part.
-            let remaining_in_part = part.size - local_offset;
+            let remaining_in_part = part.span.end - self.position;
             let to_read = (buf.len() - total_read).min(remaining_in_part as usize);
 
             let n = part.file.read(&mut buf[total_read..total_read + to_read])?;

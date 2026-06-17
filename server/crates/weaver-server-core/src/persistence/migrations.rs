@@ -226,14 +226,20 @@ impl Database {
         }
 
         // Check if we already have active jobs (already migrated).
-        {
-            let conn = self.conn();
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM active_jobs", [], |row| row.get(0))
-                .map_err(|e| StateError::Database(e.to_string()))?;
-            if count > 0 {
-                return Ok(false);
-            }
+        let datastore = self.datastore();
+        let active_job_count = self.run_sql_blocking(async move {
+            crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT COUNT(*) AS count FROM active_jobs",
+                &[],
+            )
+            .await?
+            .map(|row| row.i64("count"))
+            .transpose()
+            .map(|count| count.unwrap_or(0))
+        })?;
+        if active_job_count > 0 {
+            return Ok(false);
         }
 
         // Read the journal synchronously.

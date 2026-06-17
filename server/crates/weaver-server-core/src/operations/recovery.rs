@@ -178,6 +178,7 @@ pub async fn recover_server_state(
                             job_hash: recovered.nzb_hash,
                             spec,
                             committed_segments: recovered.committed_segments,
+                            complete_files: recovered.complete_files,
                             file_progress: recovered.file_progress,
                             detected_archives: recovered.detected_archives,
                             file_identities: recovered.file_identities,
@@ -347,8 +348,10 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::StateError;
     use crate::jobs::working_dir::working_dir_marker_path;
-    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId};
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId, NzbFileId};
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
@@ -381,13 +384,28 @@ mod tests {
     }
 
     fn count_rows(db: &Database, table: &str, job_id: u64) -> i64 {
-        let conn = db.conn();
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
-            [job_id as i64],
-            |row| row.get(0),
-        )
+        let datastore = db.datastore();
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE job_id = {{}}");
+        db.run_sql_blocking(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                &sql,
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?
+            .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
+            row.i64_at(0)
+        })
         .unwrap()
+    }
+
+    fn execute_sql(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]
@@ -425,24 +443,23 @@ mod tests {
             crc32: 42,
         }])
         .unwrap();
+        db.complete_file(JobId(1), 0, "sample", &[0xBB; 16])
+            .unwrap();
 
-        {
-            let conn = db.conn();
-            conn.execute(
-                "INSERT INTO active_segments
-                 (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
-                 VALUES (?1, 0, 0, 0, 10, 99)",
-                [99i64],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO active_file_progress
-                 (job_id, file_index, contiguous_bytes_written)
-                 VALUES (?1, 0, 1024)",
-                [100i64],
-            )
-            .unwrap();
-        }
+        execute_sql(
+            &db,
+            "INSERT INTO active_segments
+             (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
+             VALUES ({}, 0, 0, 0, 10, 99)",
+            vec![SqlArg::I64(99)],
+        );
+        execute_sql(
+            &db,
+            "INSERT INTO active_file_progress
+             (job_id, file_index, contiguous_bytes_written)
+             VALUES ({}, 0, 1024)",
+            vec![SqlArg::I64(100)],
+        );
 
         db.insert_job_history(&JobHistoryRow {
             job_id: 2,
@@ -479,6 +496,15 @@ mod tests {
         assert!(!orphan_output_dir.exists());
         assert!(unrelated_output_dir.exists());
         assert_eq!(recovered.to_restore.len(), 1);
+        assert!(
+            recovered.to_restore[0]
+                .request
+                .complete_files
+                .contains(&NzbFileId {
+                    job_id: JobId(1),
+                    file_index: 0,
+                })
+        );
     }
 
     #[tokio::test]

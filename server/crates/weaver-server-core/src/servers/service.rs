@@ -1,17 +1,39 @@
 use crate::StateError;
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::SqlRuntime;
 use crate::servers::ServerConfig;
 
 impl Database {
     pub(crate) fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
-        {
-            let conn = self.conn();
-            conn.execute("DELETE FROM servers", [])
-                .map_err(|e| StateError::Database(e.to_string()))?;
-        }
-        for server in servers {
-            self.insert_server(server)?;
-        }
-        Ok(())
+        use crate::persistence::encryption::maybe_encrypt;
+
+        let datastore = self.datastore();
+        let encryption_key = self.encryption_key().cloned();
+        self.run_sql_blocking({
+            let servers = servers.to_vec();
+            async move {
+                SqlRuntime::run_in_transaction(&datastore, "replace_servers", |tx| {
+                    let servers = servers.clone();
+                    let encryption_key = encryption_key.clone();
+                    Box::pin(async move {
+                        tx.execute("DELETE FROM servers", &[]).await?;
+                        for server in servers {
+                            let record = crate::servers::record::ServerRecord::from_config(&server);
+                            let encrypted_password =
+                                maybe_encrypt(encryption_key.as_ref(), &record.password);
+                            tx.execute(
+                                "INSERT INTO servers
+                                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert)
+                                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                                &crate::servers::persistence::server_args(record, encrypted_password),
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+            }
+        })
     }
 }

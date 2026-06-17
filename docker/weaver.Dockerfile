@@ -2,7 +2,7 @@ FROM alpine:latest
 
 ARG TARGETARCH
 
-RUN apk add --no-cache su-exec tzdata
+RUN apk add --no-cache tzdata util-linux
 
 WORKDIR /app
 

@@ -188,6 +188,7 @@ impl Pipeline {
 
     /// Handle a completed decode — persist the segment, update assembly, journal.
     pub(crate) async fn handle_decode_done(&mut self, result: DecodeDone) {
+        let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_done");
         self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
 
         let segment_id = match &result {
@@ -320,12 +321,12 @@ impl Pipeline {
     }
 
     pub(crate) async fn handle_decode_success(&mut self, result: DecodeResult) {
+        let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
             file_offset,
             decoded_size,
             crc_valid,
-            crc32,
             data,
             yenc_name,
         } = result;
@@ -367,7 +368,6 @@ impl Pipeline {
         let buffered_segment = BufferedDecodedSegment {
             segment_id,
             decoded_size,
-            crc32,
             data,
             yenc_name,
         };
@@ -416,6 +416,7 @@ impl Pipeline {
             self.remove_empty_write_buffer(file_id);
             return Ok(());
         }
+        let _profile_scope = crate::runtime::perf_probe::scope("download.persist_ready_segments");
 
         let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
         else {
@@ -567,6 +568,7 @@ impl Pipeline {
         filename: &str,
         working_dir: &std::path::Path,
     ) {
+        let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
         let job_id = segment.segment_id.file_id.job_id;
         let file_id = segment.segment_id.file_id;
 
@@ -599,30 +601,11 @@ impl Pipeline {
 
                 self.note_file_hash_chunk(file_id, file_offset, segment.data.as_slice());
 
-                self.segment_batch.push(CommittedSegment {
-                    job_id,
-                    file_index: segment.segment_id.file_id.file_index,
-                    segment_number: segment.segment_id.segment_number,
-                    file_offset,
-                    decoded_size: segment.decoded_size,
-                    crc32: segment.crc32,
-                });
-                if self.segment_batch.len() >= 100 {
-                    let batch = std::mem::take(&mut self.segment_batch);
-                    let db = self.db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = db.commit_segments(&batch) {
-                            tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
-                        } else {
-                            crate::e2e_failpoint::maybe_trip(
-                                "download.after_batch_commit_before_ack",
-                            );
-                        }
-                    });
-                }
-
                 if file_complete {
-                    self.note_file_progress_floor(file_id, total_bytes, true);
+                    crate::runtime::perf_probe::record(
+                        "download.file_progress.complete_file_row_covers_restart",
+                        std::time::Duration::ZERO,
+                    );
                     self.unavailable_promoted_recovery_segments
                         .retain(|segment_id| segment_id.file_id != file_id);
                     let file_path = working_dir.join(filename);
@@ -697,20 +680,6 @@ impl Pipeline {
                         total_bytes,
                     });
 
-                    if !self.segment_batch.is_empty() {
-                        let batch = std::mem::take(&mut self.segment_batch);
-                        let db = self.db.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(e) = db.commit_segments(&batch) {
-                                tracing::error!(count = batch.len(), error = %e, "failed to commit segment batch");
-                            } else {
-                                crate::e2e_failpoint::maybe_trip(
-                                    "download.after_batch_commit_before_ack",
-                                );
-                            }
-                        });
-                    }
-
                     {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
@@ -730,6 +699,10 @@ impl Pipeline {
 
                     let mut stage_start = Instant::now();
                     self.try_load_par2_metadata(job_id, file_id).await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.try_load_par2_metadata",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
@@ -737,6 +710,10 @@ impl Pipeline {
                     );
                     stage_start = Instant::now();
                     self.try_merge_par2_recovery(job_id, file_id).await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.try_merge_par2_recovery",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
@@ -745,6 +722,10 @@ impl Pipeline {
                     stage_start = Instant::now();
                     self.refresh_archive_state_for_completed_file(job_id, file_id, true)
                         .await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.refresh_archive_state_for_completed_file",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
@@ -752,6 +733,10 @@ impl Pipeline {
                     );
                     stage_start = Instant::now();
                     self.retry_par2_authoritative_identity(job_id).await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.retry_par2_authoritative_identity",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
@@ -759,6 +744,10 @@ impl Pipeline {
                     );
                     stage_start = Instant::now();
                     self.try_rar_extraction(job_id).await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.try_rar_extraction",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
@@ -766,6 +755,10 @@ impl Pipeline {
                     );
                     stage_start = Instant::now();
                     self.check_job_completion(job_id).await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.check_job_completion",
+                        stage_start.elapsed(),
+                    );
                     debug!(
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,

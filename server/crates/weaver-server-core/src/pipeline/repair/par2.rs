@@ -624,27 +624,6 @@ impl Pipeline {
         let _ = self
             .event_tx
             .send(PipelineEvent::Par2MetadataLoaded { job_id });
-
-        if let Err(e) = self
-            .db
-            .set_par2_metadata(job_id, slice_size, recovery_block_count)
-        {
-            error!(error = %e, "db write failed for set_par2_metadata");
-        }
-        if let Err(error) = self.db.upsert_par2_file(
-            job_id,
-            file_id.file_index,
-            &filename,
-            recovery_block_count,
-            false,
-        ) {
-            error!(
-                job_id = job_id.0,
-                file_index = file_id.file_index,
-                error = %error,
-                "db write failed for upsert_par2_file"
-            );
-        }
     }
 
     /// When a PAR2 recovery volume completes, parse it and merge recovery
@@ -719,27 +698,6 @@ impl Pipeline {
                     entry.filename = filename.clone();
                     entry.recovery_blocks = result.new_recovery_slices;
                     entry.promoted = promoted;
-                }
-                if let Err(error) = self.db.upsert_par2_file(
-                    job_id,
-                    file_id.file_index,
-                    &filename,
-                    result.new_recovery_slices,
-                    promoted,
-                ) {
-                    error!(
-                        job_id = job_id.0,
-                        file_index = file_id.file_index,
-                        error = %error,
-                        "db write failed for upsert_par2_file"
-                    );
-                }
-                let slice_size = self.par2_set(job_id).map(|set| set.slice_size).unwrap_or(0);
-                if let Err(error) = self
-                    .db
-                    .set_par2_metadata(job_id, slice_size, total_recovery)
-                {
-                    error!(error = %error, "db write failed for set_par2_metadata");
                 }
                 info!(
                     job_id = job_id.0,
@@ -1043,17 +1001,7 @@ impl Pipeline {
                     entry.promoted = true;
                     (entry.filename.clone(), entry.recovery_blocks)
                 };
-                if let Err(error) =
-                    self.db
-                        .upsert_par2_file(job_id, *file_index, &filename, recovery_blocks, true)
-                {
-                    error!(
-                        job_id = job_id.0,
-                        file_index,
-                        error = %error,
-                        "failed to persist PAR2 file state"
-                    );
-                }
+                let _ = (filename, recovery_blocks);
             }
             info!(
                 job_id = job_id.0,

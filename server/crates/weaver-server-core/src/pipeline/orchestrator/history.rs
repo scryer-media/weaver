@@ -24,12 +24,17 @@ impl Pipeline {
         }
 
         let db = self.db.clone();
-        let row = tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
-            .await
-            .map_err(|e| {
-                crate::SchedulerError::Internal(format!("failed to join history lookup task: {e}"))
-            })?
-            .map_err(crate::SchedulerError::State)?;
+        let row = tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(
+                job_id.0,
+                "db.get_job_history.pipeline_history_cleanup_dirs",
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::SchedulerError::Internal(format!("failed to join history lookup task: {e}"))
+        })?
+        .map_err(crate::SchedulerError::State)?;
         if let Some(row) = row
             && let Some(output_dir) = row.output_dir
             && let Some(path) =
@@ -112,10 +117,12 @@ impl Pipeline {
             return Some(state.working_dir.clone());
         }
         let db = self.db.clone();
-        let row = tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
-            .await
-            .ok()?
-            .ok()?;
+        let row = tokio::task::spawn_blocking(move || {
+            db.get_job_history_profiled(job_id.0, "db.get_job_history.pipeline_output_dir_for_job")
+        })
+        .await
+        .ok()?
+        .ok()?;
         row.and_then(|r| r.output_dir).map(PathBuf::from)
     }
 

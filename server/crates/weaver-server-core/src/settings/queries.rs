@@ -1,37 +1,44 @@
 use crate::StateError;
 use crate::bandwidth::ScheduleEntry;
 use crate::persistence::Database;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::record::SettingRecord;
 
 impl Database {
     pub(crate) fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare_cached("SELECT key, value FROM settings ORDER BY key")
-            .map_err(|e| StateError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(SettingRecord {
-                    key: row.get(0)?,
-                    value: row.get(1)?,
-                })
-            })
-            .map_err(|e| StateError::Database(e.to_string()))?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT key, value FROM settings ORDER BY key",
+                &[],
+            )
+            .await?;
 
-        let mut settings = Vec::new();
-        for row in rows {
-            settings.push(row.map_err(|e| StateError::Database(e.to_string()))?);
-        }
-        Ok(settings)
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SettingRecord {
+                        key: row.text("key")?,
+                        value: row.text("value")?,
+                    })
+                })
+                .collect()
+        })
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, StateError> {
-        let conn = self.read_conn();
-        let mut stmt = conn
-            .prepare_cached("SELECT value FROM settings WHERE key = ?1")
-            .map_err(|e| StateError::Database(e.to_string()))?;
-        let result = stmt.query_row([key], |row| row.get(0)).ok();
-        Ok(result)
+        let datastore = self.datastore();
+        let key = key.to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT value FROM settings WHERE key = {}",
+                &[SqlArg::Text(key)],
+            )
+            .await?
+            .map(|row| row.text("value"))
+            .transpose()
+        })
     }
 
     pub fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError> {

@@ -1,4 +1,4 @@
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -92,7 +92,8 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
 }
 
 fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

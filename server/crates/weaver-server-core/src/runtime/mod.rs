@@ -2,6 +2,7 @@ pub mod affinity;
 pub mod buffers;
 pub(crate) mod file_cache;
 pub mod log_buffer;
+pub(crate) mod perf_probe;
 pub mod postprocess_pool;
 pub mod reload;
 pub mod system_probe;

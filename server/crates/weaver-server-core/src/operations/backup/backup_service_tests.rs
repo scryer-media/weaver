@@ -15,8 +15,7 @@ struct RuntimeCapture {
 }
 
 fn open_temp_db() -> Database {
-    let dir = tempfile::tempdir().unwrap();
-    Database::open(&dir.path().join("weaver.db")).unwrap()
+    Database::open_in_memory().unwrap()
 }
 
 fn build_service(db: Database, config: Config) -> (BackupService, RuntimeCapture) {

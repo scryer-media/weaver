@@ -242,11 +242,16 @@ impl JobsQuery {
             Ok(info) => info.output_dir.clone(),
             Err(weaver_server_core::SchedulerError::JobNotFound(_)) => {
                 let db = ctx.data::<Database>()?.clone();
-                tokio::task::spawn_blocking(move || db.get_job_history(job_id))
-                    .await
-                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                    .and_then(|row| row.output_dir)
+                tokio::task::spawn_blocking(move || {
+                    db.get_job_history_profiled(
+                        job_id,
+                        "db.get_job_history.api_job_output_dir_fallback",
+                    )
+                })
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .and_then(|row| row.output_dir)
             }
             Err(e) => return Err(e.into()),
         };

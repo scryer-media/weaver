@@ -1,22 +1,6 @@
 use super::*;
 
 impl Pipeline {
-    fn member_artifact_root_for_restart_reconcile(&self, job_id: JobId) -> Option<PathBuf> {
-        let state = self.jobs.get(&job_id)?;
-        if let Some(staging_dir) = state.staging_dir.as_ref()
-            && staging_dir.exists()
-        {
-            return Some(staging_dir.clone());
-        }
-
-        let deterministic_staging_dir = self.deterministic_extraction_staging_dir(job_id);
-        if deterministic_staging_dir.exists() {
-            return Some(deterministic_staging_dir);
-        }
-
-        Some(state.working_dir.clone())
-    }
-
     #[cfg(test)]
     pub(crate) fn status_enter_failpoint_for_transition(
         old_post_state: crate::jobs::model::PostState,
@@ -229,6 +213,23 @@ impl Pipeline {
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
     ) {
+        fn should_persist_runtime_to_db(
+            old_run_state: crate::jobs::model::RunState,
+            new_status: &JobStatus,
+            new_run_state: crate::jobs::model::RunState,
+        ) -> bool {
+            matches!(
+                new_status,
+                JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Paused
+            ) || matches!(
+                (old_run_state, new_run_state),
+                (
+                    crate::jobs::model::RunState::Paused,
+                    crate::jobs::model::RunState::Active
+                )
+            )
+        }
+
         let failpoint_name = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -253,7 +254,15 @@ impl Pipeline {
                 }
             }
         };
-        let (transitioned, released_repair, released_extract, entered_repair, entered_extract) = {
+        let (
+            transitioned,
+            persisted_snapshot_changed,
+            persist_runtime_to_db,
+            released_repair,
+            released_extract,
+            entered_repair,
+            entered_extract,
+        ) = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -261,8 +270,12 @@ impl Pipeline {
             let old_download_state = state.download_state;
             let old_post_state = state.post_state;
             let old_run_state = state.run_state;
+            let old_failure_error = state.failure_error.clone();
             let queued_repair_at = state.queued_repair_at_epoch_ms;
             let queued_extract_at = state.queued_extract_at_epoch_ms;
+            let old_paused_resume_status = state.paused_resume_status.clone();
+            let old_paused_resume_download_state = state.paused_resume_download_state;
+            let old_paused_resume_post_state = state.paused_resume_post_state;
             let transitioned = old_status != new_status
                 || old_download_state != new_download_state
                 || old_post_state != new_post_state
@@ -320,8 +333,19 @@ impl Pipeline {
             state.download_state = new_download_state;
             state.post_state = new_post_state;
             state.run_state = new_run_state;
+            let persisted_snapshot_changed = transitioned
+                || state.failure_error != old_failure_error
+                || state.queued_repair_at_epoch_ms != queued_repair_at
+                || state.queued_extract_at_epoch_ms != queued_extract_at
+                || state.paused_resume_status != old_paused_resume_status
+                || state.paused_resume_download_state != old_paused_resume_download_state
+                || state.paused_resume_post_state != old_paused_resume_post_state;
+            let persist_runtime_to_db =
+                should_persist_runtime_to_db(old_run_state, &state.status, state.run_state);
             (
                 transitioned,
+                persisted_snapshot_changed,
+                persist_runtime_to_db,
                 released_repair,
                 released_extract,
                 entered_repair,
@@ -341,8 +365,26 @@ impl Pipeline {
         if entered_extract {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
         }
-        if persist_status.is_some() {
-            self.persist_active_runtime(job_id);
+        if let Some(persist_status) = persist_status {
+            let changed_label = if persisted_snapshot_changed {
+                "changed"
+            } else {
+                "unchanged"
+            };
+            crate::runtime::perf_probe::record_owned(
+                format!(
+                    "pipeline.persist_active_runtime.requested.{changed_label}.{persist_status}"
+                ),
+                std::time::Duration::from_nanos(1),
+            );
+            if persist_runtime_to_db {
+                self.persist_active_runtime(job_id);
+            } else {
+                crate::runtime::perf_probe::record_owned(
+                    format!("pipeline.persist_active_runtime.skipped.transient.{persist_status}"),
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         if let (true, Some(name)) = (transitioned, failpoint_name) {
             crate::e2e_failpoint::maybe_delay(name);
@@ -379,30 +421,6 @@ impl Pipeline {
             return false;
         }
 
-        for member in &initial_missing_members {
-            match self
-                .recover_extracted_member_from_checkpoint(job_id, member)
-                .await
-            {
-                Ok(true) => {
-                    info!(
-                        job_id = job_id.0,
-                        member = %member,
-                        "recovered missing extracted output from finalized checkpoint"
-                    );
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(
-                        job_id = job_id.0,
-                        member = %member,
-                        error = %error,
-                        "failed to recover missing extracted output from checkpoint"
-                    );
-                }
-            }
-        }
-
         let missing_members: Vec<String> = existing_members
             .iter()
             .filter(|member| {
@@ -437,6 +455,17 @@ impl Pipeline {
         }
         self.extracted_archives.remove(&job_id);
         self.clear_persisted_extracted_members(job_id);
+        let set_names = self.rar_set_names_for_job(job_id);
+        for member in &missing_members {
+            if let Err(error) = self.db.clear_member_chunks_for_all_sets(job_id, member) {
+                warn!(
+                    job_id = job_id.0,
+                    member = %member,
+                    error = %error,
+                    "failed to clear stale extracted member chunks after reconciliation"
+                );
+            }
+        }
 
         if let Some(remaining_members) = self.extracted_members.get(&job_id) {
             for member in remaining_members {
@@ -453,7 +482,7 @@ impl Pipeline {
             }
         }
 
-        for set_name in self.rar_set_names_for_job(job_id) {
+        for set_name in set_names {
             if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
                 warn!(
                     job_id = job_id.0,
@@ -465,108 +494,6 @@ impl Pipeline {
         }
 
         true
-    }
-
-    async fn recover_extracted_member_from_checkpoint(
-        &mut self,
-        job_id: JobId,
-        member_name: &str,
-    ) -> Result<bool, String> {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return Ok(false);
-        };
-
-        let Some((set_name, first_volume, last_volume, unpacked_size)) = state
-            .assembly
-            .archive_topologies()
-            .iter()
-            .find_map(|(set_name, topology)| {
-                topology.members.iter().find_map(|member| {
-                    (member.name == member_name).then_some((
-                        set_name.clone(),
-                        member.first_volume,
-                        member.last_volume,
-                        member.unpacked_size,
-                    ))
-                })
-            })
-        else {
-            return Ok(false);
-        };
-
-        let Some(artifact_root) = self.member_artifact_root_for_restart_reconcile(job_id) else {
-            return Ok(false);
-        };
-        let (out_path, partial_path) = Self::member_output_paths(&artifact_root, member_name);
-        if out_path.exists() || !partial_path.exists() {
-            return Ok(false);
-        }
-
-        let manifest_rows: Vec<crate::ExtractionChunk> = self
-            .db
-            .get_extraction_chunks(job_id, &set_name)
-            .map_err(|error| format!("failed to load extraction checkpoint rows: {error}"))?
-            .into_iter()
-            .filter(|chunk| chunk.member_name == member_name)
-            .collect();
-        let Some(checkpoint) =
-            Self::validate_member_extraction_manifest(&manifest_rows, first_volume, last_volume)
-                .map_err(|error| format!("invalid extraction checkpoint manifest: {error}"))?
-        else {
-            return Ok(false);
-        };
-        info!(
-            job_id = job_id.0,
-            set_name = %set_name,
-            member = %member_name,
-            first_volume,
-            last_volume,
-            checkpoint_rows = manifest_rows.len(),
-            checkpoint_manifest = ?manifest_rows
-                .iter()
-                .map(|chunk| (
-                    chunk.volume_index,
-                    chunk.bytes_written,
-                    chunk.start_offset,
-                    chunk.end_offset,
-                ))
-                .collect::<Vec<_>>(),
-            next_offset = checkpoint.next_offset,
-            unpacked_size,
-            partial_path = %partial_path.display(),
-            out_path = %out_path.display(),
-            "attempting checkpoint-based extracted member recovery"
-        );
-        if checkpoint.next_offset < unpacked_size {
-            return Ok(false);
-        }
-
-        let chunk_dir = Self::member_chunk_dir(&artifact_root, &set_name, member_name);
-        let finalized_size = Self::finalize_member_output_paths(
-            &self.db,
-            &self.event_tx,
-            job_id,
-            &set_name,
-            member_name,
-            &partial_path,
-            &out_path,
-            &chunk_dir,
-        )?;
-        if finalized_size != unpacked_size {
-            return Err(format!(
-                "checkpoint finalized {finalized_size} bytes for {member_name}, expected {unpacked_size}"
-            ));
-        }
-
-        self.extracted_members
-            .entry(job_id)
-            .or_default()
-            .insert(member_name.to_string());
-        self.db
-            .add_extracted_member(job_id, member_name, &out_path)
-            .map_err(|error| format!("failed to persist recovered extracted member: {error}"))?;
-
-        Ok(true)
     }
 
     pub(crate) async fn reconcile_job_progress(&mut self, job_id: JobId) {

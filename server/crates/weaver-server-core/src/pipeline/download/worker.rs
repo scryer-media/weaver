@@ -181,6 +181,7 @@ impl Pipeline {
         let metrics = Arc::clone(&self.metrics);
 
         tokio::task::spawn_blocking(move || {
+            let _profile_scope = crate::runtime::perf_probe::scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
             let send_decode_failure = |error: String| {
@@ -215,7 +216,6 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
-                        let crc32 = decode_result.part_crc;
                         let decoded = DecodedChunk::from(output.as_slice().to_vec());
 
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
@@ -223,7 +223,6 @@ impl Pipeline {
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
-                            crc32,
                             data: decoded,
                             yenc_name: decode_result.metadata.name,
                         }));
@@ -251,14 +250,11 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
-                        let crc32 = decode_result.part_crc;
-
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
-                            crc32,
                             data: DecodedChunk::from(output),
                             yenc_name: decode_result.metadata.name,
                         }));
@@ -582,6 +578,7 @@ impl Pipeline {
         let exclude_servers = work.exclude_servers;
 
         tokio::spawn(async move {
+            let fetch_started = Instant::now();
             let trace = if exclude_servers.is_empty() {
                 nntp.fetch_body_with_groups_traced(&message_id, &groups)
                     .await
@@ -589,6 +586,7 @@ impl Pipeline {
                 nntp.fetch_body_with_groups_excluding_traced(&message_id, &groups, &exclude_servers)
                     .await
             };
+            crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
             let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
                 matches!(
                     attempt.outcome,

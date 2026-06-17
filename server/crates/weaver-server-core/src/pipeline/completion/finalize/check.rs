@@ -1053,8 +1053,11 @@ impl Pipeline {
             }
         }
 
-        for (file_id, filename, total_bytes) in &files_to_complete {
-            self.note_file_progress_floor(*file_id, *total_bytes, true);
+        for (file_id, filename, _total_bytes) in &files_to_complete {
+            crate::runtime::perf_probe::record(
+                "download.file_progress.complete_file_row_covers_restart",
+                std::time::Duration::ZERO,
+            );
             let file_index = file_id.file_index;
             let current_filename = filename.clone();
             let current_hash = Self::expected_hash_for_verified_file(*file_id, &existing_hashes);

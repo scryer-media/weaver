@@ -1,4 +1,5 @@
 use super::keystore::KeyStore;
+use keyring_core::{Entry, Error};
 
 const SERVICE: &str = "weaver";
 const ACCOUNT: &str = "encryption-master-key";
@@ -6,9 +7,10 @@ const ACCOUNT: &str = "encryption-master-key";
 pub struct WindowsCredentialManager;
 
 impl WindowsCredentialManager {
-    fn entry() -> Result<keyring::Entry, String> {
-        keyring::Entry::new(SERVICE, ACCOUNT)
-            .map_err(|e| format!("failed to create credential entry: {e}"))
+    fn entry() -> Result<Entry, String> {
+        keyring::use_native_store(false)
+            .map_err(|e| format!("failed to initialize Windows Credential Manager: {e}"))?;
+        Entry::new(SERVICE, ACCOUNT).map_err(|e| format!("failed to create credential entry: {e}"))
     }
 }
 
@@ -24,7 +26,7 @@ impl KeyStore for WindowsCredentialManager {
                     Ok(Some(trimmed))
                 }
             }
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("Windows Credential Manager error: {e}")),
         }
     }
@@ -40,7 +42,7 @@ impl KeyStore for WindowsCredentialManager {
         let entry = Self::entry()?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(Error::NoEntry) => Ok(()),
             Err(e) => Err(format!(
                 "failed to delete key from Windows Credential Manager: {e}"
             )),

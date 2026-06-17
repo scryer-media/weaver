@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::{Database, StateError};
 
 const HISTORY_DELETE_KIND: &str = "history_delete";
@@ -171,109 +171,118 @@ fn dedupe_ids(ids: &[u64]) -> Vec<u64> {
 }
 
 fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
+    std::iter::repeat_n("{}", count)
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn count_existing_history_rows(tx: &Transaction<'_>, ids: &[u64]) -> Result<usize, StateError> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM job_history WHERE job_id IN ({})",
-        placeholders(ids.len())
-    );
-    let mut stmt = tx.prepare(&sql).map_err(db_err)?;
-    let values = ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
-    stmt.query_row(rusqlite::params_from_iter(values), |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|count| count as usize)
-    .map_err(db_err)
+fn id_args(ids: &[u64]) -> Vec<SqlArg> {
+    ids.iter().map(|id| SqlArg::I64(*id as i64)).collect()
 }
 
-fn count_locked_history_delete_targets(
-    tx: &Transaction<'_>,
+fn payload_json(delete_files: bool) -> Result<String, StateError> {
+    serde_json::to_string(&HistoryDeleteOperationPayload { delete_files }).map_err(db_err)
+}
+
+fn parse_payload(raw: &str) -> Result<HistoryDeleteOperationPayload, StateError> {
+    serde_json::from_str(raw).map_err(db_err)
+}
+
+async fn count_existing_history_rows(tx: &mut SqlTx<'_>, ids: &[u64]) -> Result<usize, StateError> {
+    let sql = format!(
+        "SELECT COUNT(*) AS count FROM job_history WHERE job_id IN ({})",
+        placeholders(ids.len())
+    );
+    let row = tx.fetch_optional(&sql, &id_args(ids)).await?;
+    Ok(row.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as usize)
+}
+
+async fn count_locked_history_delete_targets(
+    tx: &mut SqlTx<'_>,
     ids: &[u64],
 ) -> Result<usize, StateError> {
     let sql = format!(
-        "SELECT COUNT(DISTINCT target_id)
+        "SELECT COUNT(DISTINCT target_id) AS count
          FROM async_operation_targets
-         WHERE target_kind = ?1
+         WHERE target_kind = {{}}
            AND state IN ('queued', 'running')
            AND target_id IN ({})",
         placeholders(ids.len())
     );
-    let mut stmt = tx.prepare(&sql).map_err(db_err)?;
-    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
-    values.push(rusqlite::types::Value::Text(
-        HISTORY_JOB_TARGET_KIND.to_string(),
-    ));
-    values.extend(ids.iter().map(|id| (*id as i64).into()));
-    stmt.query_row(rusqlite::params_from_iter(values), |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|count| count as usize)
-    .map_err(db_err)
+    let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+    args.extend(id_args(ids));
+    let row = tx.fetch_optional(&sql, &args).await?;
+    Ok(row.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as usize)
 }
 
-fn list_all_history_job_ids_tx(tx: &Transaction<'_>) -> Result<Vec<u64>, StateError> {
-    let mut stmt = tx
-        .prepare(
+async fn list_all_history_job_ids_tx(tx: &mut SqlTx<'_>) -> Result<Vec<u64>, StateError> {
+    let rows = tx
+        .fetch_all(
             "SELECT job_id
              FROM job_history
              ORDER BY completed_at DESC, job_id DESC",
+            &[],
         )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, i64>(0))
-        .map_err(db_err)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(db_err)? as u64);
-    }
-    Ok(out)
+        .await?;
+    rows.into_iter()
+        .map(|row| Ok(row.i64("job_id")? as u64))
+        .collect()
 }
 
-fn insert_history_delete_operation_tx(
-    tx: &Transaction<'_>,
+async fn has_locked_history_delete_targets_tx(tx: &mut SqlTx<'_>) -> Result<bool, StateError> {
+    Ok(tx
+        .fetch_optional(
+            "SELECT 1
+             FROM async_operation_targets
+             WHERE target_kind = {}
+               AND state IN ('queued', 'running')
+             LIMIT 1",
+            &[SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())],
+        )
+        .await?
+        .is_some())
+}
+
+async fn insert_history_delete_operation_tx(
+    tx: &mut SqlTx<'_>,
     ids: &[u64],
     delete_files: bool,
 ) -> Result<u64, StateError> {
-    let payload_json =
-        serde_json::to_string(&HistoryDeleteOperationPayload { delete_files }).map_err(db_err)?;
+    let payload_json = payload_json(delete_files)?;
     let now = epoch_ms_now();
 
-    tx.execute(
-        "INSERT INTO async_operations
-         (kind, state, payload_json, requested_at, started_at, finished_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
-        params![
-            HISTORY_DELETE_KIND,
-            AsyncOperationState::Queued.as_str(),
-            payload_json,
-            now,
-        ],
-    )
-    .map_err(db_err)?;
-    let operation_id = tx.last_insert_rowid() as u64;
+    let row = tx
+        .fetch_optional(
+            "INSERT INTO async_operations
+             (kind, state, payload_json, requested_at, started_at, finished_at)
+             VALUES ({}, {}, {}, {}, NULL, NULL)
+             RETURNING id",
+            &[
+                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                SqlArg::Text(AsyncOperationState::Queued.as_str().to_string()),
+                SqlArg::Text(payload_json),
+                SqlArg::I64(now),
+            ],
+        )
+        .await?
+        .ok_or_else(|| StateError::Database("failed to insert async operation".to_string()))?;
+    let operation_id = row.i64("id")? as u64;
 
-    let mut stmt = tx
-        .prepare(
+    for (index, id) in ids.iter().enumerate() {
+        tx.execute(
             "INSERT INTO async_operation_targets
              (operation_id, target_kind, target_id, state, error_message, sort_order)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+             VALUES ({}, {}, {}, {}, NULL, {})",
+            &[
+                SqlArg::I64(operation_id as i64),
+                SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                SqlArg::I64(*id as i64),
+                SqlArg::Text(AsyncOperationTargetState::Queued.as_str().to_string()),
+                SqlArg::I64(index as i64),
+            ],
         )
-        .map_err(db_err)?;
-    for (index, id) in ids.iter().enumerate() {
-        stmt.execute(params![
-            operation_id as i64,
-            HISTORY_JOB_TARGET_KIND,
-            *id as i64,
-            AsyncOperationTargetState::Queued.as_str(),
-            index as i64,
-        ])
-        .map_err(db_err)?;
+        .await?;
     }
-    drop(stmt);
 
     Ok(operation_id)
 }
@@ -288,49 +297,40 @@ impl Database {
             return Ok(HashSet::new());
         }
 
-        let conn = self.conn();
-        let sql = format!(
-            "SELECT DISTINCT target_id
-             FROM async_operation_targets
-             WHERE target_kind = ?1
-               AND state IN ('queued', 'running')
-               AND target_id IN ({})",
-            placeholders(ids.len())
-        );
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
-        values.push(rusqlite::types::Value::Text(
-            HISTORY_JOB_TARGET_KIND.to_string(),
-        ));
-        values.extend(ids.iter().map(|id| (*id as i64).into()));
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values), |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(db_err)?;
-        let mut out = HashSet::new();
-        for row in rows {
-            out.insert(row.map_err(db_err)? as u64);
-        }
-        Ok(out)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let sql = format!(
+                "SELECT DISTINCT target_id
+                 FROM async_operation_targets
+                 WHERE target_kind = {{}}
+                   AND state IN ('queued', 'running')
+                   AND target_id IN ({})",
+                placeholders(ids.len())
+            );
+            let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+            args.extend(id_args(&ids));
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| Ok(row.i64("target_id")? as u64))
+                .collect()
+        })
     }
 
     pub fn has_any_locked_history_delete_targets(&self) -> Result<bool, StateError> {
-        let conn = self.conn();
-        let exists = conn
-            .query_row(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            Ok(SqlRuntime::fetch_optional(
+                datastore.read_exec(),
                 "SELECT 1
                  FROM async_operation_targets
-                 WHERE target_kind = ?1
+                 WHERE target_kind = {}
                    AND state IN ('queued', 'running')
                  LIMIT 1",
-                [HISTORY_JOB_TARGET_KIND],
-                |row| row.get::<_, i64>(0),
+                &[SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())],
             )
-            .optional()
-            .map_err(db_err)?
-            .is_some();
-        Ok(exists)
+            .await?
+            .is_some())
+        })
     }
 
     pub fn list_history_job_ids(&self, ids: &[u64]) -> Result<BTreeSet<u64>, StateError> {
@@ -339,42 +339,34 @@ impl Database {
             return Ok(BTreeSet::new());
         }
 
-        let conn = self.conn();
-        let sql = format!(
-            "SELECT job_id FROM job_history WHERE job_id IN ({})",
-            placeholders(ids.len())
-        );
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let values = ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values), |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(db_err)?;
-        let mut out = BTreeSet::new();
-        for row in rows {
-            out.insert(row.map_err(db_err)? as u64);
-        }
-        Ok(out)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let sql = format!(
+                "SELECT job_id FROM job_history WHERE job_id IN ({})",
+                placeholders(ids.len())
+            );
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &id_args(&ids)).await?;
+            rows.into_iter()
+                .map(|row| Ok(row.i64("job_id")? as u64))
+                .collect()
+        })
     }
 
     pub fn list_all_history_job_ids(&self) -> Result<Vec<u64>, StateError> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT job_id
                  FROM job_history
                  ORDER BY completed_at DESC, job_id DESC",
+                &[],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)? as u64);
-        }
-        Ok(out)
+            .await?;
+            rows.into_iter()
+                .map(|row| Ok(row.i64("job_id")? as u64))
+                .collect()
+        })
     }
 
     pub fn insert_history_delete_operation(
@@ -387,197 +379,192 @@ impl Database {
             return Err(HistoryDeleteOperationInsertError::EmptyTargets);
         }
 
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        let existing_count = count_existing_history_rows(&tx, &ids)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        if existing_count != ids.len() {
-            return Err(HistoryDeleteOperationInsertError::MissingRows);
-        }
-        let locked_count = count_locked_history_delete_targets(&tx, &ids)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        if locked_count > 0 {
-            return Err(HistoryDeleteOperationInsertError::LockedTargets);
-        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "insert_history_delete_operation", |tx| {
+                let ids = ids.clone();
+                Box::pin(async move {
+                    let existing_count = count_existing_history_rows(tx, &ids).await?;
+                    if existing_count != ids.len() {
+                        return Ok(Err(HistoryDeleteOperationInsertError::MissingRows));
+                    }
+                    let locked_count = count_locked_history_delete_targets(tx, &ids).await?;
+                    if locked_count > 0 {
+                        return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
+                    }
 
-        let operation_id = insert_history_delete_operation_tx(&tx, &ids, delete_files)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        tx.commit()
-            .map_err(db_err)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        Ok(operation_id)
+                    let operation_id =
+                        insert_history_delete_operation_tx(tx, &ids, delete_files).await?;
+                    Ok(Ok(operation_id))
+                })
+            })
+            .await
+        })?
     }
 
     pub fn insert_all_history_delete_operation(
         &self,
         delete_files: bool,
     ) -> Result<(u64, Vec<u64>), HistoryDeleteOperationInsertError> {
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        let ids =
-            list_all_history_job_ids_tx(&tx).map_err(HistoryDeleteOperationInsertError::from)?;
-        if ids.is_empty() {
-            return Err(HistoryDeleteOperationInsertError::NoHistoryRows);
-        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "insert_all_history_delete_operation",
+                |tx| {
+                    Box::pin(async move {
+                        let ids = list_all_history_job_ids_tx(tx).await?;
+                        if ids.is_empty() {
+                            return Ok(Err(HistoryDeleteOperationInsertError::NoHistoryRows));
+                        }
 
-        let has_locked = tx
-            .query_row(
-                "SELECT 1
-                 FROM async_operation_targets
-                 WHERE target_kind = ?1
-                   AND state IN ('queued', 'running')
-                 LIMIT 1",
-                [HISTORY_JOB_TARGET_KIND],
-                |row| row.get::<_, i64>(0),
+                        if has_locked_history_delete_targets_tx(tx).await? {
+                            return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
+                        }
+
+                        let operation_id =
+                            insert_history_delete_operation_tx(tx, &ids, delete_files).await?;
+                        Ok(Ok((operation_id, ids)))
+                    })
+                },
             )
-            .optional()
-            .map_err(db_err)
-            .map_err(HistoryDeleteOperationInsertError::from)?
-            .is_some();
-        if has_locked {
-            return Err(HistoryDeleteOperationInsertError::LockedTargets);
-        }
-
-        let operation_id = insert_history_delete_operation_tx(&tx, &ids, delete_files)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        tx.commit()
-            .map_err(db_err)
-            .map_err(HistoryDeleteOperationInsertError::from)?;
-        Ok((operation_id, ids))
+            .await
+        })?
     }
 
     pub fn recover_running_history_delete_operations(&self) -> Result<(), StateError> {
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)?;
-        tx.execute(
-            "UPDATE async_operation_targets
-             SET state = 'queued',
-                 error_message = NULL
-             WHERE target_kind = ?1
-               AND state = 'running'
-               AND operation_id IN (
-                 SELECT id
-                 FROM async_operations
-                 WHERE kind = ?2
-                   AND state = 'running'
-               )",
-            params![HISTORY_JOB_TARGET_KIND, HISTORY_DELETE_KIND],
-        )
-        .map_err(db_err)?;
-        tx.execute(
-            "UPDATE async_operations
-             SET state = 'queued',
-                 finished_at = NULL
-             WHERE kind = ?1
-               AND state = 'running'",
-            [HISTORY_DELETE_KIND],
-        )
-        .map_err(db_err)?;
-        tx.commit().map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "recover_running_history_delete_operations",
+                |tx| {
+                    Box::pin(async move {
+                        tx.execute(
+                            "UPDATE async_operation_targets
+                         SET state = 'queued',
+                             error_message = NULL
+                         WHERE target_kind = {}
+                           AND state = 'running'
+                           AND operation_id IN (
+                             SELECT id
+                             FROM async_operations
+                             WHERE kind = {}
+                               AND state = 'running'
+                           )",
+                            &[
+                                SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                            ],
+                        )
+                        .await?;
+                        tx.execute(
+                            "UPDATE async_operations
+                         SET state = 'queued',
+                             finished_at = NULL
+                         WHERE kind = {}
+                           AND state = 'running'",
+                            &[SqlArg::Text(HISTORY_DELETE_KIND.to_string())],
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                },
+            )
+            .await
+        })
     }
 
     pub fn requeue_history_delete_operation(&self, operation_id: u64) -> Result<(), StateError> {
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)?;
-        tx.execute(
-            "UPDATE async_operation_targets
-             SET state = 'queued',
-                 error_message = NULL
-             WHERE operation_id = ?1
-               AND target_kind = ?2
-               AND state = 'running'",
-            params![operation_id as i64, HISTORY_JOB_TARGET_KIND],
-        )
-        .map_err(db_err)?;
-        tx.execute(
-            "UPDATE async_operations
-             SET state = 'queued',
-                 finished_at = NULL
-             WHERE id = ?1
-               AND kind = ?2
-               AND state = 'running'",
-            params![operation_id as i64, HISTORY_DELETE_KIND],
-        )
-        .map_err(db_err)?;
-        tx.commit().map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "requeue_history_delete_operation", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE async_operation_targets
+                         SET state = 'queued',
+                             error_message = NULL
+                         WHERE operation_id = {}
+                           AND target_kind = {}
+                           AND state = 'running'",
+                        &[
+                            SqlArg::I64(operation_id as i64),
+                            SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE async_operations
+                         SET state = 'queued',
+                             finished_at = NULL
+                         WHERE id = {}
+                           AND kind = {}
+                           AND state = 'running'",
+                        &[
+                            SqlArg::I64(operation_id as i64),
+                            SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     pub fn next_history_delete_operation(
         &self,
     ) -> Result<Option<HistoryDeleteOperationRow>, StateError> {
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_err)?;
-        let row = tx
-            .query_row(
-                "SELECT id, payload_json
-                 FROM async_operations
-                 WHERE kind = ?1
-                   AND state = 'queued'
-                 ORDER BY requested_at ASC, id ASC
-                 LIMIT 1",
-                [HISTORY_DELETE_KIND],
-                |row| {
-                    let id = row.get::<_, i64>(0)? as u64;
-                    let payload = serde_json::from_str::<HistoryDeleteOperationPayload>(
-                        &row.get::<_, String>(1)?,
-                    )
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "next_history_delete_operation", |tx| {
+                Box::pin(async move {
+                    let row = tx
+                        .fetch_optional(
+                            "SELECT id, payload_json
+                             FROM async_operations
+                             WHERE kind = {}
+                               AND state = 'queued'
+                             ORDER BY requested_at ASC, id ASC
+                             LIMIT 1",
+                            &[SqlArg::Text(HISTORY_DELETE_KIND.to_string())],
                         )
-                    })?;
-                    Ok((id, payload.delete_files))
-                },
-            )
-            .optional()
-            .map_err(db_err)?;
-        let Some((operation_id, delete_files)) = row else {
-            tx.commit().map_err(db_err)?;
-            return Ok(None);
-        };
+                        .await?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    let operation_id = row.i64("id")? as u64;
+                    let delete_files = parse_payload(&row.text("payload_json")?)?.delete_files;
 
-        let updated = tx
-            .execute(
-                "UPDATE async_operations
-                 SET state = ?1,
-                     started_at = COALESCE(started_at, ?2),
-                     finished_at = NULL
-                 WHERE id = ?3
-                   AND state = 'queued'",
-                params![
-                    AsyncOperationState::Running.as_str(),
-                    epoch_ms_now(),
-                    operation_id as i64,
-                ],
-            )
-            .map_err(db_err)?;
-        if updated != 1 {
-            tx.commit().map_err(db_err)?;
-            return Ok(None);
-        }
+                    let updated = tx
+                        .execute(
+                            "UPDATE async_operations
+                             SET state = {},
+                                 started_at = COALESCE(started_at, {}),
+                                 finished_at = NULL
+                             WHERE id = {}
+                               AND state = 'queued'",
+                            &[
+                                SqlArg::Text(AsyncOperationState::Running.as_str().to_string()),
+                                SqlArg::I64(epoch_ms_now()),
+                                SqlArg::I64(operation_id as i64),
+                            ],
+                        )
+                        .await?;
+                    if updated != 1 {
+                        return Ok(None);
+                    }
 
-        tx.commit().map_err(db_err)?;
-        Ok(Some(HistoryDeleteOperationRow {
-            id: operation_id,
-            state: AsyncOperationState::Running,
-            delete_files,
-        }))
+                    Ok(Some(HistoryDeleteOperationRow {
+                        id: operation_id,
+                        state: AsyncOperationState::Running,
+                        delete_files,
+                    }))
+                })
+            })
+            .await
+        })
     }
 
     pub fn list_history_delete_operation_targets(
@@ -585,44 +572,33 @@ impl Database {
         operation_id: u64,
         delete_files: bool,
     ) -> Result<Vec<HistoryDeleteTargetWork>, StateError> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
                 "SELECT target_id, state
                  FROM async_operation_targets
-                 WHERE operation_id = ?1
-                   AND target_kind = ?2
+                 WHERE operation_id = {}
+                   AND target_kind = {}
                    AND state IN ('queued', 'running')
                  ORDER BY sort_order ASC, target_id ASC",
+                &[
+                    SqlArg::I64(operation_id as i64),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                ],
             )
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map(
-                params![operation_id as i64, HISTORY_JOB_TARGET_KIND],
-                |row| {
-                    let target_id = row.get::<_, i64>(0)? as u64;
-                    let state = AsyncOperationTargetState::parse(&row.get::<_, String>(1)?)
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::other(error.to_string())),
-                            )
-                        })?;
+            .await?;
+            rows.into_iter()
+                .map(|row| {
                     Ok(HistoryDeleteTargetWork {
                         operation_id,
-                        target_id,
-                        state,
+                        target_id: row.i64("target_id")? as u64,
+                        state: AsyncOperationTargetState::parse(&row.text("state")?)?,
                         delete_files,
                     })
-                },
-            )
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+                })
+                .collect()
+        })
     }
 
     pub fn mark_history_delete_target_state(
@@ -632,56 +608,72 @@ impl Database {
         state: AsyncOperationTargetState,
         error_message: Option<&str>,
     ) -> Result<(), StateError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE async_operation_targets
-             SET state = ?1,
-                 error_message = ?2
-             WHERE operation_id = ?3
-               AND target_kind = ?4
-               AND target_id = ?5",
-            params![
-                state.as_str(),
-                error_message,
-                operation_id as i64,
-                HISTORY_JOB_TARGET_KIND,
-                target_id as i64,
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
+        let datastore = self.datastore();
+        let error_message = error_message.map(str::to_string);
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE async_operation_targets
+                 SET state = {},
+                     error_message = {}
+                 WHERE operation_id = {}
+                   AND target_kind = {}
+                   AND target_id = {}",
+                &[
+                    SqlArg::Text(state.as_str().to_string()),
+                    SqlArg::OptText(error_message),
+                    SqlArg::I64(operation_id as i64),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                    SqlArg::I64(target_id as i64),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     pub fn finalize_history_delete_operation(
         &self,
         operation_id: u64,
     ) -> Result<AsyncOperationState, StateError> {
-        let conn = self.conn();
-        let failed_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let failed_count = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT COUNT(*) AS count
                  FROM async_operation_targets
-                 WHERE operation_id = ?1
-                   AND target_kind = ?2
+                 WHERE operation_id = {}
+                   AND target_kind = {}
                    AND state = 'failed'",
-                params![operation_id as i64, HISTORY_JOB_TARGET_KIND],
-                |row| row.get(0),
+                &[
+                    SqlArg::I64(operation_id as i64),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                ],
             )
-            .map_err(db_err)?;
-        let next_state = if failed_count > 0 {
-            AsyncOperationState::CompletedWithErrors
-        } else {
-            AsyncOperationState::Completed
-        };
-        conn.execute(
-            "UPDATE async_operations
-             SET state = ?1,
-                 finished_at = ?2
-             WHERE id = ?3",
-            params![next_state.as_str(), epoch_ms_now(), operation_id as i64],
-        )
-        .map_err(db_err)?;
-        Ok(next_state)
+            .await?
+            .map(|row| row.i64("count"))
+            .transpose()?
+            .unwrap_or(0);
+            let next_state = if failed_count > 0 {
+                AsyncOperationState::CompletedWithErrors
+            } else {
+                AsyncOperationState::Completed
+            };
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE async_operations
+                 SET state = {},
+                     finished_at = {}
+                 WHERE id = {}",
+                &[
+                    SqlArg::Text(next_state.as_str().to_string()),
+                    SqlArg::I64(epoch_ms_now()),
+                    SqlArg::I64(operation_id as i64),
+                ],
+            )
+            .await?;
+            Ok(next_state)
+        })
     }
 
     pub fn list_history_delete_row_states(
@@ -693,153 +685,116 @@ impl Database {
             return Ok(HashMap::new());
         }
 
-        let conn = self.conn();
-        let sql = format!(
-            "SELECT t.target_id, t.operation_id, t.state, t.error_message, o.payload_json
-             FROM async_operation_targets t
-             INNER JOIN async_operations o ON o.id = t.operation_id
-             WHERE o.kind = ?1
-               AND t.target_kind = ?2
-               AND t.state != 'completed'
-               AND t.target_id IN ({})
-               AND t.operation_id = (
-                 SELECT t2.operation_id
-                 FROM async_operation_targets t2
-                 INNER JOIN async_operations o2 ON o2.id = t2.operation_id
-                 WHERE o2.kind = ?1
-                   AND t2.target_kind = ?2
-                   AND t2.target_id = t.target_id
-                   AND t2.state != 'completed'
-                 ORDER BY t2.operation_id DESC
-                 LIMIT 1
-               )",
-            placeholders(ids.len())
-        );
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
-        params.push(rusqlite::types::Value::Text(
-            HISTORY_DELETE_KIND.to_string(),
-        ));
-        params.push(rusqlite::types::Value::Text(
-            HISTORY_JOB_TARGET_KIND.to_string(),
-        ));
-        params.extend(ids.iter().map(|id| (*id as i64).into()));
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(params), |row| {
-                let target_id = row.get::<_, i64>(0)? as u64;
-                let operation_id = row.get::<_, i64>(1)? as u64;
-                let state = AsyncOperationTargetState::parse(&row.get::<_, String>(2)?).map_err(
-                    |error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::other(error.to_string())),
-                        )
-                    },
-                )?;
-                let error_message = row.get::<_, Option<String>>(3)?;
-                let payload = serde_json::from_str::<HistoryDeleteOperationPayload>(
-                    &row.get::<_, String>(4)?,
-                )
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok((
-                    target_id,
-                    HistoryDeleteRowState {
-                        operation_id,
-                        state,
-                        locked: state.locked(),
-                        delete_files: payload.delete_files,
-                        error_message,
-                    },
-                ))
-            })
-            .map_err(db_err)?;
-        let mut out = HashMap::new();
-        for row in rows {
-            let (target_id, state) = row.map_err(db_err)?;
-            out.insert(target_id, state);
-        }
-        Ok(out)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let sql = format!(
+                "SELECT t.target_id, t.operation_id, t.state, t.error_message, o.payload_json
+                 FROM async_operation_targets t
+                 INNER JOIN async_operations o ON o.id = t.operation_id
+                 WHERE o.kind = {{}}
+                   AND t.target_kind = {{}}
+                   AND t.state != 'completed'
+                   AND t.target_id IN ({})
+                   AND t.operation_id = (
+                     SELECT t2.operation_id
+                     FROM async_operation_targets t2
+                     INNER JOIN async_operations o2 ON o2.id = t2.operation_id
+                     WHERE o2.kind = {{}}
+                       AND t2.target_kind = {{}}
+                       AND t2.target_id = t.target_id
+                       AND t2.state != 'completed'
+                     ORDER BY t2.operation_id DESC
+                     LIMIT 1
+                   )",
+                placeholders(ids.len())
+            );
+            let mut args = vec![
+                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+            ];
+            args.extend(id_args(&ids));
+            args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
+            args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()));
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            let mut out = HashMap::new();
+            for row in rows {
+                let target_id = row.i64("target_id")? as u64;
+                out.insert(target_id, history_delete_row_state_from_row(row)?);
+            }
+            Ok(out)
+        })
     }
 
     pub fn list_history_delete_operations(
         &self,
         active_only: bool,
     ) -> Result<Vec<HistoryDeleteOperationSummary>, StateError> {
-        let conn = self.conn();
-        let mut sql = String::from(
-            "SELECT o.id,
-                    o.state,
-                    o.payload_json,
-                    o.requested_at,
-                    COUNT(t.target_id) AS total_targets,
-                    SUM(CASE WHEN t.state = 'queued' THEN 1 ELSE 0 END) AS queued_targets,
-                    SUM(CASE WHEN t.state = 'running' THEN 1 ELSE 0 END) AS running_targets,
-                    SUM(CASE WHEN t.state = 'completed' THEN 1 ELSE 0 END) AS completed_targets,
-                    SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END) AS failed_targets
-             FROM async_operations o
-             LEFT JOIN async_operation_targets t
-               ON t.operation_id = o.id
-              AND t.target_kind = ?1
-             WHERE o.kind = ?2",
-        );
-        if active_only {
-            sql.push_str(" AND o.state IN ('queued', 'running')");
-        }
-        sql.push_str(
-            " GROUP BY o.id, o.state, o.payload_json, o.requested_at
-              ORDER BY o.requested_at ASC, o.id ASC",
-        );
-        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-        let rows = stmt
-            .query_map(
-                params![HISTORY_JOB_TARGET_KIND, HISTORY_DELETE_KIND],
-                |row| {
-                    let id = row.get::<_, i64>(0)? as u64;
-                    let state =
-                        AsyncOperationState::parse(&row.get::<_, String>(1)?).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::other(error.to_string())),
-                            )
-                        })?;
-                    let payload = serde_json::from_str::<HistoryDeleteOperationPayload>(
-                        &row.get::<_, String>(2)?,
-                    )
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(HistoryDeleteOperationSummary {
-                        id,
-                        state,
-                        delete_files: payload.delete_files,
-                        requested_at_epoch_ms: row.get::<_, i64>(3)?,
-                        total_targets: row.get::<_, i64>(4)? as u32,
-                        queued_targets: row.get::<_, i64>(5)? as u32,
-                        running_targets: row.get::<_, i64>(6)? as u32,
-                        completed_targets: row.get::<_, i64>(7)? as u32,
-                        failed_targets: row.get::<_, i64>(8)? as u32,
-                    })
-                },
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut sql = String::from(
+                "SELECT o.id,
+                        o.state,
+                        o.payload_json,
+                        o.requested_at,
+                        COUNT(t.target_id) AS total_targets,
+                        SUM(CASE WHEN t.state = 'queued' THEN 1 ELSE 0 END) AS queued_targets,
+                        SUM(CASE WHEN t.state = 'running' THEN 1 ELSE 0 END) AS running_targets,
+                        SUM(CASE WHEN t.state = 'completed' THEN 1 ELSE 0 END) AS completed_targets,
+                        SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END) AS failed_targets
+                 FROM async_operations o
+                 LEFT JOIN async_operation_targets t
+                   ON t.operation_id = o.id
+                  AND t.target_kind = {}
+                 WHERE o.kind = {}",
+            );
+            if active_only {
+                sql.push_str(" AND o.state IN ('queued', 'running')");
+            }
+            sql.push_str(
+                " GROUP BY o.id, o.state, o.payload_json, o.requested_at
+                  ORDER BY o.requested_at ASC, o.id ASC",
+            );
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &sql,
+                &[
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+                    SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                ],
             )
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
+            .await?;
+            rows.into_iter()
+                .map(history_delete_operation_summary_from_row)
+                .collect()
+        })
     }
+}
+
+fn history_delete_row_state_from_row(row: SqlRow) -> Result<HistoryDeleteRowState, StateError> {
+    let state = AsyncOperationTargetState::parse(&row.text("state")?)?;
+    Ok(HistoryDeleteRowState {
+        operation_id: row.i64("operation_id")? as u64,
+        state,
+        locked: state.locked(),
+        delete_files: parse_payload(&row.text("payload_json")?)?.delete_files,
+        error_message: row.opt_text("error_message")?,
+    })
+}
+
+fn history_delete_operation_summary_from_row(
+    row: SqlRow,
+) -> Result<HistoryDeleteOperationSummary, StateError> {
+    Ok(HistoryDeleteOperationSummary {
+        id: row.i64("id")? as u64,
+        state: AsyncOperationState::parse(&row.text("state")?)?,
+        delete_files: parse_payload(&row.text("payload_json")?)?.delete_files,
+        requested_at_epoch_ms: row.i64("requested_at")?,
+        total_targets: row.i64("total_targets")? as u32,
+        queued_targets: row.i64("queued_targets")? as u32,
+        running_targets: row.i64("running_targets")? as u32,
+        completed_targets: row.i64("completed_targets")? as u32,
+        failed_targets: row.i64("failed_targets")? as u32,
+    })
 }
 
 #[cfg(test)]
