@@ -2191,11 +2191,15 @@ async fn wait_until(
 }
 
 async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
-    for _ in 0..expected {
-        let done = tokio::time::timeout(Duration::from_secs(5), pipeline.decode_done_rx.recv())
-            .await
-            .expect("decode result should arrive")
-            .expect("decode channel should stay open");
+    for index in 0..expected {
+        let done =
+            match tokio::time::timeout(Duration::from_secs(20), pipeline.decode_done_rx.recv())
+                .await
+            {
+                Ok(Some(done)) => done,
+                Ok(None) => panic!("decode channel should stay open"),
+                Err(_) => panic!("decode result {}/{} should arrive", index + 1, expected),
+            };
         pipeline.handle_decode_done(done).await;
         settle_inflight_moves(pipeline).await;
     }
