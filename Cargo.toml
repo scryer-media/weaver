@@ -86,6 +86,7 @@ age = { version = "0.11", default-features = false }
 security-framework = { version = "3", default-features = false }
 security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false }
+keyring-core = { version = "1", default-features = false }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]

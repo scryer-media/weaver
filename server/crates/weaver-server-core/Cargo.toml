@@ -61,6 +61,7 @@ security-framework-sys = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true }
+keyring-core = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
