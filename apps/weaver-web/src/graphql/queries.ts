@@ -81,6 +81,28 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
   }
 `;
 
+export const HISTORY_TABLE_ITEM_FIELDS = `
+  fragment HistoryTableItemFields on HistoryItem {
+    id
+    name
+    displayTitle
+    originalTitle
+    status: state
+    totalBytes
+    health
+    category
+    completedAt
+    ${DIAGNOSTIC_HISTORY_FIELDS}
+    deleteOperation {
+      operationId
+      state
+      locked
+      deleteFiles
+      errorMessage
+    }
+  }
+`;
+
 export const PARSED_RELEASE_FIELDS = `
   fragment ParsedReleaseFields on ParsedRelease {
     normalizedTitle
@@ -600,7 +622,6 @@ export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
   mutation AcceptHistoryDelete($input: AcceptHistoryDeleteInput!) {
     acceptHistoryDelete(input: $input) {
       operationId
-      acceptedIds
       totalTargets
     }
   }
@@ -761,7 +782,7 @@ export const HISTORY_PAGE_QUERY = gql`
   query HistoryPage($input: HistoryPageInput!) {
     historyPage(input: $input) {
       items {
-        ...FacadeHistoryItemFields
+        ...HistoryTableItemFields
       }
       totalCount
       counts {
@@ -771,8 +792,7 @@ export const HISTORY_PAGE_QUERY = gql`
       }
     }
   }
-  ${PARSED_RELEASE_FIELDS}
-  ${FACADE_HISTORY_ITEM_FIELDS}
+  ${HISTORY_TABLE_ITEM_FIELDS}
 `;
 
 export const HISTORY_DELETE_OPERATIONS_QUERY = gql`

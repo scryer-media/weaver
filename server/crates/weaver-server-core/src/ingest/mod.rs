@@ -13,11 +13,9 @@ pub use metadata::{
 };
 pub use naming::derive_release_name;
 pub use persisted_nzb::{
-    PersistedNzbError, PersistedNzbReader, cleanup_orphaned_persisted_nzbs, compress_nzb_bytes,
-    decode_persisted_nzb_bytes, hash_persisted_nzb, hash_persisted_nzb_bytes,
-    hash_persisted_nzb_or_empty, load_persisted_nzb_storage_bytes, open_persisted_nzb_reader,
-    parse_persisted_nzb, parse_persisted_nzb_bytes, persist_decoded_nzb_reader,
-    persist_decoded_nzb_reader_to_zstd, remove_persisted_nzb_if_exists, write_compressed_nzb,
+    PersistedNzbError, compress_nzb_bytes, decode_persisted_nzb_bytes, hash_persisted_nzb_bytes,
+    load_persisted_nzb_storage_bytes, parse_persisted_nzb_bytes,
+    persist_decoded_nzb_reader_to_zstd,
 };
 pub use submission::{
     SubmitNzbError, SubmittedJob, fetch_nzb_from_url, init_job_counter, next_submission_job_id,

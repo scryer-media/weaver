@@ -128,7 +128,7 @@ impl Database {
                             category = excluded.category,
                             output_dir = excluded.output_dir,
                             nzb_path = excluded.nzb_path,
-                            nzb_zstd = excluded.nzb_zstd,
+                            nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                             created_at = excluded.created_at,
                             completed_at = excluded.completed_at,
                             metadata = excluded.metadata,

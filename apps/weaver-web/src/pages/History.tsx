@@ -16,7 +16,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { Link } from "react-router";
-import { useClient, useMutation, useQuery, useSubscription } from "urql";
+import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DataTable } from "@/components/data-table/DataTable";
 import type { DataTableColumnMeta } from "@/components/data-table/DataTable";
@@ -32,10 +32,10 @@ import { DIAGNOSTICS_ENABLED } from "@/lib/features";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
-  normalizeJobData,
   type DeleteOperationData,
-  type GraphqlJobData,
-  type JobData,
+  type DiagnosticRunData,
+  normalizeFacadeJobStatus,
+  normalizeGraphqlTimestamp,
 } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
 import {
@@ -52,9 +52,29 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
-type HistoryJob = JobData;
+type HistoryJob = {
+  id: number;
+  name: string;
+  displayTitle: string;
+  originalTitle: string;
+  status: string;
+  totalBytes: number;
+  health: number;
+  category: string | null;
+  completedAt?: number | null;
+  deleteOperation?: DeleteOperationData | null;
+  diagnosticRun?: DiagnosticRunData | null;
+  lastDiagnosticId?: string | null;
+  lastDiagnosticUploadedAt?: number | null;
+};
 type HistoryFilter = "all" | "success" | "failure";
-type FacadeHistoryJob = GraphqlJobData;
+type FacadeHistoryJob = Omit<HistoryJob, "completedAt" | "diagnosticRun" | "lastDiagnosticUploadedAt"> & {
+  completedAt?: string | number | null;
+  lastDiagnosticUploadedAt?: string | number | null;
+  diagnosticRun?: (Omit<DiagnosticRunData, "updatedAt"> & {
+    updatedAt?: string | number | null;
+  }) | null;
+};
 type HistoryPageCounts = {
   all: number;
   success: number;
@@ -70,7 +90,6 @@ type HistoryPageResponse = {
 type HistoryDeleteAcceptanceResponse = {
   acceptHistoryDelete: {
     operationId: number;
-    acceptedIds: number[];
     totalTargets: number;
   };
 };
@@ -123,7 +142,18 @@ function handleHistoryFilterOptionKeyDown(
 }
 
 function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
-  return normalizeJobData(job);
+  return {
+    ...job,
+    status: normalizeFacadeJobStatus(job.status),
+    completedAt: normalizeGraphqlTimestamp(job.completedAt),
+    lastDiagnosticUploadedAt: normalizeGraphqlTimestamp(job.lastDiagnosticUploadedAt),
+    diagnosticRun: job.diagnosticRun
+      ? {
+        ...job.diagnosticRun,
+        updatedAt: normalizeGraphqlTimestamp(job.diagnosticRun.updatedAt),
+      }
+      : null,
+  };
 }
 
 function historyStatusToGraphql(filter: HistoryFilter): "ALL" | "SUCCESS" | "FAILURE" {
@@ -190,66 +220,9 @@ function localDeleteOperation(lock: LocalDeleteLock): DeleteOperationData {
   };
 }
 
-function sameStringArray(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function sameEpisode(left: JobData["parsedRelease"]["episode"], right: JobData["parsedRelease"]["episode"]): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return left == null && right == null;
-  }
-  return left.season === right.season
-    && left.absoluteEpisode === right.absoluteEpisode
-    && left.raw === right.raw
-    && left.episodeNumbers.length === right.episodeNumbers.length
-    && left.episodeNumbers.every((value, index) => value === right.episodeNumbers[index]);
-}
-
-function sameParsedRelease(left: JobData["parsedRelease"], right: JobData["parsedRelease"]): boolean {
-  return left.normalizedTitle === right.normalizedTitle
-    && left.releaseGroup === right.releaseGroup
-    && sameStringArray(left.languagesAudio, right.languagesAudio)
-    && sameStringArray(left.languagesSubtitles, right.languagesSubtitles)
-    && left.year === right.year
-    && left.quality === right.quality
-    && left.source === right.source
-    && left.videoCodec === right.videoCodec
-    && left.videoEncoding === right.videoEncoding
-    && left.audio === right.audio
-    && sameStringArray(left.audioCodecs, right.audioCodecs)
-    && left.audioChannels === right.audioChannels
-    && left.isDualAudio === right.isDualAudio
-    && left.isAtmos === right.isAtmos
-    && left.isDolbyVision === right.isDolbyVision
-    && left.detectedHdr === right.detectedHdr
-    && left.isHdr10Plus === right.isHdr10Plus
-    && left.isHlg === right.isHlg
-    && left.fps === right.fps
-    && left.isProperUpload === right.isProperUpload
-    && left.isRepack === right.isRepack
-    && left.isRemux === right.isRemux
-    && left.isBdDisk === right.isBdDisk
-    && left.isAiEnhanced === right.isAiEnhanced
-    && left.isHardcodedSubs === right.isHardcodedSubs
-    && left.streamingService === right.streamingService
-    && left.edition === right.edition
-    && left.animeVersion === right.animeVersion
-    && left.parseConfidence === right.parseConfidence
-    && sameEpisode(left.episode, right.episode);
-}
-
-function sameMetadata(left: { key: string; value: string }[], right: { key: string; value: string }[]): boolean {
-  return left.length === right.length
-    && left.every((entry, index) =>
-      entry.key === right[index]?.key && entry.value === right[index]?.value);
-}
-
 function sameDeleteOperationData(
-  left: JobData["deleteOperation"],
-  right: JobData["deleteOperation"],
+  left: HistoryJob["deleteOperation"],
+  right: HistoryJob["deleteOperation"],
 ): boolean {
   if (left === right) {
     return true;
@@ -265,8 +238,8 @@ function sameDeleteOperationData(
 }
 
 function sameDiagnosticRunData(
-  left: JobData["diagnosticRun"],
-  right: JobData["diagnosticRun"],
+  left: HistoryJob["diagnosticRun"],
+  right: HistoryJob["diagnosticRun"],
 ): boolean {
   if (left === right) {
     return true;
@@ -289,23 +262,11 @@ function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
     && left.name === right.name
     && left.displayTitle === right.displayTitle
     && left.originalTitle === right.originalTitle
-    && sameParsedRelease(left.parsedRelease, right.parsedRelease)
     && left.status === right.status
-    && left.progress === right.progress
-    && left.progressPercent === right.progressPercent
     && left.totalBytes === right.totalBytes
-    && left.downloadedBytes === right.downloadedBytes
-    && left.optionalRecoveryBytes === right.optionalRecoveryBytes
-    && left.optionalRecoveryDownloadedBytes === right.optionalRecoveryDownloadedBytes
-    && left.failedBytes === right.failedBytes
     && left.health === right.health
-    && left.hasPassword === right.hasPassword
     && left.category === right.category
-    && left.createdAt === right.createdAt
     && left.completedAt === right.completedAt
-    && left.error === right.error
-    && left.outputDir === right.outputDir
-    && sameMetadata(left.metadata, right.metadata)
     && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null)
     && sameDiagnosticRunData(left.diagnosticRun ?? null, right.diagnosticRun ?? null)
     && left.lastDiagnosticId === right.lastDiagnosticId
@@ -441,10 +402,10 @@ function formatDiagnosticSummary(
 
 export function History() {
   const t = useTranslate();
-  const client = useClient();
   const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
   const previousRawJobsRef = useRef<HistoryJob[]>([]);
   const previousVisibleJobsRef = useRef<HistoryJob[]>([]);
+  const deleteOperationsFetchingRef = useRef(false);
   const [historyPreferences, setHistoryPreferences] = useTablePreferences(
     "weaver.history.table.preferences",
     DEFAULT_HISTORY_PREFERENCES,
@@ -465,6 +426,9 @@ export function History() {
   const [acceptedDeleteLocks, setAcceptedDeleteLocks] = useState<Record<number, LocalDeleteLock>>(
     {},
   );
+  const [pendingDeleteTargetCount, setPendingDeleteTargetCount] = useState(0);
+  const [awaitingDeleteStatusRefresh, setAwaitingDeleteStatusRefresh] = useState(false);
+  const [deleteStatusRefreshStarted, setDeleteStatusRefreshStarted] = useState(false);
   const [hadActiveDeleteOperations, setHadActiveDeleteOperations] = useState(false);
 
   const deferredSearch = useDeferredValue(historyPreferences.search.trim());
@@ -477,7 +441,7 @@ export function History() {
     query: HISTORY_PAGE_QUERY,
     variables: { input: historyPageInput },
   });
-  const [{ data: deleteOperationsData }, reexecuteHistoryDeleteOperations] =
+  const [{ data: deleteOperationsData, fetching: fetchingDeleteOperations }, reexecuteHistoryDeleteOperations] =
     useQuery<HistoryDeleteOperationsResponse>({
       query: HISTORY_DELETE_OPERATIONS_QUERY,
       variables: { activeOnly: true },
@@ -546,10 +510,7 @@ export function History() {
     [jobs, selectedActionIds],
   );
   const selectedCount = selectedActionIds.length;
-  const hasActiveDeleteOperations =
-    deleteOperations.length > 0
-    || jobs.some((job) => job.deleteOperation?.locked)
-    || Object.keys(acceptedDeleteLocks).length > 0;
+  const hasActiveDeleteOperations = deleteOperations.length > 0 || pendingDeleteTargetCount > 0;
   const deleteProgress = useMemo(
     () => {
       const summary = deleteOperations.reduce(
@@ -572,7 +533,7 @@ export function History() {
         return summary;
       }
 
-      const pendingTargets = Object.keys(acceptedDeleteLocks).length;
+      const pendingTargets = pendingDeleteTargetCount || Object.keys(acceptedDeleteLocks).length;
       return {
         totalTargets: pendingTargets,
         completedTargets: 0,
@@ -581,7 +542,7 @@ export function History() {
         queuedTargets: pendingTargets,
       };
     },
-    [acceptedDeleteLocks, deleteOperations],
+    [acceptedDeleteLocks, deleteOperations, pendingDeleteTargetCount],
   );
   const actionsBusy =
     acceptDeleteState.fetching
@@ -593,6 +554,10 @@ export function History() {
     () => DIAGNOSTICS_ENABLED && jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
     [jobs],
   );
+
+  useEffect(() => {
+    deleteOperationsFetchingRef.current = fetchingDeleteOperations;
+  }, [fetchingDeleteOperations]);
 
   useEffect(() => {
     if (pageIndex >= pageCount && pageIndex > 0) {
@@ -647,10 +612,10 @@ export function History() {
     }
 
     const intervalId = window.setInterval(() => {
-      if (hasActiveDeleteOperations) {
+      if (hasActiveDeleteOperations && !deleteOperationsFetchingRef.current) {
         void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
       }
-      if (hasActiveDeleteOperations || hasActiveDiagnosticRuns) {
+      if (hasActiveDiagnosticRuns) {
         void reexecuteHistoryPage({ requestPolicy: "network-only" });
       }
     }, 1000);
@@ -662,6 +627,23 @@ export function History() {
     reexecuteHistoryDeleteOperations,
     reexecuteHistoryPage,
   ]);
+
+  useEffect(() => {
+    if (!awaitingDeleteStatusRefresh) {
+      return;
+    }
+    if (fetchingDeleteOperations) {
+      setDeleteStatusRefreshStarted(true);
+      return;
+    }
+    if (!deleteStatusRefreshStarted) {
+      return;
+    }
+
+    setAwaitingDeleteStatusRefresh(false);
+    setDeleteStatusRefreshStarted(false);
+    setPendingDeleteTargetCount(0);
+  }, [awaitingDeleteStatusRefresh, deleteStatusRefreshStarted, fetchingDeleteOperations]);
 
   useEffect(() => {
     if (hasActiveDeleteOperations) {
@@ -685,22 +667,9 @@ export function History() {
     reexecuteHistoryPage,
   ]);
 
-  const refetchHistoryPage = useCallback(async (preferredPageIndex: number) => {
-    const probeInput = buildHistoryPageInput(historyPreferences, deferredSearch, preferredPageIndex);
-    const probe = await client
-      .query(HISTORY_PAGE_QUERY, { input: probeInput }, { requestPolicy: "network-only" })
-      .toPromise();
-    const nextTotal = probe.data?.historyPage.totalCount ?? 0;
-    const nextPageCount = Math.max(1, Math.ceil(nextTotal / historyPreferences.pageSize));
-    const nextPageIndex = Math.min(preferredPageIndex, nextPageCount - 1);
-
-    if (nextPageIndex !== pageIndex) {
-      setPageIndex(nextPageIndex);
-      return;
-    }
-
+  const refetchHistoryPage = useCallback(async () => {
     void reexecuteHistoryPage({ requestPolicy: "network-only" });
-  }, [client, deferredSearch, historyPreferences, pageIndex, reexecuteHistoryPage]);
+  }, [reexecuteHistoryPage]);
 
   const handleSubscription = useCallback(
     (
@@ -708,18 +677,21 @@ export function History() {
       response: { queueEvents: { kind: string; itemId: number | null; state: string | null } },
     ) => {
       const event = response.queueEvents;
+      if (event.kind === "ITEM_REMOVED" && hasActiveDeleteOperations) {
+        return previous;
+      }
       if (
         (event.kind === "ITEM_COMPLETED"
           || (event.kind === "ITEM_STATE_CHANGED" && event.state === "FAILED")
           || event.kind === "ITEM_REMOVED")
         && event.itemId != null
       ) {
-        void refetchHistoryPage(pageIndex === 0 ? 0 : pageIndex);
+        void refetchHistoryPage();
         void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
       }
       return previous;
     },
-    [pageIndex, refetchHistoryPage, reexecuteHistoryDeleteOperations],
+    [hasActiveDeleteOperations, refetchHistoryPage, reexecuteHistoryDeleteOperations],
   );
   useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, handleSubscription);
 
@@ -740,10 +712,10 @@ export function History() {
       const result = await reprocessJob({ id: jobId });
       if (!result.error) {
         setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
-        await refetchHistoryPage(pageIndex);
+        await refetchHistoryPage();
       }
     },
-    [pageIndex, refetchHistoryPage, reprocessJob],
+    [refetchHistoryPage, reprocessJob],
   );
 
   const handleBatchReprocess = useCallback(
@@ -762,10 +734,10 @@ export function History() {
 
       if (completedIds.length > 0) {
         setRowSelection((current) => removeRowSelectionIds(current, completedIds));
-        await refetchHistoryPage(pageIndex);
+        await refetchHistoryPage();
       }
     },
-    [pageIndex, refetchHistoryPage, reprocessJob],
+    [refetchHistoryPage, reprocessJob],
   );
 
   const handleDiagnosticRedownload = useCallback(
@@ -783,11 +755,10 @@ export function History() {
         return false;
       }
       setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
-      await refetchHistoryPage(pageIndex);
-      void reexecuteHistoryPage({ requestPolicy: "network-only" });
+      await refetchHistoryPage();
       return true;
     },
-    [pageIndex, refetchHistoryPage, reexecuteHistoryPage, startDiagnosticRedownload],
+    [refetchHistoryPage, startDiagnosticRedownload],
   );
 
   const isJobLocked = useCallback(
@@ -813,9 +784,17 @@ export function History() {
         return false;
       }
 
+      const locallyLockedIds =
+        input.mode === "IDS"
+          ? input.ids
+          : jobs.filter((job) => !isJobLocked(job)).map((job) => job.id);
+
+      setPendingDeleteTargetCount(acceptance.totalTargets);
+      setAwaitingDeleteStatusRefresh(true);
+      setDeleteStatusRefreshStarted(false);
       setAcceptedDeleteLocks((current) => {
         const next = { ...current };
-        for (const id of acceptance.acceptedIds) {
+        for (const id of locallyLockedIds) {
           next[id] = {
             operationId: acceptance.operationId,
             deleteFiles: input.deleteFiles,
@@ -823,12 +802,11 @@ export function History() {
         }
         return next;
       });
-      setRowSelection((current) => removeRowSelectionIds(current, acceptance.acceptedIds));
+      setRowSelection((current) => removeRowSelectionIds(current, locallyLockedIds));
       void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
-      void reexecuteHistoryPage({ requestPolicy: "network-only" });
       return true;
     },
-    [acceptHistoryDelete, reexecuteHistoryDeleteOperations, reexecuteHistoryPage],
+    [acceptHistoryDelete, isJobLocked, jobs, reexecuteHistoryDeleteOperations],
   );
 
   const renderActions = useCallback(
@@ -1215,7 +1193,7 @@ export function History() {
     const result = await redownloadJob({ id: jobId });
     if (!result.error) {
       setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
-      await refetchHistoryPage(pageIndex);
+      await refetchHistoryPage();
     }
   }
 
@@ -1234,7 +1212,7 @@ export function History() {
 
     if (completedIds.length > 0) {
       setRowSelection((current) => removeRowSelectionIds(current, completedIds));
-      await refetchHistoryPage(pageIndex);
+      await refetchHistoryPage();
     }
   }
 

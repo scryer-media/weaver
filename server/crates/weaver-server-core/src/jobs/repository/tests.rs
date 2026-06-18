@@ -497,6 +497,46 @@ fn archive_job_moves_to_history() {
 }
 
 #[test]
+fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+
+    let mut history = JobHistoryRow {
+        job_id: 1,
+        job_hash: None,
+        name: "test.nzb".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 1_000_000,
+        downloaded_bytes: 1_000_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: Some("/tmp/output_1".to_string()),
+        nzb_path: Some("/tmp/original.nzb".to_string()),
+        created_at: 1_700_000_001,
+        completed_at: 1_700_000_010,
+        metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    };
+    db.archive_job(JobId(1), &history).unwrap();
+    let (_, expected_nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
+
+    history.status = "failed".to_string();
+    history.error_message = Some("late archive rewrite".to_string());
+    history.nzb_path = None;
+    db.archive_job(JobId(1), &history).unwrap();
+
+    let (path, nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
+    assert_eq!(path, PathBuf::from("job-1.nzb"));
+    assert_eq!(nzb_zstd, expected_nzb_zstd);
+    assert!(db.get_job_history(1).unwrap().unwrap().nzb_path.is_none());
+}
+
+#[test]
 fn delete_active_job_cleans_all() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();

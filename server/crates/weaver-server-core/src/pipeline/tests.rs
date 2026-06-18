@@ -5098,18 +5098,14 @@ async fn delete_history_removes_intermediate_output_dir() {
 }
 
 #[tokio::test]
-async fn delete_history_preserves_source_nzb_metadata_path() {
+async fn delete_history_removes_db_only_history_row() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30023);
-    let output_dir = intermediate_dir.join("history-retained-nzb-job");
-    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
+    let output_dir = intermediate_dir.join("history-db-only-job");
     tokio::fs::create_dir_all(&output_dir).await.unwrap();
-    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
-    tokio::fs::write(&nzb_path, b"persisted").await.unwrap();
 
-    let mut row = history_row_with_output_dir(job_id, "History Retained NZB", "failed", output_dir);
-    row.nzb_path = Some(nzb_path.display().to_string());
+    let row = history_row_with_output_dir(job_id, "History DB NZB", "failed", output_dir);
     pipeline.db.insert_job_history(&row).unwrap();
 
     let (reply, recv) = oneshot::channel();
@@ -5126,7 +5122,6 @@ async fn delete_history_preserves_source_nzb_metadata_path() {
         .unwrap()
         .unwrap();
 
-    assert!(nzb_path.exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
 
@@ -7432,14 +7427,6 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30037);
-    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
-    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
-    tokio::fs::write(
-        &nzb_path,
-        zstd::bulk::compress(&sample_nzb_bytes(), 3).unwrap(),
-    )
-    .await
-    .unwrap();
     let mut row = history_row_with_output_dir(
         job_id,
         "Failed History Job",
@@ -7449,7 +7436,6 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
     row.output_dir = None;
     row.error_message = Some("boom".to_string());
     row.category = Some("tv".to_string());
-    row.nzb_path = Some(nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
 
@@ -7463,7 +7449,10 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
         state.spec.metadata,
         vec![
             ("source".to_string(), "history".to_string()),
-            ("weaver.original_title".to_string(), job_id.0.to_string()),
+            (
+                "weaver.original_title".to_string(),
+                format!("job-{}", job_id.0),
+            ),
         ]
     );
     assert!(state.download_queue.is_empty());
@@ -7474,14 +7463,6 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30039);
-    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
-    tokio::fs::create_dir_all(&pipeline.nzb_dir).await.unwrap();
-    tokio::fs::write(
-        &nzb_path,
-        zstd::bulk::compress(&sample_nzb_bytes(), 3).unwrap(),
-    )
-    .await
-    .unwrap();
     let mut row = history_row_with_output_dir(
         job_id,
         "Complete History Job",
@@ -7490,7 +7471,6 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
     );
     row.output_dir = None;
     row.category = Some("tv".to_string());
-    row.nzb_path = Some(nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
 
@@ -7504,7 +7484,10 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
         state.spec.metadata,
         vec![
             ("source".to_string(), "history".to_string()),
-            ("weaver.original_title".to_string(), job_id.0.to_string()),
+            (
+                "weaver.original_title".to_string(),
+                format!("job-{}", job_id.0),
+            ),
         ]
     );
     assert!(state.download_queue.is_empty());
@@ -7515,7 +7498,6 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30038);
-    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
     let working_dir = intermediate_dir.join("failed-redownload-job");
     let staging_dir = pipeline
         .complete_dir
@@ -7533,7 +7515,6 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
     let mut row =
         history_row_with_output_dir(job_id, "Failed History Job", "failed", working_dir.clone());
     row.category = Some("tv".to_string());
-    row.nzb_path = Some(nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
 
@@ -7560,7 +7541,6 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30040);
-    let nzb_path = pipeline.nzb_dir.join(format!("{}.nzb", job_id.0));
     let working_dir = complete_dir.join("complete-redownload-job");
     let staging_dir = pipeline
         .complete_dir
@@ -7588,7 +7568,6 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
         working_dir.clone(),
     );
     row.category = Some("tv".to_string());
-    row.nzb_path = Some(nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
 

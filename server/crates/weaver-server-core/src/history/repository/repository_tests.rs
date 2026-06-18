@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use super::*;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 fn sample_history() -> JobHistoryRow {
     JobHistoryRow {
@@ -46,6 +49,40 @@ fn insert_and_list() {
     assert_eq!(entries[0].optional_recovery_bytes, 200_000);
     assert_eq!(entries[0].optional_recovery_downloaded_bytes, 50_000);
     assert_eq!(db.get_job_history(1).unwrap().unwrap().name, "test.nzb");
+}
+
+#[test]
+fn upsert_preserves_persisted_nzb_bytes_when_update_omits_them() {
+    let db = Database::open_in_memory().unwrap();
+    let mut history = sample_history();
+    history.nzb_path = Some("/tmp/original.nzb".to_string());
+    db.insert_job_history(&history).unwrap();
+
+    let expected_nzb = crate::ingest::compress_nzb_bytes(b"<nzb></nzb>").unwrap();
+    let datastore = db.datastore();
+    let expected_for_update = expected_nzb.clone();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.read_exec(),
+            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
+            &[SqlArg::Bytes(expected_for_update), SqlArg::I64(1)],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+
+    let mut update = sample_history();
+    update.name = "updated.nzb".to_string();
+    update.status = "failed".to_string();
+    update.error_message = Some("later metadata rewrite".to_string());
+    update.nzb_path = None;
+    db.insert_job_history(&update).unwrap();
+
+    let (path, nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
+    assert_eq!(path, PathBuf::from("job-1.nzb"));
+    assert_eq!(nzb_zstd.as_deref(), Some(expected_nzb.as_slice()));
+    assert!(db.get_job_history(1).unwrap().unwrap().nzb_path.is_none());
 }
 
 #[test]

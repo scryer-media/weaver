@@ -814,7 +814,7 @@ impl Pipeline {
             }
         } else {
             let history_row = self.load_history_row(job_id).await?;
-            let (nzb, nzb_path, category, metadata, output_dir, downloaded_bytes) =
+            let (nzb, nzb_path, nzb_hash, category, metadata, output_dir, downloaded_bytes) =
                 if let Some(row) = history_row.as_ref() {
                     let status = crate::job_status_from_persisted_str(
                         &row.status,
@@ -840,11 +840,13 @@ impl Pipeline {
                         .unwrap_or_else(|| {
                             (self.persisted_nzb_path_for_job(job_id, Some(row)), None)
                         });
-                    let (nzb, nzb_path, _) =
+                    let (nzb, nzb_path, nzb_zstd) =
                         self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
+                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
                     (
                         nzb,
                         nzb_path,
+                        nzb_hash,
                         row.category.clone(),
                         metadata,
                         row.output_dir.clone(),
@@ -872,11 +874,14 @@ impl Pipeline {
                                 None,
                             )
                         });
-                    let (nzb, nzb_path, _) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+                    let (nzb, nzb_path, nzb_zstd) =
+                        self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
 
                     (
                         nzb,
                         nzb_path,
+                        nzb_hash,
                         info.category.clone(),
                         info.metadata.clone(),
                         info.output_dir.clone(),
@@ -911,7 +916,7 @@ impl Pipeline {
             let par2_bytes = spec.par2_bytes();
             let mut state = JobState {
                 job_id,
-                job_hash: crate::ingest::hash_persisted_nzb_or_empty(&nzb_path),
+                job_hash: nzb_hash,
                 spec,
                 status: JobStatus::Downloading,
                 download_state: crate::jobs::model::DownloadState::Downloading,
