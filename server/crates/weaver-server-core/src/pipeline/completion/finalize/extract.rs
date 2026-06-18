@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::extraction::RarExtractionOpenRequest;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -478,14 +479,16 @@ impl Pipeline {
                 }
 
                 let selection = Self::open_rar_archive_for_extraction_with_password_candidates(
-                    &set_name_owned,
-                    volume_paths.clone(),
-                    password_candidates.clone(),
-                    cached_headers,
-                    shared_kdf_cache.clone(),
-                    open_mode,
-                    &[],
-                    Some(&already_extracted),
+                    RarExtractionOpenRequest {
+                        set_name: &set_name_owned,
+                        volume_paths: volume_paths.clone(),
+                        password_candidates: password_candidates.clone(),
+                        cached_headers,
+                        shared_kdf_cache: shared_kdf_cache.clone(),
+                        open_mode,
+                        requested_members: &[],
+                        already_extracted: Some(&already_extracted),
+                    },
                 )?;
                 let mut archive = selection.archive;
                 let selected_password = selection.password;

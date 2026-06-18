@@ -421,14 +421,16 @@ impl Pipeline {
                         pp_pool.install(move || {
                             let selection =
                                 Self::open_rar_archive_for_extraction_with_password_candidates(
-                                    &set_name_for_archive,
-                                    volume_paths_for_task.clone(),
-                                    password_candidates_for_task.clone(),
-                                    cached_headers_for_task,
-                                    shared_kdf_cache_for_task,
-                                    RarArchiveOpenMode::AttachOnly,
-                                    &members_to_extract,
-                                    None,
+                                    RarExtractionOpenRequest {
+                                        set_name: &set_name_for_archive,
+                                        volume_paths: volume_paths_for_task.clone(),
+                                        password_candidates: password_candidates_for_task.clone(),
+                                        cached_headers: cached_headers_for_task,
+                                        shared_kdf_cache: shared_kdf_cache_for_task,
+                                        open_mode: RarArchiveOpenMode::AttachOnly,
+                                        requested_members: &members_to_extract,
+                                        already_extracted: None,
+                                    },
                                 )?;
                             let mut archive = selection.archive;
                             let selected_password = selection.password;

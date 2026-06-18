@@ -10,7 +10,7 @@ mod checkpoint;
 mod member;
 mod scheduler;
 
-pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext};
+pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 
 #[cfg(test)]
 mod tests;

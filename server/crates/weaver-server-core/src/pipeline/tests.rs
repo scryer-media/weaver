@@ -991,7 +991,7 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
 
     let key = (job_id, set_name.to_string());
     assert!(
-        pipeline.archive_password_winners.get(&key).is_none(),
+        !pipeline.archive_password_winners.contains_key(&key),
         "topology/header open alone must not remember a password winner"
     );
 
@@ -1008,14 +1008,16 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
     );
 
     let selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
-        set_name,
-        volume_paths,
-        restart_candidates.clone(),
-        Some(cached_headers),
-        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
-        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
-        &[],
-        None,
+        crate::pipeline::extraction::RarExtractionOpenRequest {
+            set_name,
+            volume_paths,
+            password_candidates: restart_candidates.clone(),
+            cached_headers: Some(cached_headers),
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+            requested_members: &[],
+            already_extracted: None,
+        },
     )
     .expect("cached headers should validate extraction with the fallback winner");
 
@@ -1061,7 +1063,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
 
     let key = (job_id, set_name.to_string());
     assert!(
-        pipeline.archive_password_winners.get(&key).is_none(),
+        !pipeline.archive_password_winners.contains_key(&key),
         "member-encrypted topology/header open must not remember a password winner"
     );
 
@@ -1076,14 +1078,16 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
 
     let requested_members = vec!["small.txt".to_string()];
     let mut selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
-        set_name,
-        volume_paths.clone(),
-        candidates.clone(),
-        None,
-        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
-        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
-        &requested_members,
-        None,
+        crate::pipeline::extraction::RarExtractionOpenRequest {
+            set_name,
+            volume_paths: volume_paths.clone(),
+            password_candidates: candidates.clone(),
+            cached_headers: None,
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+            requested_members: &requested_members,
+            already_extracted: None,
+        },
     )
     .expect("member extraction probe should fall back to the NZB meta password");
 
@@ -1155,7 +1159,7 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
 
     let key = (job_id, set_name.to_string());
     assert!(
-        pipeline.archive_password_winners.get(&key).is_none(),
+        !pipeline.archive_password_winners.contains_key(&key),
         "member-encrypted topology/header open must not remember a password winner"
     );
     let cached_headers = pipeline
@@ -1172,14 +1176,16 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
 
     let requested_members = vec!["small.txt".to_string()];
     let selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
-        set_name,
-        volume_paths,
-        candidates.clone(),
-        Some(cached_headers),
-        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
-        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
-        &requested_members,
-        None,
+        crate::pipeline::extraction::RarExtractionOpenRequest {
+            set_name,
+            volume_paths,
+            password_candidates: candidates.clone(),
+            cached_headers: Some(cached_headers),
+            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+            requested_members: &requested_members,
+            already_extracted: None,
+        },
     )
     .expect("cached headers should still probe extraction before selecting a member password");
 

@@ -18,6 +18,17 @@ pub(crate) enum RarArchiveOpenMode {
     RefreshProvidedVolumes,
 }
 
+pub(crate) struct RarExtractionOpenRequest<'a> {
+    pub(crate) set_name: &'a str,
+    pub(crate) volume_paths: std::collections::BTreeMap<u32, PathBuf>,
+    pub(crate) password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    pub(crate) cached_headers: Option<Vec<u8>>,
+    pub(crate) shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+    pub(crate) open_mode: RarArchiveOpenMode,
+    pub(crate) requested_members: &'a [String],
+    pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+}
+
 pub(crate) struct RarExtractionOpenSelection {
     pub(crate) archive: weaver_rar::RarArchive,
     pub(crate) password: Option<String>,
@@ -303,15 +314,19 @@ impl Pipeline {
     }
 
     pub(crate) fn open_rar_archive_for_extraction_with_password_candidates(
-        set_name: &str,
-        volume_paths: std::collections::BTreeMap<u32, PathBuf>,
-        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-        cached_headers: Option<Vec<u8>>,
-        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
-        open_mode: RarArchiveOpenMode,
-        requested_members: &[String],
-        already_extracted: Option<&std::collections::HashSet<String>>,
+        request: RarExtractionOpenRequest<'_>,
     ) -> Result<RarExtractionOpenSelection, String> {
+        let RarExtractionOpenRequest {
+            set_name,
+            volume_paths,
+            password_candidates,
+            cached_headers,
+            shared_kdf_cache,
+            open_mode,
+            requested_members,
+            already_extracted,
+        } = request;
+
         if password_candidates.len() <= 1 {
             let selection = Self::open_rar_archive_from_snapshot_or_disk(
                 set_name,
@@ -422,7 +437,7 @@ impl Pipeline {
         };
 
         for (volume_number, path) in volume_paths {
-            let file = match std::fs::File::open(&path) {
+            let file = match std::fs::File::open(path) {
                 Ok(file) => file,
                 Err(error)
                     if has_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
