@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use axum::Json;
 use axum::extract::{
-    Extension, Multipart,
+    Extension, FromRequestParts, Multipart,
     multipart::{Field, MultipartError},
 };
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
@@ -19,6 +19,54 @@ use weaver_server_core::security::RuntimeSecurityConfig;
 #[derive(Debug, Deserialize)]
 pub(super) struct BackupExportRequest {
     password: Option<String>,
+}
+
+pub(super) struct BackupHandlerState {
+    db: Database,
+    auth_cache: LoginAuthCache,
+    api_key_cache: ApiKeyCache,
+    backup: BackupService,
+    session_token: Arc<String>,
+    security: RuntimeSecurityConfig,
+}
+
+impl<S> FromRequestParts<S> for BackupHandlerState
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Extension(db) = Extension::<Database>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Extension(auth_cache) = Extension::<LoginAuthCache>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Extension(api_key_cache) = Extension::<ApiKeyCache>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Extension(backup) = Extension::<BackupService>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Extension(super::SessionToken(session_token)) =
+            Extension::<super::SessionToken>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Extension(security) =
+            Extension::<RuntimeSecurityConfig>::from_request_parts(parts, state)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Self {
+            db,
+            auth_cache,
+            api_key_cache,
+            backup,
+            session_token,
+            security,
+        })
+    }
 }
 
 async fn require_admin(
@@ -83,12 +131,14 @@ pub(super) async fn backup_export_handler(
 }
 
 pub(super) async fn backup_inspect_handler(
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
-    Extension(backup): Extension<BackupService>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
-    Extension(security): Extension<RuntimeSecurityConfig>,
+    BackupHandlerState {
+        db,
+        auth_cache,
+        api_key_cache,
+        backup,
+        session_token,
+        security,
+    }: BackupHandlerState,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
@@ -112,12 +162,14 @@ pub(super) async fn backup_inspect_handler(
 }
 
 pub(super) async fn backup_restore_handler(
-    Extension(db): Extension<Database>,
-    Extension(auth_cache): Extension<LoginAuthCache>,
-    Extension(api_key_cache): Extension<ApiKeyCache>,
-    Extension(backup): Extension<BackupService>,
-    Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
-    Extension(security): Extension<RuntimeSecurityConfig>,
+    BackupHandlerState {
+        db,
+        auth_cache,
+        api_key_cache,
+        backup,
+        session_token,
+        security,
+    }: BackupHandlerState,
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {

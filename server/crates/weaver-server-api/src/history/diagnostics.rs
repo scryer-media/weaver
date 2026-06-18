@@ -63,6 +63,56 @@ struct BoundedJobIdCache {
     order: VecDeque<u64>,
 }
 
+#[derive(Debug, Default)]
+struct DiagnosticLogWorkerState {
+    skipped_service_log_lines: u64,
+    failed_append_attempts: u64,
+}
+
+impl DiagnosticLogWorkerState {
+    fn record_lag(&mut self, skipped: u64) {
+        self.skipped_service_log_lines = self.skipped_service_log_lines.saturating_add(skipped);
+    }
+
+    fn record_append_failure(&mut self) {
+        self.failed_append_attempts = self.failed_append_attempts.saturating_add(1);
+    }
+
+    fn lines_for_next_service_line(
+        &mut self,
+        active_run_count: usize,
+        service_line: String,
+    ) -> Option<Vec<String>> {
+        if active_run_count == 0 {
+            self.discard_pending();
+            return None;
+        }
+
+        let mut lines = Vec::new();
+        if self.skipped_service_log_lines > 0 {
+            lines.push(format!(
+                "diagnostic log collection skipped {} service log lines",
+                self.skipped_service_log_lines
+            ));
+            self.skipped_service_log_lines = 0;
+        }
+        if self.failed_append_attempts > 0 {
+            lines.push(format!(
+                "diagnostic log collection failed to append {} diagnostic log records",
+                self.failed_append_attempts
+            ));
+            self.failed_append_attempts = 0;
+        }
+        lines.push(service_line);
+        Some(lines)
+    }
+
+    fn discard_pending(&mut self) {
+        self.skipped_service_log_lines = 0;
+        self.failed_append_attempts = 0;
+    }
+}
+
 impl BoundedJobIdCache {
     fn new(limit: usize) -> Self {
         Self {
@@ -391,25 +441,25 @@ impl DiagnosticManager {
 
     async fn run_log_worker(self) {
         let mut rx = self.log_buffer.subscribe();
+        let mut state = DiagnosticLogWorkerState::default();
         loop {
             match rx.recv().await {
                 Ok(line) => {
                     let runs = self.active_runs().await;
+                    let Some(lines) = state.lines_for_next_service_line(runs.len(), line) else {
+                        continue;
+                    };
                     for run in runs {
-                        if let Err(error) = self
-                            .append_text_line(self.staging_dir(&run).await.join(LOG_FILE), &line)
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %error,
-                                diagnostic_job_id = run.diagnostic_job_id,
-                                "failed to append diagnostic log line"
-                            );
+                        let path = self.staging_dir(&run).await.join(LOG_FILE);
+                        for line in &lines {
+                            if self.append_text_line(path.clone(), line).await.is_err() {
+                                state.record_append_failure();
+                            }
                         }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "diagnostic log worker lagged");
+                    state.record_lag(skipped);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -1657,7 +1707,10 @@ fn bundle_graphql_error(error: DiagnosticBundleError) -> async_graphql::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedJobIdCache, DEFAULT_DIAGNOSTIC_UPLOAD_URL, resolved_diagnostic_upload_url};
+    use super::{
+        BoundedJobIdCache, DEFAULT_DIAGNOSTIC_UPLOAD_URL, DiagnosticLogWorkerState,
+        resolved_diagnostic_upload_url,
+    };
 
     #[test]
     fn bounded_job_id_cache_evicts_old_entries_and_removes() {
@@ -1691,6 +1744,70 @@ mod tests {
 
         assert!(cache.contains(10));
         assert!(cache.contains(11));
+    }
+
+    #[test]
+    fn diagnostic_log_worker_state_preserves_normal_lines() {
+        let mut state = DiagnosticLogWorkerState::default();
+
+        assert_eq!(
+            state.lines_for_next_service_line(1, "service line".to_string()),
+            Some(vec!["service line".to_string()]),
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_worker_state_coalesces_lag_marker_once() {
+        let mut state = DiagnosticLogWorkerState::default();
+        state.record_lag(3);
+        state.record_lag(4);
+
+        assert_eq!(
+            state.lines_for_next_service_line(1, "after lag".to_string()),
+            Some(vec![
+                "diagnostic log collection skipped 7 service log lines".to_string(),
+                "after lag".to_string(),
+            ]),
+        );
+        assert_eq!(
+            state.lines_for_next_service_line(1, "next".to_string()),
+            Some(vec!["next".to_string()]),
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_worker_state_discards_markers_without_active_runs() {
+        let mut state = DiagnosticLogWorkerState::default();
+        state.record_lag(5);
+        state.record_append_failure();
+
+        assert_eq!(
+            state.lines_for_next_service_line(0, "ignored".to_string()),
+            None,
+        );
+        assert_eq!(
+            state.lines_for_next_service_line(1, "later".to_string()),
+            Some(vec!["later".to_string()]),
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_worker_state_coalesces_append_failures_once() {
+        let mut state = DiagnosticLogWorkerState::default();
+        state.record_append_failure();
+        state.record_append_failure();
+
+        assert_eq!(
+            state.lines_for_next_service_line(1, "after failure".to_string()),
+            Some(vec![
+                "diagnostic log collection failed to append 2 diagnostic log records".to_string(),
+                "after failure".to_string(),
+            ]),
+        );
+        assert_eq!(
+            state.lines_for_next_service_line(1, "next".to_string()),
+            Some(vec!["next".to_string()]),
+        );
     }
 
     #[test]

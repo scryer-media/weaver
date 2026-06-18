@@ -168,15 +168,14 @@ pub(super) async fn resolve_caller(
 
     // 3. No login auth enabled: accept the browser-only session cookie issued
     // by the SPA index response.
-    if cached_auth.is_none() {
-        if let Some(cookie) = extract_session_cookie(headers)
-            && cookie == session_token
-        {
-            return Ok(ResolvedCaller {
-                scope: CallerScope::Local,
-                identity: CallerIdentity::Local(hash_api_key(&cookie)),
-            });
-        }
+    if cached_auth.is_none()
+        && let Some(cookie) = extract_session_cookie(headers)
+        && cookie == session_token
+    {
+        return Ok(ResolvedCaller {
+            scope: CallerScope::Local,
+            identity: CallerIdentity::Local(hash_api_key(&cookie)),
+        });
     }
 
     Err(StatusCode::UNAUTHORIZED)

@@ -40,18 +40,51 @@ pub fn open_db_and_config(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let db = Database::open_target(target)?;
+    let mut db = Database::open_target(target)?;
 
     if let Some(ref toml) = toml_path {
-        match db.migrate_from_toml(toml) {
-            Ok(true) => info!(toml = %toml.display(), "migrated config from TOML to database"),
-            Ok(false) => {}
-            Err(e) => error!(error = %e, "TOML migration failed"),
+        bootstrap_encryption_for_toml_import(config_path, toml, &mut db)?;
+        if db.migrate_from_toml(toml)? {
+            info!(toml = %toml.display(), "migrated config from TOML to database");
         }
     }
 
     let config = db.load_config()?;
     Ok((db, config))
+}
+
+fn bootstrap_encryption_for_toml_import(
+    config_path: &Path,
+    toml_path: &Path,
+    db: &mut Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !toml_path.exists() || !db.is_empty()? {
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(toml_path)?;
+    let config: Config = toml::from_str(&contents)
+        .map_err(|e| format!("failed to parse TOML before encryption bootstrap: {e}"))?;
+    let data_dir = if config.data_dir.is_empty() {
+        default_data_dir_for_config_path(config_path)
+    } else {
+        PathBuf::from(config.data_dir)
+    };
+
+    let key = crate::persistence::encryption::ensure_encryption_key(Some(data_dir))?;
+    db.set_encryption_key(key);
+    Ok(())
+}
+
+fn default_data_dir_for_config_path(config_path: &Path) -> PathBuf {
+    if config_path.extension().is_none_or(|e| e != "toml") {
+        config_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
 }
 
 pub fn bootstrap_encryption(
@@ -83,12 +116,12 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_test_config(path: &Path) {
+    fn write_test_config(path: &Path, data_dir: &Path) {
         let mut file = std::fs::File::create(path).unwrap();
         write!(
             file,
             r#"
-data_dir = "/tmp/weaver-data"
+data_dir = "{}"
 
 [[servers]]
 id = 1
@@ -99,7 +132,8 @@ username = "user"
 password = "pass"
 connections = 10
 active = true
-"#
+"#,
+            data_dir.display()
         )
         .unwrap();
     }
@@ -108,7 +142,7 @@ active = true
     fn resolve_database_paths_treats_migrated_toml_as_file() {
         let dir = tempfile::tempdir().unwrap();
         let migrated_path = dir.path().join("weaver.toml.migrated");
-        write_test_config(&migrated_path);
+        write_test_config(&migrated_path, &dir.path().join("data"));
 
         let (db_path, toml_path) = resolve_database_paths(&migrated_path);
 
@@ -119,13 +153,37 @@ active = true
     #[test]
     fn open_db_and_config_imports_migrated_toml_without_renaming_again() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
         let migrated_path = dir.path().join("weaver.toml.migrated");
-        write_test_config(&migrated_path);
+        write_test_config(&migrated_path, &data_dir);
 
         let (_db, config) = open_db_and_config(&migrated_path).unwrap();
 
-        assert_eq!(config.data_dir, "/tmp/weaver-data");
+        assert_eq!(config.data_dir, data_dir.display().to_string());
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].password, Some("pass".to_string()));
+        if std::env::var("WEAVER_ENCRYPTION_KEY")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            assert!(data_dir.join("encryption.key").exists());
+        }
         assert!(migrated_path.exists());
         assert!(!dir.path().join("weaver.toml.toml.migrated").exists());
+    }
+
+    #[test]
+    fn open_db_and_config_fails_when_toml_import_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("weaver.toml");
+        std::fs::write(&toml_path, "data_dir = [not valid toml]").unwrap();
+
+        let error = match open_db_and_config(&toml_path) {
+            Ok(_) => panic!("invalid TOML import unexpectedly succeeded"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("failed to parse TOML"));
+        assert!(toml_path.exists());
     }
 }

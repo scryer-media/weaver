@@ -44,7 +44,8 @@ active = true
     )
     .unwrap();
 
-    let db = Database::open_in_memory().unwrap();
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     assert!(db.migrate_from_toml(&toml_path).unwrap());
 
     // Verify config was imported.
