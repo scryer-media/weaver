@@ -8,8 +8,6 @@ pub struct WindowsCredentialManager;
 
 impl WindowsCredentialManager {
     fn entry() -> Result<Entry, String> {
-        keyring::use_native_store(false)
-            .map_err(|e| format!("failed to initialize Windows Credential Manager: {e}"))?;
         Entry::new(SERVICE, ACCOUNT).map_err(|e| format!("failed to create credential entry: {e}"))
     }
 }

@@ -36,8 +36,6 @@ impl KeyStore for KeyFile {
     }
 
     fn set_key(&self, key_base64: &str) -> Result<(), String> {
-        use std::io::Write;
-
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
@@ -45,6 +43,7 @@ impl KeyStore for KeyFile {
 
         #[cfg(unix)]
         {
+            use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
