@@ -36,6 +36,7 @@ use crate::jobs::assembly::ExtractionReadiness;
 use crate::jobs::assembly::JobAssembly;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
@@ -72,6 +73,115 @@ fn health_milli(total: u64, failed_bytes: u64) -> u32 {
         .saturating_mul(1000)
         .checked_div(total)
         .unwrap_or(1000) as u32
+}
+
+impl Pipeline {
+    pub(super) fn archive_password_candidates_for_job(
+        &self,
+        job_id: JobId,
+    ) -> Vec<ArchivePasswordCandidate> {
+        let spec_password = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.spec.password.as_deref());
+        let mut candidates = match self.db.load_active_job_persisted_nzb(job_id) {
+            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+                match crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd) {
+                    Ok(nzb) => crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "failed to parse persisted NZB for password candidates"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted NZB for password candidates"
+                );
+                Vec::new()
+            }
+        };
+
+        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password)
+            && !candidates
+                .iter()
+                .any(|candidate| candidate.value() == value.as_str())
+        {
+            candidates.insert(
+                0,
+                ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value),
+            );
+        }
+
+        candidates
+    }
+
+    pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {
+        self.archive_password_candidates_for_job(job_id)
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.value().to_string())
+    }
+
+    pub(super) fn archive_password_candidates_for_set(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Vec<ArchivePasswordCandidate> {
+        let candidates = self.archive_password_candidates_for_job(job_id);
+        let Some(winner) = self
+            .archive_password_winners
+            .get(&(job_id, set_name.to_string()))
+            .cloned()
+        else {
+            return candidates;
+        };
+
+        Self::password_candidates_with_selected_first(candidates, &winner)
+    }
+
+    pub(super) fn password_candidates_with_selected_first(
+        mut candidates: Vec<ArchivePasswordCandidate>,
+        selected: &ArchivePasswordCandidate,
+    ) -> Vec<ArchivePasswordCandidate> {
+        if let Some(position) = candidates
+            .iter()
+            .position(|candidate| candidate.value() == selected.value())
+        {
+            candidates.remove(position);
+        }
+        candidates.insert(0, selected.clone());
+        candidates
+    }
+
+    pub(super) fn remember_archive_password_winner(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        selected_password: Option<&str>,
+        candidates: &[ArchivePasswordCandidate],
+    ) {
+        let Some(selected_password) = selected_password else {
+            return;
+        };
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.value() == selected_password)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.archive_password_winners
+            .insert((job_id, set_name.to_string()), candidate);
+    }
 }
 
 /// Result of a download task.
@@ -180,15 +290,51 @@ pub(super) struct VerifiedSuspectPersistState {
     pub(super) queued: bool,
 }
 
+pub(crate) enum RarPasswordAttemptError {
+    Rar(weaver_rar::RarError),
+    Fatal(String),
+}
+
+pub(crate) struct ArchivePasswordSelection<T> {
+    pub(crate) value: T,
+    pub(crate) selected_password: Option<String>,
+}
+
+impl<T> ArchivePasswordSelection<T> {
+    pub(crate) fn new(value: T, selected_password: Option<String>) -> Self {
+        Self {
+            value,
+            selected_password,
+        }
+    }
+}
+
+impl std::fmt::Display for RarPasswordAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rar(error) => write!(f, "{error}"),
+            Self::Fatal(error) => f.write_str(error),
+        }
+    }
+}
+
+impl From<weaver_rar::RarError> for RarPasswordAttemptError {
+    fn from(value: weaver_rar::RarError) -> Self {
+        Self::Rar(value)
+    }
+}
+
 /// Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
     pub(super) failed: Vec<(String, String)>,
+    pub(super) selected_password: Option<String>,
 }
 
 pub(super) struct FullSetExtractionOutcome {
     pub(super) extracted: Vec<String>,
     pub(super) failed: Vec<String>,
+    pub(super) selected_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -301,6 +447,8 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    /// Winning archive password candidate per job/RAR set, kept process-local and redacted.
+    pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     /// Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
     /// Number of in-flight downloads (primary + recovery).

@@ -1,6 +1,6 @@
 use super::*;
 use crate::jobs::types::AttributeInput;
-use weaver_server_core::JobHistoryRow;
+use weaver_server_core::{CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobHistoryRow};
 
 #[test]
 fn history_item_roundtrips_attributes_and_client_request_id() {

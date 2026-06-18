@@ -78,6 +78,23 @@ file = "migrations/0026_extracted_member_output_size/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 27
+description = "history poll indexes"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0027_history_poll_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0027_history_poll_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

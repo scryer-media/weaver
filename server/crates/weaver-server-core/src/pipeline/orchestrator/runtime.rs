@@ -62,6 +62,7 @@ impl Pipeline {
             tuner,
             metrics,
             jobs: HashMap::new(),
+            archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,
             active_recovery: 0,

@@ -8,7 +8,7 @@ use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
-    HistoryFilter, JobHistoryRow, JobId,
+    HistoryFilter, HistoryMetadataEquals, JobHistoryRow, JobId,
 };
 
 fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
@@ -31,6 +31,19 @@ fn fetch_i64_pair(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> (
             .await?
             .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
         Ok((row.i64_at(0)?, row.i64_at(1)?))
+    })
+    .unwrap()
+}
+
+fn fetch_text(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>, column: &str) -> String {
+    let datastore = db.datastore();
+    let sql = sql.into();
+    let column = column.to_string();
+    db.run_sql_blocking(async move {
+        let row = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
+            .await?
+            .ok_or_else(|| StateError::Database(format!("query returned no rows: {sql}")))?;
+        row.text(&column)
     })
     .unwrap()
 }
@@ -439,7 +452,16 @@ fn archive_job_moves_to_history() {
         nzb_path: Some("/tmp/test_1.nzb".to_string()),
         created_at: 1700000001,
         completed_at: 1700001000,
-        metadata: None,
+        metadata: Some(
+            serde_json::to_string(&vec![
+                ("archive_key".to_string(), "archive-value".to_string()),
+                (
+                    crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                    "req-archive".to_string(),
+                ),
+            ])
+            .unwrap(),
+        ),
         last_diagnostic_id: None,
         last_diagnostic_uploaded_at_epoch_ms: None,
     };
@@ -453,6 +475,25 @@ fn archive_job_moves_to_history() {
     let hist = db.list_job_history(&HistoryFilter::default()).unwrap();
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].name, "test.nzb");
+    assert_eq!(
+        db.count_job_history(&HistoryFilter {
+            metadata_equals: Some(HistoryMetadataEquals {
+                key: "archive_key".to_string(),
+                value: "archive-value".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.count_job_history(&HistoryFilter {
+            metadata_has_key: Some(crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -641,6 +682,41 @@ fn active_file_identity_roundtrip() {
             .map(|classification| &classification.kind),
         Some(DetectedArchiveKind::Rar)
     ));
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(7)],
+            "filename",
+        ),
+        "show.part001.rar"
+    );
+
+    db.save_file_identity(
+        JobId(1),
+        &ActiveFileIdentity {
+            file_index: 7,
+            source_filename: "51273aad56a8b904e96928935278a627.101".to_string(),
+            current_filename: "show.part01.rar".to_string(),
+            canonical_filename: Some("show.part01.rar".to_string()),
+            classification: Some(DetectedArchiveIdentity {
+                kind: DetectedArchiveKind::Rar,
+                set_name: "show".to_string(),
+                volume_index: Some(0),
+            }),
+            classification_source: FileIdentitySource::Par2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(7)],
+            "filename",
+        ),
+        "show.part01.rar"
+    );
 }
 
 #[test]

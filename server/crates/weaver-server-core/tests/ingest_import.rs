@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use weaver_model::files::FileRole;
 use weaver_nzb::{Nzb, NzbFile, NzbMeta, NzbSegment};
 use weaver_server_core::ingest::nzb_to_spec;
 
@@ -59,6 +60,114 @@ fn nzb_to_spec_leaves_password_empty_when_missing() {
     let spec = nzb_to_spec(&nzb, path, None, vec![]);
 
     assert_eq!(spec.password, None);
+}
+
+#[test]
+fn nzb_to_spec_sanitizes_trailing_quote_filename() {
+    let path = Path::new("/downloads/Fixture.Release.nzb");
+    let nzb = Nzb {
+        meta: NzbMeta::default(),
+        files: vec![NzbFile {
+            poster: "poster@example.com".to_string(),
+            subject: "Fixture.Release Fixture.Payload.mkv\" yEnc (1/1)".to_string(),
+            date: 1_700_000_000,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![NzbSegment {
+                number: 1,
+                bytes: 10,
+                message_id: "one@example.com".to_string(),
+            }],
+        }],
+    };
+
+    let spec = nzb_to_spec(&nzb, path, None, vec![]);
+
+    assert_eq!(spec.files[0].filename, "Fixture.Payload.mkv_");
+    assert_eq!(spec.files[0].role, FileRole::Unknown);
+}
+
+#[test]
+fn nzb_to_spec_preserves_colliding_sanitized_filenames() {
+    let path = Path::new("/downloads/Fixture.Release.nzb");
+    let nzb = Nzb {
+        meta: NzbMeta::default(),
+        files: vec![
+            NzbFile {
+                poster: "poster@example.com".to_string(),
+                subject: "Fixture.Release - \"A/B.rar\" yEnc (1/1)".to_string(),
+                date: 1_700_000_000,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![NzbSegment {
+                    number: 1,
+                    bytes: 10,
+                    message_id: "one@example.com".to_string(),
+                }],
+            },
+            NzbFile {
+                poster: "poster@example.com".to_string(),
+                subject: "Fixture.Release - \"A_B.rar\" yEnc (1/1)".to_string(),
+                date: 1_700_000_000,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![NzbSegment {
+                    number: 2,
+                    bytes: 10,
+                    message_id: "two@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+
+    let spec = nzb_to_spec(&nzb, path, None, vec![]);
+
+    assert_eq!(spec.files[0].filename, "A_B.rar");
+    assert_eq!(spec.files[1].filename, "A_B.duplicate1.rar");
+    assert_eq!(spec.files[0].role, FileRole::RarVolume { volume_number: 0 });
+    assert_eq!(spec.files[1].role, FileRole::RarVolume { volume_number: 0 });
+}
+
+#[test]
+fn nzb_to_spec_sanitizes_and_classifies_archive_roles() {
+    let path = Path::new("/downloads/Fixture.Release.nzb");
+    let nzb = Nzb {
+        meta: NzbMeta::default(),
+        files: vec![
+            NzbFile {
+                poster: "poster@example.com".to_string(),
+                subject: "Fixture.Release Fixture.Payload.rar\" yEnc (1/1)".to_string(),
+                date: 1_700_000_000,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![NzbSegment {
+                    number: 1,
+                    bytes: 10,
+                    message_id: "one@example.com".to_string(),
+                }],
+            },
+            NzbFile {
+                poster: "poster@example.com".to_string(),
+                subject: "Fixture.Release Fixture.Payload.vol00+01.par2\" yEnc (1/1)".to_string(),
+                date: 1_700_000_000,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![NzbSegment {
+                    number: 2,
+                    bytes: 10,
+                    message_id: "two@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+
+    let spec = nzb_to_spec(&nzb, path, None, vec![]);
+
+    assert_eq!(spec.files[0].filename, "Fixture.Payload.rar_");
+    assert_eq!(spec.files[0].role, FileRole::RarVolume { volume_number: 0 });
+    assert_eq!(spec.files[1].filename, "Fixture.Payload.vol00+01.par2_");
+    assert_eq!(
+        spec.files[1].role,
+        FileRole::Par2 {
+            is_index: false,
+            recovery_block_count: 1
+        }
+    );
 }
 
 #[test]

@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 26;
+const CURRENT_SCHEMA_VERSION: i64 = 27;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -944,6 +944,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(nzb_cols, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_history_attribute_migration_backfills_public_metadata() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(26), true)
+            .await
+            .unwrap();
+
+        let metadata = serde_json::to_string(&vec![
+            ("*scryer_title_id".to_string(), "title-a".to_string()),
+            (
+                crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                "req-1".to_string(),
+            ),
+            (
+                crate::history::DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
+                "42".to_string(),
+            ),
+        ])
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_history
+                (job_id, name, status, total_bytes, downloaded_bytes,
+                 optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                 failed_bytes, health, created_at, completed_at, metadata)
+             VALUES (1, 'history', 'complete', 1, 1, 0, 0, 0, 1000, 10, 20, ?)",
+        )
+        .bind(metadata)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        apply_version_range(
+            &pool,
+            &catalog,
+            &payload,
+            MigrationInstallKind::Upgrade,
+            27,
+            27,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM job_history_attributes ORDER BY key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("*scryer_title_id".to_string(), "title-a".to_string())]
+        );
     }
 
     #[tokio::test]

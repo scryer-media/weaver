@@ -2,12 +2,11 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::history::{
+    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
+};
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::{Database, StateError};
-
-pub const DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY: &str = "__weaver_diagnostic_source_job_id";
-pub const DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY: &str =
-    "__weaver_diagnostic_include_server_hostnames";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticRunStage {

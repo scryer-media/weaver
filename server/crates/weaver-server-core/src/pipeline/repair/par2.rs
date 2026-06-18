@@ -1,7 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use super::*;
-use crate::jobs::record::FileIdentitySource;
+use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
+use weaver_model::files::{
+    allocate_unique_download_filename, forget_reserved_download_filename,
+    reserve_download_filename, sanitize_download_filename,
+};
 
 pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
@@ -46,6 +51,39 @@ fn recovery_file_role(spec: &JobSpec, file_index: u32) -> Option<weaver_model::f
     spec.files
         .get(file_index as usize)
         .map(|file| file.role.clone())
+}
+
+fn reserve_identity_filenames(
+    identity: &ActiveFileIdentity,
+    occupied_filenames: &mut HashSet<String>,
+) {
+    reserve_download_filename(&identity.source_filename, occupied_filenames);
+    reserve_download_filename(&identity.current_filename, occupied_filenames);
+    if let Some(canonical) = identity.canonical_filename.as_ref() {
+        reserve_download_filename(canonical, occupied_filenames);
+    }
+}
+
+fn forget_identity_filenames(
+    identity: &ActiveFileIdentity,
+    occupied_filenames: &mut HashSet<String>,
+) {
+    forget_reserved_download_filename(&identity.source_filename, occupied_filenames);
+    forget_reserved_download_filename(&identity.current_filename, occupied_filenames);
+    if let Some(canonical) = identity.canonical_filename.as_ref() {
+        forget_reserved_download_filename(canonical, occupied_filenames);
+    }
+}
+
+fn reserve_directory_filenames(dir: &Path, occupied_filenames: &mut HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(filename) = entry.file_name().to_str() {
+            reserve_download_filename(filename, occupied_filenames);
+        }
+    }
 }
 
 fn compare_selection(
@@ -215,6 +253,11 @@ impl Pipeline {
                 by_rar_volume.insert(*volume_number, *file_id);
             }
         }
+        let mut occupied_filenames = HashSet::<String>::new();
+        for (_, identity, _, _) in &files {
+            reserve_identity_filenames(identity, &mut occupied_filenames);
+        }
+        reserve_directory_filenames(&working_dir, &mut occupied_filenames);
 
         let mut touched_files = Vec::<NzbFileId>::new();
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
@@ -223,7 +266,7 @@ impl Pipeline {
         let mut rebound = 0usize;
 
         for desc in par2_set.files.values() {
-            let canonical_filename = desc.filename.clone();
+            let canonical_filename = sanitize_download_filename(&desc.filename);
             let matched_file_id = by_current
                 .get(&canonical_filename)
                 .copied()
@@ -250,6 +293,10 @@ impl Pipeline {
             };
 
             let old_current = identity.current_filename.clone();
+            let mut target_occupied = occupied_filenames.clone();
+            forget_identity_filenames(&identity, &mut target_occupied);
+            let canonical_filename =
+                allocate_unique_download_filename(&canonical_filename, &mut target_occupied);
             let filename_changed = old_current != canonical_filename;
             let old_rar_set_name = identity
                 .classification
@@ -282,20 +329,22 @@ impl Pipeline {
             let old_path = working_dir.join(&old_current);
             let new_path = working_dir.join(&canonical_filename);
             let canonical_path_exists = new_path.exists();
-            let renamed_to_canonical = if filename_changed && is_complete && old_path.exists() {
-                std::fs::rename(&old_path, &new_path).map_err(|error| {
-                    format!(
-                        "failed to rename {} to {} from PAR2 metadata: {error}",
-                        old_path.display(),
-                        new_path.display()
-                    )
-                })?;
-                true
-            } else {
-                false
-            };
-            let canonical_is_current =
-                !filename_changed || renamed_to_canonical || canonical_path_exists;
+            let renamed_to_canonical =
+                if filename_changed && is_complete && old_path.exists() && !canonical_path_exists {
+                    std::fs::rename(&old_path, &new_path).map_err(|error| {
+                        format!(
+                            "failed to rename {} to {} from PAR2 metadata: {error}",
+                            old_path.display(),
+                            new_path.display()
+                        )
+                    })?;
+                    true
+                } else {
+                    false
+                };
+            let canonical_is_current = !filename_changed
+                || renamed_to_canonical
+                || (canonical_path_exists && !old_path.exists());
 
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
@@ -334,6 +383,7 @@ impl Pipeline {
                 continue;
             }
             self.set_file_identity(job_id, rebound_identity)?;
+            reserve_download_filename(&canonical_filename, &mut occupied_filenames);
 
             if is_complete && canonical_is_current && (filename_changed || classification_changed) {
                 touched_files.push(file_id);

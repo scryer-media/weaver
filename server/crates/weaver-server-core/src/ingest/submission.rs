@@ -15,9 +15,9 @@ use crate::settings::SharedConfig;
 use weaver_nzb::Nzb;
 
 use super::persisted_nzb;
-use crate::ingest::{append_original_title_metadata, derive_release_name};
+use crate::ingest::{append_original_title_metadata, derive_release_name, nzb_password_candidates};
 use crate::jobs::{FileSpec, SegmentSpec};
-use weaver_model::files::FileRole;
+use weaver_model::files::{FileRole, unique_download_filenames};
 
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
 const MAX_FETCH_REDIRECTS: usize = 10;
@@ -85,26 +85,33 @@ pub fn nzb_to_submission_spec(
         nzb.meta.title.as_deref(),
     );
 
-    let password = password.or_else(|| {
-        nzb.meta
-            .password
-            .as_ref()
-            .filter(|value| !value.is_empty())
-            .cloned()
-    });
+    let password_path = filename
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("upload.nzb"));
+    let password = nzb_password_candidates(nzb, &password_path, password.as_deref())
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.value().to_string());
 
     let mut files = Vec::with_capacity(nzb.files.len());
     let mut total_bytes: u64 = 0;
+    let filename_candidates = nzb
+        .files
+        .iter()
+        .map(|nzb_file| {
+            // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
+            // If the extracted name is obfuscated, keep it - PAR2 deobfuscation will
+            // rename it post-repair using 16KB hash matching.
+            nzb_file
+                .extract_filename()
+                .map(|(name, _confidence)| name)
+                .or_else(|| nzb_file.filename().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .collect::<Vec<_>>();
+    let filenames = unique_download_filenames(filename_candidates.iter().map(String::as_str));
 
-    for nzb_file in &nzb.files {
-        // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
-        // If the extracted name is obfuscated, keep it - PAR2 deobfuscation will
-        // rename it post-repair using 16KB hash matching.
-        let filename = nzb_file
-            .extract_filename()
-            .map(|(name, _confidence)| name)
-            .or_else(|| nzb_file.filename().map(str::to_string))
-            .unwrap_or_else(|| "unknown".to_string());
+    for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
         let role = FileRole::from_filename(&filename);
 
         let segments: Vec<SegmentSpec> = nzb_file
@@ -207,6 +214,7 @@ async fn submit_prepared_nzb(
         name = %spec.name,
         category = spec.category,
         metadata_len = spec.metadata.len(),
+        has_password = spec.password.is_some(),
         elapsed_ms = submit_started.elapsed().as_millis() as u64,
         "submitted NZB job"
     );

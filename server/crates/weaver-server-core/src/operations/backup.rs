@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::fs::File;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
-use sqlx::{Acquire, AssertSqlSafe, ConnectOptions, Row};
+use sqlx::{Acquire, AssertSqlSafe, ConnectOptions, Row, Sqlite, Transaction};
 
 use crate::StateError;
 use crate::persistence::Database;
@@ -34,6 +34,7 @@ const STABLE_TABLES: &[&str] = &[
     "categories",
     "api_keys",
     "job_history",
+    "job_history_attributes",
     "job_events",
     "bandwidth_usage_minute_buckets",
     "rss_feeds",
@@ -44,6 +45,7 @@ const STABLE_TABLES: &[&str] = &[
 const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "metrics_history_chunks",
     "job_history",
+    "job_history_attributes",
     "job_events",
     "active_jobs",
     "active_segments",
@@ -69,6 +71,7 @@ const CLEAR_IMPORT_TABLES: &[&str] = &[
     "rss_feeds",
     "integration_events",
     "job_events",
+    "job_history_attributes",
     "job_history",
     "api_keys",
     "bandwidth_usage_minute_buckets",
@@ -76,6 +79,29 @@ const CLEAR_IMPORT_TABLES: &[&str] = &[
     "servers",
     "settings",
 ];
+
+const MIGRATION_LEDGER_TABLE: &str = "_sqlx_migrations";
+
+const REBUILD_JOB_HISTORY_ATTRIBUTES_SQL: &str =
+    "INSERT OR IGNORE INTO job_history_attributes (job_id, key, value, completed_at)
+     SELECT
+         h.job_id,
+         json_extract(attr.value, '$[0]') AS key,
+         json_extract(attr.value, '$[1]') AS value,
+         h.completed_at
+     FROM job_history h,
+          json_each(CASE WHEN json_valid(h.metadata) THEN h.metadata ELSE '[]' END) AS attr
+     WHERE h.metadata IS NOT NULL
+       AND json_valid(h.metadata)
+       AND json_type(attr.value) = 'array'
+       AND json_array_length(attr.value) = 2
+       AND json_type(attr.value, '$[0]') = 'text'
+       AND json_type(attr.value, '$[1]') = 'text'
+       AND json_extract(attr.value, '$[0]') NOT IN (
+           '__weaver_client_request_id',
+           '__weaver_diagnostic_source_job_id',
+           '__weaver_diagnostic_include_server_hostnames'
+       )";
 
 #[derive(Debug, Clone)]
 pub struct StableStateExport {
@@ -125,16 +151,108 @@ async fn copy_stable_tables_to_backup(
         .await
         .map_err(db_err)?;
 
-    for table in STABLE_TABLES {
-        let sql = format!("CREATE TABLE {table} AS SELECT * FROM src.{table}");
+    create_backup_table_schema(&mut export_conn).await?;
+
+    for table in STABLE_TABLES
+        .iter()
+        .copied()
+        .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
+    {
+        if table == "job_history_attributes" {
+            continue;
+        }
+
+        let sql = format!("INSERT INTO {table} SELECT * FROM src.{table}");
         sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
             .execute(&mut export_conn)
             .await
             .map_err(db_err)?;
     }
+    rebuild_job_history_attributes(&mut export_conn).await?;
+    create_backup_indexes(&mut export_conn).await?;
 
     sqlx::raw_sql("DETACH DATABASE src")
         .execute(&mut export_conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn create_backup_table_schema(conn: &mut SqliteConnection) -> Result<(), StateError> {
+    for table in STABLE_TABLES
+        .iter()
+        .copied()
+        .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
+    {
+        let create_sql: String = sqlx::query_scalar(
+            "SELECT sql
+               FROM src.sqlite_master
+              WHERE type = 'table'
+                AND name = ?",
+        )
+        .bind(table)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| StateError::Database(format!("source database is missing {table}")))?;
+        sqlx::raw_sql(AssertSqlSafe(create_sql.as_str()))
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+async fn create_backup_indexes(conn: &mut SqliteConnection) -> Result<(), StateError> {
+    for table in STABLE_TABLES
+        .iter()
+        .copied()
+        .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
+    {
+        let rows = sqlx::query(
+            "SELECT sql
+               FROM src.sqlite_master
+              WHERE type = 'index'
+                AND tbl_name = ?
+                AND sql IS NOT NULL
+              ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        for row in rows {
+            let create_sql: String = row.try_get("sql").map_err(db_err)?;
+            sqlx::raw_sql(AssertSqlSafe(create_sql.as_str()))
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild_job_history_attributes(conn: &mut SqliteConnection) -> Result<(), StateError> {
+    sqlx::raw_sql("DELETE FROM job_history_attributes")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    sqlx::raw_sql(REBUILD_JOB_HISTORY_ATTRIBUTES_SQL)
+        .execute(conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn rebuild_job_history_attributes_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StateError> {
+    sqlx::raw_sql("DELETE FROM job_history_attributes")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::raw_sql(REBUILD_JOB_HISTORY_ATTRIBUTES_SQL)
+        .execute(&mut **tx)
         .await
         .map_err(db_err)?;
     Ok(())
@@ -323,6 +441,7 @@ impl Database {
                             .execute(&mut *tx)
                             .await
                             .map_err(db_err)?;
+                            rebuild_job_history_attributes_tx(&mut tx).await?;
 
                             tx.commit().await.map_err(db_err)?;
                             Ok::<(), StateError>(())

@@ -117,7 +117,7 @@ impl Pipeline {
     async fn detect_nested_archive_identities(
         root: &Path,
         files: &mut [ScannedExtractionFile],
-        password: Option<String>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     ) -> Result<(), String> {
         let mut numeric_groups = HashMap::<String, Vec<(usize, u32)>>::new();
         for (index, file) in files.iter().enumerate() {
@@ -160,8 +160,11 @@ impl Pipeline {
             if !path.exists() {
                 continue;
             }
-            if let Ok(facts) =
-                Pipeline::parse_rar_volume_facts_from_path(path.clone(), password.clone()).await
+            if let Ok(facts) = Pipeline::parse_rar_volume_facts_from_path(
+                path.clone(),
+                password_candidates.clone(),
+            )
+            .await
             {
                 file.detected_archive = Some(crate::jobs::assembly::DetectedArchiveIdentity {
                     kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
@@ -211,7 +214,7 @@ impl Pipeline {
 
     async fn scan_extraction_root(
         root: &Path,
-        password: Option<String>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     ) -> Result<Vec<ScannedExtractionFile>, String> {
         fn walk(
             root: &Path,
@@ -262,7 +265,7 @@ impl Pipeline {
             walk(root, root, &mut files)?;
         }
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Self::detect_nested_archive_identities(root, &mut files, password).await?;
+        Self::detect_nested_archive_identities(root, &mut files, password_candidates).await?;
         Ok(files)
     }
 
@@ -489,11 +492,8 @@ impl Pipeline {
             .flat_map(|topology| topology.volume_map.keys().cloned())
             .collect();
         let scan_root = self.nested_scan_root(job_id)?;
-        let password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone());
-        let scanned_files = Self::scan_extraction_root(&scan_root, password).await?;
+        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()
             .filter_map(|file| {

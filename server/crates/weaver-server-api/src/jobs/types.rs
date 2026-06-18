@@ -6,14 +6,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::DownloadBlockState;
 use weaver_server_core::operations::metrics::MetricsSnapshot;
-use weaver_server_core::{
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-};
+use weaver_server_core::split_history_metadata;
 
 use super::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
 
-pub const CLIENT_REQUEST_ID_ATTRIBUTE_KEY: &str = "__weaver_client_request_id";
+pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct Attribute {
@@ -878,23 +876,14 @@ pub(crate) fn matches_attribute_filter_prepared(
 }
 
 fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attribute>) {
-    let mut client_request_id = None;
-    let mut attributes = Vec::new();
-    for (key, value) in metadata {
-        if key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY {
-            client_request_id = Some(value.clone());
-        } else if key == DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY
-            || key == DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY
-        {
-            continue;
-        } else {
-            attributes.push(Attribute {
-                key: key.clone(),
-                value: value.clone(),
-            });
-        }
-    }
-    (client_request_id, attributes)
+    let (client_request_id, attributes) = split_history_metadata(metadata);
+    (
+        client_request_id,
+        attributes
+            .into_iter()
+            .map(|(key, value)| Attribute { key, value })
+            .collect(),
+    )
 }
 
 fn normalize_progress_percent(progress_ratio: f64) -> f64 {

@@ -9,6 +9,52 @@ use crate::jobs::record::ActiveFileIdentity;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArchivePasswordSource {
+    Explicit,
+    NzbMeta,
+    FilenameConvention,
+}
+
+impl ArchivePasswordSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::NzbMeta => "nzb_meta",
+            Self::FilenameConvention => "filename_convention",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArchivePasswordCandidate {
+    source: ArchivePasswordSource,
+    value: String,
+}
+
+impl ArchivePasswordCandidate {
+    pub fn new(source: ArchivePasswordSource, value: String) -> Self {
+        Self { source, value }
+    }
+
+    pub fn source(&self) -> ArchivePasswordSource {
+        self.source
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for ArchivePasswordCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchivePasswordCandidate")
+            .field("source", &self.source)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// A job definition submitted to the scheduler.
 /// Contains everything needed to create and run a download job.
 #[derive(Clone)]

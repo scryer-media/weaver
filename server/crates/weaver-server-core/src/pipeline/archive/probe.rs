@@ -369,12 +369,9 @@ impl Pipeline {
             return;
         }
 
-        let password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone());
+        let password_candidates = self.archive_password_candidates_for_job(job_id);
         let identity = match self
-            .probe_archive_candidate(job_id, &candidate, password)
+            .probe_archive_candidate(job_id, &candidate, password_candidates)
             .await
         {
             Ok(identity) => identity,
@@ -455,7 +452,7 @@ impl Pipeline {
         &self,
         job_id: JobId,
         candidate: &ArchiveProbeCandidate,
-        password: Option<String>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     ) -> Result<Option<DetectedArchiveIdentity>, String> {
         let Some(path) = self.resolve_job_input_path(job_id, &candidate.filename) else {
             return Ok(None);
@@ -464,7 +461,9 @@ impl Pipeline {
             return Ok(None);
         }
 
-        if let Ok(facts) = Self::parse_rar_volume_facts_from_path(path.clone(), password).await {
+        if let Ok(facts) =
+            Self::parse_rar_volume_facts_from_path(path.clone(), password_candidates).await
+        {
             return Ok(Some(DetectedArchiveIdentity {
                 kind: PersistedDetectedArchiveKind::Rar,
                 set_name: candidate.set_key.clone(),

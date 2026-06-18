@@ -22,7 +22,11 @@ pub mod settings;
 pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;
 pub use error::Error;
-pub use history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
+pub use history::{
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, HistoryFilter, HistoryMetadataEquals, IntegrationEventRow,
+    JobEvent, JobHistoryRow, is_public_history_attribute_key, parse_history_metadata,
+    public_history_attributes, split_history_metadata,
+};
 pub use jobs::{
     ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, DownloadBlockKind,
     DownloadBlockState, DownloadState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo,

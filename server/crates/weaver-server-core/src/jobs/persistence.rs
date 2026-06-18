@@ -783,7 +783,9 @@ impl Database {
                                 tx.execute(
                                     "INSERT INTO active_files (job_id, file_index, filename, md5)
                                      VALUES ({}, {}, {}, {})
-                                     ON CONFLICT(job_id, file_index) DO NOTHING",
+                                     ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                        filename = excluded.filename,
+                                        md5 = excluded.md5",
                                     &[
                                         SqlArg::I64(job_id.0 as i64),
                                         SqlArg::I64(file_index as i64),
@@ -811,7 +813,9 @@ impl Database {
                              INSERT INTO active_files (job_id, file_index, filename, md5)
                              SELECT {}, {}, {}, {}
                              FROM active_file_complete_active
-                             ON CONFLICT(job_id, file_index) DO NOTHING",
+                             ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                filename = excluded.filename,
+                                md5 = excluded.md5",
                         &[
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
@@ -905,11 +909,13 @@ impl Database {
                             classification_source = excluded.classification_source"
                         }
                     };
+                    let active_file_index = identity.file_index;
+                    let active_filename = identity.current_filename.clone();
                     tx.execute(
                         sql,
                         &[
                             SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(identity.file_index as i64),
+                            SqlArg::I64(active_file_index as i64),
                             SqlArg::Text(identity.source_filename),
                             SqlArg::Text(identity.current_filename),
                             SqlArg::OptText(identity.canonical_filename),
@@ -934,6 +940,17 @@ impl Database {
                             ),
                             SqlArg::Text(identity.classification_source.as_str().to_string()),
                             SqlArg::I64(job_id.0 as i64),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE active_files
+                         SET filename = {}
+                         WHERE job_id = {} AND file_index = {}",
+                        &[
+                            SqlArg::Text(active_filename),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(active_file_index as i64),
                         ],
                     )
                     .await?;

@@ -1,5 +1,10 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use weaver_model::files::{
+    allocate_unique_download_filename, forget_reserved_download_filename,
+    reserve_download_filename, sanitize_download_filename,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanPar2IntegrityGate {
@@ -23,6 +28,39 @@ struct PromotedRecoveryPipelineState {
     active_promoted_decodes: usize,
     write_buffered_promoted_recovery: usize,
     unavailable_promoted_recovery_segments: usize,
+}
+
+fn reserve_identity_filenames(
+    identity: &crate::jobs::record::ActiveFileIdentity,
+    occupied_filenames: &mut HashSet<String>,
+) {
+    reserve_download_filename(&identity.source_filename, occupied_filenames);
+    reserve_download_filename(&identity.current_filename, occupied_filenames);
+    if let Some(canonical) = identity.canonical_filename.as_ref() {
+        reserve_download_filename(canonical, occupied_filenames);
+    }
+}
+
+fn forget_identity_filenames(
+    identity: &crate::jobs::record::ActiveFileIdentity,
+    occupied_filenames: &mut HashSet<String>,
+) {
+    forget_reserved_download_filename(&identity.source_filename, occupied_filenames);
+    forget_reserved_download_filename(&identity.current_filename, occupied_filenames);
+    if let Some(canonical) = identity.canonical_filename.as_ref() {
+        forget_reserved_download_filename(canonical, occupied_filenames);
+    }
+}
+
+fn reserve_directory_filenames(dir: &Path, occupied_filenames: &mut HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(filename) = entry.file_name().to_str() {
+            reserve_download_filename(filename, occupied_filenames);
+        }
+    }
 }
 
 impl PromotedRecoveryPipelineState {
@@ -475,6 +513,11 @@ impl Pipeline {
                 by_canonical.insert(canonical.clone(), (*file_id, *is_complete));
             }
         }
+        let mut occupied_filenames = HashSet::<String>::new();
+        for (_, identity, _) in &file_rows {
+            reserve_identity_filenames(identity, &mut occupied_filenames);
+        }
+        reserve_directory_filenames(&state.working_dir, &mut occupied_filenames);
         let _ = state;
 
         let mut renamed = 0usize;
@@ -482,7 +525,7 @@ impl Pipeline {
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
         for suggestion in &suggestions {
             let old = &suggestion.current_path;
-            let new = old.parent().unwrap().join(&suggestion.correct_name);
+            let requested_correct_name = sanitize_download_filename(&suggestion.correct_name);
             let old_name = old
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -492,23 +535,46 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
+            let mut target_occupied = occupied_filenames.clone();
+            if let Some((file_id, _)) = matched
+                && let Some((_, identity, _)) = file_rows
+                    .iter()
+                    .find(|(candidate_file_id, _, _)| *candidate_file_id == file_id)
+            {
+                forget_identity_filenames(identity, &mut target_occupied);
+            }
+            let correct_name =
+                allocate_unique_download_filename(&requested_correct_name, &mut target_occupied);
+            let new = old.parent().unwrap().join(&correct_name);
             if old
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
-                == Some(suggestion.correct_name.clone())
+                == Some(correct_name.clone())
             {
                 continue;
             }
 
-            match std::fs::rename(old, &new) {
+            if new.exists() {
+                warn!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    to = %new.display(),
+                    "PAR2 rename target already exists"
+                );
+                continue;
+            }
+
+            let renamed_successfully = match std::fs::rename(old, &new) {
                 Ok(()) => {
                     renamed += 1;
+                    reserve_download_filename(&correct_name, &mut occupied_filenames);
                     info!(
                         job_id = job_id.0,
                         from = %old.file_name().unwrap().to_string_lossy(),
-                        to = %suggestion.correct_name,
+                        to = %correct_name,
                         "deobfuscated file via PAR2 metadata"
                     );
+                    true
                 }
                 Err(error) => {
                     warn!(
@@ -518,7 +584,11 @@ impl Pipeline {
                         error = %error,
                         "PAR2 rename failed"
                     );
+                    false
                 }
+            };
+            if !renamed_successfully {
+                continue;
             }
 
             if let Some((file_id, is_complete)) = matched {
@@ -538,9 +608,8 @@ impl Pipeline {
                         )
                         .then(|| classification.set_name.clone())
                     });
-                let classification =
-                    Self::canonical_archive_identity_from_filename(&suggestion.correct_name)
-                        .or(identity.classification.clone());
+                let classification = Self::canonical_archive_identity_from_filename(&correct_name)
+                    .or(identity.classification.clone());
                 if let Some(set_name) = old_rar_set_name {
                     touched_rar_files
                         .entry(set_name)
@@ -548,8 +617,8 @@ impl Pipeline {
                         .insert(old_current_filename);
                 }
                 let mut rebound_identity = identity;
-                rebound_identity.current_filename = suggestion.correct_name.clone();
-                rebound_identity.canonical_filename = Some(suggestion.correct_name.clone());
+                rebound_identity.current_filename = correct_name.clone();
+                rebound_identity.canonical_filename = Some(correct_name.clone());
                 rebound_identity.classification = classification;
                 rebound_identity.classification_source =
                     crate::jobs::record::FileIdentitySource::Par2;
@@ -842,7 +911,7 @@ impl Pipeline {
             hash_lookup
                 .entry(desc.hash_full)
                 .or_default()
-                .push((*file_id, desc.filename.clone()));
+                .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
         let mut matches = HashMap::<String, (weaver_par2::FileId, String)>::new();
@@ -880,6 +949,7 @@ impl Pipeline {
             let Some(desc) = par2_set.file_description(&file_id).cloned() else {
                 continue;
             };
+            let correct_filename = sanitize_download_filename(&desc.filename);
 
             if conflict_ids.contains(&file_id) {
                 continue;
@@ -890,29 +960,30 @@ impl Pipeline {
                 continue;
             };
 
-            if disk_name == desc.filename {
+            if disk_name == correct_filename {
                 exact.push(file_id);
             } else if !seen_swap.contains(&file_id) {
-                let other_file_id = matches.get(desc.filename.as_str()).map(|(id, _)| *id);
+                let other_file_id = matches.get(correct_filename.as_str()).map(|(id, _)| *id);
                 if let Some(other_id) = other_file_id
                     && other_id != file_id
                     && id_to_disk
                         .get(&other_id)
-                        .is_some_and(|name| name == &desc.filename)
+                        .is_some_and(|name| name == &correct_filename)
                 {
                     let Some(other_desc) = par2_set.file_description(&other_id) else {
                         return Ok(None);
                     };
+                    let other_correct_filename = sanitize_download_filename(&other_desc.filename);
                     swaps.push((
                         weaver_par2::PlacementEntry {
                             file_id,
                             current_name: disk_name.clone(),
-                            correct_name: desc.filename.clone(),
+                            correct_name: correct_filename.clone(),
                         },
                         weaver_par2::PlacementEntry {
                             file_id: other_id,
-                            current_name: desc.filename.clone(),
-                            correct_name: other_desc.filename.clone(),
+                            current_name: correct_filename.clone(),
+                            correct_name: other_correct_filename,
                         },
                     ));
                     seen_swap.insert(file_id);
@@ -921,7 +992,7 @@ impl Pipeline {
                     renames.push(weaver_par2::PlacementEntry {
                         file_id,
                         current_name: disk_name.clone(),
-                        correct_name: desc.filename.clone(),
+                        correct_name: correct_filename.clone(),
                     });
                 }
             }
@@ -929,7 +1000,7 @@ impl Pipeline {
             let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
             files.push(weaver_par2::verify::FileVerification {
                 file_id,
-                filename: desc.filename,
+                filename: correct_filename,
                 status: weaver_par2::verify::FileStatus::Complete,
                 valid_slices: vec![true; slice_count],
                 missing_slice_count: 0,

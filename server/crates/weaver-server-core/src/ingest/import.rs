@@ -5,7 +5,10 @@ use tracing::info;
 
 use crate::ingest::{append_original_title_metadata, derive_release_name};
 use crate::jobs::ids::JobId;
-use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
+use crate::jobs::{
+    ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, SegmentSpec,
+};
+use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, parse_nzb};
 
 /// Global counter for generating unique job IDs.
@@ -53,14 +56,18 @@ pub fn nzb_to_spec(
         nzb.meta.title.as_deref(),
     );
 
-    let password = extract_password(nzb, nzb_path);
+    let password = first_password_candidate(nzb, nzb_path, None);
 
     let mut files = Vec::with_capacity(nzb.files.len());
     let mut total_bytes: u64 = 0;
+    let filenames = unique_download_filenames(
+        nzb.files
+            .iter()
+            .map(|nzb_file| nzb_file.filename().unwrap_or("unknown")),
+    );
 
-    for nzb_file in &nzb.files {
-        let filename = nzb_file.filename().unwrap_or("unknown").to_string();
-        let role = nzb_file.role();
+    for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
+        let role = FileRole::from_filename(&filename);
 
         let segments: Vec<SegmentSpec> = nzb_file
             .segments
@@ -95,27 +102,78 @@ pub fn nzb_to_spec(
     }
 }
 
-/// Extract password from NZB metadata or the {{password}} filename convention.
-fn extract_password(nzb: &Nzb, nzb_path: &Path) -> Option<String> {
-    // 1. NZB meta password field.
-    if let Some(password) = &nzb.meta.password
-        && !password.is_empty()
-    {
-        return Some(password.clone());
+pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
     }
+    let normalized = value.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "0" | "1" | "true" | "false" | "yes" | "no" | "passworded" | "protected"
+    ) {
+        return None;
+    }
+    Some(value.to_string())
+}
 
-    // 2. Filename convention: "Some.Release.{{password}}.nzb"
+pub fn nzb_password_candidates(
+    nzb: &Nzb,
+    nzb_path: &Path,
+    explicit_password: Option<&str>,
+) -> Vec<ArchivePasswordCandidate> {
+    let mut candidates = Vec::new();
+    push_password_candidate(
+        &mut candidates,
+        ArchivePasswordSource::Explicit,
+        explicit_password,
+    );
+    push_password_candidate(
+        &mut candidates,
+        ArchivePasswordSource::NzbMeta,
+        nzb.meta.password.as_deref(),
+    );
+
     if let Some(stem) = nzb_path.file_stem().and_then(|segment| segment.to_str())
         && let Some(start) = stem.find("{{")
         && let Some(end) = stem[start..].find("}}")
     {
-        let password = &stem[start + 2..start + end];
-        if !password.is_empty() {
-            return Some(password.to_string());
-        }
+        push_password_candidate(
+            &mut candidates,
+            ArchivePasswordSource::FilenameConvention,
+            Some(&stem[start + 2..start + end]),
+        );
     }
 
-    None
+    candidates
+}
+
+fn first_password_candidate(
+    nzb: &Nzb,
+    nzb_path: &Path,
+    explicit_password: Option<&str>,
+) -> Option<String> {
+    nzb_password_candidates(nzb, nzb_path, explicit_password)
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.value().to_string())
+}
+
+fn push_password_candidate(
+    candidates: &mut Vec<ArchivePasswordCandidate>,
+    source: ArchivePasswordSource,
+    raw: Option<&str>,
+) {
+    let Some(value) = normalize_archive_password_candidate(raw) else {
+        return;
+    };
+    if candidates
+        .iter()
+        .any(|candidate| candidate.value() == value.as_str())
+    {
+        return;
+    }
+    candidates.push(ArchivePasswordCandidate::new(source, value));
 }
 
 #[derive(Debug)]

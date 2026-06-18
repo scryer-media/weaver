@@ -424,15 +424,15 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let (volume_paths, cached_headers, password) = {
-            let state = self
+        let (volume_paths, cached_headers, password_candidates) = {
+            let _state = self
                 .jobs
                 .get(&job_id)
                 .ok_or_else(|| format!("job {job_id:?} not found"))?;
             (
                 self.volume_paths_for_rar_set(job_id, set_name),
                 self.load_rar_snapshot(job_id, set_name),
-                state.spec.password.clone(),
+                self.archive_password_candidates_for_set(job_id, set_name),
             )
         };
 
@@ -477,29 +477,36 @@ impl Pipeline {
                     return Err(format!("no on-disk RAR volumes for set '{set_name_owned}'"));
                 }
 
-                let mut archive = Self::open_rar_archive_from_snapshot_or_disk(
+                let selection = Self::open_rar_archive_for_extraction_with_password_candidates(
                     &set_name_owned,
                     volume_paths.clone(),
-                    password.clone(),
+                    password_candidates.clone(),
                     cached_headers,
                     shared_kdf_cache.clone(),
                     open_mode,
+                    &[],
+                    Some(&already_extracted),
                 )?;
+                let mut archive = selection.archive;
+                let selected_password = selection.password;
 
                 let meta = archive.metadata();
+                let archive_password_required = meta.is_encrypted;
                 let options = weaver_rar::ExtractOptions {
                     verify: true,
-                    password: password.clone(),
+                    password: selected_password.clone(),
                 };
                 let is_solid = archive.is_solid();
 
                 let mut extracted_members = Vec::new();
                 let mut failed_members: Vec<String> = Vec::new();
+                let mut validated_password = selection.validated_password;
                 for (idx, member) in meta.members.iter().enumerate() {
                     if already_extracted.contains(&member.name) {
                         continue;
                     }
 
+                    let member_password_required = archive_password_required || member.is_encrypted;
                     match Self::extract_rar_member_to_output(
                         &mut archive,
                         crate::pipeline::extraction::RarExtractionContext::new(
@@ -513,6 +520,9 @@ impl Pipeline {
                         idx,
                     ) {
                         Ok((member_name, bytes_written, total_bytes)) => {
+                            if validated_password.is_none() && member_password_required {
+                                validated_password = selected_password.clone();
+                            }
                             info!(job_id = job_id.0, member = %member_name, bytes_written, total_bytes, "member extracted");
                             let _ = event_tx.send(PipelineEvent::ExtractionProgress {
                                 job_id,
@@ -546,6 +556,7 @@ impl Pipeline {
                 Ok(FullSetExtractionOutcome {
                     extracted: extracted_members,
                     failed: failed_members,
+                    selected_password: validated_password,
                 })
             }))
             .await;
@@ -647,7 +658,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let (file_paths, password) = {
+        let file_paths = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -672,9 +683,9 @@ impl Pipeline {
                 }
             }
             parts.sort_by_key(|(n, _)| *n);
-            let paths: Vec<PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
-            (paths, state.spec.password.clone())
+            parts.into_iter().map(|(_, p)| p).collect::<Vec<PathBuf>>()
         };
+        let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
         let event_tx = self.event_tx.clone();
@@ -774,6 +785,7 @@ impl Pipeline {
                     Ok(FullSetExtractionOutcome {
                         extracted: extracted_members,
                         failed: Vec::new(),
+                        selected_password: None,
                     })
                 })
             })
@@ -804,7 +816,7 @@ impl Pipeline {
         set_name: &str,
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
-        let (file_paths, password) = {
+        let file_paths = {
             let state = self
                 .jobs
                 .get(&job_id)
@@ -828,9 +840,12 @@ impl Pipeline {
                 }
             }
             parts.sort_by_key(|(n, _)| *n);
-            let paths: Vec<std::path::PathBuf> = parts.into_iter().map(|(_, p)| p).collect();
-            (paths, state.spec.password.clone())
+            parts
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect::<Vec<std::path::PathBuf>>()
         };
+        let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
         let event_tx = self.event_tx.clone();
@@ -923,6 +938,7 @@ impl Pipeline {
                     Ok(FullSetExtractionOutcome {
                         extracted: extracted_members,
                         failed: Vec::new(),
+                        selected_password: None,
                     })
                 })
             })

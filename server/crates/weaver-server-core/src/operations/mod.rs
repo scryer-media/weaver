@@ -8,6 +8,9 @@ pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
 
+pub use crate::history::{
+    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
+};
 pub use async_ops::{
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
@@ -19,7 +22,6 @@ pub use backup::{
     StableStateExport,
 };
 pub use diagnostics::{
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
     DiagnosticRunInsertError, DiagnosticRunRow, DiagnosticRunStage, diagnostic_cleanup_cutoff_ms,
     diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
 };

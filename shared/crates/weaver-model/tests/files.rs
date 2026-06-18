@@ -1,4 +1,104 @@
-use weaver_model::files::{FileRole, archive_base_name};
+use weaver_model::files::{
+    FileRole, archive_base_name, sanitize_download_filename, unique_download_filenames,
+};
+
+#[test]
+fn sanitize_download_filename_replaces_nzbget_reserved_chars() {
+    assert_eq!(
+        sanitize_download_filename("Fixture:<Payload>\"*.mkv"),
+        "Fixture__Payload___.mkv"
+    );
+    assert_eq!(
+        sanitize_download_filename("Fixture/Segment\\Payload?.par2"),
+        "Fixture_Segment_Payload_.par2"
+    );
+    assert_eq!(
+        sanitize_download_filename("Fixture\u{1f}Payload|Name.rar"),
+        "Fixture_Payload_Name.rar"
+    );
+}
+
+#[test]
+fn sanitize_download_filename_trims_trailing_dot_and_space() {
+    assert_eq!(
+        sanitize_download_filename("Fixture.Payload.mkv. "),
+        "Fixture.Payload.mkv"
+    );
+    assert_eq!(sanitize_download_filename("..."), "unknown");
+}
+
+#[test]
+fn sanitize_download_filename_disarms_windows_device_names() {
+    assert_eq!(sanitize_download_filename("CON"), "_CON");
+    assert_eq!(sanitize_download_filename("com1.rar"), "_com1.rar");
+    assert_eq!(sanitize_download_filename("LPT9.par2"), "_LPT9.par2");
+    assert_eq!(sanitize_download_filename("LPT10.par2"), "LPT10.par2");
+}
+
+#[test]
+fn unique_download_filenames_disambiguates_sanitized_collisions() {
+    assert_eq!(
+        unique_download_filenames(["A/B.rar", "A_B.rar"]),
+        vec!["A_B.rar", "A_B.duplicate1.rar"]
+    );
+}
+
+#[test]
+fn unique_download_filenames_disambiguates_case_collisions() {
+    assert_eq!(
+        unique_download_filenames(["Show.RAR", "show.rar"]),
+        vec!["Show.RAR", "show.duplicate1.rar"]
+    );
+}
+
+#[test]
+fn unique_download_filenames_disambiguates_windows_device_collisions() {
+    assert_eq!(
+        unique_download_filenames(["CON.rar", "_CON.rar"]),
+        vec!["_CON.rar", "_CON.duplicate1.rar"]
+    );
+}
+
+#[test]
+fn unique_download_filenames_uses_nzbget_style_extension_splits() {
+    assert_eq!(
+        unique_download_filenames([
+            "Show.part01.rar",
+            "Show.part01.rar",
+            "Archive.7z.001",
+            "Archive.7z.001",
+            "Set.vol00+01.par2",
+            "Set.vol00+01.par2",
+        ]),
+        vec![
+            "Show.part01.rar",
+            "Show.part01.duplicate1.rar",
+            "Archive.7z.001",
+            "Archive.7z.duplicate1.001",
+            "Set.vol00+01.par2",
+            "Set.duplicate1.vol00+01.par2",
+        ]
+    );
+}
+
+#[test]
+fn file_role_ignores_nzbget_duplicate_marker() {
+    assert_eq!(
+        FileRole::from_filename("Show.part02.duplicate1.rar"),
+        FileRole::RarVolume { volume_number: 1 }
+    );
+    assert_eq!(
+        FileRole::from_filename("Archive.7z.duplicate1.002"),
+        FileRole::SevenZipSplit { number: 1 }
+    );
+    assert_eq!(
+        FileRole::from_filename("Set.duplicate1.vol00+02.par2"),
+        FileRole::Par2 {
+            is_index: false,
+            recovery_block_count: 2
+        }
+    );
+}
 
 #[test]
 fn par2_index() {
@@ -147,6 +247,52 @@ fn sevenz_split() {
 #[test]
 fn unknown() {
     assert_eq!(FileRole::from_filename("data.bin"), FileRole::Unknown);
+}
+
+#[test]
+fn file_role_classifies_trailing_sanitized_artifacts() {
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.rar_"),
+        FileRole::RarVolume { volume_number: 0 }
+    );
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.vol00+01.par2_"),
+        FileRole::Par2 {
+            is_index: false,
+            recovery_block_count: 1
+        }
+    );
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.7z_"),
+        FileRole::SevenZipArchive
+    );
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.mkv_"),
+        FileRole::Unknown
+    );
+    assert_eq!(
+        archive_base_name(
+            "Fixture.Payload.part01.rar_",
+            &FileRole::from_filename("Fixture.Payload.part01.rar_")
+        ),
+        Some("Fixture.Payload".to_string())
+    );
+}
+
+#[test]
+fn file_role_does_not_classify_double_extension_malware() {
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.mkv.exe"),
+        FileRole::Unknown
+    );
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.rar.exe"),
+        FileRole::Unknown
+    );
+    assert_eq!(
+        FileRole::from_filename("Fixture.Payload.par2.exe"),
+        FileRole::Unknown
+    );
 }
 
 #[test]

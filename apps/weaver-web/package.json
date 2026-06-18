@@ -44,5 +44,8 @@
     "typescript-eslint": "^8.59.2",
     "vite": "^8.0.10",
     "vite-plugin-compression2": "^2.5.3"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true
   }
 }

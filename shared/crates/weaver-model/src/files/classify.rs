@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::role_filename_view;
+
 /// What role a file plays in the context of a Usenet post.
 ///
 /// Used by engines to understand archive layout and by the server to determine
@@ -46,7 +48,8 @@ pub enum FileRole {
 impl FileRole {
     /// Infer the file role from a filename using standard Usenet naming conventions.
     pub fn from_filename(name: &str) -> Self {
-        let lower = name.to_ascii_lowercase();
+        let lower = role_filename_view(name).to_ascii_lowercase();
+        let lower = remove_nzbget_duplicate_marker(&lower);
 
         if lower.ends_with(".par2") {
             if let Some(recovery_blocks) = parse_par2_vol_blocks(&lower) {
@@ -162,6 +165,29 @@ impl FileRole {
     pub fn counts_toward_health(&self) -> bool {
         !matches!(self, FileRole::Par2 { .. })
     }
+}
+
+fn remove_nzbget_duplicate_marker(lower: &str) -> String {
+    let Some(marker_pos) = lower.rfind(".duplicate") else {
+        return lower.to_string();
+    };
+    let digits_start = marker_pos + ".duplicate".len();
+    let bytes = lower.as_bytes();
+    let mut digits_end = digits_start;
+    while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+        digits_end += 1;
+    }
+    if digits_end == digits_start {
+        return lower.to_string();
+    }
+    if digits_end != bytes.len() && bytes[digits_end] != b'.' {
+        return lower.to_string();
+    }
+
+    let mut normalized = String::with_capacity(lower.len() - (digits_end - marker_pos));
+    normalized.push_str(&lower[..marker_pos]);
+    normalized.push_str(&lower[digits_end..]);
+    normalized
 }
 
 fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {

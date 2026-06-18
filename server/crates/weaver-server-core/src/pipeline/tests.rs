@@ -164,6 +164,20 @@ fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
+fn sample_nzb_zstd_with_password(password: &str) -> Vec<u8> {
+    let nzb = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <head><meta type="password">{password}</meta></head>
+          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
+          </file>
+        </nzb>"#
+    );
+    crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap()
+}
+
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
     JobState {
         job_id,
@@ -580,12 +594,13 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let mut archive_without_refresh = Pipeline::open_rar_archive_from_snapshot_or_disk(
         "show",
         volume_paths.clone(),
-        None,
+        Vec::new(),
         Some(stale_headers.clone()),
         std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
     )
-    .unwrap();
+    .unwrap()
+    .value;
     let idx_without_refresh = archive_without_refresh
         .find_member_sanitized("E02.mkv")
         .unwrap();
@@ -615,12 +630,13 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let mut archive_with_refresh = Pipeline::open_rar_archive_from_snapshot_or_disk(
         "show",
         volume_paths.clone(),
-        None,
+        Vec::new(),
         Some(stale_headers),
         std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
     )
-    .unwrap();
+    .unwrap()
+    .value;
     let idx_with_refresh = archive_with_refresh
         .find_member_sanitized("E02.mkv")
         .unwrap();
@@ -949,6 +965,302 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
         selected.keys().copied().collect::<Vec<_>>(),
         vec![0, 1, 2, 3, 4]
     );
+}
+
+#[tokio::test]
+async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cached_headers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40104);
+    let set_name = "video";
+    let files = vec![(
+        "video.rar".to_string(),
+        rar5_fixture_bytes("rar5_hp_store.rar"),
+    )];
+    let mut spec = rar_job_spec("RAR Password Fallback From NZB Meta", &files);
+    spec.password = Some("wrong-password".to_string());
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("secretpass"),
+    )
+    .await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+
+    let key = (job_id, set_name.to_string());
+    assert!(
+        pipeline.archive_password_winners.get(&key).is_none(),
+        "topology/header open alone must not remember a password winner"
+    );
+
+    let cached_headers = pipeline
+        .load_rar_snapshot(job_id, set_name)
+        .expect("encrypted volume-zero topology should persist cached headers");
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, set_name);
+    let restart_candidates = pipeline.archive_password_candidates_for_set(job_id, set_name);
+    assert_eq!(
+        restart_candidates
+            .first()
+            .map(|candidate| candidate.source().as_str()),
+        Some("explicit")
+    );
+
+    let selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
+        set_name,
+        volume_paths,
+        restart_candidates.clone(),
+        Some(cached_headers),
+        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+        &[],
+        None,
+    )
+    .expect("cached headers should validate extraction with the fallback winner");
+
+    assert!(selection.validated_password.is_some());
+    assert!(
+        !selection.archive.metadata().members.is_empty(),
+        "cached-header reopen should deserialize member metadata"
+    );
+    pipeline.remember_archive_password_winner(
+        job_id,
+        set_name,
+        selection.validated_password.as_deref(),
+        &restart_candidates,
+    );
+    let winner = pipeline
+        .archive_password_winners
+        .get(&key)
+        .expect("validated extraction should remember the fallback winner");
+    assert_eq!(winner.source().as_str(), "nzb_meta");
+}
+
+#[tokio::test]
+async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40105);
+    let set_name = "video";
+    let files = vec![(
+        "video.rar".to_string(),
+        rar5_fixture_bytes("rar5_enc_store.rar"),
+    )];
+    let mut spec = rar_job_spec("RAR Member Password Fallback From NZB Meta", &files);
+    spec.password = Some("wrong-password".to_string());
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("testpass123"),
+    )
+    .await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+
+    let key = (job_id, set_name.to_string());
+    assert!(
+        pipeline.archive_password_winners.get(&key).is_none(),
+        "member-encrypted topology/header open must not remember a password winner"
+    );
+
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, set_name);
+    let candidates = pipeline.archive_password_candidates_for_set(job_id, set_name);
+    assert_eq!(
+        candidates
+            .first()
+            .map(|candidate| candidate.source().as_str()),
+        Some("explicit")
+    );
+
+    let requested_members = vec!["small.txt".to_string()];
+    let mut selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
+        set_name,
+        volume_paths.clone(),
+        candidates.clone(),
+        None,
+        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+        &requested_members,
+        None,
+    )
+    .expect("member extraction probe should fall back to the NZB meta password");
+
+    assert!(selection.validated_password.is_some());
+    pipeline.remember_archive_password_winner(
+        job_id,
+        set_name,
+        selection.validated_password.as_deref(),
+        &candidates,
+    );
+    let winner = pipeline
+        .archive_password_winners
+        .get(&key)
+        .expect("validated member extraction should remember the fallback winner");
+    assert_eq!(winner.source().as_str(), "nzb_meta");
+
+    let output_dir = temp_dir.path().join("member-password-fallback");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let options = weaver_rar::ExtractOptions {
+        verify: true,
+        password: selection.password.clone(),
+    };
+    let idx = selection
+        .archive
+        .find_member_sanitized("small.txt")
+        .expect("fixture member should be present");
+    let (member_name, _, _) = Pipeline::extract_rar_member_to_output(
+        &mut selection.archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            set_name,
+            &output_dir,
+            &options,
+        ),
+        idx,
+    )
+    .expect("extraction should use the validated fallback password");
+
+    assert_eq!(member_name, "small.txt");
+    assert_eq!(
+        std::fs::read(output_dir.join("small.txt")).unwrap(),
+        rar_original_fixture_bytes("small.txt")
+    );
+}
+
+#[tokio::test]
+async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40106);
+    let set_name = "video";
+    let files = vec![(
+        "video.rar".to_string(),
+        rar5_fixture_bytes("rar5_enc_store.rar"),
+    )];
+    let mut spec = rar_job_spec("RAR Member Cached Password Fallback From NZB Meta", &files);
+    spec.password = Some("wrong-password".to_string());
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("testpass123"),
+    )
+    .await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+
+    let key = (job_id, set_name.to_string());
+    assert!(
+        pipeline.archive_password_winners.get(&key).is_none(),
+        "member-encrypted topology/header open must not remember a password winner"
+    );
+    let cached_headers = pipeline
+        .load_rar_snapshot(job_id, set_name)
+        .expect("member-encrypted topology should persist cached headers");
+    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, set_name);
+    let candidates = pipeline.archive_password_candidates_for_set(job_id, set_name);
+    assert_eq!(
+        candidates
+            .first()
+            .map(|candidate| candidate.source().as_str()),
+        Some("explicit")
+    );
+
+    let requested_members = vec!["small.txt".to_string()];
+    let selection = Pipeline::open_rar_archive_for_extraction_with_password_candidates(
+        set_name,
+        volume_paths,
+        candidates.clone(),
+        Some(cached_headers),
+        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+        &requested_members,
+        None,
+    )
+    .expect("cached headers should still probe extraction before selecting a member password");
+
+    assert!(selection.validated_password.is_some());
+    pipeline.remember_archive_password_winner(
+        job_id,
+        set_name,
+        selection.validated_password.as_deref(),
+        &candidates,
+    );
+    let winner = pipeline
+        .archive_password_winners
+        .get(&key)
+        .expect("validated cached-header probe should remember the fallback winner");
+    assert_eq!(winner.source().as_str(), "nzb_meta");
+}
+
+#[test]
+fn rar_password_candidate_helper_stops_on_non_password_error() {
+    let candidates = vec![
+        crate::jobs::ArchivePasswordCandidate::new(
+            crate::jobs::ArchivePasswordSource::Explicit,
+            "first-secret".to_string(),
+        ),
+        crate::jobs::ArchivePasswordCandidate::new(
+            crate::jobs::ArchivePasswordSource::NzbMeta,
+            "second-secret".to_string(),
+        ),
+    ];
+    let mut attempts = 0;
+
+    let error = match Pipeline::try_rar_password_candidates::<(), _>(
+        "candidate helper",
+        &candidates,
+        |_password| {
+            attempts += 1;
+            Err(RarPasswordAttemptError::Fatal(
+                "cache decode failed".to_string(),
+            ))
+        },
+    ) {
+        Ok(_) => panic!("non-password error should fail immediately"),
+        Err(error) => error,
+    };
+
+    assert_eq!(attempts, 1);
+    assert_eq!(error, "candidate helper: cache decode failed");
+}
+
+#[test]
+fn rar_password_candidate_helper_redacts_exhausted_candidates() {
+    let candidates = vec![
+        crate::jobs::ArchivePasswordCandidate::new(
+            crate::jobs::ArchivePasswordSource::Explicit,
+            "first-secret".to_string(),
+        ),
+        crate::jobs::ArchivePasswordCandidate::new(
+            crate::jobs::ArchivePasswordSource::NzbMeta,
+            "second-secret".to_string(),
+        ),
+    ];
+    let mut attempts = 0;
+
+    let error = match Pipeline::try_rar_password_candidates::<(), _>(
+        "candidate helper",
+        &candidates,
+        |_password| {
+            attempts += 1;
+            Err(RarPasswordAttemptError::Rar(
+                weaver_rar::RarError::InvalidPassword,
+            ))
+        },
+    ) {
+        Ok(_) => panic!("exhausted password candidates should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(attempts, 2);
+    assert!(error.contains("after 2 candidate(s) from explicit,nzb_meta"));
+    assert!(!error.contains("first-secret"));
+    assert!(!error.contains("second-secret"));
 }
 
 fn dummy_rar_volume_facts(volume_number: u32) -> weaver_rar::RarVolumeFacts {
@@ -1413,6 +1725,15 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
 }
 
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
+    insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
+}
+
+async fn insert_active_job_with_persisted_nzb(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+) -> PathBuf {
     let dir_name = crate::jobs::working_dir::sanitize_dirname(&spec.name);
     let candidate = pipeline.intermediate_dir.join(&dir_name);
     let working_dir = if candidate.exists() {
@@ -1435,7 +1756,7 @@ async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec
             job_id,
             nzb_hash: [0; 32],
             nzb_path: working_dir.join(format!("{}.nzb", job_id.0)),
-            nzb_zstd: sample_nzb_zstd(),
+            nzb_zstd,
             output_dir: working_dir.clone(),
             created_at: 0,
             category: spec.category.clone(),
@@ -1490,6 +1811,15 @@ fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../engines/weaver-rar/tests/fixtures/rar5")
+            .join(name),
+    )
+    .unwrap()
+}
+
+fn rar_original_fixture_bytes(name: &str) -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../engines/weaver-rar/tests/fixtures/originals")
             .join(name),
     )
     .unwrap()
@@ -5818,6 +6148,78 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
             .contains_key(&(job_id, "51273aad56a8b904e96928935278a627".to_string())),
         "old obfuscated RAR set should not survive canonical PAR2 rebinding"
     );
+}
+
+#[tokio::test]
+async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30151);
+    let unsafe_canonical_filename = "Fixture.Payload.part001.rar\"";
+    let sanitized_canonical_filename = "Fixture.Payload.part001.rar_";
+    let obfuscated_filename = "51273aad56a8b904e96928935278a627.101";
+    let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
+    let spec = JobSpec {
+        name: "PAR2 Sanitized Canonical Rebind".to_string(),
+        password: None,
+        total_bytes: rar_bytes.len() as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: obfuscated_filename.to_string(),
+            role: FileRole::from_filename(obfuscated_filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: rar_bytes.len() as u32,
+                message_id: "rar-sanitized-canonical@example.com".to_string(),
+            }],
+        }],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&[(unsafe_canonical_filename.to_string(), rar_bytes.clone())]),
+        &[],
+    );
+
+    write_and_complete_file(&mut pipeline, job_id, 0, obfuscated_filename, &rar_bytes).await;
+    pipeline.retry_par2_authoritative_identity(job_id).await;
+    drain_rar_refreshes(&mut pipeline).await;
+
+    let identity = pipeline
+        .file_identity(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        )
+        .cloned()
+        .expect("PAR2 should bind identity from sanitized canonical filename");
+    assert_eq!(identity.current_filename, sanitized_canonical_filename);
+    assert_eq!(
+        identity.canonical_filename.as_deref(),
+        Some(sanitized_canonical_filename)
+    );
+    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+    assert!(!working_dir.join(obfuscated_filename).exists());
+    assert!(!working_dir.join(unsafe_canonical_filename).exists());
+    assert!(working_dir.join(sanitized_canonical_filename).exists());
+
+    let topology = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.archive_topology_for("Fixture.Payload"))
+        .cloned()
+        .expect("sanitized PAR2 rebinding should rebuild RAR topology");
+    assert!(
+        topology
+            .volume_map
+            .contains_key(sanitized_canonical_filename)
+    );
+    assert!(!topology.volume_map.contains_key(unsafe_canonical_filename));
 }
 
 #[tokio::test]

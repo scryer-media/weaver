@@ -1,5 +1,6 @@
 use crate::StateError;
 use crate::history;
+use crate::history::persistence::replace_job_history_attributes_tx;
 use crate::jobs::ids::JobId;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
@@ -199,6 +200,9 @@ async fn archive_job_sql(
             .await?
             .map(history::queries::job_history_row_from_sql)
             .transpose()?;
+            if let Some(row) = &archived {
+                replace_job_history_attributes_tx(tx, row).await?;
+            }
             delete_active_job_rows(tx, job_id.0 as i64).await?;
             Ok(archived)
         })

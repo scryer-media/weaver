@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::history::types::{
-    history_delete_row_state_from_core, history_diagnostic_run_from_core,
-    matches_history_filter_prepared,
-};
-use crate::jobs::types::PreparedQueueFilter;
+use crate::history::types::{history_delete_row_state_from_core, history_diagnostic_run_from_core};
+
+enum HistoryQueryPlan {
+    Empty,
+    Query(weaver_server_core::HistoryFilter),
+}
 
 #[derive(Default)]
 pub(crate) struct HistoryQuery;
@@ -25,12 +26,14 @@ impl HistoryQuery {
     ) -> Result<Vec<HistoryItem>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first.unwrap_or(u32::MAX) as usize;
         let diagnostics_active = history_diagnostics_active(ctx).await;
         let db = ctx.data::<Database>()?.clone();
-        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
+        let plan = history_query_plan(filter.as_ref(), first, Some(offset));
+        let HistoryQueryPlan::Query(history_filter) = plan else {
+            return Ok(Vec::new());
+        };
         let items = tokio::task::spawn_blocking(move || {
-            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+            let rows = db.list_job_history(&history_filter)?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
             let diagnostic_states = load_history_diagnostic_states(
                 &db,
@@ -50,9 +53,6 @@ impl HistoryQuery {
                             .map(history_delete_row_state_from_core);
                         history_item_from_row(&row, diagnostic_run, delete_state)
                     })
-                    .filter(|item| matches_history_filter_prepared(item, prepared_filter.as_ref()))
-                    .skip(offset)
-                    .take(limit)
                     .collect::<Vec<_>>(),
             )
         })
@@ -123,37 +123,15 @@ impl HistoryQuery {
         ctx: &Context<'_>,
         filter: Option<QueueFilterInput>,
     ) -> Result<u32> {
-        let diagnostics_active = history_diagnostics_active(ctx).await;
         let db = ctx.data::<Database>()?.clone();
-        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
-        let count = tokio::task::spawn_blocking(move || {
-            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
-            let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
-            let diagnostic_states = load_history_diagnostic_states(
-                &db,
-                rows.iter().map(|row| row.job_id),
-                diagnostics_active,
-            )?;
-            Ok::<_, weaver_server_core::StateError>(
-                rows.into_iter()
-                    .map(|row| {
-                        let diagnostic_run = diagnostic_states
-                            .get(&row.job_id)
-                            .cloned()
-                            .map(history_diagnostic_run_from_core);
-                        let delete_state = delete_states
-                            .get(&row.job_id)
-                            .cloned()
-                            .map(history_delete_row_state_from_core);
-                        history_item_from_row(&row, diagnostic_run, delete_state)
-                    })
-                    .filter(|item| matches_history_filter_prepared(item, prepared_filter.as_ref()))
-                    .count() as u32,
-            )
-        })
-        .await
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        let plan = history_query_plan(filter.as_ref(), None, None);
+        let HistoryQueryPlan::Query(history_filter) = plan else {
+            return Ok(0);
+        };
+        let count = tokio::task::spawn_blocking(move || db.count_job_history(&history_filter))
+            .await
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
         Ok(count)
     }
     /// Compatibility facade for recent queue lifecycle history.
@@ -425,6 +403,61 @@ async fn history_diagnostics_active(_ctx: &Context<'_>) -> bool {
         }
     }
     false
+}
+
+fn history_query_plan(
+    filter: Option<&QueueFilterInput>,
+    limit: Option<u32>,
+    offset: Option<usize>,
+) -> HistoryQueryPlan {
+    let mut history_filter = weaver_server_core::HistoryFilter {
+        limit,
+        offset: offset.map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+        ..Default::default()
+    };
+
+    let Some(filter) = filter else {
+        return HistoryQueryPlan::Query(history_filter);
+    };
+
+    if let Some(states) = &filter.states {
+        let mut statuses = Vec::new();
+        for state in states {
+            match state {
+                QueueItemState::Completed => statuses.push("complete".to_string()),
+                QueueItemState::Failed => {
+                    statuses.push("failed".to_string());
+                    statuses.push("cancelled".to_string());
+                }
+                QueueItemState::Paused => statuses.push("paused".to_string()),
+                QueueItemState::Queued
+                | QueueItemState::Downloading
+                | QueueItemState::Checking
+                | QueueItemState::Verifying
+                | QueueItemState::Repairing
+                | QueueItemState::Extracting
+                | QueueItemState::Finalizing => {}
+            }
+        }
+        if statuses.is_empty() {
+            return HistoryQueryPlan::Empty;
+        }
+        statuses.sort();
+        statuses.dedup();
+        history_filter.statuses = Some(statuses);
+    }
+
+    history_filter.item_ids = filter.item_ids.clone();
+    history_filter.category = filter.category.clone();
+    history_filter.metadata_has_key = filter.has_attribute_key.clone();
+    history_filter.metadata_equals = filter.attribute_equals.as_ref().map(|attribute| {
+        weaver_server_core::history::model::HistoryMetadataEquals {
+            key: attribute.key.clone(),
+            value: attribute.value.clone(),
+        }
+    });
+
+    HistoryQueryPlan::Query(history_filter)
 }
 
 fn build_history_page(

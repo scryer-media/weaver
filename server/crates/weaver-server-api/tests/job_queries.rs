@@ -2,7 +2,10 @@ mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
 use tokio::time::{Duration, sleep};
-use weaver_server_core::JobHistoryRow;
+use weaver_server_core::{
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY,
+    DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY, JobHistoryRow,
+};
 
 fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) -> JobHistoryRow {
     JobHistoryRow {
@@ -389,6 +392,160 @@ async fn history_page_caps_page_size_at_five_hundred() {
     let page = &data["historyPage"];
     assert_eq!(page["totalCount"].as_u64().unwrap(), 550);
     assert_eq!(page["items"].as_array().unwrap().len(), 500);
+}
+
+#[tokio::test]
+async fn history_items_respects_bounded_pagination_before_returning_rows() {
+    let h = TestHarness::new().await;
+    for job_id in 1..=5 {
+        h.insert_history_row(&sample_history_row(
+            job_id,
+            &format!("facade-{job_id}"),
+            "complete",
+            1_700_000_000 + if job_id <= 2 { 1 } else { job_id as i64 },
+        ));
+    }
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(first: 2) {
+                id
+                name
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["historyItems"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"].as_u64().unwrap(), 5);
+    assert_eq!(items[1]["id"].as_u64().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn history_items_active_only_state_filter_returns_empty() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        1,
+        "completed-history",
+        "complete",
+        1_700_000_001,
+    ));
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(filter: { states: [DOWNLOADING, EXTRACTING] }, first: 10) {
+                id
+              }
+              historyItemsCount(filter: { states: [DOWNLOADING, EXTRACTING] })
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["historyItems"].as_array().unwrap().is_empty());
+    assert_eq!(data["historyItemsCount"].as_u64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn history_items_title_attribute_filter_matches_count() {
+    let h = TestHarness::new().await;
+    for (job_id, title_id) in [(1, "title-a"), (2, "title-b"), (3, "title-a")] {
+        let mut row = sample_history_row(
+            job_id,
+            &format!("title-history-{job_id}"),
+            "complete",
+            1_700_000_000 + job_id as i64,
+        );
+        row.metadata = Some(
+            serde_json::to_string(&vec![
+                ("*scryer_title_id".to_string(), title_id.to_string()),
+                ("source".to_string(), "scryer".to_string()),
+            ])
+            .unwrap(),
+        );
+        h.insert_history_row(&row);
+    }
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(
+                filter: { attributeEquals: { key: "*scryer_title_id", value: "title-a" } }
+                first: 10
+              ) {
+                id
+                attributes { key value }
+              }
+              historyItemsCount(
+                filter: { attributeEquals: { key: "*scryer_title_id", value: "title-a" } }
+              )
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["historyItems"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(data["historyItemsCount"].as_u64().unwrap(), 2);
+    assert_eq!(items[0]["id"].as_u64().unwrap(), 3);
+    assert_eq!(items[1]["id"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn history_items_hidden_metadata_keys_are_not_attributes() {
+    let h = TestHarness::new().await;
+    let mut row = sample_history_row(1, "hidden-history", "complete", 1_700_000_001);
+    row.metadata = Some(
+        serde_json::to_string(&vec![
+            (
+                CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                "req-1".to_string(),
+            ),
+            (
+                DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
+                "42".to_string(),
+            ),
+            (
+                DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY.to_string(),
+                "false".to_string(),
+            ),
+            ("public".to_string(), "yes".to_string()),
+        ])
+        .unwrap(),
+    );
+    h.insert_history_row(&row);
+
+    let resp = h
+        .execute(
+            r#"{
+              hiddenClient: historyItems(filter: { hasAttributeKey: "__weaver_client_request_id" }, first: 10) { id }
+              hiddenDiagnostic: historyItems(filter: { hasAttributeKey: "__weaver_diagnostic_source_job_id" }, first: 10) { id }
+              publicMatch: historyItems(filter: { hasAttributeKey: "public" }, first: 10) {
+                id
+                attributes { key value }
+                clientRequestId
+              }
+              hiddenCount: historyItemsCount(filter: { attributeEquals: { key: "__weaver_client_request_id", value: "req-1" } })
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["hiddenClient"].as_array().unwrap().is_empty());
+    assert!(data["hiddenDiagnostic"].as_array().unwrap().is_empty());
+    assert_eq!(data["hiddenCount"].as_u64().unwrap(), 0);
+    let public = data["publicMatch"].as_array().unwrap();
+    assert_eq!(public.len(), 1);
+    assert_eq!(public[0]["clientRequestId"].as_str().unwrap(), "req-1");
+    assert_eq!(public[0]["attributes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        public[0]["attributes"][0]["key"].as_str().unwrap(),
+        "public"
+    );
 }
 
 #[tokio::test]

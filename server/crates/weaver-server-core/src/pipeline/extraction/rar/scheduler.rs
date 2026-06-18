@@ -6,7 +6,7 @@ struct ReadyRarExtraction {
     volume_paths_map: std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<Vec<u8>>,
     shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
-    password: Option<String>,
+    password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     is_solid: bool,
 }
 
@@ -318,13 +318,10 @@ impl Pipeline {
                 continue;
             }
             let cached_headers = self.load_rar_snapshot(job_id, &set_name);
-            let Some(password) = self
-                .jobs
-                .get(&job_id)
-                .map(|state| state.spec.password.clone())
-            else {
+            if !self.jobs.contains_key(&job_id) {
                 return;
-            };
+            }
+            let password_candidates = self.archive_password_candidates_for_set(job_id, &set_name);
             let shared_kdf_cache = self
                 .rar_sets
                 .get(&(job_id, set_name.clone()))
@@ -336,7 +333,7 @@ impl Pipeline {
                 volume_paths_map,
                 cached_headers,
                 shared_kdf_cache,
-                password,
+                password_candidates,
                 is_solid,
             });
         }
@@ -357,7 +354,7 @@ impl Pipeline {
                 volume_paths_map,
                 cached_headers,
                 shared_kdf_cache,
-                password,
+                password_candidates,
                 is_solid,
             } = ready_set;
             for member_name in ready_members {
@@ -416,28 +413,35 @@ impl Pipeline {
                 let set_name_for_archive = set_name.clone();
                 let volume_paths_for_task = volume_paths_for_member;
                 let cached_headers_for_task = cached_headers.clone();
-                let password_for_task = password.clone();
+                let password_candidates_for_task = password_candidates.clone();
                 let shared_kdf_cache_for_task = shared_kdf_cache.clone();
                 let pp_pool = self.pp_pool.clone();
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         pp_pool.install(move || {
-                            let mut archive = Self::open_rar_archive_from_snapshot_or_disk(
-                                &set_name_for_archive,
-                                volume_paths_for_task.clone(),
-                                password_for_task.clone(),
-                                cached_headers_for_task,
-                                shared_kdf_cache_for_task,
-                                RarArchiveOpenMode::AttachOnly,
-                            )?;
+                            let selection =
+                                Self::open_rar_archive_for_extraction_with_password_candidates(
+                                    &set_name_for_archive,
+                                    volume_paths_for_task.clone(),
+                                    password_candidates_for_task.clone(),
+                                    cached_headers_for_task,
+                                    shared_kdf_cache_for_task,
+                                    RarArchiveOpenMode::AttachOnly,
+                                    &members_to_extract,
+                                    None,
+                                )?;
+                            let mut archive = selection.archive;
+                            let selected_password = selection.password;
+                            let archive_password_required = archive.metadata().is_encrypted;
 
                             let options = weaver_rar::ExtractOptions {
                                 verify: true,
-                                password: password_for_task.clone(),
+                                password: selected_password.clone(),
                             };
                             let mut outcome = BatchExtractionOutcome {
                                 extracted: Vec::new(),
                                 failed: Vec::new(),
+                                selected_password: selection.validated_password,
                             };
 
                             for member_name in &members_to_extract {
@@ -448,6 +452,11 @@ impl Pipeline {
                                     ));
                                     continue;
                                 };
+
+                                let member_password_required = archive_password_required
+                                    || archive
+                                        .member_info(idx)
+                                        .is_some_and(|member| member.is_encrypted);
 
                                 match Self::extract_rar_member_to_output(
                                     &mut archive,
@@ -462,6 +471,11 @@ impl Pipeline {
                                     idx,
                                 ) {
                                     Ok((extracted_name, bytes_written, total_bytes)) => {
+                                        if outcome.selected_password.is_none()
+                                            && member_password_required
+                                        {
+                                            outcome.selected_password = selected_password.clone();
+                                        }
                                         let _ = event_tx.send(PipelineEvent::ExtractionProgress {
                                             job_id,
                                             member: extracted_name.clone(),
@@ -753,6 +767,14 @@ impl Pipeline {
 
                 match result {
                     Ok(outcome) => {
+                        let password_candidates =
+                            self.archive_password_candidates_for_set(job_id, &set_name);
+                        self.remember_archive_password_winner(
+                            job_id,
+                            &set_name,
+                            outcome.selected_password.as_deref(),
+                            &password_candidates,
+                        );
                         info!(
                             job_id = job_id.0,
                             set_name = %set_name,
@@ -895,6 +917,14 @@ impl Pipeline {
                 result,
             } => match result {
                 Ok(outcome) => {
+                    let password_candidates =
+                        self.archive_password_candidates_for_set(job_id, &set_name);
+                    self.remember_archive_password_winner(
+                        job_id,
+                        &set_name,
+                        outcome.selected_password.as_deref(),
+                        &password_candidates,
+                    );
                     if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();

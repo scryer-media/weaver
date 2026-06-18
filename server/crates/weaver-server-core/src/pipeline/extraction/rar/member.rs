@@ -18,6 +18,12 @@ pub(crate) enum RarArchiveOpenMode {
     RefreshProvidedVolumes,
 }
 
+pub(crate) struct RarExtractionOpenSelection {
+    pub(crate) archive: weaver_rar::RarArchive,
+    pub(crate) password: Option<String>,
+    pub(crate) validated_password: Option<String>,
+}
+
 impl<'a> RarExtractionContext<'a> {
     pub(crate) fn new(
         volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -278,44 +284,140 @@ impl Pipeline {
     pub(crate) fn open_rar_archive_from_snapshot_or_disk(
         set_name: &str,
         volume_paths: std::collections::BTreeMap<u32, PathBuf>,
-        password: Option<String>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
         cached_headers: Option<Vec<u8>>,
         shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
         open_mode: RarArchiveOpenMode,
-    ) -> Result<weaver_rar::RarArchive, String> {
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_rar::RarArchive>, String> {
+        let context = format!("failed to open RAR archive for set '{set_name}'");
+        Self::try_rar_password_candidates(&context, &password_candidates, |password| {
+            Self::open_rar_archive_from_snapshot_or_disk_with_password(
+                set_name,
+                &volume_paths,
+                cached_headers.as_deref(),
+                shared_kdf_cache.clone(),
+                open_mode,
+                password,
+            )
+        })
+    }
+
+    pub(crate) fn open_rar_archive_for_extraction_with_password_candidates(
+        set_name: &str,
+        volume_paths: std::collections::BTreeMap<u32, PathBuf>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+        cached_headers: Option<Vec<u8>>,
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+        open_mode: RarArchiveOpenMode,
+        requested_members: &[String],
+        already_extracted: Option<&std::collections::HashSet<String>>,
+    ) -> Result<RarExtractionOpenSelection, String> {
+        if password_candidates.len() <= 1 {
+            let selection = Self::open_rar_archive_from_snapshot_or_disk(
+                set_name,
+                volume_paths,
+                password_candidates,
+                cached_headers,
+                shared_kdf_cache,
+                open_mode,
+            )?;
+            return Ok(RarExtractionOpenSelection {
+                archive: selection.value,
+                password: selection.selected_password,
+                validated_password: None,
+            });
+        }
+
+        let context = format!("failed to validate RAR password for set '{set_name}'");
+        let selection =
+            Self::try_rar_password_candidates(&context, &password_candidates, |password| {
+                let mut probe_archive = Self::open_rar_archive_from_snapshot_or_disk_with_password(
+                    set_name,
+                    &volume_paths,
+                    cached_headers.as_deref(),
+                    shared_kdf_cache.clone(),
+                    open_mode,
+                    password,
+                )?;
+                let probe = Self::select_rar_password_probe_member(
+                    &probe_archive,
+                    requested_members,
+                    already_extracted,
+                );
+                let password_validated = if let Some((idx, requires_password)) = probe {
+                    Self::probe_rar_member_password(
+                        &mut probe_archive,
+                        &volume_paths,
+                        idx,
+                        password,
+                    )?;
+                    requires_password
+                } else {
+                    false
+                };
+                let archive = Self::open_rar_archive_from_snapshot_or_disk_with_password(
+                    set_name,
+                    &volume_paths,
+                    cached_headers.as_deref(),
+                    shared_kdf_cache.clone(),
+                    open_mode,
+                    password,
+                )?;
+                Ok((archive, password_validated))
+            })?;
+        let (archive, password_validated) = selection.value;
+        let password = selection.selected_password;
+        let validated_password = password_validated.then(|| password.clone()).flatten();
+        Ok(RarExtractionOpenSelection {
+            archive,
+            password,
+            validated_password,
+        })
+    }
+
+    fn open_rar_archive_from_snapshot_or_disk_with_password(
+        set_name: &str,
+        volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
+        cached_headers: Option<&[u8]>,
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+        open_mode: RarArchiveOpenMode,
+        password: Option<&str>,
+    ) -> Result<weaver_rar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
         let has_cached_headers = cached_headers.is_some();
         let refresh_provided_volumes =
             matches!(open_mode, RarArchiveOpenMode::RefreshProvidedVolumes);
+
         let mut archive = match cached_headers {
             Some(headers) => {
+                if let Some(first_path) = volume_paths.get(&0) {
+                    let _ = Self::open_rar_volume_zero_with_password(
+                        first_path,
+                        password,
+                        shared_kdf_cache.clone(),
+                    )?;
+                }
                 weaver_rar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
-                    &headers,
-                    password.clone(),
+                    headers,
+                    password.map(str::to_string),
                     shared_kdf_cache.clone(),
                 )
-                .map_err(|e| {
-                    format!("failed to deserialize cached RAR headers for set '{set_name}': {e}")
+                .map_err(|error| {
+                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                        "failed to deserialize cached RAR headers for set '{set_name}': {error}"
+                    ))
                 })?
             }
             None => {
                 let first_path = volume_paths.get(&0).ok_or_else(|| {
-                    format!("RAR set '{set_name}' cannot be opened without volume 0")
+                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                        "RAR set '{set_name}' cannot be opened without volume 0"
+                    ))
                 })?;
-                let first_file = std::fs::File::open(first_path)
-                    .map_err(|e| format!("failed to open RAR volume 0: {e}"))?;
-                if let Some(password) = password.as_deref() {
-                    weaver_rar::RarArchive::open_with_password_and_shared_kdf_cache(
-                        first_file,
-                        password,
-                        shared_kdf_cache.clone(),
-                    )
-                } else {
-                    weaver_rar::RarArchive::open_with_shared_kdf_cache(
-                        first_file,
-                        shared_kdf_cache.clone(),
-                    )
-                }
-                .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name}': {e}"))?
+                Self::open_rar_volume_zero_with_password(
+                    first_path,
+                    password,
+                    shared_kdf_cache.clone(),
+                )?
             }
         };
 
@@ -328,35 +430,238 @@ impl Pipeline {
                     continue;
                 }
                 Err(error) => {
-                    return Err(format!(
+                    return Err(crate::pipeline::RarPasswordAttemptError::Fatal(format!(
                         "failed to open RAR volume {volume_number} for set '{set_name}': {error}"
-                    ));
+                    )));
                 }
             };
             if has_cached_headers
                 && refresh_provided_volumes
-                && archive.has_volume(volume_number as usize)
+                && archive.has_volume(*volume_number as usize)
             {
                 archive
-                    .refresh_volume(volume_number as usize, Box::new(file))
-                    .map_err(|e| {
-                        format!(
-                            "failed to refresh RAR volume {volume_number} for set '{set_name}': {e}"
-                        )
+                    .refresh_volume(*volume_number as usize, Box::new(file))
+                    .map_err(|error| {
+                        crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                            "failed to refresh RAR volume {volume_number} for set '{set_name}': {error}"
+                        ))
                     })?;
-            } else if archive.has_volume(volume_number as usize) {
-                archive.attach_volume_reader(volume_number as usize, Box::new(file));
+            } else if archive.has_volume(*volume_number as usize) {
+                archive.attach_volume_reader(*volume_number as usize, Box::new(file));
             } else {
                 archive
-                    .add_volume(volume_number as usize, Box::new(file))
-                    .map_err(|e| {
-                        format!(
-                            "failed to integrate RAR volume {volume_number} for set '{set_name}': {e}"
-                        )
-                    })?;
+                    .add_volume(*volume_number as usize, Box::new(file))
+                    .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             }
         }
 
         Ok(archive)
+    }
+
+    fn open_rar_volume_zero_with_password(
+        first_path: &PathBuf,
+        password: Option<&str>,
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+    ) -> Result<weaver_rar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
+        let first_file = std::fs::File::open(first_path).map_err(|e| {
+            crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                "failed to open RAR volume 0: {e}"
+            ))
+        })?;
+        match password {
+            Some(password) => weaver_rar::RarArchive::open_with_password_and_shared_kdf_cache(
+                first_file,
+                password,
+                shared_kdf_cache,
+            ),
+            None => {
+                weaver_rar::RarArchive::open_with_shared_kdf_cache(first_file, shared_kdf_cache)
+            }
+        }
+        .map_err(crate::pipeline::RarPasswordAttemptError::from)
+    }
+
+    fn select_rar_password_probe_member(
+        archive: &weaver_rar::RarArchive,
+        requested_members: &[String],
+        already_extracted: Option<&std::collections::HashSet<String>>,
+    ) -> Option<(usize, bool)> {
+        let metadata = archive.metadata();
+        let mut candidates = Vec::new();
+        if requested_members.is_empty() {
+            for (idx, member) in metadata.members.iter().enumerate() {
+                if member.is_directory
+                    || already_extracted.is_some_and(|extracted| extracted.contains(&member.name))
+                {
+                    continue;
+                }
+                candidates.push((idx, metadata.is_encrypted || member.is_encrypted));
+            }
+        } else {
+            for requested in requested_members {
+                let Some((idx, member)) = metadata
+                    .members
+                    .iter()
+                    .enumerate()
+                    .find(|(_, member)| member.name == *requested && !member.is_directory)
+                else {
+                    continue;
+                };
+                candidates.push((idx, metadata.is_encrypted || member.is_encrypted));
+            }
+        }
+
+        candidates
+            .iter()
+            .copied()
+            .find(|(idx, _)| metadata.members[*idx].is_encrypted)
+            .or_else(|| candidates.first().copied())
+    }
+
+    fn probe_rar_member_password(
+        archive: &mut weaver_rar::RarArchive,
+        volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
+        idx: usize,
+        password: Option<&str>,
+    ) -> Result<(), crate::pipeline::RarPasswordAttemptError> {
+        let member = archive.member_info(idx).ok_or_else(|| {
+            crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                "member index {idx} missing from archive metadata"
+            ))
+        })?;
+        if member.is_directory {
+            return Ok(());
+        }
+        let options = weaver_rar::ExtractOptions {
+            verify: true,
+            password: password.map(str::to_string),
+        };
+
+        if archive.is_solid() {
+            archive
+                .extract_member_solid_chunked(idx, &options, |_| {
+                    Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+                })
+                .map(|_| ())
+                .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
+            return Ok(());
+        }
+
+        let first_volume = member.volumes.first_volume as u32;
+        let last_volume = member.volumes.last_volume as u32;
+        let mut provider_paths = std::collections::HashMap::new();
+        for absolute_volume in first_volume..=last_volume {
+            let Some(path) = volume_paths.get(&absolute_volume) else {
+                return Err(crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                    "missing local RAR volume {absolute_volume} for member {}",
+                    member.name
+                )));
+            };
+            provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+        }
+        let provider = weaver_rar::StaticVolumeProvider::new(provider_paths);
+        let mut sink = std::io::sink();
+        archive
+            .extract_member_streaming(idx, &options, &provider, &mut sink)
+            .map(|_| ())
+            .map_err(crate::pipeline::RarPasswordAttemptError::from)
+    }
+
+    pub(crate) fn try_rar_password_candidates<T, F>(
+        context: &str,
+        candidates: &[crate::jobs::ArchivePasswordCandidate],
+        mut attempt: F,
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<T>, String>
+    where
+        F: FnMut(Option<&str>) -> Result<T, crate::pipeline::RarPasswordAttemptError>,
+    {
+        if candidates.is_empty() {
+            return attempt(None)
+                .map(|value| crate::pipeline::ArchivePasswordSelection::new(value, None))
+                .map_err(|error| format!("{context}: {error}"));
+        }
+
+        let mut last_password_error = None;
+        for candidate in candidates {
+            match attempt(Some(candidate.value())) {
+                Ok(value) => {
+                    return Ok(crate::pipeline::ArchivePasswordSelection::new(
+                        value,
+                        Some(candidate.value().to_string()),
+                    ));
+                }
+                Err(crate::pipeline::RarPasswordAttemptError::Rar(error))
+                    if Self::rar_error_is_password_related(&error) =>
+                {
+                    last_password_error = Some(error);
+                }
+                Err(error) => return Err(format!("{context}: {error}")),
+            }
+        }
+
+        let sources = Self::password_candidate_sources(candidates);
+        Err(format!(
+            "{context}: invalid password for encrypted archive after {} candidate(s) from {sources}: {}",
+            candidates.len(),
+            last_password_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "password rejected".to_string())
+        ))
+    }
+
+    pub(crate) fn deserialize_rar_headers_with_password_candidates(
+        set_name: &str,
+        headers: &[u8],
+        candidates: &[crate::jobs::ArchivePasswordCandidate],
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_rar::RarArchive>, String> {
+        let selected = candidates.first();
+        let password = selected.map(|candidate| candidate.value().to_string());
+        weaver_rar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
+            headers,
+            password,
+            shared_kdf_cache,
+        )
+        .map(|archive| {
+            crate::pipeline::ArchivePasswordSelection::new(
+                archive,
+                selected.map(|candidate| candidate.value().to_string()),
+            )
+        })
+        .map_err(|error| {
+            format!("failed to deserialize cached RAR headers for set '{set_name}': {error}")
+        })
+    }
+
+    pub(crate) fn open_rar_volume_zero_with_password_candidates(
+        set_name: &str,
+        first_path: &PathBuf,
+        candidates: &[crate::jobs::ArchivePasswordCandidate],
+        shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+    ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_rar::RarArchive>, String> {
+        let context = format!("failed to parse RAR volume 0 for set '{set_name}'");
+        Self::try_rar_password_candidates(&context, candidates, |password| {
+            Self::open_rar_volume_zero_with_password(first_path, password, shared_kdf_cache.clone())
+        })
+    }
+
+    pub(crate) fn rar_error_is_password_related(error: &weaver_rar::RarError) -> bool {
+        matches!(
+            error,
+            weaver_rar::RarError::EncryptedArchive
+                | weaver_rar::RarError::EncryptedMember { .. }
+                | weaver_rar::RarError::InvalidPassword
+                | weaver_rar::RarError::WrongPassword { .. }
+        )
+    }
+
+    pub(crate) fn password_candidate_sources(
+        candidates: &[crate::jobs::ArchivePasswordCandidate],
+    ) -> String {
+        candidates
+            .iter()
+            .map(|candidate| candidate.source().as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }

@@ -4,7 +4,10 @@ pub mod naming;
 mod persisted_nzb;
 mod submission;
 
-pub use import::{ImportError, import_nzb, nzb_to_spec};
+pub use import::{
+    ImportError, import_nzb, normalize_archive_password_candidate, nzb_password_candidates,
+    nzb_to_spec,
+};
 pub use metadata::{
     ORIGINAL_TITLE_METADATA_KEY, append_original_title_metadata, original_release_title,
 };

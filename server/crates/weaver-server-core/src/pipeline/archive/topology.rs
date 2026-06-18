@@ -177,7 +177,7 @@ struct RarSetComputeInput {
     existing: RarSetState,
     volume_map: HashMap<String, u32>,
     volume_paths: BTreeMap<u32, PathBuf>,
-    password: Option<String>,
+    password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     extracted: HashSet<String>,
     failed: HashSet<String>,
     facts: BTreeMap<u32, weaver_rar::RarVolumeFacts>,
@@ -216,17 +216,21 @@ impl Pipeline {
 
     pub(crate) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
-        password: Option<String>,
+        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     ) -> Result<weaver_rar::RarVolumeFacts, String> {
         tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            weaver_rar::RarArchive::parse_volume_facts(file, password.as_deref()).map_err(|e| {
-                format!(
-                    "failed to parse RAR volume facts from {}: {e}",
-                    path.display()
-                )
+            let context = format!("failed to parse RAR volume facts from {}", path.display());
+            Self::try_rar_password_candidates(&context, &password_candidates, |password| {
+                let file = std::fs::File::open(&path).map_err(|e| {
+                    crate::pipeline::RarPasswordAttemptError::Fatal(format!(
+                        "failed to open {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                weaver_rar::RarArchive::parse_volume_facts(file, password)
+                    .map_err(crate::pipeline::RarPasswordAttemptError::from)
             })
+            .map(|selection| selection.value)
         })
         .await
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
@@ -460,10 +464,7 @@ impl Pipeline {
             return None;
         }
         let volume_paths = self.volume_paths_for_rar_set(job_id, set_name);
-        let password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone());
+        let password_candidates = self.archive_password_candidates_for_set(job_id, set_name);
         let extracted = self
             .extracted_members
             .get(&job_id)
@@ -485,7 +486,7 @@ impl Pipeline {
             existing,
             volume_map,
             volume_paths,
-            password,
+            password_candidates,
             extracted,
             failed,
             facts,
@@ -510,7 +511,7 @@ impl Pipeline {
             set_name: set_name_owned,
             volume_map,
             volume_paths,
-            password,
+            password_candidates,
             extracted,
             failed,
             facts,
@@ -521,21 +522,19 @@ impl Pipeline {
             ..
         } = input;
 
-        let open_from_volume_zero = || -> Result<weaver_rar::RarArchive, String> {
+        let open_from_volume_zero =
+            || -> Result<crate::pipeline::ArchivePasswordSelection<weaver_rar::RarArchive>, String> {
             let first_path = volume_paths.get(&0).ok_or_else(|| {
                 format!(
                     "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
                 )
             })?;
-            let first_file = std::fs::File::open(first_path).map_err(|e| {
-                format!("failed to open RAR volume 0 for set '{set_name_owned}': {e}")
-            })?;
-            if let Some(password) = password.as_deref() {
-                weaver_rar::RarArchive::open_with_password(first_file, password)
-            } else {
-                weaver_rar::RarArchive::open(first_file)
-            }
-            .map_err(|e| format!("failed to parse RAR volume 0 for set '{set_name_owned}': {e}"))
+            Self::open_rar_volume_zero_with_password_candidates(
+                &set_name_owned,
+                first_path,
+                &password_candidates,
+                std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            )
         };
 
         let attach_volumes_and_build_plan = |mut archive: weaver_rar::RarArchive,
@@ -608,13 +607,15 @@ impl Pipeline {
         let has_cached_headers = cached_headers.is_some();
         let mut using_cached_headers = has_cached_headers;
         let mut force_refresh_all_volumes = false;
-        let mut archive = match cached_headers {
+        let initial_selection = match cached_headers {
             Some(headers) => {
-                match weaver_rar::RarArchive::deserialize_headers_with_password(
+                match Self::deserialize_rar_headers_with_password_candidates(
+                    &set_name_owned,
                     &headers,
-                    password.clone(),
+                    &password_candidates,
+                    std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
                 ) {
-                    Ok(archive) => archive,
+                    Ok(selection) => selection,
                     Err(error) => {
                         warn!(
                             set_name = %set_name_owned,
@@ -622,12 +623,14 @@ impl Pipeline {
                             "failed to deserialize cached RAR headers during plan rebuild, falling back to volume 0"
                         );
                         rebuild_source = RarTopologyRebuildSource::VolumeZero;
+                        using_cached_headers = false;
                         open_from_volume_zero()?
                     }
                 }
             }
             None => open_from_volume_zero()?,
         };
+        let mut archive = initial_selection.value;
 
         if using_cached_headers
             && reason >= RefreshReason::ValidationFailure
@@ -636,7 +639,8 @@ impl Pipeline {
             })
             && volume_paths.contains_key(&0)
         {
-            archive = open_from_volume_zero()?;
+            let selection = open_from_volume_zero()?;
+            archive = selection.value;
             rebuild_source = RarTopologyRebuildSource::VolumeZero;
             using_cached_headers = false;
         }
@@ -664,7 +668,8 @@ impl Pipeline {
                         "cached RAR headers contradicted per-volume facts; forcing registered volume refresh"
                     );
                     if volume_paths.contains_key(&0) {
-                        archive = open_from_volume_zero()?;
+                        let selection = open_from_volume_zero()?;
+                        archive = selection.value;
                         rebuild_source = RarTopologyRebuildSource::VolumeZero;
                         using_cached_headers = false;
                     }
@@ -695,8 +700,9 @@ impl Pipeline {
                 "cached RAR headers waited on present volumes; retrying from live volumes"
             );
 
+            let selection = open_from_volume_zero()?;
             (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
-                open_from_volume_zero()?,
+                selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
                 false,
@@ -711,8 +717,9 @@ impl Pipeline {
                 "cached RAR headers produced ownerless present volumes; retrying from live volumes"
             );
 
+            let selection = open_from_volume_zero()?;
             (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
-                open_from_volume_zero()?,
+                selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
                 false,
@@ -728,8 +735,9 @@ impl Pipeline {
                 "cached RAR headers produced incoherent waiting plan; retrying from live volumes"
             );
 
+            let selection = open_from_volume_zero()?;
             (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
-                open_from_volume_zero()?,
+                selection.value,
                 RarTopologyRebuildSource::VolumeZero,
                 false,
                 false,
@@ -1019,13 +1027,11 @@ impl Pipeline {
             return Ok(());
         }
 
-        let password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone());
+        let password_candidates = self.archive_password_candidates_for_set(job_id, set_name);
         let mut parsed = Vec::new();
         for (expected_volume_number, filename, path) in volume_paths {
-            let facts = Self::parse_rar_volume_facts_from_path(path, password.clone()).await?;
+            let facts =
+                Self::parse_rar_volume_facts_from_path(path, password_candidates.clone()).await?;
             if facts.volume_number != expected_volume_number {
                 info!(
                     job_id = job_id.0,
@@ -1138,16 +1144,15 @@ impl Pipeline {
     }
 
     pub(crate) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
-        let password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone());
+        let password_candidates = self.archive_password_candidates_for_job(job_id);
         match self.db.load_all_archive_headers(job_id) {
             Ok(headers_by_set) => {
                 for (set_name, headers) in headers_by_set {
-                    match weaver_rar::RarArchive::deserialize_headers_with_password(
+                    match Self::deserialize_rar_headers_with_password_candidates(
+                        &set_name,
                         &headers,
-                        password.clone(),
+                        &password_candidates,
+                        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
                     ) {
                         Ok(_) => {
                             self.rar_sets
@@ -1238,8 +1243,8 @@ impl Pipeline {
             }
         }
         let set_names: Vec<String> = set_names.into_iter().collect();
-
         for set_name in &set_names {
+            let password_candidates = self.archive_password_candidates_for_set(job_id, set_name);
             let volume_files = {
                 let Some(state) = self.jobs.get(&job_id) else {
                     return;
@@ -1269,7 +1274,9 @@ impl Pipeline {
             };
             let mut live_volumes = HashSet::new();
             for (filename, path) in volume_files {
-                match Self::parse_rar_volume_facts_from_path(path, password.clone()).await {
+                match Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
+                    .await
+                {
                     Ok(facts) => {
                         live_volumes.insert(facts.volume_number);
                         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
@@ -1345,7 +1352,7 @@ impl Pipeline {
     /// When a RAR volume file completes, rebuild topology from the persistent
     /// multi-volume header snapshot instead of inferring spans by volume order.
     pub(crate) async fn try_update_archive_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
-        let (observed_volume, filename, set_name, path, password) = {
+        let (observed_volume, filename, set_name, path, password_candidates) = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
             };
@@ -1360,6 +1367,7 @@ impl Pipeline {
             let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) else {
                 return;
             };
+            let password_candidates = self.archive_password_candidates_for_set(job_id, &set_name);
             (
                 volume_number,
                 self.current_filename_for_file(job_id, file_asm),
@@ -1371,7 +1379,7 @@ impl Pipeline {
                     Some(path) => path,
                     None => return,
                 },
-                state.spec.password.clone(),
+                password_candidates,
             )
         };
 
@@ -1380,7 +1388,7 @@ impl Pipeline {
             self.try_update_archive_topology_calls += 1;
         }
 
-        match Self::parse_rar_volume_facts_from_path(path, password).await {
+        match Self::parse_rar_volume_facts_from_path(path, password_candidates).await {
             Ok(facts) => {
                 let parsed_volume = facts.volume_number;
                 let changed = match self.persist_rar_volume_facts(

@@ -16,6 +16,14 @@ const JOB_HISTORY_SELECT: &str =
         last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
    FROM job_history";
 
+const JOB_HISTORY_SELECT_ALIASED: &str =
+    "SELECT h.job_id, h.job_hash, h.name, h.status, h.error_message, h.total_bytes, h.downloaded_bytes,
+        h.optional_recovery_bytes, h.optional_recovery_downloaded_bytes,
+        h.failed_bytes, h.health, h.category, h.output_dir, h.nzb_path,
+        h.created_at, h.completed_at, h.metadata,
+        h.last_diagnostic_id, h.last_diagnostic_uploaded_at_epoch_ms
+   FROM ";
+
 impl Database {
     pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
         self.get_job_history_inner(job_id)
@@ -64,34 +72,40 @@ impl Database {
         filter: &HistoryFilter,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
-        let status = filter.status.clone();
-        let category = filter.category.clone();
-        let limit = filter.limit;
-        let offset = filter.offset;
+        let filter = filter.clone();
         self.run_sql_blocking(async move {
-            let mut sql = format!("{JOB_HISTORY_SELECT} WHERE 1=1");
+            let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
             let mut args = Vec::new();
 
-            if let Some(status) = status {
-                sql.push_str(" AND status = {}");
-                args.push(SqlArg::Text(status));
-            }
-            if let Some(category) = category {
-                sql.push_str(" AND category = {}");
-                args.push(SqlArg::Text(category));
-            }
+            append_history_from_clause(&mut sql, &mut args, &filter);
+            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
 
-            sql.push_str(" ORDER BY completed_at DESC");
+            sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
 
-            if let Some(limit) = limit {
-                sql.push_str(&format!(" LIMIT {}", limit));
-            }
-            if let Some(offset) = offset {
-                sql.push_str(&format!(" OFFSET {}", offset));
-            }
+            append_history_pagination(&mut sql, &mut args, &filter);
 
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
             rows.into_iter().map(job_history_row_from_sql).collect()
+        })
+    }
+
+    pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
+        let datastore = self.datastore();
+        let filter = filter.clone();
+        self.run_sql_blocking(async move {
+            let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
+            let mut args = Vec::new();
+
+            append_history_from_clause(&mut sql, &mut args, &filter);
+            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
+
+            let count = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
+                .await?
+                .map(|row| row.i64("count"))
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as u32;
+            Ok(count)
         })
     }
 
@@ -198,6 +212,120 @@ impl Database {
             })
             .transpose()
         })
+    }
+}
+
+fn append_history_from_clause(sql: &mut String, args: &mut Vec<SqlArg>, filter: &HistoryFilter) {
+    match (&filter.metadata_equals, &filter.metadata_has_key) {
+        (Some(metadata_equals), maybe_key) => {
+            sql.push_str(
+                "job_history_attributes a
+                 JOIN job_history h ON h.job_id = a.job_id
+                 WHERE a.key = {} AND a.value = {}",
+            );
+            args.push(SqlArg::Text(metadata_equals.key.clone()));
+            args.push(SqlArg::Text(metadata_equals.value.clone()));
+            if let Some(key) = maybe_key
+                && key != &metadata_equals.key
+            {
+                sql.push_str(
+                    " AND EXISTS (
+                        SELECT 1
+                          FROM job_history_attributes ak
+                         WHERE ak.job_id = h.job_id
+                           AND ak.key = {}
+                     )",
+                );
+                args.push(SqlArg::Text(key.clone()));
+            }
+        }
+        (None, Some(key)) => {
+            sql.push_str(
+                "(SELECT DISTINCT job_id
+                    FROM job_history_attributes
+                   WHERE key = {}) a
+                 JOIN job_history h ON h.job_id = a.job_id
+                 WHERE 1=1",
+            );
+            args.push(SqlArg::Text(key.clone()));
+        }
+        (None, None) => {
+            sql.push_str("job_history h WHERE 1=1");
+        }
+    }
+}
+
+fn append_history_row_filter_predicates(
+    sql: &mut String,
+    args: &mut Vec<SqlArg>,
+    filter: &HistoryFilter,
+) {
+    if let Some(statuses) = &filter.statuses {
+        append_in_i64_or_text_filter(
+            sql,
+            args,
+            "h.status",
+            statuses.iter().cloned().map(SqlArg::Text).collect(),
+        );
+    }
+    if let Some(item_ids) = &filter.item_ids {
+        append_in_i64_or_text_filter(
+            sql,
+            args,
+            "h.job_id",
+            item_ids
+                .iter()
+                .copied()
+                .map(|value| SqlArg::I64(value as i64))
+                .collect(),
+        );
+    }
+    if let Some(category) = &filter.category {
+        sql.push_str(" AND h.category = {}");
+        args.push(SqlArg::Text(category.clone()));
+    }
+}
+
+fn append_in_i64_or_text_filter(
+    sql: &mut String,
+    args: &mut Vec<SqlArg>,
+    column: &str,
+    values: Vec<SqlArg>,
+) {
+    if values.is_empty() {
+        sql.push_str(" AND 1=0");
+        return;
+    }
+
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" IN (");
+    sql.push_str(
+        &std::iter::repeat_n("{}", values.len())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    sql.push(')');
+    args.extend(values);
+}
+
+fn append_history_pagination(sql: &mut String, args: &mut Vec<SqlArg>, filter: &HistoryFilter) {
+    match (filter.limit, filter.offset) {
+        (Some(limit), Some(offset)) => {
+            sql.push_str(" LIMIT {} OFFSET {}");
+            args.push(SqlArg::I64(i64::from(limit)));
+            args.push(SqlArg::I64(i64::from(offset)));
+        }
+        (Some(limit), None) => {
+            sql.push_str(" LIMIT {}");
+            args.push(SqlArg::I64(i64::from(limit)));
+        }
+        (None, Some(offset)) => {
+            sql.push_str(" LIMIT {} OFFSET {}");
+            args.push(SqlArg::I64(i64::from(u32::MAX)));
+            args.push(SqlArg::I64(i64::from(offset)));
+        }
+        (None, None) => {}
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::StateError;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
+use crate::history::{parse_history_metadata, public_history_attributes};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
@@ -65,44 +66,82 @@ async fn bulk_insert_integration_events_tx(
     Ok(())
 }
 
+pub(crate) async fn replace_job_history_attributes_tx(
+    tx: &mut SqlTx<'_>,
+    entry: &JobHistoryRow,
+) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM job_history_attributes WHERE job_id = {}",
+        &[SqlArg::I64(entry.job_id as i64)],
+    )
+    .await?;
+
+    let metadata = parse_history_metadata(entry.metadata.as_deref());
+    for (key, value) in public_history_attributes(&metadata) {
+        tx.execute(
+            "INSERT INTO job_history_attributes (job_id, key, value, completed_at)
+             VALUES ({}, {}, {}, {})
+             ON CONFLICT(job_id, key, value) DO UPDATE SET
+                completed_at = excluded.completed_at",
+            &[
+                SqlArg::I64(entry.job_id as i64),
+                SqlArg::Text(key),
+                SqlArg::Text(value),
+                SqlArg::I64(entry.completed_at),
+            ],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let cache_entry = entry.clone();
         let args = job_history_args(entry);
+        let attribute_entry = entry.clone();
         let result = self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "INSERT INTO job_history
-                    (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
-                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                     failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                     created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
-                 ON CONFLICT(job_id) DO UPDATE SET
-                    job_hash = excluded.job_hash,
-                    name = excluded.name,
-                    status = excluded.status,
-                    error_message = excluded.error_message,
-                    total_bytes = excluded.total_bytes,
-                    downloaded_bytes = excluded.downloaded_bytes,
-                    optional_recovery_bytes = excluded.optional_recovery_bytes,
-                    optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
-                    failed_bytes = excluded.failed_bytes,
-                    health = excluded.health,
-                    category = excluded.category,
-                    output_dir = excluded.output_dir,
-                    nzb_path = excluded.nzb_path,
-                    nzb_zstd = excluded.nzb_zstd,
-                    created_at = excluded.created_at,
-                    completed_at = excluded.completed_at,
-                    metadata = excluded.metadata,
-                    last_diagnostic_id = excluded.last_diagnostic_id,
-                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
-                &args,
-            )
-            .await?;
-            Ok(())
+            SqlRuntime::run_in_transaction(&datastore, "insert_job_history", |tx| {
+                let args = args.clone();
+                let attribute_entry = attribute_entry.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO job_history
+                            (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
+                             optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                             failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                             created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                         ON CONFLICT(job_id) DO UPDATE SET
+                            job_hash = excluded.job_hash,
+                            name = excluded.name,
+                            status = excluded.status,
+                            error_message = excluded.error_message,
+                            total_bytes = excluded.total_bytes,
+                            downloaded_bytes = excluded.downloaded_bytes,
+                            optional_recovery_bytes = excluded.optional_recovery_bytes,
+                            optional_recovery_downloaded_bytes = excluded.optional_recovery_downloaded_bytes,
+                            failed_bytes = excluded.failed_bytes,
+                            health = excluded.health,
+                            category = excluded.category,
+                            output_dir = excluded.output_dir,
+                            nzb_path = excluded.nzb_path,
+                            nzb_zstd = excluded.nzb_zstd,
+                            created_at = excluded.created_at,
+                            completed_at = excluded.completed_at,
+                            metadata = excluded.metadata,
+                            last_diagnostic_id = excluded.last_diagnostic_id,
+                            last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                        &args,
+                    )
+                    .await?;
+                    replace_job_history_attributes_tx(tx, &attribute_entry).await?;
+                    Ok(())
+                })
+            })
+            .await
         });
         if result.is_ok() {
             self.cache_job_history(cache_entry);

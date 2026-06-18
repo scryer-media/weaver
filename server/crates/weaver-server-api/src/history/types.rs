@@ -3,17 +3,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use weaver_server_core::{
-    AsyncOperationState, AsyncOperationTargetState,
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-    DiagnosticRunRow, DiagnosticRunStage as CoreDiagnosticRunStage,
+    AsyncOperationState, AsyncOperationTargetState, DiagnosticRunRow,
+    DiagnosticRunStage as CoreDiagnosticRunStage,
     HistoryDeleteOperationSummary as CoreHistoryDeleteOperationSummary,
-    HistoryDeleteRowState as CoreHistoryDeleteRowState, JobHistoryRow,
+    HistoryDeleteRowState as CoreHistoryDeleteRowState, JobHistoryRow, parse_history_metadata,
+    split_history_metadata,
 };
 
 use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
-    Attribute, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobStatusGql, ParsedRelease, PreparedQueueFilter,
-    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
+    Attribute, JobStatusGql, ParsedRelease, PreparedQueueFilter, QueueAttention, QueueFilterInput,
+    QueueItemState, matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -417,11 +417,7 @@ pub fn history_item_from_row(
     diagnostic_run: Option<HistoryDiagnosticRun>,
     delete_operation: Option<HistoryDeleteRowState>,
 ) -> HistoryItem {
-    let metadata_pairs = row
-        .metadata
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-        .unwrap_or_default();
+    let metadata_pairs = parse_history_metadata(row.metadata.as_deref());
     let (client_request_id, attributes) = split_attributes(&metadata_pairs);
     let state = history_state_from_row(row);
     let display = release_display_info(ReleaseDisplayInput {
@@ -570,23 +566,14 @@ pub(crate) fn matches_history_filter_prepared(
 }
 
 fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attribute>) {
-    let mut client_request_id = None;
-    let mut attributes = Vec::new();
-    for (key, value) in metadata {
-        if key == CLIENT_REQUEST_ID_ATTRIBUTE_KEY {
-            client_request_id = Some(value.clone());
-        } else if key == DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY
-            || key == DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY
-        {
-            continue;
-        } else {
-            attributes.push(Attribute {
-                key: key.clone(),
-                value: value.clone(),
-            });
-        }
-    }
-    (client_request_id, attributes)
+    let (client_request_id, attributes) = split_history_metadata(metadata);
+    (
+        client_request_id,
+        attributes
+            .into_iter()
+            .map(|(key, value)| Attribute { key, value })
+            .collect(),
+    )
 }
 
 fn secs_to_datetime(secs: i64) -> DateTime<Utc> {

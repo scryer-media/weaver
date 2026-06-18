@@ -1,4 +1,4 @@
-use super::FileRole;
+use super::{FileRole, role_filename_view};
 
 /// Extract the archive set base name from a filename and its role.
 ///
@@ -9,6 +9,7 @@ use super::FileRole;
 ///
 /// Returns `None` for non-archive roles.
 pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
+    let filename = role_filename_view(filename);
     match role {
         FileRole::SevenZipArchive => Some(filename.to_string()),
         FileRole::SevenZipSplit { .. } => {
