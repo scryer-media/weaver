@@ -11,13 +11,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::http::{Response as HttpResponse, StatusCode, header};
+use axum::http::{HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tower_http::compression::{
     CompressionLayer,
     predicate::{DefaultPredicate, Predicate},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
@@ -25,6 +25,7 @@ use weaver_server_api::{BackupService, WeaverSchema};
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
+use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 
 pub(crate) use self::metrics::PrometheusMetricsExporter;
@@ -50,6 +51,7 @@ pub struct ServerRuntime {
     pub metrics_exporter: PrometheusMetricsExporter,
     pub config: SharedConfig,
     pub base_url: String,
+    pub security: RuntimeSecurityConfig,
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -82,11 +84,36 @@ fn internal_upload_err(e: impl std::fmt::Display) -> (axum::http::StatusCode, St
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+fn cors_layer(
+    security: &RuntimeSecurityConfig,
+) -> Result<CorsLayer, Box<dyn std::error::Error + Send + Sync>> {
+    if security.cors_allowed_origins.is_empty() {
+        return Ok(CorsLayer::new());
+    }
+
+    let origins = security
+        .cors_allowed_origins
+        .iter()
+        .map(|origin| HeaderValue::from_str(origin))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("x-api-key"),
+        ])
+        .allow_credentials(true))
+}
+
 pub async fn run_server(
     runtime: ServerRuntime,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
+    let cors = cors_layer(&runtime.security)?;
     let app = routes::build_router(runtime)
         .layer(compression_layer())
         .layer(
@@ -96,7 +123,7 @@ pub async fn run_server(
                 .br(true)
                 .zstd(true),
         )
-        .layer(CorsLayer::permissive());
+        .layer(cors);
 
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {

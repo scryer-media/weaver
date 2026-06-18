@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod rss;
 pub mod runtime;
 pub mod schema_migrations;
+pub mod security;
 pub mod servers;
 pub mod settings;
 

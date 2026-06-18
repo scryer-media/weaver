@@ -12,6 +12,7 @@ use axum::routing::get;
 use tempfile::TempDir;
 use tokio::sync::{RwLock, mpsc};
 
+use crate::security::RuntimeSecurityConfig;
 use crate::settings::Config;
 use crate::{JobSpec, PipelineMetrics, SchedulerCommand, SharedPipelineState};
 
@@ -200,7 +201,8 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
 #[tokio::test]
 async fn run_sync_uses_conditional_get_and_basic_auth() {
     let temp = TempDir::new().unwrap();
-    let db = Database::open(&temp.path().join("rss-auth.sqlite")).unwrap();
+    let mut db = Database::open(&temp.path().join("rss-auth.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let state = TestHttpState {
         feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
@@ -405,7 +407,15 @@ fn build_service(
     }));
     let handle = test_scheduler_handle(submissions);
     crate::ingest::init_job_counter(20_000);
-    RssService::new(handle, config, db)
+    RssService::new_with_security(
+        handle,
+        config,
+        db,
+        RuntimeSecurityConfig {
+            rss_allow_private_network: true,
+            ..RuntimeSecurityConfig::default()
+        },
+    )
 }
 
 fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {

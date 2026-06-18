@@ -260,6 +260,7 @@ impl JobsMutation {
     }
     /// Delete a completed/failed/cancelled job from history.
     /// Returns the remaining history jobs after deletion.
+    #[graphql(guard = "ControlGuard")]
     async fn delete_history(
         &self,
         ctx: &Context<'_>,

@@ -72,7 +72,10 @@ async fn async_main() {
     }
 
     let data_dir = PathBuf::from(&config.data_dir);
-    bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config);
+    if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
+        error!("failed to bootstrap encryption key: {error}");
+        std::process::exit(1);
+    }
 
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());

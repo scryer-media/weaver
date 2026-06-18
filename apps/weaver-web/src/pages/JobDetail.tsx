@@ -32,7 +32,7 @@ import {
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { authHeaders, getSessionToken, requestGraphqlClientRestart } from "@/graphql/client";
+import { authHeaders, requestGraphqlClientRestart } from "@/graphql/client";
 import {
   useLiveConnection,
   useLiveJob,
@@ -659,41 +659,10 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     setDownloadingPath(file.path);
     setDownloadError(null);
 
-    const token = getSessionToken();
-    if (token) {
-      submitFormAsDownload(outputFileDownloadHref, {
-        path: file.path,
-        token,
-      });
-      window.setTimeout(() => {
-        setDownloadingPath((current) => (current === file.path ? null : current));
-      }, 1000);
-      return;
-    }
-
-    try {
-      const response = await fetch(outputFileDownloadHref, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-          ...authHeaders(),
-        },
-        credentials: "same-origin",
-        body: new URLSearchParams({ path: file.path }),
-      });
-
-      if (!response.ok) {
-        throw new Error(await readDownloadErrorMessage(response, `Failed to download ${file.name}.`));
-      }
-
-      await saveResponseAsDownload(response, file.name);
-    } catch (error) {
-      setDownloadError(
-        error instanceof Error ? error.message : `Failed to download ${file.name}.`,
-      );
-    } finally {
+    submitFormAsDownload(outputFileDownloadHref, { path: file.path });
+    window.setTimeout(() => {
       setDownloadingPath((current) => (current === file.path ? null : current));
-    }
+    }, 1000);
   }
 
   return (

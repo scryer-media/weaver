@@ -518,7 +518,7 @@ impl Database {
             pending_archive_retries: Arc::new(AtomicUsize::new(0)),
             pending_archive_notify: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
-            encryption_key: None,
+            encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
             _ephemeral_dir: Some(tempdir),
         };
         db.spawn_writer_task(writer_rx);

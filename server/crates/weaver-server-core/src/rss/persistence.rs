@@ -7,11 +7,12 @@ use super::repository::{encode_categories, encode_metadata};
 
 impl Database {
     pub fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
-        use crate::persistence::encryption::maybe_encrypt;
+        use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
         let metadata = encode_metadata(&feed.default_metadata)?;
-        let encrypted_password = maybe_encrypt(self.encryption_key(), &feed.password);
+        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &feed.password)
+            .map_err(StateError::Database)?;
         let args = rss_feed_args(feed, metadata, encrypted_password);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -29,11 +30,12 @@ impl Database {
     }
 
     pub fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
-        use crate::persistence::encryption::maybe_encrypt;
+        use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
         let metadata = encode_metadata(&feed.default_metadata)?;
-        let encrypted_password = maybe_encrypt(self.encryption_key(), &feed.password);
+        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &feed.password)
+            .map_err(StateError::Database)?;
         let mut args = rss_feed_args(feed, metadata, encrypted_password);
         let id = args.remove(0);
         args.push(id);

@@ -10,20 +10,29 @@ use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
 use weaver_server_core::auth::{
     ApiKeyAuthRow, ApiKeyCache, CallerScope, LoginAuthCache, hash_api_key, verify_password,
 };
+use weaver_server_core::security::RuntimeSecurityConfig;
+
+pub(super) const JWT_COOKIE_NAME: &str = "weaver_jwt";
+pub(super) const SESSION_COOKIE_NAME: &str = "weaver_session";
 
 /// Extract the `weaver_jwt` cookie value from request headers.
 pub(super) fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_cookie(headers, JWT_COOKIE_NAME)
+}
+
+pub(super) fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_cookie(headers, SESSION_COOKIE_NAME)
+}
+
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .map(str::trim)
-        .find_map(|cookie| {
-            cookie
-                .strip_prefix("weaver_jwt=")
-                .map(|value| value.to_string())
-        })
+        .find_map(|cookie| cookie.strip_prefix(&prefix).map(|value| value.to_string()))
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -157,9 +166,17 @@ pub(super) async fn resolve_caller(
         });
     }
 
-    // 3. No login auth enabled: require an explicit session token or API key.
+    // 3. No login auth enabled: accept the browser-only session cookie issued
+    // by the SPA index response.
     if cached_auth.is_none() {
-        return Err(StatusCode::UNAUTHORIZED);
+        if let Some(cookie) = extract_session_cookie(headers)
+            && cookie == session_token
+        {
+            return Ok(ResolvedCaller {
+                scope: CallerScope::Local,
+                identity: CallerIdentity::Local(hash_api_key(&cookie)),
+            });
+        }
     }
 
     Err(StatusCode::UNAUTHORIZED)
@@ -189,6 +206,7 @@ pub(super) struct LoginRequest {
 pub(super) async fn login_handler(
     Extension(_db): Extension<Database>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let creds = match auth_cache.snapshot() {
@@ -219,8 +237,10 @@ pub(super) async fn login_handler(
         &effective_auth.jwt_secret,
         JWT_TTL_SECS,
     );
-    let cookie =
-        format!("weaver_jwt={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}");
+    let cookie = format!(
+        "{JWT_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={JWT_TTL_SECS}{}",
+        secure_cookie_suffix(&security)
+    );
 
     (
         StatusCode::OK,
@@ -230,14 +250,41 @@ pub(super) async fn login_handler(
         .into_response()
 }
 
-pub(super) async fn logout_handler() -> Response {
-    let cookie = "weaver_jwt=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
+pub(super) async fn logout_handler(
+    Extension(security): Extension<RuntimeSecurityConfig>,
+) -> Response {
+    let secure = secure_cookie_suffix(&security);
+    let jwt_cookie =
+        format!("{JWT_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
+    let session_cookie =
+        format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
     (
         StatusCode::OK,
-        [(header::SET_COOKIE, cookie.to_string())],
+        [
+            (header::SET_COOKIE, jwt_cookie),
+            (header::SET_COOKIE, session_cookie),
+        ],
         Json(serde_json::json!({ "ok": true })),
     )
         .into_response()
+}
+
+pub(super) fn session_cookie_value(
+    session_token: &str,
+    security: &RuntimeSecurityConfig,
+) -> String {
+    format!(
+        "{SESSION_COOKIE_NAME}={session_token}; Path=/; HttpOnly; SameSite=Strict{}",
+        secure_cookie_suffix(security)
+    )
+}
+
+fn secure_cookie_suffix(security: &RuntimeSecurityConfig) -> &'static str {
+    if security.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
 pub(super) async fn auth_status_handler(

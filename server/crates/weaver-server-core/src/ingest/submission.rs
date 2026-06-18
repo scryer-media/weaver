@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +10,7 @@ use crate::Database;
 use crate::SchedulerHandle;
 use crate::jobs::JobSpec;
 use crate::jobs::ids::JobId;
+use crate::security::{ResolvedFetchTarget, RuntimeSecurityConfig, resolve_fetch_target};
 use crate::settings::SharedConfig;
 use weaver_nzb::Nzb;
 
@@ -18,6 +20,7 @@ use crate::jobs::{FileSpec, SegmentSpec};
 use weaver_model::files::FileRole;
 
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
+const MAX_FETCH_REDIRECTS: usize = 10;
 
 #[derive(Clone)]
 pub struct SubmittedJob {
@@ -248,36 +251,117 @@ pub async fn submit_nzb_bytes(
 }
 
 pub async fn fetch_nzb_from_url(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
 ) -> Result<(Vec<u8>, Option<String>), SubmitNzbError> {
-    let response = client
-        .get(url)
-        .send()
+    fetch_nzb_from_url_with_resolver(url, |current_url| async move {
+        resolve_fetch_target(&current_url, false).await
+    })
+    .await
+}
+
+async fn fetch_nzb_from_url_with_resolver<R, Fut>(
+    url: &str,
+    mut resolve_target: R,
+) -> Result<(Vec<u8>, Option<String>), SubmitNzbError>
+where
+    R: FnMut(reqwest::Url) -> Fut,
+    Fut: Future<Output = Result<ResolvedFetchTarget, String>>,
+{
+    let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
+    let mut current_url =
+        reqwest::Url::parse(url).map_err(|error| SubmitNzbError::Fetch(error.to_string()))?;
+
+    for redirect_count in 0..=MAX_FETCH_REDIRECTS {
+        let target = resolve_target(current_url.clone())
+            .await
+            .map_err(SubmitNzbError::Fetch)?;
+        let client = target
+            .apply_dns_override(
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(std::time::Duration::from_secs(60))
+                    .user_agent("weaver/0.1")
+                    .gzip(true)
+                    .brotli(true)
+                    .deflate(true)
+                    .zstd(true),
+            )
+            .build()
+            .map_err(|error| SubmitNzbError::Fetch(format!("client build failed: {error}")))?;
+
+        let response = client
+            .get(target.url.clone())
+            .send()
+            .await
+            .map_err(|error| SubmitNzbError::Fetch(format!("request failed: {error}")))?;
+
+        if response.status().is_redirection() {
+            if redirect_count == MAX_FETCH_REDIRECTS {
+                return Err(SubmitNzbError::Fetch("too many redirects".to_string()));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| SubmitNzbError::Fetch("redirect missing Location".to_string()))?;
+            current_url = current_url
+                .join(location)
+                .map_err(|error| SubmitNzbError::Fetch(format!("invalid redirect: {error}")))?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(SubmitNzbError::Fetch(format!("HTTP {}", response.status())));
+        }
+
+        let filename = extract_filename_from_response(&response, current_url.as_str());
+        let nzb_bytes =
+            read_response_with_limit(response, limits.nzb_decompressed_limit_bytes).await?;
+
+        if nzb_bytes.is_empty() {
+            return Err(SubmitNzbError::Fetch("empty response body".into()));
+        }
+
+        let nzb = weaver_nzb::parse_nzb(&nzb_bytes)?;
+        if nzb.files.is_empty() {
+            return Err(SubmitNzbError::Empty);
+        }
+
+        return Ok((nzb_bytes, filename));
+    }
+
+    Err(SubmitNzbError::Fetch("too many redirects".to_string()))
+}
+
+async fn read_response_with_limit(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, SubmitNzbError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(SubmitNzbError::Fetch(format!(
+            "response exceeds {limit} bytes"
+        )));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| SubmitNzbError::Fetch(format!("request failed: {error}")))?;
-
-    if !response.status().is_success() {
-        return Err(SubmitNzbError::Fetch(format!("HTTP {}", response.status())));
+        .map_err(|error| SubmitNzbError::Fetch(format!("body read failed: {error}")))?
+    {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len as u64 > limit {
+            return Err(SubmitNzbError::Fetch(format!(
+                "response exceeds {limit} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
-
-    let filename = extract_filename_from_response(&response, url);
-
-    let nzb_bytes = response
-        .bytes()
-        .await
-        .map_err(|error| SubmitNzbError::Fetch(format!("body read failed: {error}")))?;
-
-    if nzb_bytes.is_empty() {
-        return Err(SubmitNzbError::Fetch("empty response body".into()));
-    }
-
-    let nzb = weaver_nzb::parse_nzb(&nzb_bytes)?;
-    if nzb.files.is_empty() {
-        return Err(SubmitNzbError::Empty);
-    }
-
-    Ok((nzb_bytes.to_vec(), filename))
+    Ok(body)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,5 +483,139 @@ fn parse_content_disposition_filename(header: &str) -> Option<String> {
             return None;
         }
         Some(name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn minimal_nzb(name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1234567890" subject="{name} - &quot;file.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="500000" number="1">{name}-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+        )
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn pinned_target(url: reqwest::Url, addr: SocketAddr) -> ResolvedFetchTarget {
+        let host = url.host_str().unwrap().to_string();
+        ResolvedFetchTarget {
+            url,
+            host,
+            addrs: vec![addr],
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_nzb_uses_pinned_hostname_resolution() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let xml = minimal_nzb("Pinned.Release");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/x-nzb\r\n\
+                 Content-Disposition: attachment; filename=\"Pinned.Release.nzb\"\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                xml.len(),
+                xml
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+
+        let url = format!("http://public.test:{}/download.nzb", addr.port());
+        let (bytes, filename) = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+            Ok(pinned_target(url, addr))
+        })
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+
+        assert_eq!(filename.as_deref(), Some("Pinned.Release.nzb"));
+        assert!(!bytes.is_empty());
+        assert!(request.starts_with("GET /download.nzb HTTP/1.1"));
+        assert!(request.contains(&format!("host: public.test:{}", addr.port())));
+    }
+
+    #[tokio::test]
+    async fn fetch_nzb_rejects_redirect_to_private_before_request() {
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private_addr = private_listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn(async move {
+            let (mut stream, _) = redirect_listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\n\
+                 Location: http://127.0.0.1:{}/private.nzb\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                private_addr.port()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let private_accept = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(200), private_listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let url = format!("http://public.test:{}/redirect.nzb", redirect_addr.port());
+        let error = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+            if url.host_str() == Some("public.test") {
+                Ok(pinned_target(url, redirect_addr))
+            } else {
+                resolve_fetch_target(&url, false).await
+            }
+        })
+        .await
+        .unwrap_err();
+        redirect_server.await.unwrap();
+        let private_was_hit = private_accept.await.unwrap();
+
+        assert!(error.to_string().contains("not allowed"));
+        assert!(!private_was_hit);
+    }
+
+    #[test]
+    fn pinned_target_preserves_original_host_for_dns_override() {
+        let url = reqwest::Url::parse("http://public.test:8080/file.nzb").unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let target = pinned_target(url, addr);
+
+        assert_eq!(target.host, "public.test");
+        assert_eq!(target.addrs, vec![addr]);
     }
 }

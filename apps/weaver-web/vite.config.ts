@@ -193,32 +193,24 @@ self.addEventListener("fetch", (event) => {
   };
 }
 
-/**
- * Dev-only plugin: fetches the backend's index.html at startup to extract
- * the ephemeral session token, then injects it into Vite's dev HTML.
- */
 function buildDevSessionPlugin(): Plugin {
-  let sessionScript = "";
-
   return {
     name: "weaver-dev-session",
     apply: "serve",
-    async configureServer() {
-      try {
-        const response = await fetch(BACKEND_ORIGIN);
-        const html = await response.text();
-        const match = /window\.__WEAVER_SESSION__\s*=\s*"([^"]+)"/.exec(html);
-        if (match?.[1]) {
-          sessionScript = `<script>window.__WEAVER_SESSION__=${JSON.stringify(match[1])}</script>`;
+    configureServer(server) {
+      server.middlewares.use("/__weaver/session", async (_req, res) => {
+        try {
+          const response = await fetch(BACKEND_ORIGIN);
+          const setCookie = response.headers.get("set-cookie");
+          if (setCookie) {
+            res.setHeader("set-cookie", setCookie);
+          }
+          res.statusCode = response.ok ? 204 : response.status;
+        } catch {
+          res.statusCode = 502;
         }
-      } catch {
-        // Backend not running — session token will be undefined; API calls
-        // will 401 but the dev server still starts.
-      }
-    },
-    transformIndexHtml(html) {
-      if (!sessionScript) return html;
-      return html.replace("</head>", `${sessionScript}\n  </head>`);
+        res.end();
+      });
     },
   };
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::Extension;
 use axum::routing::{get, post};
+use tower_http::limit::RequestBodyLimitLayer;
 
 use weaver_server_core::auth::generate_api_key;
 
@@ -17,9 +18,12 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         metrics_exporter,
         config,
         base_url,
+        security,
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
+    let backup_upload_limit =
+        usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
     let request_auth = super::RequestAuthContext {
         db: db.clone(),
         auth_cache: auth_cache.clone(),
@@ -34,6 +38,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         api_key_cache.clone(),
         session_token.clone(),
     );
+    let backup_upload_routes = Router::new()
+        .route("/inspect", post(super::backup::backup_inspect_handler))
+        .route("/restore", post(super::backup::backup_restore_handler))
+        .route_layer(RequestBodyLimitLayer::new(backup_upload_limit));
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
@@ -56,14 +64,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             "/api/backup/export",
             post(super::backup::backup_export_handler),
         )
-        .route(
-            "/api/backup/inspect",
-            post(super::backup::backup_inspect_handler),
-        )
-        .route(
-            "/api/backup/restore",
-            post(super::backup::backup_restore_handler),
-        )
+        .nest("/api/backup", backup_upload_routes)
         .route("/api/login", post(super::auth::login_handler))
         .route("/api/logout", post(super::auth::logout_handler))
         .route("/api/auth/status", get(super::auth::auth_status_handler))
@@ -79,6 +80,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
+        .layer(Extension(security))
         .layer(Extension(session_token));
 
     if base_url.is_empty() {

@@ -54,27 +54,28 @@ pub fn open_db_and_config(
     Ok((db, config))
 }
 
-pub fn bootstrap_encryption(data_dir: &Path, db: &mut Database, config: &mut Config) {
-    match crate::persistence::encryption::ensure_encryption_key(Some(data_dir.to_path_buf())) {
-        Ok(key) => {
-            db.set_encryption_key(key);
-            if let Err(e) = db.migrate_plaintext_credentials() {
-                error!("failed to encrypt existing passwords: {e}");
-            }
-
-            let saved_data_dir = config.data_dir.clone();
-            match db.load_config() {
-                Ok(mut reloaded) => {
-                    if reloaded.data_dir.is_empty() {
-                        reloaded.data_dir = saved_data_dir;
-                    }
-                    *config = reloaded;
-                }
-                Err(e) => error!("failed to reload config after setting encryption key: {e}"),
-            }
-        }
-        Err(e) => error!("failed to bootstrap encryption key: {e}"),
+pub fn bootstrap_encryption(
+    data_dir: &Path,
+    db: &mut Database,
+    config: &mut Config,
+) -> Result<(), String> {
+    let key = crate::persistence::encryption::ensure_encryption_key(Some(data_dir.to_path_buf()))?;
+    db.set_encryption_key(key);
+    if let Err(e) = db.migrate_plaintext_credentials() {
+        error!("failed to encrypt existing passwords: {e}");
     }
+
+    let saved_data_dir = config.data_dir.clone();
+    match db.load_config() {
+        Ok(mut reloaded) => {
+            if reloaded.data_dir.is_empty() {
+                reloaded.data_dir = saved_data_dir;
+            }
+            *config = reloaded;
+        }
+        Err(e) => error!("failed to reload config after setting encryption key: {e}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

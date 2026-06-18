@@ -5,7 +5,7 @@ use crate::servers::ServerConfig;
 
 impl Database {
     pub(crate) fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
-        use crate::persistence::encryption::maybe_encrypt;
+        use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
@@ -20,7 +20,8 @@ impl Database {
                         for server in servers {
                             let record = crate::servers::record::ServerRecord::from_config(&server);
                             let encrypted_password =
-                                maybe_encrypt(encryption_key.as_ref(), &record.password);
+                                encrypt_secret_for_write(encryption_key.as_ref(), &record.password)
+                                    .map_err(StateError::Database)?;
                             tx.execute(
                                 "INSERT INTO servers
                                     (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert)

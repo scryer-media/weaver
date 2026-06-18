@@ -3,6 +3,31 @@ mod common;
 use async_graphql::Value;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use weaver_server_api::auth::CallerScope;
+use weaver_server_core::JobHistoryRow;
+
+fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: name.to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 1_000_000 + job_id,
+        downloaded_bytes: 1_000_000 + job_id,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".to_string()),
+        output_dir: Some(format!("/downloads/{name}")),
+        nzb_path: Some(format!("/nzb/{name}.nzb")),
+        created_at: 1_717_171_700,
+        completed_at: 1_717_171_760,
+        metadata: None,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    }
+}
 
 #[tokio::test]
 async fn create_control_api_key() {
@@ -350,6 +375,62 @@ async fn read_scope_cannot_submit() {
             }),
         Some("FORBIDDEN")
     );
+}
+
+#[tokio::test]
+async fn auth_read_scope_cannot_delete_history() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(71, "read-delete-denied"));
+
+    let resp = h
+        .execute_as(
+            r#"mutation {
+                deleteHistory(id: 71, deleteFiles: false) {
+                    id
+                }
+            }"#,
+            CallerScope::Read,
+        )
+        .await;
+
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("FORBIDDEN")
+    );
+    assert!(h.db.get_job_history(71).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn auth_control_scope_can_delete_history() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(72, "control-delete-allowed"));
+
+    let resp = h
+        .execute_as(
+            r#"mutation {
+                deleteHistory(id: 72, deleteFiles: false) {
+                    id
+                }
+            }"#,
+            CallerScope::Control,
+        )
+        .await;
+
+    assert_no_errors(&resp);
+    let remaining = response_data(&resp)["deleteHistory"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert!(remaining.iter().all(|item| item["id"].as_u64() != Some(72)));
+    assert!(h.db.get_job_history(72).unwrap().is_none());
 }
 
 #[tokio::test]

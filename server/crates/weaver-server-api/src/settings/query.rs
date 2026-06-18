@@ -23,6 +23,7 @@ impl SettingsQuery {
             .await,
         )
     }
+    #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();
         let entries: Vec<weaver_server_core::bandwidth::ScheduleEntry> =

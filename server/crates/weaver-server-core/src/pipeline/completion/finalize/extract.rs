@@ -1,6 +1,51 @@
 use super::*;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
+    if raw_name.contains('\0') {
+        return Err(format!("unsafe zip entry path: {raw_name}"));
+    }
+
+    let normalized = raw_name.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if normalized.is_empty() {
+        return Err(format!("unsafe zip entry path: {raw_name}"));
+    }
+
+    let path = Path::new(normalized);
+    if path.is_absolute() {
+        return Err(format!("unsafe zip entry path: {raw_name}"));
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let value = part.to_string_lossy();
+                if is_windows_drive_component(&value) {
+                    return Err(format!("unsafe zip entry path: {raw_name}"));
+                }
+                safe.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("unsafe zip entry path: {raw_name}"));
+            }
+        }
+    }
+
+    if safe.as_os_str().is_empty() {
+        return Err(format!("unsafe zip entry path: {raw_name}"));
+    }
+
+    Ok(safe)
+}
+
+fn is_windows_drive_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
 
 fn extract_zip(
     archive_path: &Path,
@@ -25,16 +70,18 @@ fn extract_zip(
                 .by_index(i)
                 .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
         };
-        let name = entry.name().to_string();
+        let raw_name = entry.name().to_string();
+        let safe_path = validate_zip_entry_path(&raw_name)?;
+        let name = safe_path.to_string_lossy().replace('\\', "/");
 
         if entry.is_dir() {
-            let dir_path = output_dir.join(&name);
+            let dir_path = output_dir.join(&safe_path);
             std::fs::create_dir_all(&dir_path)
                 .map_err(|e| format!("failed to create dir {name}: {e}"))?;
             continue;
         }
 
-        let out_path = output_dir.join(&name);
+        let out_path = output_dir.join(&safe_path);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create parent dir: {e}"))?;

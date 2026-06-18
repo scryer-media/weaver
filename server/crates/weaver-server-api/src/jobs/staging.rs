@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
     SubmitNzbError, nzb_to_submission_spec, persist_decoded_nzb_reader_to_zstd,
 };
+use weaver_server_core::security::RuntimeSecurityConfig;
 
 const DEFAULT_STAGED_UPLOAD_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -255,23 +256,72 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
 }
 
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+    label: &'static str,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, limit: u64, label: &'static str) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+            label,
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let cap = usize::try_from(self.remaining.saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.inner.read(&mut buf[..cap])?;
+        if read as u64 > self.remaining {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{} exceeds {} bytes", self.label, self.limit),
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
 pub(crate) fn normalize_uploaded_nzb_reader(
     upload: UploadValue,
 ) -> Result<Box<dyn Read + Send>, SubmitNzbError> {
+    let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
     let encoding = detect_upload_encoding(&upload);
-    let source = upload.into_read();
+    let source = LimitedReader::new(
+        upload.into_read(),
+        limits.nzb_upload_limit_bytes,
+        "NZB upload",
+    );
 
-    match encoding {
-        UploadEncoding::Plain => Ok(Box::new(source)),
+    let decoded: Box<dyn Read + Send> = match encoding {
+        UploadEncoding::Plain => Box::new(source),
         UploadEncoding::Zstd => {
             let decoder =
                 zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?;
-            Ok(Box::new(decoder))
+            Box::new(decoder)
         }
-        UploadEncoding::Gzip => Ok(Box::new(flate2::read::GzDecoder::new(source))),
-        UploadEncoding::Brotli => Ok(Box::new(brotli::Decompressor::new(source, 64 * 1024))),
-        UploadEncoding::Deflate => Ok(Box::new(flate2::read::DeflateDecoder::new(source))),
-    }
+        UploadEncoding::Gzip => Box::new(flate2::read::GzDecoder::new(source)),
+        UploadEncoding::Brotli => Box::new(brotli::Decompressor::new(source, 64 * 1024)),
+        UploadEncoding::Deflate => Box::new(flate2::read::DeflateDecoder::new(source)),
+    };
+
+    Ok(Box::new(LimitedReader::new(
+        decoded,
+        limits.nzb_decompressed_limit_bytes,
+        "decompressed NZB",
+    )))
 }
 
 #[cfg(test)]
@@ -296,6 +346,15 @@ mod tests {
             content_type: Some("application/x-nzb".to_string()),
             content: minimal_nzb(name).into_bytes().into(),
         }
+    }
+
+    #[test]
+    fn limited_reader_errors_after_limit() {
+        let mut reader = LimitedReader::new(std::io::Cursor::new(b"abcdef"), 3, "test payload");
+        let mut buf = Vec::new();
+        let error = reader.read_to_end(&mut buf).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.to_string().contains("test payload exceeds 3 bytes"));
     }
 
     #[tokio::test]

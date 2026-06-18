@@ -15,8 +15,11 @@ use crate::ingest::submit_nzb_bytes;
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata};
 #[cfg(test)]
 use crate::rss::model::{compile_rules, evaluate_item, feed_item_from_entry, unix_now_secs};
+use crate::security::{RuntimeSecurityConfig, resolve_fetch_target};
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
+
+const MAX_RSS_REDIRECTS: usize = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct RssFeedSyncReport {
@@ -68,25 +71,32 @@ pub(super) struct RssServiceInner {
     pub(super) db: Database,
     pub(super) handle: SchedulerHandle,
     pub(super) config: SharedConfig,
-    pub(super) client: reqwest::Client,
+    pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
 }
 
 impl RssService {
     pub fn new(handle: SchedulerHandle, config: SharedConfig, db: Database) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("weaver-rss/0.1")
-            .gzip(true)
-            .build()
-            .expect("reqwest client build should succeed");
+        Self::new_with_security(
+            handle,
+            config,
+            db,
+            RuntimeSecurityConfig::from_env_or_default_for_tests(),
+        )
+    }
 
+    fn new_with_security(
+        handle: SchedulerHandle,
+        config: SharedConfig,
+        db: Database,
+        security: RuntimeSecurityConfig,
+    ) -> Self {
         Self {
             inner: Arc::new(RssServiceInner {
                 db,
                 handle,
                 config,
-                client,
+                security,
                 sync_lock: Mutex::new(()),
             }),
         }
@@ -102,19 +112,18 @@ impl RssService {
             return Err("accepted item has no direct NZB URL".to_string());
         };
 
-        let request = apply_basic_auth(self.inner.client.get(&download_url), feed);
-        let response = request
-            .send()
+        let response = self
+            .send_rss_request(feed, &download_url, false)
             .await
             .map_err(|e| format!("failed to fetch NZB: {e}"))?;
         if !response.status().is_success() {
             return Err(format!("failed to fetch NZB: HTTP {}", response.status()));
         }
 
-        let nzb_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("failed to read NZB body: {e}"))?;
+        let nzb_bytes =
+            read_response_with_limit(response, self.inner.security.nzb_decompressed_limit_bytes)
+                .await
+                .map_err(|e| format!("failed to read NZB body: {e}"))?;
         weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| format!("invalid NZB: {e}"))?;
 
         let raw_category = rule
@@ -163,19 +172,73 @@ impl RssService {
         &self,
         feed: &RssFeedRow,
     ) -> Result<reqwest::Response, RssServiceError> {
-        let mut request = self.inner.client.get(&feed.url);
-        request = apply_basic_auth(request, feed);
-        if let Some(etag) = &feed.etag {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        if let Some(last_modified) = &feed.last_modified {
-            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        self.send_rss_request(feed, &feed.url, true).await
+    }
+
+    async fn send_rss_request(
+        &self,
+        feed: &RssFeedRow,
+        url: &str,
+        conditional: bool,
+    ) -> Result<reqwest::Response, RssServiceError> {
+        let original_url =
+            reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let mut current_url = original_url.clone();
+
+        for redirect_count in 0..=MAX_RSS_REDIRECTS {
+            let target =
+                resolve_fetch_target(&current_url, self.inner.security.rss_allow_private_network)
+                    .await
+                    .map_err(RssServiceError::Http)?;
+            let client = target
+                .apply_dns_override(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .user_agent("weaver-rss/0.1")
+                        .redirect(reqwest::redirect::Policy::none())
+                        .gzip(true),
+                )
+                .build()
+                .map_err(|e| RssServiceError::Http(e.to_string()))?;
+
+            let mut request = client.get(target.url.clone());
+            if current_url.origin() == original_url.origin() {
+                request = apply_basic_auth(request, feed);
+            }
+            if conditional && redirect_count == 0 {
+                if let Some(etag) = &feed.etag {
+                    request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+                }
+                if let Some(last_modified) = &feed.last_modified {
+                    request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+                }
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| RssServiceError::Http(e.to_string()))?;
+            if response.status().is_redirection() {
+                if redirect_count == MAX_RSS_REDIRECTS {
+                    return Err(RssServiceError::Http("too many redirects".to_string()));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        RssServiceError::Http("redirect missing Location".to_string())
+                    })?;
+                current_url = current_url
+                    .join(location)
+                    .map_err(|e| RssServiceError::Http(format!("invalid redirect: {e}")))?;
+                continue;
+            }
+
+            return Ok(response);
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| RssServiceError::Http(e.to_string()))
+        Err(RssServiceError::Http("too many redirects".to_string()))
     }
 
     pub(super) fn record_seen(
@@ -205,6 +268,32 @@ impl RssService {
             })
             .map_err(|e| RssServiceError::Http(e.to_string()))
     }
+}
+
+async fn read_response_with_limit(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(format!("response exceeds {limit} bytes"));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("body read failed: {e}"))?
+    {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len as u64 > limit {
+            return Err(format!("response exceeds {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

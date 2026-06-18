@@ -64,6 +64,10 @@ pub(crate) fn ensure_runtime_directories(
     Ok(())
 }
 
-pub(crate) fn bootstrap_encryption(data_dir: &Path, db: &mut Database, config: &mut Config) {
-    weaver_server_core::persistence::bootstrap_encryption(data_dir, db, config);
+pub(crate) fn bootstrap_encryption(
+    data_dir: &Path,
+    db: &mut Database,
+    config: &mut Config,
+) -> Result<(), String> {
+    weaver_server_core::persistence::bootstrap_encryption(data_dir, db, config)
 }

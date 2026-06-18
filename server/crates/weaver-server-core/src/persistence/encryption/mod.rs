@@ -21,6 +21,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 
 use std::path::PathBuf;
 
+use crate::security::{ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY, parse_bool_env};
+
 const ENCRYPTED_PREFIX: &str = "enc:v1:";
 const NONCE_LEN: usize = 12;
 
@@ -136,6 +138,24 @@ pub(crate) fn maybe_encrypt(key: Option<&EncryptionKey>, value: &Option<String>)
     }
 }
 
+/// Encrypt a secret for new writes. Plaintext compatibility is read-only: callers
+/// that store new secrets should fail if no encryption key is available.
+pub(crate) fn encrypt_secret_for_write(
+    key: Option<&EncryptionKey>,
+    value: &Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(v) = value.as_deref() else {
+        return Ok(None);
+    };
+    if v.is_empty() || is_encrypted(v) {
+        return Ok(Some(v.to_string()));
+    }
+    let Some(key) = key else {
+        return Err("encryption key is required to store secrets".to_string());
+    };
+    encrypt_value(key, v).map(Some)
+}
+
 /// Decrypt a value if it's encrypted. Returns as-is if not encrypted or empty/None.
 pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) -> Option<String> {
     let v = value?;
@@ -203,11 +223,17 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
             );
         }
         None => {
+            let allow_ephemeral = parse_bool_env(ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY, false)
+                .map_err(|error| error.to_string())?;
+            if !allow_ephemeral {
+                return Err(format!(
+                    "no persistent encryption key source is available; set WEAVER_ENCRYPTION_KEY \
+                     or {ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY}=true to allow an ephemeral key"
+                ));
+            }
             tracing::warn!(
                 "generated new encryption master key (in memory only) — \
-                 set WEAVER_ENCRYPTION_KEY to persist it across restarts\n\n  \
-                 WEAVER_ENCRYPTION_KEY={}\n",
-                key.to_base64()
+                 set WEAVER_ENCRYPTION_KEY to persist it across restarts"
             );
         }
     }

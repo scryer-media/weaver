@@ -195,6 +195,7 @@ impl SettingsMutation {
 
         Ok(settings)
     }
+    #[graphql(guard = "AdminGuard")]
     async fn create_schedule(
         &self,
         ctx: &Context<'_>,
@@ -219,6 +220,7 @@ impl SettingsMutation {
             .map(crate::settings::types::Schedule::from)
             .collect())
     }
+    #[graphql(guard = "AdminGuard")]
     async fn update_schedule(
         &self,
         ctx: &Context<'_>,
@@ -250,6 +252,7 @@ impl SettingsMutation {
             .map(crate::settings::types::Schedule::from)
             .collect())
     }
+    #[graphql(guard = "AdminGuard")]
     async fn delete_schedule(
         &self,
         ctx: &Context<'_>,
@@ -273,6 +276,7 @@ impl SettingsMutation {
             .map(crate::settings::types::Schedule::from)
             .collect())
     }
+    #[graphql(guard = "AdminGuard")]
     async fn toggle_schedule(
         &self,
         ctx: &Context<'_>,

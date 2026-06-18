@@ -30,6 +30,9 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
         .route("/api/login", post(auth::login_handler))
         .route("/api/auth/status", get(auth::auth_status_handler))
         .layer(Extension(db))
+        .layer(Extension(
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+        ))
         .layer(Extension(auth_cache))
 }
 
@@ -487,30 +490,7 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
 }
 
 #[tokio::test]
-async fn nzbget_append_fetches_url_payloads_for_prowlarr_shape() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let xml = minimal_nzb("Prowlarr.Release.2026.1080p");
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request_buf = [0u8; 1024];
-        let _ = stream.read(&mut request_buf).await.unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/x-nzb\r\n\
-             Content-Disposition: attachment; filename=\"Prowlarr.Release.2026.1080p.nzb\"\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            xml.len(),
-            xml
-        );
-        stream.write_all(response.as_bytes()).await.unwrap();
-    });
-
+async fn nzbget_append_rejects_private_url_payloads_for_prowlarr_shape() {
     let db = Database::open_in_memory().unwrap();
     let handle = scheduler_handle_with_mock_commands(vec![]);
     let app = nzbget_test_router(
@@ -526,7 +506,7 @@ async fn nzbget_append_fetches_url_payloads_for_prowlarr_shape() {
             "method": "append",
             "params": [
                 "",
-                format!("http://{addr}/download.nzb"),
+                "http://127.0.0.1:9/download.nzb",
                 "Prowlarr",
                 0,
                 false,
@@ -541,16 +521,16 @@ async fn nzbget_append_fetches_url_payloads_for_prowlarr_shape() {
         "Bearer control-key",
     )
     .await;
-    server.await.unwrap();
 
     assert_eq!(status, StatusCode::OK);
-    assert!(payload["result"].as_u64().unwrap() >= 10_000);
-    let jobs = handle.list_jobs();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].category.as_deref(), Some("Prowlarr"));
-    assert!(jobs[0].metadata.iter().any(|(key, value)| {
-        key == weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY && value == "prowlarrdroneid"
-    }));
+    assert_eq!(payload["error"]["code"], 2);
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed")
+    );
+    assert!(handle.list_jobs().is_empty());
 }
 
 #[tokio::test]
@@ -860,6 +840,23 @@ async fn resolve_scope_accepts_session_bearer_without_login() {
     );
     let result =
         auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+    assert_eq!(result, Ok(CallerScope::Local));
+}
+
+#[tokio::test]
+async fn resolve_scope_accepts_session_cookie_without_login() {
+    let db = Database::open_in_memory().unwrap();
+    let auth_cache = LoginAuthCache::default();
+    let api_key_cache = ApiKeyCache::default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_static("weaver_session=session-token"),
+    );
+
+    let result =
+        auth::resolve_scope(&db, &auth_cache, &api_key_cache, "session-token", &headers).await;
+
     assert_eq!(result, Ok(CallerScope::Local));
 }
 

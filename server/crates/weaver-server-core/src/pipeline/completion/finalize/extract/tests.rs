@@ -1,10 +1,13 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
 use tempfile::TempDir;
+use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 fn create_test_files(dir: &Path) -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
@@ -90,6 +93,14 @@ fn extract_with_weaver_zip(
     output_dir: &Path,
     password: Option<&str>,
 ) -> Vec<String> {
+    extract_with_weaver_zip_result(archive_path, output_dir, password).unwrap()
+}
+
+fn extract_with_weaver_zip_result(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> Result<Vec<String>, String> {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
     extract_zip(
         archive_path,
@@ -99,7 +110,17 @@ fn extract_with_weaver_zip(
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
     )
-    .unwrap()
+}
+
+fn create_zip_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
+    let file = fs::File::create(archive_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default();
+    for (name, contents) in entries {
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(contents).unwrap();
+    }
+    zip.finish().unwrap();
 }
 
 fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
@@ -158,6 +179,58 @@ fn zip_aes_matches_7z() {
         &["-mm=Deflate", "-mem=AES256", "-pTestPass123"],
         Some("TestPass123"),
     );
+}
+
+#[test]
+fn zip_direct_writer_nested_entry_extracts_with_normalized_name() {
+    let tmp = TempDir::new().unwrap();
+    let archive_path = tmp.path().join("direct.zip");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    create_zip_with_entries(&archive_path, &[("nested/note.txt", b"safe nested")]);
+
+    let extracted_names = extract_with_weaver_zip(&archive_path, &out_dir, None);
+
+    assert_eq!(extracted_names, vec!["nested/note.txt".to_string()]);
+    assert_eq!(
+        fs::read(out_dir.join("nested/note.txt")).unwrap(),
+        b"safe nested"
+    );
+}
+
+#[test]
+fn zip_rejects_unsafe_entry_paths() {
+    let unsafe_names = [
+        "../escape.txt",
+        "nested/../../escape.txt",
+        "/absolute.txt",
+        "C:/windows.txt",
+        "..\\escape.txt",
+        "nested\\..\\escape.txt",
+    ];
+
+    for name in unsafe_names {
+        let tmp = TempDir::new().unwrap();
+        let archive_path = tmp.path().join("unsafe.zip");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        create_zip_with_entries(&archive_path, &[(name, b"unsafe")]);
+
+        let error = extract_with_weaver_zip_result(&archive_path, &out_dir, None).unwrap_err();
+
+        assert!(
+            error.contains("unsafe zip entry path"),
+            "unexpected error for {name}: {error}"
+        );
+        assert!(
+            read_dir_contents(&out_dir).is_empty(),
+            "unsafe zip entry {name} should not write under output dir"
+        );
+        assert!(
+            !tmp.path().join("escape.txt").exists(),
+            "unsafe zip entry {name} should not write beside output dir"
+        );
+    }
 }
 
 #[test]

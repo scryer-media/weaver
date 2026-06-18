@@ -1,6 +1,15 @@
 mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
+use weaver_server_core::auth::CallerScope;
+
+fn assert_forbidden(resp: &async_graphql::Response) {
+    assert!(
+        format!("{:?}", resp.errors).contains("FORBIDDEN"),
+        "expected FORBIDDEN error, got {:?}",
+        resp.errors
+    );
+}
 
 #[tokio::test]
 async fn list_schedules_empty() {
@@ -12,6 +21,38 @@ async fn list_schedules_empty() {
     let data = response_data(&resp);
     let schedules = data["schedules"].as_array().unwrap();
     assert!(schedules.is_empty());
+}
+
+#[tokio::test]
+async fn schedules_require_admin_scope() {
+    let h = TestHarness::new().await;
+    let query = "{ schedules { id } }";
+
+    assert_forbidden(&h.execute_as(query, CallerScope::Read).await);
+    assert_forbidden(&h.execute_as(query, CallerScope::Control).await);
+
+    let resp = h.execute_as(query, CallerScope::Admin).await;
+    assert_no_errors(&resp);
+}
+
+#[tokio::test]
+async fn schedule_mutations_require_admin_scope() {
+    let h = TestHarness::new().await;
+    let mutation = r#"mutation {
+        createSchedule(input: {
+            enabled: true,
+            label: "Admin only",
+            days: [],
+            time: "08:00",
+            actionType: "pause"
+        }) { id }
+    }"#;
+
+    assert_forbidden(&h.execute_as(mutation, CallerScope::Read).await);
+    assert_forbidden(&h.execute_as(mutation, CallerScope::Control).await);
+
+    let resp = h.execute_as(mutation, CallerScope::Admin).await;
+    assert_no_errors(&resp);
 }
 
 #[tokio::test]

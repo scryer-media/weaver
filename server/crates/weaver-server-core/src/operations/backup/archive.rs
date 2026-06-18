@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::manifest::{BackupManifest, BackupServiceError, io_err};
+use crate::security::RuntimeSecurityConfig;
 
 pub(crate) fn write_plain_archive(
     dest: &Path,
@@ -92,6 +93,14 @@ fn decrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), Ba
     use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 
+    let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes;
+    let file_size = std::fs::metadata(input).map_err(io_err)?.len();
+    if file_size > limit {
+        return Err(BackupServiceError::Validation(format!(
+            "encrypted backup exceeds {limit} bytes"
+        )));
+    }
+
     let mut data = Vec::new();
     File::open(input)
         .map_err(io_err)?
@@ -126,7 +135,66 @@ pub(crate) fn unpack_plain_archive(
     let file = File::open(input).map_err(io_err)?;
     let decoder = zstd::stream::read::Decoder::new(file).map_err(io_err)?;
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(output_dir).map_err(io_err)?;
+    let backup_db_limit =
+        RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes;
+    let mut saw_manifest = false;
+    let mut saw_backup_db = false;
+
+    for entry in archive.entries().map_err(io_err)? {
+        let mut entry = entry.map_err(io_err)?;
+        if !entry.header().entry_type().is_file() {
+            return Err(BackupServiceError::Validation(
+                "backup archive contains a non-regular entry".to_string(),
+            ));
+        }
+        let path = entry.path().map_err(io_err)?;
+        let name = path.to_str().ok_or_else(|| {
+            BackupServiceError::Validation("backup archive contains a non-utf8 entry".to_string())
+        })?;
+        match name {
+            "manifest.json" => {
+                if saw_manifest {
+                    return Err(BackupServiceError::Validation(
+                        "backup archive contains duplicate manifest.json".to_string(),
+                    ));
+                }
+                saw_manifest = true;
+                entry
+                    .unpack(output_dir.join("manifest.json"))
+                    .map_err(io_err)?;
+            }
+            "backup.db" => {
+                if saw_backup_db {
+                    return Err(BackupServiceError::Validation(
+                        "backup archive contains duplicate backup.db".to_string(),
+                    ));
+                }
+                let size = entry.header().size().map_err(io_err)?;
+                if size > backup_db_limit {
+                    return Err(BackupServiceError::Validation(format!(
+                        "backup.db exceeds {backup_db_limit} bytes"
+                    )));
+                }
+                saw_backup_db = true;
+                entry.unpack(output_dir.join("backup.db")).map_err(io_err)?;
+            }
+            other => {
+                return Err(BackupServiceError::Validation(format!(
+                    "backup archive contains unexpected entry {other}"
+                )));
+            }
+        }
+    }
+    if !saw_manifest {
+        return Err(BackupServiceError::Validation(
+            "backup archive is missing manifest.json".to_string(),
+        ));
+    }
+    if !saw_backup_db {
+        return Err(BackupServiceError::Validation(
+            "backup archive is missing backup.db".to_string(),
+        ));
+    }
     Ok(())
 }
 

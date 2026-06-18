@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use axum::extract::Extension;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 use weaver_server_core::auth as jwt;
 use weaver_server_core::auth::LoginAuthCache;
+use weaver_server_core::security::RuntimeSecurityConfig;
 
 #[derive(Embed)]
 #[folder = "../../../apps/weaver-web/dist/"]
@@ -15,13 +16,12 @@ struct FrontendAssets;
 #[derive(Clone)]
 pub(super) struct BaseUrl(pub(super) Arc<String>);
 
-/// Rewrite `index.html` to inject the session token and (optionally) base URL.
+/// Rewrite `index.html` to inject the optional base URL.
 ///
-/// Always injects `window.__WEAVER_SESSION__` so the frontend can authenticate.
-/// When `base_url` is non-empty (e.g. "/weaver"), also:
+/// When `base_url` is non-empty (e.g. "/weaver"):
 /// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
 /// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
-fn rewrite_index_html(raw: &[u8], base_url: &str, session_token: &str) -> Vec<u8> {
+fn rewrite_index_html(raw: &[u8], base_url: &str) -> Vec<u8> {
     let html = String::from_utf8_lossy(raw);
     let html = if base_url.is_empty() {
         html.into_owned()
@@ -38,13 +38,6 @@ fn rewrite_index_html(raw: &[u8], base_url: &str, session_token: &str) -> Vec<u8
             ),
         )
     };
-    let html = html.replace(
-        "</head>",
-        &format!(
-            "<script>window.__WEAVER_SESSION__={}</script>\n  </head>",
-            serde_json::to_string(session_token).unwrap_or_default()
-        ),
-    );
     html.into_bytes()
 }
 
@@ -61,6 +54,7 @@ pub(super) async fn static_handler(
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     Extension(auth_cache): Extension<LoginAuthCache>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
@@ -116,13 +110,20 @@ pub(super) async fn static_handler(
 
         if let Some(index) = FrontendAssets::get("index.html") {
             let mime = mime_guess::from_path("index.html").first_or_octet_stream();
-            let body = rewrite_index_html(&index.data, &base_url, &session_token);
-            (
+            let body = rewrite_index_html(&index.data, &base_url);
+            let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime.as_ref().to_string())],
                 body,
             )
-                .into_response()
+                .into_response();
+            if auth_cache.snapshot().is_none() {
+                let cookie = super::auth::session_cookie_value(&session_token, &security);
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            response
         } else {
             StatusCode::NOT_FOUND.into_response()
         }

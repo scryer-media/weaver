@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use axum::extract::Extension;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 
 use weaver_nntp::pool::NntpPool;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
+use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
 
 #[derive(Clone)]
@@ -36,16 +37,33 @@ impl PrometheusMetricsExporter {
 
 pub(super) async fn metrics_handler(
     Extension(exporter): Extension<PrometheusMetricsExporter>,
-) -> impl IntoResponse {
+    Extension(request_auth): Extension<super::RequestAuthContext>,
+    Extension(security): Extension<RuntimeSecurityConfig>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    if security.metrics_auth_required {
+        let scope = super::auth::resolve_scope(
+            &request_auth.db,
+            &request_auth.auth_cache,
+            &request_auth.api_key_cache,
+            request_auth.session_token.0.as_str(),
+            &headers,
+        )
+        .await?;
+        if !scope.can_read() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
     let body = exporter.render().await;
-    (
+    Ok((
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8".to_string(),
         )],
         body,
-    )
+    ))
 }
 
 pub(super) struct ServerHealthInfo {

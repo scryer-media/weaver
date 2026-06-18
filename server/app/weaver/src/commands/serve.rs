@@ -6,10 +6,10 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info};
 
 use crate::{http, shutdown, wiring};
-use weaver_server_core::Database;
 use weaver_server_core::events::model::PipelineEvent;
+use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
-use weaver_server_core::{Pipeline, SchedulerCommand, SchedulerHandle};
+use weaver_server_core::{Database, Pipeline, SchedulerCommand, SchedulerHandle};
 
 pub(crate) async fn run(
     mut config: Config,
@@ -18,6 +18,7 @@ pub(crate) async fn run(
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let security = RuntimeSecurityConfig::from_env()?;
     let data_dir = PathBuf::from(&config.data_dir);
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());
@@ -143,7 +144,7 @@ pub(crate) async fn run(
     );
 
     // Run HTTP server.
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(security.http_bind_address, port);
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
@@ -154,6 +155,7 @@ pub(crate) async fn run(
         metrics_exporter,
         config: shared_config.clone(),
         base_url,
+        security,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, addr));
 

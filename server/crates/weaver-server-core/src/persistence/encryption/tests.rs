@@ -84,3 +84,23 @@ fn maybe_decrypt_no_key_returns_as_is() {
     let result = maybe_decrypt(None, val.clone());
     assert_eq!(result, val);
 }
+
+#[test]
+fn encrypt_secret_for_write_requires_key_for_plaintext() {
+    let plaintext = Some("new-password".to_string());
+    assert!(encrypt_secret_for_write(None, &plaintext).is_err());
+
+    let key = EncryptionKey::generate();
+    let encrypted = encrypt_secret_for_write(Some(&key), &plaintext).unwrap();
+    assert!(encrypted.as_ref().unwrap().starts_with(ENCRYPTED_PREFIX));
+
+    assert_eq!(encrypt_secret_for_write(None, &None).unwrap(), None);
+    assert_eq!(
+        encrypt_secret_for_write(None, &Some(String::new())).unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(
+        encrypt_secret_for_write(None, &encrypted).unwrap(),
+        encrypted
+    );
+}

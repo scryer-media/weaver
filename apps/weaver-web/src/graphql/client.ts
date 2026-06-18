@@ -6,12 +6,9 @@ import {
 } from "graphql-ws";
 
 const graphqlUrl = "graphql";
-let sessionToken: string | undefined = (window as unknown as Record<string, unknown>)
-  .__WEAVER_SESSION__ as string | undefined;
 const WS_KEEP_ALIVE_MS = 10_000;
 const WS_PONG_TIMEOUT_MS = 5_000;
 const CLIENT_RESTART_THROTTLE_MS = 2_000;
-const SESSION_TOKEN_PATTERN = /window\.__WEAVER_SESSION__\s*=\s*"([^"]+)"/;
 
 export type GraphqlConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -144,27 +141,16 @@ function tokenRefreshUrl(): string {
     typeof __WEAVER_DEV_BACKEND_ORIGIN__ === "string" &&
     __WEAVER_DEV_BACKEND_ORIGIN__.trim().length > 0
   ) {
-    return new URL("/", __WEAVER_DEV_BACKEND_ORIGIN__).href;
+    return new URL("__weaver/session", document.baseURI).href;
   }
 
   return "/";
 }
 
-function withFreshSessionAuth(init?: RequestInit): RequestInit | undefined {
-  if (!init) {
-    return sessionToken ? { headers: { Authorization: `Bearer ${sessionToken}` } } : undefined;
-  }
-
-  const headers = new Headers(init.headers);
-  if (sessionToken) {
-    headers.set("Authorization", `Bearer ${sessionToken}`);
-  } else {
-    headers.delete("Authorization");
-  }
-
+function withSessionCredentials(init?: RequestInit): RequestInit {
   return {
     ...init,
-    headers,
+    credentials: init?.credentials ?? "include",
   };
 }
 
@@ -172,17 +158,17 @@ export async function fetchWithSessionRetry(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
-  let response = await fetch(input, withFreshSessionAuth(init));
+  let response = await fetch(input, withSessionCredentials(init));
   if (response.status !== 401) {
     return response;
   }
 
-  const refreshed = await refreshSessionToken();
+  const refreshed = await refreshSessionCookie();
   if (!refreshed) {
     return response;
   }
 
-  response = await fetch(input, withFreshSessionAuth(init));
+  response = await fetch(input, withSessionCredentials(init));
   return response;
 }
 
@@ -198,8 +184,7 @@ function createGraphqlClientResources(): GraphqlClientResources {
       fetch: (input, init) => fetchWithSessionRetry(input, init),
       preferGetMethod: false,
       requestPolicy: "network-only",
-      fetchOptions: () =>
-        sessionToken ? { headers: { Authorization: `Bearer ${sessionToken}` } } : {},
+      fetchOptions: () => ({ credentials: "include" }),
       exchanges: [
         subscriptionExchange({
           forwardSubscription(request) {
@@ -221,21 +206,19 @@ function createGraphqlClientResources(): GraphqlClientResources {
 function createTrackedWsClient(transportId: number): GraphqlWsClient {
   const wsClient = createWSClient({
     url: wsUrl(),
-    connectionParams: () =>
-      sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined,
     keepAlive: WS_KEEP_ALIVE_MS,
     // Keep the socket alive briefly across React StrictMode unmount/remount
     // cycles so subscriptions don't get killed and re-created.
     lazyCloseTimeout: 3_000,
     retryAttempts: Number.POSITIVE_INFINITY,
     // Always retry — auth failures (4401) after a server restart are
-    // recoverable once refreshSessionToken() picks up the new token.
+    // recoverable once refreshSessionCookie() picks up the new cookie.
     shouldRetry: () => true,
     retryWait: async (retries) => {
       const delay = retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000);
       await new Promise((resolve) => setTimeout(resolve, delay));
-      // Try to pick up a new session token before the next connection attempt.
-      await refreshSessionToken();
+      // Try to pick up a new session cookie before the next connection attempt.
+      await refreshSessionCookie();
     },
     on: {
       connecting: (isRetry) => {
@@ -340,31 +323,21 @@ export function useGraphqlClient(): Client {
 
 /** Headers that authenticate requests to the Weaver API. */
 export function authHeaders(): Record<string, string> {
-  return sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {};
-}
-
-/** Session token used for same-origin REST downloads that cannot set headers. */
-export function getSessionToken(): string | undefined {
-  return sessionToken;
+  return {};
 }
 
 /**
- * Fetch the index page from the server and extract a fresh session token.
- * After a server restart, the token embedded in the original HTML is stale —
- * the server injects a new one into every response for `/`.
+ * Fetch the index page from the server so it can issue a fresh HttpOnly
+ * browser-session cookie after a server restart.
  */
-export async function refreshSessionToken(): Promise<boolean> {
+export async function refreshSessionCookie(): Promise<boolean> {
   try {
-    const res = await fetch(tokenRefreshUrl(), { credentials: "same-origin" });
+    const res = await fetch(tokenRefreshUrl(), { credentials: "include" });
     if (!res.ok) return false;
-    const html = await res.text();
-    const match = SESSION_TOKEN_PATTERN.exec(html);
-    if (match && match[1] && match[1] !== sessionToken) {
-      sessionToken = match[1];
-      return true;
-    }
+    await res.arrayBuffer();
+    return true;
   } catch {
-    // Server still down — leave token as-is, will retry later.
+    // Server still down — leave the current cookie as-is, will retry later.
   }
   return false;
 }
@@ -376,7 +349,7 @@ export async function requestGraphqlClientRestart() {
   }
 
   lastClientRestartAt = now;
-  await refreshSessionToken();
+  await refreshSessionCookie();
   const previousResources = currentResources;
   clearPongTimeout();
   currentResources = createGraphqlClientResources();

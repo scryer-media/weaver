@@ -189,6 +189,68 @@ async fn plain_backup_contains_manifest_and_database() {
     );
 }
 
+fn write_plain_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
+    let file = File::create(path).unwrap();
+    let encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
+    let mut tar = tar::Builder::new(encoder);
+    for (name, bytes) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, *name, *bytes).unwrap();
+    }
+    let encoder = tar.into_inner().unwrap();
+    encoder.finish().unwrap();
+}
+
+#[test]
+fn unpack_plain_archive_rejects_unexpected_entries() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let archive_path = tempdir.path().join("bad.tar.zst");
+    let output_dir = tempdir.path().join("out");
+    std::fs::create_dir(&output_dir).unwrap();
+
+    write_plain_test_archive(
+        &archive_path,
+        &[
+            ("manifest.json", b"{}".as_slice()),
+            ("backup.db", b"sqlite".as_slice()),
+            ("extra.txt", b"nope".as_slice()),
+        ],
+    );
+
+    let error = archive::unpack_plain_archive(&archive_path, &output_dir).unwrap_err();
+    assert!(error.to_string().contains("unexpected entry extra.txt"));
+    assert!(!output_dir.join("extra.txt").exists());
+}
+
+#[test]
+fn unpack_plain_archive_requires_manifest() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let archive_path = tempdir.path().join("missing-manifest.tar.zst");
+    let output_dir = tempdir.path().join("out");
+    std::fs::create_dir(&output_dir).unwrap();
+    write_plain_test_archive(&archive_path, &[("backup.db", b"sqlite".as_slice())]);
+
+    let error = archive::unpack_plain_archive(&archive_path, &output_dir).unwrap_err();
+
+    assert!(error.to_string().contains("missing manifest.json"));
+}
+
+#[test]
+fn unpack_plain_archive_requires_backup_db() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let archive_path = tempdir.path().join("missing-db.tar.zst");
+    let output_dir = tempdir.path().join("out");
+    std::fs::create_dir(&output_dir).unwrap();
+    write_plain_test_archive(&archive_path, &[("manifest.json", b"{}".as_slice())]);
+
+    let error = archive::unpack_plain_archive(&archive_path, &output_dir).unwrap_err();
+
+    assert!(error.to_string().contains("missing backup.db"));
+}
+
 #[tokio::test]
 async fn restore_requires_category_remap_for_external_paths() {
     let source_db = open_temp_db();

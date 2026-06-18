@@ -5,11 +5,12 @@ use crate::servers::{ServerConfig, record::ServerRecord};
 
 impl Database {
     pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
-        use crate::persistence::encryption::maybe_encrypt;
+        use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
         let record = ServerRecord::from_config(server);
-        let encrypted_password = maybe_encrypt(self.encryption_key(), &record.password);
+        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &record.password)
+            .map_err(StateError::Database)?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
@@ -24,11 +25,12 @@ impl Database {
     }
 
     pub fn update_server(&self, server: &ServerConfig) -> Result<(), StateError> {
-        use crate::persistence::encryption::maybe_encrypt;
+        use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
         let record = ServerRecord::from_config(server);
-        let encrypted_password = maybe_encrypt(self.encryption_key(), &record.password);
+        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &record.password)
+            .map_err(StateError::Database)?;
         self.run_sql_blocking(async move {
             let mut args = server_args(record, encrypted_password);
             let id = args.remove(0);
