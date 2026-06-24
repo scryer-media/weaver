@@ -1053,7 +1053,12 @@ jobs:
                 }
                 $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
                 $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
-                $json = $api.Content | ConvertFrom-Json
+                $responseText = if ($api.Content -is [byte[]]) {
+                  [System.Text.Encoding]::UTF8.GetString($api.Content)
+                } else {
+                  [string]$api.Content
+                }
+                $json = $responseText | ConvertFrom-Json
                 if ($json.errors) {
                   throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
                 }
@@ -1264,7 +1269,12 @@ jobs:
                 }
                 $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
                 $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
-                $json = $api.Content | ConvertFrom-Json
+                $responseText = if ($api.Content -is [byte[]]) {
+                  [System.Text.Encoding]::UTF8.GetString($api.Content)
+                } else {
+                  [string]$api.Content
+                }
+                $json = $responseText | ConvertFrom-Json
                 if ($json.errors) {
                   throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
                 }
