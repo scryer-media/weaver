@@ -1051,7 +1051,7 @@ jobs:
                 if ($spa.StatusCode -ne 200) {
                   throw "SPA returned HTTP $($spa.StatusCode)"
                 }
-                $payload = @{ query = "query { systemStatus { version globalState { isPaused } summary { totalItems } } }" } | ConvertTo-Json -Compress
+                $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
                 $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
                 $json = $api.Content | ConvertFrom-Json
                 if ($json.errors) {
@@ -1262,7 +1262,7 @@ jobs:
                 if ($spa.StatusCode -ne 200) {
                   throw "SPA returned HTTP $($spa.StatusCode)"
                 }
-                $payload = @{ query = "query { systemStatus { version globalState { isPaused } summary { totalItems } } }" } | ConvertTo-Json -Compress
+                $payload = @{ query = "query { systemStatus { version } }" } | ConvertTo-Json -Compress
                 $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
                 $json = $api.Content | ConvertFrom-Json
                 if ($json.errors) {
