@@ -314,6 +314,38 @@ fn tar_extracts_safe_nested_entry() {
 }
 
 #[test]
+fn tar_ignores_current_dir_entry() {
+    let tmp = TempDir::new().unwrap();
+    let archive_path = tmp.path().join("current-dir.tar");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut tar = tar::Builder::new(file);
+    tar.append_dir("./", tmp.path()).unwrap();
+
+    let mut header = tar::Header::new_gnu();
+    header.set_size(b"safe nested".len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(
+        &mut header,
+        "./nested/note.txt",
+        Cursor::new(b"safe nested"),
+    )
+    .unwrap();
+    tar.finish().unwrap();
+
+    let extracted_names = extract_with_weaver_tar_result(&archive_path, &out_dir).unwrap();
+
+    assert_eq!(extracted_names, vec!["nested/note.txt".to_string()]);
+    assert_eq!(
+        fs::read(out_dir.join("nested/note.txt")).unwrap(),
+        b"safe nested"
+    );
+}
+
+#[test]
 fn tar_rejects_unsafe_entry_paths() {
     let unsafe_names = [
         "../escape.txt",

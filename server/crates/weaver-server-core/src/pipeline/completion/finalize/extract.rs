@@ -14,6 +14,18 @@ fn validate_tar_entry_path(raw_name: &str) -> Result<PathBuf, String> {
     validate_archive_entry_path(raw_name, "tar")
 }
 
+fn is_tar_current_dir_entry(raw_name: &str) -> bool {
+    if raw_name.contains(['\\', '\0']) {
+        return false;
+    }
+
+    let normalized = raw_name.trim_end_matches('/');
+    !normalized.is_empty()
+        && Path::new(normalized)
+            .components()
+            .all(|component| matches!(component, Component::CurDir))
+}
+
 fn validate_archive_entry_path(raw_name: &str, archive_kind: &str) -> Result<PathBuf, String> {
     if raw_name.contains('\0') {
         return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
@@ -178,6 +190,9 @@ fn extract_tar_from_reader<R: std::io::Read>(
             .map_err(|e| format!("invalid tar entry path: {e}"))?
             .to_string_lossy()
             .to_string();
+        if entry.header().entry_type().is_dir() && is_tar_current_dir_entry(&raw_name) {
+            continue;
+        }
         let safe_path = validate_tar_entry_path(&raw_name)?;
         let name = safe_path.to_string_lossy().replace('\\', "/");
 
