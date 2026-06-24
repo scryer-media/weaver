@@ -149,7 +149,7 @@ jobs:
       - name: Set target CPU flags
         shell: pwsh
         run: |
-          "RUSTFLAGS=-C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RUSTFLAGS=-C target-feature=+crt-static -C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build fast release diagnostic binary
         shell: pwsh
         run: |
@@ -188,7 +188,11 @@ jobs:
             }
           }
           if ($dumpbin) {
-            & $dumpbin /dependents $exe 2>&1 | Out-String | Add-Content $out
+            $dependents = & $dumpbin /dependents $exe 2>&1 | Out-String
+            $dependents | Add-Content $out
+            if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b') {
+              throw "Windows diagnostic binary depends on Visual C++ runtime DLLs; expected static CRT"
+            }
           } else {
             "dumpbin.exe not found" | Add-Content $out
           }

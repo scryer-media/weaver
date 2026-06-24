@@ -1001,6 +1001,34 @@ jobs:
           if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
             throw "embedded manifest does not contain longPathAware=true"
           }
+      - name: Verify Windows runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $out = "weaver-windows-x86_64-dependencies.txt"
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
+            foreach ($root in $roots) {
+              if ((-not $dumpbin) -and (Test-Path $root)) {
+                $dumpbin = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+            }
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found; cannot verify Windows runtime dependencies"
+          }
+          & $dumpbin /dependents $exe 2>&1 | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $dependents = Get-Content $out -Raw
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b') {
+            throw "Windows package depends on Visual C++ runtime DLLs; expected static CRT"
+          }
       - name: Smoke test release binary startup
         shell: pwsh
         run: |
@@ -1118,6 +1146,7 @@ jobs:
           path: |
             weaver-windows-x86_64.zip
             weaver-windows-x86_64-build.log
+            weaver-windows-x86_64-dependencies.txt
             weaver-windows-x86_64-startup.log
             weaver-windows-x86_64-sccache-stats.txt
           if-no-files-found: error
@@ -1216,6 +1245,34 @@ jobs:
           $manifest = Get-Content embedded-manifest.xml -Raw
           if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
             throw "embedded manifest does not contain longPathAware=true"
+          }
+      - name: Verify Windows runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
+          $out = "weaver-windows-arm64-dependencies.txt"
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
+            foreach ($root in $roots) {
+              if ((-not $dumpbin) -and (Test-Path $root)) {
+                $dumpbin = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+            }
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found; cannot verify Windows runtime dependencies"
+          }
+          & $dumpbin /dependents $exe 2>&1 | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $dependents = Get-Content $out -Raw
+          if ($dependents -match '(?i)\b(?:vcruntime|msvcp)\d*[^\\/\s]*\.dll\b') {
+            throw "Windows package depends on Visual C++ runtime DLLs; expected static CRT"
           }
       - name: Smoke test release binary startup
         shell: pwsh
@@ -1334,6 +1391,7 @@ jobs:
           path: |
             weaver-windows-arm64.zip
             weaver-windows-arm64-build.log
+            weaver-windows-arm64-dependencies.txt
             weaver-windows-arm64-startup.log
             weaver-windows-arm64-sccache-stats.txt
           if-no-files-found: error

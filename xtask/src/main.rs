@@ -426,6 +426,7 @@ fn ci_rustflags_for_target(target: &str, lane: ReleaseLane) -> Result<String> {
         if lane == ReleaseLane::Haswell {
             flags.push("-C target-cpu=haswell");
         }
+        flags.push("-C target-feature=+crt-static");
         flags.push("-C linker=rust-lld");
     } else if target.starts_with("x86_64-") {
         if lane == ReleaseLane::Haswell {
@@ -442,6 +443,7 @@ fn ci_rustflags_for_target(target: &str, lane: ReleaseLane) -> Result<String> {
             flags.push("-C target-cpu=cortex-a76");
         }
         flags.push("--cfg aes_armv8");
+        flags.push("-C target-feature=+crt-static");
         flags.push("-C linker=rust-lld");
     } else if target.starts_with("aarch64-") && target.contains("-linux-") {
         if lane == ReleaseLane::CortexA76 {
@@ -492,6 +494,11 @@ fn verify_crypto_target(target: &str, lane: ReleaseLane) -> Result<()> {
 
     let flags = ci_rustflags_for_target(target, lane)?;
     let has = |needle: &str| flags.split_whitespace().any(|token| token == needle);
+    let has_prefix = |prefix: &str| {
+        flags
+            .split_whitespace()
+            .any(|token| token.starts_with(prefix))
+    };
 
     if target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl") {
         if lane == ReleaseLane::Haswell && !has("target-cpu=haswell") {
@@ -507,7 +514,10 @@ fn verify_crypto_target(target: &str, lane: ReleaseLane) -> Result<()> {
         if !has("linker=rust-lld") {
             bail!("missing Windows x86_64 linker flag for {target}: {flags}");
         }
-        if has("target-cpu=haswell") {
+        if !has("target-feature=+crt-static") {
+            bail!("missing Windows x86_64 static CRT flag for {target}: {flags}");
+        }
+        if has_prefix("target-cpu=") {
             bail!("unexpected Windows x86_64 optimized target-cpu for {target}: {flags}");
         }
         if has("aes_armv8") || has("chacha20_force_neon") {
@@ -543,7 +553,10 @@ fn verify_crypto_target(target: &str, lane: ReleaseLane) -> Result<()> {
         if !has("aes_armv8") || !has("linker=rust-lld") {
             bail!("missing Windows ARM crypto/linker flags for {target}: {flags}");
         }
-        if has("target-cpu=cortex-a76") {
+        if !has("target-feature=+crt-static") {
+            bail!("missing Windows ARM static CRT flag for {target}: {flags}");
+        }
+        if has_prefix("target-cpu=") {
             bail!("unexpected Windows ARM optimized target-cpu for {target}: {flags}");
         }
         if has("chacha20_force_neon") {
@@ -2655,7 +2668,7 @@ mod tests {
             (
                 "aarch64-pc-windows-msvc",
                 ReleaseLane::Portable,
-                "--cfg aes_armv8 -C linker=rust-lld",
+                "--cfg aes_armv8 -C target-feature=+crt-static -C linker=rust-lld",
             ),
             ("x86_64-apple-darwin", ReleaseLane::Portable, ""),
             (
@@ -2672,10 +2685,19 @@ mod tests {
             (
                 "x86_64-pc-windows-msvc",
                 ReleaseLane::Portable,
-                "-C linker=rust-lld",
+                "-C target-feature=+crt-static -C linker=rust-lld",
             ),
         ] {
             assert_eq!(ci_rustflags_for_target(target, lane).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn ci_windows_release_flags_are_static_crt_and_portable_cpu() {
+        for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+            let flags = ci_rustflags_for_target(target, ReleaseLane::Portable).unwrap();
+            assert!(flags.contains("-C target-feature=+crt-static"));
+            assert!(!flags.contains("target-cpu="));
         }
     }
 
