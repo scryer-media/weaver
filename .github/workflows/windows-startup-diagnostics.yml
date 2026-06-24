@@ -149,8 +149,7 @@ jobs:
       - name: Set target CPU flags
         shell: pwsh
         run: |
-          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-pc-windows-msvc" --lane portable
-          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RUSTFLAGS=-C linker=rust-lld" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build fast release diagnostic binary
         shell: pwsh
         run: |
