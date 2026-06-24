@@ -1001,6 +1001,96 @@ jobs:
           if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
             throw "embedded manifest does not contain longPathAware=true"
           }
+      - name: Smoke test release binary startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "weaver-startup-smoke-x86_64"
+          $configDir = Join-Path $smokeRoot "config"
+          $logFile = Join-Path $smokeRoot "weaver.log"
+          $artifactLog = "weaver-windows-x86_64-startup.log"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          function Show-SmokeLog {
+            if (Test-Path $logFile) {
+              Write-Host "----- Weaver startup log tail -----"
+              Get-Content $logFile -Tail 160
+              Write-Host "----- End Weaver startup log tail -----"
+            } else {
+              Write-Host "Weaver startup log was not created at $logFile"
+            }
+          }
+
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+
+          $keyBytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyBytes)
+          $env:WEAVER_ENCRYPTION_KEY = [Convert]::ToBase64String($keyBytes)
+          $env:WEAVER_HTTP_BIND_ADDRESS = "127.0.0.1"
+
+          $process = $null
+          try {
+            $args = @("--config", $configDir, "--log-file", $logFile, "serve", "--port", "$port")
+            $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
+            $baseUrl = "http://127.0.0.1:$port"
+            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            $deadline = (Get-Date).AddSeconds(30)
+            $lastError = $null
+            $ready = $false
+
+            while ((Get-Date) -lt $deadline) {
+              if ($process.HasExited) {
+                throw "Weaver exited before API readiness with code $($process.ExitCode)"
+              }
+              try {
+                $spa = Invoke-WebRequest -Uri "$baseUrl/" -WebSession $session -TimeoutSec 5
+                if ($spa.StatusCode -ne 200) {
+                  throw "SPA returned HTTP $($spa.StatusCode)"
+                }
+                $payload = @{ query = "query { systemStatus { version globalState { isPaused } summary { totalItems } } }" } | ConvertTo-Json -Compress
+                $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
+                $json = $api.Content | ConvertFrom-Json
+                if ($json.errors) {
+                  throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
+                }
+                if (-not $json.data.systemStatus.version) {
+                  throw "GraphQL systemStatus did not include a version"
+                }
+                Write-Host "Weaver startup API smoke test passed with version $($json.data.systemStatus.version)"
+                $ready = $true
+                break
+              } catch {
+                $lastError = $_.Exception.Message
+                Start-Sleep -Milliseconds 500
+              }
+            }
+
+            if (-not $ready) {
+              throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
+            }
+          } catch {
+            Write-Error $_
+            Show-SmokeLog
+            throw
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+              try {
+                Wait-Process -Id $process.Id -Timeout 10 -ErrorAction Stop
+              } catch {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              }
+            }
+            if (Test-Path $logFile) {
+              Copy-Item $logFile $artifactLog -Force
+            } else {
+              "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
+            }
+          }
       - name: Package zip
         shell: pwsh
         run: |
@@ -1023,6 +1113,7 @@ jobs:
           path: |
             weaver-windows-x86_64.zip
             weaver-windows-x86_64-build.log
+            weaver-windows-x86_64-startup.log
             weaver-windows-x86_64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
@@ -1121,6 +1212,96 @@ jobs:
           if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
             throw "embedded manifest does not contain longPathAware=true"
           }
+      - name: Smoke test release binary startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "weaver-startup-smoke-arm64"
+          $configDir = Join-Path $smokeRoot "config"
+          $logFile = Join-Path $smokeRoot "weaver.log"
+          $artifactLog = "weaver-windows-arm64-startup.log"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          function Show-SmokeLog {
+            if (Test-Path $logFile) {
+              Write-Host "----- Weaver startup log tail -----"
+              Get-Content $logFile -Tail 160
+              Write-Host "----- End Weaver startup log tail -----"
+            } else {
+              Write-Host "Weaver startup log was not created at $logFile"
+            }
+          }
+
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+
+          $keyBytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyBytes)
+          $env:WEAVER_ENCRYPTION_KEY = [Convert]::ToBase64String($keyBytes)
+          $env:WEAVER_HTTP_BIND_ADDRESS = "127.0.0.1"
+
+          $process = $null
+          try {
+            $args = @("--config", $configDir, "--log-file", $logFile, "serve", "--port", "$port")
+            $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
+            $baseUrl = "http://127.0.0.1:$port"
+            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            $deadline = (Get-Date).AddSeconds(30)
+            $lastError = $null
+            $ready = $false
+
+            while ((Get-Date) -lt $deadline) {
+              if ($process.HasExited) {
+                throw "Weaver exited before API readiness with code $($process.ExitCode)"
+              }
+              try {
+                $spa = Invoke-WebRequest -Uri "$baseUrl/" -WebSession $session -TimeoutSec 5
+                if ($spa.StatusCode -ne 200) {
+                  throw "SPA returned HTTP $($spa.StatusCode)"
+                }
+                $payload = @{ query = "query { systemStatus { version globalState { isPaused } summary { totalItems } } }" } | ConvertTo-Json -Compress
+                $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
+                $json = $api.Content | ConvertFrom-Json
+                if ($json.errors) {
+                  throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
+                }
+                if (-not $json.data.systemStatus.version) {
+                  throw "GraphQL systemStatus did not include a version"
+                }
+                Write-Host "Weaver startup API smoke test passed with version $($json.data.systemStatus.version)"
+                $ready = $true
+                break
+              } catch {
+                $lastError = $_.Exception.Message
+                Start-Sleep -Milliseconds 500
+              }
+            }
+
+            if (-not $ready) {
+              throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
+            }
+          } catch {
+            Write-Error $_
+            Show-SmokeLog
+            throw
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+              try {
+                Wait-Process -Id $process.Id -Timeout 10 -ErrorAction Stop
+              } catch {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              }
+            }
+            if (Test-Path $logFile) {
+              Copy-Item $logFile $artifactLog -Force
+            } else {
+              "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
+            }
+          }
       - name: Package zip
         shell: pwsh
         run: |
@@ -1143,6 +1324,7 @@ jobs:
           path: |
             weaver-windows-arm64.zip
             weaver-windows-arm64-build.log
+            weaver-windows-arm64-startup.log
             weaver-windows-arm64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
