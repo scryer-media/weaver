@@ -1,0 +1,365 @@
+name: windows-startup-diagnostics
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "weaver-windows-startup-diagnostics-*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "25"
+  RUST_TOOLCHAIN: "1.96"
+  WEB_ARTIFACT_NAME: weaver-web-dist
+
+jobs:
+  web-build:
+    name: web-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/weaver-web/package-lock.json
+      - name: Install dependencies
+        working-directory: apps/weaver-web
+        run: npm ci
+      - name: Build web app
+        working-directory: apps/weaver-web
+        run: npm run build
+      - name: Verify static output
+        run: test -f apps/weaver-web/dist/index.html
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-startup-diagnostics:
+    name: windows-startup-diagnostics
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    needs: [web-build]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_DEBUG: "full"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_PANIC: "unwind"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+      RUST_BACKTRACE: full
+      RUSTC_WRAPPER: sccache
+      RUST_LIB_BACKTRACE: full
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install target
+        run: rustup target add x86_64-pc-windows-msvc
+      - name: Restore sccache directory
+        id: windows-startup-sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: gha-sccache-v1-weaver-windows-startup-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-windows-startup-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-on-failure: false
+          key: windows-startup-diagnostics
+      - name: Prime sccache server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          sccache --start-server
+          sccache --zero-stats
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Capture host diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "weaver-windows-startup-diagnostics-host.txt"
+          "Runner: $env:RUNNER_NAME" | Set-Content $out
+          "Image: $env:ImageOS $env:ImageVersion" | Add-Content $out
+          "Workspace: $env:GITHUB_WORKSPACE" | Add-Content $out
+          "" | Add-Content $out
+          "PowerShell:" | Add-Content $out
+          $PSVersionTable | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "Operating system:" | Add-Content $out
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "Processor:" | Add-Content $out
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, Manufacturer, Architecture, NumberOfCores, NumberOfLogicalProcessors |
+            Format-List | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "rustc -vV:" | Add-Content $out
+          rustc -vV 2>&1 | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "cargo -vV:" | Add-Content $out
+          cargo -vV 2>&1 | Out-String | Add-Content $out
+      - name: Set target CPU flags
+        shell: pwsh
+        run: |
+          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-pc-windows-msvc" --lane portable
+          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build fast release diagnostic binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build -p weaver --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-startup-diagnostics-build.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+      - name: Inspect diagnostic binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $out = "weaver-windows-startup-diagnostics-binary.txt"
+          Get-Item $exe | Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc |
+            Format-List | Out-String | Set-Content $out
+          "" | Add-Content $out
+          "SHA256:" | Add-Content $out
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "Release directory:" | Add-Content $out
+          Get-ChildItem "target\x86_64-pc-windows-msvc\release" -Filter "weaver*" |
+            Select-Object Name, Length, LastWriteTimeUtc |
+            Format-Table -AutoSize | Out-String | Add-Content $out
+          "" | Add-Content $out
+          "dumpbin /dependents:" | Add-Content $out
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
+            foreach ($root in $roots) {
+              if ((-not $dumpbin) -and (Test-Path $root)) {
+                $dumpbin = Get-ChildItem $root -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+            }
+          }
+          if ($dumpbin) {
+            & $dumpbin /dependents $exe 2>&1 | Out-String | Add-Content $out
+          } else {
+            "dumpbin.exe not found" | Add-Content $out
+          }
+      - name: Run startup API diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $prefix = "weaver-windows-startup-diagnostics"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "weaver-startup-diagnostics"
+          $configDir = Join-Path $smokeRoot "config"
+          $logFile = Join-Path $smokeRoot "weaver.log"
+          $stdoutLog = "$prefix-stdout.log"
+          $stderrLog = "$prefix-stderr.log"
+          $appLogArtifact = "$prefix-weaver.log"
+          $eventLog = "$prefix-events.txt"
+          $helpOut = "$prefix-help.stdout.log"
+          $helpErr = "$prefix-help.stderr.log"
+          $dumpDir = Join-Path $smokeRoot "dumps"
+          Remove-Item $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $configDir, $dumpDir | Out-Null
+
+          function Copy-AppLog {
+            if (Test-Path $logFile) {
+              Copy-Item $logFile $appLogArtifact -Force
+            } else {
+              "Weaver startup log was not created at $logFile" | Set-Content $appLogArtifact
+            }
+          }
+
+          function Show-FileTail($path, $label) {
+            Write-Host "----- $label -----"
+            if (Test-Path $path) {
+              Get-Content $path -Tail 200
+            } else {
+              Write-Host "$path was not created"
+            }
+            Write-Host "----- End $label -----"
+          }
+
+          function Capture-Events($since) {
+            try {
+              Get-WinEvent -FilterHashtable @{ LogName = "Application"; StartTime = $since } -ErrorAction Stop |
+                Where-Object {
+                  $_.ProviderName -in @("Application Error", "Windows Error Reporting") -or
+                  $_.Message -match "weaver|fault|crash|panic"
+                } |
+                Select-Object TimeCreated, ProviderName, Id, LevelDisplayName, Message |
+                Format-List | Out-String | Set-Content $eventLog
+            } catch {
+              "failed to capture Windows event log: $($_.Exception.Message)" | Set-Content $eventLog
+            }
+          }
+
+          $localDumpKey = "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\weaver.exe"
+          New-Item -Path $localDumpKey -Force | Out-Null
+          New-ItemProperty -Path $localDumpKey -Name DumpFolder -Value $dumpDir -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $localDumpKey -Name DumpCount -Value 4 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $localDumpKey -Name DumpType -Value 2 -PropertyType DWord -Force | Out-Null
+
+          $startTime = (Get-Date).AddSeconds(-10)
+
+          & $exe --help > $helpOut 2> $helpErr
+          if ($LASTEXITCODE -ne 0) {
+            Capture-Events $startTime
+            Show-FileTail $helpOut "weaver --help stdout"
+            Show-FileTail $helpErr "weaver --help stderr"
+            throw "weaver --help failed with exit code $LASTEXITCODE"
+          }
+
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+
+          $keyBytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyBytes)
+          $env:WEAVER_ENCRYPTION_KEY = [Convert]::ToBase64String($keyBytes)
+          $env:WEAVER_HTTP_BIND_ADDRESS = "127.0.0.1"
+          $env:RUST_BACKTRACE = "full"
+          $env:RUST_LIB_BACKTRACE = "full"
+
+          $process = $null
+          try {
+            $args = @("--config", $configDir, "--log-file", $logFile, "serve", "--port", "$port")
+            $process = Start-Process -FilePath $exe -ArgumentList $args -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru -NoNewWindow
+            $baseUrl = "http://127.0.0.1:$port"
+            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            $deadline = (Get-Date).AddSeconds(45)
+            $lastError = $null
+            $ready = $false
+
+            while ((Get-Date) -lt $deadline) {
+              if ($process.HasExited) {
+                throw "Weaver exited before API readiness with code $($process.ExitCode)"
+              }
+              try {
+                $spa = Invoke-WebRequest -Uri "$baseUrl/" -WebSession $session -TimeoutSec 5
+                if ($spa.StatusCode -ne 200) {
+                  throw "SPA returned HTTP $($spa.StatusCode)"
+                }
+                $payload = @{ query = "query { systemStatus { version globalState { isPaused } summary { totalItems } } }" } | ConvertTo-Json -Compress
+                $api = Invoke-WebRequest -Uri "$baseUrl/graphql" -Method Post -ContentType "application/json" -Body $payload -WebSession $session -TimeoutSec 5
+                $json = $api.Content | ConvertFrom-Json
+                if ($json.errors) {
+                  throw "GraphQL errors: $($json.errors | ConvertTo-Json -Compress -Depth 8)"
+                }
+                if (-not $json.data.systemStatus.version) {
+                  throw "GraphQL systemStatus did not include a version"
+                }
+                "API ready at $baseUrl with version $($json.data.systemStatus.version)" | Set-Content "$prefix-ready.txt"
+                Write-Host "Weaver startup API diagnostics passed with version $($json.data.systemStatus.version)"
+                $ready = $true
+                break
+              } catch {
+                $lastError = $_.Exception.Message
+                Start-Sleep -Milliseconds 500
+              }
+            }
+
+            if (-not $ready) {
+              throw "Timed out waiting for Weaver API readiness. Last error: $lastError"
+            }
+          } catch {
+            Write-Error $_
+            throw
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+              try {
+                Wait-Process -Id $process.Id -Timeout 10 -ErrorAction Stop
+              } catch {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              }
+            }
+            Copy-AppLog
+            Capture-Events $startTime
+            if (Test-Path $dumpDir) {
+              Get-ChildItem $dumpDir -Recurse | Select-Object FullName, Length, LastWriteTimeUtc |
+                Format-Table -AutoSize | Out-String | Set-Content "$prefix-dumps.txt"
+            }
+            Show-FileTail $stdoutLog "Weaver stdout"
+            Show-FileTail $stderrLog "Weaver stderr"
+            Show-FileTail $appLogArtifact "Weaver log file"
+            Show-FileTail $eventLog "Windows application events"
+          }
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            sccache --show-stats | Tee-Object -FilePath weaver-windows-startup-diagnostics-sccache-stats.txt
+          } else {
+            "sccache not installed; skipping stats" | Tee-Object -FilePath weaver-windows-startup-diagnostics-sccache-stats.txt
+          }
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: weaver-windows-startup-diagnostics-${{ github.run_id }}
+          path: |
+            weaver-windows-startup-diagnostics-*.log
+            weaver-windows-startup-diagnostics-*.txt
+            ${{ runner.temp }}\weaver-startup-diagnostics\dumps
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Save sccache directory
+        if: always() && steps.windows-startup-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: ${{ steps.windows-startup-sccache-restore.outputs.cache-primary-key }}
