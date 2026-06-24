@@ -384,11 +384,17 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
           Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
           Expand-Archive nasm.zip -DestinationPath C:\nasm
           $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Exclude build dir from Windows Defender
         if: runner.os == 'Windows'
         shell: pwsh
@@ -403,6 +409,35 @@ jobs:
           cache-bin: false
           cache-on-failure: false
           key: crypto-${{ matrix.platform }}
+      - name: Configure Windows sccache environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "CARGO_INCREMENTAL=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RUSTC_WRAPPER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SCCACHE_BASEDIRS=${{ github.workspace }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SCCACHE_CACHE_SIZE=10G" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SCCACHE_DIR=${{ github.workspace }}\.sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SCCACHE_IDLE_TIMEOUT=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Restore Windows sccache directory
+        if: runner.os == 'Windows'
+        id: windows-crypto-sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-
+      - name: Install Windows sccache
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Prime Windows sccache server
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          sccache --start-server
+          sccache --zero-stats
       - name: Verify target crypto config
         run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
       - name: Set target CPU flags (Unix)
@@ -417,6 +452,22 @@ jobs:
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Check native crypto crates
         run: cargo check --locked -p weaver-rar -p weaver-par2 --target ${{ matrix.target }}
+      - name: Show Windows sccache stats
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            sccache --show-stats
+          } else {
+            Write-Host "sccache not installed; skipping stats"
+          }
+      - name: Save Windows sccache directory
+        if: always() && runner.os == 'Windows' && steps.windows-crypto-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: ${{ steps.windows-crypto-sccache-restore.outputs.cache-primary-key }}
 
   # ── Release packaging (tag pushes only) ──────────────────────────────────
 
@@ -853,6 +904,13 @@ jobs:
     runs-on: windows-2025-vs2026
     timeout-minutes: 60
     needs: [web-build]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -860,14 +918,30 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-pc-windows-msvc
+      - name: Restore sccache directory
+        id: windows-x86_64-sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: gha-sccache-v1-weaver-package-windows-x86_64-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-package-windows-x86_64-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Install NASM
         shell: pwsh
         run: |
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
           Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
           Expand-Archive nasm.zip -DestinationPath C:\nasm
           $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          echo "$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Exclude build dir from Windows Defender
         shell: pwsh
         run: |
@@ -881,6 +955,12 @@ jobs:
           cache-bin: false
           cache-on-failure: false
           key: package-windows-x86_64
+      - name: Prime sccache server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          sccache --start-server
+          sccache --zero-stats
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -892,25 +972,79 @@ jobs:
           $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-pc-windows-msvc" --lane portable
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build release binary
-        run: cargo build -p weaver --release --locked --target x86_64-pc-windows-msvc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build -p weaver --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+      - name: Verify embedded Windows manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $mt = (Get-Command mt.exe -ErrorAction SilentlyContinue).Source
+          if (-not $mt) {
+            $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mt) {
+            throw "mt.exe was not found; cannot verify embedded Windows manifest"
+          }
+          & $mt -nologo "-inputresource:$exe;#1" "-out:embedded-manifest.xml"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $manifest = Get-Content embedded-manifest.xml -Raw
+          if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
+            throw "embedded manifest does not contain longPathAware=true"
+          }
       - name: Package zip
         shell: pwsh
         run: |
           Compress-Archive -Path target\x86_64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-x86_64.zip
           if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            sccache --show-stats | Tee-Object -FilePath weaver-windows-x86_64-sccache-stats.txt
+          } else {
+            "sccache not installed; skipping stats" | Tee-Object -FilePath weaver-windows-x86_64-sccache-stats.txt
+          }
       - name: Upload release package
         uses: actions/upload-artifact@v7
         with:
           name: weaver-windows-x86_64-${{ github.run_id }}
-          path: weaver-windows-x86_64.zip
+          path: |
+            weaver-windows-x86_64.zip
+            weaver-windows-x86_64-build.log
+            weaver-windows-x86_64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
+      - name: Save sccache directory
+        if: always() && steps.windows-x86_64-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: ${{ steps.windows-x86_64-sccache-restore.outputs.cache-primary-key }}
 
   rust-package-windows-arm64:
     name: rust-package-windows-arm64
     runs-on: windows-11-arm
     timeout-minutes: 60
     needs: [web-build]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -918,6 +1052,16 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-pc-windows-msvc
+      - name: Restore sccache directory
+        id: windows-arm64-sccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: gha-sccache-v1-weaver-package-windows-arm64-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-package-windows-arm64-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Exclude build dir from Windows Defender
         shell: pwsh
         run: |
@@ -931,6 +1075,12 @@ jobs:
           cache-bin: false
           cache-on-failure: false
           key: package-windows-arm64
+      - name: Prime sccache server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          sccache --start-server
+          sccache --zero-stats
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -942,19 +1092,66 @@ jobs:
           $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-pc-windows-msvc" --lane portable
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build release binary
-        run: cargo build -p weaver --release --locked --target aarch64-pc-windows-msvc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build -p weaver --release --locked --target aarch64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-arm64-build.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+      - name: Verify embedded Windows manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
+          $mt = (Get-Command mt.exe -ErrorAction SilentlyContinue).Source
+          if (-not $mt) {
+            $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mt) {
+            throw "mt.exe was not found; cannot verify embedded Windows manifest"
+          }
+          & $mt -nologo "-inputresource:$exe;#1" "-out:embedded-manifest.xml"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $manifest = Get-Content embedded-manifest.xml -Raw
+          if ($manifest -notmatch '<[^>]*longPathAware\b[^>]*>\s*true\s*</[^>]*longPathAware>') {
+            throw "embedded manifest does not contain longPathAware=true"
+          }
       - name: Package zip
         shell: pwsh
         run: |
           Compress-Archive -Path target\aarch64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-arm64.zip
           if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Get-Command sccache -ErrorAction SilentlyContinue) {
+            sccache --show-stats | Tee-Object -FilePath weaver-windows-arm64-sccache-stats.txt
+          } else {
+            "sccache not installed; skipping stats" | Tee-Object -FilePath weaver-windows-arm64-sccache-stats.txt
+          }
       - name: Upload release package
         uses: actions/upload-artifact@v7
         with:
           name: weaver-windows-arm64-${{ github.run_id }}
-          path: weaver-windows-arm64.zip
+          path: |
+            weaver-windows-arm64.zip
+            weaver-windows-arm64-build.log
+            weaver-windows-arm64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
+      - name: Save sccache directory
+        if: always() && steps.windows-arm64-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}\.sccache
+          key: ${{ steps.windows-arm64-sccache-restore.outputs.cache-primary-key }}
 
   # ── Docker validation + release publish ──────────────────────────────────
 
