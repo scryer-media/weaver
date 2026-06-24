@@ -26,8 +26,8 @@ pub use diagnostics::{
     diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
 };
 pub use health::{
-    CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing, browse_directories,
-    create_directory,
+    BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
+    browse_directories, create_directory,
 };
 pub use logs::snapshot_service_logs;
 pub use maintenance::spawn_maintenance_worker;

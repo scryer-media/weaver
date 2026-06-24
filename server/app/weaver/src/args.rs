@@ -9,6 +9,10 @@ pub(crate) struct Cli {
     #[arg(short, long, default_value = "weaver.toml")]
     pub(crate) config: PathBuf,
 
+    /// Write service logs to the given file.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub(crate) log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

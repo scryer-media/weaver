@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use weaver_model::files::{
@@ -554,7 +555,7 @@ impl Pipeline {
                 continue;
             }
 
-            if new.exists() {
+            if new.exists() && !runtime_fs::paths_equivalent_for_placement(old, &new) {
                 warn!(
                     job_id = job_id.0,
                     from = %old.display(),
@@ -564,7 +565,7 @@ impl Pipeline {
                 continue;
             }
 
-            let renamed_successfully = match std::fs::rename(old, &new) {
+            let renamed_successfully = match runtime_fs::rename_no_overwrite(old, &new) {
                 Ok(()) => {
                     renamed += 1;
                     reserve_download_filename(&correct_name, &mut occupied_filenames);

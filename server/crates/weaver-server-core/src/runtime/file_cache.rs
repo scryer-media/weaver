@@ -14,11 +14,7 @@ pub(crate) fn copy_large_file(src: &Path, dst: &Path) -> io::Result<u64> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut output = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(dst)?;
+    let mut output = OpenOptions::new().create_new(true).write(true).open(dst)?;
 
     let mut copied = 0u64;
     let mut buf = vec![0u8; COPY_BUFFER_BYTES];

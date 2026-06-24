@@ -6,7 +6,8 @@ pub use archive_name::archive_base_name;
 pub use classify::FileRole;
 pub(crate) use sanitize::role_filename_view;
 pub use sanitize::{
-    allocate_unique_download_filename, download_filename_collision_key,
-    forget_reserved_download_filename, reserve_download_filename, sanitize_download_filename,
+    DOWNLOAD_FILENAME_MAX_BYTES, allocate_unique_download_filename,
+    download_filename_collision_key, forget_reserved_download_filename, path_component_with_suffix,
+    reserve_download_filename, sanitize_download_filename, sanitize_path_component,
     unique_download_filenames,
 };

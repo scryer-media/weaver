@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod buffers;
 pub(crate) mod file_cache;
+pub(crate) mod fs;
 pub mod log_buffer;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;

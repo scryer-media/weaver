@@ -4,19 +4,30 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
+    validate_archive_entry_path(raw_name, "zip")
+}
+
+fn validate_tar_entry_path(raw_name: &str) -> Result<PathBuf, String> {
+    if raw_name.contains('\\') {
+        return Err(format!("unsafe tar entry path: {raw_name}"));
+    }
+    validate_archive_entry_path(raw_name, "tar")
+}
+
+fn validate_archive_entry_path(raw_name: &str, archive_kind: &str) -> Result<PathBuf, String> {
     if raw_name.contains('\0') {
-        return Err(format!("unsafe zip entry path: {raw_name}"));
+        return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
     }
 
     let normalized = raw_name.replace('\\', "/");
     let normalized = normalized.trim_end_matches('/');
     if normalized.is_empty() {
-        return Err(format!("unsafe zip entry path: {raw_name}"));
+        return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
     }
 
     let path = Path::new(normalized);
     if path.is_absolute() {
-        return Err(format!("unsafe zip entry path: {raw_name}"));
+        return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
     }
 
     let mut safe = PathBuf::new();
@@ -25,19 +36,19 @@ fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
             Component::Normal(part) => {
                 let value = part.to_string_lossy();
                 if is_windows_drive_component(&value) {
-                    return Err(format!("unsafe zip entry path: {raw_name}"));
+                    return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
                 }
                 safe.push(part);
             }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("unsafe zip entry path: {raw_name}"));
+                return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
             }
         }
     }
 
     if safe.as_os_str().is_empty() {
-        return Err(format!("unsafe zip entry path: {raw_name}"));
+        return Err(format!("unsafe {archive_kind} entry path: {raw_name}"));
     }
 
     Ok(safe)
@@ -162,11 +173,13 @@ fn extract_tar_from_reader<R: std::io::Read>(
         .map_err(|e| format!("failed to read tar entries: {e}"))?
     {
         let mut entry = entry.map_err(|e| format!("failed to read tar entry: {e}"))?;
-        let path = entry
+        let raw_name = entry
             .path()
             .map_err(|e| format!("invalid tar entry path: {e}"))?
-            .to_path_buf();
-        let name = path.to_string_lossy().to_string();
+            .to_string_lossy()
+            .to_string();
+        let safe_path = validate_tar_entry_path(&raw_name)?;
+        let name = safe_path.to_string_lossy().replace('\\', "/");
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
@@ -174,9 +187,12 @@ fn extract_tar_from_reader<R: std::io::Read>(
             member: name.clone(),
         });
 
-        entry
+        let unpacked = entry
             .unpack_in(output_dir)
             .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?;
+        if !unpacked {
+            return Err(format!("unsafe tar entry path: {raw_name}"));
+        }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
             job_id,

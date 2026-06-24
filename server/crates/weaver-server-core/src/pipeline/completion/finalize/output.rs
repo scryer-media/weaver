@@ -2,7 +2,7 @@ use super::*;
 use std::path::PathBuf;
 
 use crate::jobs::working_dir::WORKING_DIR_MARKER;
-use crate::runtime::file_cache;
+use crate::runtime::{file_cache, fs as runtime_fs};
 
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
@@ -10,15 +10,25 @@ fn move_path_with_copy_fallback(
 ) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
 
-    if metadata.is_dir() {
-        if dst.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("destination already exists: {}", dst.display()),
-            ));
-        }
+    if metadata.file_type().is_symlink() {
+        runtime_fs::rename_no_overwrite(src, dst)?;
+        return Ok(());
+    }
 
-        std::fs::create_dir_all(dst)?;
+    if metadata.is_dir() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(dst).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("destination already exists: {}", dst.display()),
+                )
+            } else {
+                error
+            }
+        })?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             move_path_with_copy_fallback(&entry.path(), &dst.join(entry.file_name()))?;
@@ -27,12 +37,45 @@ fn move_path_with_copy_fallback(
         return Ok(());
     }
 
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
+    match file_cache::copy_large_file(src, dst) {
+        Ok(_) => {}
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                cleanup_copy_destination_if_parent_matches(dst, &parent_fingerprint);
+            }
+            return Err(error);
+        }
     }
-    file_cache::copy_large_file(src, dst)?;
+    if !runtime_fs::destination_parent_matches(dst, &parent_fingerprint)? {
+        return Err(std::io::Error::other(format!(
+            "destination parent changed during copy: {}",
+            dst.display()
+        )));
+    }
     std::fs::remove_file(src)?;
     Ok(())
+}
+
+fn cleanup_copy_destination_if_parent_matches(
+    dst: &std::path::Path,
+    parent_fingerprint: &runtime_fs::DirectoryFingerprint,
+) {
+    if runtime_fs::destination_parent_matches(dst, parent_fingerprint).unwrap_or(false) {
+        let _ = std::fs::remove_file(dst);
+    }
+}
+
+fn move_path_with_safe_rename_or_copy_fallback(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), (std::io::Error, std::io::Error)> {
+    match runtime_fs::rename_no_overwrite(src, dst) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            move_path_with_copy_fallback(src, dst).map_err(|copy_err| (rename_err, copy_err))
+        }
+    }
 }
 
 async fn run_move_to_complete(
@@ -84,38 +127,30 @@ async fn run_move_to_complete(
             }
             let src = entry.path();
             let dst = dest.join(&file_name);
-            match tokio::fs::rename(&src, &dst).await {
-                Ok(()) => {
+            let src_fb = src.clone();
+            let dst_fb = dst.clone();
+            match tokio::task::spawn_blocking(move || {
+                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb)
+            })
+            .await
+            {
+                Ok(Ok(())) => {
                     moved += 1;
                 }
-                Err(rename_err) => {
-                    let src_fb = src.clone();
-                    let dst_fb = dst.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        move_path_with_copy_fallback(&src_fb, &dst_fb)
-                    })
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            moved += 1;
-                        }
-                        Ok(Err(copy_err)) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                copy_err
-                            ));
-                        }
-                        Err(join_err) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback task failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                join_err
-                            ));
-                        }
-                    }
+                Ok(Err((rename_err, copy_err))) => {
+                    failures.push(format!(
+                        "{}: rename failed: {}; fallback failed: {}",
+                        file_name.to_string_lossy(),
+                        rename_err,
+                        copy_err
+                    ));
+                }
+                Err(join_err) => {
+                    failures.push(format!(
+                        "{}: move task failed: {}",
+                        file_name.to_string_lossy(),
+                        join_err
+                    ));
                 }
             }
         }
@@ -132,41 +167,33 @@ async fn run_move_to_complete(
             }
             let src = entry.path();
             let dst = dest.join(&file_name);
-            if dst.exists() {
+            if dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
             }
-            match tokio::fs::rename(&src, &dst).await {
-                Ok(()) => {
+            let src_fb = src.clone();
+            let dst_fb = dst.clone();
+            match tokio::task::spawn_blocking(move || {
+                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb)
+            })
+            .await
+            {
+                Ok(Ok(())) => {
                     moved += 1;
                 }
-                Err(rename_err) => {
-                    let src_fb = src.clone();
-                    let dst_fb = dst.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        move_path_with_copy_fallback(&src_fb, &dst_fb)
-                    })
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            moved += 1;
-                        }
-                        Ok(Err(copy_err)) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                copy_err
-                            ));
-                        }
-                        Err(join_err) => {
-                            failures.push(format!(
-                                "{}: rename failed: {}; fallback task failed: {}",
-                                file_name.to_string_lossy(),
-                                rename_err,
-                                join_err
-                            ));
-                        }
-                    }
+                Ok(Err((rename_err, copy_err))) => {
+                    failures.push(format!(
+                        "{}: rename failed: {}; fallback failed: {}",
+                        file_name.to_string_lossy(),
+                        rename_err,
+                        copy_err
+                    ));
+                }
+                Err(join_err) => {
+                    failures.push(format!(
+                        "{}: move task failed: {}",
+                        file_name.to_string_lossy(),
+                        join_err
+                    ));
                 }
             }
         }
@@ -271,14 +298,20 @@ impl Pipeline {
         let parent = base_dest
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let suffixed = parent.join(format!("{}.#{}", dir_name, job_id.0));
+        let suffixed = parent.join(weaver_model::files::path_component_with_suffix(
+            &dir_name,
+            &format!(".#{}", job_id.0),
+        ));
         if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
             return suffixed;
         }
 
         let mut attempt = 1u32;
         loop {
-            let candidate = parent.join(format!("{}.#{}.{}", dir_name, job_id.0, attempt));
+            let candidate = parent.join(weaver_model::files::path_component_with_suffix(
+                &dir_name,
+                &format!(".#{}.{}", job_id.0, attempt),
+            ));
             if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
                 return candidate;
             }

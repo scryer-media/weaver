@@ -91,17 +91,29 @@ impl SystemQuery {
             |cfg| cfg.complete_dir(),
         )
         .await;
-        let requested_path = path
+        let explicit_path = path
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(default_path);
+            .filter(|value| !value.is_empty());
+        let requested_path = if let Some(path) = explicit_path {
+            std::path::PathBuf::from(path)
+        } else {
+            absolutize_default_browse_path(default_path)
+                .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        };
 
         let listing = tokio::task::spawn_blocking(move || {
-            weaver_server_core::operations::browse_directories(Path::new(&requested_path))
+            weaver_server_core::operations::browse_directories(&requested_path)
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|error| graphql_error("INTERNAL", error))?;
+        .map_err(|error| match error {
+            weaver_server_core::operations::BrowseDirectoryError::InvalidInput(message) => {
+                graphql_error("INVALID_INPUT", message)
+            }
+            weaver_server_core::operations::BrowseDirectoryError::Internal(message) => {
+                graphql_error("INTERNAL", message)
+            }
+        })?;
 
         Ok(listing.into())
     }
@@ -132,5 +144,14 @@ impl SystemQuery {
     async fn download_block(&self, ctx: &Context<'_>) -> Result<DownloadBlock> {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(DownloadBlock::from(&handle.get_download_block()))
+    }
+}
+
+fn absolutize_default_browse_path(path: String) -> std::io::Result<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path))
     }
 }

@@ -52,5 +52,8 @@ brotli = { workspace = true }
 bzip2 = { workspace = true }
 tempfile = { workspace = true }
 
+[build-dependencies]
+embed-resource = "3.0.9"
+
 [dev-dependencies]
 tower = { workspace = true, default-features = false }

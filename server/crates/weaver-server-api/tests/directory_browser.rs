@@ -29,11 +29,58 @@ async fn browse_nonexistent_path() {
         ))
         .await;
 
+    assert_has_errors(&resp);
+    let err_msg = format!("{:?}", resp.errors);
+    assert!(
+        err_msg.contains("Directory does not exist"),
+        "expected missing-directory error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("INVALID_INPUT"),
+        "expected INVALID_INPUT error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn browse_relative_path_rejected() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(r#"{ browseDirectories(path: "relative/path") { currentPath } }"#)
+        .await;
+
+    assert_has_errors(&resp);
+    let err_msg = format!("{:?}", resp.errors);
+    assert!(
+        err_msg.contains("path must be absolute"),
+        "expected absolute-path error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("INVALID_INPUT"),
+        "expected INVALID_INPUT error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn browse_default_relative_complete_dir_is_resolved() {
+    let cwd = std::env::current_dir().expect("failed to read current dir");
+    let complete_dir = tempfile::tempdir_in(&cwd).expect("failed to create relative complete dir");
+    let relative_complete_dir = complete_dir
+        .path()
+        .strip_prefix(&cwd)
+        .expect("tempdir should be under cwd")
+        .to_string_lossy()
+        .to_string();
+
+    let h = TestHarness::new().await;
+    h.config.write().await.complete_dir = Some(relative_complete_dir);
+
+    let resp = h.execute(r#"{ browseDirectories { currentPath } }"#).await;
+
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert_eq!(
         data["browseDirectories"]["currentPath"].as_str().unwrap(),
-        tempdir.path().to_string_lossy().as_ref()
+        complete_dir.path().to_string_lossy().as_ref()
     );
 }
 
@@ -53,6 +100,46 @@ async fn browse_file_not_dir() {
     assert!(
         err_msg.contains("not a directory"),
         "expected 'not a directory' error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("INVALID_INPUT"),
+        "expected INVALID_INPUT error, got: {err_msg}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn browse_unreadable_path_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let unreadable = tempdir.path().join("unreadable");
+    std::fs::create_dir(&unreadable).expect("failed to create unreadable dir");
+    let mut permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&unreadable, permissions).unwrap();
+
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(&format!(
+            r#"{{ browseDirectories(path: "{}") {{ currentPath }} }}"#,
+            unreadable.to_string_lossy()
+        ))
+        .await;
+
+    let mut permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&unreadable, permissions).unwrap();
+
+    assert_has_errors(&resp);
+    let err_msg = format!("{:?}", resp.errors);
+    assert!(
+        err_msg.contains("Directory is not readable"),
+        "expected unreadable-directory error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("INVALID_INPUT"),
+        "expected INVALID_INPUT error, got: {err_msg}"
     );
 }
 

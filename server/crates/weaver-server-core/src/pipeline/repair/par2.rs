@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
+use crate::runtime::fs as runtime_fs;
 use weaver_model::files::{
     allocate_unique_download_filename, forget_reserved_download_filename,
     reserve_download_filename, sanitize_download_filename,
@@ -329,19 +330,24 @@ impl Pipeline {
             let old_path = working_dir.join(&old_current);
             let new_path = working_dir.join(&canonical_filename);
             let canonical_path_exists = new_path.exists();
-            let renamed_to_canonical =
-                if filename_changed && is_complete && old_path.exists() && !canonical_path_exists {
-                    std::fs::rename(&old_path, &new_path).map_err(|error| {
-                        format!(
-                            "failed to rename {} to {} from PAR2 metadata: {error}",
-                            old_path.display(),
-                            new_path.display()
-                        )
-                    })?;
-                    true
-                } else {
-                    false
-                };
+            let canonical_path_is_same =
+                runtime_fs::paths_equivalent_for_placement(&old_path, &new_path);
+            let renamed_to_canonical = if filename_changed
+                && is_complete
+                && old_path.exists()
+                && (!canonical_path_exists || canonical_path_is_same)
+            {
+                runtime_fs::rename_no_overwrite(&old_path, &new_path).map_err(|error| {
+                    format!(
+                        "failed to rename {} to {} from PAR2 metadata: {error}",
+                        old_path.display(),
+                        new_path.display()
+                    )
+                })?;
+                true
+            } else {
+                false
+            };
             let canonical_is_current = !filename_changed
                 || renamed_to_canonical
                 || (canonical_path_exists && !old_path.exists());

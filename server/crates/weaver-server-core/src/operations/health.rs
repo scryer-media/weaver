@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +21,34 @@ pub enum CreateDirectoryError {
     Internal(String),
 }
 
-pub fn browse_directories(path: &Path) -> Result<DirectoryBrowseListing, String> {
-    let path = nearest_existing_directory(path)?;
-    directory_listing_for_path(&path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowseDirectoryError {
+    InvalidInput(String),
+    Internal(String),
+}
+
+impl fmt::Display for BrowseDirectoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BrowseDirectoryError::InvalidInput(message)
+            | BrowseDirectoryError::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for BrowseDirectoryError {
+    fn from(message: String) -> Self {
+        if message == "Directory is not readable" {
+            Self::InvalidInput(message)
+        } else {
+            Self::Internal(message)
+        }
+    }
+}
+
+pub fn browse_directories(path: &Path) -> Result<DirectoryBrowseListing, BrowseDirectoryError> {
+    let path = requested_directory(path)?;
+    directory_listing_for_path(&path).map_err(BrowseDirectoryError::from)
 }
 
 pub fn create_directory(
@@ -66,24 +92,27 @@ pub fn create_directory(
     directory_listing_for_path(&target).map_err(CreateDirectoryError::Internal)
 }
 
-fn nearest_existing_directory(path: &Path) -> Result<PathBuf, String> {
-    let mut candidate = path.to_path_buf();
+fn requested_directory(path: &Path) -> Result<PathBuf, BrowseDirectoryError> {
+    if !path.is_absolute() {
+        return Err(BrowseDirectoryError::InvalidInput(
+            "path must be absolute".to_string(),
+        ));
+    }
 
-    loop {
-        match std::fs::metadata(&candidate) {
-            Ok(metadata) => {
-                if metadata.is_dir() {
-                    return Ok(candidate);
-                }
-                return Err("path is not a directory".to_string());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !candidate.pop() {
-                    return Err(format!("failed to read directory metadata: {error}"));
-                }
-            }
-            Err(error) => return Err(format!("failed to read directory metadata: {error}")),
-        }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(path.to_path_buf()),
+        Ok(_) => Err(BrowseDirectoryError::InvalidInput(
+            "Path is not a directory".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            BrowseDirectoryError::InvalidInput("Directory does not exist".to_string()),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(
+            BrowseDirectoryError::InvalidInput("Directory is not readable".to_string()),
+        ),
+        Err(error) => Err(BrowseDirectoryError::Internal(format!(
+            "failed to read directory metadata: {error}"
+        ))),
     }
 }
 
@@ -100,7 +129,13 @@ fn directory_listing_for_path(path: &Path) -> Result<DirectoryBrowseListing, Str
     let path = existing_directory(path)?;
 
     let mut entries = std::fs::read_dir(&path)
-        .map_err(|error| format!("failed to read directory: {error}"))?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "Directory is not readable".to_string()
+            } else {
+                format!("failed to read directory: {error}")
+            }
+        })?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let entry_path = entry.path();

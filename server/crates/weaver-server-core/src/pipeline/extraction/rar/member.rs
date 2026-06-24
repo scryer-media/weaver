@@ -2,6 +2,7 @@ use super::checkpoint::{
     DirectOutputWriter, ExtractionCheckpointState, FinalizeMemberContext, SharedOutputFile,
 };
 use super::*;
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct RarExtractionContext<'a> {
     pub(crate) volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -33,6 +34,65 @@ pub(crate) struct RarExtractionOpenSelection {
     pub(crate) archive: weaver_rar::RarArchive,
     pub(crate) password: Option<String>,
     pub(crate) validated_password: Option<String>,
+}
+
+fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
+    if member_name.contains('\0') {
+        return Err(format!("unsafe RAR member path: {member_name}"));
+    }
+
+    let path = Path::new(member_name);
+    if member_name.is_empty() || path.is_absolute() {
+        return Err(format!("unsafe RAR member path: {member_name}"));
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let value = part.to_string_lossy();
+                if is_windows_drive_component(&value) {
+                    return Err(format!("unsafe RAR member path: {member_name}"));
+                }
+                safe.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("unsafe RAR member path: {member_name}"));
+            }
+        }
+    }
+
+    if safe.as_os_str().is_empty() {
+        return Err(format!("unsafe RAR member path: {member_name}"));
+    }
+
+    Ok(safe)
+}
+
+fn is_windows_drive_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn ensure_unique_sanitized_rar_member_paths(
+    archive: &weaver_rar::RarArchive,
+) -> Result<(), String> {
+    let mut occupied = std::collections::HashSet::<String>::new();
+    for raw_name in archive.member_names() {
+        let member_name = weaver_rar::sanitize_path(raw_name);
+        let safe_path = validate_sanitized_rar_member_path(&member_name)?;
+        let collision_key = safe_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if !occupied.insert(collision_key) {
+            return Err(format!(
+                "RAR archive contains colliding sanitized member path: {member_name}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl<'a> RarExtractionContext<'a> {
@@ -73,6 +133,7 @@ impl Pipeline {
             .member_info(idx)
             .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
         let member_name = member.name.clone();
+        let safe_member_path = validate_sanitized_rar_member_path(&member_name)?;
         let unpacked_size = member.unpacked_size.unwrap_or(0);
         let is_directory = member.is_directory;
         let first_volume = member.volumes.first_volume as u32;
@@ -80,13 +141,14 @@ impl Pipeline {
         let is_solid = archive.is_solid();
 
         if is_directory {
-            let dir_path = output_dir.join(&member_name);
+            let dir_path = output_dir.join(&safe_member_path);
             std::fs::create_dir_all(&dir_path)
                 .map_err(|e| format!("failed to create dir {}: {e}", member_name))?;
             return Ok((member_name, 0, unpacked_size));
         }
 
-        let (out_path, partial_path) = Self::member_output_paths(output_dir, &member_name);
+        let safe_member_name = safe_member_path.to_string_lossy().replace('\\', "/");
+        let (out_path, partial_path) = Self::member_output_paths(output_dir, &safe_member_name);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create parent dir: {e}"))?;
@@ -311,6 +373,10 @@ impl Pipeline {
                 password,
             )
         })
+        .and_then(|selection| {
+            ensure_unique_sanitized_rar_member_paths(&selection.value)?;
+            Ok(selection)
+        })
     }
 
     pub(crate) fn open_rar_archive_for_extraction_with_password_candidates(
@@ -381,6 +447,7 @@ impl Pipeline {
                 Ok((archive, password_validated))
             })?;
         let (archive, password_validated) = selection.value;
+        ensure_unique_sanitized_rar_member_paths(&archive)?;
         let password = selection.selected_password;
         let validated_password = password_validated.then(|| password.clone()).flatten();
         Ok(RarExtractionOpenSelection {
@@ -678,5 +745,30 @@ impl Pipeline {
             .map(|candidate| candidate.source().as_str())
             .collect::<Vec<_>>()
             .join(",")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitized_rar_member_path_rejects_empty_and_parent_components() {
+        assert!(validate_sanitized_rar_member_path("").is_err());
+        assert!(validate_sanitized_rar_member_path("../escape.txt").is_err());
+        assert!(validate_sanitized_rar_member_path("nested/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn sanitized_rar_member_path_rejects_absolute_and_drive_paths() {
+        assert!(validate_sanitized_rar_member_path("/absolute.txt").is_err());
+        assert!(validate_sanitized_rar_member_path("C:/windows.txt").is_err());
+    }
+
+    #[test]
+    fn sanitized_rar_member_path_accepts_nested_relative_paths() {
+        let path = validate_sanitized_rar_member_path("nested/movie.mkv").unwrap();
+
+        assert_eq!(path, PathBuf::from("nested").join("movie.mkv"));
     }
 }

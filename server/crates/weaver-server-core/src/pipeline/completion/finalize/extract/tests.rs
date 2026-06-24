@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -123,6 +124,68 @@ fn create_zip_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
     zip.finish().unwrap();
 }
 
+fn create_tar_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
+    let file = fs::File::create(archive_path).unwrap();
+    let mut tar = tar::Builder::new(file);
+    for (name, contents) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, Cursor::new(*contents))
+            .unwrap();
+    }
+    tar.finish().unwrap();
+}
+
+fn create_raw_tar_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
+    let mut file = fs::File::create(archive_path).unwrap();
+    for (name, contents) in entries {
+        assert!(name.len() <= 100, "test tar name too long: {name}");
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        write_tar_octal_field(&mut header[100..108], 0o644);
+        write_tar_octal_field(&mut header[108..116], 0);
+        write_tar_octal_field(&mut header[116..124], 0);
+        write_tar_octal_field(&mut header[124..136], contents.len() as u64);
+        write_tar_octal_field(&mut header[136..148], 0);
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|byte| *byte as u32).sum::<u32>();
+        let checksum_field = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum_field.as_bytes());
+
+        file.write_all(&header).unwrap();
+        file.write_all(contents).unwrap();
+        let padding = (512 - (contents.len() % 512)) % 512;
+        if padding > 0 {
+            file.write_all(&vec![0u8; padding]).unwrap();
+        }
+    }
+    file.write_all(&[0u8; 1024]).unwrap();
+}
+
+fn write_tar_octal_field(field: &mut [u8], value: u64) {
+    let text = format!("{value:0width$o}\0", width = field.len() - 1);
+    field.copy_from_slice(text.as_bytes());
+}
+
+fn extract_with_weaver_tar_result(
+    archive_path: &Path,
+    output_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    extract_tar(
+        archive_path,
+        output_dir,
+        &event_tx,
+        JobId(1),
+        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
+    )
+}
+
 fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
     let tmp = TempDir::new().unwrap();
     let source_dir = tmp.path().join("src");
@@ -229,6 +292,59 @@ fn zip_rejects_unsafe_entry_paths() {
         assert!(
             !tmp.path().join("escape.txt").exists(),
             "unsafe zip entry {name} should not write beside output dir"
+        );
+    }
+}
+
+#[test]
+fn tar_extracts_safe_nested_entry() {
+    let tmp = TempDir::new().unwrap();
+    let archive_path = tmp.path().join("safe.tar");
+    let out_dir = tmp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    create_tar_with_entries(&archive_path, &[("nested/note.txt", b"safe nested")]);
+
+    let extracted_names = extract_with_weaver_tar_result(&archive_path, &out_dir).unwrap();
+
+    assert_eq!(extracted_names, vec!["nested/note.txt".to_string()]);
+    assert_eq!(
+        fs::read(out_dir.join("nested/note.txt")).unwrap(),
+        b"safe nested"
+    );
+}
+
+#[test]
+fn tar_rejects_unsafe_entry_paths() {
+    let unsafe_names = [
+        "../escape.txt",
+        "nested/../../escape.txt",
+        "/absolute.txt",
+        "C:/windows.txt",
+        "..\\escape.txt",
+        "nested\\note.txt",
+        "nested\\..\\escape.txt",
+    ];
+
+    for name in unsafe_names {
+        let tmp = TempDir::new().unwrap();
+        let archive_path = tmp.path().join("unsafe.tar");
+        let out_dir = tmp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        create_raw_tar_with_entries(&archive_path, &[(name, b"unsafe")]);
+
+        let error = extract_with_weaver_tar_result(&archive_path, &out_dir).unwrap_err();
+
+        assert!(
+            error.contains("unsafe tar entry path"),
+            "unexpected error for {name}: {error}"
+        );
+        assert!(
+            read_dir_contents(&out_dir).is_empty(),
+            "unsafe tar entry {name} should not write under output dir"
+        );
+        assert!(
+            !tmp.path().join("escape.txt").exists(),
+            "unsafe tar entry {name} should not write beside output dir"
         );
     }
 }

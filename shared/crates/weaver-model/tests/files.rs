@@ -1,5 +1,6 @@
 use weaver_model::files::{
-    FileRole, archive_base_name, sanitize_download_filename, unique_download_filenames,
+    DOWNLOAD_FILENAME_MAX_BYTES, FileRole, archive_base_name, path_component_with_suffix,
+    sanitize_download_filename, unique_download_filenames,
 };
 
 #[test]
@@ -33,6 +34,46 @@ fn sanitize_download_filename_disarms_windows_device_names() {
     assert_eq!(sanitize_download_filename("com1.rar"), "_com1.rar");
     assert_eq!(sanitize_download_filename("LPT9.par2"), "_LPT9.par2");
     assert_eq!(sanitize_download_filename("LPT10.par2"), "LPT10.par2");
+}
+
+#[test]
+fn sanitize_download_filename_truncates_long_components_with_extension() {
+    let filename = format!("{}.mkv", "a".repeat(400));
+    let sanitized = sanitize_download_filename(&filename);
+
+    assert!(sanitized.len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(sanitized.ends_with(".mkv"));
+    assert!(sanitized.is_char_boundary(sanitized.len()));
+}
+
+#[test]
+fn sanitize_download_filename_truncates_utf8_safely() {
+    let filename = format!("{}.rar", "é".repeat(200));
+    let sanitized = sanitize_download_filename(&filename);
+
+    assert!(sanitized.len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(sanitized.ends_with(".rar"));
+    assert!(sanitized.is_char_boundary(sanitized.len()));
+}
+
+#[test]
+fn sanitize_download_filename_disarms_reserved_name_after_truncation() {
+    let filename = format!("CON.{}.rar", "x".repeat(400));
+    let sanitized = sanitize_download_filename(&filename);
+
+    assert!(sanitized.len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(sanitized.starts_with("_CON."));
+    assert!(sanitized.ends_with(".rar"));
+}
+
+#[test]
+fn path_component_with_suffix_keeps_suffix_under_limit() {
+    let component = sanitize_download_filename(&"a".repeat(400));
+    let suffixed = path_component_with_suffix(&component, ".#123456");
+
+    assert!(suffixed.len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(suffixed.ends_with(".#123456"));
+    assert!(suffixed.is_char_boundary(suffixed.len()));
 }
 
 #[test]
@@ -79,6 +120,30 @@ fn unique_download_filenames_uses_nzbget_style_extension_splits() {
             "Set.duplicate1.vol00+01.par2",
         ]
     );
+}
+
+#[test]
+fn unique_download_filenames_keeps_long_duplicates_under_limit() {
+    let filename = format!("{}.rar", "a".repeat(400));
+    let filenames = unique_download_filenames([filename.as_str(), filename.as_str()]);
+
+    assert_eq!(filenames.len(), 2);
+    assert!(filenames[0].len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(filenames[1].len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(filenames[1].contains(".duplicate1."));
+    assert!(filenames[1].ends_with(".rar"));
+}
+
+#[test]
+fn unique_download_filenames_preserves_long_par2_recovery_suffix() {
+    let filename = format!("{}.vol00+01.par2", "a".repeat(400));
+    let filenames = unique_download_filenames([filename.as_str(), filename.as_str()]);
+
+    assert_eq!(filenames.len(), 2);
+    assert!(filenames[0].len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(filenames[1].len() <= DOWNLOAD_FILENAME_MAX_BYTES);
+    assert!(filenames[0].ends_with(".vol00+01.par2"));
+    assert!(filenames[1].contains(".duplicate1.vol00+01.par2"));
 }
 
 #[test]
