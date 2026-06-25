@@ -268,9 +268,6 @@ jobs:
           $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
           $listener.Stop()
 
-          $keyBytes = New-Object byte[] 32
-          [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyBytes)
-          $env:WEAVER_ENCRYPTION_KEY = [Convert]::ToBase64String($keyBytes)
           $env:WEAVER_HTTP_BIND_ADDRESS = "127.0.0.1"
           $env:RUST_BACKTRACE = "full"
           $env:RUST_LIB_BACKTRACE = "full"

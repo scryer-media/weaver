@@ -29,13 +29,6 @@ impl KeyStore for WindowsCredentialManager {
         }
     }
 
-    fn set_key(&self, key_base64: &str) -> Result<(), String> {
-        let entry = Self::entry()?;
-        entry
-            .set_password(key_base64)
-            .map_err(|e| format!("failed to store key in Windows Credential Manager: {e}"))
-    }
-
     fn delete_key(&self) -> Result<(), String> {
         let entry = Self::entry()?;
         match entry.delete_credential() {

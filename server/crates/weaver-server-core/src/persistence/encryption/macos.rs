@@ -27,11 +27,6 @@ impl KeyStore for MacOSKeychain {
         }
     }
 
-    fn set_key(&self, key_base64: &str) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, key_base64.as_bytes())
-            .map_err(|e| format!("failed to store key in macOS Keychain: {e}"))
-    }
-
     fn delete_key(&self) -> Result<(), String> {
         match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
             Ok(()) => Ok(()),

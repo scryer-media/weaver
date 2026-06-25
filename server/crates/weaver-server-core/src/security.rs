@@ -12,7 +12,6 @@ pub const ENV_BACKUP_UPLOAD_LIMIT_BYTES: &str = "WEAVER_BACKUP_UPLOAD_LIMIT_BYTE
 pub const ENV_NZB_UPLOAD_LIMIT_BYTES: &str = "WEAVER_NZB_UPLOAD_LIMIT_BYTES";
 pub const ENV_NZB_DECOMPRESSED_LIMIT_BYTES: &str = "WEAVER_NZB_DECOMPRESSED_LIMIT_BYTES";
 pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK";
-pub const ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY: &str = "WEAVER_ALLOW_EPHEMERAL_ENCRYPTION_KEY";
 
 pub const DEFAULT_BACKUP_UPLOAD_LIMIT_BYTES: u64 = 2_147_483_648;
 pub const DEFAULT_NZB_UPLOAD_LIMIT_BYTES: u64 = 268_435_456;
@@ -28,7 +27,6 @@ pub struct RuntimeSecurityConfig {
     pub nzb_upload_limit_bytes: u64,
     pub nzb_decompressed_limit_bytes: u64,
     pub rss_allow_private_network: bool,
-    pub allow_ephemeral_encryption_key: bool,
 }
 
 impl RuntimeSecurityConfig {
@@ -54,10 +52,6 @@ impl RuntimeSecurityConfig {
                 DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             )?,
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, false)?,
-            allow_ephemeral_encryption_key: parse_bool_env(
-                ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY,
-                false,
-            )?,
         })
     }
 
@@ -77,7 +71,6 @@ impl Default for RuntimeSecurityConfig {
             nzb_upload_limit_bytes: DEFAULT_NZB_UPLOAD_LIMIT_BYTES,
             nzb_decompressed_limit_bytes: DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             rss_allow_private_network: false,
-            allow_ephemeral_encryption_key: false,
         }
     }
 }
@@ -288,7 +281,6 @@ mod tests {
             ENV_NZB_UPLOAD_LIMIT_BYTES,
             ENV_NZB_DECOMPRESSED_LIMIT_BYTES,
             ENV_RSS_ALLOW_PRIVATE_NETWORK,
-            ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY,
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -318,7 +310,6 @@ mod tests {
             DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES
         );
         assert!(!config.rss_allow_private_network);
-        assert!(!config.allow_ephemeral_encryption_key);
     }
 
     #[test]
@@ -337,7 +328,6 @@ mod tests {
             env::set_var(ENV_NZB_UPLOAD_LIMIT_BYTES, "11");
             env::set_var(ENV_NZB_DECOMPRESSED_LIMIT_BYTES, "12");
             env::set_var(ENV_RSS_ALLOW_PRIVATE_NETWORK, "1");
-            env::set_var(ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY, "true");
         }
 
         let config = RuntimeSecurityConfig::from_env().unwrap();
@@ -353,7 +343,6 @@ mod tests {
         assert_eq!(config.nzb_upload_limit_bytes, 11);
         assert_eq!(config.nzb_decompressed_limit_bytes, 12);
         assert!(config.rss_allow_private_network);
-        assert!(config.allow_ephemeral_encryption_key);
 
         clear_env();
     }

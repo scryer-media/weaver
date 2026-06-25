@@ -35,38 +35,6 @@ impl KeyStore for KeyFile {
         }
     }
 
-    fn set_key(&self, key_base64: &str) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.path)
-                .map_err(|e| {
-                    format!("failed to create key file at {}: {e}", self.path.display())
-                })?;
-            file.write_all(key_base64.as_bytes())
-                .map_err(|e| format!("failed to write key file at {}: {e}", self.path.display()))?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&self.path, key_base64)
-                .map_err(|e| format!("failed to write key file at {}: {e}", self.path.display()))?;
-        }
-
-        Ok(())
-    }
-
     fn delete_key(&self) -> Result<(), String> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),

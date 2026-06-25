@@ -21,8 +21,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 
 use std::path::PathBuf;
 
-use crate::security::{ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY, parse_bool_env};
-
 const ENCRYPTED_PREFIX: &str = "enc:v1:";
 const NONCE_LEN: usize = 12;
 
@@ -177,25 +175,13 @@ pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) 
 /// Ensure an encryption master key is available.
 ///
 /// Priority:
-/// 1. `WEAVER_ENCRYPTION_KEY` env var
-/// 2. Platform keystores (Docker secret, OS keychain, key file)
-/// 3. Auto-generate, store in best available keystore, warn
+/// 1. Platform keystores (Docker secret, OS keychain, key file)
+/// 2. `WEAVER_ENCRYPTION_KEY` env var escape hatch
+/// 3. Auto-generate an in-memory ephemeral key, warn
 pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey, String> {
     let stores = keystore::platform_keystores(data_dir);
 
-    // 1. Env var
-    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
-        let trimmed = env_key.trim().to_string();
-        if !trimmed.is_empty() {
-            let key = EncryptionKey::from_base64(&trimmed)
-                .map_err(|e| format!("invalid WEAVER_ENCRYPTION_KEY: {e}"))?;
-            opportunistic_store(&stores, &key);
-            tracing::info!("using encryption master key from WEAVER_ENCRYPTION_KEY");
-            return Ok(key);
-        }
-    }
-
-    // 2. Platform keystores
+    // 1. Persistent platform keystores
     for store in &stores {
         match store.get_key() {
             Ok(Some(key_b64)) => {
@@ -212,78 +198,25 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
         }
     }
 
-    // 3. Auto-generate
+    // 2. Env var escape hatch.
+    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
+        let trimmed = env_key.trim().to_string();
+        if !trimmed.is_empty() {
+            let key = EncryptionKey::from_base64(&trimmed)
+                .map_err(|e| format!("invalid WEAVER_ENCRYPTION_KEY: {e}"))?;
+            tracing::info!("using encryption master key from WEAVER_ENCRYPTION_KEY");
+            return Ok(key);
+        }
+    }
+
+    // 3. Ephemeral in-memory key. Do not persist this automatically.
     let key = EncryptionKey::generate();
-    let stored_in = try_store_new_key(&stores, &key);
-    match stored_in {
-        Some(name) => {
-            tracing::warn!(
-                "generated new encryption master key and stored in {name} — \
-                 all sensitive settings (passwords) are encrypted with this key"
-            );
-        }
-        None => {
-            let allow_ephemeral = parse_bool_env(ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY, false)
-                .map_err(|error| error.to_string())?;
-            if !allow_ephemeral {
-                return Err(format!(
-                    "no persistent encryption key source is available; set WEAVER_ENCRYPTION_KEY \
-                     or {ENV_ALLOW_EPHEMERAL_ENCRYPTION_KEY}=true to allow an ephemeral key"
-                ));
-            }
-            tracing::warn!(
-                "generated new encryption master key (in memory only) — \
-                 set WEAVER_ENCRYPTION_KEY to persist it across restarts"
-            );
-        }
-    }
+    tracing::warn!(
+        "generated ephemeral encryption master key (in memory only); configure the platform \
+         keystore or set WEAVER_ENCRYPTION_KEY as an escape hatch to decrypt secrets across \
+         restarts"
+    );
     Ok(key)
-}
-
-fn try_store_new_key(
-    stores: &[Box<dyn keystore::KeyStore>],
-    key: &EncryptionKey,
-) -> Option<&'static str> {
-    for store in stores {
-        match store.set_key(&key.to_base64()) {
-            Ok(()) => return Some(store.name()),
-            Err(e) => {
-                tracing::debug!("could not store key in {}: {e}", store.name());
-                continue;
-            }
-        }
-    }
-    None
-}
-
-fn opportunistic_store(stores: &[Box<dyn keystore::KeyStore>], key: &EncryptionKey) {
-    let key_b64 = key.to_base64();
-    for store in stores {
-        match store.get_key() {
-            Ok(None) => match store.set_key(&key_b64) {
-                Ok(()) => {
-                    tracing::info!("copied encryption key to {}", store.name());
-                    return;
-                }
-                Err(_) => continue,
-            },
-            Ok(Some(existing)) if existing == key_b64 => return,
-            Ok(Some(_)) => match store.set_key(&key_b64) {
-                Ok(()) => {
-                    tracing::info!("updated stale encryption key in {}", store.name());
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "{} has a different encryption key but could not be updated: {e}",
-                        store.name()
-                    );
-                    continue;
-                }
-            },
-            Err(_) => continue,
-        }
-    }
 }
 
 #[cfg(test)]

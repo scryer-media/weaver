@@ -76,14 +76,15 @@ fn bootstrap_encryption_for_toml_import(
     Ok(())
 }
 
-fn default_data_dir_for_config_path(config_path: &Path) -> PathBuf {
-    if config_path.extension().is_none_or(|e| e != "toml") {
-        config_path.to_path_buf()
-    } else {
+pub fn default_data_dir_for_config_path(config_path: &Path) -> PathBuf {
+    if is_explicit_config_file(config_path) {
         config_path
             .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
+    } else {
+        config_path.to_path_buf()
     }
 }
 
@@ -115,6 +116,7 @@ pub fn bootstrap_encryption(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn write_test_config(path: &Path, data_dir: &Path) {
         let mut file = std::fs::File::create(path).unwrap();
@@ -151,6 +153,34 @@ active = true
     }
 
     #[test]
+    fn relative_toml_default_data_dir_uses_current_directory() {
+        assert_eq!(
+            default_data_dir_for_config_path(Path::new("weaver.toml")),
+            PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn migrated_toml_default_data_dir_uses_parent_directory() {
+        assert_eq!(
+            default_data_dir_for_config_path(Path::new("/tmp/weaver.toml.migrated")),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn existing_extensionless_config_file_default_data_dir_uses_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("weaver-config");
+        std::fs::write(&config_path, "").unwrap();
+
+        assert_eq!(
+            default_data_dir_for_config_path(&config_path),
+            dir.path().to_path_buf()
+        );
+    }
+
+    #[test]
     fn open_db_and_config_imports_migrated_toml_without_renaming_again() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
@@ -162,12 +192,7 @@ active = true
         assert_eq!(config.data_dir, data_dir.display().to_string());
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].password, Some("pass".to_string()));
-        if std::env::var("WEAVER_ENCRYPTION_KEY")
-            .ok()
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            assert!(data_dir.join("encryption.key").exists());
-        }
+        assert!(!data_dir.join("encryption.key").exists());
         assert!(migrated_path.exists());
         assert!(!dir.path().join("weaver.toml.toml.migrated").exists());
     }

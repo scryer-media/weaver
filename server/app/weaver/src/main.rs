@@ -33,6 +33,7 @@ async fn async_main() {
         log_file: log_file_override,
         command,
     } = Cli::parse();
+    let command = command.unwrap_or_else(Command::default_serve);
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();

@@ -3,6 +3,7 @@ use std::path::Path;
 use tracing::{error, info, warn};
 
 use weaver_server_core::Database;
+use weaver_server_core::persistence::setup::default_data_dir_for_config_path;
 use weaver_server_core::settings::Config;
 
 pub(crate) fn open_db_and_config(
@@ -22,12 +23,10 @@ pub(crate) fn reset_login_if_requested(db: &mut Database) {
 }
 
 pub(crate) fn default_data_dir_from_config_path(config_path: &Path, config: &mut Config) {
-    // When --config points to a directory and data_dir is unset (fresh DB),
-    // default data_dir to that directory. This is the common Docker pattern:
-    //   weaver --config /config serve
-    if config.data_dir.is_empty() && config_path.extension().is_none_or(|e| e != "toml") {
-        let dir = config_path.to_string_lossy().to_string();
-        info!(data_dir = %dir, "defaulting data_dir to --config directory");
+    if config.data_dir.is_empty() {
+        let dir = default_data_dir_for_config_path(config_path);
+        let dir = dir.to_string_lossy().to_string();
+        info!(data_dir = %dir, "defaulting data_dir from config path");
         config.data_dir = dir;
     }
 }
@@ -70,4 +69,49 @@ pub(crate) fn bootstrap_encryption(
     config: &mut Config,
 ) -> Result<(), String> {
     weaver_server_core::persistence::bootstrap_encryption(data_dir, db, config)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn empty_config() -> Config {
+        Config {
+            data_dir: String::new(),
+            intermediate_dir: None,
+            complete_dir: None,
+            buffer_pool: None,
+            tuner: None,
+            servers: Vec::new(),
+            categories: Vec::new(),
+            retry: None,
+            max_download_speed: None,
+            cleanup_after_extract: None,
+            isp_bandwidth_cap: None,
+            diagnostic_upload_url: None,
+            config_path: None,
+        }
+    }
+
+    #[test]
+    fn default_toml_config_path_uses_parent_as_data_dir() {
+        let mut config = empty_config();
+        let config_path = PathBuf::from("weaver.toml");
+
+        default_data_dir_from_config_path(&config_path, &mut config);
+
+        assert_eq!(config.data_dir, ".");
+    }
+
+    #[test]
+    fn directory_config_path_uses_directory_as_data_dir() {
+        let mut config = empty_config();
+        let config_path = PathBuf::from("/tmp/weaver-config");
+
+        default_data_dir_from_config_path(&config_path, &mut config);
+
+        assert_eq!(config.data_dir, "/tmp/weaver-config");
+    }
 }

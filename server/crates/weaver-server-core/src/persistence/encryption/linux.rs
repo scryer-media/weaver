@@ -22,10 +22,6 @@ impl KeyStore for DockerSecret {
         }
     }
 
-    fn set_key(&self, _key_base64: &str) -> Result<(), String> {
-        Err("Docker secrets are read-only".into())
-    }
-
     fn delete_key(&self) -> Result<(), String> {
         Err("Docker secrets are read-only".into())
     }

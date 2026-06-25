@@ -1,5 +1,30 @@
 use super::*;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 #[test]
 fn encrypt_decrypt_round_trip() {
     let key = EncryptionKey::generate();
@@ -103,4 +128,20 @@ fn encrypt_secret_for_write_requires_key_for_plaintext() {
         encrypt_secret_for_write(None, &encrypted).unwrap(),
         encrypted
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn persistent_store_wins_over_env_escape_hatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let stored_key = EncryptionKey::generate();
+    let env_key = EncryptionKey::generate();
+    std::fs::write(dir.path().join("encryption.key"), stored_key.to_base64()).unwrap();
+
+    let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", env_key.to_base64());
+
+    let loaded_key = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap();
+
+    assert_eq!(loaded_key.to_base64(), stored_key.to_base64());
+    assert_ne!(loaded_key.to_base64(), env_key.to_base64());
 }

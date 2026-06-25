@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 pub trait KeyStore: Send + Sync {
     fn get_key(&self) -> Result<Option<String>, String>;
-    fn set_key(&self, key_base64: &str) -> Result<(), String>;
     #[allow(dead_code)]
     fn delete_key(&self) -> Result<(), String>;
     fn name(&self) -> &'static str;
