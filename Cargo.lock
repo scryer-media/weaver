@@ -4796,7 +4796,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -4840,14 +4840,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "bytes",
  "criterion",
@@ -4867,7 +4867,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "quick-xml 0.40.1",
  "serde",
@@ -4878,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -4898,7 +4898,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-rar"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -4925,14 +4925,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-reed-solomon"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "weaver-server-api"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes-gcm",
  "age",
@@ -4967,7 +4967,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5019,7 +5019,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "crc32fast",
  "criterion",
