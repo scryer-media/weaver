@@ -1126,6 +1126,13 @@ jobs:
         run: |
           Compress-Archive -Path target\x86_64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-x86_64.zip
           if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
+      - name: Validate packaged Windows artifact
+        shell: pwsh
+        run: |
+          .\.github\scripts\validate-windows-package.ps1 `
+            -Architecture x86_64 `
+            -ZipPath weaver-windows-x86_64.zip `
+            -BuiltExePath target\x86_64-pc-windows-msvc\release\weaver.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -1137,6 +1144,7 @@ jobs:
             "sccache not installed; skipping stats" | Tee-Object -FilePath weaver-windows-x86_64-sccache-stats.txt
           }
       - name: Upload release package
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: weaver-windows-x86_64-${{ github.run_id }}
@@ -1145,6 +1153,10 @@ jobs:
             weaver-windows-x86_64-build.log
             weaver-windows-x86_64-dependencies.txt
             weaver-windows-x86_64-startup.log
+            weaver-windows-x86_64-defender-scan.log
+            weaver-windows-x86_64-attachment-services.log
+            weaver-windows-x86_64-noarg-startup.log
+            weaver-windows-x86_64-winget-install.log
             weaver-windows-x86_64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
@@ -1368,6 +1380,13 @@ jobs:
         run: |
           Compress-Archive -Path target\aarch64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-arm64.zip
           if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
+      - name: Validate packaged Windows artifact
+        shell: pwsh
+        run: |
+          .\.github\scripts\validate-windows-package.ps1 `
+            -Architecture arm64 `
+            -ZipPath weaver-windows-arm64.zip `
+            -BuiltExePath target\aarch64-pc-windows-msvc\release\weaver.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -1379,6 +1398,7 @@ jobs:
             "sccache not installed; skipping stats" | Tee-Object -FilePath weaver-windows-arm64-sccache-stats.txt
           }
       - name: Upload release package
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: weaver-windows-arm64-${{ github.run_id }}
@@ -1387,6 +1407,10 @@ jobs:
             weaver-windows-arm64-build.log
             weaver-windows-arm64-dependencies.txt
             weaver-windows-arm64-startup.log
+            weaver-windows-arm64-defender-scan.log
+            weaver-windows-arm64-attachment-services.log
+            weaver-windows-arm64-noarg-startup.log
+            weaver-windows-arm64-winget-install.log
             weaver-windows-arm64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14

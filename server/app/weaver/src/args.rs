@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+pub(crate) const DEFAULT_CONFIG_FILE: &str = "weaver.toml";
 pub(crate) const DEFAULT_SERVE_PORT: u16 = 9090;
 pub(crate) const DEFAULT_SERVE_BASE_URL: &str = "/";
 
@@ -9,8 +10,8 @@ pub(crate) const DEFAULT_SERVE_BASE_URL: &str = "/";
 #[command(name = "weaver", about = "Usenet binary downloader")]
 pub(crate) struct Cli {
     /// Path to configuration file.
-    #[arg(short, long, default_value = "weaver.toml")]
-    pub(crate) config: PathBuf,
+    #[arg(short, long)]
+    pub(crate) config: Option<PathBuf>,
 
     /// Write service logs to the given file.
     #[arg(long, value_name = "PATH", global = true)]
@@ -18,6 +19,50 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
+}
+
+impl Cli {
+    pub(crate) fn resolved_config_path(&self) -> PathBuf {
+        self.config
+            .clone()
+            .unwrap_or_else(default_implicit_config_path)
+    }
+}
+
+fn default_implicit_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        return windows_implicit_config_path(
+            PathBuf::from(DEFAULT_CONFIG_FILE).exists(),
+            PathBuf::from("weaver.db").exists(),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            std::env::var_os("APPDATA").map(PathBuf::from),
+        );
+    }
+
+    PathBuf::from(DEFAULT_CONFIG_FILE)
+}
+
+#[cfg(windows)]
+fn windows_implicit_config_path(
+    local_config_exists: bool,
+    local_db_exists: bool,
+    local_app_data: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+) -> PathBuf {
+    if local_config_exists || local_db_exists {
+        return PathBuf::from(DEFAULT_CONFIG_FILE);
+    }
+
+    if let Some(base) = local_app_data {
+        return base.join("weaver");
+    }
+
+    if let Some(base) = app_data {
+        return base.join("weaver");
+    }
+
+    PathBuf::from(DEFAULT_CONFIG_FILE)
 }
 
 #[derive(Subcommand)]
@@ -90,9 +135,11 @@ pub(crate) enum Par2Command {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, DEFAULT_CONFIG_FILE};
 
     #[test]
     fn argless_invocation_defaults_to_serve() {
@@ -118,5 +165,72 @@ mod tests {
             }
             _ => panic!("explicit serve invocation should parse as serve"),
         }
+    }
+
+    #[test]
+    fn explicit_config_path_is_preserved() {
+        let cli = Cli::parse_from(["weaver", "--config", "custom-weaver.toml"]);
+
+        assert_eq!(
+            cli.resolved_config_path(),
+            PathBuf::from("custom-weaver.toml")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn implicit_non_windows_config_path_stays_current_directory_toml() {
+        let cli = Cli::parse_from(["weaver"]);
+
+        assert_eq!(
+            cli.resolved_config_path(),
+            PathBuf::from(DEFAULT_CONFIG_FILE)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn implicit_windows_config_prefers_existing_current_directory_state() {
+        assert_eq!(
+            super::windows_implicit_config_path(
+                true,
+                false,
+                Some(PathBuf::from("LocalAppData")),
+                None,
+            ),
+            PathBuf::from(DEFAULT_CONFIG_FILE),
+        );
+        assert_eq!(
+            super::windows_implicit_config_path(
+                false,
+                true,
+                Some(PathBuf::from("LocalAppData")),
+                None,
+            ),
+            PathBuf::from(DEFAULT_CONFIG_FILE),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn implicit_windows_config_uses_writable_app_data_for_new_portable_installs() {
+        assert_eq!(
+            super::windows_implicit_config_path(
+                false,
+                false,
+                Some(PathBuf::from("LocalAppData")),
+                Some(PathBuf::from("RoamingAppData")),
+            ),
+            PathBuf::from("LocalAppData").join("weaver"),
+        );
+        assert_eq!(
+            super::windows_implicit_config_path(
+                false,
+                false,
+                None,
+                Some(PathBuf::from("RoamingAppData")),
+            ),
+            PathBuf::from("RoamingAppData").join("weaver"),
+        );
     }
 }

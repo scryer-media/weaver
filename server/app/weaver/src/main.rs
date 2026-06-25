@@ -28,11 +28,13 @@ fn main() {
 }
 
 async fn async_main() {
+    let cli = Cli::parse();
+    let config_path = cli.resolved_config_path();
     let Cli {
-        config: config_path,
         log_file: log_file_override,
         command,
-    } = Cli::parse();
+        ..
+    } = cli;
     let command = command.unwrap_or_else(Command::default_serve);
 
     let log_ring_buffer =
