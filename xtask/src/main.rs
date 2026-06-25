@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -42,6 +43,13 @@ const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("C:/", "Users/"),
 ];
 const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[concat!("..", "/e2e/"), concat!("..\\", "e2e\\")];
+const WINGET_PACKAGE_IDENTIFIER: &str = "ScryerMedia.Weaver";
+const WINGET_PACKAGE_NAME: &str = "Weaver";
+const WINGET_MONIKER: &str = "weaver-usenet";
+const WINGET_PORTABLE_COMMAND_ALIAS: &str = "weaver";
+const WINGET_MANIFEST_VERSION: &str = "1.12.0";
+const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.zip";
+const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.zip";
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -97,12 +105,29 @@ struct CiArgs {
 #[derive(Subcommand)]
 enum CiCommand {
     Clippy(ClippyArgs),
+    Winget(WingetArgs),
 }
 
 #[derive(Args)]
 struct ClippyArgs {
     #[arg(long)]
     linux_only: bool,
+}
+
+#[derive(Args)]
+struct WingetArgs {
+    #[arg(long, help = "Weaver version without the weaver-v prefix")]
+    version: String,
+    #[arg(long, help = "Release tag that owns the Windows assets")]
+    tag: Option<String>,
+    #[arg(long, default_value = "scryer-media/weaver")]
+    repository: String,
+    #[arg(long, default_value = "release-artifacts")]
+    artifacts_dir: PathBuf,
+    #[arg(long, default_value = "target/winget")]
+    output_dir: PathBuf,
+    #[arg(long, help = "Release date in YYYY-MM-DD format; defaults to today")]
+    release_date: Option<String>,
 }
 
 #[derive(Args)]
@@ -346,6 +371,7 @@ fn main() -> Result<()> {
         Commands::Release(args) => run_release(&ctx, args),
         Commands::Ci(args) => match args.command {
             CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
+            CiCommand::Winget(args) => run_ci_winget(&ctx, args),
         },
         Commands::Serve(args) => run_serve(&ctx, args),
         Commands::Deploy(args) => match args.command {
@@ -1291,6 +1317,312 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_ci_winget(ctx: &TaskContext, args: WingetArgs) -> Result<()> {
+    step("Preparing WinGet portable manifests");
+    let version = normalize_winget_version(&args.version)?;
+    let tag_name = args
+        .tag
+        .unwrap_or_else(|| format!("weaver-v{version}"))
+        .trim()
+        .to_string();
+    let expected_tag = format!("weaver-v{version}");
+    if tag_name != expected_tag {
+        bail!("WinGet tag/version mismatch: expected {expected_tag}, got {tag_name}");
+    }
+    let repository = normalize_github_repository(&args.repository)?;
+    let release_date = args
+        .release_date
+        .unwrap_or_else(|| Utc::now().date_naive().to_string());
+    validate_winget_release_date(&release_date)?;
+
+    let artifacts_dir = if args.artifacts_dir.is_absolute() {
+        args.artifacts_dir
+    } else {
+        ctx.repo_root.join(args.artifacts_dir)
+    };
+    let output_dir = if args.output_dir.is_absolute() {
+        args.output_dir
+    } else {
+        ctx.repo_root.join(args.output_dir)
+    };
+    let artifacts = collect_winget_artifacts(&repository, &tag_name, &artifacts_dir)?;
+    let manifest_dir = write_winget_manifests(&output_dir, &version, &release_date, &artifacts)?;
+
+    ok(format!(
+        "Generated WinGet manifests in {}",
+        manifest_dir.display()
+    ));
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WingetArtifact {
+    architecture: &'static str,
+    installer_url: String,
+    installer_sha256: String,
+}
+
+fn normalize_winget_version(raw: &str) -> Result<Version> {
+    let trimmed = raw.trim();
+    let version = trimmed
+        .strip_prefix("weaver-v")
+        .or_else(|| trimmed.strip_prefix('v'))
+        .unwrap_or(trimmed);
+    Version::parse(version).with_context(|| format!("invalid Weaver version: {raw}"))
+}
+
+fn normalize_github_repository(raw: &str) -> Result<String> {
+    let repository = raw.trim().trim_matches('/').to_string();
+    let mut parts = repository.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty());
+    let name = parts.next().filter(|part| !part.is_empty());
+    if owner.is_none() || name.is_none() || parts.next().is_some() || repository.contains("://") {
+        bail!("GitHub repository must be owner/name, got {raw}");
+    }
+    Ok(repository)
+}
+
+fn validate_winget_release_date(release_date: &str) -> Result<()> {
+    NaiveDate::parse_from_str(release_date, "%Y-%m-%d")
+        .with_context(|| format!("release date must be YYYY-MM-DD, got {release_date}"))?;
+    Ok(())
+}
+
+fn collect_winget_artifacts(
+    repository: &str,
+    tag_name: &str,
+    artifacts_dir: &Path,
+) -> Result<Vec<WingetArtifact>> {
+    [
+        ("x64", WINGET_WINDOWS_X64_ASSET),
+        ("arm64", WINGET_WINDOWS_ARM64_ASSET),
+    ]
+    .into_iter()
+    .map(|(architecture, asset_name)| {
+        let path = artifacts_dir.join(asset_name);
+        validate_winget_portable_zip(&path)?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let installer_sha256 = sha256_hex(&bytes).to_ascii_uppercase();
+        let installer_url =
+            format!("https://github.com/{repository}/releases/download/{tag_name}/{asset_name}");
+        Ok(WingetArtifact {
+            architecture,
+            installer_url,
+            installer_sha256,
+        })
+    })
+    .collect()
+}
+
+fn validate_winget_portable_zip(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let entries = zip_central_directory_entries(&bytes)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if entries.iter().any(|entry| entry == "weaver.exe") {
+        Ok(())
+    } else {
+        bail!(
+            "{} must contain weaver.exe at the zip root for WinGet portable install",
+            path.display()
+        )
+    }
+}
+
+fn zip_central_directory_entries(bytes: &[u8]) -> Result<Vec<String>> {
+    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+    const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
+
+    if bytes.len() < 22 {
+        bail!("zip is too short to contain an end-of-central-directory record");
+    }
+
+    let search_start = bytes.len().saturating_sub(22 + u16::MAX as usize);
+    let eocd_offset = (search_start..=bytes.len() - 22)
+        .rev()
+        .find(|offset| bytes.get(*offset..*offset + 4) == Some(EOCD_SIGNATURE.as_slice()))
+        .context("missing zip end-of-central-directory record")?;
+    let central_directory_size = read_le_u32(bytes, eocd_offset + 12)? as usize;
+    let central_directory_offset = read_le_u32(bytes, eocd_offset + 16)? as usize;
+    let central_directory_end = central_directory_offset
+        .checked_add(central_directory_size)
+        .context("zip central directory overflows usize")?;
+    if central_directory_end > bytes.len() {
+        bail!("zip central directory points beyond file length");
+    }
+
+    let mut offset = central_directory_offset;
+    let mut entries = Vec::new();
+    while offset < central_directory_end {
+        let signature = read_le_u32(bytes, offset)?;
+        if signature != CENTRAL_DIRECTORY_SIGNATURE {
+            bail!("invalid zip central directory header at byte {offset}");
+        }
+        let file_name_len = read_le_u16(bytes, offset + 28)? as usize;
+        let extra_len = read_le_u16(bytes, offset + 30)? as usize;
+        let comment_len = read_le_u16(bytes, offset + 32)? as usize;
+        let name_start = offset + 46;
+        let name_end = name_start
+            .checked_add(file_name_len)
+            .context("zip file name length overflows usize")?;
+        let record_end = name_end
+            .checked_add(extra_len)
+            .and_then(|end| end.checked_add(comment_len))
+            .context("zip central directory record length overflows usize")?;
+        if record_end > central_directory_end {
+            bail!("zip central directory record extends beyond declared directory");
+        }
+        let name = std::str::from_utf8(&bytes[name_start..name_end])
+            .context("zip entry name is not utf-8")?;
+        entries.push(name.to_string());
+        offset = record_end;
+    }
+    Ok(entries)
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let raw = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| anyhow!("unexpected end of zip while reading u16 at byte {offset}"))?;
+    Ok(u16::from_le_bytes(
+        raw.try_into().expect("slice length checked"),
+    ))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("unexpected end of zip while reading u32 at byte {offset}"))?;
+    Ok(u32::from_le_bytes(
+        raw.try_into().expect("slice length checked"),
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn write_winget_manifests(
+    output_dir: &Path,
+    version: &Version,
+    release_date: &str,
+    artifacts: &[WingetArtifact],
+) -> Result<PathBuf> {
+    let manifest_dir = output_dir
+        .join(WINGET_PACKAGE_IDENTIFIER)
+        .join(version.to_string());
+    if manifest_dir.exists() {
+        fs::remove_dir_all(&manifest_dir)
+            .with_context(|| format!("failed to clear {}", manifest_dir.display()))?;
+    }
+    fs::create_dir_all(&manifest_dir)
+        .with_context(|| format!("failed to create {}", manifest_dir.display()))?;
+
+    write_text_file(
+        &manifest_dir.join(format!("{WINGET_PACKAGE_IDENTIFIER}.yaml")),
+        &winget_version_manifest(version),
+    )?;
+    write_text_file(
+        &manifest_dir.join(format!("{WINGET_PACKAGE_IDENTIFIER}.locale.en-US.yaml")),
+        &winget_locale_manifest(version),
+    )?;
+    write_text_file(
+        &manifest_dir.join(format!("{WINGET_PACKAGE_IDENTIFIER}.installer.yaml")),
+        &winget_installer_manifest(version, release_date, artifacts),
+    )?;
+    Ok(manifest_dir)
+}
+
+fn write_text_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn winget_version_manifest(version: &Version) -> String {
+    format!(
+        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.{WINGET_MANIFEST_VERSION}.schema.json\n\n\
+PackageIdentifier: {WINGET_PACKAGE_IDENTIFIER}\n\
+PackageVersion: {version}\n\
+DefaultLocale: en-US\n\
+ManifestType: version\n\
+ManifestVersion: {WINGET_MANIFEST_VERSION}\n"
+    )
+}
+
+fn winget_locale_manifest(version: &Version) -> String {
+    format!(
+        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.{WINGET_MANIFEST_VERSION}.schema.json\n\n\
+PackageIdentifier: {WINGET_PACKAGE_IDENTIFIER}\n\
+PackageVersion: {version}\n\
+PackageLocale: en-US\n\
+Publisher: Scryer Media\n\
+PublisherUrl: https://www.scryer.media/\n\
+PublisherSupportUrl: https://github.com/scryer-media/weaver/issues\n\
+Author: Scryer Media\n\
+PackageName: {WINGET_PACKAGE_NAME}\n\
+PackageUrl: https://github.com/scryer-media/weaver\n\
+License: GPL-3.0\n\
+LicenseUrl: https://github.com/scryer-media/weaver/blob/main/LICENSE\n\
+Copyright: Copyright (c) Scryer Media\n\
+ShortDescription: High-performance Usenet binary downloader.\n\
+Description: Weaver is a Usenet binary downloader that handles downloading, decoding, PAR2 verification and repair, and archive extraction.\n\
+Moniker: {WINGET_MONIKER}\n\
+Tags:\n\
+- downloader\n\
+- media\n\
+- nntp\n\
+- par2\n\
+- usenet\n\
+ReleaseNotesUrl: https://github.com/scryer-media/weaver/releases/tag/weaver-v{version}\n\
+ManifestType: defaultLocale\n\
+ManifestVersion: {WINGET_MANIFEST_VERSION}\n"
+    )
+}
+
+fn winget_installer_manifest(
+    version: &Version,
+    release_date: &str,
+    artifacts: &[WingetArtifact],
+) -> String {
+    let installers = artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}",
+                artifact.architecture, artifact.installer_url, artifact.installer_sha256
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{WINGET_MANIFEST_VERSION}.schema.json\n\n\
+PackageIdentifier: {WINGET_PACKAGE_IDENTIFIER}\n\
+PackageVersion: {version}\n\
+InstallerType: zip\n\
+NestedInstallerType: portable\n\
+NestedInstallerFiles:\n\
+- RelativeFilePath: weaver.exe\n  PortableCommandAlias: {WINGET_PORTABLE_COMMAND_ALIAS}\n\
+InstallModes:\n\
+- silent\n\
+UpgradeBehavior: install\n\
+ReleaseDate: {release_date}\n\
+Installers:\n\
+{installers}\n\
+ManifestType: installer\n\
+ManifestVersion: {WINGET_MANIFEST_VERSION}\n"
+    )
 }
 
 fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
@@ -2469,6 +2801,103 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_winget_artifacts() -> Vec<WingetArtifact> {
+        vec![
+            WingetArtifact {
+                architecture: "x64",
+                installer_url: format!(
+                    "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_X64_ASSET}"
+                ),
+                installer_sha256: "A".repeat(64),
+            },
+            WingetArtifact {
+                architecture: "arm64",
+                installer_url: format!(
+                    "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_ARM64_ASSET}"
+                ),
+                installer_sha256: "B".repeat(64),
+            },
+        ]
+    }
+
+    #[test]
+    fn winget_installer_manifest_uses_weaver_portable_zip_contract() {
+        let version = Version::parse("0.6.6").unwrap();
+        let manifest =
+            winget_installer_manifest(&version, "2026-06-24", &sample_winget_artifacts());
+
+        assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
+        assert!(manifest.contains("PackageVersion: 0.6.6"));
+        assert!(manifest.contains("InstallerType: zip"));
+        assert!(manifest.contains("NestedInstallerType: portable"));
+        assert!(manifest.contains("RelativeFilePath: weaver.exe"));
+        assert!(manifest.contains("  PortableCommandAlias: weaver"));
+        assert!(manifest.contains("Architecture: x64"));
+        assert!(manifest.contains("Architecture: arm64"));
+        assert!(manifest.contains(WINGET_WINDOWS_X64_ASSET));
+        assert!(manifest.contains(WINGET_WINDOWS_ARM64_ASSET));
+        assert!(manifest.contains("ReleaseDate: 2026-06-24"));
+    }
+
+    #[test]
+    fn winget_locale_manifest_matches_weaver_identity() {
+        let version = Version::parse("0.6.6").unwrap();
+        let manifest = winget_locale_manifest(&version);
+
+        assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
+        assert!(manifest.contains("Publisher: Scryer Media"));
+        assert!(manifest.contains("PackageName: Weaver"));
+        assert!(manifest.contains("License: GPL-3.0"));
+        assert!(manifest.contains("Moniker: weaver-usenet"));
+        assert!(manifest.contains(
+            "ReleaseNotesUrl: https://github.com/scryer-media/weaver/releases/tag/weaver-v0.6.6"
+        ));
+    }
+
+    #[test]
+    fn winget_manifest_writer_uses_package_version_directory() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let version = Version::parse("0.6.6").unwrap();
+
+        let manifest_dir = write_winget_manifests(
+            output_dir.path(),
+            &version,
+            "2026-06-24",
+            &sample_winget_artifacts(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest_dir.strip_prefix(output_dir.path()).unwrap(),
+            Path::new("ScryerMedia.Weaver").join("0.6.6")
+        );
+        assert!(
+            manifest_dir
+                .join("ScryerMedia.Weaver.installer.yaml")
+                .is_file()
+        );
+        assert!(manifest_dir.join("ScryerMedia.Weaver.yaml").is_file());
+        assert!(
+            manifest_dir
+                .join("ScryerMedia.Weaver.locale.en-US.yaml")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn winget_version_and_repository_validation_are_strict() {
+        assert_eq!(
+            normalize_winget_version("weaver-v0.6.6").unwrap(),
+            Version::parse("0.6.6").unwrap()
+        );
+        assert_eq!(
+            normalize_github_repository("/scryer-media/weaver/").unwrap(),
+            "scryer-media/weaver"
+        );
+        assert!(normalize_github_repository("https://github.com/scryer-media/weaver").is_err());
+        assert!(validate_winget_release_date("2026/06/24").is_err());
+    }
 
     fn sample_release_dry_run_cache() -> ReleaseDryRunCache {
         ReleaseDryRunCache {
