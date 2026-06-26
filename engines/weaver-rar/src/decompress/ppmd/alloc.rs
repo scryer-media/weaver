@@ -11,6 +11,8 @@
 //!
 //! Reference: 7-zip Ppmd7.c (public domain), Shkarin's original PPMd code.
 
+use std::cell::Cell;
+
 /// Size of one allocation unit in bytes.
 pub const UNIT_SIZE: usize = 12;
 
@@ -39,7 +41,7 @@ impl NodeRef {
     /// Byte offset into the arena.
     #[inline]
     pub fn offset(self) -> usize {
-        self.0 as usize * UNIT_SIZE
+        (self.0 as usize).saturating_mul(UNIT_SIZE)
     }
 }
 
@@ -53,6 +55,8 @@ struct FreeNode {
 pub struct SubAllocator {
     /// The memory arena.
     arena: Vec<u8>,
+    /// Set when a checked arena access would have gone out of bounds.
+    arena_fault: Cell<bool>,
     /// Free lists indexed by bin size.
     free_lists: [NodeRef; NUM_INDEXES],
 
@@ -85,6 +89,7 @@ impl SubAllocator {
 
         let mut alloc = Self {
             arena: vec![0u8; arena_size],
+            arena_fault: Cell::new(false),
             free_lists: [NodeRef::NULL; NUM_INDEXES],
             p_text: UNIT_SIZE, // start after NULL unit
             units_start_bytes,
@@ -99,6 +104,7 @@ impl SubAllocator {
     /// Reset the allocator, freeing all allocations.
     pub fn reset(&mut self) {
         self.free_lists = [NodeRef::NULL; NUM_INDEXES];
+        self.clear_arena_fault();
         self.arena.fill(0);
 
         let text_units = (self.arena.len() / 8 / UNIT_SIZE).max(1) + 1;
@@ -275,7 +281,7 @@ impl SubAllocator {
         let src = node.offset();
         let dst = new_node.offset();
         let len = old_nu * UNIT_SIZE;
-        self.arena.copy_within(src..src + len, dst);
+        self.copy_checked(src, dst, len);
         self.insert_node(node, old_idx);
         new_node
     }
@@ -293,7 +299,7 @@ impl SubAllocator {
             let src = node.offset();
             let dst = new_node.offset();
             let len = new_nu * UNIT_SIZE;
-            self.arena.copy_within(src..src + len, dst);
+            self.copy_checked(src, dst, len);
             self.insert_node(node, old_idx);
             return new_node;
         }
@@ -317,26 +323,41 @@ impl SubAllocator {
     /// Read a u8 at a specific byte offset within a node.
     #[inline]
     pub fn read_u8(&self, node: NodeRef, field_offset: usize) -> u8 {
-        self.arena[node.offset() + field_offset]
+        self.node_field_offset(node, field_offset, 1)
+            .and_then(|off| self.arena.get(off).copied())
+            .unwrap_or_else(|| {
+                self.mark_arena_fault();
+                0
+            })
     }
 
     /// Write a u8 at a specific byte offset within a node.
     #[inline]
     pub fn write_u8(&mut self, node: NodeRef, field_offset: usize, val: u8) {
-        self.arena[node.offset() + field_offset] = val;
+        let Some(off) = self.node_field_offset(node, field_offset, 1) else {
+            self.mark_arena_fault();
+            return;
+        };
+        self.arena[off] = val;
     }
 
     /// Read a u16 LE at a specific byte offset within a node.
     #[inline]
     pub fn read_u16(&self, node: NodeRef, field_offset: usize) -> u16 {
-        let off = node.offset() + field_offset;
+        let Some(off) = self.node_field_offset(node, field_offset, 2) else {
+            self.mark_arena_fault();
+            return 0;
+        };
         u16::from_le_bytes([self.arena[off], self.arena[off + 1]])
     }
 
     /// Write a u16 LE at a specific byte offset within a node.
     #[inline]
     pub fn write_u16(&mut self, node: NodeRef, field_offset: usize, val: u16) {
-        let off = node.offset() + field_offset;
+        let Some(off) = self.node_field_offset(node, field_offset, 2) else {
+            self.mark_arena_fault();
+            return;
+        };
         let bytes = val.to_le_bytes();
         self.arena[off] = bytes[0];
         self.arena[off + 1] = bytes[1];
@@ -345,7 +366,10 @@ impl SubAllocator {
     /// Read a u32 LE at a specific byte offset within a node.
     #[inline]
     pub fn read_u32(&self, node: NodeRef, field_offset: usize) -> u32 {
-        let off = node.offset() + field_offset;
+        let Some(off) = self.node_field_offset(node, field_offset, 4) else {
+            self.mark_arena_fault();
+            return 0;
+        };
         u32::from_le_bytes([
             self.arena[off],
             self.arena[off + 1],
@@ -357,7 +381,10 @@ impl SubAllocator {
     /// Write a u32 LE at a specific byte offset within a node.
     #[inline]
     pub fn write_u32(&mut self, node: NodeRef, field_offset: usize, val: u32) {
-        let off = node.offset() + field_offset;
+        let Some(off) = self.node_field_offset(node, field_offset, 4) else {
+            self.mark_arena_fault();
+            return;
+        };
         let bytes = val.to_le_bytes();
         self.arena[off..off + 4].copy_from_slice(&bytes);
     }
@@ -367,24 +394,41 @@ impl SubAllocator {
     /// Read a byte at an arbitrary byte offset in the arena.
     #[inline]
     pub fn read_byte_at(&self, off: usize) -> u8 {
-        self.arena[off]
+        self.checked_offset(off, 1)
+            .and_then(|off| self.arena.get(off).copied())
+            .unwrap_or_else(|| {
+                self.mark_arena_fault();
+                0
+            })
     }
 
     /// Write a byte at an arbitrary byte offset.
     #[inline]
     pub fn write_byte_at(&mut self, off: usize, val: u8) {
+        let Some(off) = self.checked_offset(off, 1) else {
+            self.mark_arena_fault();
+            return;
+        };
         self.arena[off] = val;
     }
 
     /// Read u16 LE at an arbitrary byte offset.
     #[inline]
     pub fn read_u16_at(&self, off: usize) -> u16 {
+        let Some(off) = self.checked_offset(off, 2) else {
+            self.mark_arena_fault();
+            return 0;
+        };
         u16::from_le_bytes([self.arena[off], self.arena[off + 1]])
     }
 
     /// Write u16 LE at an arbitrary byte offset.
     #[inline]
     pub fn write_u16_at(&mut self, off: usize, val: u16) {
+        let Some(off) = self.checked_offset(off, 2) else {
+            self.mark_arena_fault();
+            return;
+        };
         let bytes = val.to_le_bytes();
         self.arena[off] = bytes[0];
         self.arena[off + 1] = bytes[1];
@@ -393,6 +437,10 @@ impl SubAllocator {
     /// Read u32 LE at an arbitrary byte offset.
     #[inline]
     pub fn read_u32_at(&self, off: usize) -> u32 {
+        let Some(off) = self.checked_offset(off, 4) else {
+            self.mark_arena_fault();
+            return 0;
+        };
         u32::from_le_bytes([
             self.arena[off],
             self.arena[off + 1],
@@ -404,15 +452,55 @@ impl SubAllocator {
     /// Write u32 LE at an arbitrary byte offset.
     #[inline]
     pub fn write_u32_at(&mut self, off: usize, val: u32) {
+        let Some(off) = self.checked_offset(off, 4) else {
+            self.mark_arena_fault();
+            return;
+        };
         self.arena[off..off + 4].copy_from_slice(&val.to_le_bytes());
     }
 
     /// Copy bytes within the arena.
     pub fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
-        self.arena.copy_within(src..src + len, dst);
+        self.copy_checked(src, dst, len);
+    }
+
+    /// Clear the recorded arena fault.
+    pub fn clear_arena_fault(&self) {
+        self.arena_fault.set(false);
+    }
+
+    /// Return and clear the recorded arena fault.
+    pub fn take_arena_fault(&self) -> bool {
+        let faulted = self.arena_fault.get();
+        self.arena_fault.set(false);
+        faulted
     }
 
     // ---- Internal ----
+
+    fn mark_arena_fault(&self) {
+        self.arena_fault.set(true);
+    }
+
+    fn checked_offset(&self, off: usize, len: usize) -> Option<usize> {
+        off.checked_add(len)
+            .filter(|end| *end <= self.arena.len())
+            .map(|_| off)
+    }
+
+    fn node_field_offset(&self, node: NodeRef, field_offset: usize, len: usize) -> Option<usize> {
+        node.offset()
+            .checked_add(field_offset)
+            .and_then(|off| self.checked_offset(off, len))
+    }
+
+    fn copy_checked(&mut self, src: usize, dst: usize, len: usize) {
+        if self.checked_offset(src, len).is_none() || self.checked_offset(dst, len).is_none() {
+            self.mark_arena_fault();
+            return;
+        }
+        self.arena.copy_within(src..src + len, dst);
+    }
 
     fn read_free_node(&self, node: NodeRef) -> FreeNode {
         FreeNode {
@@ -528,5 +616,24 @@ mod tests {
         assert_eq!(alloc.read_byte_at(off + 3), 0x77);
         alloc.write_u32_at(off + 4, 0x12345678);
         assert_eq!(alloc.read_u32_at(off + 4), 0x12345678);
+    }
+
+    #[test]
+    fn out_of_bounds_arena_access_records_fault_instead_of_panicking() {
+        let mut alloc = SubAllocator::new(96);
+        let past_end = 10_000;
+
+        assert_eq!(alloc.read_byte_at(past_end), 0);
+        assert!(alloc.take_arena_fault());
+
+        alloc.write_u32_at(past_end, 0x12345678);
+        assert!(alloc.take_arena_fault());
+
+        alloc.copy_within(past_end, 0, 4);
+        assert!(alloc.take_arena_fault());
+
+        let bogus_node = NodeRef(u32::MAX);
+        assert_eq!(alloc.read_u32(bogus_node, 0), 0);
+        assert!(alloc.take_arena_fault());
     }
 }

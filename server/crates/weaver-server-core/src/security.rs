@@ -14,7 +14,9 @@ pub const ENV_NZB_DECOMPRESSED_LIMIT_BYTES: &str = "WEAVER_NZB_DECOMPRESSED_LIMI
 pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK";
 pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
 
-pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+// Keep the default bind broad for Docker and homelab deployments. Production-style
+// guardrails live in WEAVER_STRICT_SECURITY rather than silently narrowing this.
+pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_BACKUP_UPLOAD_LIMIT_BYTES: u64 = 2_147_483_648;
 pub const DEFAULT_NZB_UPLOAD_LIMIT_BYTES: u64 = 268_435_456;
 pub const DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES: u64 = 536_870_912;
@@ -311,6 +313,7 @@ mod tests {
         let config = RuntimeSecurityConfig::from_env().unwrap();
 
         assert_eq!(config.http_bind_address, DEFAULT_HTTP_BIND_ADDRESS);
+        assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(config.metrics_auth_required);
         assert!(config.cors_allowed_origins.is_empty());
         assert!(!config.secure_cookies);
@@ -384,15 +387,15 @@ mod tests {
 
     #[test]
     fn open_admin_warning_predicate_tracks_bind_and_login() {
-        let loopback = RuntimeSecurityConfig::default();
-        assert!(!loopback.exposes_admin_without_login(false));
+        let default = RuntimeSecurityConfig::default();
+        assert!(default.exposes_admin_without_login(false));
+        assert!(!default.exposes_admin_without_login(true));
 
-        let exposed = RuntimeSecurityConfig {
-            http_bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        let loopback = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ..RuntimeSecurityConfig::default()
         };
-        assert!(exposed.exposes_admin_without_login(false));
-        assert!(!exposed.exposes_admin_without_login(true));
+        assert!(!loopback.exposes_admin_without_login(false));
     }
 
     #[test]
@@ -407,6 +410,7 @@ mod tests {
         assert!(exposed.strict_security_violation(true).is_none());
 
         let loopback = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             strict_security: true,
             ..RuntimeSecurityConfig::default()
         };

@@ -63,12 +63,10 @@ impl LoginRateLimiter {
         }
     }
 
-    fn record_success(&self, username: &str, client_id: &str) {
-        let keys = Self::limiter_keys(username, client_id);
+    fn record_success(&self, username: &str, _client_id: &str) {
+        let key = Self::account_key(username);
         let mut attempts = self.inner.lock().unwrap();
-        for key in keys {
-            attempts.remove(&key);
-        }
+        attempts.remove(&key);
     }
 
     fn prune_expired(attempts: &mut HashMap<String, LoginFailureWindow>, now: Instant) {
@@ -77,10 +75,11 @@ impl LoginRateLimiter {
     }
 
     fn limiter_keys(username: &str, client_id: &str) -> [String; 2] {
-        [
-            format!("account:{}", username.trim().to_ascii_lowercase()),
-            format!("client:{client_id}"),
-        ]
+        [Self::account_key(username), format!("client:{client_id}")]
+    }
+
+    fn account_key(username: &str) -> String {
+        format!("account:{}", username.trim().to_ascii_lowercase())
     }
 }
 
@@ -411,16 +410,18 @@ mod tests {
     }
 
     #[test]
-    fn login_limiter_success_clears_matching_account_and_client() {
+    fn login_limiter_success_clears_matching_account_but_not_client() {
         let limiter = LoginRateLimiter::default();
         for _ in 0..LOGIN_MAX_FAILURES {
             limiter.record_failure("admin", "203.0.113.5");
         }
         assert!(limiter.too_many_failures("admin", "203.0.113.5"));
+        assert!(limiter.too_many_failures("other", "203.0.113.5"));
 
         limiter.record_success("admin", "203.0.113.5");
 
-        assert!(!limiter.too_many_failures("admin", "203.0.113.5"));
+        assert!(!limiter.too_many_failures("admin", "203.0.113.6"));
+        assert!(limiter.too_many_failures("other", "203.0.113.5"));
     }
 
     #[test]

@@ -47,8 +47,7 @@ fn spool_threshold_bytes() -> usize {
         .unwrap_or(DEFAULT_SPOOL_THRESHOLD_BYTES)
 }
 
-fn enforce_member_limits(file_header: &FileHeader) -> RarResult<()> {
-    let limits = Limits::default();
+fn enforce_member_limits(file_header: &FileHeader, limits: &Limits) -> RarResult<()> {
     if file_header.data_size > limits.max_data_segment {
         return Err(RarError::ResourceLimit {
             detail: format!(
@@ -283,6 +282,31 @@ where
     R: Read + Seek,
     W: Write,
 {
+    extract_stored_with_limits(
+        reader,
+        writer,
+        file_header,
+        options,
+        progress,
+        member_info,
+        &Limits::default(),
+    )
+}
+
+/// Extract a stored file using caller-provided resource limits.
+pub fn extract_stored_with_limits<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    file_header: &FileHeader,
+    options: &ExtractOptions,
+    progress: Option<&dyn ProgressHandler>,
+    member_info: Option<&MemberInfo>,
+    limits: &Limits,
+) -> RarResult<u64>
+where
+    R: Read + Seek,
+    W: Write,
+{
     // Reject encrypted members — callers must decrypt before extraction.
     if file_header.is_encrypted {
         return Err(RarError::EncryptedMember {
@@ -297,7 +321,7 @@ where
             version: file_header.compression.version,
         });
     }
-    enforce_member_limits(file_header)?;
+    enforce_member_limits(file_header, limits)?;
 
     // Seek to the data offset
     reader
@@ -382,6 +406,27 @@ pub fn extract_member<R: Read + Seek>(
     member_info: Option<&MemberInfo>,
     hash: Option<&FileHash>,
 ) -> RarResult<ExtractedMember> {
+    extract_member_with_limits(
+        reader,
+        file_header,
+        options,
+        progress,
+        member_info,
+        hash,
+        &Limits::default(),
+    )
+}
+
+/// Extract a member using caller-provided resource limits.
+pub fn extract_member_with_limits<R: Read + Seek>(
+    reader: &mut R,
+    file_header: &FileHeader,
+    options: &ExtractOptions,
+    progress: Option<&dyn ProgressHandler>,
+    member_info: Option<&MemberInfo>,
+    hash: Option<&FileHash>,
+    limits: &Limits,
+) -> RarResult<ExtractedMember> {
     // Reject encrypted members — callers must decrypt before extraction.
     if file_header.is_encrypted {
         return Err(RarError::EncryptedMember {
@@ -389,7 +434,7 @@ pub fn extract_member<R: Read + Seek>(
         });
     }
 
-    enforce_member_limits(file_header)?;
+    enforce_member_limits(file_header, limits)?;
 
     // Seek to the data area.
     reader
@@ -435,21 +480,23 @@ pub fn extract_member<R: Read + Seek>(
     let output = match file_header.compression.method {
         CompressionMethod::Store => {
             // For store, the CRC is verified inside decompress.
-            let data = decompress::decompress(
+            let data = decompress::decompress_with_limits(
                 &compressed,
                 unpacked_size,
                 &file_header.compression,
                 expected_crc,
+                limits,
             )?;
             ExtractedMember::InMemory(data)
         }
         _ => {
             // For compressed data, decompress first then verify CRC.
-            let decompressed = decompress::decompress(
+            let decompressed = decompress::decompress_with_limits(
                 &compressed,
                 unpacked_size,
                 &file_header.compression,
                 None, // CRC verified post-decompression
+                limits,
             )?;
 
             // Verify CRC32 of decompressed data.
@@ -748,6 +795,29 @@ mod tests {
             None,
             None,
             None,
+        );
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn extract_member_with_limits_uses_custom_data_size_limit() {
+        let test_data = b"small";
+        let fh = make_stored_file_header("custom-packed.bin", test_data, 0);
+        let limits = Limits {
+            max_data_segment: 4,
+            ..Limits::default()
+        };
+
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        let result = extract_member_with_limits(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+            &limits,
         );
 
         assert!(matches!(result, Err(RarError::ResourceLimit { .. })));

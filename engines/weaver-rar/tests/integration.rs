@@ -1082,7 +1082,10 @@ fn test_rar4_long_password_unrar_vector_archive_extracts() {
 #[test]
 fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() {
     let Ok(unrar_bin) = std::env::var("UNRAR_BIN") else {
-        eprintln!("set UNRAR_BIN to run the local unrar oracle check");
+        if std::env::var("WEAVER_REQUIRE_UNRAR_ORACLE").is_ok_and(|v| v == "1" || v == "true") {
+            panic!("WEAVER_REQUIRE_UNRAR_ORACLE is set but UNRAR_BIN is missing");
+        }
+        eprintln!("skipping local unrar oracle check; set UNRAR_BIN to enable it");
         return;
     };
 

@@ -89,11 +89,10 @@ impl PpmdDecoder {
         let start_len = output.len();
 
         while output.len() - start_len < target {
-            let ch = model.decode_char(&mut rc);
-            if ch < 0 {
+            let Some(ch) = model.decode_char_result(&mut rc)? else {
                 break;
-            }
-            output.push(ch as u8);
+            };
+            output.push(ch);
         }
 
         Ok(rc.position())

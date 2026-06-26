@@ -3,7 +3,9 @@ mod common;
 use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 use common::TestHarness;
 use serde_json::Value;
-use weaver_server_api::context::{GRAPHQL_MAX_COMPLEXITY, GRAPHQL_MAX_DEPTH};
+use weaver_server_api::context::{
+    GRAPHQL_MAX_COMPLEXITY, GRAPHQL_MAX_DEPTH, apply_graphql_query_guards,
+};
 
 struct DeepQuery;
 
@@ -163,9 +165,9 @@ async fn graphql_query_complexity_is_limited() {
 
 #[tokio::test]
 async fn graphql_query_depth_is_limited() {
-    let schema = Schema::build(DeepQuery, EmptyMutation, EmptySubscription)
-        .limit_depth(GRAPHQL_MAX_DEPTH)
-        .finish();
+    let schema =
+        apply_graphql_query_guards(Schema::build(DeepQuery, EmptyMutation, EmptySubscription))
+            .finish();
     let mut selection = "value".to_string();
     for _ in 0..=GRAPHQL_MAX_DEPTH {
         selection = format!("child {{ {selection} }}");

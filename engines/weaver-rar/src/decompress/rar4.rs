@@ -1742,8 +1742,7 @@ impl Rar4LzDecoder {
                     }
                 };
 
-                let ch = model.decode_char(&mut rc);
-                if ch == -1 {
+                let Some(ch) = model.decode_char_result(&mut rc)? else {
                     // Corrupt PPM data — switch to LZ mode.
                     if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
@@ -1770,14 +1769,12 @@ impl Rar4LzDecoder {
                     self.ppm_model = None;
                     self.block_type = BlockType::Lz;
                     break;
-                }
+                };
 
-                let ch = ch as u8;
                 if ch == self.ppm_esc_char {
                     // Escape sequence — decode the command byte.
                     let model = self.ppm_model_mut()?;
-                    let next_ch = model.decode_char(&mut rc);
-                    if next_ch == -1 {
+                    let Some(next_ch) = model.decode_char_result(&mut rc)? else {
                         if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
                             if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
@@ -1803,7 +1800,7 @@ impl Rar4LzDecoder {
                         self.ppm_model = None;
                         self.block_type = BlockType::Lz;
                         break;
-                    }
+                    };
 
                     match next_ch {
                         0 => {
@@ -1828,15 +1825,14 @@ impl Rar4LzDecoder {
                             let mut failed = false;
                             let model = self.ppm_model_mut()?;
                             for i in 0..4 {
-                                let b = model.decode_char(&mut rc);
-                                if b == -1 {
+                                let Some(b) = model.decode_char_result(&mut rc)? else {
                                     failed = true;
                                     break;
-                                }
+                                };
                                 if i == 3 {
                                     length = b as u32;
                                 } else {
-                                    distance = (distance << 8) | (b as u32 & 0xFF);
+                                    distance = (distance << 8) | u32::from(b);
                                 }
                             }
                             if failed {
@@ -1860,19 +1856,18 @@ impl Rar4LzDecoder {
                         }
                         5 => {
                             let model = self.ppm_model_mut()?;
-                            let len_byte = model.decode_char(&mut rc);
-                            if len_byte == -1 {
+                            let Some(len_byte) = model.decode_char_result(&mut rc)? else {
                                 self.ppm_model = None;
                                 self.block_type = BlockType::Lz;
                                 break;
-                            }
+                            };
                             if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                                 eprintln!(
                                     "RAR4 PPM rle_copy at output_size={output_size} length={}",
-                                    (len_byte as usize) + 4
+                                    usize::from(len_byte) + 4
                                 );
                             }
-                            let copy_len = (len_byte as usize) + 4;
+                            let copy_len = usize::from(len_byte) + 4;
                             let remaining_out = (unpacked_size - output_size) as usize;
                             let actual = copy_len.min(remaining_out);
                             self.window.copy(1, actual)?;
@@ -1906,13 +1901,12 @@ impl Rar4LzDecoder {
                 .ok_or_else(|| RarError::CorruptArchive {
                     detail: "RAR4: PPMd model missing during VM filter read".into(),
                 })?;
-            let byte = model.decode_char(rc);
-            if byte == -1 {
+            let Some(byte) = model.decode_char_result(rc)? else {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR4: PPMd corrupt during VM filter read".into(),
                 });
-            }
-            Ok(byte as u8)
+            };
+            Ok(byte)
         };
 
         let first_byte = read_model_byte(self, rc)?;

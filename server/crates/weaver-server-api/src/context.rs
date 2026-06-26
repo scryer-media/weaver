@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use async_graphql::Schema;
+use async_graphql::{Schema, SchemaBuilder};
 use weaver_server_core::Database;
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
@@ -14,6 +14,15 @@ use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
 pub const GRAPHQL_MAX_DEPTH: usize = 16;
+
+pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
+    builder: SchemaBuilder<Query, Mutation, Subscription>,
+) -> SchemaBuilder<Query, Mutation, Subscription> {
+    builder
+        .disable_introspection()
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+}
 
 pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
@@ -59,14 +68,11 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
 
-    let schema = Schema::build(
+    let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
         SubscriptionRoot::default(),
-    )
-    .disable_introspection()
-    .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
-    .limit_depth(GRAPHQL_MAX_DEPTH)
+    ))
     .data(context.handle)
     .data(context.config)
     .data(context.db)

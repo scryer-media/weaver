@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufRead, Cursor, Read};
 
 use quick_xml::events::Event;
@@ -172,6 +173,8 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             subject,
                             groups: Vec::new(),
                             segments: Vec::new(),
+                            segment_numbers: HashSet::new(),
+                            message_ids: HashSet::new(),
                         });
                     }
                     b"groups" if current_file.is_some() => in_groups = true,
@@ -265,17 +268,23 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 let number = seg.number.expect("validated segment number");
                                 let bytes = seg.bytes.expect("validated segment byte count");
 
-                                if let Some(existing) =
-                                    f.segments.iter().find(|existing| existing.number == number)
-                                {
+                                if f.segment_numbers.contains(&number) {
                                     tracing::warn!(
                                         subject = %f.subject,
                                         number,
-                                        existing_message_id = %existing.message_id,
                                         duplicate_message_id = %message_id,
                                         "skipping duplicate NZB segment number"
                                     );
+                                } else if f.message_ids.contains(&message_id) {
+                                    tracing::warn!(
+                                        subject = %f.subject,
+                                        number,
+                                        duplicate_message_id = %message_id,
+                                        "skipping duplicate NZB segment message id"
+                                    );
                                 } else {
+                                    f.segment_numbers.insert(number);
+                                    f.message_ids.insert(message_id.clone());
                                     if f.segments.len() >= limits.max_segments_per_file {
                                         return Err(NzbError::ResourceLimit(format!(
                                             "file has more than {} segments",
@@ -385,6 +394,8 @@ struct FileBuilder {
     subject: String,
     groups: Vec<String>,
     segments: Vec<NzbSegment>,
+    segment_numbers: HashSet<u32>,
+    message_ids: HashSet<String>,
 }
 
 struct SegmentBuilder {
@@ -776,6 +787,28 @@ mod tests {
         assert_eq!(segments[0].message_id, "first");
         assert_eq!(segments[1].number, 2);
         assert_eq!(segments[1].message_id, "second");
+    }
+
+    #[test]
+    fn duplicate_segment_message_ids_are_skipped() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="s">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="1" number="1">same-id</segment>
+      <segment bytes="2" number="2">same-id</segment>
+      <segment bytes="3" number="3">next-id</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        let segments = &nzb.files[0].segments;
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].number, 1);
+        assert_eq!(segments[0].message_id, "same-id");
+        assert_eq!(segments[1].number, 3);
+        assert_eq!(segments[1].message_id, "next-id");
     }
 
     // Additional: invalid date value

@@ -10,6 +10,7 @@ use super::range::RangeCode;
 #[cfg(test)]
 use super::range::RangeDecoder;
 use super::see::SeeTable;
+use crate::error::{RarError, RarResult};
 // --- Constants ---
 
 const MAX_ORDER: usize = 64;
@@ -501,6 +502,18 @@ impl Model {
         rc.normalize();
         self.debug_output_index += 1;
         symbol as i32
+    }
+
+    /// Decode one character with checked arena access.
+    pub fn decode_char_result<R: RangeCode>(&mut self, rc: &mut R) -> RarResult<Option<u8>> {
+        self.alloc.clear_arena_fault();
+        let ch = self.decode_char(rc);
+        if self.alloc.take_arena_fault() {
+            return Err(RarError::CorruptArchive {
+                detail: "RAR PPMd arena access out of bounds".into(),
+            });
+        }
+        if ch < 0 { Ok(None) } else { Ok(Some(ch as u8)) }
     }
 
     // =======================================================================
@@ -1711,13 +1724,9 @@ mod tests {
         let mut model = Model::new(6, 1024 * 1024);
         let data = vec![0u8; 256];
         let mut rc = RangeDecoder::new(&data).unwrap();
-        // Should decode symbols without crashing. -1 is valid (escape/end).
+        // Should decode symbols without crashing. None is valid (escape/end).
         for _ in 0..5 {
-            let ch = model.decode_char(&mut rc);
-            assert!(
-                (0..256).contains(&ch) || ch == -1,
-                "unexpected decode result: {ch}"
-            );
+            let _ = model.decode_char_result(&mut rc).unwrap();
         }
     }
 }

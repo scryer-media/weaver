@@ -43,7 +43,18 @@ pub fn decompress(
     info: &CompressionInfo,
     expected_crc: Option<u32>,
 ) -> RarResult<Vec<u8>> {
-    enforce_direct_output_limit(unpacked_size)?;
+    decompress_with_limits(input, unpacked_size, info, expected_crc, &Limits::default())
+}
+
+/// Decompress data using caller-provided resource limits.
+pub fn decompress_with_limits(
+    input: &[u8],
+    unpacked_size: u64,
+    info: &CompressionInfo,
+    expected_crc: Option<u32>,
+    limits: &Limits,
+) -> RarResult<Vec<u8>> {
+    enforce_direct_output_limit(unpacked_size, limits)?;
 
     match info.method {
         CompressionMethod::Store => {
@@ -69,8 +80,8 @@ pub fn decompress(
     }
 }
 
-fn enforce_direct_output_limit(unpacked_size: u64) -> RarResult<()> {
-    let max_unpacked_size = Limits::default().max_unpacked_size;
+fn enforce_direct_output_limit(unpacked_size: u64, limits: &Limits) -> RarResult<()> {
+    let max_unpacked_size = limits.max_unpacked_size;
     if unpacked_size > max_unpacked_size {
         return Err(RarError::ResourceLimit {
             detail: format!(
@@ -245,6 +256,25 @@ mod tests {
         };
 
         let result = decompress(&[0], Limits::default().max_unpacked_size + 1, &info, None);
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn test_dispatch_uses_custom_direct_output_limit() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 0,
+            solid: false,
+            method: CompressionMethod::Store,
+            dict_size: 128 * 1024,
+        };
+        let limits = Limits {
+            max_unpacked_size: 0,
+            ..Limits::default()
+        };
+
+        let result = decompress_with_limits(&[0], 1, &info, None, &limits);
 
         assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
     }
