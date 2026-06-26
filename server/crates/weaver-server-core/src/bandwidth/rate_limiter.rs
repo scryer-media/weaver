@@ -44,6 +44,24 @@ impl TokenBucket {
         self.tokens -= bytes as f64;
     }
 
+    /// Refund previously consumed bytes, capped at the bucket capacity.
+    pub fn refund(&mut self, bytes: u64) {
+        if self.rate <= 0.0 {
+            return;
+        }
+        self.refill();
+        self.tokens = (self.tokens + bytes as f64).min(self.capacity);
+    }
+
+    /// Reconcile an estimated consumption with the actual byte count.
+    pub fn reconcile(&mut self, estimated_bytes: u64, actual_bytes: u64) {
+        if actual_bytes > estimated_bytes {
+            self.consume(actual_bytes - estimated_bytes);
+        } else if estimated_bytes > actual_bytes {
+            self.refund(estimated_bytes - actual_bytes);
+        }
+    }
+
     /// Returns true if the caller should wait (balance < 0 and rate limiting is active).
     pub fn should_wait(&mut self) -> bool {
         if self.rate <= 0.0 {

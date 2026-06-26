@@ -108,6 +108,8 @@ impl Pipeline {
                     self.pending_retries_by_job.remove(&job_id);
                     self.pending_retries_by_segment
                         .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                    self.rate_limit_reservations
+                        .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                     self.job_last_download_activity.remove(&job_id);
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);

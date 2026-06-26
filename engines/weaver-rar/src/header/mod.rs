@@ -164,7 +164,7 @@ pub fn parse_all_headers<R: Read + Seek>(
                 }
 
                 // Derive key (IV comes per-header from stream, not PBKDF2).
-                let (key, _) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count);
+                let (key, _) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count)?;
 
                 // Parse remaining headers — each has its own IV + padded encryption.
                 parse_encrypted_headers(reader, &key, &mut result)?;

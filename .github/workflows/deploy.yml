@@ -86,7 +86,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: Run cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+        run: cargo run -p xtask --locked -- ci audit
 
   # ── Jobs that need the web artifact ──────────────────────────────────────
 
@@ -152,6 +152,74 @@ jobs:
           printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run workspace tests
         run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
+
+  weaver-par2-rar-e2e:
+    name: weaver-par2-rar-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [web-build]
+    env:
+      E2E_PROJECT: weaver-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      E2E_RUN_DIR: /tmp/weaver-e2e/run
+      E2E_RUNTIME_PORTS_FILE: /tmp/weaver-e2e/runtime-ports.json
+      E2E_VERBOSE: "0"
+      E2E_WEAVER_IMAGE: scryer-e2e-weaver:${{ github.sha }}
+      WEAVER_BIN: ${{ github.workspace }}/weaver/target/x86_64-unknown-linux-musl/release/weaver
+    steps:
+      - name: Checkout Weaver
+        uses: actions/checkout@v6
+        with:
+          path: weaver
+          lfs: true
+      - name: Checkout e2e harness
+        uses: actions/checkout@v6
+        with:
+          repository: scryer-media/e2e
+          path: e2e
+          lfs: true
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mold nasm
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: weaver/apps/weaver-web/dist
+      - name: Build Weaver e2e binary
+        working-directory: weaver
+        run: cargo build --release --locked -p weaver --target x86_64-unknown-linux-musl
+      - name: Build weaver-e2e CLI
+        working-directory: e2e
+        run: |
+          mkdir -p .bin
+          go build -o .bin/weaver-e2e ./cmd/weaver-e2e
+      - name: Build Weaver e2e image
+        run: docker build -f weaver/Dockerfile.e2e -t "$E2E_WEAVER_IMAGE" weaver
+      - name: Seed PAR2/RAR fixture
+        working-directory: e2e
+        run: ./.bin/weaver-e2e seed testdata/par2-small-repair
+      - name: Run PAR2/RAR fixture
+        working-directory: e2e
+        run: ./.bin/weaver-e2e test par2-small-repair
+      - name: Dump e2e logs
+        if: failure()
+        working-directory: e2e
+        run: docker compose -p "$E2E_PROJECT" logs --no-color weaver nntp newznab || true
+      - name: Stop e2e stack
+        if: always()
+        working-directory: e2e
+        run: docker compose -p "$E2E_PROJECT" down -v --remove-orphans || true
 
   rust-test-arm:
     name: rust-test-arm

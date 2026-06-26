@@ -38,6 +38,25 @@ pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, Yenc
     )
 }
 
+fn validate_ypart_decoded_size(
+    metadata: &YencMetadata,
+    bytes_written: usize,
+) -> Result<(), YencError> {
+    if metadata.part.is_some()
+        && let (Some(begin), Some(end)) = (metadata.begin, metadata.end)
+    {
+        let expected_size = end - begin + 1;
+        if bytes_written as u64 != expected_size {
+            return Err(YencError::SizeMismatch {
+                expected: expected_size,
+                actual: bytes_written as u64,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Decode a complete yEnc article with custom options.
 pub fn decode_with_options(
     input: &[u8],
@@ -70,6 +89,8 @@ pub fn decode_with_options(
         });
     }
 
+    validate_ypart_decoded_size(&parsed.metadata, bytes_written)?;
+
     // For single-part articles, also validate =ybegin size vs =yend size.
     if parsed.metadata.part.is_none()
         && let Some(expected_size) = yend_size
@@ -90,10 +111,14 @@ pub fn decode_with_options(
         expected_file_crc
     };
 
-    let crc_valid = match expected_crc_to_check {
-        Some(expected) => part_crc == expected,
-        None => true, // No expected CRC means we can't validate, treat as valid.
-    };
+    if let Some(expected) = expected_crc_to_check
+        && part_crc != expected
+    {
+        return Err(YencError::CrcMismatch {
+            expected,
+            actual: part_crc,
+        });
+    }
 
     Ok(DecodeResult {
         metadata: parsed.metadata,
@@ -101,7 +126,7 @@ pub fn decode_with_options(
         part_crc,
         expected_part_crc,
         expected_file_crc,
-        crc_valid,
+        crc_valid: true,
         has_trailer: parsed.yend.is_some(),
     })
 }
@@ -208,6 +233,8 @@ impl StreamingArticleDecoder {
             });
         }
 
+        validate_ypart_decoded_size(&metadata, bytes_written)?;
+
         if metadata.part.is_none()
             && let Some(expected_size) = yend_size
             && metadata.size != expected_size
@@ -223,10 +250,14 @@ impl StreamingArticleDecoder {
         } else {
             expected_file_crc
         };
-        let crc_valid = match expected_crc_to_check {
-            Some(expected) => part_crc == expected,
-            None => true,
-        };
+        if let Some(expected) = expected_crc_to_check
+            && part_crc != expected
+        {
+            return Err(YencError::CrcMismatch {
+                expected,
+                actual: part_crc,
+            });
+        }
 
         Ok(DecodedArticle {
             data: output,
@@ -236,7 +267,7 @@ impl StreamingArticleDecoder {
                 part_crc,
                 expected_part_crc,
                 expected_file_crc,
-                crc_valid,
+                crc_valid: true,
                 has_trailer,
             },
         })
@@ -590,6 +621,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_article_decoder_crc_mismatch_errors() {
+        let original = b"Hello streamed yEnc";
+        let mut article =
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).into_bytes();
+        article.extend_from_slice(&encode_raw(original));
+        article.extend_from_slice(
+            format!("\r\n=yend size={} crc32=DEADBEEF\r\n", original.len()).as_bytes(),
+        );
+
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article, &mut output).unwrap();
+        let err = decoder.finish(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn streaming_article_decoder_split_chunks() {
         let original = b"Hello streamed yEnc split";
         let mut article =
@@ -847,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_full_crc_mismatch_still_decodes() {
+    fn decode_full_crc_mismatch_errors() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
 
@@ -859,13 +914,38 @@ mod tests {
         article.extend_from_slice(b"\r\n=yend size=9 crc32=DEADBEEF\r\n");
 
         let mut output = vec![0u8; 1024];
-        let result = decode(&article, &mut output).unwrap();
+        let err = decode(&article, &mut output).unwrap_err();
 
-        // Data should still be decoded.
-        assert_eq!(result.bytes_written, original.len());
-        assert_eq!(&output[..result.bytes_written], original.as_slice());
-        // But CRC should be invalid.
-        assert!(!result.crc_valid);
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_multipart_ypart_range_size_mismatch_errors() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin part=1 total=2 line=128 size=20 name=test.bin\r\n");
+        article.extend_from_slice(b"=ypart begin=1 end=8\r\n");
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
+
+        let mut output = vec![0u8; 1024];
+        let err = decode(&article, &mut output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            YencError::SizeMismatch {
+                expected: 8,
+                actual: 9,
+            }
+        ));
     }
 
     #[test]

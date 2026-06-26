@@ -682,7 +682,8 @@ impl Pipeline {
                     weaver_par2::Par2RepairStatus::Verified
                     | weaver_par2::Par2RepairStatus::Repaired => {}
                     weaver_par2::Par2RepairStatus::RepairPossible
-                    | weaver_par2::Par2RepairStatus::Insufficient => {
+                    | weaver_par2::Par2RepairStatus::Insufficient
+                    | weaver_par2::Par2RepairStatus::ResourceLimited => {
                         return Err(format!(
                             "PAR2 repairer did not complete repair: {:?}",
                             outcome.status
@@ -1951,7 +1952,17 @@ impl Pipeline {
                         | weaver_par2::verify::Repairability::Insufficient {
                             blocks_needed, ..
                         } => *blocks_needed,
+                        weaver_par2::verify::Repairability::ResourceLimited { .. } => 0,
                     };
+
+                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                        &verification.repairable
+                    {
+                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        warn!(job_id = job_id.0, error = %msg);
+                        self.fail_job(job_id, msg);
+                        return;
+                    }
 
                     if !par2_verification_needs_repair(verification) {
                         info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
@@ -2087,6 +2098,7 @@ impl Pipeline {
                     if matches!(
                         &verification.repairable,
                         weaver_par2::verify::Repairability::Insufficient { .. }
+                            | weaver_par2::verify::Repairability::ResourceLimited { .. }
                     ) {
                         let msg = format!(
                             "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
@@ -2232,6 +2244,15 @@ impl Pipeline {
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
 
+                if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                    &verification.repairable
+                {
+                    let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                    warn!(job_id = job_id.0, error = %msg);
+                    self.fail_job(job_id, msg);
+                    return;
+                }
+
                 if !par2_verification_needs_repair(&verification) {
                     info!(
                         job_id = job_id.0,
@@ -2373,6 +2394,15 @@ impl Pipeline {
                     }
                     let damaged = repairer_damaged;
                     let recovery_now = repairer_recovery_now;
+
+                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                        &repair_preview.verification.repairable
+                    {
+                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        warn!(job_id = job_id.0, error = %msg);
+                        self.fail_job(job_id, msg);
+                        return;
+                    }
 
                     if total_recovery_capacity < damaged {
                         self.fail_job(

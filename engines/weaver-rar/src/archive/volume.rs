@@ -13,7 +13,9 @@ impl RarArchive {
         }
 
         let mut readers = readers.into_iter();
-        let first = readers.next().unwrap();
+        let first = readers.next().ok_or_else(|| RarError::CorruptArchive {
+            detail: "no volumes provided".into(),
+        })?;
         let mut archive = Self::open_boxed_inner(
             first,
             None,

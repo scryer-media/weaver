@@ -1502,20 +1502,8 @@ impl RarArchive {
             )?
         };
 
-        let actual_crc = shared_crc.map(|shared| {
-            Arc::try_unwrap(shared)
-                .unwrap()
-                .into_inner()
-                .unwrap()
-                .finalize()
-        });
-        let actual_blake = shared_blake.map(|shared| {
-            Arc::try_unwrap(shared)
-                .unwrap()
-                .into_inner()
-                .unwrap()
-                .finalize()
-        });
+        let actual_crc = shared_crc.map(finalize_shared_crc32).transpose()?;
+        let actual_blake = shared_blake.map(finalize_shared_blake2).transpose()?;
         Self::verify_member_crc32(
             &fh.name,
             expected_crc,
@@ -1573,26 +1561,21 @@ impl RarArchive {
 
         let dict_size = dict_size as usize;
         if fh.compression.format == ArchiveFormat::Rar4 {
-            if let Some(decoder) = solid_decoder_rar4 {
+            let decoder = if let Some(decoder) = solid_decoder_rar4 {
                 decoder.prepare_solid_continuation();
+                decoder
             } else {
-                *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
-            }
-            solid_decoder_rar4
-                .as_mut()
-                .unwrap()
-                .decompress_reader_to_writer(compressed, unpacked_size, writer)
+                solid_decoder_rar4.insert(Rar4LzDecoder::new(dict_size))
+            };
+            decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
-            if let Some(decoder) = solid_decoder {
+            let decoder = if let Some(decoder) = solid_decoder {
                 decoder.prepare_solid_continuation();
+                decoder
             } else {
-                *solid_decoder = Some(LzDecoder::new(dict_size, fh.compression.version));
-            }
-            solid_decoder.as_mut().unwrap().decompress_reader_to_writer(
-                compressed,
-                unpacked_size,
-                writer,
-            )
+                solid_decoder.insert(LzDecoder::new(dict_size, fh.compression.version))
+            };
+            decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         }
     }
 
@@ -1625,12 +1608,12 @@ impl RarArchive {
         let mut writer_factory = writer_factory;
 
         let chunks = if fh.compression.format == ArchiveFormat::Rar4 {
-            if let Some(decoder) = solid_decoder_rar4 {
+            let decoder = if let Some(decoder) = solid_decoder_rar4 {
                 decoder.prepare_solid_continuation();
+                decoder
             } else {
-                *solid_decoder_rar4 = Some(Rar4LzDecoder::new(dict_size));
-            }
-            let decoder = solid_decoder_rar4.as_mut().unwrap();
+                solid_decoder_rar4.insert(Rar4LzDecoder::new(dict_size))
+            };
             let crc_clone = shared_crc.clone();
             let blake_clone = shared_blake.clone();
             decoder.decompress_reader_to_writer_chunked(
@@ -1652,12 +1635,12 @@ impl RarArchive {
                 },
             )?
         } else {
-            if let Some(decoder) = solid_decoder {
+            let decoder = if let Some(decoder) = solid_decoder {
                 decoder.prepare_solid_continuation();
+                decoder
             } else {
-                *solid_decoder = Some(LzDecoder::new(dict_size, fh.compression.version));
-            }
-            let decoder = solid_decoder.as_mut().unwrap();
+                solid_decoder.insert(LzDecoder::new(dict_size, fh.compression.version))
+            };
             let crc_clone = shared_crc.clone();
             let blake_clone = shared_blake.clone();
             decoder.decompress_reader_to_writer_chunked(
@@ -2931,10 +2914,16 @@ impl<W: Write> Write for HashTrackingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
         if let Some(ref hasher) = self.crc {
-            hasher.lock().unwrap().update(&buf[..n]);
+            hasher
+                .lock()
+                .map_err(|_| std::io::Error::other("RAR CRC tracker mutex poisoned"))?
+                .update(&buf[..n]);
         }
         if let Some(ref hasher) = self.blake2 {
-            hasher.lock().unwrap().update(&buf[..n]);
+            hasher
+                .lock()
+                .map_err(|_| std::io::Error::other("RAR BLAKE2 tracker mutex poisoned"))?
+                .update(&buf[..n]);
         }
         Ok(n)
     }
@@ -2942,6 +2931,26 @@ impl<W: Write> Write for HashTrackingWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+fn finalize_shared_crc32(shared: Arc<std::sync::Mutex<crc32fast::Hasher>>) -> RarResult<u32> {
+    let mutex = Arc::try_unwrap(shared).map_err(|_| RarError::CorruptArchive {
+        detail: "RAR CRC tracker still has active writers after extraction".into(),
+    })?;
+    let hasher = mutex.into_inner().map_err(|_| RarError::CorruptArchive {
+        detail: "RAR CRC tracker mutex poisoned".into(),
+    })?;
+    Ok(hasher.finalize())
+}
+
+fn finalize_shared_blake2(shared: Arc<std::sync::Mutex<Blake2spHasher>>) -> RarResult<[u8; 32]> {
+    let mutex = Arc::try_unwrap(shared).map_err(|_| RarError::CorruptArchive {
+        detail: "RAR BLAKE2 tracker still has active writers after extraction".into(),
+    })?;
+    let hasher = mutex.into_inner().map_err(|_| RarError::CorruptArchive {
+        detail: "RAR BLAKE2 tracker mutex poisoned".into(),
+    })?;
+    Ok(hasher.finalize())
 }
 
 /// Metadata captured from continuation headers discovered during streaming.
@@ -3269,7 +3278,12 @@ impl Read for ChainedSegmentReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if self.remaining_in_segment > 0 {
-                let reader = self.current_reader.as_mut().unwrap();
+                let reader = self.current_reader.as_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "RAR segment reader missing current volume",
+                    )
+                })?;
                 let to_read = buf.len().min(self.remaining_in_segment as usize);
                 let n = reader.read(&mut buf[..to_read])?;
                 if n == 0 {

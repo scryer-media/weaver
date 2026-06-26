@@ -162,7 +162,8 @@ impl TestHarness {
 
         let (handle, metrics, shared_state, scheduler_task) = spawn_test_scheduler(db.clone());
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
-        let auth_cache = LoginAuthCache::from_credentials(None);
+        let auth_cache =
+            LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));

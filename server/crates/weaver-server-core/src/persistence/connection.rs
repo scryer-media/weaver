@@ -778,7 +778,9 @@ impl Database {
 
             for (id, plaintext) in &server_rows {
                 let val = Some(plaintext.clone());
-                if let Some(encrypted) = maybe_encrypt(Some(&key), &val) {
+                if let Some(encrypted) =
+                    maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
+                {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE servers SET password = {} WHERE id = {}",
@@ -809,7 +811,9 @@ impl Database {
 
             for (id, plaintext) in &feed_rows {
                 let val = Some(plaintext.clone());
-                if let Some(encrypted) = maybe_encrypt(Some(&key), &val) {
+                if let Some(encrypted) =
+                    maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
+                {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE rss_feeds SET password = {} WHERE id = {}",

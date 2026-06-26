@@ -81,23 +81,28 @@ fn is_encrypted_detection() {
 #[test]
 fn maybe_encrypt_none_returns_none() {
     let key = EncryptionKey::generate();
-    assert!(maybe_encrypt(Some(&key), &None).is_none());
+    assert!(maybe_encrypt(Some(&key), &None).unwrap().is_none());
 }
 
 #[test]
 fn maybe_encrypt_empty_returns_empty() {
     let key = EncryptionKey::generate();
     assert_eq!(
-        maybe_encrypt(Some(&key), &Some(String::new())),
+        maybe_encrypt(Some(&key), &Some(String::new())).unwrap(),
         Some(String::new())
     );
+}
+
+#[test]
+fn maybe_encrypt_requires_key_for_plaintext() {
+    assert!(maybe_encrypt(None, &Some("my-password".to_string())).is_err());
 }
 
 #[test]
 fn maybe_encrypt_decrypt_round_trip() {
     let key = EncryptionKey::generate();
     let original = Some("my-password".to_string());
-    let encrypted = maybe_encrypt(Some(&key), &original);
+    let encrypted = maybe_encrypt(Some(&key), &original).unwrap();
     assert!(encrypted.as_ref().unwrap().starts_with(ENCRYPTED_PREFIX));
     let decrypted = maybe_decrypt(Some(&key), encrypted);
     assert_eq!(decrypted, original);

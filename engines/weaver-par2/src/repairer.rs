@@ -25,7 +25,8 @@ use crate::packet::{Packet, scan_packets_from_path_with_set_ids};
 use crate::par2_set::Par2FileSet;
 use crate::path::is_generated_par2_artifact_name;
 use crate::repair::{
-    DEFAULT_REPAIR_MEMORY_LIMIT, RepairOptions, execute_repair_with_options, plan_repair,
+    DEFAULT_REPAIR_MEMORY_LIMIT, RepairOptions, execute_repair_with_options,
+    plan_repair_with_memory_limit, repair_matrix_resource_limit_reason,
 };
 use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
@@ -50,6 +51,7 @@ pub enum Par2RepairStatus {
     RepairPossible,
     Repaired,
     Insufficient,
+    ResourceLimited,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -222,7 +224,14 @@ impl Par2Repairer {
         packet_diagnostics.inconsistent_packets = state.inconsistent_packets;
 
         let scan = state.scan(&self.options)?;
-        let verification = state.verification_result();
+        let mut verification = state.verification_result();
+        if let Some(reason) = repair_matrix_resource_limit_reason(
+            &state.set,
+            &verification,
+            self.options.memory_limit,
+        )? {
+            verification.repairable = Repairability::ResourceLimited { reason };
+        }
 
         if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
             return Ok(state.outcome(
@@ -236,23 +245,24 @@ impl Par2Repairer {
         }
 
         if !self.options.repair {
-            let status = match verification.repairable {
+            let status = match &verification.repairable {
                 Repairability::NotNeeded => Par2RepairStatus::Verified,
                 Repairability::Repairable { .. } => Par2RepairStatus::RepairPossible,
                 Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
+                Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
             return Ok(state.outcome(status, 0, 0, packet_diagnostics, scan, verification));
         }
 
-        if matches!(verification.repairable, Repairability::Insufficient { .. }) {
-            return Ok(state.outcome(
-                Par2RepairStatus::Insufficient,
-                0,
-                0,
-                packet_diagnostics,
-                scan,
-                verification,
-            ));
+        if matches!(
+            &verification.repairable,
+            Repairability::Insufficient { .. } | Repairability::ResourceLimited { .. }
+        ) {
+            let status = match &verification.repairable {
+                Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
+                _ => Par2RepairStatus::Insufficient,
+            };
+            return Ok(state.outcome(status, 0, 0, packet_diagnostics, scan, verification));
         }
 
         let repair = state.repair(&self.options, &verification)?;
@@ -1203,7 +1213,8 @@ impl RepairState {
                 &staged_file_ids,
                 self.set.slice_size,
             )?;
-            let plan = plan_repair(&self.set, verification)?;
+            let plan =
+                plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
             bytes_reconstructed = plan
                 .missing_slices
                 .iter()
@@ -2609,6 +2620,40 @@ mod tests {
             payload
         );
         assert_eq!(fs::metadata(&src).unwrap().len(), 64 * 1024 * 1024 + 4096);
+    }
+
+    #[test]
+    fn preview_reports_resource_limited_when_matrix_budget_is_too_small() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+        let mut set = synthetic_set(&[("data.bin", &file_data)], slice_size);
+        for exponent in 0..2u32 {
+            set.recovery_slices.insert(
+                exponent,
+                crate::par2_set::RecoverySlice {
+                    exponent,
+                    data: vec![0u8; slice_size as usize].into(),
+                },
+            );
+        }
+
+        let mut damaged = file_data.clone();
+        damaged[..64].fill(0);
+        damaged[64..128].fill(0);
+        fs::write(dir.path().join("data.bin"), damaged).unwrap();
+
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.file_set = Some(set);
+        options.repair = false;
+        options.memory_limit = Some(8);
+
+        let outcome = Par2Repairer::new(options).verify_or_repair().unwrap();
+        assert_eq!(outcome.status, Par2RepairStatus::ResourceLimited);
+        assert!(matches!(
+            outcome.verification.repairable,
+            Repairability::ResourceLimited { .. }
+        ));
     }
 
     #[cfg(feature = "slow-tests")]

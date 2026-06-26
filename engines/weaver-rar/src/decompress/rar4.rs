@@ -183,6 +183,15 @@ impl Rar4LzDecoder {
         }
     }
 
+    fn ppm_model_mut(&mut self) -> RarResult<&mut Model> {
+        self.ppm_model
+            .as_mut()
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR4 PPM escape sequence requested without an initialized PPM model"
+                    .to_string(),
+            })
+    }
+
     fn flush_threshold(&self) -> usize {
         self.window
             .dict_size()
@@ -752,7 +761,9 @@ impl Rar4LzDecoder {
                 });
             }
 
-            let mut data = self.window.copy_output(next_start, filter_block_length);
+            let mut data = self
+                .window
+                .try_copy_output(next_start, filter_block_length)?;
             let mut chain_len = 1usize;
             while chain_len < self.pending_vm_filters.len() {
                 let next = &self.pending_vm_filters[chain_len];
@@ -1737,13 +1748,19 @@ impl Rar4LzDecoder {
                     if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
                         if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
-                            let bytes = self.window.copy_output(0, output_size as usize);
+                            let bytes = self
+                                .window
+                                .try_copy_output(0, output_size as usize)
+                                .unwrap_or_default();
                             let _ = std::fs::write(path, &bytes);
                         }
                         let tail_len = (output_size as usize).min(160);
                         if tail_len > 0 {
                             let start = output_size - tail_len as u64;
-                            let tail = self.window.copy_output(start, tail_len);
+                            let tail = self
+                                .window
+                                .try_copy_output(start, tail_len)
+                                .unwrap_or_default();
                             eprintln!(
                                 "RAR4 PPM decode_char tail[{start}..{output_size}]: {:?}",
                                 String::from_utf8_lossy(&tail)
@@ -1758,19 +1775,25 @@ impl Rar4LzDecoder {
                 let ch = ch as u8;
                 if ch == self.ppm_esc_char {
                     // Escape sequence — decode the command byte.
-                    let model = self.ppm_model.as_mut().unwrap();
+                    let model = self.ppm_model_mut()?;
                     let next_ch = model.decode_char(&mut rc);
                     if next_ch == -1 {
                         if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
                             if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
-                                let bytes = self.window.copy_output(0, output_size as usize);
+                                let bytes = self
+                                    .window
+                                    .try_copy_output(0, output_size as usize)
+                                    .unwrap_or_default();
                                 let _ = std::fs::write(path, &bytes);
                             }
                             let tail_len = (output_size as usize).min(160);
                             if tail_len > 0 {
                                 let start = output_size - tail_len as u64;
-                                let tail = self.window.copy_output(start, tail_len);
+                                let tail = self
+                                    .window
+                                    .try_copy_output(start, tail_len)
+                                    .unwrap_or_default();
                                 eprintln!(
                                     "RAR4 PPM next_ch tail[{start}..{output_size}]: {:?}",
                                     String::from_utf8_lossy(&tail)
@@ -1803,7 +1826,7 @@ impl Rar4LzDecoder {
                             let mut distance: u32 = 0;
                             let mut length: u32 = 0;
                             let mut failed = false;
-                            let model = self.ppm_model.as_mut().unwrap();
+                            let model = self.ppm_model_mut()?;
                             for i in 0..4 {
                                 let b = model.decode_char(&mut rc);
                                 if b == -1 {
@@ -1836,7 +1859,7 @@ impl Rar4LzDecoder {
                             output_size += actual as u64;
                         }
                         5 => {
-                            let model = self.ppm_model.as_mut().unwrap();
+                            let model = self.ppm_model_mut()?;
                             let len_byte = model.decode_char(&mut rc);
                             if len_byte == -1 {
                                 self.ppm_model = None;

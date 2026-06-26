@@ -963,51 +963,57 @@ fn build_rar4_encrypted_file_header(
     finalize_rar4_header_crc(buf)
 }
 
-#[test]
-fn test_rar4_encrypted_stored_file() {
+fn encrypt_rar4_stored_payload(content: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
     use aes::Aes128;
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
 
     type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
-    let password = "secret123";
-    let salt: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-    let content = b"RAR4 encrypted stored content!!"; // 31 bytes
-
-    // Compute CRC of plaintext.
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(content);
-    let crc = hasher.finalize();
-
-    // Derive key/IV and encrypt.
-    // We call the crypto module directly to build ciphertext.
-    let (key, iv) = weaver_rar::crypto::rar4_derive_key(password, Some(&salt));
-
-    // Pad content to AES block boundary (16 bytes).
-    let padded_len = (content.len() + 15) & !15; // round up to 32
-    let mut plaintext_padded = vec![0u8; padded_len];
-    plaintext_padded[..content.len()].copy_from_slice(content);
-
-    let mut ciphertext = plaintext_padded.clone();
-    let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
+    let padded_len = (content.len() + 15) & !15;
+    let mut ciphertext = vec![0u8; padded_len];
+    ciphertext[..content.len()].copy_from_slice(content);
+    let encryptor = Aes128CbcEnc::new(key.into(), iv.into());
     encryptor
         .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
         .unwrap();
+    ciphertext
+}
 
-    // Build the archive.
+fn build_rar4_encrypted_stored_archive(
+    filename: &str,
+    content: &[u8],
+    salt: &[u8; 8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Vec<u8> {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(content);
+    let crc = hasher.finalize();
+    let ciphertext = encrypt_rar4_stored_payload(content, key, iv);
+
     let mut vol = Vec::new();
     vol.extend_from_slice(&RAR4_SIG);
     vol.extend_from_slice(&build_rar4_archive_header(0));
     vol.extend_from_slice(&build_rar4_encrypted_file_header(
-        "secret.txt",
+        filename,
         ciphertext.len() as u32,
         content.len() as u32,
         crc,
-        &salt,
-        0, // no split flags
+        salt,
+        0,
     ));
     vol.extend_from_slice(&ciphertext);
     vol.extend_from_slice(&build_rar4_end_header(false));
+    vol
+}
+
+#[test]
+fn test_rar4_encrypted_stored_file() {
+    let password = "secret123";
+    let salt: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let content = b"RAR4 encrypted stored content!!"; // 31 bytes
+    let (key, iv) = weaver_rar::crypto::rar4_derive_key(password, Some(&salt));
+    let vol = build_rar4_encrypted_stored_archive("secret.txt", content, &salt, &key, &iv);
 
     // Open and extract with password.
     let mut archive =
@@ -1031,6 +1037,73 @@ fn test_rar4_encrypted_stored_file() {
 
     // The decrypted data is padded to block boundary; unpacked_size truncates it.
     assert_eq!(result, content);
+}
+
+const RAR4_LONG_PASSWORD: &str = "abcdefghijklmnopqrstuvwxyzabcdef";
+const RAR4_LONG_PASSWORD_SALT: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+const RAR4_LONG_PASSWORD_UNRAR_KEY: [u8; 16] = [
+    0x64, 0x09, 0xb2, 0x06, 0xed, 0x97, 0x47, 0x88, 0xe3, 0xd4, 0x81, 0x9e, 0x4e, 0xdb, 0xa9, 0xb1,
+];
+const RAR4_LONG_PASSWORD_UNRAR_IV: [u8; 16] = [
+    0x87, 0xbb, 0xc0, 0xbf, 0x98, 0xda, 0xa1, 0xaa, 0x13, 0xe0, 0x10, 0xcf, 0x14, 0xce, 0xd6, 0xce,
+];
+const RAR4_LONG_PASSWORD_CONTENT: &[u8] = b"RAR4 long-password fixture verified by local unrar";
+
+fn build_rar4_long_password_unrar_fixture() -> Vec<u8> {
+    build_rar4_encrypted_stored_archive(
+        "long-password.txt",
+        RAR4_LONG_PASSWORD_CONTENT,
+        &RAR4_LONG_PASSWORD_SALT,
+        &RAR4_LONG_PASSWORD_UNRAR_KEY,
+        &RAR4_LONG_PASSWORD_UNRAR_IV,
+    )
+}
+
+#[test]
+fn test_rar4_long_password_unrar_vector_archive_extracts() {
+    let vol = build_rar4_long_password_unrar_fixture();
+    let mut archive =
+        weaver_rar::RarArchive::open_with_password(Cursor::new(vol), RAR4_LONG_PASSWORD).unwrap();
+
+    let result = archive
+        .extract_by_name(
+            "long-password.txt",
+            &weaver_rar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(result, RAR4_LONG_PASSWORD_CONTENT);
+}
+
+#[test]
+fn test_rar4_long_password_fixture_is_accepted_by_local_unrar_when_configured() {
+    let Ok(unrar_bin) = std::env::var("UNRAR_BIN") else {
+        eprintln!("set UNRAR_BIN to run the local unrar oracle check");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive_path = dir.path().join("long-password.rar");
+    std::fs::write(&archive_path, build_rar4_long_password_unrar_fixture()).unwrap();
+
+    let output = std::process::Command::new(unrar_bin)
+        .arg("t")
+        .arg("-idq")
+        .arg(format!("-p{RAR4_LONG_PASSWORD}"))
+        .arg(&archive_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "local unrar rejected long-password fixture\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1157,7 +1230,7 @@ fn test_blake2_hash_propagated_to_member_info() {
 fn test_symlink_propagated_to_member_info() {
     // Extra record type 0x05 = REDIRECTION
     // Body: redir_type(vint) + flags(vint) + name_length(vint) + name
-    let target = "/usr/bin/target";
+    let target = "usr/bin/target";
     let mut redir_body = Vec::new();
     redir_body.extend_from_slice(&encode_vint(1)); // UnixSymlink
     redir_body.extend_from_slice(&encode_vint(0)); // flags
@@ -1927,6 +2000,25 @@ fn test_rar4_hp_encrypted_large() {
         password: Some("e2e-test-password".into()),
     };
     archive.extract_member(0, &opts, None).unwrap();
+}
+
+#[test]
+#[ignore = "requires rar4/rar4_hp_long_password.rar generated by tests/fixtures/generate_edge_cases.sh"]
+fn test_rar4_hp_long_password_fixture_gate() {
+    let path = fixture("rar4", "rar4_hp_long_password.rar");
+    assert!(
+        path.exists(),
+        "missing real RAR4 long-password fixture; generate with engines/weaver-rar/tests/fixtures/generate_edge_cases.sh"
+    );
+
+    let password = "abcdefghijklmnopqrstuvwxyzabcdef";
+    let mut archive = open_single_with_password("rar4", "rar4_hp_long_password.rar", password);
+    let opts = weaver_rar::ExtractOptions {
+        verify: true,
+        password: Some(password.into()),
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result, b"RAR4 long password KDF fixture\n");
 }
 
 // -- RAR5 header-encrypted (-hp) fixtures ---------------------------------

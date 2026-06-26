@@ -61,6 +61,15 @@ pub fn plan_repair(
     par2_set: &Par2FileSet,
     verification: &VerificationResult,
 ) -> Result<RepairPlan> {
+    plan_repair_with_memory_limit(par2_set, verification, Some(DEFAULT_REPAIR_MEMORY_LIMIT))
+}
+
+/// Plan a repair operation using an explicit repair workspace memory limit.
+pub fn plan_repair_with_memory_limit(
+    par2_set: &Par2FileSet,
+    verification: &VerificationResult,
+    memory_limit: Option<usize>,
+) -> Result<RepairPlan> {
     // Check repairability.
     match &verification.repairable {
         Repairability::NotNeeded => {
@@ -77,6 +86,11 @@ pub fn plan_repair(
                 needed: *blocks_needed,
                 available: *blocks_available,
                 deficit: *deficit,
+            });
+        }
+        Repairability::ResourceLimited { reason } => {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: format!("PAR2 verification is resource-limited: {reason}"),
             });
         }
         Repairability::Repairable { .. } => {}
@@ -171,15 +185,10 @@ pub fn plan_repair(
             deficit: (missing_count - all_exponents.len()) as u32,
         });
     }
-    if estimated_repair_matrix_bytes(total_input_slices, missing_count)
-        > DEFAULT_REPAIR_MEMORY_LIMIT
+    if let Some(reason) =
+        repair_matrix_limit_reason(total_input_slices, missing_count, memory_limit)
     {
-        return Err(Par2Error::ResourceLimitExceeded {
-            reason: format!(
-                "repair matrix for {missing_count} missing slices would exceed the {} byte repair memory limit",
-                DEFAULT_REPAIR_MEMORY_LIMIT
-            ),
-        });
+        return Err(Par2Error::ResourceLimitExceeded { reason });
     }
 
     // Compute constants for all input slices.
@@ -282,6 +291,24 @@ pub fn plan_repair(
     })
 }
 
+pub(crate) fn repair_matrix_resource_limit_reason(
+    par2_set: &Par2FileSet,
+    verification: &VerificationResult,
+    memory_limit: Option<usize>,
+) -> Result<Option<String>> {
+    if !matches!(verification.repairable, Repairability::Repairable { .. }) {
+        return Ok(None);
+    }
+
+    let total_input_slices = total_input_slices_for_set(par2_set)?;
+    let missing_count = verification.total_missing_blocks as usize;
+    Ok(repair_matrix_limit_reason(
+        total_input_slices,
+        missing_count,
+        memory_limit,
+    ))
+}
+
 /// Options controlling repair execution.
 pub struct RepairOptions {
     /// If set, repair will check this token and stop early if cancelled.
@@ -357,6 +384,52 @@ fn estimated_repair_matrix_bytes(total_inputs: usize, missing_rows: usize) -> us
         .saturating_mul(missing_rows)
         .saturating_add(missing_rows.saturating_mul(total_inputs));
     working_words.saturating_mul(std::mem::size_of::<u16>())
+}
+
+fn repair_memory_limit_bytes(memory_limit: Option<usize>) -> usize {
+    memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT)
+}
+
+fn repair_matrix_limit_reason(
+    total_input_slices: usize,
+    missing_count: usize,
+    memory_limit: Option<usize>,
+) -> Option<String> {
+    let estimated = estimated_repair_matrix_bytes(total_input_slices, missing_count);
+    let limit = repair_memory_limit_bytes(memory_limit);
+    (estimated > limit).then(|| {
+        format!(
+            "repair matrix for {missing_count} missing slices would require {estimated} bytes, exceeding the {limit} byte repair memory limit"
+        )
+    })
+}
+
+fn total_input_slices_for_set(par2_set: &Par2FileSet) -> Result<usize> {
+    let mut total = 0usize;
+    for file_id in &par2_set.recovery_file_ids {
+        let Some(desc) = par2_set.file_description(file_id) else {
+            continue;
+        };
+        let slice_count =
+            usize::try_from(par2_set.slice_count_for_file(desc.length)).map_err(|_| {
+                Par2Error::ResourceLimitExceeded {
+                    reason: format!(
+                        "file {} has more than {MAX_SLICES_PER_FILE} addressable PAR2 slices",
+                        desc.filename
+                    ),
+                }
+            })?;
+        if slice_count > MAX_SLICES_PER_FILE {
+            return Err(Par2Error::ResourceLimitExceeded {
+                reason: format!(
+                    "file {} has {slice_count} PAR2 slices; max is {MAX_SLICES_PER_FILE}",
+                    desc.filename
+                ),
+            });
+        }
+        total = total.saturating_add(slice_count);
+    }
+    Ok(total)
 }
 
 fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize) -> usize {
@@ -1298,7 +1371,7 @@ mod tests {
     use crate::packet::header;
     use crate::par2_set::{Par2FileSet, RecoverySlice};
     use crate::types::SliceChecksum;
-    use crate::verify::{self, MemoryFileAccess};
+    use crate::verify::{self, FileStatus, FileVerification, MemoryFileAccess};
     use bytes::Bytes;
     use md5::{Digest, Md5};
     use tempfile::tempdir;
@@ -1574,6 +1647,53 @@ mod tests {
     }
 
     #[test]
+    fn plan_repair_rejects_resource_limited_verification() {
+        let slice_size = 64u64;
+        let file_data = vec![0xABu8; 128];
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 2);
+        let result = VerificationResult {
+            files: vec![FileVerification {
+                file_id,
+                filename: "testfile.dat".to_string(),
+                status: FileStatus::Damaged(0),
+                valid_slices: Vec::new(),
+                missing_slice_count: 0,
+            }],
+            recovery_blocks_available: 2,
+            total_missing_blocks: 0,
+            repairable: Repairability::ResourceLimited {
+                reason: "file testfile.dat exceeds verifier slice limits".to_string(),
+            },
+        };
+
+        let err = plan_repair(&par2_set, &result).unwrap_err();
+        assert!(matches!(err, Par2Error::ResourceLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn plan_repair_respects_configured_matrix_memory_limit() {
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
+        let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 3);
+
+        let mut damaged = file_data.clone();
+        damaged[..64].fill(0);
+        damaged[64..128].fill(0);
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        assert_eq!(result.total_missing_blocks, 2);
+
+        let err = plan_repair_with_memory_limit(&par2_set, &result, Some(8)).unwrap_err();
+        assert!(matches!(err, Par2Error::ResourceLimitExceeded { .. }));
+
+        let plan = plan_repair_with_memory_limit(&par2_set, &result, Some(64)).unwrap();
+        assert_eq!(plan.missing_slices.len(), 2);
+    }
+
+    #[test]
     fn repair_with_partial_last_slice() {
         // File size not a multiple of slice_size.
         let slice_size = 64u64;
@@ -1625,7 +1745,7 @@ mod tests {
             &par2_set,
             &mut access,
             &RepairOptions {
-                memory_limit: Some(1),
+                memory_limit: Some(32),
                 ..RepairOptions::default()
             },
         )
@@ -1661,7 +1781,7 @@ mod tests {
             &par2_set,
             &mut access,
             &RepairOptions {
-                memory_limit: Some(1),
+                memory_limit: Some(32),
                 ..RepairOptions::default()
             },
         )

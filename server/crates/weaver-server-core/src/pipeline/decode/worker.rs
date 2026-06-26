@@ -1,8 +1,33 @@
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::time::Instant;
 
 use super::*;
+
+#[derive(Debug)]
+struct SegmentWriteError {
+    file_id: NzbFileId,
+    source: io::Error,
+}
+
+impl SegmentWriteError {
+    fn new(file_id: NzbFileId, source: io::Error) -> Self {
+        Self { file_id, source }
+    }
+}
+
+impl fmt::Display for SegmentWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.file_id, self.source)
+    }
+}
+
+impl std::error::Error for SegmentWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 impl Pipeline {
     pub(crate) fn yenc_name_matches_rewritten_source(
@@ -162,14 +187,13 @@ impl Pipeline {
                         break;
                     };
 
-                    if let Err(e) = self
+                    if let Err(error) = self
                         .persist_out_of_order_segment(file_id, offset, segment)
                         .await
                     {
-                        warn!(
-                            file_id = %file_id,
-                            error = %e,
-                            "failed to flush quiescent buffered segment"
+                        self.fail_job_for_disk_write(
+                            error,
+                            "failed to flush quiescent buffered segment",
                         );
                         break;
                     }
@@ -383,26 +407,48 @@ impl Pipeline {
         };
         self.note_write_buffered(buffered_len, 1);
 
-        if let Err(e) = self.persist_ready_segments(file_id, ready.0, ready.1).await {
-            warn!(
-                file_id = %file_id,
-                error = %e,
-                "disk write failed for sequential decoded segments"
+        if let Err(error) = self.persist_ready_segments(file_id, ready.0, ready.1).await {
+            self.fail_job_for_disk_write(
+                error,
+                "disk write failed for sequential decoded segments",
             );
             return;
         }
 
-        if let Err(e) = self.enforce_file_write_backlog(file_id).await {
-            warn!(
-                file_id = %file_id,
-                error = %e,
-                "failed to relieve per-file write backlog"
-            );
+        if let Err(error) = self.enforce_file_write_backlog(file_id).await {
+            self.fail_job_for_disk_write(error, "failed to relieve per-file write backlog");
             return;
         }
 
-        if let Err(e) = self.relieve_global_write_backlog().await {
-            warn!(error = %e, "failed to relieve global write backlog");
+        if let Err(error) = self.relieve_global_write_backlog().await {
+            self.fail_job_for_disk_write(error, "failed to relieve global write backlog");
+        }
+    }
+
+    fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
+        let job_id = error.file_id.job_id;
+        let message = format!("{context} for {}: {}", error.file_id, error.source);
+        error!(
+            job_id = job_id.0,
+            file_id = %error.file_id,
+            error = %error.source,
+            context,
+            "disk write failed; failing job"
+        );
+        self.fail_job(job_id, message);
+    }
+
+    fn release_unwritten_segments<I>(&mut self, segments: I)
+    where
+        I: IntoIterator<Item = (u64, BufferedDecodedSegment)>,
+    {
+        let (released_bytes, released_segments) = segments
+            .into_iter()
+            .fold((0usize, 0usize), |(bytes, count), (_, segment)| {
+                (bytes + segment.len_bytes(), count + 1)
+            });
+        if released_bytes > 0 || released_segments > 0 {
+            self.release_write_buffered(released_bytes, released_segments);
         }
     }
 
@@ -411,7 +457,7 @@ impl Pipeline {
         file_id: NzbFileId,
         ready: Vec<(u64, BufferedDecodedSegment)>,
         contiguous_end_after_ready: u64,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), SegmentWriteError> {
         if ready.is_empty() {
             self.remove_empty_write_buffer(file_id);
             return Ok(());
@@ -427,12 +473,16 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
-        for (offset, segment) in ready {
+        let mut ready = ready.into_iter();
+        while let Some((offset, segment)) = ready.next() {
             let segment_bytes = segment.len_bytes();
             let write_result =
                 write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
             self.release_write_buffered(segment_bytes, 1);
-            write_result?;
+            if let Err(source) = write_result {
+                self.release_unwritten_segments(ready);
+                return Err(SegmentWriteError::new(file_id, source));
+            }
             crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
             self.commit_persisted_segment(offset, segment, &filename, &working_dir)
                 .await;
@@ -450,7 +500,7 @@ impl Pipeline {
     async fn enforce_file_write_backlog(
         &mut self,
         file_id: NzbFileId,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), SegmentWriteError> {
         loop {
             let to_persist = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
@@ -471,7 +521,7 @@ impl Pipeline {
         }
     }
 
-    async fn relieve_global_write_backlog(&mut self) -> Result<(), std::io::Error> {
+    async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
         while self.write_buffered_bytes > self.write_backlog_budget_bytes {
             let candidate_file = self
                 .write_buffers
@@ -505,7 +555,7 @@ impl Pipeline {
         file_id: NzbFileId,
         offset: u64,
         segment: BufferedDecodedSegment,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), SegmentWriteError> {
         let segment_bytes = segment.len_bytes();
         let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
         else {
@@ -521,7 +571,9 @@ impl Pipeline {
             .disk_write_latency_us
             .store(write_us, Ordering::Relaxed);
         self.release_write_buffered(segment_bytes, 1);
-        write_result?;
+        if let Err(source) = write_result {
+            return Err(SegmentWriteError::new(file_id, source));
+        }
         crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
 
         if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
@@ -618,7 +670,8 @@ impl Pipeline {
                                 leftover_segments = leftovers.len(),
                                 "file reached complete state with buffered decoded segments still pending; flushing directly"
                             );
-                            for (offset, buffered) in leftovers {
+                            let mut leftovers = leftovers.into_iter();
+                            while let Some((offset, buffered)) = leftovers.next() {
                                 let buffered_bytes = buffered.len_bytes();
                                 if let Err(e) = write_segment_to_disk(
                                     &file_path,
@@ -633,6 +686,13 @@ impl Pipeline {
                                         error = %e,
                                         "disk write failed during final buffered flush"
                                     );
+                                    self.release_write_buffered(buffered_bytes, 1);
+                                    self.release_unwritten_segments(leftovers);
+                                    self.fail_job_for_disk_write(
+                                        SegmentWriteError::new(file_id, e),
+                                        "disk write failed during final buffered flush",
+                                    );
+                                    return;
                                 }
                                 self.release_write_buffered(buffered_bytes, 1);
                             }

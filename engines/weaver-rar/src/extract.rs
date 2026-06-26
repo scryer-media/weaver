@@ -10,6 +10,7 @@ use tempfile::NamedTempFile;
 use crate::decompress;
 use crate::error::{RarError, RarResult};
 use crate::header::file::FileHeader;
+use crate::limits::Limits;
 use crate::progress::ProgressHandler;
 use crate::types::{CompressionMethod, FileHash, MemberInfo};
 
@@ -44,6 +45,40 @@ fn spool_threshold_bytes() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SPOOL_THRESHOLD_BYTES)
+}
+
+fn enforce_member_limits(file_header: &FileHeader) -> RarResult<()> {
+    let limits = Limits::default();
+    if file_header.data_size > limits.max_data_segment {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "member {} compressed data size {} exceeds maximum {}",
+                file_header.name, file_header.data_size, limits.max_data_segment
+            ),
+        });
+    }
+
+    if let Some(unpacked_size) = file_header.unpacked_size
+        && unpacked_size > limits.max_unpacked_size
+    {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "member {} unpacked size {} exceeds maximum {}",
+                file_header.name, unpacked_size, limits.max_unpacked_size
+            ),
+        });
+    }
+
+    if file_header.compression.method != CompressionMethod::Store
+        && file_header.compression.dict_size > limits.max_dict_size
+    {
+        return Err(RarError::DictionaryTooLarge {
+            size: file_header.compression.dict_size,
+            max: limits.max_dict_size,
+        });
+    }
+
+    Ok(())
 }
 
 pub enum ExtractedMember {
@@ -262,6 +297,7 @@ where
             version: file_header.compression.version,
         });
     }
+    enforce_member_limits(file_header)?;
 
     // Seek to the data offset
     reader
@@ -353,13 +389,21 @@ pub fn extract_member<R: Read + Seek>(
         });
     }
 
+    enforce_member_limits(file_header)?;
+
     // Seek to the data area.
     reader
         .seek(SeekFrom::Start(file_header.data_offset))
         .map_err(RarError::Io)?;
 
     // Read the compressed data area.
-    let data_size = file_header.data_size as usize;
+    let data_size =
+        usize::try_from(file_header.data_size).map_err(|_| RarError::ResourceLimit {
+            detail: format!(
+                "member {} compressed data size {} exceeds platform capacity",
+                file_header.name, file_header.data_size
+            ),
+        })?;
     let mut compressed = vec![0u8; data_size];
     if data_size > 0 {
         reader.read_exact(&mut compressed).map_err(|e| {
@@ -688,5 +732,63 @@ mod tests {
 
         assert_eq!(bytes_written, test_data.len() as u64);
         assert_eq!(output, test_data);
+    }
+
+    #[test]
+    fn extract_member_rejects_data_size_above_limit_before_allocation() {
+        let test_data = b"small";
+        let mut fh = make_stored_file_header("huge-packed.bin", test_data, 0);
+        fh.data_size = Limits::default().max_data_segment + 1;
+
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn extract_member_rejects_unpacked_size_above_limit() {
+        let test_data = b"small";
+        let mut fh = make_stored_file_header("huge-unpacked.bin", test_data, 0);
+        fh.unpacked_size = Some(Limits::default().max_unpacked_size + 1);
+
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn extract_member_rejects_compressed_dictionary_above_limit() {
+        let test_data = b"small";
+        let mut fh = make_stored_file_header("huge-dict.bin", test_data, 0);
+        fh.compression.method = CompressionMethod::Normal;
+        fh.compression.dict_size = Limits::default().max_dict_size + 1;
+
+        let mut reader = std::io::Cursor::new(test_data.to_vec());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(RarError::DictionaryTooLarge { .. })));
     }
 }

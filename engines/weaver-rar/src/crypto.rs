@@ -19,7 +19,7 @@ use aes::cipher::{Block, BlockModeDecrypt, BlockSizeUser};
 #[cfg(not(feature = "native-crypto"))]
 use aes::{Aes128, Aes256};
 #[cfg(feature = "native-crypto")]
-use aws_lc_rs::{digest as aws_digest, hmac as aws_hmac};
+use aws_lc_rs::hmac as aws_hmac;
 #[cfg(feature = "native-crypto")]
 use aws_lc_sys::{
     EVP_CIPHER, EVP_CIPHER_CTX, EVP_CIPHER_CTX_free, EVP_CIPHER_CTX_new,
@@ -31,7 +31,6 @@ use blake2s_simd::blake2sp;
 use cbc::cipher::KeyIvInit;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use sha2::Sha256;
 #[cfg(feature = "native-crypto")]
 use std::ptr::null_mut;
@@ -220,16 +219,18 @@ pub fn derive_rar5_material(
 /// RAR5 KDF: iterations = 1 << kdf_count (confirmed against unrar source).
 /// Returns only the 32-byte key. IVs in RAR5 are read from the stream
 /// (each encrypted block is preceded by a 16-byte IV), not derived.
-pub fn derive_key(password: &str, salt: &[u8; 16], kdf_count: u8) -> ([u8; 32], [u8; 16]) {
+pub fn derive_key(
+    password: &str,
+    salt: &[u8; 16],
+    kdf_count: u8,
+) -> RarResult<([u8; 32], [u8; 16])> {
     // IV is not derived — return zeros. Callers that need an IV read it
     // from the stream (header encryption) or from the file header (file
     // data encryption).
-    (
-        derive_rar5_material(password, salt, kdf_count)
-            .expect("RAR5 KDF inputs should be validated before key derivation")
-            .key,
+    Ok((
+        derive_rar5_material(password, salt, kdf_count)?.key,
         [0u8; 16],
-    )
+    ))
 }
 
 /// Decrypt data using AES-256-CBC.
@@ -427,16 +428,24 @@ impl KdfCache {
     }
 
     /// Derive (or return cached) RAR5 AES-256 key.
-    pub fn derive_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
-        self.derive_material_rar5(password, salt, kdf_count)
-            .expect("RAR5 KDF inputs should be validated before key derivation")
-            .key
+    pub fn derive_key_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+    ) -> RarResult<[u8; 32]> {
+        Ok(self.derive_material_rar5(password, salt, kdf_count)?.key)
     }
 
-    pub fn derive_hash_key_rar5(&self, password: &str, salt: &[u8; 16], kdf_count: u8) -> [u8; 32] {
-        self.derive_material_rar5(password, salt, kdf_count)
-            .expect("RAR5 KDF inputs should be validated before key derivation")
-            .hash_key
+    pub fn derive_hash_key_rar5(
+        &self,
+        password: &str,
+        salt: &[u8; 16],
+        kdf_count: u8,
+    ) -> RarResult<[u8; 32]> {
+        Ok(self
+            .derive_material_rar5(password, salt, kdf_count)?
+            .hash_key)
     }
 
     /// Verify password check value using cached data (avoids separate PBKDF2).
@@ -723,6 +732,151 @@ impl Rar20Decryptor {
 /// RAR4 key derivation iteration count.
 const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 
+#[derive(Clone)]
+struct Rar29Sha1 {
+    state: [u32; 5],
+    buffer: [u8; 64],
+    count: u64,
+}
+
+impl Rar29Sha1 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6745_2301,
+                0xefcd_ab89,
+                0x98ba_dcfe,
+                0x1032_5476,
+                0xc3d2_e1f0,
+            ],
+            buffer: [0; 64],
+            count: 0,
+        }
+    }
+
+    fn process(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        let mut j = (self.count & 63) as usize;
+        self.count += data.len() as u64;
+
+        if j + data.len() > 63 {
+            i = 64 - j;
+            self.buffer[j..64].copy_from_slice(&data[..i]);
+            self.transform_buffer();
+
+            while i + 63 < data.len() {
+                self.transform_block((&data[i..i + 64]).try_into().unwrap());
+                i += 64;
+            }
+            j = 0;
+        }
+
+        if data.len() > i {
+            let len = data.len() - i;
+            self.buffer[j..j + len].copy_from_slice(&data[i..]);
+        }
+    }
+
+    fn process_rar29(&mut self, data: &mut [u8]) {
+        let mut i = 0usize;
+        let mut j = (self.count & 63) as usize;
+        self.count += data.len() as u64;
+
+        if j + data.len() > 63 {
+            i = 64 - j;
+            self.buffer[j..64].copy_from_slice(&data[..i]);
+            self.transform_buffer();
+
+            while i + 63 < data.len() {
+                let workspace = self.transform_block((&data[i..i + 64]).try_into().unwrap());
+                for (chunk, word) in data[i..i + 64].chunks_exact_mut(4).zip(workspace) {
+                    chunk.copy_from_slice(&word.to_le_bytes());
+                }
+                i += 64;
+            }
+            j = 0;
+        }
+
+        if data.len() > i {
+            let len = data.len() - i;
+            self.buffer[j..j + len].copy_from_slice(&data[i..]);
+        }
+    }
+
+    fn finish_words(mut self) -> [u32; 5] {
+        let bit_length = self.count * 8;
+        let mut buf_pos = (self.count & 63) as usize;
+        self.buffer[buf_pos] = 0x80;
+        buf_pos += 1;
+
+        if buf_pos != 56 {
+            if buf_pos > 56 {
+                self.buffer[buf_pos..64].fill(0);
+                self.transform_buffer();
+                buf_pos = 0;
+            }
+            self.buffer[buf_pos..56].fill(0);
+        }
+
+        self.buffer[56..60].copy_from_slice(&((bit_length >> 32) as u32).to_be_bytes());
+        self.buffer[60..64].copy_from_slice(&(bit_length as u32).to_be_bytes());
+        self.transform_buffer();
+        self.state
+    }
+
+    fn transform_buffer(&mut self) -> [u32; 16] {
+        let block = self.buffer;
+        self.transform_block(&block)
+    }
+
+    fn transform_block(&mut self, block: &[u8; 64]) -> [u32; 16] {
+        let mut workspace = [0u32; 16];
+        for (word, chunk) in workspace.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes(chunk.try_into().unwrap());
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e] = self.state;
+        for i in 0..80 {
+            let w = if i < 16 {
+                workspace[i]
+            } else {
+                let value = (workspace[(i + 13) & 15]
+                    ^ workspace[(i + 8) & 15]
+                    ^ workspace[(i + 2) & 15]
+                    ^ workspace[i & 15])
+                    .rotate_left(1);
+                workspace[i & 15] = value;
+                value
+            };
+            let (f, k) = match i {
+                0..=19 => (((b & (c ^ d)) ^ d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((((b | c) & d) | (b & c)), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+
+        workspace
+    }
+}
+
 /// Derive AES-128 key and IV from password and salt using RAR4's custom KDF.
 ///
 /// RAR4 KDF algorithm (reference: unrar crypt3.cpp SetKey30):
@@ -733,9 +887,7 @@ const RAR4_KDF_ITERATIONS: u32 = 0x40000; // 262144
 ///   SHA-1 intermediate digest word H4's low byte is extracted as an IV byte
 /// - After all iterations, the final SHA-1 digest words H0-H3 are extracted as the
 ///   AES-128 key in little-endian byte order per word
-fn rar4_derive_key_rustcrypto(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
-    use sha1::Digest;
-
+fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
     // Encode password as UTF-16LE, then append salt if present — matching
     // unrar's RawPsw buffer for both salted and saltless RAR30 members.
     let mut raw_psw: Vec<u8> = password
@@ -748,92 +900,41 @@ fn rar4_derive_key_rustcrypto(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 1
 
     let iv_interval = RAR4_KDF_ITERATIONS / 16;
     let mut iv = [0u8; 16];
-    let mut sha = Sha1::new();
+    let mut sha = Rar29Sha1::new();
 
     for i in 0..RAR4_KDF_ITERATIONS {
-        sha.update(&raw_psw);
+        sha.process_rar29(&mut raw_psw);
 
         // Append iteration counter as 3 bytes LE.
         let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.update(i_bytes);
+        sha.process(&i_bytes);
 
         // Extract IV byte at each interval boundary (unrar: `I%(HashRounds/16)==0`).
         if i % iv_interval == 0 {
-            let intermediate = sha.clone().finalize();
+            let intermediate = sha.clone().finish_words();
             let iv_index = (i / iv_interval) as usize;
-            // (byte)digest[4] in unrar = low byte of H4 = last byte of big-endian output.
-            iv[iv_index] = intermediate[19];
+            iv[iv_index] = intermediate[4] as u8;
         }
     }
 
-    let digest = sha.finalize();
+    let digest = sha.finish_words();
 
     // unrar extracts key bytes in LE order per 32-bit digest word:
     //   AESKey[I*4+J] = (byte)(digest[I] >> (J*8))
-    // The Rust sha1 crate outputs bytes in big-endian, so we reverse within each
-    // 4-byte group to match unrar's little-endian extraction.
     let mut key = [0u8; 16];
     for word in 0..4 {
-        key[word * 4] = digest[word * 4 + 3]; // LSB
-        key[word * 4 + 1] = digest[word * 4 + 2];
-        key[word * 4 + 2] = digest[word * 4 + 1];
-        key[word * 4 + 3] = digest[word * 4]; // MSB
-    }
-
-    (key, iv)
-}
-
-#[cfg(feature = "native-crypto")]
-fn rar4_derive_key_native(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
-    let mut raw_psw: Vec<u8> = password
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    if let Some(salt) = salt {
-        raw_psw.extend_from_slice(salt);
-    }
-
-    let iv_interval = RAR4_KDF_ITERATIONS / 16;
-    let mut iv = [0u8; 16];
-    let mut sha = aws_digest::Context::new(&aws_digest::SHA1_FOR_LEGACY_USE_ONLY);
-
-    for i in 0..RAR4_KDF_ITERATIONS {
-        sha.update(&raw_psw);
-
-        let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
-        sha.update(&i_bytes);
-
-        if i % iv_interval == 0 {
-            let intermediate = sha.clone().finish();
-            let iv_index = (i / iv_interval) as usize;
-            iv[iv_index] = intermediate.as_ref()[19];
-        }
-    }
-
-    let digest = sha.finish();
-    let digest = digest.as_ref();
-
-    let mut key = [0u8; 16];
-    for word in 0..4 {
-        key[word * 4] = digest[word * 4 + 3];
-        key[word * 4 + 1] = digest[word * 4 + 2];
-        key[word * 4 + 2] = digest[word * 4 + 1];
-        key[word * 4 + 3] = digest[word * 4];
+        key[word * 4..word * 4 + 4].copy_from_slice(&digest[word].to_le_bytes());
     }
 
     (key, iv)
 }
 
 fn rar4_derive_key_with_backend(
-    backend: RarCryptoBackend,
+    _backend: RarCryptoBackend,
     password: &str,
     salt: Option<&[u8; 8]>,
 ) -> ([u8; 16], [u8; 16]) {
-    match backend {
-        RarCryptoBackend::RustCrypto => rar4_derive_key_rustcrypto(password, salt),
-        #[cfg(feature = "native-crypto")]
-        RarCryptoBackend::NativeAwsLc => rar4_derive_key_native(password, salt),
-    }
+    rar4_derive_key_unrar(password, salt)
 }
 
 pub fn rar4_derive_key(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
@@ -1233,13 +1334,13 @@ mod tests {
     #[test]
     fn test_derive_key_deterministic() {
         let salt = [0xAA; 16];
-        let (key1, iv1) = derive_key("password", &salt, 0);
-        let (key2, iv2) = derive_key("password", &salt, 0);
+        let (key1, iv1) = derive_key("password", &salt, 0).unwrap();
+        let (key2, iv2) = derive_key("password", &salt, 0).unwrap();
         assert_eq!(key1, key2);
         assert_eq!(iv1, iv2);
 
         // Different password produces different key
-        let (key3, _) = derive_key("other", &salt, 0);
+        let (key3, _) = derive_key("other", &salt, 0).unwrap();
         assert_ne!(key1, key3);
     }
 
@@ -1376,6 +1477,36 @@ mod tests {
         // Different salt produces different key.
         let (key4, _) = rar4_derive_key("password", Some(&[0xDD; 8]));
         assert_ne!(key1, key4);
+    }
+
+    #[test]
+    fn test_rar4_derive_key_matches_unrar_rar29_sha1() {
+        let salt = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let (short_key, short_iv) = rar4_derive_key("password", Some(&salt));
+        assert_eq!(hex(&short_key), "6dc5de01e3b2dbe3be10be0a04a61451");
+        assert_eq!(hex(&short_iv), "28578a432b367b73dccfd439911f9584");
+
+        let long_password = "abcdefghijklmnopqrstuvwxyzabcdef";
+        let (long_key, long_iv) = rar4_derive_key(long_password, Some(&salt));
+        assert_eq!(hex(&long_key), "d74f5e96dd94aa870efe4fdcd3d3e155");
+        assert_eq!(hex(&long_iv), "4b12f8f5e926761d3ab3a3c98cc00d48");
+
+        let (saltless_key, saltless_iv) = rar4_derive_key(long_password, None);
+        assert_eq!(hex(&saltless_key), "a067cc19f522570c5440adfabc8ae733");
+        assert_eq!(hex(&saltless_iv), "1a1eb51d88c1905a6c09328074c39f42");
+    }
+
+    #[test]
+    fn test_rar4_long_password_kdf_matches_local_unrar_vector() {
+        // Generated with the local unrar checkout's crypt3.cpp SetKey30 loop
+        // and sha1.cpp sha1_process_rar29 implementation.
+        let salt = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+        let password = "abcdefghijklmnopqrstuvwxyzabcdef";
+
+        let (key, iv) = rar4_derive_key(password, Some(&salt));
+
+        assert_eq!(hex(&key), "6409b206ed974788e3d4819e4edba9b1");
+        assert_eq!(hex(&iv), "87bbc0bf98daa1aa13e010cf14ced6ce");
     }
 
     #[test]

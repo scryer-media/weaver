@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use flate2::Compression;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tower::ServiceExt;
@@ -26,13 +27,16 @@ use weaver_server_core::{
 };
 
 fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
+    let peer_addr: SocketAddr = "127.0.0.1:49152".parse().unwrap();
     Router::new()
         .route("/api/login", post(auth::login_handler))
         .route("/api/auth/status", get(auth::auth_status_handler))
+        .layer(axum::extract::connect_info::MockConnectInfo(peer_addr))
         .layer(Extension(db))
         .layer(Extension(
             weaver_server_core::security::RuntimeSecurityConfig::default(),
         ))
+        .layer(Extension(auth::LoginRateLimiter::default()))
         .layer(Extension(auth_cache))
 }
 
@@ -866,7 +870,7 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
     let password_hash = hash_password("hunter2").unwrap();
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash);
+    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
 
@@ -911,7 +915,10 @@ async fn login_handler_rejects_legacy_scrypt_hash() {
         "$scrypt$ln=16,r=8,p=1$MDAwMDAwMDAwMDAwMDAwMA$MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
             .to_string();
     db.set_auth_credentials("admin", &legacy_hash).unwrap();
-    let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+    let auth_cache = LoginAuthCache::from_credentials(
+        db.get_auth_credentials().unwrap(),
+        db.get_or_create_jwt_signing_secret().unwrap(),
+    );
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
     let response = app
@@ -937,7 +944,10 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password("hunter2").unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
-    let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+    let auth_cache = LoginAuthCache::from_credentials(
+        db.get_auth_credentials().unwrap(),
+        db.get_or_create_jwt_signing_secret().unwrap(),
+    );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
@@ -960,10 +970,100 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
 }
 
 #[tokio::test]
+async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
+    let db = Database::open_in_memory().unwrap();
+    let argon2_hash = hash_password("hunter2").unwrap();
+    db.set_auth_credentials("admin", &argon2_hash).unwrap();
+    let auth_cache = LoginAuthCache::from_credentials(
+        db.get_auth_credentials().unwrap(),
+        db.get_or_create_jwt_signing_secret().unwrap(),
+    );
+    let original = auth_cache.snapshot().unwrap();
+    let app = auth_test_router(db.clone(), auth_cache.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"not-admin","password":"hunter2"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let stored = db.get_auth_credentials().unwrap().unwrap();
+    assert_eq!(stored.password_hash, argon2_hash);
+    assert_eq!(auth_cache.snapshot().unwrap(), original);
+}
+
+#[tokio::test]
+async fn login_handler_rate_limits_repeated_failures() {
+    let db = Database::open_in_memory().unwrap();
+    let argon2_hash = hash_password("hunter2").unwrap();
+    db.set_auth_credentials("admin", &argon2_hash).unwrap();
+    let auth_cache = LoginAuthCache::from_credentials(
+        db.get_auth_credentials().unwrap(),
+        db.get_or_create_jwt_signing_secret().unwrap(),
+    );
+    let app = auth_test_router(db, auth_cache);
+
+    for _ in 0..auth::LOGIN_MAX_FAILURES {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let throttled_wrong = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(throttled_wrong.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let throttled_correct = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"username":"admin","password":"hunter2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(throttled_correct.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn login_handler_malformed_hash_fails_cleanly() {
     let db = Database::open_in_memory().unwrap();
     db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
-    let auth_cache = LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap());
+    let auth_cache = LoginAuthCache::from_credentials(
+        db.get_auth_credentials().unwrap(),
+        db.get_or_create_jwt_signing_secret().unwrap(),
+    );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
@@ -990,7 +1090,7 @@ async fn auth_status_handler_uses_cached_auth_state() {
     let db = Database::open_in_memory().unwrap();
     let password_hash = hash_password("hunter2").unwrap();
     let auth_cache = LoginAuthCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash);
+    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
     let app = auth_test_router(db, auth_cache);

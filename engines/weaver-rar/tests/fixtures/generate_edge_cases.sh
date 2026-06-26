@@ -10,6 +10,7 @@ set -euo pipefail
 FIXTURE_DIR="$(cd "$(dirname "$0")" && pwd)"
 RAR5_DIR="$FIXTURE_DIR/rar5"
 RAR4_DIR="$FIXTURE_DIR/rar4"
+RAR4_LONG_PASSWORD="abcdefghijklmnopqrstuvwxyzabcdef"
 
 mkdir -p "$RAR5_DIR" "$RAR4_DIR"
 
@@ -49,6 +50,9 @@ LONGNAME="$(printf 'a%.0s' {1..200}).txt"
 echo "long filename test" > "$SRCDIR/$LONGNAME"
 # Comment file
 echo "This is a test comment for the archive" > "$SRCDIR/_comment.txt"
+# RAR4 long-password KDF fixture. UTF-16LE password bytes plus salt exceed one
+# SHA-1 block, so this exercises unrar's RAR29 message-schedule write-back path.
+echo "RAR4 long password KDF fixture" > "$SRCDIR/rar4_long_password.txt"
 # Symlink
 ln -sf hello.txt "$SRCDIR/link_to_hello.txt"
 
@@ -93,29 +97,32 @@ rar5 a -m0 -ol -ep1 rar5/rar5_symlink.rar _edge_src/link_to_hello.txt _edge_src/
 echo ""
 echo "=== Generating RAR4 edge-case fixtures ==="
 
-echo "  [1/8] multi-file stored"
+echo "  [1/9] multi-file stored"
 rar4 a -ma4 -m0 -ep1 rar4/rar4_multifile_store.rar _edge_src/hello.txt _edge_src/second.txt _edge_src/random_512.bin
 
-echo "  [2/8] multi-file compressed"
+echo "  [2/9] multi-file compressed"
 rar4 a -ma4 -m3 -ep1 rar4/rar4_multifile_lz.rar _edge_src/hello.txt _edge_src/second.txt _edge_src/zeros_64k.bin
 
-echo "  [3/8] directory structure"
+echo "  [3/9] directory structure"
 rar4 a -ma4 -m0 -r rar4/rar4_dirs.rar _edge_src/subdir/
 
-echo "  [4/8] empty file member"
+echo "  [4/9] empty file member"
 rar4 a -ma4 -m0 -ep1 rar4/rar4_empty_member.rar _edge_src/empty.txt _edge_src/hello.txt
 
-echo "  [5/8] solid archive"
+echo "  [5/9] solid archive"
 rar4 a -ma4 -m3 -s -ep1 rar4/rar4_solid.rar _edge_src/hello.txt _edge_src/second.txt _edge_src/zeros_64k.bin _edge_src/random_512.bin
 
-echo "  [6/8] recovery record"
+echo "  [6/9] recovery record"
 rar4 a -ma4 -m0 -rr5p -ep1 rar4/rar4_recovery.rar _edge_src/hello.txt _edge_src/second.txt
 
-echo "  [7/8] comment archive"
+echo "  [7/9] comment archive"
 rar4 a -ma4 -m0 -ep1 -z_edge_src/_comment.txt rar4/rar4_comment.rar _edge_src/hello.txt
 
-echo "  [8/8] long filename (200 chars)"
+echo "  [8/9] long filename (200 chars)"
 rar4 a -ma4 -m0 -ep1 rar4/rar4_longname.rar "_edge_src/$LONGNAME"
+
+echo "  [9/9] header-encrypted long-password KDF fixture"
+rar4 a -ma4 -m0 -hp"$RAR4_LONG_PASSWORD" -ep1 rar4/rar4_hp_long_password.rar _edge_src/rar4_long_password.txt
 
 echo ""
 echo "=== Saving originals and cleaning up ==="
@@ -125,6 +132,7 @@ cp _edge_src/second.txt originals/
 cp _edge_src/zeros_64k.bin originals/
 cp _edge_src/random_512.bin originals/
 cp _edge_src/empty.txt originals/
+cp _edge_src/rar4_long_password.txt originals/
 cp "_edge_src/日本語ファイル.txt" originals/
 cp "_edge_src/café-résumé.txt" originals/
 cp _edge_src/subdir/a.txt originals/subdir_a.txt

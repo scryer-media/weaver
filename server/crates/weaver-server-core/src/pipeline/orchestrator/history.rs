@@ -188,7 +188,14 @@ impl Pipeline {
         self.clear_job_progress_floor_runtime(job_id);
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
+        self.rate_limit_reservations
+            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();
+    }
+
+    pub(crate) fn enforce_finished_jobs_runtime_cap(&mut self) {
+        self.finished_jobs
+            .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
     }
 
     pub(crate) fn record_job_history(&mut self, job_id: JobId) {
@@ -242,32 +249,36 @@ impl Pipeline {
             state.assembly.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
-        self.finished_jobs.push(JobInfo {
-            job_id,
-            job_hash: Some(state.job_hash),
-            name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else {
-                None
+        self.finished_jobs.insert(
+            0,
+            JobInfo {
+                job_id,
+                job_hash: Some(state.job_hash),
+                name: state.spec.name.clone(),
+                error: if let JobStatus::Failed { error } = &state.status {
+                    Some(error.clone())
+                } else {
+                    None
+                },
+                status: state.status.clone(),
+                download_state,
+                post_state,
+                run_state,
+                progress: Self::effective_progress(state),
+                total_bytes: total,
+                downloaded_bytes: Self::effective_downloaded_bytes(state),
+                optional_recovery_bytes,
+                optional_recovery_downloaded_bytes,
+                failed_bytes: state.failed_bytes,
+                health,
+                password: state.spec.password.clone(),
+                category: state.spec.category.clone(),
+                metadata: state.spec.metadata.clone(),
+                output_dir: Some(state.working_dir.display().to_string()),
+                created_at_epoch_ms: state.created_at_epoch_ms,
             },
-            status: state.status.clone(),
-            download_state,
-            post_state,
-            run_state,
-            progress: Self::effective_progress(state),
-            total_bytes: total,
-            downloaded_bytes: Self::effective_downloaded_bytes(state),
-            optional_recovery_bytes,
-            optional_recovery_downloaded_bytes,
-            failed_bytes: state.failed_bytes,
-            health,
-            password: state.spec.password.clone(),
-            category: state.spec.category.clone(),
-            metadata: state.spec.metadata.clone(),
-            output_dir: Some(state.working_dir.display().to_string()),
-            created_at_epoch_ms: state.created_at_epoch_ms,
-        });
+        );
+        self.enforce_finished_jobs_runtime_cap();
 
         let archive_started = Instant::now();
         if let Err(e) = self.db.try_queue_archive_job(job_id, row) {

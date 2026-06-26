@@ -3,6 +3,7 @@ use super::*;
 impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -17,13 +18,14 @@ impl Pipeline {
         complete_dir: PathBuf,
         total_connections: usize,
         write_buf_max_pending: usize,
-        initial_history: Vec<JobInfo>,
+        mut initial_history: Vec<JobInfo>,
         initial_global_paused: bool,
         shared_state: SharedPipelineState,
         db: crate::Database,
         config: crate::settings::SharedConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
+        initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         let initial_bandwidth_policy = config.read().await.isp_bandwidth_cap.clone();
@@ -113,6 +115,7 @@ impl Pipeline {
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
+            rate_limit_reservations: HashMap::new(),
             connection_ramp: total_connections.min(5),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
@@ -260,6 +263,30 @@ impl Pipeline {
         });
     }
 
+    pub(crate) async fn flush_file_progress_batch_awaited(
+        &mut self,
+        label: &'static str,
+    ) -> Result<(), crate::StateError> {
+        if self.pending_file_progress.is_empty() {
+            return Ok(());
+        }
+        let _probe = crate::runtime::perf_probe::scope(label);
+        let pending = std::mem::take(&mut self.pending_file_progress);
+        for (file_id, bytes) in &pending {
+            self.persisted_file_progress.insert(*file_id, *bytes);
+        }
+        let batch: Vec<ActiveFileProgress> = pending
+            .into_iter()
+            .map(|(file_id, contiguous_bytes_written)| ActiveFileProgress {
+                job_id: file_id.job_id,
+                file_index: file_id.file_index,
+                contiguous_bytes_written,
+            })
+            .collect();
+        self.db_blocking(move |db| db.upsert_file_progress_batch(&batch))
+            .await
+    }
+
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -320,6 +347,8 @@ impl Pipeline {
                 );
             }
         }
+        self.rate_limit_reservations
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
 
         in_flight
     }
@@ -400,7 +429,7 @@ impl Pipeline {
             self.reconcile_job_progress(job_id).await;
         }
 
-        loop {
+        'run_loop: loop {
             self.pump_decode_queue();
 
             let pending_completion_checks = self.pending_completion_checks.len();
@@ -421,7 +450,7 @@ impl Pipeline {
                 match self.cmd_rx.try_recv() {
                     Ok(SchedulerCommand::Shutdown) => {
                         info!("pipeline shutting down");
-                        return;
+                        break 'run_loop;
                     }
                     Ok(cmd) => self.handle_command(cmd).await,
                     Err(_) => break,
@@ -550,18 +579,98 @@ impl Pipeline {
         }
     }
 
-    async fn drain(&mut self) {
+    pub(crate) async fn drain(&mut self) {
+        self.drain_inflight_download_and_decode_work().await;
+        self.flush_quiescent_write_backlog().await;
+
+        if self.active_downloads > 0
+            || !self.active_decodes_by_job.is_empty()
+            || !self.pending_decode.is_empty()
+        {
+            warn!(
+                active_downloads = self.active_downloads,
+                active_decodes = self.active_decodes_by_job.values().sum::<usize>(),
+                pending_decode = self.pending_decode.len(),
+                "shutdown drain ended with in-flight pipeline work"
+            );
+        } else {
+            info!("shutdown drain completed active download/decode work");
+        }
+
         if self.active_downloads > 0 {
             info!(
                 active = self.active_downloads,
                 "draining in-flight downloads"
             );
         }
-        self.flush_file_progress_batch("download.file_progress.flush.drain");
+        if let Err(error) = self
+            .flush_file_progress_batch_awaited("download.file_progress.flush.drain")
+            .await
+        {
+            warn!(error = %error, "failed to flush file progress floors during drain");
+        }
         if let Err(error) = self.flush_download_bandwidth_usage() {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
     }
+
+    fn has_download_or_decode_drain_work(&self) -> bool {
+        self.active_downloads > 0
+            || !self.active_decodes_by_job.is_empty()
+            || !self.pending_decode.is_empty()
+            || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
+    }
+
+    async fn drain_inflight_download_and_decode_work(&mut self) {
+        self.pump_decode_queue();
+
+        while self.has_download_or_decode_drain_work() {
+            let event = tokio::time::timeout(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, async {
+                tokio::select! {
+                    result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
+                        result.map(ShutdownDrainEvent::Download)
+                    }
+                    result = self.decode_done_rx.recv(), if !self.active_decodes_by_job.is_empty()
+                        || !self.pending_decode.is_empty()
+                        || self.metrics.decode_pending.load(Ordering::Relaxed) > 0 => {
+                        result.map(ShutdownDrainEvent::Decode)
+                    }
+                }
+            })
+            .await;
+
+            match event {
+                Ok(Some(ShutdownDrainEvent::Download(result))) => {
+                    self.handle_download_done(result).await;
+                    self.pump_decode_queue();
+                }
+                Ok(Some(ShutdownDrainEvent::Decode(result))) => {
+                    self.handle_decode_done(result).await;
+                    self.pump_decode_queue();
+                }
+                Ok(None) => {
+                    warn!("shutdown drain channel closed before in-flight work completed");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        active_downloads = self.active_downloads,
+                        active_decodes = self.active_decodes_by_job.values().sum::<usize>(),
+                        pending_decode = self.pending_decode.len(),
+                        decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
+                        idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),
+                        "timed out waiting for in-flight download/decode work during shutdown"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+enum ShutdownDrainEvent {
+    Download(DownloadResult),
+    Decode(DecodeDone),
 }
 
 pub(crate) async fn write_segment_to_disk(
@@ -584,6 +693,7 @@ pub(crate) async fn write_segment_to_disk(
             .open(&path)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
         file.write_all(&data)?;
+        file.sync_data()?;
         let result = Ok::<(), std::io::Error>(());
         crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
         result

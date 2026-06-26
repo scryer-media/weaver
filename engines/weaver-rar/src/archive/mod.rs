@@ -397,6 +397,7 @@ impl RarArchive {
         let rar4_unix_symlink = self.format == ArchiveFormat::Rar4
             && matches!(fh.host_os, crate::types::HostOs::Unix)
             && (fh.attributes.0 & 0xF000) == 0xA000;
+        let member_name = crate::path::sanitize_path(&fh.name);
         let (is_symlink, is_hardlink, link_target) = match &entry.redirection {
             Some(redir) => {
                 let is_sym = matches!(
@@ -410,9 +411,21 @@ impl RarArchive {
             }
             None => (rar4_unix_symlink, false, None),
         };
+        let (is_symlink, is_hardlink, link_target) = if let Some(target) = link_target.as_ref()
+            && !crate::path::is_safe_link_target(&member_name, target)
+        {
+            tracing::warn!(
+                member = %member_name,
+                target = %target,
+                "ignoring unsafe RAR link target"
+            );
+            (false, false, None)
+        } else {
+            (is_symlink, is_hardlink, link_target)
+        };
 
         MemberInfo {
-            name: crate::path::sanitize_path(&fh.name),
+            name: member_name,
             raw_name: fh.name.clone(),
             unpacked_size: fh.unpacked_size,
             compressed_size: total_compressed,
@@ -494,5 +507,93 @@ impl RarArchive {
     /// Whether a member is encrypted.
     pub fn member_is_encrypted(&self, index: usize) -> bool {
         self.members.get(index).is_some_and(|e| e.is_encrypted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FileAttributes, HostOs};
+
+    fn test_file_header(name: &str) -> FileHeader {
+        FileHeader {
+            name: name.to_string(),
+            unpacked_size: Some(0),
+            attributes: FileAttributes(0o644),
+            mtime: None,
+            ctime: None,
+            atime: None,
+            data_crc32: None,
+            compression: crate::types::CompressionInfo {
+                format: ArchiveFormat::Rar5,
+                version: 0,
+                solid: false,
+                method: CompressionMethod::Store,
+                dict_size: 128 * 1024,
+            },
+            host_os: HostOs::Unix,
+            is_directory: false,
+            file_flags: 0,
+            data_size: 0,
+            split_before: false,
+            split_after: false,
+            data_offset: 0,
+            is_encrypted: false,
+            version: None,
+            service_subdata: None,
+        }
+    }
+
+    fn archive_with_redirection(member_name: &str, target: &str) -> RarArchive {
+        RarArchive {
+            format: ArchiveFormat::Rar5,
+            is_solid: false,
+            is_encrypted: false,
+            has_recovery_record: false,
+            is_locked: false,
+            has_authenticity_verification: false,
+            volume_set: VolumeSet::new(),
+            members: vec![MemberEntry {
+                file_header: test_file_header(member_name),
+                is_encrypted: false,
+                file_encryption: None,
+                rar4_salt: None,
+                hash: None,
+                redirection: Some(header::Redirection {
+                    redir_type: header::RedirectionType::UnixSymlink,
+                    target: target.to_string(),
+                    target_is_directory: false,
+                }),
+                owner: None,
+                segments: Vec::new(),
+            }],
+            more_volumes: false,
+            volumes: Vec::new(),
+            solid_decoder: None,
+            solid_decoder_rar4: None,
+            solid_next_index: 0,
+            limits: Limits::default(),
+            password: None,
+            kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
+        }
+    }
+
+    #[test]
+    fn member_info_exposes_safe_link_target() {
+        let archive = archive_with_redirection("dir/link", "../target.txt");
+        let info = archive.member_info(0).unwrap();
+
+        assert!(info.is_symlink);
+        assert_eq!(info.link_target.as_deref(), Some("../target.txt"));
+    }
+
+    #[test]
+    fn member_info_ignores_unsafe_link_target() {
+        let archive = archive_with_redirection("dir/link", "/etc/passwd");
+        let info = archive.member_info(0).unwrap();
+
+        assert!(!info.is_symlink);
+        assert!(!info.is_hardlink);
+        assert!(info.link_target.is_none());
     }
 }

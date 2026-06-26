@@ -12,6 +12,8 @@ use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 
 pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
+pub const GRAPHQL_MAX_DEPTH: usize = 16;
 
 pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
@@ -62,6 +64,9 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         MutationRoot::default(),
         SubscriptionRoot::default(),
     )
+    .disable_introspection()
+    .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+    .limit_depth(GRAPHQL_MAX_DEPTH)
     .data(context.handle)
     .data(context.config)
     .data(context.db)

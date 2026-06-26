@@ -119,21 +119,20 @@ pub fn is_encrypted(value: &str) -> bool {
 }
 
 /// Encrypt a value if it's not already encrypted. Returns as-is if already encrypted or empty/None.
-pub(crate) fn maybe_encrypt(key: Option<&EncryptionKey>, value: &Option<String>) -> Option<String> {
-    let v = value.as_deref()?;
+pub(crate) fn maybe_encrypt(
+    key: Option<&EncryptionKey>,
+    value: &Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(v) = value.as_deref() else {
+        return Ok(None);
+    };
     if v.is_empty() || is_encrypted(v) {
-        return Some(v.to_string());
+        return Ok(Some(v.to_string()));
     }
     let Some(key) = key else {
-        return Some(v.to_string());
+        return Err("encryption key is required to store secrets".to_string());
     };
-    match encrypt_value(key, v) {
-        Ok(encrypted) => Some(encrypted),
-        Err(e) => {
-            tracing::warn!("failed to encrypt value: {e}");
-            Some(v.to_string())
-        }
-    }
+    encrypt_value(key, v).map(Some)
 }
 
 /// Encrypt a secret for new writes. Plaintext compatibility is read-only: callers

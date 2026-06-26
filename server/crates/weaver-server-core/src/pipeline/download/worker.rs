@@ -79,6 +79,26 @@ impl Pipeline {
         decoded.saturating_add(decoded / 16).saturating_add(1024)
     }
 
+    fn reserve_rate_limit_for_dispatch(&mut self, segment_id: SegmentId, estimate_bytes: u64) {
+        self.rate_limiter.consume(estimate_bytes);
+        self.rate_limit_reservations
+            .insert(segment_id, estimate_bytes);
+    }
+
+    fn reconcile_rate_limit_for_download(
+        &mut self,
+        segment_id: SegmentId,
+        actual_bytes: Option<u64>,
+    ) {
+        let Some(estimated_bytes) = self.rate_limit_reservations.remove(&segment_id) else {
+            return;
+        };
+        match actual_bytes {
+            Some(actual_bytes) => self.rate_limiter.reconcile(estimated_bytes, actual_bytes),
+            None => self.rate_limiter.refund(estimated_bytes),
+        }
+    }
+
     fn try_dispatch_download_for_job(&mut self, job_id: JobId) -> DispatchAttempt {
         let Some(work) = self
             .jobs
@@ -120,9 +140,10 @@ impl Pipeline {
         }
 
         let estimate = work.byte_estimate as u64;
+        let segment_id = work.segment_id;
         let is_recovery = work.is_recovery;
         self.spawn_download(work, is_recovery);
-        self.rate_limiter.consume(estimate);
+        self.reserve_rate_limit_for_dispatch(segment_id, estimate);
         DispatchAttempt::Dispatched
     }
 
@@ -228,6 +249,9 @@ impl Pipeline {
                         }));
                     }
                     Err(e) => {
+                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
+                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
@@ -260,6 +284,9 @@ impl Pipeline {
                         }));
                     }
                     Err(e) => {
+                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
+                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
@@ -641,6 +668,11 @@ impl Pipeline {
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
             error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
         }
+        let actual_raw_bytes = match &result.data {
+            Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
+            Err(_) => None,
+        };
+        self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
         match &result.data {
             Ok(DownloadPayload::Raw(raw)) => {
                 if let Err(error) = self.record_download_bandwidth_usage(raw.len() as u64) {

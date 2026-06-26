@@ -1,4 +1,4 @@
-use std::io::{BufRead, Cursor};
+use std::io::{BufRead, Cursor, Read};
 
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -6,13 +6,71 @@ use quick_xml::{Reader, XmlVersion};
 use crate::error::NzbError;
 use crate::types::{Nzb, NzbFile, NzbMeta, NzbSegment};
 
+pub const MAX_NZB_XML_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_NZB_FILES: usize = 100_000;
+pub const MAX_SEGMENTS_PER_FILE: usize = 100_000;
+pub const MAX_NZB_SEGMENTS: usize = 2_000_000;
+pub const MAX_DECLARED_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: u32 = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ParserLimits {
+    max_xml_bytes: usize,
+    max_files: usize,
+    max_segments_per_file: usize,
+    max_segments: usize,
+    max_declared_bytes: u64,
+}
+
+const DEFAULT_LIMITS: ParserLimits = ParserLimits {
+    max_xml_bytes: MAX_NZB_XML_BYTES,
+    max_files: MAX_NZB_FILES,
+    max_segments_per_file: MAX_SEGMENTS_PER_FILE,
+    max_segments: MAX_NZB_SEGMENTS,
+    max_declared_bytes: MAX_DECLARED_BYTES,
+};
+
 /// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
-    parse_nzb_reader(Cursor::new(xml))
+    parse_nzb_with_limits(xml, DEFAULT_LIMITS)
+}
+
+fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbError> {
+    if xml.len() > limits.max_xml_bytes {
+        return Err(NzbError::ResourceLimit(format!(
+            "XML document is {} bytes; max is {}",
+            xml.len(),
+            limits.max_xml_bytes
+        )));
+    }
+    parse_nzb_reader_with_limits(Cursor::new(xml), limits)
 }
 
 /// Parse an NZB XML document from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
+    parse_nzb_reader_limited(reader, DEFAULT_LIMITS)
+}
+
+fn parse_nzb_reader_limited<R: BufRead>(
+    mut reader: R,
+    limits: ParserLimits,
+) -> Result<Nzb, NzbError> {
+    let read_limit = limits.max_xml_bytes.checked_add(1).ok_or_else(|| {
+        NzbError::ResourceLimit("XML byte cap is too large to enforce".to_string())
+    })?;
+    let mut xml = Vec::with_capacity(limits.max_xml_bytes.min(64 * 1024));
+    reader
+        .by_ref()
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut xml)
+        .map_err(|e| NzbError::Xml(e.to_string()))?;
+    parse_nzb_with_limits(&xml, limits)
+}
+
+fn parse_nzb_reader_with_limits<R: BufRead>(
+    reader: R,
+    limits: ParserLimits,
+) -> Result<Nzb, NzbError> {
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
 
@@ -26,6 +84,8 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
     // File accumulation
     let mut files: Vec<NzbFile> = Vec::new();
     let mut current_file: Option<FileBuilder> = None;
+    let mut total_segments = 0usize;
+    let mut total_declared_bytes = 0u64;
 
     // Parser state
     let mut in_head = false;
@@ -74,13 +134,16 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                                 }
                                 b"date" => {
                                     let val = String::from_utf8_lossy(&attr.value).into_owned();
-                                    date = Some(val.parse::<u64>().map_err(|_| {
-                                        NzbError::InvalidValue {
-                                            element: "file".into(),
-                                            attribute: "date".into(),
-                                            value: val,
+                                    match val.parse::<u64>() {
+                                        Ok(parsed) => date = Some(parsed),
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                value = %val,
+                                                "invalid NZB file date; defaulting to 0"
+                                            );
+                                            date = Some(0);
                                         }
-                                    })?);
+                                    }
                                 }
                                 b"subject" => {
                                     subject = Some(
@@ -119,33 +182,40 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                     b"segment" if in_segments => {
                         let mut bytes = None;
                         let mut number = None;
+                        let mut invalid_reason = None;
                         for attr in e.attributes() {
                             let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
                             match attr.key.as_ref() {
                                 b"bytes" => {
                                     let val = String::from_utf8_lossy(&attr.value).into_owned();
-                                    bytes = Some(val.parse::<u32>().map_err(|_| {
-                                        NzbError::InvalidValue {
-                                            element: "segment".into(),
-                                            attribute: "bytes".into(),
-                                            value: val,
+                                    match val.parse::<u32>() {
+                                        Ok(parsed) => bytes = Some(parsed),
+                                        Err(_) => {
+                                            invalid_reason.get_or_insert_with(|| {
+                                                format!("invalid bytes attribute: {val}")
+                                            });
                                         }
-                                    })?);
+                                    }
                                 }
                                 b"number" => {
                                     let val = String::from_utf8_lossy(&attr.value).into_owned();
-                                    number = Some(val.parse::<u32>().map_err(|_| {
-                                        NzbError::InvalidValue {
-                                            element: "segment".into(),
-                                            attribute: "number".into(),
-                                            value: val,
+                                    match val.parse::<u32>() {
+                                        Ok(parsed) => number = Some(parsed),
+                                        Err(_) => {
+                                            invalid_reason.get_or_insert_with(|| {
+                                                format!("invalid number attribute: {val}")
+                                            });
                                         }
-                                    })?);
+                                    }
                                 }
                                 _ => {}
                             }
                         }
-                        current_segment = Some(SegmentBuilder { bytes, number });
+                        current_segment = Some(SegmentBuilder {
+                            bytes,
+                            number,
+                            invalid_reason,
+                        });
                         text_buf.clear();
                     }
                     _ => {}
@@ -178,18 +248,67 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                         if let Some(seg) = current_segment.take()
                             && let Some(ref mut f) = current_file
                         {
-                            let number = seg.number.unwrap_or(0);
-                            let bytes = seg.bytes.unwrap_or(0);
                             // Strip angle brackets from message-ID if present
                             let message_id = text_buf
+                                .trim()
                                 .trim_start_matches('<')
                                 .trim_end_matches('>')
                                 .to_owned();
-                            f.segments.push(NzbSegment {
-                                number,
-                                bytes,
-                                message_id,
-                            });
+                            if let Some(reason) = seg.skip_reason(&message_id) {
+                                tracing::warn!(
+                                    subject = %f.subject,
+                                    message_id = %message_id,
+                                    reason,
+                                    "skipping malformed NZB segment"
+                                );
+                            } else {
+                                let number = seg.number.expect("validated segment number");
+                                let bytes = seg.bytes.expect("validated segment byte count");
+
+                                if let Some(existing) =
+                                    f.segments.iter().find(|existing| existing.number == number)
+                                {
+                                    tracing::warn!(
+                                        subject = %f.subject,
+                                        number,
+                                        existing_message_id = %existing.message_id,
+                                        duplicate_message_id = %message_id,
+                                        "skipping duplicate NZB segment number"
+                                    );
+                                } else {
+                                    if f.segments.len() >= limits.max_segments_per_file {
+                                        return Err(NzbError::ResourceLimit(format!(
+                                            "file has more than {} segments",
+                                            limits.max_segments_per_file
+                                        )));
+                                    }
+                                    if total_segments >= limits.max_segments {
+                                        return Err(NzbError::ResourceLimit(format!(
+                                            "NZB has more than {} segments",
+                                            limits.max_segments
+                                        )));
+                                    }
+                                    total_declared_bytes = total_declared_bytes
+                                        .checked_add(bytes as u64)
+                                        .ok_or_else(|| {
+                                            NzbError::ResourceLimit(
+                                                "declared segment bytes overflow u64".to_string(),
+                                            )
+                                        })?;
+                                    if total_declared_bytes > limits.max_declared_bytes {
+                                        return Err(NzbError::ResourceLimit(format!(
+                                            "declared segment bytes exceed cap {}",
+                                            limits.max_declared_bytes
+                                        )));
+                                    }
+                                    total_segments += 1;
+                                    f.segments.push(NzbSegment {
+                                        number,
+                                        bytes,
+                                        message_id,
+                                    });
+                                }
+                            }
                         }
                     }
                     b"segments" => in_segments = false,
@@ -201,6 +320,12 @@ pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
                                     "skipping file with no segments"
                                 );
                             } else {
+                                if files.len() >= limits.max_files {
+                                    return Err(NzbError::ResourceLimit(format!(
+                                        "NZB has more than {} files",
+                                        limits.max_files
+                                    )));
+                                }
                                 let mut segments = f.segments;
                                 segments.sort_by_key(|s| s.number);
                                 files.push(NzbFile {
@@ -265,6 +390,34 @@ struct FileBuilder {
 struct SegmentBuilder {
     bytes: Option<u32>,
     number: Option<u32>,
+    invalid_reason: Option<String>,
+}
+
+impl SegmentBuilder {
+    fn skip_reason(&self, message_id: &str) -> Option<&str> {
+        if let Some(reason) = self.invalid_reason.as_deref() {
+            return Some(reason);
+        }
+
+        match self.number {
+            Some(0) => return Some("nonpositive number attribute"),
+            Some(_) => {}
+            None => return Some("missing number attribute"),
+        }
+
+        match self.bytes {
+            Some(0) => return Some("nonpositive bytes attribute"),
+            Some(bytes) if bytes > MAX_SEGMENT_BYTES => return Some("bytes attribute exceeds cap"),
+            Some(_) => {}
+            None => return Some("missing bytes attribute"),
+        }
+
+        if message_id.is_empty() {
+            return Some("missing message id");
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +728,56 @@ mod tests {
         assert_eq!(nzb.files[0].subject, "good");
     }
 
+    #[test]
+    fn malformed_segments_are_skipped() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="s">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="bad" number="1">bad-bytes</segment>
+      <segment bytes="1" number="bad">bad-number</segment>
+      <segment bytes="0" number="2">zero-bytes</segment>
+      <segment bytes="1" number="0">zero-number</segment>
+      <segment bytes="8388609" number="3">too-large</segment>
+      <segment bytes="1">missing-number</segment>
+      <segment number="4">missing-bytes</segment>
+      <segment bytes="1" number="5"></segment>
+      <segment bytes="42" number="6">valid</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(nzb.files.len(), 1);
+        assert_eq!(nzb.files[0].segments.len(), 1);
+        assert_eq!(nzb.files[0].segments[0].number, 6);
+        assert_eq!(nzb.files[0].segments[0].bytes, 42);
+        assert_eq!(nzb.files[0].segments[0].message_id, "valid");
+    }
+
+    #[test]
+    fn duplicate_segment_numbers_are_skipped() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="s">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="1" number="1">first</segment>
+      <segment bytes="2" number="1">duplicate</segment>
+      <segment bytes="3" number="2">second</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        let segments = &nzb.files[0].segments;
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].number, 1);
+        assert_eq!(segments[0].bytes, 1);
+        assert_eq!(segments[0].message_id, "first");
+        assert_eq!(segments[1].number, 2);
+        assert_eq!(segments[1].message_id, "second");
+    }
+
     // Additional: invalid date value
     #[test]
     fn invalid_date_value() {
@@ -585,11 +788,9 @@ mod tests {
     <segments><segment bytes="1" number="1">id</segment></segments>
   </file>
 </nzb>"#;
-        let err = parse_nzb(xml).unwrap_err();
-        assert!(
-            matches!(err, NzbError::InvalidValue { ref element, ref attribute, .. }
-            if element == "file" && attribute == "date")
-        );
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(nzb.files.len(), 1);
+        assert_eq!(nzb.files[0].date, 0);
     }
 
     // Additional: namespace prefix handling
@@ -636,6 +837,127 @@ mod tests {
             "Title & More - \"file.rar\" yEnc (1/1)"
         );
         assert_eq!(nzb.files[0].filename(), Some("file.rar"));
+    }
+
+    fn test_limits() -> ParserLimits {
+        ParserLimits {
+            max_xml_bytes: 4096,
+            max_files: 100,
+            max_segments_per_file: 100,
+            max_segments: 100,
+            max_declared_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn rejects_xml_over_byte_cap() {
+        let err = parse_nzb_with_limits(
+            b"<nzb/>",
+            ParserLimits {
+                max_xml_bytes: 3,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn rejects_reader_over_byte_cap() {
+        let err = parse_nzb_reader_limited(
+            std::io::Cursor::new(b"<nzb/>"),
+            ParserLimits {
+                max_xml_bytes: 3,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn rejects_file_count_over_cap() {
+        let xml = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments><segment bytes="1" number="1">one</segment></segments>
+  </file>
+  <file poster="p" date="0" subject="two">
+    <segments><segment bytes="1" number="1">two</segment></segments>
+  </file>
+</nzb>"#;
+
+        let err = parse_nzb_with_limits(
+            xml,
+            ParserLimits {
+                max_files: 1,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn rejects_per_file_segment_count_over_cap() {
+        let xml = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments>
+      <segment bytes="1" number="1">one</segment>
+      <segment bytes="1" number="2">two</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let err = parse_nzb_with_limits(
+            xml,
+            ParserLimits {
+                max_segments_per_file: 1,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn rejects_total_segment_count_over_cap() {
+        let xml = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments><segment bytes="1" number="1">one</segment></segments>
+  </file>
+  <file poster="p" date="0" subject="two">
+    <segments><segment bytes="1" number="1">two</segment></segments>
+  </file>
+</nzb>"#;
+
+        let err = parse_nzb_with_limits(
+            xml,
+            ParserLimits {
+                max_segments: 1,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn rejects_declared_bytes_over_cap() {
+        let xml = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments><segment bytes="2" number="1">one</segment></segments>
+  </file>
+</nzb>"#;
+
+        let err = parse_nzb_with_limits(
+            xml,
+            ParserLimits {
+                max_declared_bytes: 1,
+                ..test_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NzbError::ResourceLimit(_)));
     }
 
     /// Helper to create an NzbFile with just a subject for filename/role tests.

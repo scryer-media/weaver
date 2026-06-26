@@ -16,6 +16,8 @@ use crate::jobs::error::SchedulerError;
 use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
+pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
+
 /// Shared read-only view of pipeline state for the control plane.
 ///
 /// Written by the pipeline loop after each event, read by API handlers

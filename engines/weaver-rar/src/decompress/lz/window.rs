@@ -217,11 +217,35 @@ impl Window {
     /// `start_total` is the absolute position (based on total_written) to start copying.
     /// `len` is the number of bytes to copy.
     /// Returns the bytes copied.
-    pub fn copy_output(&self, start_total: u64, len: usize) -> Vec<u8> {
+    pub fn try_copy_output(&self, start_total: u64, len: usize) -> RarResult<Vec<u8>> {
+        let end_total =
+            start_total
+                .checked_add(len as u64)
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "window output range overflows u64".to_string(),
+                })?;
+        if start_total > self.total_written || end_total > self.total_written {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "window output range [{start_total}, {end_total}) exceeds written output {}",
+                    self.total_written
+                ),
+            });
+        }
+
         let dict_size = self.buf.len();
+        let distance = (self.total_written - start_total) as usize;
+        if distance > dict_size {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "window output start {start_total} is outside the {} byte dictionary history",
+                    dict_size
+                ),
+            });
+        }
+
         let mut result = Vec::with_capacity(len);
 
-        let distance = (self.total_written - start_total) as usize;
         let mut idx = if distance <= self.pos {
             self.pos - distance
         } else {
@@ -236,7 +260,13 @@ impl Window {
             remaining -= contig;
         }
 
-        result
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub fn copy_output(&self, start_total: u64, len: usize) -> Vec<u8> {
+        self.try_copy_output(start_total, len)
+            .expect("valid window output range")
     }
 
     /// Flush unflushed bytes from the window to a writer.
@@ -477,6 +507,32 @@ mod tests {
         assert_eq!(&output, b"Hello, world!");
         let partial = w.copy_output(7, 6);
         assert_eq!(&partial, b"world!");
+    }
+
+    #[test]
+    fn test_try_copy_output_rejects_future_start() {
+        let mut w = Window::new(16);
+        for b in b"abc" {
+            w.put_byte(*b);
+        }
+
+        assert!(matches!(
+            w.try_copy_output(4, 1),
+            Err(RarError::CorruptArchive { .. })
+        ));
+    }
+
+    #[test]
+    fn test_try_copy_output_rejects_evicted_history() {
+        let mut w = Window::new(4);
+        for b in b"abcdef" {
+            w.put_byte(*b);
+        }
+
+        assert!(matches!(
+            w.try_copy_output(0, 1),
+            Err(RarError::CorruptArchive { .. })
+        ));
     }
 
     #[test]

@@ -23,6 +23,14 @@ pub enum JwtError {
     InvalidClaims(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum JwtSecretError {
+    #[error("JWT signing secret must be 64 hex characters")]
+    InvalidLength,
+    #[error("JWT signing secret is not valid hex: {0}")]
+    InvalidHex(#[from] hex::FromHexError),
+}
+
 pub fn generate_api_key() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed");
@@ -35,10 +43,22 @@ pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-pub fn derive_jwt_secret(password_hash: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(password_hash.as_bytes());
-    hasher.finalize().into()
+pub fn generate_jwt_secret() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    bytes
+}
+
+pub fn encode_jwt_secret(secret: &[u8; 32]) -> String {
+    hex::encode(secret)
+}
+
+pub fn decode_jwt_secret(value: &str) -> Result<[u8; 32], JwtSecretError> {
+    if value.len() != 64 {
+        return Err(JwtSecretError::InvalidLength);
+    }
+    let bytes = hex::decode(value)?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| JwtSecretError::InvalidLength)
 }
 
 pub fn create_jwt(username: &str, secret: &[u8], ttl_secs: u64) -> String {

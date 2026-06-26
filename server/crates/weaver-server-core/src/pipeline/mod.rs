@@ -531,6 +531,8 @@ pub struct Pipeline {
     /// Conservative byte reservations for in-flight downloads used to enforce the
     /// ISP bandwidth cap before actual payload bytes are known.
     pub(crate) bandwidth_reservations: HashMap<SegmentId, u64>,
+    /// Estimated bytes charged to the speed limiter for in-flight downloads.
+    pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     /// Bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
     /// Gradual connection ramp-up limit (increases each tick).

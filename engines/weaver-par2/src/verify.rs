@@ -181,6 +181,8 @@ pub enum Repairability {
         blocks_available: u32,
         deficit: u32,
     },
+    /// Verification could not continue within configured resource limits.
+    ResourceLimited { reason: String },
 }
 
 /// Overall verification result.
@@ -202,6 +204,16 @@ impl VerificationResult {
     }
 
     pub fn refresh_repairability(&mut self) {
+        if let Repairability::ResourceLimited { .. } = self.repairable
+            && (self.total_missing_blocks > 0
+                || self
+                    .files
+                    .iter()
+                    .any(|file| !matches!(file.status, FileStatus::Complete)))
+        {
+            return;
+        }
+
         self.repairable = repairability_for_result(
             &self.files,
             self.total_missing_blocks,
@@ -223,6 +235,18 @@ fn repairability_for_result(
         Repairability::NotNeeded
     } else {
         repairability_for_counts(total_missing_blocks, recovery_blocks_available)
+    }
+}
+
+fn repairability_for_result_with_resource_limit(
+    files: &[FileVerification],
+    total_missing_blocks: u32,
+    recovery_blocks_available: u32,
+    resource_limit_reason: Option<String>,
+) -> Repairability {
+    match resource_limit_reason {
+        Some(reason) => Repairability::ResourceLimited { reason },
+        None => repairability_for_result(files, total_missing_blocks, recovery_blocks_available),
     }
 }
 
@@ -255,9 +279,9 @@ fn resource_limited_verification(file_id: FileId, filename: String) -> FileVerif
     FileVerification {
         file_id,
         filename,
-        status: FileStatus::Damaged(u32::MAX),
+        status: FileStatus::Damaged(0),
         valid_slices: Vec::new(),
-        missing_slice_count: u32::MAX,
+        missing_slice_count: 0,
     }
 }
 
@@ -734,6 +758,7 @@ pub fn verify_selected_file_ids_with_options(
 ) -> VerificationResult {
     let mut files = Vec::new();
     let mut total_missing_blocks = 0u32;
+    let mut resource_limit_reason = None;
     let total_files = file_ids.len() as u32;
     let mut bytes_processed = 0u64;
 
@@ -750,7 +775,9 @@ pub fn verify_selected_file_ids_with_options(
             None => continue,
         };
         let Some(slice_count) = bounded_slice_count(par2, desc.length) else {
-            total_missing_blocks = u32::MAX;
+            resource_limit_reason.get_or_insert_with(|| {
+                format!("file {} exceeds verifier slice limits", desc.filename)
+            });
             files.push(resource_limited_verification(
                 *file_id,
                 desc.filename.clone(),
@@ -925,8 +952,12 @@ pub fn verify_selected_file_ids_with_options(
     }
 
     let recovery_blocks_available = par2.recovery_block_count();
-    let repairable =
-        repairability_for_result(&files, total_missing_blocks, recovery_blocks_available);
+    let repairable = repairability_for_result_with_resource_limit(
+        &files,
+        total_missing_blocks,
+        recovery_blocks_available,
+        resource_limit_reason,
+    );
 
     VerificationResult {
         files,
@@ -1140,6 +1171,42 @@ mod tests {
 
         let set = Par2FileSet::from_files(&[&stream]).unwrap();
         (set, access, file_ids)
+    }
+
+    fn setup_oversized_file_set() -> Par2FileSet {
+        let slice_size = 4u64;
+        let file_length = (MAX_SLICES_PER_FILE as u64 + 1) * slice_size;
+        let filename = b"huge.dat";
+        let hash_full = [0u8; 16];
+        let hash_16k = [0u8; 16];
+
+        let mut id_input = Vec::new();
+        id_input.extend_from_slice(&hash_16k);
+        id_input.extend_from_slice(&file_length.to_le_bytes());
+        id_input.extend_from_slice(filename);
+        let file_id_bytes: [u8; 16] = Md5::digest(&id_input).into();
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&1u32.to_le_bytes());
+        main_body.extend_from_slice(&file_id_bytes);
+        let rsid: [u8; 16] = Md5::digest(&main_body).into();
+
+        let mut fd_body = Vec::new();
+        fd_body.extend_from_slice(&file_id_bytes);
+        fd_body.extend_from_slice(&hash_full);
+        fd_body.extend_from_slice(&hash_16k);
+        fd_body.extend_from_slice(&file_length.to_le_bytes());
+        fd_body.extend_from_slice(filename);
+        while fd_body.len() % 4 != 0 {
+            fd_body.push(0);
+        }
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&make_full_packet(header::TYPE_MAIN, &main_body, rsid));
+        stream.extend_from_slice(&make_full_packet(header::TYPE_FILE_DESC, &fd_body, rsid));
+
+        Par2FileSet::from_files(&[&stream]).unwrap()
     }
 
     struct ReadIntoOnlyAccess {
@@ -1640,6 +1707,26 @@ mod tests {
             result.repairable,
             Repairability::Insufficient { .. }
         ));
+    }
+
+    #[test]
+    fn verify_resource_limited_file_does_not_inflate_missing_blocks() {
+        let set = setup_oversized_file_set();
+        let access = MemoryFileAccess::new();
+
+        let result = verify_all(&set, &access);
+
+        assert_eq!(result.total_missing_blocks, 0);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].missing_slice_count, 0);
+        assert!(result.files[0].valid_slices.is_empty());
+        assert!(matches!(result.files[0].status, FileStatus::Damaged(0)));
+        match result.repairable {
+            Repairability::ResourceLimited { reason } => {
+                assert!(reason.contains("huge.dat"));
+            }
+            other => panic!("expected resource-limited repairability, got {other:?}"),
+        }
     }
 
     #[test]

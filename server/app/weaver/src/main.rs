@@ -82,6 +82,7 @@ async fn async_main() {
         .with(buffer_layer)
         .with(log_file_layer)
         .init();
+    install_panic_hook();
 
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {
@@ -156,6 +157,32 @@ async fn async_main() {
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
     }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+
+        if let Some(location) = info.location() {
+            error!(
+                panic.message = payload,
+                panic.file = location.file(),
+                panic.line = location.line(),
+                panic.column = location.column(),
+                "unexpected panic"
+            );
+        } else {
+            error!(panic.message = payload, "unexpected panic");
+        }
+
+        default_hook(info);
+    }));
 }
 
 struct ResolvedLogFileConfig {

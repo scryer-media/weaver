@@ -1,6 +1,22 @@
 mod common;
 
+use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
 use common::TestHarness;
+use serde_json::Value;
+use weaver_server_api::context::{GRAPHQL_MAX_COMPLEXITY, GRAPHQL_MAX_DEPTH};
+
+struct DeepQuery;
+
+#[Object]
+impl DeepQuery {
+    async fn child(&self) -> DeepQuery {
+        DeepQuery
+    }
+
+    async fn value(&self) -> &str {
+        "ok"
+    }
+}
 
 const DIAGNOSTICS_ENABLED: bool = cfg!(weaver_diagnostics);
 
@@ -105,5 +121,65 @@ async fn public_facade_schema_exposes_core_surface() {
     assert!(
         sdl.contains("attributeEquals: AttributeInput"),
         "QueueFilterInput should expose exact attribute matching"
+    );
+}
+
+#[tokio::test]
+async fn graphql_introspection_queries_are_disabled() {
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute("{ __schema { queryType { name } mutationType { name } } }")
+        .await;
+
+    assert!(
+        resp.errors.is_empty(),
+        "async-graphql disables schema introspection by returning null, got {:?}",
+        resp.errors
+    );
+    let data = resp.data.into_json().unwrap();
+    assert_eq!(data["__schema"], Value::Null);
+}
+
+#[tokio::test]
+async fn graphql_query_complexity_is_limited() {
+    let h = TestHarness::new().await;
+    let fields = (0..=GRAPHQL_MAX_COMPLEXITY)
+        .map(|index| format!("f{index}: latestQueueCursor"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let query = format!("query TooComplex {{ {fields} }}");
+
+    let resp = h.execute(&query).await;
+
+    assert!(
+        resp.errors
+            .iter()
+            .any(|error| error.message.contains("Query is too complex")),
+        "expected complexity limit error, got {:?}",
+        resp.errors
+    );
+}
+
+#[tokio::test]
+async fn graphql_query_depth_is_limited() {
+    let schema = Schema::build(DeepQuery, EmptyMutation, EmptySubscription)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+        .finish();
+    let mut selection = "value".to_string();
+    for _ in 0..=GRAPHQL_MAX_DEPTH {
+        selection = format!("child {{ {selection} }}");
+    }
+    let query = format!("query TooDeep {{ {selection} }}");
+
+    let resp = schema.execute(&query).await;
+
+    assert!(
+        resp.errors.iter().any(|error| {
+            let message = error.message.to_ascii_lowercase();
+            message.contains("depth") || message.contains("nested")
+        }),
+        "expected depth limit error, got {:?}",
+        resp.errors
     );
 }

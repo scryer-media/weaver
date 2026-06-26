@@ -23,7 +23,7 @@ fn hash_different_keys() {
 
 #[test]
 fn roundtrip_create_verify() {
-    let secret = derive_jwt_secret("fake_hash");
+    let secret = [7u8; 32];
     let token = create_jwt("admin", &secret, 3600);
     let claims = verify_jwt(&token, &secret).unwrap();
     assert_eq!(claims.sub, "admin");
@@ -31,8 +31,8 @@ fn roundtrip_create_verify() {
 
 #[test]
 fn wrong_secret_fails() {
-    let secret1 = derive_jwt_secret("hash1");
-    let secret2 = derive_jwt_secret("hash2");
+    let secret1 = [1u8; 32];
+    let secret2 = [2u8; 32];
     let token = create_jwt("admin", &secret1, 3600);
     assert!(matches!(
         verify_jwt(&token, &secret2),
@@ -42,7 +42,7 @@ fn wrong_secret_fails() {
 
 #[test]
 fn expired_token_fails() {
-    let secret = derive_jwt_secret("test");
+    let secret = [3u8; 32];
     let token = create_jwt("admin", &secret, 0);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert!(matches!(
@@ -53,7 +53,7 @@ fn expired_token_fails() {
 
 #[test]
 fn malformed_token_fails() {
-    let secret = derive_jwt_secret("test");
+    let secret = [4u8; 32];
     assert!(matches!(
         verify_jwt("not.a.valid.token", &secret),
         Err(JwtError::Malformed)
@@ -65,8 +65,21 @@ fn malformed_token_fails() {
 }
 
 #[test]
-fn derive_secret_changes_with_hash() {
-    let s1 = derive_jwt_secret("hash_a");
-    let s2 = derive_jwt_secret("hash_b");
-    assert_ne!(s1, s2);
+fn jwt_secret_hex_roundtrip() {
+    let secret = generate_jwt_secret();
+    let encoded = encode_jwt_secret(&secret);
+    assert_eq!(encoded.len(), 64);
+    assert_eq!(decode_jwt_secret(&encoded).unwrap(), secret);
+}
+
+#[test]
+fn jwt_secret_decode_rejects_malformed_values() {
+    assert!(matches!(
+        decode_jwt_secret("short"),
+        Err(JwtSecretError::InvalidLength)
+    ));
+    assert!(matches!(
+        decode_jwt_secret(&"z".repeat(64)),
+        Err(JwtSecretError::InvalidHex(_))
+    ));
 }

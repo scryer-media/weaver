@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 use crate::Database;
+use crate::history::HistoryFilter;
 use crate::ingest;
+use crate::jobs::FINISHED_JOBS_RUNTIME_CAP;
 use crate::jobs::working_dir::is_weaver_owned_working_dir;
 use crate::runtime::load_global_pause_from_db;
 use crate::{
@@ -215,7 +217,10 @@ pub async fn recover_server_state(
     }
 
     // Also load archived job history from SQLite so the UI can show completed/failed jobs.
-    match db.list_job_history(&crate::HistoryFilter::default()) {
+    match db.list_job_history(&HistoryFilter {
+        limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
+        ..HistoryFilter::default()
+    }) {
         Ok(history_rows) => {
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {
@@ -275,6 +280,7 @@ pub async fn recover_server_state(
             warn!(error = %e, "failed to load job history from database");
         }
     }
+    initial_history.truncate(FINISHED_JOBS_RUNTIME_CAP);
 
     match cleanup_unreferenced_intermediate_dirs(intermediate_dir, &referenced_intermediate_dirs) {
         Ok(removed) if removed > 0 => {

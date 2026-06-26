@@ -386,7 +386,9 @@ impl Model {
             }
         } else {
             // Binary context.
-            self.decode_bin_symbol(rc);
+            if !self.decode_bin_symbol(rc) {
+                return -1;
+            }
         }
 
         // Escape loop: walk suffix chain until a symbol is found.
@@ -505,7 +507,7 @@ impl Model {
     // decode_bin_symbol (NumStats == 1)
     // =======================================================================
 
-    fn decode_bin_symbol<R: RangeCode>(&mut self, rc: &mut R) {
+    fn decode_bin_symbol<R: RangeCode>(&mut self, rc: &mut R) -> bool {
         let ctx = self.min_context;
         let symbol = self.one_sym(ctx);
         let freq = self.one_freq(ctx);
@@ -519,7 +521,7 @@ impl Model {
             1 // Avoid underflow; won't be used if suffix is null.
         };
         let idx1 = self.prev_success as usize
-            + self.ns2_bs_indx[suffix_ns.wrapping_sub(1) as usize] as usize
+            + self.ns2_bs_indx[suffix_ns.wrapping_sub(1).min(255) as usize] as usize
             + self.hi_bits_flag as usize
             + 2 * self.hb2_flag[symbol as usize] as usize
             + ((self.run_length >> 26) as usize & 0x20);
@@ -546,6 +548,9 @@ impl Model {
             );
         }
 
+        if bs as u32 > BIN_SCALE {
+            return false;
+        }
         let threshold = rc.get_threshold(BIN_SCALE);
         if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
             && (40272340..=40272346).contains(&self.debug_output_index)
@@ -573,25 +578,26 @@ impl Model {
             rc.decode(bs as u32, BIN_SCALE - bs as u32, BIN_SCALE);
             let mean = ((bs as u32 + 32) >> 7) as u16;
             let new_bs = bs.wrapping_sub(mean);
+            let Some(&init_esc) = EXP_ESCAPE.get((new_bs >> 10) as usize) else {
+                return false;
+            };
             if std::env::var_os("WEAVER_RAR4_DEBUG_PPM").is_some()
                 && (40272340..=40272346).contains(&self.debug_output_index)
             {
                 eprintln!(
                     "PPMD decode_bin_symbol escaped: ctx={} symbol={} new_bs={} init_esc={}",
-                    ctx,
-                    symbol,
-                    new_bs,
-                    EXP_ESCAPE[(new_bs >> 10) as usize]
+                    ctx, symbol, new_bs, init_esc
                 );
             }
             self.bin_summ[idx0][idx1] = new_bs;
 
-            self.init_esc = EXP_ESCAPE[(new_bs >> 10) as usize];
+            self.init_esc = init_esc;
             self.num_masked = 1;
             self.char_mask[symbol as usize] = self.esc_count;
             self.prev_success = 0;
             self.found_state = 0;
         }
+        true
     }
 
     // =======================================================================
@@ -808,6 +814,9 @@ impl Model {
         while p < end {
             let sym = self.st_sym(p);
             if self.char_mask[sym as usize] != self.esc_count {
+                if n >= unmasked.len() {
+                    return false;
+                }
                 let freq = self.st_freq(p) as u32;
                 hi_cnt += freq;
                 unmasked[n] = (p, freq as u8);

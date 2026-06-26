@@ -67,7 +67,7 @@ pub use rename::{
 };
 pub use repair::{
     RepairOptions, RepairPlan, execute_repair, execute_repair_with_options, plan_repair,
-    prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
+    plan_repair_with_memory_limit, prepare_recovery_buffers, reconstruct_and_write, xor_out_slice,
 };
 pub use repairer::{
     BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{http, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
@@ -75,8 +75,20 @@ pub(crate) async fn run(
         db.clone(),
         rss.clone(),
     );
+    let jwt_secret = db.get_or_create_jwt_signing_secret()?;
+    let auth_credentials = db.get_auth_credentials()?;
+    let login_enabled = auth_credentials.is_some();
+    if let Some(message) = security.strict_security_violation(login_enabled) {
+        return Err(message.into());
+    }
+    if security.exposes_admin_without_login(login_enabled) {
+        warn!(
+            bind_address = %security.http_bind_address,
+            "Weaver HTTP admin is bound beyond loopback without login protection"
+        );
+    }
     let login_auth_cache =
-        weaver_server_core::auth::LoginAuthCache::from_credentials(db.get_auth_credentials()?);
+        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, jwt_secret);
     let api_key_cache =
         weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 

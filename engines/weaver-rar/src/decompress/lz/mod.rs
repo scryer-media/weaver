@@ -387,7 +387,7 @@ impl LzDecoder {
         let total = self.window.total_written();
         let start = total.saturating_sub(unpacked_size);
         let len = (total - start) as usize;
-        let mut output = self.window.copy_output(start, len);
+        let mut output = self.window.try_copy_output(start, len)?;
 
         // Apply pending filters to the output buffer.
         self.apply_filters(&mut output, start);
@@ -1096,7 +1096,7 @@ impl LzDecoder {
             return Ok(());
         }
 
-        let buf = self.window.copy_output(start_total, len);
+        let buf = self.window.try_copy_output(start_total, len)?;
         writer.write_all(&buf).map_err(RarError::Io)
     }
 
@@ -1158,7 +1158,7 @@ impl LzDecoder {
                     })?;
                 let mut buf = self
                     .window
-                    .copy_output(filter.block_start, filter.block_length);
+                    .try_copy_output(filter.block_start, filter.block_length)?;
                 match filter.filter_type {
                     FilterType::Delta => filter::apply_delta(&mut buf, filter.channels),
                     FilterType::E8 => filter::apply_e8(&mut buf, file_block_start),

@@ -14,7 +14,9 @@ use crate::runtime::system_profile::{
     SystemProfile,
 };
 use crate::settings::{Config, SharedConfig};
-use crate::{FileSpec, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState};
+use crate::{
+    FileSpec, JobInfo, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
+};
 use chrono::Timelike;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
@@ -219,6 +221,31 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         download_queue: DownloadQueue::new(),
         recovery_queue: DownloadQueue::new(),
         staging_dir: None,
+    }
+}
+
+fn finished_job_info(job_id: JobId) -> JobInfo {
+    JobInfo {
+        job_id,
+        job_hash: Some([0; 32]),
+        name: format!("finished-{}", job_id.0),
+        error: None,
+        status: JobStatus::Complete,
+        download_state: crate::jobs::model::DownloadState::Complete,
+        post_state: crate::jobs::model::PostState::Idle,
+        run_state: crate::jobs::model::RunState::Active,
+        progress: 1.0,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        password: None,
+        category: None,
+        metadata: vec![],
+        output_dir: None,
+        created_at_epoch_ms: job_id.0 as f64,
     }
 }
 
@@ -2540,6 +2567,57 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
         settle_inflight_moves(pipeline).await;
     }
     settle_inflight_moves(pipeline).await;
+}
+
+#[tokio::test]
+async fn shutdown_drain_consumes_inflight_download_results() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: JobId(42),
+            file_index: 0,
+        },
+        segment_number: 1,
+    };
+
+    pipeline.active_downloads = 1;
+    pipeline
+        .active_downloads_by_job
+        .insert(segment_id.file_id.job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(segment_id.file_id, 1);
+
+    pipeline
+        .download_done_tx
+        .send(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch("shutdown test".to_string())),
+            attempts: Vec::new(),
+            source_server_idx: None,
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), pipeline.drain())
+        .await
+        .expect("shutdown drain should consume queued download result");
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert!(
+        !pipeline
+            .active_downloads_by_job
+            .contains_key(&segment_id.file_id.job_id)
+    );
+    assert!(
+        !pipeline
+            .active_downloads_by_file
+            .contains_key(&segment_id.file_id)
+    );
 }
 
 #[tokio::test]
@@ -5275,6 +5353,44 @@ async fn fail_job_clears_write_backlog_accounting() {
 }
 
 #[tokio::test]
+async fn disk_write_failure_fails_job_before_commit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20016);
+    let spec = standalone_job_spec("Disk Write Failure", &[("blocked.bin".to_string(), 4u32)]);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working_dir.join("blocked.bin"))
+        .await
+        .unwrap();
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    pipeline
+        .handle_decode_success(DecodeResult {
+            segment_id: SegmentId {
+                file_id,
+                segment_number: 0,
+            },
+            file_offset: 0,
+            decoded_size: 4,
+            crc_valid: true,
+            data: DecodedChunk::from(b"fail".to_vec()),
+            yenc_name: "blocked.bin".to_string(),
+        })
+        .await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(
+        &status,
+        JobStatus::Failed { error } if error.contains("disk write failed")
+    ));
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(working_dir.join("blocked.bin").is_dir());
+}
+
+#[tokio::test]
 async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -5855,6 +5971,41 @@ async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
             .iter()
             .any(|job| job.job_id == job_id)
     );
+}
+
+#[tokio::test]
+async fn record_job_history_caps_finished_job_runtime_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let base_job_id = 900_000;
+    pipeline.finished_jobs = (0..crate::jobs::FINISHED_JOBS_RUNTIME_CAP)
+        .map(|offset| finished_job_info(JobId(base_job_id + offset as u64)))
+        .collect();
+    let evicted_job_id = JobId(base_job_id + crate::jobs::FINISHED_JOBS_RUNTIME_CAP as u64 - 1);
+
+    let job_id = JobId(base_job_id + crate::jobs::FINISHED_JOBS_RUNTIME_CAP as u64 + 1);
+    let spec = standalone_job_spec(
+        "Finished Runtime Cap",
+        &[("finished-runtime-cap.mkv".to_string(), 123)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
+
+    pipeline.record_job_history(job_id);
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    assert_eq!(
+        pipeline.finished_jobs.len(),
+        crate::jobs::FINISHED_JOBS_RUNTIME_CAP
+    );
+    assert_eq!(pipeline.finished_jobs.first().unwrap().job_id, job_id);
+    assert!(
+        pipeline
+            .finished_jobs
+            .iter()
+            .all(|job| job.job_id != evicted_job_id)
+    );
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -14461,6 +14612,74 @@ async fn pause_clears_stale_completion_rechecks() {
 }
 
 #[tokio::test]
+async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: JobId(31233),
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.rate_limiter.set_rate(1_000);
+    pipeline.rate_limiter.refund(1_000);
+    pipeline.rate_limiter.consume(1_500);
+    pipeline.rate_limit_reservations.insert(segment_id, 1_500);
+    assert!(pipeline.rate_limiter.should_wait());
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
+            attempts: vec![],
+            source_server_idx: None,
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: vec![],
+        })
+        .await;
+
+    assert!(!pipeline.rate_limit_reservations.contains_key(&segment_id));
+    assert!(!pipeline.rate_limiter.should_wait());
+}
+
+#[tokio::test]
+async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: JobId(31234),
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.rate_limiter.set_rate(1_000);
+    pipeline.rate_limiter.refund(1_000);
+    pipeline.rate_limiter.consume(500);
+    pipeline.rate_limit_reservations.insert(segment_id, 500);
+    assert!(!pipeline.rate_limiter.should_wait());
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
+            attempts: vec![],
+            source_server_idx: None,
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: vec![],
+        })
+        .await;
+
+    assert!(!pipeline.rate_limit_reservations.contains_key(&segment_id));
+    assert!(pipeline.rate_limiter.should_wait());
+}
+
+#[tokio::test]
 async fn auto_pause_stalled_download_releases_blocking_runtime() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -14482,6 +14701,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline.bandwidth_cap.reserve(256);
     pipeline.bandwidth_reservations.insert(segment_id, 256);
+    pipeline.rate_limit_reservations.insert(segment_id, 256);
     pipeline.job_last_download_activity.insert(
         job_id,
         std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
@@ -14504,6 +14724,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     assert!(!pipeline.active_download_passes.contains(&job_id));
     assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
     assert!(pipeline.bandwidth_reservations.is_empty());
+    assert!(pipeline.rate_limit_reservations.is_empty());
 }
 
 #[tokio::test]

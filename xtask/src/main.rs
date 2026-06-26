@@ -35,7 +35,18 @@ const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
-const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[&str] = &["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"];
+const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[
+    ReleaseAuditAllow {
+        id: "RUSTSEC-2023-0071",
+        expires_on: "2026-09-30",
+        reason: "transitive dependency still under review; release must revisit before expiry",
+    },
+    ReleaseAuditAllow {
+        id: "RUSTSEC-2025-0134",
+        expires_on: "2026-09-30",
+        reason: "slab advisory suppression is temporary while upstream dependency path is updated",
+    },
+];
 const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("/", "Users/"),
     concat!("/", "home/"),
@@ -50,6 +61,12 @@ const WINGET_PORTABLE_COMMAND_ALIAS: &str = "weaver";
 const WINGET_MANIFEST_VERSION: &str = "1.12.0";
 const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.zip";
 const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.zip";
+
+struct ReleaseAuditAllow {
+    id: &'static str,
+    expires_on: &'static str,
+    reason: &'static str,
+}
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -104,6 +121,7 @@ struct CiArgs {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    Audit,
     Clippy(ClippyArgs),
     Winget(WingetArgs),
 }
@@ -370,6 +388,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Release(args) => run_release(&ctx, args),
         Commands::Ci(args) => match args.command {
+            CiCommand::Audit => run_cargo_audit_validation(&ctx, "ci-audit"),
             CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
             CiCommand::Winget(args) => run_ci_winget(&ctx, args),
         },
@@ -1934,6 +1953,44 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
     Ok(())
 }
 
+fn release_allowed_cargo_audit_ids() -> Result<Vec<&'static str>> {
+    let today = Utc::now().date_naive();
+    let mut ids = Vec::with_capacity(RELEASE_ALLOWED_CARGO_AUDIT_IDS.len());
+    for advisory in RELEASE_ALLOWED_CARGO_AUDIT_IDS {
+        let expires_on = NaiveDate::parse_from_str(advisory.expires_on, "%Y-%m-%d")
+            .with_context(|| format!("invalid expiry for {}", advisory.id))?;
+        if today > expires_on {
+            bail!(
+                "cargo audit allowlist entry {} expired on {}: {}",
+                advisory.id,
+                advisory.expires_on,
+                advisory.reason
+            );
+        }
+        ids.push(advisory.id);
+    }
+    Ok(ids)
+}
+
+fn run_cargo_audit_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Running cargo audit");
+    if !command_available("cargo-audit")? {
+        warn("cargo-audit not installed — installing");
+        let mut install = ctx.command_in("cargo", &ctx.repo_root);
+        install.args(["install", "--locked", "cargo-audit"]);
+        run_streaming(&mut install, prefix)?;
+    }
+    let mut audit = ctx.command_in("cargo", &ctx.repo_root);
+    audit.arg("audit");
+    let allowed_advisories = release_allowed_cargo_audit_ids()?;
+    for advisory in allowed_advisories {
+        audit.args(["--ignore", advisory]);
+    }
+    run_streaming(&mut audit, prefix)?;
+    prefixed_ok(prefix, "cargo audit passed");
+    Ok(())
+}
+
 fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     prefixed_step(prefix, "Running cargo fmt --all");
     let mut fmt_fix = ctx.command_in("cargo", &ctx.repo_root);
@@ -1953,20 +2010,7 @@ fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> R
     run_streaming(&mut update, prefix)?;
     prefixed_ok(prefix, "Cargo.lock updated");
 
-    prefixed_step(prefix, "Running cargo audit");
-    if !command_available("cargo-audit")? {
-        warn("cargo-audit not installed — installing");
-        let mut install = ctx.command_in("cargo", &ctx.repo_root);
-        install.args(["install", "--locked", "cargo-audit"]);
-        run_streaming(&mut install, prefix)?;
-    }
-    let mut audit = ctx.command_in("cargo", &ctx.repo_root);
-    audit.arg("audit");
-    for advisory in RELEASE_ALLOWED_CARGO_AUDIT_IDS {
-        audit.args(["--ignore", advisory]);
-    }
-    run_streaming(&mut audit, prefix)?;
-    prefixed_ok(prefix, "cargo audit passed");
+    run_cargo_audit_validation(ctx, prefix)?;
 
     Ok(())
 }

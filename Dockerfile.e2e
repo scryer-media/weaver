@@ -1,10 +1,20 @@
-FROM rust:1.96-slim-bookworm AS chef
+FROM rust:1.96-slim-bookworm AS builder
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev curl ca-certificates gnupg && \
+    pkg-config libssl-dev curl ca-certificates gnupg musl-tools && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+RUN arch="${TARGETARCH:-$(uname -m)}" && \
+    case "$arch" in \
+        amd64|x86_64) target="x86_64-unknown-linux-musl" ;; \
+        arm64|aarch64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "unsupported TARGETARCH: $arch" >&2; exit 1 ;; \
+    esac && \
+    rustup toolchain install 1.96 --profile minimal --target "$target" && \
+    echo "$target" > /tmp/weaver-target
 
 # Copy workspace
 COPY . .
@@ -13,18 +23,27 @@ COPY . .
 RUN cd apps/weaver-web && npm ci && npm run build
 
 # Build backend
-RUN cargo build --release -p weaver
+RUN cargo build --release --locked -p weaver --target "$(cat /tmp/weaver-target)" && \
+    cp "target/$(cat /tmp/weaver-target)/release/weaver" /tmp/weaver-portable
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && \
+    ca-certificates tzdata util-linux wget && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=chef /app/target/release/weaver /usr/local/bin/weaver
+COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/runtime-select.sh /runtime-select.sh
+COPY --from=builder /tmp/weaver-portable /opt/weaver/weaver-portable
 
-RUN mkdir -p /data
+RUN chmod +x /entrypoint.sh /runtime-select.sh /opt/weaver/weaver-portable && \
+    mkdir -p /config /data
+VOLUME /config
 VOLUME /data
 
 EXPOSE 9090
 
-CMD ["weaver", "serve", "--port", "9090"]
+ENV PUID=1000
+ENV PGID=1000
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--config", "/config", "serve", "--port", "9090"]

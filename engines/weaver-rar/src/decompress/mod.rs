@@ -11,7 +11,11 @@ pub mod store;
 use std::io::Write;
 
 use crate::error::{RarError, RarResult};
+use crate::limits::Limits;
 use crate::types::{ArchiveFormat, CompressionInfo, CompressionMethod};
+
+/// Maximum initial allocation for the Vec-returning decompression helper.
+const DIRECT_OUTPUT_INITIAL_CAPACITY_LIMIT: usize = 1024 * 1024;
 
 /// A volume transition boundary used for chunked decompression.
 ///
@@ -39,6 +43,8 @@ pub fn decompress(
     info: &CompressionInfo,
     expected_crc: Option<u32>,
 ) -> RarResult<Vec<u8>> {
+    enforce_direct_output_limit(unpacked_size)?;
+
     match info.method {
         CompressionMethod::Store => {
             // Method 0: no compression, direct copy with CRC check.
@@ -51,7 +57,7 @@ pub fn decompress(
         | CompressionMethod::Normal
         | CompressionMethod::Good
         | CompressionMethod::Best => {
-            let capacity = unpacked_size.min(usize::MAX as u64) as usize;
+            let capacity = direct_output_initial_capacity(input.len(), unpacked_size);
             let mut output = Vec::with_capacity(capacity);
             decompress_to_writer(input, unpacked_size, info, expected_crc, &mut output)?;
             Ok(output)
@@ -61,6 +67,28 @@ pub fn decompress(
             version: info.version,
         }),
     }
+}
+
+fn enforce_direct_output_limit(unpacked_size: u64) -> RarResult<()> {
+    let max_unpacked_size = Limits::default().max_unpacked_size;
+    if unpacked_size > max_unpacked_size {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "direct decompression output size {unpacked_size} exceeds limit {max_unpacked_size}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn direct_output_initial_capacity(input_len: usize, unpacked_size: u64) -> usize {
+    let unpacked_hint =
+        usize::try_from(unpacked_size).unwrap_or(DIRECT_OUTPUT_INITIAL_CAPACITY_LIMIT);
+
+    input_len
+        .min(unpacked_hint)
+        .min(DIRECT_OUTPUT_INITIAL_CAPACITY_LIMIT)
 }
 
 /// Streaming variant: decompress directly to a writer.
@@ -204,6 +232,29 @@ mod tests {
 
         let result = decompress(&[], 0, &info, None).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dispatch_lz_rejects_direct_output_above_limit_before_allocating() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 0,
+            solid: false,
+            method: CompressionMethod::Normal,
+            dict_size: 128 * 1024,
+        };
+
+        let result = decompress(&[0], Limits::default().max_unpacked_size + 1, &info, None);
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn test_direct_output_initial_capacity_is_bounded() {
+        assert_eq!(
+            direct_output_initial_capacity(usize::MAX, u64::MAX),
+            DIRECT_OUTPUT_INITIAL_CAPACITY_LIMIT
+        );
     }
 
     #[test]
