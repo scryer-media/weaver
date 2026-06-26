@@ -926,6 +926,43 @@ mod tests {
     }
 
     #[test]
+    fn decode_multipart_checks_pcrc32_and_carries_file_crc32() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(original);
+        let part_crc = hasher.finalize();
+
+        let mut article = Vec::new();
+        article.extend_from_slice(
+            format!(
+                "=ybegin part=1 total=2 line=128 size={} name=test.bin\r\n",
+                original.len() * 2
+            )
+            .as_bytes(),
+        );
+        article.extend_from_slice(format!("=ypart begin=1 end={}\r\n", original.len()).as_bytes());
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(
+            format!(
+                "\r\n=yend size={} part=1 pcrc32={part_crc:08x} crc32=DEADBEEF\r\n",
+                original.len()
+            )
+            .as_bytes(),
+        );
+
+        let mut output = vec![0u8; 1024];
+        let result = decode(&article, &mut output).unwrap();
+
+        assert_eq!(result.bytes_written, original.len());
+        assert_eq!(&output[..result.bytes_written], original.as_slice());
+        assert_eq!(result.part_crc, part_crc);
+        assert_eq!(result.expected_part_crc, Some(part_crc));
+        assert_eq!(result.expected_file_crc, Some(0xDEADBEEF));
+        assert!(result.crc_valid);
+    }
+
+    #[test]
     fn decode_multipart_ypart_range_size_mismatch_errors() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);

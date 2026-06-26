@@ -244,6 +244,7 @@ impl Pipeline {
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
+                            expected_file_crc: decode_result.expected_file_crc,
                             data: decoded,
                             yenc_name: decode_result.metadata.name,
                         }));
@@ -279,6 +280,7 @@ impl Pipeline {
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
+                            expected_file_crc: decode_result.expected_file_crc,
                             data: DecodedChunk::from(output),
                             yenc_name: decode_result.metadata.name,
                         }));

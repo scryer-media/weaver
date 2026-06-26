@@ -83,6 +83,7 @@ impl Pipeline {
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
+            expected_file_crcs: HashMap::new(),
             file_hash_reread_required: HashSet::new(),
             #[cfg(test)]
             try_update_archive_topology_calls: 0,
@@ -293,6 +294,8 @@ impl Pipeline {
         self.persisted_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
         self.file_hash_states
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.expected_file_crcs
             .retain(|file_id, _| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);

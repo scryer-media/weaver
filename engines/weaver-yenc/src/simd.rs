@@ -124,11 +124,6 @@ fn decode_kernel(
                 decode_kernel_avx512_vbmi2(input, output, state, dot_unstuffing, streaming)
             };
         }
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
-            return unsafe {
-                decode_kernel_avx512(input, output, state, dot_unstuffing, streaming)
-            };
-        }
         if is_x86_feature_detected!("avx2") {
             return unsafe { decode_kernel_avx2(input, output, state, dot_unstuffing, streaming) };
         }
@@ -466,27 +461,6 @@ unsafe fn decode_kernel_avx2(
             dot_unstuffing,
             streaming,
             try_decode_avx2_block,
-        )
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512f")]
-unsafe fn decode_kernel_avx512(
-    input: &[u8],
-    output: &mut [u8],
-    state: &mut KernelState,
-    dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
-    unsafe {
-        decode_kernel_simd64(
-            input,
-            output,
-            state,
-            dot_unstuffing,
-            streaming,
-            try_decode_avx512_block,
         )
     }
 }
@@ -1022,99 +996,6 @@ unsafe fn try_decode_avx512_vbmi2_block(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512f")]
-unsafe fn try_decode_avx512_block(
-    input: &[u8],
-    src: usize,
-    output: &mut [u8],
-    dst: &mut usize,
-    state: &mut KernelState,
-    dot_unstuffing: bool,
-) -> Result<Option<usize>, YencError> {
-    use std::arch::x86_64::*;
-
-    if input.len().saturating_sub(src) < 64 || output.len().saturating_sub(*dst) < 64 {
-        return Ok(None);
-    }
-
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
-    let block = unsafe { _mm512_loadu_si512(input.as_ptr().add(src) as *const __m512i) };
-    let eq = unsafe { avx512_mask64(block, b'=') };
-    let cr = unsafe { avx512_mask64(block, b'\r') };
-    let lf = unsafe { avx512_mask64(block, b'\n') };
-    let dot = unsafe { avx512_mask64(block, b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
-
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
-    } else {
-        0
-    };
-
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
-
-    let dot_before_break = dot_start & (raw_breaks >> 1);
-    let dot_before_eq = dot_start & (eq >> 1);
-    let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
-        return Ok(None);
-    }
-
-    let skip = fixed_eq | raw_breaks | dot_start;
-
-    if skip == 0 {
-        let sub42 = _mm512_set1_epi8(42i8.wrapping_neg());
-        let decoded = _mm512_add_epi8(block, sub42);
-        unsafe { _mm512_storeu_si512(output.as_mut_ptr().add(*dst) as *mut __m512i, decoded) };
-        *dst += 64;
-        state.state = DecoderState::None;
-        return Ok(Some(64));
-    }
-
-    let keep = 64 - skip.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < keep {
-        return Err(YencError::BufferTooSmall {
-            needed: *dst + keep,
-            available: output.len(),
-        });
-    }
-
-    for lane in 0..64usize {
-        if skip & (1u64 << lane) == 0 {
-            let byte = input[src + lane];
-            output[*dst] = if escaped & (1u64 << lane) != 0 {
-                byte.wrapping_sub(106)
-            } else {
-                byte.wrapping_sub(42)
-            };
-            *dst += 1;
-        }
-    }
-
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    Ok(Some(64))
-}
-
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64 {
     use std::arch::x86_64::*;
@@ -1140,15 +1021,6 @@ unsafe fn avx2_mask64(
     let mask_a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, needle)) as u32 as u64;
     let mask_b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, needle)) as u32 as u64;
     mask_a | (mask_b << 32)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512f")]
-unsafe fn avx512_mask64(block: std::arch::x86_64::__m512i, byte: u8) -> u64 {
-    use std::arch::x86_64::*;
-
-    let needle = _mm512_set1_epi8(byte as i8);
-    _mm512_cmpeq_epi8_mask(block, needle)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2638,31 +2510,6 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    unsafe fn avx512_block_with_state(
-        input: &[u8],
-        initial_state: DecoderState,
-        dot_unstuffing: bool,
-    ) -> Option<(Vec<u8>, KernelState)> {
-        if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f")) {
-            return None;
-        }
-
-        let mut output = vec![0u8; input.len() + 64];
-        let mut dst = 0usize;
-        let mut state = KernelState {
-            state: initial_state,
-            end: DecodeEnd::None,
-        };
-        let consumed = unsafe {
-            try_decode_avx512_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
-        assert_eq!(consumed, 64);
-        output.truncate(dst);
-        Some((output, state))
-    }
-
-    #[cfg(target_arch = "x86_64")]
     unsafe fn avx512_vbmi2_block_with_state(
         input: &[u8],
         initial_state: DecoderState,
@@ -3258,71 +3105,6 @@ mod tests {
         let (scalar, scalar_state) = scalar_body_with_state(&input, DecoderState::None, false);
 
         assert_eq!(avx2, scalar);
-        assert_eq!(avx_state, scalar_state);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn avx512_block_compacts_escapes_and_line_breaks() {
-        let mut input = [b'A'; 64];
-        input[3] = b'=';
-        input[4] = b'C';
-        input[10] = b'\r';
-        input[11] = b'\n';
-        input[20] = b'=';
-        input[21] = b'=';
-        input[22] = b'B';
-        input[37] = b'\n';
-        input[52] = b'=';
-        input[53] = b'Z';
-
-        let Some((avx512, avx_state)) =
-            (unsafe { avx512_block_with_state(&input, DecoderState::None, false) })
-        else {
-            return;
-        };
-        let (scalar, scalar_state) = scalar_body_with_state(&input, DecoderState::None, false);
-
-        assert_eq!(avx512, scalar);
-        assert_eq!(avx_state, scalar_state);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn avx512_block_handles_dot_stuffed_line_start() {
-        let mut input = [b'A'; 64];
-        input[0] = b'.';
-        input[1] = b'.';
-        input[16] = b'\r';
-        input[17] = b'\n';
-        input[18] = b'.';
-        input[19] = b'.';
-
-        let Some((avx512, avx_state)) =
-            (unsafe { avx512_block_with_state(&input, DecoderState::CrLf, true) })
-        else {
-            return;
-        };
-        let (scalar, scalar_state) = scalar_body_with_state(&input, DecoderState::CrLf, true);
-
-        assert_eq!(avx512, scalar);
-        assert_eq!(avx_state, scalar_state);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn avx512_block_preserves_trailing_cr_state() {
-        let mut input = [b'A'; 64];
-        input[63] = b'\r';
-
-        let Some((avx512, avx_state)) =
-            (unsafe { avx512_block_with_state(&input, DecoderState::None, false) })
-        else {
-            return;
-        };
-        let (scalar, scalar_state) = scalar_body_with_state(&input, DecoderState::None, false);
-
-        assert_eq!(avx512, scalar);
         assert_eq!(avx_state, scalar_state);
     }
 

@@ -382,6 +382,7 @@ pub(super) struct DecodeResult {
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
+    pub(super) expected_file_crc: Option<u32>,
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
@@ -397,6 +398,47 @@ pub(super) enum DecodeDone {
         source_server_idx: Option<usize>,
         exclude_servers: Vec<usize>,
     },
+}
+
+pub(super) struct CompletedFileChecksum {
+    pub(super) md5: [u8; 16],
+    pub(super) crc32: u32,
+}
+
+pub(super) struct CompletedFileChecksumState {
+    md5: weaver_par2::checksum::FileHashState,
+    crc32: crc32fast::Hasher,
+}
+
+impl CompletedFileChecksumState {
+    pub(super) fn new() -> Self {
+        Self {
+            md5: weaver_par2::checksum::FileHashState::new(),
+            crc32: crc32fast::Hasher::new(),
+        }
+    }
+
+    pub(super) fn update(&mut self, data: &[u8]) {
+        self.md5.update(data);
+        self.crc32.update(data);
+    }
+
+    pub(super) fn bytes_fed(&self) -> u64 {
+        self.md5.bytes_fed()
+    }
+
+    pub(super) fn finalize(self) -> CompletedFileChecksum {
+        CompletedFileChecksum {
+            md5: self.md5.finalize(),
+            crc32: self.crc32.finalize(),
+        }
+    }
+}
+
+impl Default for CompletedFileChecksumState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub(super) struct DecodedChunk(Box<[u8]>);
@@ -483,8 +525,10 @@ pub struct Pipeline {
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
     /// Last queued/persisted contiguous write floor per file.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
-    /// Streaming MD5 state for files whose decoded bytes have been observed in order.
-    pub(super) file_hash_states: HashMap<NzbFileId, weaver_par2::checksum::FileHashState>,
+    /// Streaming checksum state for files whose decoded bytes have been observed in order.
+    pub(super) file_hash_states: HashMap<NzbFileId, CompletedFileChecksumState>,
+    /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
+    pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]

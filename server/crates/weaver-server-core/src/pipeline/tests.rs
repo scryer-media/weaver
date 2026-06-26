@@ -2061,6 +2061,63 @@ async fn write_and_complete_file(
         .await;
 }
 
+fn two_segment_standalone_job_spec(
+    name: &str,
+    filename: &str,
+    first_bytes: u32,
+    second_bytes: u32,
+) -> JobSpec {
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: (first_bytes + second_bytes) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![
+                segment_spec! {
+                    number: 0,
+                    bytes: first_bytes,
+                    message_id: "segment-0@example.com".to_string(),
+                },
+                segment_spec! {
+                    number: 1,
+                    bytes: second_bytes,
+                    message_id: "segment-1@example.com".to_string(),
+                },
+            ],
+        }],
+    }
+}
+
+async fn submit_decoded_segment(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+) {
+    pipeline
+        .handle_decode_success(DecodeResult {
+            segment_id: SegmentId {
+                file_id,
+                segment_number,
+            },
+            file_offset,
+            decoded_size: data.len() as u32,
+            crc_valid: true,
+            expected_file_crc,
+            data: DecodedChunk::from(data.to_vec()),
+            yenc_name: filename.to_string(),
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn completed_rar_volume_queues_refresh_without_inline_recompute() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5376,6 +5433,7 @@ async fn disk_write_failure_fails_job_before_commit() {
             file_offset: 0,
             decoded_size: 4,
             crc_valid: true,
+            expected_file_crc: None,
             data: DecodedChunk::from(b"fail".to_vec()),
             yenc_name: "blocked.bin".to_string(),
         })
@@ -5388,6 +5446,141 @@ async fn disk_write_failure_fails_job_before_commit() {
     ));
     assert!(!pipeline.jobs.contains_key(&job_id));
     assert!(working_dir.join("blocked.bin").is_dir());
+}
+
+#[tokio::test]
+async fn completed_file_crc32_match_persists_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20017);
+    let filename = "payload.bin";
+    let payload = b"verified";
+    let spec = standalone_job_spec(
+        "Whole File CRC Match",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        Some(weaver_par2::checksum::crc32(payload)),
+    )
+    .await;
+
+    assert!(pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        hashes.get(&0).copied(),
+        Some(weaver_par2::checksum::md5(payload))
+    );
+}
+
+#[tokio::test]
+async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20018);
+    let filename = "payload.bin";
+    let payload = b"damaged";
+    let spec = standalone_job_spec(
+        "Whole File CRC Mismatch",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        Some(0xDEADBEEF),
+    )
+    .await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(
+        &status,
+        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
+    ));
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.file_hash_states.contains_key(&file_id));
+    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
+    assert!(
+        pipeline
+            .db
+            .load_complete_file_hashes(job_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn conflicting_file_crc32_across_segments_fails_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20019);
+    let filename = "payload.bin";
+    let spec = two_segment_standalone_job_spec("Conflicting Whole CRC", filename, 4, 4);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"abcd",
+        filename,
+        Some(0x1111_1111),
+    )
+    .await;
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        1,
+        4,
+        b"efgh",
+        filename,
+        Some(0x2222_2222),
+    )
+    .await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(
+        &status,
+        JobStatus::Failed { error } if error.contains("conflicting yEnc whole-file CRC32")
+    ));
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.file_hash_states.contains_key(&file_id));
+    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
+    assert!(
+        pipeline
+            .db
+            .load_complete_file_hashes(job_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -7566,11 +7759,12 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
     pipeline.note_file_hash_chunk(file_id, 4, &payload[4..8]);
     pipeline.note_file_hash_chunk(file_id, 0, &payload[0..4]);
 
-    let hash = pipeline
+    let checksum = pipeline
         .finalize_completed_file_hash(file_id, file_path, payload.len() as u64)
         .await
         .unwrap();
-    assert_eq!(hash, weaver_par2::checksum::md5(payload));
+    assert_eq!(checksum.md5, weaver_par2::checksum::md5(payload));
+    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
 }
 
 #[tokio::test]

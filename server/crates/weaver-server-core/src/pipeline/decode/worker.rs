@@ -70,6 +70,34 @@ impl Pipeline {
             .update(data);
     }
 
+    pub(crate) fn note_expected_file_crc(
+        &mut self,
+        file_id: NzbFileId,
+        expected_file_crc: Option<u32>,
+    ) -> Result<(), String> {
+        let Some(expected_file_crc) = expected_file_crc else {
+            return Ok(());
+        };
+
+        match self.expected_file_crcs.entry(file_id) {
+            std::collections::hash_map::Entry::Occupied(existing) => {
+                if *existing.get() == expected_file_crc {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "conflicting yEnc whole-file CRC32 for {file_id}: {:08x} vs {:08x}",
+                        existing.get(),
+                        expected_file_crc
+                    ))
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(expected_file_crc);
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn mark_file_hash_reread_required(&mut self, file_id: NzbFileId) {
         self.file_hash_states.remove(&file_id);
         self.file_hash_reread_required.insert(file_id);
@@ -80,7 +108,7 @@ impl Pipeline {
         file_id: NzbFileId,
         file_path: std::path::PathBuf,
         total_bytes: u64,
-    ) -> Result<[u8; 16], String> {
+    ) -> Result<CompletedFileChecksum, String> {
         let hash_state = self.file_hash_states.remove(&file_id);
         let reread_required = self.file_hash_reread_required.remove(&file_id);
         if !reread_required
@@ -90,10 +118,10 @@ impl Pipeline {
             return Ok(hash_state.finalize());
         }
 
-        tokio::task::spawn_blocking(move || hash_file_md5(&file_path))
+        tokio::task::spawn_blocking(move || checksum_completed_file(&file_path))
             .await
-            .map_err(|error| format!("file hash task panicked: {error}"))?
-            .map_err(|error| format!("failed to hash completed file: {error}"))
+            .map_err(|error| format!("file checksum task panicked: {error}"))?
+            .map_err(|error| format!("failed to checksum completed file: {error}"))
     }
 
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
@@ -351,6 +379,7 @@ impl Pipeline {
             file_offset,
             decoded_size,
             crc_valid,
+            expected_file_crc,
             data,
             yenc_name,
         } = result;
@@ -372,6 +401,11 @@ impl Pipeline {
         }
 
         self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
+        if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
+            self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+            self.fail_job(job_id, error);
+            return;
+        }
 
         if !crc_valid {
             self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
@@ -699,16 +733,43 @@ impl Pipeline {
                         }
                     }
 
-                    let file_hash = match self
+                    let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
+                    let file_checksum = match self
                         .finalize_completed_file_hash(file_id, file_path.clone(), total_bytes)
                         .await
                     {
-                        Ok(hash) => hash,
+                        Ok(checksum) => checksum,
                         Err(error) => {
+                            if expected_file_crc.is_some() {
+                                warn!(file_id = %file_id, error = %error, "failed to verify yEnc whole-file CRC32");
+                                self.fail_job(
+                                    job_id,
+                                    format!("failed to verify yEnc whole-file CRC32 for {file_id}: {error}"),
+                                );
+                                return;
+                            }
+
                             warn!(file_id = %file_id, error = %error, "failed to persist real completed-file hash");
-                            [0u8; 16]
+                            CompletedFileChecksum {
+                                md5: [0u8; 16],
+                                crc32: 0,
+                            }
                         }
                     };
+                    if let Some(expected_crc) = expected_file_crc
+                        && file_checksum.crc32 != expected_crc
+                    {
+                        self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                        self.fail_job(
+                            job_id,
+                            format!(
+                                "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
+                                file_checksum.crc32
+                            ),
+                        );
+                        return;
+                    }
+                    let file_hash = file_checksum.md5;
 
                     if !segment.yenc_name.is_empty() && segment.yenc_name != filename {
                         if self.yenc_name_matches_rewritten_source(
@@ -755,6 +816,7 @@ impl Pipeline {
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
                     self.file_hash_states.remove(&file_id);
+                    self.expected_file_crcs.remove(&file_id);
                     self.file_hash_reread_required.remove(&file_id);
 
                     let mut stage_start = Instant::now();
@@ -837,16 +899,16 @@ impl Pipeline {
     }
 }
 
-fn hash_file_md5(path: &std::path::Path) -> io::Result<[u8; 16]> {
+fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
     let mut file = File::open(path)?;
-    let mut hasher = weaver_par2::checksum::FileHashState::new();
+    let mut checksum = CompletedFileChecksumState::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        hasher.update(&buffer[..bytes_read]);
+        checksum.update(&buffer[..bytes_read]);
     }
-    Ok(hasher.finalize())
+    Ok(checksum.finalize())
 }

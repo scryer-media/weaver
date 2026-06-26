@@ -12,7 +12,7 @@ pub const MAX_NZB_FILES: usize = 100_000;
 pub const MAX_SEGMENTS_PER_FILE: usize = 100_000;
 pub const MAX_NZB_SEGMENTS: usize = 2_000_000;
 pub const MAX_DECLARED_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
-const MAX_SEGMENT_BYTES: u32 = 8 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: u32 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct ParserLimits {
@@ -750,7 +750,7 @@ mod tests {
       <segment bytes="1" number="bad">bad-number</segment>
       <segment bytes="0" number="2">zero-bytes</segment>
       <segment bytes="1" number="0">zero-number</segment>
-      <segment bytes="8388609" number="3">too-large</segment>
+      <segment bytes="33554433" number="3">too-large</segment>
       <segment bytes="1">missing-number</segment>
       <segment number="4">missing-bytes</segment>
       <segment bytes="1" number="5"></segment>
@@ -880,6 +880,55 @@ mod tests {
             max_segments: 100,
             max_declared_bytes: 1024,
         }
+    }
+
+    #[test]
+    fn accepts_segment_at_byte_cap() {
+        let xml = format!(
+            r#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments><segment bytes="{MAX_SEGMENT_BYTES}" number="1">one</segment></segments>
+  </file>
+</nzb>"#
+        );
+
+        let nzb = parse_nzb(xml.as_bytes()).unwrap();
+        assert_eq!(nzb.files[0].segments[0].bytes, MAX_SEGMENT_BYTES);
+    }
+
+    #[test]
+    fn skips_segment_over_byte_cap() {
+        let too_large = MAX_SEGMENT_BYTES + 1;
+        let xml = format!(
+            r#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments>
+      <segment bytes="1" number="1">one</segment>
+      <segment bytes="{too_large}" number="2">two</segment>
+    </segments>
+  </file>
+</nzb>"#
+        );
+
+        let nzb = parse_nzb(xml.as_bytes()).unwrap();
+        assert_eq!(nzb.files[0].segments.len(), 1);
+        assert_eq!(nzb.files[0].segments[0].message_id, "one");
+    }
+
+    #[test]
+    fn skips_zero_byte_segment() {
+        let xml = br#"<nzb>
+  <file poster="p" date="0" subject="one">
+    <segments>
+      <segment bytes="1" number="1">one</segment>
+      <segment bytes="0" number="2">zero</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(nzb.files[0].segments.len(), 1);
+        assert_eq!(nzb.files[0].segments[0].message_id, "one");
     }
 
     #[test]

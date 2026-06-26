@@ -1147,6 +1147,7 @@ impl Pipeline {
             self.pending_file_progress.remove(file_id);
             self.persisted_file_progress.remove(file_id);
             self.file_hash_states.remove(file_id);
+            self.expected_file_crcs.remove(file_id);
             self.file_hash_reread_required.remove(file_id);
             self.refresh_archive_state_for_completed_file(job_id, *file_id, true)
                 .await;
