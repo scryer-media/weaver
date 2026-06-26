@@ -148,6 +148,16 @@ fn encode_vint(mut value: u64) -> Vec<u8> {
 /// RAR5 signature bytes.
 const RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
+fn build_single_file_rar5_archive(file_header: Vec<u8>, content: &[u8]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&RAR5_SIG);
+    archive.extend_from_slice(&build_main_archive_header(0, None));
+    archive.extend_from_slice(&file_header);
+    archive.extend_from_slice(content);
+    archive.extend_from_slice(&build_end_header(false));
+    archive
+}
+
 /// Build a main archive header for a multi-volume archive.
 /// `archive_flags`: 0x0001 = VOLUME, 0x0002 = VOLUME_NUMBER, 0x0004 = SOLID
 fn build_main_archive_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
@@ -195,7 +205,33 @@ fn build_file_header_ex_with_extra(
     comp_info_raw: u64,
     extra_area: &[u8],
 ) -> Vec<u8> {
-    let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
+    build_file_header_ex_with_file_flags(
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        comp_info_raw,
+        0,
+        extra_area,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_file_header_ex_with_file_flags(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    comp_info_raw: u64,
+    file_flags_extra: u64,
+    extra_area: &[u8],
+) -> Vec<u8> {
+    let mut file_flags: u64 = file_flags_extra;
+    if data_crc.is_some() {
+        file_flags |= 0x0004;
+    }
 
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_vint(file_flags));
@@ -467,6 +503,180 @@ fn test_extract_stored_large_file() {
         .extract_member(0, &weaver_rar::ExtractOptions::default(), None)
         .unwrap();
     assert_eq!(result, content);
+}
+
+#[test]
+fn test_archive_limits_reject_declared_unpacked_size() {
+    let content = b"a";
+    let file_header = build_file_header_ex("too-big.txt", 0, content.len() as u64, 5, None, 0);
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_unpacked_size: 4,
+        ..Default::default()
+    });
+
+    let result = archive.extract_member(0, &weaver_rar::ExtractOptions::default(), None);
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn test_archive_limits_reject_packed_data_size() {
+    let content = b"hello";
+    let file_header =
+        build_file_header_ex("packed-too-big.txt", 0, content.len() as u64, 5, None, 0);
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_data_segment: 4,
+        ..Default::default()
+    });
+
+    let result = archive.extract_member(0, &weaver_rar::ExtractOptions::default(), None);
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn test_archive_limits_reject_compressed_dictionary_size() {
+    let content = &[0u8];
+    let normal_method_256k_dict = (3u64 << 7) | (1u64 << 10);
+    let file_header = build_file_header_ex(
+        "dict-too-big.bin",
+        0,
+        content.len() as u64,
+        1,
+        None,
+        normal_method_256k_dict,
+    );
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_dict_size: 128 * 1024,
+        ..Default::default()
+    });
+
+    let result = archive.extract_member(0, &weaver_rar::ExtractOptions::default(), None);
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::DictionaryTooLarge {
+            size: 262_144,
+            max: 131_072
+        })
+    ));
+}
+
+#[test]
+fn test_unknown_unpacked_size_uses_configured_output_ceiling() {
+    let content = b"hello";
+    let file_header = build_file_header_ex_with_file_flags(
+        "unknown-size.txt",
+        0,
+        content.len() as u64,
+        0,
+        None,
+        0,
+        0x0008,
+        &[],
+    );
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_unpacked_size: 4,
+        ..Default::default()
+    });
+
+    let result = archive.extract_member(0, &weaver_rar::ExtractOptions::default(), None);
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn test_streaming_unknown_unpacked_size_uses_configured_output_ceiling() {
+    let content = b"hello";
+    let file_header = build_file_header_ex_with_file_flags(
+        "unknown-streaming.txt",
+        0,
+        content.len() as u64,
+        0,
+        None,
+        0,
+        0x0008,
+        &[],
+    );
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let archive_path = temp_dir.path().join("unknown-streaming.rar");
+    std::fs::write(&archive_path, &archive_bytes).unwrap();
+
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_unpacked_size: 4,
+        ..Default::default()
+    });
+    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![archive_path]);
+    let mut output = Vec::new();
+
+    let result = archive.extract_member_streaming(
+        0,
+        &weaver_rar::ExtractOptions::default(),
+        &provider,
+        &mut output,
+    );
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn test_streaming_chunked_unknown_unpacked_size_uses_configured_output_ceiling() {
+    let content = b"hello";
+    let file_header = build_file_header_ex_with_file_flags(
+        "unknown-chunked.txt",
+        0,
+        content.len() as u64,
+        0,
+        None,
+        0,
+        0x0008,
+        &[],
+    );
+    let archive_bytes = build_single_file_rar5_archive(file_header, content);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let archive_path = temp_dir.path().join("unknown-chunked.rar");
+    std::fs::write(&archive_path, &archive_bytes).unwrap();
+
+    let mut archive = weaver_rar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    archive.set_limits(weaver_rar::Limits {
+        max_unpacked_size: 4,
+        ..Default::default()
+    });
+    let provider = weaver_rar::StaticVolumeProvider::from_ordered(vec![archive_path]);
+
+    let result = archive.extract_member_streaming_chunked(
+        0,
+        &weaver_rar::ExtractOptions::default(),
+        &provider,
+        |_| Ok(Box::new(std::io::sink())),
+    );
+
+    assert!(matches!(
+        result,
+        Err(weaver_rar::RarError::ResourceLimit { .. })
+    ));
 }
 
 #[test]

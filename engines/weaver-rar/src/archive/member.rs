@@ -19,6 +19,33 @@ struct Rar5ReaderCrypto {
     iv: [u8; 16],
 }
 
+#[derive(Clone, Copy)]
+enum StoreCopyLimit {
+    Exact(u64),
+    AtMost(u64),
+}
+
+impl StoreCopyLimit {
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Exact(bytes) | Self::AtMost(bytes) => bytes,
+        }
+    }
+
+    fn is_exact(self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+
+    fn is_ceiling(self) -> bool {
+        matches!(self, Self::AtMost(_))
+    }
+
+    fn next_read_len(self, written: u64, buffer_len: usize) -> usize {
+        let remaining = self.bytes().saturating_sub(written);
+        buffer_len.min(remaining.min(usize::MAX as u64) as usize)
+    }
+}
+
 impl RarArchive {
     fn advance_solid_cursor_to(&mut self, index: usize, fh: &FileHeader) -> RarResult<()> {
         if index < self.solid_next_index {
@@ -32,9 +59,10 @@ impl RarArchive {
             let skip_idx = self.solid_next_index;
             let skip_entry = self.members[skip_idx].clone();
             let skip_fh = skip_entry.file_header;
+            self.enforce_archive_member_limits(&skip_fh)?;
 
             if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
+                let skip_unpacked = self.target_unpacked_size(&skip_fh);
                 let rar5_crypto = if skip_entry.is_encrypted && self.format == ArchiveFormat::Rar5 {
                     let password =
                         self.password
@@ -74,7 +102,7 @@ impl RarArchive {
                             &password,
                             skip_entry.rar4_salt,
                         )?;
-                        Self::solid_decode_reader_to_sink(
+                        let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -82,6 +110,7 @@ impl RarArchive {
                             skip_unpacked,
                             &skip_fh,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                     } else {
                         let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                             detail: format!(
@@ -94,7 +123,7 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::solid_decode_reader_to_sink(
+                        let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -102,9 +131,10 @@ impl RarArchive {
                             skip_unpacked,
                             &skip_fh,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                     }
                 } else {
-                    Self::solid_decode_reader_to_sink(
+                    let written = Self::solid_decode_reader_to_sink(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         self.limits.max_dict_size,
@@ -112,6 +142,7 @@ impl RarArchive {
                         skip_unpacked,
                         &skip_fh,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                 }
             }
 
@@ -150,9 +181,10 @@ impl RarArchive {
             let skip_idx = self.solid_next_index;
             let skip_entry = self.members[skip_idx].clone();
             let skip_fh = skip_entry.file_header;
+            self.enforce_archive_member_limits(&skip_fh)?;
 
             if skip_fh.compression.method != CompressionMethod::Store {
-                let skip_unpacked = Self::decode_target_unpacked_size(&skip_fh);
+                let skip_unpacked = self.target_unpacked_size(&skip_fh);
                 let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
                     .with_max_data_segment(self.limits.max_data_segment)
@@ -175,7 +207,7 @@ impl RarArchive {
                             &password,
                             skip_entry.rar4_salt,
                         )?;
-                        Self::solid_decode_reader_to_sink(
+                        let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -183,6 +215,7 @@ impl RarArchive {
                             skip_unpacked,
                             &skip_fh,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                     } else {
                         let crypto = self.prepare_rar5_encrypted_member(
                             &skip_fh.name,
@@ -194,7 +227,7 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::solid_decode_reader_to_sink(
+                        let written = Self::solid_decode_reader_to_sink(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -202,9 +235,10 @@ impl RarArchive {
                             skip_unpacked,
                             &skip_fh,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                     }
                 } else {
-                    Self::solid_decode_reader_to_sink(
+                    let written = Self::solid_decode_reader_to_sink(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         self.limits.max_dict_size,
@@ -212,6 +246,7 @@ impl RarArchive {
                         skip_unpacked,
                         &skip_fh,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&skip_fh, written)?;
                 }
             }
 
@@ -221,12 +256,107 @@ impl RarArchive {
         Ok(())
     }
 
-    fn decode_target_unpacked_size(fh: &FileHeader) -> u64 {
-        fh.unpacked_size.unwrap_or(u64::MAX)
+    fn enforce_archive_member_limits(&self, fh: &FileHeader) -> RarResult<()> {
+        if fh.data_size > self.limits.max_data_segment {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "member {} compressed data size {} exceeds maximum {}",
+                    fh.name, fh.data_size, self.limits.max_data_segment
+                ),
+            });
+        }
+
+        if let Some(unpacked_size) = fh.unpacked_size
+            && unpacked_size > self.limits.max_unpacked_size
+        {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "member {} unpacked size {} exceeds maximum {}",
+                    fh.name, unpacked_size, self.limits.max_unpacked_size
+                ),
+            });
+        }
+
+        if fh.compression.method != CompressionMethod::Store
+            && fh.compression.dict_size > self.limits.max_dict_size
+        {
+            return Err(RarError::DictionaryTooLarge {
+                size: fh.compression.dict_size,
+                max: self.limits.max_dict_size,
+            });
+        }
+
+        Ok(())
     }
 
-    fn output_capacity_hint(fh: &FileHeader) -> usize {
-        fh.unpacked_size.unwrap_or(0).min(usize::MAX as u64) as usize
+    fn target_unpacked_size(&self, fh: &FileHeader) -> u64 {
+        fh.unpacked_size.unwrap_or(self.limits.max_unpacked_size)
+    }
+
+    fn output_capacity_hint(&self, fh: &FileHeader) -> usize {
+        fh.unpacked_size
+            .unwrap_or(0)
+            .min(self.limits.max_unpacked_size)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn store_copy_limit(&self, fh: &FileHeader) -> StoreCopyLimit {
+        fh.unpacked_size
+            .map(StoreCopyLimit::Exact)
+            .unwrap_or(StoreCopyLimit::AtMost(self.limits.max_unpacked_size))
+    }
+
+    fn resource_limit_error(member_name: &str, written: u64, limit: u64) -> RarError {
+        RarError::ResourceLimit {
+            detail: format!(
+                "member {member_name} output size exceeded maximum {limit} bytes after writing {written} bytes"
+            ),
+        }
+    }
+
+    fn enforce_store_ceiling_not_exceeded<R: Read>(
+        reader: &mut R,
+        limit: StoreCopyLimit,
+        member_name: &str,
+    ) -> RarResult<()> {
+        if !limit.is_ceiling() {
+            return Ok(());
+        }
+
+        let mut probe = [0u8; 1];
+        let read = reader.read(&mut probe).map_err(RarError::Io)?;
+        if read == 0 {
+            return Ok(());
+        }
+
+        Err(Self::resource_limit_error(
+            member_name,
+            limit.bytes() + read as u64,
+            limit.bytes(),
+        ))
+    }
+
+    fn enforce_unknown_lz_output_limit(&self, fh: &FileHeader, written: u64) -> RarResult<()> {
+        if fh.unpacked_size.is_none() && written >= self.limits.max_unpacked_size {
+            return Err(Self::resource_limit_error(
+                &fh.name,
+                written,
+                self.limits.max_unpacked_size,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn enforce_unknown_lz_chunk_limit(
+        &self,
+        fh: &FileHeader,
+        chunks: &[(usize, u64)],
+    ) -> RarResult<()> {
+        let written = chunks
+            .iter()
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
+        self.enforce_unknown_lz_output_limit(fh, written)
     }
 
     fn wrap_rar4_encrypted_reader<R: Read>(
@@ -351,21 +481,22 @@ impl RarArchive {
     fn copy_reader_to_writer<R: Read, W: Write>(
         mut reader: R,
         writer: &mut W,
-        limit: Option<u64>,
+        limit: StoreCopyLimit,
+        member_name: &str,
     ) -> RarResult<u64> {
         let mut buffer = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
         let mut written = 0u64;
-        let mut remaining = limit;
 
         loop {
-            let to_read = match remaining {
-                Some(0) => break,
-                Some(remaining) => buffer.len().min(remaining.min(usize::MAX as u64) as usize),
-                None => buffer.len(),
-            };
+            let to_read = limit.next_read_len(written, buffer.len());
+            if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, limit, member_name)?;
+                break;
+            }
+
             let read = reader.read(&mut buffer[..to_read]).map_err(RarError::Io)?;
             if read == 0 {
-                if remaining.is_some_and(|left| left > 0) {
+                if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF while copying member data",
@@ -375,9 +506,6 @@ impl RarArchive {
             }
             writer.write_all(&buffer[..read]).map_err(RarError::Io)?;
             written += read as u64;
-            if let Some(left) = remaining.as_mut() {
-                *left -= read as u64;
-            }
         }
 
         Ok(written)
@@ -388,7 +516,8 @@ impl RarArchive {
         volume_tracker: Arc<AtomicUsize>,
         first_volume_index: usize,
         mut writer_factory: F,
-        limit: Option<u64>,
+        limit: StoreCopyLimit,
+        member_name: &str,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
@@ -397,8 +526,8 @@ impl RarArchive {
         let mut current_volume = first_volume_index;
         let mut current_writer = Some(writer_factory(current_volume)?);
         let mut current_written = 0u64;
+        let mut total_written = 0u64;
         let mut chunks = Vec::new();
-        let mut remaining = limit;
 
         loop {
             let observed_volume = volume_tracker.load(Ordering::Acquire);
@@ -412,14 +541,15 @@ impl RarArchive {
                 current_written = 0;
             }
 
-            let to_read = match remaining {
-                Some(0) => break,
-                Some(remaining) => buffer.len().min(remaining.min(usize::MAX as u64) as usize),
-                None => buffer.len(),
-            };
+            let to_read = limit.next_read_len(total_written, buffer.len());
+            if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, limit, member_name)?;
+                break;
+            }
+
             let read = reader.read(&mut buffer[..to_read]).map_err(RarError::Io)?;
             if read == 0 {
-                if remaining.is_some_and(|left| left > 0) {
+                if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF while copying chunked member data",
@@ -432,9 +562,7 @@ impl RarArchive {
                 writer.write_all(&buffer[..read]).map_err(RarError::Io)?;
             }
             current_written += read as u64;
-            if let Some(left) = remaining.as_mut() {
-                *left -= read as u64;
-            }
+            total_written += read as u64;
         }
 
         if let Some(mut writer) = current_writer {
@@ -484,7 +612,9 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
+        let store_limit = self.store_copy_limit(&fh);
         let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
             member_password
                 .as_deref()
@@ -511,7 +641,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = Self::output_capacity_hint(&fh);
+            let capacity = self.output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (written, actual_crc, actual_blake) = {
@@ -533,7 +663,12 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
+                        Self::copy_reader_to_writer(
+                            reader,
+                            &mut hash_writer,
+                            store_limit,
+                            &fh.name,
+                        )?
                     } else {
                         let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                             detail: format!("member {} is missing RAR5 crypto material", fh.name),
@@ -543,10 +678,20 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
+                        Self::copy_reader_to_writer(
+                            reader,
+                            &mut hash_writer,
+                            store_limit,
+                            &fh.name,
+                        )?
                     }
                 } else {
-                    Self::copy_reader_to_writer(base_reader, &mut hash_writer, None)?
+                    Self::copy_reader_to_writer(
+                        base_reader,
+                        &mut hash_writer,
+                        store_limit,
+                        &fh.name,
+                    )?
                 };
 
                 (
@@ -598,7 +743,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = Self::output_capacity_hint(&fh);
+            let capacity = self.output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (actual_crc, actual_blake) = {
@@ -617,19 +762,21 @@ impl RarArchive {
                         &crypto.key,
                         &crypto.iv,
                     );
-                    crate::decompress::lz::decompress_lz_reader_to_writer(
+                    let written = crate::decompress::lz::decompress_lz_reader_to_writer(
                         reader,
                         unpacked_size,
                         &fh.compression,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 } else {
-                    crate::decompress::lz::decompress_lz_reader_to_writer(
+                    let written = crate::decompress::lz::decompress_lz_reader_to_writer(
                         base_reader,
                         unpacked_size,
                         &fh.compression,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
 
                 hash_writer.flush().map_err(RarError::Io)?;
@@ -681,7 +828,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = Self::output_capacity_hint(&fh);
+            let capacity = self.output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (actual_crc, actual_blake) = {
@@ -701,19 +848,21 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
+                    let written = crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
                         reader,
                         unpacked_size,
                         fh.compression.dict_size,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 } else {
-                    crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
+                    let written = crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
                         base_reader,
                         unpacked_size,
                         fh.compression.dict_size,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
@@ -748,7 +897,7 @@ impl RarArchive {
             } else {
                 None
             };
-            let capacity = Self::output_capacity_hint(&fh);
+            let capacity = self.output_capacity_hint(&fh);
             let mut output = crate::extract::ExtractedMemberSink::with_capacity_hint(capacity)?;
 
             let (actual_crc, actual_blake) = {
@@ -770,7 +919,7 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        Self::solid_decode_reader_to_writer(
+                        let written = Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -779,6 +928,7 @@ impl RarArchive {
                             &fh,
                             &mut hash_writer,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&fh, written)?;
                     } else {
                         let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                             detail: format!("member {} is missing RAR5 crypto material", fh.name),
@@ -788,7 +938,7 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::solid_decode_reader_to_writer(
+                        let written = Self::solid_decode_reader_to_writer(
                             &mut self.solid_decoder_rar4,
                             &mut self.solid_decoder,
                             self.limits.max_dict_size,
@@ -797,9 +947,10 @@ impl RarArchive {
                             &fh,
                             &mut hash_writer,
                         )?;
+                        self.enforce_unknown_lz_output_limit(&fh, written)?;
                     }
                 } else {
-                    Self::solid_decode_reader_to_writer(
+                    let written = Self::solid_decode_reader_to_writer(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         self.limits.max_dict_size,
@@ -808,6 +959,7 @@ impl RarArchive {
                         &fh,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
@@ -898,7 +1050,9 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
+        let store_limit = self.store_copy_limit(&fh);
         let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
             member_password
                 .as_deref()
@@ -947,7 +1101,12 @@ impl RarArchive {
                             pwd,
                             rar4_salt,
                         )?;
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
+                        Self::copy_reader_to_writer(
+                            reader,
+                            &mut hash_writer,
+                            store_limit,
+                            &fh.name,
+                        )?
                     } else {
                         let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                             detail: format!("member {} is missing RAR5 crypto material", fh.name),
@@ -957,10 +1116,20 @@ impl RarArchive {
                             &crypto.key,
                             &crypto.iv,
                         );
-                        Self::copy_reader_to_writer(reader, &mut hash_writer, fh.unpacked_size)?
+                        Self::copy_reader_to_writer(
+                            reader,
+                            &mut hash_writer,
+                            store_limit,
+                            &fh.name,
+                        )?
                     }
                 } else {
-                    Self::copy_reader_to_writer(base_reader, &mut hash_writer, None)?
+                    Self::copy_reader_to_writer(
+                        base_reader,
+                        &mut hash_writer,
+                        store_limit,
+                        &fh.name,
+                    )?
                 };
 
                 (
@@ -1023,19 +1192,21 @@ impl RarArchive {
                         &crypto.key,
                         &crypto.iv,
                     );
-                    crate::decompress::lz::decompress_lz_reader_to_writer(
+                    let written = crate::decompress::lz::decompress_lz_reader_to_writer(
                         reader,
                         unpacked_size,
                         &fh.compression,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 } else {
-                    crate::decompress::lz::decompress_lz_reader_to_writer(
+                    let written = crate::decompress::lz::decompress_lz_reader_to_writer(
                         base_reader,
                         unpacked_size,
                         &fh.compression,
                         &mut hash_writer,
                     )?;
+                    self.enforce_unknown_lz_output_limit(&fh, written)?;
                 }
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
@@ -1113,6 +1284,7 @@ impl RarArchive {
                         &mut hash_writer,
                     )?
                 };
+                self.enforce_unknown_lz_output_limit(&fh, written)?;
                 hash_writer.flush().map_err(RarError::Io)?;
                 let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
                 let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
@@ -1200,6 +1372,7 @@ impl RarArchive {
                         &mut hash_writer,
                     )?
                 };
+                self.enforce_unknown_lz_output_limit(&fh, written)?;
                 hash_writer.flush().map_err(RarError::Io)?;
                 (
                     written,
@@ -1276,7 +1449,9 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let rar4_salt = entry.rar4_salt;
         let archive_format = self.format;
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
+        let store_limit = self.store_copy_limit(&fh);
         let rar5_crypto = if archive_format == ArchiveFormat::Rar5 {
             member_password
                 .as_deref()
@@ -1333,7 +1508,7 @@ impl RarArchive {
                         pwd,
                         rar4_salt,
                     )?;
-                    Self::solid_decode_reader_to_writer_chunked(
+                    let chunks = Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         self.limits.max_dict_size,
@@ -1345,7 +1520,9 @@ impl RarArchive {
                         writer_factory,
                         shared_crc.clone(),
                         shared_blake.clone(),
-                    )?
+                    )?;
+                    self.enforce_unknown_lz_chunk_limit(&fh, &chunks)?;
+                    chunks
                 } else {
                     let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
                         detail: format!("member {} is missing RAR5 crypto material", fh.name),
@@ -1355,7 +1532,7 @@ impl RarArchive {
                         &crypto.key,
                         &crypto.iv,
                     );
-                    Self::solid_decode_reader_to_writer_chunked(
+                    let chunks = Self::solid_decode_reader_to_writer_chunked(
                         &mut self.solid_decoder_rar4,
                         &mut self.solid_decoder,
                         self.limits.max_dict_size,
@@ -1367,10 +1544,12 @@ impl RarArchive {
                         writer_factory,
                         shared_crc.clone(),
                         shared_blake.clone(),
-                    )?
+                    )?;
+                    self.enforce_unknown_lz_chunk_limit(&fh, &chunks)?;
+                    chunks
                 }
             } else {
-                Self::solid_decode_reader_to_writer_chunked(
+                let chunks = Self::solid_decode_reader_to_writer_chunked(
                     &mut self.solid_decoder_rar4,
                     &mut self.solid_decoder,
                     self.limits.max_dict_size,
@@ -1382,7 +1561,9 @@ impl RarArchive {
                     writer_factory,
                     shared_crc.clone(),
                     shared_blake.clone(),
-                )?
+                )?;
+                self.enforce_unknown_lz_chunk_limit(&fh, &chunks)?;
+                chunks
             };
 
             let actual_crc = shared_crc.map(|shared| {
@@ -1462,7 +1643,8 @@ impl RarArchive {
                             blake2: shared_blake.as_ref().map(Arc::clone),
                         }))
                     },
-                    fh.unpacked_size,
+                    store_limit,
+                    &fh.name,
                 )?
             } else {
                 let crypto = rar5_crypto.ok_or_else(|| RarError::CorruptArchive {
@@ -1482,7 +1664,8 @@ impl RarArchive {
                             blake2: shared_blake.as_ref().map(Arc::clone),
                         }))
                     },
-                    fh.unpacked_size,
+                    store_limit,
+                    &fh.name,
                 )?
             }
         } else {
@@ -1498,7 +1681,8 @@ impl RarArchive {
                         blake2: shared_blake.as_ref().map(Arc::clone),
                     }))
                 },
-                None,
+                store_limit,
+                &fh.name,
             )?
         };
 
@@ -1528,7 +1712,7 @@ impl RarArchive {
         compressed: R,
         unpacked_size: u64,
         fh: &FileHeader,
-    ) -> RarResult<()> {
+    ) -> RarResult<u64> {
         let mut sink = std::io::sink();
         Self::solid_decode_reader_to_writer(
             solid_decoder_rar4,
@@ -1538,8 +1722,7 @@ impl RarArchive {
             unpacked_size,
             fh,
             &mut sink,
-        )?;
-        Ok(())
+        )
     }
 
     fn solid_decode_reader_to_writer<R: Read, W: Write>(
@@ -1717,7 +1900,8 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
 
         let member_password = if is_encrypted {
             let pwd = options
@@ -1858,7 +2042,7 @@ impl RarArchive {
                 options,
                 provider,
                 &segments,
-                fh.unpacked_size.unwrap_or(0),
+                self.target_unpacked_size(fh),
                 writer,
                 password,
                 file_encryption,
@@ -1886,7 +2070,7 @@ impl RarArchive {
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
-        let unpacked_size = Self::decode_target_unpacked_size(fh);
+        let unpacked_size = self.target_unpacked_size(fh);
 
         let (written, actual_crc, actual_blake) = {
             let mut hash_writer =
@@ -1937,6 +2121,7 @@ impl RarArchive {
                     &mut hash_writer,
                 )?
             };
+            self.enforce_unknown_lz_output_limit(fh, written)?;
 
             (
                 written,
@@ -1978,7 +2163,7 @@ impl RarArchive {
         options: &ExtractOptions,
         provider: &dyn VolumeProvider,
         segments: &[DataSegment],
-        unpacked_size: u64,
+        _unpacked_size: u64,
         writer: &mut W,
         password: Option<&str>,
         file_encryption: Option<&FileEncryptionInfo>,
@@ -2024,13 +2209,9 @@ impl RarArchive {
         let mut written = 0u64;
         let mut chunk = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
 
-        // For encrypted Store members, use unpacked_size to know when to stop
-        // (decrypted data may have AES padding at the end).
-        let max_bytes = if password.is_some() {
-            unpacked_size
-        } else {
-            u64::MAX
-        };
+        // For declared Store members, use the unpacked size to avoid copying
+        // encrypted padding. Unknown-size members are capped by archive limits.
+        let store_limit = self.store_copy_limit(fh);
 
         let mut reader: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
@@ -2056,8 +2237,9 @@ impl RarArchive {
         };
 
         loop {
-            let to_read = chunk.len().min((max_bytes - written) as usize);
+            let to_read = store_limit.next_read_len(written, chunk.len());
             if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
             }
             let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
@@ -2177,14 +2359,14 @@ impl RarArchive {
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let mut hash_writer = HashingWriter::new(writer, expected_crc.is_some(), compute_blake2);
 
-        if self.format == ArchiveFormat::Rar5 {
+        let written = if self.format == ArchiveFormat::Rar5 {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
             crate::decompress::lz::decompress_lz_reader_to_writer(
                 &mut buf_reader,
                 unpacked_size,
                 &fh.compression,
                 &mut hash_writer,
-            )?;
+            )?
         } else {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
             crate::decompress::rar4::decompress_rar4_lz_reader_to_writer(
@@ -2192,8 +2374,9 @@ impl RarArchive {
                 unpacked_size,
                 fh.compression.dict_size,
                 &mut hash_writer,
-            )?;
-        }
+            )?
+        };
+        self.enforce_unknown_lz_output_limit(fh, written)?;
 
         hash_writer.flush().map_err(RarError::Io)?;
 
@@ -2221,7 +2404,7 @@ impl RarArchive {
             rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
         )?;
 
-        Ok(unpacked_size)
+        Ok(written)
     }
 
     /// Extract a member with per-volume output splitting.
@@ -2259,7 +2442,8 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
-        let unpacked_size = Self::decode_target_unpacked_size(&fh);
+        self.enforce_archive_member_limits(&fh)?;
+        let unpacked_size = self.target_unpacked_size(&fh);
 
         let member_password = if is_encrypted {
             let pwd = options
@@ -2357,7 +2541,7 @@ impl RarArchive {
         options: &ExtractOptions,
         provider: &dyn VolumeProvider,
         segments: &[DataSegment],
-        unpacked_size: u64,
+        _unpacked_size: u64,
         first_vol: usize,
         mut writer_factory: F,
         password: Option<&str>,
@@ -2401,11 +2585,7 @@ impl RarArchive {
         };
         let mut blake_hasher = compute_blake2.then(Blake2spHasher::new);
 
-        let max_bytes = if password.is_some() {
-            unpacked_size
-        } else {
-            u64::MAX
-        };
+        let store_limit = self.store_copy_limit(fh);
 
         let mut reader: Box<dyn Read + '_> = if let Some(pwd) = password {
             if self.format == ArchiveFormat::Rar4 {
@@ -2438,8 +2618,9 @@ impl RarArchive {
         let mut chunk = vec![0u8; STREAMING_STORE_CHUNK_BUFFER_BYTES];
 
         loop {
-            let to_read = chunk.len().min((max_bytes - total_written) as usize);
+            let to_read = store_limit.next_read_len(total_written, chunk.len());
             if to_read == 0 {
+                Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
             }
             let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
@@ -2538,7 +2719,7 @@ impl RarArchive {
                 options,
                 provider,
                 &segments,
-                fh.unpacked_size.unwrap_or(0),
+                self.target_unpacked_size(fh),
                 first_vol,
                 writer_factory,
                 password,
@@ -2560,7 +2741,7 @@ impl RarArchive {
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let tracking_reader = VolumeTrackingReader::new(chained, volume_tracker)
             .with_shared_transitions(Arc::clone(&shared_transitions));
-        let unpacked_size = Self::decode_target_unpacked_size(fh);
+        let unpacked_size = self.target_unpacked_size(fh);
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
             match hash {
@@ -2637,6 +2818,7 @@ impl RarArchive {
                 shared_blake.clone(),
             )?
         };
+        self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
 
         let final_meta = cont_meta.borrow();
         let effective_crc = final_meta.data_crc32.or(fh.data_crc32);
@@ -2814,6 +2996,7 @@ impl RarArchive {
                 },
             )?
         };
+        self.enforce_unknown_lz_chunk_limit(fh, &chunks)?;
 
         // Verify CRC32.
         let final_meta = cont_meta.borrow();

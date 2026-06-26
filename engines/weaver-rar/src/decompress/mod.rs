@@ -54,10 +54,12 @@ pub fn decompress_with_limits(
     expected_crc: Option<u32>,
     limits: &Limits,
 ) -> RarResult<Vec<u8>> {
+    enforce_direct_input_limit(input.len(), limits)?;
     enforce_direct_output_limit(unpacked_size, limits)?;
 
     match info.method {
         CompressionMethod::Store => {
+            enforce_direct_store_output_limit(input.len(), limits)?;
             // Method 0: no compression, direct copy with CRC check.
             let mut output = Vec::with_capacity(input.len());
             store::decompress_store(input, &mut output, expected_crc)?;
@@ -68,6 +70,7 @@ pub fn decompress_with_limits(
         | CompressionMethod::Normal
         | CompressionMethod::Good
         | CompressionMethod::Best => {
+            enforce_direct_dict_limit(info, limits)?;
             let capacity = direct_output_initial_capacity(input.len(), unpacked_size);
             let mut output = Vec::with_capacity(capacity);
             decompress_to_writer(input, unpacked_size, info, expected_crc, &mut output)?;
@@ -80,6 +83,20 @@ pub fn decompress_with_limits(
     }
 }
 
+fn enforce_direct_input_limit(input_len: usize, limits: &Limits) -> RarResult<()> {
+    let input_len = input_len as u64;
+    let max_data_segment = limits.max_data_segment;
+    if input_len > max_data_segment {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "direct decompression input size {input_len} exceeds limit {max_data_segment}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn enforce_direct_output_limit(unpacked_size: u64, limits: &Limits) -> RarResult<()> {
     let max_unpacked_size = limits.max_unpacked_size;
     if unpacked_size > max_unpacked_size {
@@ -87,6 +104,31 @@ fn enforce_direct_output_limit(unpacked_size: u64, limits: &Limits) -> RarResult
             detail: format!(
                 "direct decompression output size {unpacked_size} exceeds limit {max_unpacked_size}"
             ),
+        });
+    }
+
+    Ok(())
+}
+
+fn enforce_direct_store_output_limit(input_len: usize, limits: &Limits) -> RarResult<()> {
+    let output_len = input_len as u64;
+    let max_unpacked_size = limits.max_unpacked_size;
+    if output_len > max_unpacked_size {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "direct stored output size {output_len} exceeds limit {max_unpacked_size}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn enforce_direct_dict_limit(info: &CompressionInfo, limits: &Limits) -> RarResult<()> {
+    if info.dict_size > limits.max_dict_size {
+        return Err(RarError::DictionaryTooLarge {
+            size: info.dict_size,
+            max: limits.max_dict_size,
         });
     }
 
@@ -277,6 +319,69 @@ mod tests {
         let result = decompress_with_limits(&[0], 1, &info, None, &limits);
 
         assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn test_dispatch_uses_custom_direct_input_limit_for_store() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 0,
+            solid: false,
+            method: CompressionMethod::Store,
+            dict_size: 128 * 1024,
+        };
+        let limits = Limits {
+            max_data_segment: 0,
+            ..Limits::default()
+        };
+
+        let result = decompress_with_limits(&[0], 1, &info, None, &limits);
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn test_dispatch_uses_custom_store_output_limit() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 0,
+            solid: false,
+            method: CompressionMethod::Store,
+            dict_size: 128 * 1024,
+        };
+        let limits = Limits {
+            max_unpacked_size: 0,
+            ..Limits::default()
+        };
+
+        let result = decompress_with_limits(&[0], 0, &info, None, &limits);
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn test_dispatch_uses_custom_direct_dictionary_limit() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 0,
+            solid: false,
+            method: CompressionMethod::Normal,
+            dict_size: 256 * 1024,
+        };
+        let limits = Limits {
+            max_dict_size: 128 * 1024,
+            ..Limits::default()
+        };
+
+        let result = decompress_with_limits(&[], 0, &info, None, &limits);
+
+        assert!(matches!(
+            result,
+            Err(RarError::DictionaryTooLarge {
+                size: 262_144,
+                max: 131_072
+            })
+        ));
     }
 
     #[test]
