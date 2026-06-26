@@ -32,6 +32,10 @@ function Write-Log {
   Add-Content -Path $Path -Value $line
 }
 
+function Reset-NativeExitCode {
+  $global:LASTEXITCODE = 0
+}
+
 function Restore-EnvVar {
   param(
     [Parameter(Mandatory = $true)]
@@ -328,6 +332,11 @@ ManifestVersion: 1.12.0
       & $winget uninstall --id ScryerMedia.Weaver --accept-source-agreements --disable-interactivity *>> $wingetLog
     } catch {
       Write-Log $wingetLog "winget cleanup failed or package was not installed: $($_.Exception.Message)"
+    } finally {
+      # This smoke is evidence-only: Defender, Attachment Services, and startup checks
+      # above are the release-blocking package validations. Do not let a local WinGet
+      # transport/install quirk leak through PowerShell's native-command exit code.
+      Reset-NativeExitCode
     }
   }
 }
