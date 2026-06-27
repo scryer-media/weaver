@@ -39,7 +39,7 @@ pub(crate) fn sanitize_member_path(format: ArchiveFormat, host_os: HostOs, raw: 
         ArchiveFormat::Rar4 | ArchiveFormat::Rar14 => cleaned.replace('\\', "/"),
     };
 
-    let start = unrar_convert_path_start(&converted, true);
+    let start = unrar_convert_path_start(&converted, cfg!(windows));
     converted[start..].to_string()
 }
 
@@ -396,6 +396,32 @@ mod tests {
         assert_eq!(
             sanitize_member_path(ArchiveFormat::Rar5, HostOs::Windows, "dir\\file.txt"),
             "dir_file.txt"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn member_drive_prefix_is_relative_like_unrar_on_unix() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Windows, "C:/dir/file.txt"),
+            "C:/dir/file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar4, HostOs::Windows, "C:\\dir\\file.txt"),
+            "C:/dir/file.txt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn member_drive_prefix_is_stripped_like_unrar_on_windows() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Windows, "C:/dir/file.txt"),
+            "dir/file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar4, HostOs::Windows, "C:\\dir\\file.txt"),
+            "dir/file.txt"
         );
     }
 
