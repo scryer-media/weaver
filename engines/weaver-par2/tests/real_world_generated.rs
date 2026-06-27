@@ -65,12 +65,12 @@ fn load_par2_set(paths: &[PathBuf]) -> Par2FileSet {
     Par2FileSet::from_files(&refs).unwrap()
 }
 
-fn open_archive(paths: &[PathBuf]) -> weaver_rar::RarArchive {
-    let readers: Vec<Box<dyn weaver_rar::ReadSeek>> = paths
+fn open_archive(paths: &[PathBuf]) -> weaver_unrar::RarArchive {
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
         .iter()
-        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn weaver_rar::ReadSeek>)
+        .map(|path| Box::new(File::open(path).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
         .collect();
-    weaver_rar::RarArchive::open_volumes(readers).unwrap()
+    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
 }
 
 fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Option<&str>) {
@@ -79,7 +79,7 @@ fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Optio
     if let Some(password) = password {
         archive.set_password(password);
     }
-    let opts = weaver_rar::ExtractOptions {
+    let opts = weaver_unrar::ExtractOptions {
         verify: true,
         password: password.map(str::to_owned),
     };
@@ -290,14 +290,14 @@ fn repairs_heavy_damage_28_regions_rar5() {
 
     // Extract and verify the file is byte-identical to the original.
     let volume_paths = collect_paths(temp.path(), prefix, "rar");
-    let mut archive = weaver_rar::RarArchive::open_volumes(
+    let mut archive = weaver_unrar::RarArchive::open_volumes(
         volume_paths
             .iter()
-            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn weaver_rar::ReadSeek>)
+            .map(|p| Box::new(File::open(p).unwrap()) as Box<dyn weaver_unrar::ReadSeek>)
             .collect(),
     )
     .unwrap();
-    let opts = weaver_rar::ExtractOptions {
+    let opts = weaver_unrar::ExtractOptions {
         verify: true,
         password: None,
     };

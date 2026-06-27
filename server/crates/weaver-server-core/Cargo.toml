@@ -17,7 +17,7 @@ weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false 
 weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
     "native-crypto",
 ] }
-weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
+weaver-unrar = { path = "../../../engines/weaver-unrar", default-features = false, features = [
     "native-crypto",
 ] }
 serde = { workspace = true }
@@ -48,6 +48,7 @@ bzip2 = { workspace = true }
 sqlx = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 tempfile = { workspace = true }
+filetime = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 sevenz-rust2 = { workspace = true }

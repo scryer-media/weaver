@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Cursor;
 use weaver_par2::checksum;
-use weaver_rar::RarArchive;
+use weaver_unrar::RarArchive;
 
 const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
@@ -335,7 +335,7 @@ fn build_plan_uses_volume_facts_for_incremental_ownership_only() {
     cached["members"] = serde_json::json!([]);
     let archive = RarArchive::deserialize_headers_with_password(
         &rmp_serde::to_vec(
-            &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+            &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
         )
         .unwrap(),
         None::<String>,

@@ -291,7 +291,7 @@ pub(super) struct VerifiedSuspectPersistState {
 }
 
 pub(crate) enum RarPasswordAttemptError {
-    Rar(weaver_rar::RarError),
+    Rar(weaver_unrar::RarError),
     Fatal(String),
 }
 
@@ -318,8 +318,8 @@ impl std::fmt::Display for RarPasswordAttemptError {
     }
 }
 
-impl From<weaver_rar::RarError> for RarPasswordAttemptError {
-    fn from(value: weaver_rar::RarError) -> Self {
+impl From<weaver_unrar::RarError> for RarPasswordAttemptError {
+    fn from(value: weaver_unrar::RarError) -> Self {
         Self::Rar(value)
     }
 }

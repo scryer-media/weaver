@@ -5,7 +5,7 @@ struct ReadyRarExtraction {
     members: Vec<String>,
     volume_paths_map: std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<Vec<u8>>,
-    shared_kdf_cache: std::sync::Arc<weaver_rar::crypto::KdfCache>,
+    shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     is_solid: bool,
 }
@@ -326,7 +326,7 @@ impl Pipeline {
                 .rar_sets
                 .get(&(job_id, set_name.clone()))
                 .map(|state| state.shared_kdf_cache.clone())
-                .unwrap_or_else(|| std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()));
+                .unwrap_or_else(|| std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()));
             ready_sets.push(ReadyRarExtraction {
                 set_name,
                 members: gated_members,
@@ -436,9 +436,10 @@ impl Pipeline {
                             let selected_password = selection.password;
                             let archive_password_required = archive.metadata().is_encrypted;
 
-                            let options = weaver_rar::ExtractOptions {
+                            let options = weaver_unrar::ExtractOptions {
                                 verify: true,
                                 password: selected_password.clone(),
+                                restore_owners: false,
                             };
                             let mut outcome = BatchExtractionOutcome {
                                 extracted: Vec::new(),

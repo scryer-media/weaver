@@ -4830,9 +4830,9 @@ dependencies = [
  "weaver-nntp",
  "weaver-nzb",
  "weaver-par2",
- "weaver-rar",
  "weaver-server-api",
  "weaver-server-core",
+ "weaver-unrar",
  "weaver-yenc",
  "zip",
  "zstd",
@@ -4892,35 +4892,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "weaver-model",
- "weaver-rar",
  "weaver-reed-solomon",
-]
-
-[[package]]
-name = "weaver-rar"
-version = "0.6.9"
-dependencies = [
- "aes 0.9.1",
- "aws-lc-rs",
- "aws-lc-sys",
- "blake2s_simd",
- "cbc 0.2.1",
- "crc32fast",
- "criterion",
- "hmac 0.12.1",
- "memchr",
- "memmap2",
- "pbkdf2 0.12.2",
- "rayon",
- "rmp-serde",
- "serde",
- "sha1 0.11.0",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "weaver-reed-solomon",
+ "weaver-unrar",
 ]
 
 [[package]]
@@ -4982,6 +4955,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-queue",
  "feed-rs",
+ "filetime",
  "flate2",
  "getrandom 0.4.3",
  "hex",
@@ -5011,11 +4985,42 @@ dependencies = [
  "weaver-nntp",
  "weaver-nzb",
  "weaver-par2",
- "weaver-rar",
+ "weaver-unrar",
  "weaver-yenc",
  "windows-sys 0.61.2",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "weaver-unrar"
+version = "0.6.9"
+dependencies = [
+ "aes 0.9.1",
+ "aws-lc-rs",
+ "aws-lc-sys",
+ "blake2s_simd",
+ "cbc 0.2.1",
+ "crc32fast",
+ "criterion",
+ "filetime",
+ "hmac 0.12.1",
+ "libc",
+ "memchr",
+ "memmap2",
+ "pbkdf2 0.12.2",
+ "rayon",
+ "rmp-serde",
+ "serde",
+ "sha1 0.11.0",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "weaver-reed-solomon",
+ "zeroize",
 ]
 
 [[package]]

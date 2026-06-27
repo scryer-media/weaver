@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
-use weaver_rar::{
+use weaver_unrar::{
     RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache, sanitize_path,
 };
 
@@ -198,7 +198,7 @@ pub(crate) fn build_plan(
     let final_volume_seen = facts
         .get(&prefix_end)
         .is_some_and(|volume_facts| !volume_facts.more_volumes);
-    let missing_for_member = |member: &weaver_rar::MemberInfo| {
+    let missing_for_member = |member: &weaver_unrar::MemberInfo| {
         let mut missing = planner_states
             .get(&member.name)
             .map(PlannerMemberReadiness::missing_volumes)
@@ -208,7 +208,7 @@ pub(crate) fn build_plan(
         }
         missing
     };
-    let present_unintegrated_continuations = |member: &weaver_rar::MemberInfo| {
+    let present_unintegrated_continuations = |member: &weaver_unrar::MemberInfo| {
         let member_name = sanitize_path(&member.name);
         if member_name.is_empty() {
             return Vec::new();

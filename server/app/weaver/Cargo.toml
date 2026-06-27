@@ -18,7 +18,7 @@ weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false 
 weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
     "native-crypto",
 ] }
-weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
+weaver-unrar = { path = "../../../engines/weaver-unrar", default-features = false, features = [
     "native-crypto",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }

@@ -41,7 +41,6 @@ const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
 const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
-const ORDERED_SCAN_SKIP_LEEWAY: usize = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
 const SCANNER_SLOW_WARN_DURATION: Duration = Duration::from_secs(5);
 
@@ -1574,7 +1573,19 @@ impl<'a> RollingBlockScanner<'a> {
         let len = fs::metadata(path)?.len() as usize;
         let mut stats = FileScanStats::new(FileScanMode::OrderedCanonical, len as u64);
         let slice_size = self.table.slice_size as usize;
-        if len == 0 || slice_size == 0 || len < slice_size {
+        if len == 0 || slice_size == 0 {
+            return Ok(stats);
+        }
+        if len < slice_size {
+            scan_short_blocks_from_file(
+                self.table,
+                path,
+                kind,
+                files,
+                file_index_by_id,
+                blocks,
+                len,
+            )?;
             return Ok(stats);
         }
         let ordered_full_blocks: Vec<usize> = (0..target_file.block_count)
@@ -1583,9 +1594,6 @@ impl<'a> RollingBlockScanner<'a> {
             .collect();
         let mut cursor = OrderedWindowCursor::new(path, slice_size, &self.window_table)?;
         let mut preferred_next = (!ordered_full_blocks.is_empty()).then_some(0usize);
-        let scandistance = ORDERED_SCAN_SKIP_LEEWAY.saturating_mul(2).min(slice_size);
-        let scanskip = slice_size.saturating_sub(scandistance);
-        let mut scanoffset = scandistance / 2;
         let mut current_step_run = 0u64;
 
         while cursor.offset() <= cursor.last_full_offset() {
@@ -1620,7 +1628,6 @@ impl<'a> RollingBlockScanner<'a> {
                 stats.jumps_taken += 1;
                 stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
                 current_step_run = 0;
-                scanoffset = scandistance / 2;
 
                 if !cursor.jump(blocks[selected].expected_len as usize)? {
                     break;
@@ -1635,21 +1642,6 @@ impl<'a> RollingBlockScanner<'a> {
 
             stats.windows_stepped += 1;
             current_step_run += 1;
-            if scanskip > 0
-                && {
-                    scanoffset += 1;
-                    scanoffset >= scandistance
-                }
-                && cursor.offset() < cursor.len
-            {
-                stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
-                current_step_run = 0;
-                stats.jumps_taken += 1;
-                if !cursor.jump(scanskip)? {
-                    break;
-                }
-                scanoffset = 0;
-            }
         }
 
         stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
@@ -1934,6 +1926,8 @@ impl<'a> RollingBlockScanner<'a> {
             }
         }
 
+        scan_shifted_short_blocks_from_slice(self.table, path, kind, blocks, &map);
+
         drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         Ok(stats)
@@ -2175,7 +2169,224 @@ fn scan_short_blocks_from_file(
         }
     }
 
+    scan_shifted_short_blocks_from_file(table, path, kind, blocks, len)?;
+
     Ok(())
+}
+
+fn scan_shifted_short_blocks_from_file(
+    table: &VerificationHashTable,
+    path: &Path,
+    kind: BlockLocationKind,
+    blocks: &mut [SourceBlock],
+    len: usize,
+) -> Result<()> {
+    let lengths = unmatched_short_lengths(table, blocks, len);
+    for short_len in lengths {
+        scan_shifted_short_len_from_file(table, path, kind, blocks, len, short_len)?;
+    }
+
+    Ok(())
+}
+
+fn scan_shifted_short_blocks_from_slice(
+    table: &VerificationHashTable,
+    path: &Path,
+    kind: BlockLocationKind,
+    blocks: &mut [SourceBlock],
+    data: &[u8],
+) {
+    let lengths = unmatched_short_lengths(table, blocks, data.len());
+    for short_len in lengths {
+        scan_shifted_short_len_from_slice(table, path, kind, blocks, data, short_len);
+    }
+}
+
+fn unmatched_short_lengths(
+    table: &VerificationHashTable,
+    blocks: &[SourceBlock],
+    len: usize,
+) -> Vec<usize> {
+    let mut lengths: Vec<usize> = table
+        .short_blocks
+        .iter()
+        .filter_map(|block_index| {
+            let block = &blocks[*block_index];
+            let short_len = block.expected_len as usize;
+            (block.location.is_none() && short_len > 0 && short_len <= len).then_some(short_len)
+        })
+        .collect();
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
+}
+
+fn scan_shifted_short_len_from_file(
+    table: &VerificationHashTable,
+    path: &Path,
+    kind: BlockLocationKind,
+    blocks: &mut [SourceBlock],
+    len: usize,
+    short_len: usize,
+) -> Result<()> {
+    if short_len == 0 || short_len > len {
+        return Ok(());
+    }
+
+    if short_len > SCANNER_IO_TARGET_BYTES {
+        let file = File::open(path)?;
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        scan_shifted_short_len_from_slice(table, path, kind, blocks, &map, short_len);
+        drop(map);
+        crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
+        return Ok(());
+    }
+
+    let mut file = File::open(path)?;
+    let overlap = short_len.saturating_sub(1);
+    let fresh_read_target = SCANNER_IO_TARGET_BYTES;
+    let buffer_len = overlap.checked_add(fresh_read_target).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "scanner buffer size overflow")
+    })?;
+    let mut buffer = vec![0u8; buffer_len];
+    let mut valid_len = 0usize;
+    let mut base_offset = 0usize;
+    let mut next_unscanned_offset = 0usize;
+    let mut total_read = 0usize;
+    let window_table = generate_window_table(short_len as u64);
+    let pad_len = table.slice_size.saturating_sub(short_len as u64);
+    let zero_crc = crc32_zeros(pad_len);
+
+    loop {
+        if valid_len == buffer.len() {
+            let keep = overlap.min(valid_len);
+            buffer.copy_within(valid_len - keep..valid_len, 0);
+            base_offset += valid_len - keep;
+            valid_len = keep;
+        }
+
+        let read_len = file.read(&mut buffer[valid_len..])?;
+        total_read += read_len;
+        valid_len += read_len;
+
+        scan_shifted_short_windows(
+            table,
+            &buffer[..valid_len],
+            base_offset,
+            &mut next_unscanned_offset,
+            path,
+            kind,
+            blocks,
+            short_len,
+            pad_len,
+            zero_crc,
+            &window_table,
+        );
+
+        if read_len == 0 {
+            break;
+        }
+    }
+
+    crate::file_cache::drop_touched_file_cache(&file, path, len as u64, 0, total_read as u64);
+    Ok(())
+}
+
+fn scan_shifted_short_len_from_slice(
+    table: &VerificationHashTable,
+    path: &Path,
+    kind: BlockLocationKind,
+    blocks: &mut [SourceBlock],
+    data: &[u8],
+    short_len: usize,
+) {
+    if short_len == 0 || data.len() < short_len {
+        return;
+    }
+
+    let pad_len = table.slice_size.saturating_sub(short_len as u64);
+    let zero_crc = crc32_zeros(pad_len);
+    let window_table = generate_window_table(short_len as u64);
+    let mut next_unscanned_offset = 0usize;
+    scan_shifted_short_windows(
+        table,
+        data,
+        0,
+        &mut next_unscanned_offset,
+        path,
+        kind,
+        blocks,
+        short_len,
+        pad_len,
+        zero_crc,
+        &window_table,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_shifted_short_windows(
+    table: &VerificationHashTable,
+    buffer: &[u8],
+    base_offset: usize,
+    next_unscanned_offset: &mut usize,
+    path: &Path,
+    kind: BlockLocationKind,
+    blocks: &mut [SourceBlock],
+    short_len: usize,
+    pad_len: u64,
+    zero_crc: u32,
+    window_table: &[u32; 256],
+) {
+    if short_len == 0 || buffer.len() < short_len {
+        return;
+    }
+
+    let last_local_offset = buffer.len() - short_len;
+    let mut local_offset = next_unscanned_offset.saturating_sub(base_offset);
+    if local_offset > last_local_offset {
+        return;
+    }
+
+    let mut crc = checksum::crc32(&buffer[local_offset..local_offset + short_len]);
+    loop {
+        let padded_crc = checksum::crc32_combine(crc, zero_crc, pad_len);
+        if let Some(candidates) = table.by_crc.get(&padded_crc) {
+            let data = &buffer[local_offset..local_offset + short_len];
+            let absolute_offset = (base_offset + local_offset) as u64;
+            for block_index in candidates {
+                let block = &blocks[*block_index];
+                if block.location.is_some() || block.expected_len as usize != short_len {
+                    continue;
+                }
+                if short_block_matches(data, table.slice_size, block) {
+                    record_block_location(
+                        blocks,
+                        *block_index,
+                        BlockLocation {
+                            path: path.to_path_buf(),
+                            offset: absolute_offset,
+                            len: short_len as u64,
+                            kind,
+                        },
+                    );
+                }
+            }
+        }
+
+        if local_offset == last_local_offset {
+            break;
+        }
+
+        crc = crc_slide_char(
+            crc,
+            buffer[local_offset + short_len],
+            buffer[local_offset],
+            window_table,
+        );
+        local_offset += 1;
+    }
+
+    *next_unscanned_offset = base_offset + last_local_offset + 1;
 }
 
 fn read_exact_file_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -2409,6 +2620,12 @@ fn padded_crc(data: &[u8], pad_to: u64) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(data);
     update_crc_zeros(&mut hasher, pad_to.saturating_sub(data.len() as u64));
+    hasher.finalize()
+}
+
+fn crc32_zeros(len: u64) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    update_crc_zeros(&mut hasher, len);
     hasher.finalize()
 }
 
@@ -2933,7 +3150,55 @@ mod tests {
     }
 
     #[test]
-    fn ordered_canonical_scan_skips_through_long_miss_runs() {
+    fn ordered_canonical_scan_checks_shifted_short_file_below_slice_size() {
+        let dir = tempdir().unwrap();
+        let target = b"ABCDE".to_vec();
+        let set = synthetic_set(&[("target.bin", &target)], 8);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, b"xABCDEy").unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (ordered_locations, ordered_stats) = scan_with_ordered_canonical(&state, &candidate);
+
+        assert_eq!(
+            ordered_locations[0],
+            Some((candidate.clone(), 1, 5, BlockLocationKind::Canonical))
+        );
+        assert_eq!(ordered_stats.windows_stepped, 0);
+    }
+
+    #[test]
+    fn shifted_large_short_block_scans_without_large_heap_buffer() {
+        let dir = tempdir().unwrap();
+        let short_len = SCANNER_IO_TARGET_BYTES + 1;
+        let slice_size = short_len as u64 + 1024;
+        let target = (0..short_len)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect::<Vec<_>>();
+        let set = synthetic_set(&[("large-short.bin", &target)], slice_size);
+        let candidate = dir.path().join("large-short.bin");
+        let mut damaged = Vec::with_capacity(short_len + 2);
+        damaged.push(0xA5);
+        damaged.extend_from_slice(&target);
+        damaged.push(0x5A);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (ordered_locations, _) = scan_with_ordered_canonical(&state, &candidate);
+
+        assert_eq!(
+            ordered_locations[0],
+            Some((
+                candidate.clone(),
+                1,
+                short_len as u64,
+                BlockLocationKind::Canonical
+            ))
+        );
+    }
+
+    #[test]
+    fn ordered_canonical_scan_checks_every_byte_through_long_miss_runs() {
         let dir = tempdir().unwrap();
         let slice_size = 1024u64;
         let block = |seed: u8| {
@@ -2943,15 +3208,13 @@ mod tests {
         };
         let first = block(3);
         let second = block(71);
-        let third = block(129);
-        let target = [first.as_slice(), second.as_slice(), third.as_slice()].concat();
+        let target = [first.as_slice(), second.as_slice()].concat();
         let set = synthetic_set(&[("target.bin", &target)], slice_size);
         let candidate = dir.path().join("target.bin");
         let mut damaged = Vec::new();
         damaged.extend_from_slice(&first);
-        damaged.extend(std::iter::repeat_n(0xEE, slice_size as usize * 3));
+        damaged.extend(std::iter::repeat_n(0xEE, 176));
         damaged.extend_from_slice(&second);
-        damaged.extend_from_slice(&third);
         fs::write(&candidate, damaged).unwrap();
         let state = RepairState::from_set(dir.path(), set).unwrap();
 
@@ -2960,8 +3223,18 @@ mod tests {
         let (ordered_locations, ordered_stats) = scan_with_ordered_canonical(&state, &candidate);
 
         assert_eq!(ordered_locations, generic_locations);
-        assert!(ordered_stats.jumps_taken > 3);
-        assert!(ordered_stats.windows_stepped < generic_stats.windows_stepped / 2);
+        assert_eq!(
+            ordered_locations[1],
+            Some((
+                candidate.clone(),
+                slice_size + 176,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert!(ordered_stats.jumps_taken >= 2);
+        assert!(ordered_stats.windows_stepped > 64);
+        assert!(ordered_stats.windows_stepped <= generic_stats.windows_stepped);
     }
 
     #[test]
@@ -2997,18 +3270,22 @@ mod tests {
     }
 
     #[test]
-    fn buffered_short_block_checks_match_mmap() {
+    fn shifted_short_block_checks_match_mmap_and_buffered() {
         let dir = tempdir().unwrap();
         let data = b"ABCDEFGH12345".to_vec();
         let set = synthetic_set(&[("target.bin", &data)], 8);
         let candidate = dir.path().join("target.bin");
-        fs::write(&candidate, b"ABCDEFGH12345JUNK").unwrap();
+        fs::write(&candidate, b"ABCDEFGHxx12345JUNK").unwrap();
         let state = RepairState::from_set(dir.path(), set).unwrap();
 
         let mmap = scan_with_mmap(&state, &candidate, BlockLocationKind::Canonical);
         let buffered = scan_with_buffered(&state, &candidate, BlockLocationKind::Canonical, 8);
 
         assert_eq!(buffered, mmap);
+        assert_eq!(
+            buffered[1],
+            Some((candidate.clone(), 10, 5, BlockLocationKind::Canonical))
+        );
     }
 
     #[test]
@@ -3332,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn short_block_scan_only_matches_true_file_tail_for_extra_files() {
+    fn short_block_scan_matches_shifted_extra_file_data() {
         let dir = tempdir().unwrap();
         let data = b"ABCDEFGH12345".to_vec();
         let set = synthetic_set(&[("target.bin", &data)], 8);
@@ -3350,7 +3627,7 @@ mod tests {
             .unwrap();
         let last_block = &state.blocks[file.first_block + file.block_count - 1];
         let location = last_block.location.as_ref().unwrap();
-        assert_eq!(location.path, dir.path().join("tail.bin"));
+        assert_eq!(location.path, dir.path().join("interior.bin"));
         assert_eq!(location.offset, 4);
     }
 

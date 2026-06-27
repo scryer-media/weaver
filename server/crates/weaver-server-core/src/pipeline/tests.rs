@@ -588,18 +588,31 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let files = build_multifile_multivolume_rar_set();
 
-    let mut stale_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
-    stale_archive
+    let mut good_archive =
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
-    stale_archive
-        .add_volume(2, Box::new(std::io::Cursor::new(files[3].1.clone())))
+    good_archive
+        .add_volume(2, Box::new(std::io::Cursor::new(files[2].1.clone())))
         .unwrap();
-    stale_archive
-        .add_volume(3, Box::new(std::io::Cursor::new(files[2].1.clone())))
+    good_archive
+        .add_volume(3, Box::new(std::io::Cursor::new(files[3].1.clone())))
         .unwrap();
-    let stale_headers = stale_archive.serialize_headers();
+
+    let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
+    let members = cached["members"].as_array_mut().unwrap();
+    let e02 = members
+        .iter_mut()
+        .find(|member| member["name"] == "E02.mkv")
+        .expect("cached snapshot should contain E02");
+    for segment in e02["segments"].as_array_mut().unwrap() {
+        segment["volume_index"] = serde_json::json!(0);
+    }
+    let stale_headers = rmp_serde::to_vec(
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+    )
+    .unwrap();
 
     let volume_paths = files
         .iter()
@@ -611,9 +624,10 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let options = weaver_rar::ExtractOptions {
+    let options = weaver_unrar::ExtractOptions {
         verify: true,
         password: None,
+        restore_owners: false,
     };
 
     let output_dir_without_refresh = temp_dir.path().join("without-refresh");
@@ -623,7 +637,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         volume_paths.clone(),
         Vec::new(),
         Some(stale_headers.clone()),
-        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
     )
     .unwrap()
@@ -659,7 +673,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         volume_paths.clone(),
         Vec::new(),
         Some(stale_headers),
-        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
     )
     .unwrap()
@@ -703,7 +717,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     }
 
     let mut good_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -729,7 +743,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     e01["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -765,9 +779,11 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist a healed snapshot");
-    let healed_archive =
-        weaver_rar::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
-            .unwrap();
+    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
+        &healed_headers,
+        None::<String>,
+    )
+    .unwrap();
     let healed_e01 = healed_archive
         .metadata()
         .members
@@ -783,7 +799,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let files = build_multifile_multivolume_rar_set();
 
     let mut cached_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     cached_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -794,7 +810,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let mut facts = BTreeMap::new();
     for (volume, (_, bytes)) in files.iter().enumerate() {
         let mut parsed =
-            weaver_rar::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
+            weaver_unrar::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
                 .unwrap();
         if volume == 3 {
             parsed.more_volumes = true;
@@ -833,7 +849,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     }
 
     let mut good_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -847,7 +863,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -889,9 +905,11 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist healed headers");
-    let healed_archive =
-        weaver_rar::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
-            .unwrap();
+    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
+        &healed_headers,
+        None::<String>,
+    )
+    .unwrap();
     assert!(
         !healed_archive.metadata().members.is_empty(),
         "healed headers should no longer carry the incoherent empty-member snapshot",
@@ -941,7 +959,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
         .load_rar_snapshot(job_id, set_name)
         .expect("partial encrypted snapshot should exist after four volumes");
     let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<weaver_rar::CachedArchiveHeaders>(&cached_headers).unwrap(),
+        rmp_serde::from_slice::<weaver_unrar::CachedArchiveHeaders>(&cached_headers).unwrap(),
     )
     .unwrap();
     let members = cached["members"].as_array_mut().unwrap();
@@ -958,7 +976,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
     clip["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -1040,7 +1058,7 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
             volume_paths,
             password_candidates: restart_candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &[],
             already_extracted: None,
@@ -1110,7 +1128,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
             volume_paths: volume_paths.clone(),
             password_candidates: candidates.clone(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
@@ -1133,9 +1151,10 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
 
     let output_dir = temp_dir.path().join("member-password-fallback");
     std::fs::create_dir_all(&output_dir).unwrap();
-    let options = weaver_rar::ExtractOptions {
+    let options = weaver_unrar::ExtractOptions {
         verify: true,
         password: selection.password.clone(),
+        restore_owners: false,
     };
     let idx = selection
         .archive
@@ -1208,7 +1227,7 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
             volume_paths,
             password_candidates: candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
@@ -1282,7 +1301,7 @@ fn rar_password_candidate_helper_redacts_exhausted_candidates() {
         |_password| {
             attempts += 1;
             Err(RarPasswordAttemptError::Rar(
-                weaver_rar::RarError::InvalidPassword,
+                weaver_unrar::RarError::InvalidPassword,
             ))
         },
     ) {
@@ -1296,8 +1315,8 @@ fn rar_password_candidate_helper_redacts_exhausted_candidates() {
     assert!(!error.contains("second-secret"));
 }
 
-fn dummy_rar_volume_facts(volume_number: u32) -> weaver_rar::RarVolumeFacts {
-    weaver_rar::RarVolumeFacts {
+fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
+    weaver_unrar::RarVolumeFacts {
         format: 5,
         volume_number,
         more_volumes: true,
@@ -1310,9 +1329,9 @@ fn dummy_rar_volume_facts(volume_number: u32) -> weaver_rar::RarVolumeFacts {
 fn dummy_named_rar_volume_facts(
     volume_number: u32,
     member_name: &str,
-) -> weaver_rar::RarVolumeFacts {
-    weaver_rar::RarVolumeFacts {
-        members: vec![weaver_rar::RarVolumeMemberFacts {
+) -> weaver_unrar::RarVolumeFacts {
+    weaver_unrar::RarVolumeFacts {
+        members: vec![weaver_unrar::RarVolumeMemberFacts {
             order: 0,
             name: member_name.to_string(),
             unpacked_size: Some(1024),
@@ -1843,7 +1862,7 @@ async fn insert_active_job_with_persisted_nzb(
 fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-rar/tests/fixtures/rar5")
+            .join("../../../engines/weaver-unrar/tests/fixtures/rar5")
             .join(name),
     )
     .unwrap()
@@ -1852,7 +1871,7 @@ fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
 fn rar_original_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-rar/tests/fixtures/originals")
+            .join("../../../engines/weaver-unrar/tests/fixtures/originals")
             .join(name),
     )
     .unwrap()
@@ -7059,7 +7078,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
         .load_rar_snapshot(job_id, canonical_set_name)
         .expect("canonical encrypted snapshot should exist after four rebound volumes");
     let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<weaver_rar::CachedArchiveHeaders>(&cached_headers).unwrap(),
+        rmp_serde::from_slice::<weaver_unrar::CachedArchiveHeaders>(&cached_headers).unwrap(),
     )
     .unwrap();
     let clip = cached["members"]
@@ -7077,7 +7096,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
     clip["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     pipeline
@@ -9018,10 +9037,10 @@ async fn solid_rar_keeps_later_members_ready_after_earlier_failure() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30009);
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../engines/weaver-rar/tests/fixtures/rar5/rar5_solid.rar");
+        .join("../../../engines/weaver-unrar/tests/fixtures/rar5/rar5_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
     let archive =
-        weaver_rar::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
+        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
     let member_names = archive.member_names();
     assert!(member_names.len() >= 3);
 
@@ -9075,7 +9094,7 @@ async fn solid_rar4_pipeline_extracts_large_fixture_end_to_end() {
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30010);
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../engines/weaver-rar/tests/fixtures/rar4/rar4_solid.rar");
+        .join("../../../engines/weaver-unrar/tests/fixtures/rar4/rar4_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
 
     let spec = rar_job_spec(
@@ -12250,7 +12269,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -12321,7 +12340,7 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -12398,7 +12417,7 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -12483,7 +12502,7 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::from([1u32]),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -12859,7 +12878,7 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
             facts: BTreeMap::from([(0u32, stale_named_facts)]),
             volume_files: BTreeMap::from([(0u32, "show.part01.rar".to_string())]),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -13006,7 +13025,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     }
 
     let mut good_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -13020,7 +13039,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -13127,7 +13146,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
         );
 
     let mut good_archive =
-        weaver_rar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -13141,7 +13160,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -13368,7 +13387,7 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
             facts: std::collections::BTreeMap::from([(1u32, dummy_rar_volume_facts(1))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -14152,7 +14171,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
             facts: std::collections::BTreeMap::from([(0u32, dummy_rar_volume_facts(0))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -14966,7 +14985,7 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -15180,7 +15199,7 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
         minimal_job_state(job_id, "purge-job", temp_dir.path().join("purge-job")),
     );
 
-    let shared_kdf_cache = std::sync::Arc::new(weaver_rar::crypto::KdfCache::new());
+    let shared_kdf_cache = std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new());
     let weak_cache = std::sync::Arc::downgrade(&shared_kdf_cache);
 
     pipeline.rar_sets.insert(

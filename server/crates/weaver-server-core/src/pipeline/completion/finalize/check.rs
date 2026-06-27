@@ -7,6 +7,33 @@ use weaver_model::files::{
     reserve_download_filename, sanitize_download_filename,
 };
 
+const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
+const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+fn configured_par2_repair_memory_limit_bytes() -> usize {
+    parse_par2_repair_memory_limit_bytes(
+        std::env::var(PAR2_REPAIR_MEMORY_LIMIT_ENV).ok().as_deref(),
+    )
+}
+
+fn parse_par2_repair_memory_limit_bytes(raw: Option<&str>) -> usize {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES;
+    };
+    match value.parse::<usize>() {
+        Ok(bytes) if bytes > 0 => bytes,
+        _ => {
+            warn!(
+                env = PAR2_REPAIR_MEMORY_LIMIT_ENV,
+                value,
+                default_bytes = DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES,
+                "invalid PAR2 repair memory limit; using default"
+            );
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanPar2IntegrityGate {
     None,
@@ -666,6 +693,7 @@ impl Pipeline {
             }
         }
 
+        let memory_limit = configured_par2_repair_memory_limit_bytes();
         let repair_result = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -673,6 +701,7 @@ impl Pipeline {
             let mut options = weaver_par2::Par2RepairerOptions::new(working_dir, Vec::new());
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
+            options.memory_limit = Some(memory_limit);
             let repairer = weaver_par2::Par2Repairer::new(options);
             let outcome = repairer
                 .verify_or_repair()
@@ -2875,6 +2904,38 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn par2_repair_memory_limit_defaults_when_unset() {
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(None),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("  ")),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn par2_repair_memory_limit_accepts_positive_bytes() {
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("134217728")),
+            134_217_728
+        );
+    }
+
+    #[test]
+    fn par2_repair_memory_limit_rejects_invalid_or_zero_values() {
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("not-bytes")),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("0")),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+    }
 
     #[test]
     fn incomplete_promoted_recovery_without_concrete_work_is_not_pending() {
