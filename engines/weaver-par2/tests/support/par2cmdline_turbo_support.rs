@@ -17,7 +17,7 @@ use weaver_par2::{
     input_slice_constants, mul_acc_region, plan_repair, verify_all,
 };
 
-pub const UPSTREAM_FUNCTIONAL_CASE_COUNT: usize = 37;
+pub const UPSTREAM_FUNCTIONAL_CASE_COUNT: usize = 46;
 pub const UPSTREAM_UNIT_CASE_COUNT: usize = 11;
 
 pub fn fixture_root() -> PathBuf {

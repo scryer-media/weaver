@@ -517,7 +517,9 @@ fn native_crypto_supported_target(target: &str) -> bool {
 
 fn release_lane_supported_for_target(target: &str, lane: ReleaseLane) -> bool {
     match lane {
-        ReleaseLane::Portable => native_crypto_supported_target(target),
+        ReleaseLane::Portable => {
+            native_crypto_supported_target(target) && !target.starts_with("x86_64-apple-")
+        }
         ReleaseLane::Haswell => {
             target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl")
         }
@@ -3143,7 +3145,6 @@ mod tests {
                 ReleaseLane::Portable,
                 "--cfg aes_armv8 -C target-feature=+crt-static -C linker=rust-lld",
             ),
-            ("x86_64-apple-darwin", ReleaseLane::Portable, ""),
             (
                 "x86_64-apple-darwin",
                 ReleaseLane::Haswell,
@@ -3183,6 +3184,14 @@ mod tests {
                 "unsupported lane apple-m1 for rustflags target aarch64-unknown-linux-musl"
             )
         );
+
+        let error =
+            ci_rustflags_for_target("x86_64-apple-darwin", ReleaseLane::Portable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lane portable for rustflags target x86_64-apple-darwin")
+        );
     }
 
     #[test]
@@ -3212,7 +3221,6 @@ mod tests {
     #[test]
     fn verify_crypto_target_accepts_supported_release_targets() {
         for (target, lane) in [
-            ("x86_64-apple-darwin", ReleaseLane::Portable),
             ("x86_64-apple-darwin", ReleaseLane::Haswell),
             ("aarch64-apple-darwin", ReleaseLane::Portable),
             ("aarch64-apple-darwin", ReleaseLane::AppleM1),
@@ -3246,6 +3254,13 @@ mod tests {
             error.to_string().contains(
                 "unsupported lane haswell for native crypto target x86_64-pc-windows-msvc"
             )
+        );
+
+        let error = verify_crypto_target("x86_64-apple-darwin", ReleaseLane::Portable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lane portable for native crypto target x86_64-apple-darwin")
         );
     }
 

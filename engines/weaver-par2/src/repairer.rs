@@ -41,6 +41,7 @@ const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
 const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
+const ORDERED_SCAN_DEFAULT_SKIP_LEEWAY: u64 = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
 const SCANNER_SLOW_WARN_DURATION: Duration = Duration::from_secs(5);
 
@@ -137,6 +138,8 @@ pub struct Par2RepairerOptions {
     pub extra_paths: Vec<PathBuf>,
     pub repair: bool,
     pub memory_limit: Option<usize>,
+    pub scan_skip_data: bool,
+    pub scan_skip_leeway: u64,
     pub cancel: Option<CancellationToken>,
     pub progress: Option<ProgressCallback>,
 }
@@ -151,6 +154,8 @@ impl Par2RepairerOptions {
             extra_paths: Vec::new(),
             repair: true,
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
+            scan_skip_data: false,
+            scan_skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
             cancel: None,
             progress: None,
         }
@@ -197,6 +202,7 @@ pub struct SourceFileEntry {
     pub block_count: usize,
     pub target_exists: bool,
     pub complete_location: Option<BlockLocation>,
+    pub non_canonical_complete_source_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -286,7 +292,7 @@ impl Par2Repairer {
             });
         }
 
-        state.install_repaired_files(&repair)?;
+        state.install_repaired_files(&repair, &self.options)?;
         let _ = fs::remove_dir_all(&repair.install_dir);
 
         Ok(state.outcome(
@@ -794,6 +800,7 @@ impl RepairState {
                 block_count: if recoverable { block_count } else { 0 },
                 target_exists: false,
                 complete_location: None,
+                non_canonical_complete_source_count: 0,
             };
             file_index_by_id.insert(*file_id, files.len());
             files.push(entry);
@@ -816,92 +823,77 @@ impl RepairState {
 
     fn scan(&mut self, options: &Par2RepairerOptions) -> Result<ScanDiagnostics> {
         let mut diagnostics = ScanDiagnostics::default();
-        let mut candidates = Vec::new();
+        let mut canonical_candidates = self
+            .files
+            .iter()
+            .map(|file| file.safe_path.clone())
+            .collect::<Vec<_>>();
+        canonical_candidates.sort();
+        canonical_candidates.dedup();
 
-        for file in &self.files {
-            candidates.push((file.safe_path.clone(), BlockLocationKind::Canonical));
+        for path in canonical_candidates {
+            self.scan_candidate(
+                options,
+                path,
+                BlockLocationKind::Canonical,
+                &mut diagnostics,
+            )?;
         }
 
+        self.refresh_file_states();
+        if self.files_are_canonical_complete() {
+            return Ok(diagnostics);
+        }
+
+        let mut extra_candidates = Vec::new();
         for path in discover_candidate_files(&options.base_dir)? {
-            candidates.push((path, BlockLocationKind::Extra));
+            extra_candidates.push(path);
         }
         for path in &options.extra_paths {
-            candidates.push((path.clone(), BlockLocationKind::Extra));
+            extra_candidates.push(path.clone());
         }
 
-        candidates.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-        candidates.dedup_by(|left, right| left.0 == right.0);
+        extra_candidates.sort();
+        extra_candidates.dedup();
 
-        for (path, mut kind) in candidates {
-            check_cancel(options)?;
-            if should_skip_candidate(&path) {
-                diagnostics.files_skipped += 1;
+        for path in extra_candidates {
+            if self.files.iter().any(|file| file.safe_path == path) {
                 continue;
             }
-            if !path.is_file() {
-                continue;
-            }
-            if kind == BlockLocationKind::Extra
-                && self.files.iter().any(|file| file.safe_path == path)
-            {
-                kind = BlockLocationKind::Canonical;
-            }
-            let metadata = fs::metadata(&path)?;
-            diagnostics.files_scanned += 1;
-            diagnostics.bytes_scanned += metadata.len();
+            self.scan_candidate(options, path, BlockLocationKind::Extra, &mut diagnostics)?;
+        }
 
-            let started = Instant::now();
-            let found_before = self
-                .blocks
-                .iter()
-                .filter(|block| block.location.is_some())
-                .count();
-            if self.scan_complete_file(&path, kind)? {
-                let found_after = self
-                    .blocks
-                    .iter()
-                    .filter(|block| block.location.is_some())
-                    .count();
-                let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
-                diagnostics.blocks_found += blocks_confirmed;
-                log_file_scan(
-                    &path,
-                    kind,
-                    FileScanStats::new(FileScanMode::Complete, metadata.len()),
-                    blocks_confirmed,
-                    started.elapsed(),
-                );
-                continue;
-            }
-            let ordered_target = (kind == BlockLocationKind::Canonical)
-                .then(|| {
-                    self.files
-                        .iter()
-                        .find(|file| {
-                            file.safe_path == path && file.recoverable && file.block_count > 0
-                        })
-                        .cloned()
-                })
-                .flatten();
-            let scanner = RollingBlockScanner::new(&self.hash_table, self.set.slice_size);
-            let stats = if let Some(target_file) = ordered_target.as_ref() {
-                scanner.scan_file_ordered_canonical(
-                    &path,
-                    kind,
-                    &self.files,
-                    &self.file_index_by_id,
-                    target_file,
-                    &mut self.blocks,
-                )?
-            } else {
-                scanner.scan_file(
-                    &path,
-                    kind,
-                    &self.files,
-                    &self.file_index_by_id,
-                    &mut self.blocks,
-                )?
-            };
+        self.refresh_file_states();
+        Ok(diagnostics)
+    }
+
+    fn scan_candidate(
+        &mut self,
+        options: &Par2RepairerOptions,
+        path: PathBuf,
+        kind: BlockLocationKind,
+        diagnostics: &mut ScanDiagnostics,
+    ) -> Result<()> {
+        check_cancel(options)?;
+        if should_skip_candidate(&path) {
+            diagnostics.files_skipped += 1;
+            return Ok(());
+        }
+        if !path.is_file() {
+            return Ok(());
+        }
+
+        let metadata = fs::metadata(&path)?;
+        diagnostics.files_scanned += 1;
+        diagnostics.bytes_scanned += metadata.len();
+
+        let started = Instant::now();
+        let found_before = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        if self.scan_complete_file(&path, kind)? {
             let found_after = self
                 .blocks
                 .iter()
@@ -909,11 +901,62 @@ impl RepairState {
                 .count();
             let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
             diagnostics.blocks_found += blocks_confirmed;
-            log_file_scan(&path, kind, stats, blocks_confirmed, started.elapsed());
+            log_file_scan(
+                &path,
+                kind,
+                FileScanStats::new(FileScanMode::Complete, metadata.len()),
+                blocks_confirmed,
+                started.elapsed(),
+            );
+            return Ok(());
         }
+        let ordered_target = (kind == BlockLocationKind::Canonical)
+            .then(|| {
+                self.files
+                    .iter()
+                    .find(|file| file.safe_path == path && file.recoverable && file.block_count > 0)
+                    .cloned()
+            })
+            .flatten();
+        let scanner = RollingBlockScanner::new(&self.hash_table, self.set.slice_size);
+        let stats = if let Some(target_file) = ordered_target.as_ref() {
+            scanner.scan_file_ordered_canonical(
+                &path,
+                kind,
+                SourceFileScanLookup {
+                    files: &self.files,
+                    file_index_by_id: &self.file_index_by_id,
+                },
+                target_file,
+                &mut self.blocks,
+                ScanSkipOptions {
+                    skip_data: options.scan_skip_data,
+                    skip_leeway: options.scan_skip_leeway,
+                },
+            )?
+        } else {
+            scanner.scan_file_with_options(
+                &path,
+                kind,
+                &self.files,
+                &self.file_index_by_id,
+                &mut self.blocks,
+                ScanSkipOptions {
+                    skip_data: options.scan_skip_data,
+                    skip_leeway: options.scan_skip_leeway,
+                },
+            )?
+        };
+        let found_after = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
+        diagnostics.blocks_found += blocks_confirmed;
+        log_file_scan(&path, kind, stats, blocks_confirmed, started.elapsed());
 
-        self.refresh_file_states();
-        Ok(diagnostics)
+        Ok(())
     }
 
     fn scan_complete_file(&mut self, path: &Path, kind: BlockLocationKind) -> Result<bool> {
@@ -955,6 +998,9 @@ impl RepairState {
             let complete_kind = if self.files[idx].safe_path == path {
                 BlockLocationKind::Canonical
             } else {
+                self.files[idx].non_canonical_complete_source_count = self.files[idx]
+                    .non_canonical_complete_source_count
+                    .saturating_add(1);
                 kind
             };
             self.files[idx].complete_location = Some(BlockLocation {
@@ -1168,10 +1214,11 @@ impl RepairState {
             out.set_len(file.length)?;
         }
 
+        let mut whole_file_copied_ids = HashSet::new();
         for file in self
             .files
             .iter()
-            .filter(|file| staged_file_ids.contains(&file.file_id) && file.block_count == 0)
+            .filter(|file| staged_file_ids.contains(&file.file_id))
         {
             let Some(location) = file.complete_location.as_ref() else {
                 continue;
@@ -1179,11 +1226,14 @@ impl RepairState {
             let target = install_dir.join(&file.safe_name);
             copy_range(&location.path, 0, &target, 0, file.length)?;
             bytes_copied += file.length;
+            whole_file_copied_ids.insert(file.file_id);
         }
 
         for block in &self.blocks {
             check_cancel(options)?;
-            if !staged_file_ids.contains(&block.file_id) {
+            if !staged_file_ids.contains(&block.file_id)
+                || whole_file_copied_ids.contains(&block.file_id)
+            {
                 continue;
             }
             let Some(location) = block.location.as_ref() else {
@@ -1243,7 +1293,33 @@ impl RepairState {
         })
     }
 
-    fn install_repaired_files(&self, repair: &RepairInstall) -> Result<()> {
+    fn install_repaired_files(
+        &self,
+        repair: &RepairInstall,
+        options: &Par2RepairerOptions,
+    ) -> Result<()> {
+        let canonical_paths: HashSet<&Path> = self
+            .files
+            .iter()
+            .filter(|file| file.recoverable)
+            .map(|file| file.safe_path.as_path())
+            .collect();
+        let explicit_extra_paths: HashSet<&Path> =
+            options.extra_paths.iter().map(PathBuf::as_path).collect();
+        let consumed_complete_sources: HashSet<PathBuf> = self
+            .files
+            .iter()
+            .filter(|file| repair.staged_file_ids.contains(&file.file_id))
+            .filter_map(|file| {
+                let location = file.complete_location.as_ref()?;
+                (location.path != file.safe_path
+                    && file.non_canonical_complete_source_count == 1
+                    && explicit_extra_paths.contains(location.path.as_path())
+                    && !canonical_paths.contains(location.path.as_path()))
+                .then(|| location.path.clone())
+            })
+            .collect();
+
         for file in self
             .files
             .iter()
@@ -1254,13 +1330,31 @@ impl RepairState {
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if dst.exists() {
-                let backup = unique_backup_path(dst);
-                fs::rename(dst, &backup)?;
-                crate::file_cache::drop_path_cache(&backup);
+            match fs::symlink_metadata(dst) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(Par2Error::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("repair target is a symbolic link: {}", dst.display()),
+                    )));
+                }
+                Ok(_) => {
+                    let backup = unique_backup_path(dst);
+                    fs::rename(dst, &backup)?;
+                    crate::file_cache::drop_path_cache(&backup);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
             fs::rename(src, dst)?;
             crate::file_cache::drop_path_cache(dst);
+        }
+
+        for source in consumed_complete_sources {
+            match fs::remove_file(&source) {
+                Ok(()) => crate::file_cache::drop_path_cache(&source),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }
@@ -1363,6 +1457,80 @@ struct PendingMd5Check<'a> {
     offset: u64,
     len: u64,
     kind: BlockLocationKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScanSkipOptions {
+    skip_data: bool,
+    skip_leeway: u64,
+}
+
+impl ScanSkipOptions {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            skip_data: false,
+            skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
+        }
+    }
+
+    fn scan_distance(self, slice_size: usize) -> usize {
+        if !self.skip_data {
+            return 0;
+        }
+        let skip_leeway = if self.skip_leeway == 0 {
+            ORDERED_SCAN_DEFAULT_SKIP_LEEWAY
+        } else {
+            self.skip_leeway
+        };
+        skip_leeway
+            .saturating_mul(2)
+            .min(slice_size as u64)
+            .try_into()
+            .unwrap_or(slice_size)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RollingScanProgress {
+    current_step_run: u64,
+    scan_offset: usize,
+}
+
+impl RollingScanProgress {
+    fn new(scan_options: ScanSkipOptions, slice_size: usize) -> Self {
+        Self {
+            current_step_run: 0,
+            scan_offset: scan_options.scan_distance(slice_size) / 2,
+        }
+    }
+
+    fn record_step(&mut self, stats: &mut FileScanStats) {
+        stats.windows_stepped += 1;
+        self.current_step_run += 1;
+    }
+
+    fn record_jump(&mut self, stats: &mut FileScanStats) {
+        stats.jumps_taken += 1;
+        stats.max_consecutive_steps = stats.max_consecutive_steps.max(self.current_step_run);
+        self.current_step_run = 0;
+    }
+}
+
+struct BufferedWindowScan<'a, 'scanner> {
+    scanner: &'a RollingBlockScanner<'scanner>,
+    path: &'a Path,
+    kind: BlockLocationKind,
+    blocks: &'a mut [SourceBlock],
+    scan_options: ScanSkipOptions,
+    progress: &'a mut RollingScanProgress,
+    stats: &'a mut FileScanStats,
+}
+
+#[derive(Clone, Copy)]
+struct SourceFileScanLookup<'a> {
+    files: &'a [SourceFileEntry],
+    file_index_by_id: &'a HashMap<FileId, usize>,
 }
 
 struct OrderedWindowMatch<'a> {
@@ -1539,6 +1707,7 @@ impl<'a> RollingBlockScanner<'a> {
         }
     }
 
+    #[cfg(test)]
     fn scan_file(
         &self,
         path: &Path,
@@ -1547,17 +1716,46 @@ impl<'a> RollingBlockScanner<'a> {
         file_index_by_id: &HashMap<FileId, usize>,
         blocks: &mut [SourceBlock],
     ) -> Result<FileScanStats> {
-        if scanner_uses_mmap_fallback(self.table.slice_size) {
-            return self.scan_file_mmap(path, kind, files, file_index_by_id, blocks);
-        }
-
-        self.scan_file_buffered_with_target(
+        self.scan_file_with_options(
             path,
             kind,
             files,
             file_index_by_id,
             blocks,
+            ScanSkipOptions::disabled(),
+        )
+    }
+
+    fn scan_file_with_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
+    ) -> Result<FileScanStats> {
+        if scanner_uses_mmap_fallback(self.table.slice_size) {
+            return self.scan_file_mmap_with_options(
+                path,
+                kind,
+                files,
+                file_index_by_id,
+                blocks,
+                scan_options,
+            );
+        }
+
+        self.scan_file_buffered_with_target_options(
+            path,
+            kind,
+            SourceFileScanLookup {
+                files,
+                file_index_by_id,
+            },
+            blocks,
             SCANNER_IO_TARGET_BYTES,
+            scan_options,
         )
     }
 
@@ -1565,10 +1763,10 @@ impl<'a> RollingBlockScanner<'a> {
         &self,
         path: &Path,
         kind: BlockLocationKind,
-        files: &[SourceFileEntry],
-        file_index_by_id: &HashMap<FileId, usize>,
+        lookup: SourceFileScanLookup<'_>,
         target_file: &SourceFileEntry,
         blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
         let len = fs::metadata(path)?.len() as usize;
         let mut stats = FileScanStats::new(FileScanMode::OrderedCanonical, len as u64);
@@ -1581,8 +1779,8 @@ impl<'a> RollingBlockScanner<'a> {
                 self.table,
                 path,
                 kind,
-                files,
-                file_index_by_id,
+                lookup.files,
+                lookup.file_index_by_id,
                 blocks,
                 len,
             )?;
@@ -1595,6 +1793,13 @@ impl<'a> RollingBlockScanner<'a> {
         let mut cursor = OrderedWindowCursor::new(path, slice_size, &self.window_table)?;
         let mut preferred_next = (!ordered_full_blocks.is_empty()).then_some(0usize);
         let mut current_step_run = 0u64;
+        let scan_distance = scan_options.scan_distance(slice_size);
+        let scan_skip = if scan_distance > 0 {
+            slice_size.saturating_sub(scan_distance)
+        } else {
+            0
+        };
+        let mut scan_offset = scan_distance / 2;
 
         while cursor.offset() <= cursor.last_full_offset() {
             let expected_block = preferred_next
@@ -1628,6 +1833,7 @@ impl<'a> RollingBlockScanner<'a> {
                 stats.jumps_taken += 1;
                 stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
                 current_step_run = 0;
+                scan_offset = scan_distance / 2;
 
                 if !cursor.jump(blocks[selected].expected_len as usize)? {
                     break;
@@ -1642,11 +1848,33 @@ impl<'a> RollingBlockScanner<'a> {
 
             stats.windows_stepped += 1;
             current_step_run += 1;
+
+            if scan_skip > 0 {
+                scan_offset += 1;
+                if scan_offset >= scan_distance && cursor.offset() < cursor.last_full_offset() {
+                    stats.jumps_taken += 1;
+                    stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
+                    current_step_run = 0;
+
+                    if !cursor.jump(scan_skip)? {
+                        break;
+                    }
+                    scan_offset = 0;
+                }
+            }
         }
 
         stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
 
-        scan_short_blocks_from_file(self.table, path, kind, files, file_index_by_id, blocks, len)?;
+        scan_short_blocks_from_file(
+            self.table,
+            path,
+            kind,
+            lookup.files,
+            lookup.file_index_by_id,
+            blocks,
+            len,
+        )?;
 
         Ok(stats)
     }
@@ -1726,6 +1954,7 @@ impl<'a> RollingBlockScanner<'a> {
         selected
     }
 
+    #[cfg(test)]
     fn scan_file_buffered_with_target(
         &self,
         path: &Path,
@@ -1734,6 +1963,28 @@ impl<'a> RollingBlockScanner<'a> {
         file_index_by_id: &HashMap<FileId, usize>,
         blocks: &mut [SourceBlock],
         read_target: usize,
+    ) -> Result<FileScanStats> {
+        self.scan_file_buffered_with_target_options(
+            path,
+            kind,
+            SourceFileScanLookup {
+                files,
+                file_index_by_id,
+            },
+            blocks,
+            read_target,
+            ScanSkipOptions::disabled(),
+        )
+    }
+
+    fn scan_file_buffered_with_target_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        blocks: &mut [SourceBlock],
+        read_target: usize,
+        scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
@@ -1755,6 +2006,16 @@ impl<'a> RollingBlockScanner<'a> {
             let mut valid_len = 0usize;
             let mut base_offset = 0usize;
             let mut next_unscanned_offset = 0usize;
+            let mut scan_progress = RollingScanProgress::new(scan_options, slice_size);
+            let mut scan_context = BufferedWindowScan {
+                scanner: self,
+                path,
+                kind,
+                blocks,
+                scan_options,
+                progress: &mut scan_progress,
+                stats: &mut stats,
+            };
 
             loop {
                 if valid_len == buffer.len() {
@@ -1768,14 +2029,11 @@ impl<'a> RollingBlockScanner<'a> {
                 total_read += read_len;
                 valid_len += read_len;
 
-                stats.windows_stepped += scan_buffered_windows(
-                    self,
+                scan_buffered_windows(
+                    &mut scan_context,
                     &buffer[..valid_len],
                     base_offset,
                     &mut next_unscanned_offset,
-                    path,
-                    kind,
-                    blocks,
                 );
 
                 if read_len == 0 {
@@ -1784,13 +2042,15 @@ impl<'a> RollingBlockScanner<'a> {
             }
         }
 
-        stats.max_consecutive_steps = stats.windows_stepped;
+        if !scan_options.skip_data {
+            stats.max_consecutive_steps = stats.windows_stepped;
+        }
         let short_result = scan_short_blocks_from_file(
             self.table,
             path,
             kind,
-            files,
-            file_index_by_id,
+            lookup.files,
+            lookup.file_index_by_id,
             blocks,
             len,
         );
@@ -1800,6 +2060,7 @@ impl<'a> RollingBlockScanner<'a> {
         Ok(stats)
     }
 
+    #[cfg(test)]
     fn scan_file_mmap(
         &self,
         path: &Path,
@@ -1807,6 +2068,25 @@ impl<'a> RollingBlockScanner<'a> {
         files: &[SourceFileEntry],
         file_index_by_id: &HashMap<FileId, usize>,
         blocks: &mut [SourceBlock],
+    ) -> Result<FileScanStats> {
+        self.scan_file_mmap_with_options(
+            path,
+            kind,
+            files,
+            file_index_by_id,
+            blocks,
+            ScanSkipOptions::disabled(),
+        )
+    }
+
+    fn scan_file_mmap_with_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
@@ -1821,15 +2101,25 @@ impl<'a> RollingBlockScanner<'a> {
         if slice_size > 0 && len >= slice_size {
             let mut crc = checksum::crc32(&map[..slice_size]);
             let last = len - slice_size;
+            let scan_distance = scan_options.scan_distance(slice_size);
+            let scan_skip = if scan_distance > 0 {
+                slice_size.saturating_sub(scan_distance)
+            } else {
+                0
+            };
+            let mut scan_progress = RollingScanProgress::new(scan_options, slice_size);
             let scanner_batch_lanes = scanner_md5_batch_lanes(slice_size);
             let mut pending = Vec::with_capacity(scanner_batch_lanes);
-            for offset in 0..=last {
+            let mut offset = 0usize;
+            while offset <= last {
+                let mut saw_crc_candidate = false;
                 if let Some(candidates) = self.table.by_crc.get(&crc) {
                     for block_index in candidates {
                         let block = &blocks[*block_index];
                         if block.expected_len != self.table.slice_size {
                             continue;
                         }
+                        saw_crc_candidate = true;
                         let data = &map[offset..offset + slice_size];
                         if scanner_batch_lanes < 2 {
                             record_matching_md5_block(
@@ -1862,12 +2152,34 @@ impl<'a> RollingBlockScanner<'a> {
                         map[offset],
                         &self.window_table,
                     );
-                    stats.windows_stepped += 1;
+                    offset += 1;
+                    scan_progress.record_step(&mut stats);
+
+                    if scan_skip > 0 {
+                        if saw_crc_candidate {
+                            scan_progress.scan_offset = scan_distance / 2;
+                        } else {
+                            scan_progress.scan_offset = scan_progress.scan_offset.saturating_add(1);
+                            if scan_progress.scan_offset >= scan_distance && offset < last {
+                                scan_progress.record_jump(&mut stats);
+                                scan_progress.scan_offset = 0;
+                                offset = offset.saturating_add(scan_skip).min(last);
+                                crc = checksum::crc32(&map[offset..offset + slice_size]);
+                            }
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
             flush_pending_md5_checks(&mut pending, blocks, path);
+            stats.max_consecutive_steps = stats
+                .max_consecutive_steps
+                .max(scan_progress.current_step_run);
         }
-        stats.max_consecutive_steps = stats.windows_stepped;
+        if !scan_options.skip_data {
+            stats.max_consecutive_steps = stats.windows_stepped;
+        }
 
         for block_index in &self.table.short_blocks {
             if blocks[*block_index].location.is_some() {
@@ -2014,47 +2326,55 @@ fn log_file_scan(
 }
 
 fn scan_buffered_windows(
-    scanner: &RollingBlockScanner<'_>,
+    scan: &mut BufferedWindowScan<'_, '_>,
     buffer: &[u8],
     base_offset: usize,
     next_unscanned_offset: &mut usize,
-    path: &Path,
-    kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
-) -> u64 {
+) {
+    let scanner = scan.scanner;
+    let path = scan.path;
+    let kind = scan.kind;
+    let scan_options = scan.scan_options;
     let slice_size = scanner.table.slice_size as usize;
     if slice_size == 0 || buffer.len() < slice_size {
-        return 0;
+        return;
     }
 
     let last_local_offset = buffer.len() - slice_size;
     let mut local_offset = next_unscanned_offset.saturating_sub(base_offset);
     if local_offset > last_local_offset {
-        return 0;
+        return;
     }
 
+    let scan_distance = scan_options.scan_distance(slice_size);
+    let scan_skip = if scan_distance > 0 {
+        slice_size.saturating_sub(scan_distance)
+    } else {
+        0
+    };
     let scanner_batch_lanes = scanner_md5_batch_lanes(slice_size);
     let mut pending = Vec::with_capacity(scanner_batch_lanes);
     let mut crc = checksum::crc32(&buffer[local_offset..local_offset + slice_size]);
-    let mut steps = 0u64;
 
     loop {
+        let mut saw_crc_candidate = false;
         if let Some(candidates) = scanner.table.by_crc.get(&crc) {
             for block_index in candidates {
-                let block = &blocks[*block_index];
-                if block.expected_len != scanner.table.slice_size {
+                let expected_len = scan.blocks[*block_index].expected_len;
+                if expected_len != scanner.table.slice_size {
                     continue;
                 }
+                saw_crc_candidate = true;
                 let data = &buffer[local_offset..local_offset + slice_size];
                 let absolute_offset = (base_offset + local_offset) as u64;
                 if scanner_batch_lanes < 2 {
                     record_matching_md5_block(
-                        blocks,
+                        scan.blocks,
                         *block_index,
                         data,
                         path,
                         absolute_offset,
-                        block.expected_len,
+                        expected_len,
                         kind,
                     );
                     continue;
@@ -2063,11 +2383,11 @@ fn scan_buffered_windows(
                     block_index: *block_index,
                     data,
                     offset: absolute_offset,
-                    len: block.expected_len,
+                    len: expected_len,
                     kind,
                 });
                 if pending.len() == scanner_batch_lanes {
-                    flush_pending_md5_checks(&mut pending, blocks, path);
+                    flush_pending_md5_checks(&mut pending, scan.blocks, path);
                 }
             }
         }
@@ -2083,12 +2403,43 @@ fn scan_buffered_windows(
             &scanner.window_table,
         );
         local_offset += 1;
-        steps += 1;
+        scan.progress.record_step(scan.stats);
+        *next_unscanned_offset = base_offset + local_offset;
+
+        if scan_skip > 0 {
+            if saw_crc_candidate {
+                scan.progress.scan_offset = scan_distance / 2;
+            } else {
+                scan.progress.scan_offset = scan.progress.scan_offset.saturating_add(1);
+                if scan.progress.scan_offset >= scan_distance && local_offset < last_local_offset {
+                    let jump_offset = (base_offset + local_offset).saturating_add(scan_skip);
+                    scan.progress.record_jump(scan.stats);
+                    scan.progress.scan_offset = 0;
+
+                    if jump_offset > base_offset + last_local_offset {
+                        *next_unscanned_offset = jump_offset;
+                        flush_pending_md5_checks(&mut pending, scan.blocks, path);
+                        scan.stats.max_consecutive_steps = scan
+                            .stats
+                            .max_consecutive_steps
+                            .max(scan.progress.current_step_run);
+                        return;
+                    }
+
+                    local_offset = jump_offset - base_offset;
+                    *next_unscanned_offset = jump_offset;
+                    crc = checksum::crc32(&buffer[local_offset..local_offset + slice_size]);
+                }
+            }
+        }
     }
 
-    flush_pending_md5_checks(&mut pending, blocks, path);
+    flush_pending_md5_checks(&mut pending, scan.blocks, path);
     *next_unscanned_offset = base_offset + last_local_offset + 1;
-    steps
+    scan.stats.max_consecutive_steps = scan
+        .stats
+        .max_consecutive_steps
+        .max(scan.progress.current_step_run);
 }
 
 fn scan_short_blocks_from_file(
@@ -3001,6 +3352,21 @@ mod tests {
         state: &RepairState,
         path: &Path,
     ) -> (BlockLocationSummary, FileScanStats) {
+        scan_with_ordered_canonical_options(
+            state,
+            path,
+            ScanSkipOptions {
+                skip_data: false,
+                skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
+            },
+        )
+    }
+
+    fn scan_with_ordered_canonical_options(
+        state: &RepairState,
+        path: &Path,
+        scan_options: ScanSkipOptions,
+    ) -> (BlockLocationSummary, FileScanStats) {
         let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
         let mut blocks = state.blocks.clone();
         let target = state
@@ -3012,10 +3378,13 @@ mod tests {
             .scan_file_ordered_canonical(
                 path,
                 BlockLocationKind::Canonical,
-                &state.files,
-                &state.file_index_by_id,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
                 target,
                 &mut blocks,
+                scan_options,
             )
             .unwrap();
         (block_location_summary(&blocks), stats)
@@ -3040,6 +3409,31 @@ mod tests {
             )
             .unwrap();
         block_location_summary(&blocks)
+    }
+
+    fn scan_with_buffered_options(
+        state: &RepairState,
+        path: &Path,
+        kind: BlockLocationKind,
+        read_target: usize,
+        scan_options: ScanSkipOptions,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let mut blocks = state.blocks.clone();
+        let stats = scanner
+            .scan_file_buffered_with_target_options(
+                path,
+                kind,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
+                &mut blocks,
+                read_target,
+                scan_options,
+            )
+            .unwrap();
+        (block_location_summary(&blocks), stats)
     }
 
     #[test]
@@ -3238,6 +3632,118 @@ mod tests {
     }
 
     #[test]
+    fn ordered_canonical_scan_can_skip_long_in_place_miss_runs_when_enabled() {
+        let dir = tempdir().unwrap();
+        let slice_size = 1024u64;
+        let make_block = |seed: u8| {
+            (0..slice_size as usize)
+                .map(|index| seed.wrapping_mul(17).wrapping_add(index as u8))
+                .collect::<Vec<_>>()
+        };
+        let blocks = [
+            make_block(3),
+            make_block(31),
+            make_block(71),
+            make_block(109),
+        ];
+        let target = blocks
+            .iter()
+            .flat_map(|block| block.iter().copied())
+            .collect::<Vec<_>>();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let mut damaged = target.clone();
+        damaged[slice_size as usize..(slice_size as usize * 2)].fill(0xEE);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (default_locations, default_stats) = scan_with_ordered_canonical(&state, &candidate);
+        let (skip_locations, skip_stats) = scan_with_ordered_canonical_options(
+            &state,
+            &candidate,
+            ScanSkipOptions {
+                skip_data: true,
+                skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
+            },
+        );
+
+        assert_eq!(skip_locations, default_locations);
+        assert_eq!(
+            skip_locations[0],
+            Some((
+                candidate.clone(),
+                0,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert_eq!(skip_locations[1], None);
+        assert_eq!(
+            skip_locations[2],
+            Some((
+                candidate.clone(),
+                slice_size * 2,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert_eq!(
+            skip_locations[3],
+            Some((
+                candidate.clone(),
+                slice_size * 3,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert!(default_stats.windows_stepped >= slice_size);
+        assert!(skip_stats.windows_stepped < default_stats.windows_stepped / 2);
+        assert!(skip_stats.max_consecutive_steps <= ORDERED_SCAN_DEFAULT_SKIP_LEEWAY);
+    }
+
+    #[test]
+    fn buffered_generic_scan_can_skip_long_extra_miss_runs_when_enabled() {
+        let dir = tempdir().unwrap();
+        let slice_size = 128 * 1024u64;
+        let target: Vec<u8> = (0..slice_size as usize)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate_data = vec![0xA5; slice_size as usize * 6];
+        let candidate = dir.path().join("unrelated-extra.bin");
+        fs::write(&candidate, &candidate_data).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (default_locations, default_stats) = scan_with_buffered_options(
+            &state,
+            &candidate,
+            BlockLocationKind::Extra,
+            candidate_data.len(),
+            ScanSkipOptions {
+                skip_data: false,
+                skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
+            },
+        );
+        let (skip_locations, skip_stats) = scan_with_buffered_options(
+            &state,
+            &candidate,
+            BlockLocationKind::Extra,
+            candidate_data.len(),
+            ScanSkipOptions {
+                skip_data: true,
+                skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
+            },
+        );
+
+        assert_eq!(skip_locations, default_locations);
+        assert!(skip_locations.iter().all(Option::is_none));
+        assert_eq!(default_stats.jumps_taken, 0);
+        assert!(skip_stats.jumps_taken > 0);
+        assert!(skip_stats.windows_stepped < default_stats.windows_stepped / 2);
+        assert!(skip_stats.max_consecutive_steps <= ORDERED_SCAN_DEFAULT_SKIP_LEEWAY * 2);
+    }
+
+    #[test]
     fn buffered_scan_finds_block_across_refill_overlap() {
         let dir = tempdir().unwrap();
         let target: Vec<u8> = (0..64u32)
@@ -3350,7 +3856,7 @@ mod tests {
         let post = verify_all(&state.set, &access);
         assert_eq!(post.total_missing_blocks, 0);
 
-        state.install_repaired_files(&repair).unwrap();
+        state.install_repaired_files(&repair, &options).unwrap();
         assert_eq!(fs::read(dir.path().join("nested/movie.r00")).unwrap(), data);
         assert!(renamed.exists());
     }
@@ -3402,7 +3908,7 @@ mod tests {
         ));
 
         let repair = state.repair(&options, &verification).unwrap();
-        state.install_repaired_files(&repair).unwrap();
+        state.install_repaired_files(&repair, &options).unwrap();
         assert_eq!(fs::read(dir.path().join("target.bin")).unwrap(), target);
     }
 
@@ -3432,9 +3938,29 @@ mod tests {
         assert!(!state.files_are_canonical_complete());
 
         let repair = state.repair(&options, &verification).unwrap();
-        state.install_repaired_files(&repair).unwrap();
+        state.install_repaired_files(&repair, &options).unwrap();
         assert_eq!(fs::read(dir.path().join("alpha.bin")).unwrap(), alpha);
         assert_eq!(fs::read(dir.path().join("beta.bin")).unwrap(), beta);
+    }
+
+    #[test]
+    fn scan_skips_extra_candidates_when_canonical_files_are_complete() {
+        let dir = tempdir().unwrap();
+        let data = b"complete-target".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        fs::write(dir.path().join("target.bin"), &data).unwrap();
+        fs::write(dir.path().join("aaa-extra.bin"), b"unrelated extra data").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let scan = state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(scan.bytes_scanned, data.len() as u64);
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert!(state.files_are_canonical_complete());
+        assert!(matches!(verification.repairable, Repairability::NotNeeded));
     }
 
     #[test]
@@ -3581,7 +4107,7 @@ mod tests {
         ));
 
         let repair = state.repair(&options, &verification).unwrap();
-        state.install_repaired_files(&repair).unwrap();
+        state.install_repaired_files(&repair, &options).unwrap();
 
         assert_eq!(fs::read(dir.path().join("target.bin")).unwrap(), data);
     }

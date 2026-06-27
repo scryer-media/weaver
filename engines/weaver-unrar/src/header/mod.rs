@@ -194,7 +194,7 @@ pub fn parse_all_headers<R: Read + Seek>(
             }
             HeaderType::MainArchive => {
                 dispatch_header(&raw, data_offset, &mut result)?;
-                if let Some(quick_open) = try_parse_quick_open_headers(reader, &result)? {
+                if let Some(quick_open) = try_parse_quick_open_headers(reader, &result, password)? {
                     return Ok(quick_open);
                 }
                 common::skip_data_area(reader, &raw)?;
@@ -258,15 +258,7 @@ fn parse_encrypted_headers<R: Read + Seek>(
             break;
         }
 
-        if header_size > common::MAX_HEADER_BODY {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "encrypted header size {} exceeds maximum {}",
-                    header_size,
-                    common::MAX_HEADER_BODY
-                ),
-            });
-        }
+        common::validate_header_size(header_start, header_size, vint_len)?;
 
         // Total header bytes = CRC(4) + vint_len + body(header_size).
         let total = 4 + vint_len + header_size as usize;
@@ -405,6 +397,7 @@ fn dispatch_header(raw: &RawHeader, data_offset: u64, result: &mut ParsedHeaders
 fn try_parse_quick_open_headers<R: Read + Seek>(
     reader: &mut R,
     parsed: &ParsedHeaders,
+    password: Option<&str>,
 ) -> RarResult<Option<ParsedHeaders>> {
     let Some(main) = parsed.main.as_ref() else {
         return Ok(None);
@@ -414,7 +407,7 @@ fn try_parse_quick_open_headers<R: Read + Seek>(
     };
 
     let restore_pos = reader.stream_position().map_err(RarError::Io)?;
-    let attempt = parse_quick_open_headers_at(reader, quick_open_offset, main.clone());
+    let attempt = parse_quick_open_headers_at(reader, quick_open_offset, main.clone(), password);
     reader
         .seek(SeekFrom::Start(restore_pos))
         .map_err(RarError::Io)?;
@@ -435,6 +428,7 @@ fn parse_quick_open_headers_at<R: Read + Seek>(
     reader: &mut R,
     quick_open_offset: u64,
     main: main_archive::MainArchiveHeader,
+    password: Option<&str>,
 ) -> RarResult<Option<ParsedHeaders>> {
     reader
         .seek(SeekFrom::Start(quick_open_offset))
@@ -452,17 +446,94 @@ fn parse_quick_open_headers_at<R: Read + Seek>(
     if qopen_service.header.service_name() != "QO" {
         return Ok(None);
     }
-    if qopen_service.is_encrypted
-        || qopen_service.header.inner.compression.method != crate::types::CompressionMethod::Store
-    {
+    if qopen_service.header.inner.compression.method != crate::types::CompressionMethod::Store {
         return Ok(None);
     }
 
-    let mut remaining = qopen_raw.data_area_size;
+    if qopen_service.is_encrypted {
+        return parse_encrypted_quick_open_records(
+            reader,
+            &qopen_raw,
+            &qopen_service,
+            password,
+            quick_open_offset,
+            main,
+        );
+    }
+
+    parse_quick_open_records(
+        reader,
+        qopen_raw.data_area_size,
+        qopen_raw.offset,
+        quick_open_offset,
+        main,
+    )
+}
+
+fn parse_encrypted_quick_open_records<R: Read>(
+    reader: &mut R,
+    qopen_raw: &RawHeader,
+    qopen_service: &ParsedService,
+    password: Option<&str>,
+    quick_open_offset: u64,
+    main: main_archive::MainArchiveHeader,
+) -> RarResult<Option<ParsedHeaders>> {
+    let Some(password) = password else {
+        return Ok(None);
+    };
+    let Some(encryption) = qopen_service.file_encryption.as_ref() else {
+        return Ok(None);
+    };
+    if encryption.version != 0 {
+        return Ok(None);
+    }
+    if let Some(check_data) = encryption.check_data.as_ref() {
+        if !crate::crypto::verify_password_check(
+            password,
+            &encryption.salt,
+            encryption.kdf_count,
+            check_data,
+        ) {
+            return Ok(None);
+        }
+    }
+
+    let unpacked_size = qopen_service
+        .header
+        .inner
+        .unpacked_size
+        .unwrap_or(qopen_raw.data_area_size);
+    if qopen_raw.data_area_size % 16 != 0 {
+        return Ok(None);
+    }
+
+    let (mut key, _) = crate::crypto::derive_key(password, &encryption.salt, encryption.kdf_count)?;
+    let limited = reader.take(qopen_raw.data_area_size);
+    let mut decrypted_reader =
+        crate::crypto::DecryptingReader::new_rar5(limited, &key, &encryption.iv);
+    key.fill(0);
+
+    parse_quick_open_records(
+        &mut decrypted_reader,
+        unpacked_size,
+        qopen_raw.offset,
+        quick_open_offset,
+        main,
+    )
+}
+
+fn parse_quick_open_records<R: Read>(
+    reader: &mut R,
+    remaining: u64,
+    qopen_header_offset: u64,
+    quick_open_offset: u64,
+    main: main_archive::MainArchiveHeader,
+) -> RarResult<Option<ParsedHeaders>> {
+    let mut remaining = remaining;
     let mut result = empty_parsed_headers();
     result.main = Some(main);
 
-    while let Some(raw) = read_quick_open_record(reader, &mut remaining, qopen_raw.offset)? {
+    while let Some(raw) = read_quick_open_record(reader, &mut remaining, qopen_header_offset)? {
         let data_offset = raw.offset + 4 + raw.header_size_vint_len as u64 + raw.header_size;
         match raw.header_type {
             HeaderType::Encryption => return Ok(None),
@@ -508,6 +579,7 @@ fn read_quick_open_record<R: Read>(
             detail: "RAR5 QuickOpen record has invalid body size".into(),
         });
     }
+    common::validate_header_size(qopen_header_offset, body_size, body_size_vint_len)?;
     if body_size > common::MAX_HEADER_BODY {
         return Err(RarError::CorruptArchive {
             detail: format!(
@@ -640,11 +712,12 @@ fn parse_quick_open_cached_header(bytes: &[u8], offset: u64) -> RarResult<RawHea
     }
     let stored_crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let (header_size, header_size_vint_len) = vint::read_vint(&bytes[4..])?;
-    if header_size == 0 || header_size > common::MAX_HEADER_BODY {
+    if header_size == 0 {
         return Err(RarError::CorruptArchive {
             detail: format!("RAR5 QuickOpen cached header has invalid size {header_size}"),
         });
     }
+    common::validate_header_size(offset, header_size, header_size_vint_len)?;
     let body_start = 4 + header_size_vint_len;
     let body_len = usize::try_from(header_size).map_err(|_| RarError::CorruptArchive {
         detail: format!("RAR5 QuickOpen cached header size {header_size} does not fit in memory"),
@@ -884,6 +957,33 @@ mod tests {
         build_test_raw_header(3, 0, &body, &[], Some(payload.len() as u64))
     }
 
+    fn build_test_encrypted_qopen_service(
+        plaintext_payload: &[u8],
+        encrypted_payload: &[u8],
+        salt: &[u8; 16],
+        iv: &[u8; 16],
+        kdf_count: u8,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&vint::encode_vint(0)); // service flags.
+        body.extend_from_slice(&vint::encode_vint(plaintext_payload.len() as u64));
+        body.extend_from_slice(&vint::encode_vint(0)); // attributes.
+        body.extend_from_slice(&vint::encode_vint(0)); // RAR5 Store.
+        body.extend_from_slice(&vint::encode_vint(1)); // Unix host OS.
+        body.extend_from_slice(&vint::encode_vint(2));
+        body.extend_from_slice(b"QO");
+
+        let mut encryption_body = Vec::new();
+        encryption_body.extend_from_slice(&vint::encode_vint(0)); // encryption version.
+        encryption_body.extend_from_slice(&vint::encode_vint(0)); // encryption flags.
+        encryption_body.push(kdf_count);
+        encryption_body.extend_from_slice(salt);
+        encryption_body.extend_from_slice(iv);
+        let extra = build_test_extra_record(extra::record_type::FILE_ENCRYPTION, &encryption_body);
+
+        build_test_raw_header(3, 0, &body, &extra, Some(encrypted_payload.len() as u64))
+    }
+
     fn build_test_qopen_record(
         qopen_header_offset: u64,
         original_header_offset: u64,
@@ -910,6 +1010,19 @@ mod tests {
         out
     }
 
+    fn build_test_qopen_record_with_raw_size(size: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(size);
+        hasher.update(body);
+        let crc = hasher.finalize();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(size);
+        out.extend_from_slice(body);
+        out
+    }
+
     fn encrypt_first_cbc_block(key: &[u8; 32], iv: &[u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
         let cipher = Aes256::new(key.into());
         let mut block = plaintext;
@@ -921,6 +1034,30 @@ mod tests {
         cipher.encrypt_block(&mut block_ref);
         block.copy_from_slice(&block_ref);
         block
+    }
+
+    fn encrypt_cbc_blocks(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+        let padded_len = if plaintext.is_empty() {
+            0
+        } else {
+            ((plaintext.len() + 15) / 16) * 16
+        };
+        let mut encrypted = plaintext.to_vec();
+        encrypted.resize(padded_len, 0);
+
+        let cipher = Aes256::new(key.into());
+        let mut previous = *iv;
+        for chunk in encrypted.chunks_exact_mut(16) {
+            for (byte, previous_byte) in chunk.iter_mut().zip(previous.iter()) {
+                *byte ^= previous_byte;
+            }
+            let mut block_ref = aes::Block::default();
+            block_ref.copy_from_slice(chunk);
+            cipher.encrypt_block(&mut block_ref);
+            chunk.copy_from_slice(&block_ref);
+            previous.copy_from_slice(chunk);
+        }
+        encrypted
     }
 
     #[test]
@@ -966,6 +1103,34 @@ mod tests {
     }
 
     #[test]
+    fn quick_open_record_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+        let size = [0x81, 0x80, 0x80, 0x00];
+        let record = build_test_qopen_record_with_raw_size(&size, &[0]);
+        let mut cursor = std::io::Cursor::new(record.as_slice());
+        let mut remaining = record.len() as u64;
+
+        let result = read_quick_open_record(&mut cursor, &mut remaining, 256);
+
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
+            "expected long QuickOpen record size vint to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn quick_open_cached_header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+        let size = [0x81, 0x80, 0x80, 0x00];
+        let cached_header = build_test_qopen_record_with_raw_size(&size, &[0]);
+
+        let result = parse_quick_open_cached_header(&cached_header, 96);
+
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
+            "expected long cached header size vint to be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
     fn quick_open_crc_error_falls_back_to_physical_headers() {
         let qopen_offset = 256u64;
         let main = build_test_main_with_qopen_locator(qopen_offset - 8);
@@ -1002,6 +1167,170 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_quick_open_uses_password_and_avoids_physical_scan() {
+        let qopen_offset = 512u64;
+        let cached_file_offset = 96u64;
+        let cached_end_offset = 160u64;
+
+        let cached_file = build_test_file_header("encrypted-cached.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_file_offset,
+            &cached_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_end_offset,
+            &cached_end,
+        ));
+
+        let password = "quick-open-pass";
+        let salt = [0x41; 16];
+        let iv = [0x82; 16];
+        let kdf_count = 4;
+        let (key, _) = crate::crypto::derive_key(password, &salt, kdf_count).unwrap();
+        let encrypted_payload = encrypt_cbc_blocks(&key, &iv, &qopen_payload);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&build_test_main_with_qopen_locator(qopen_offset - 8));
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_encrypted_qopen_service(
+            &qopen_payload,
+            &encrypted_payload,
+            &salt,
+            &iv,
+            kdf_count,
+        ));
+        archive.extend_from_slice(&encrypted_payload);
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, Some(password)).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].header.name, "encrypted-cached.bin");
+        assert_eq!(
+            parsed.files[0].header.data_offset,
+            cached_file_offset + cached_file.len() as u64
+        );
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
+    fn encrypted_quick_open_streams_data_area_above_header_body_cap() {
+        let qopen_offset = 512u64;
+        let cached_file_offset = 96u64;
+        let cached_end_offset = 160u64;
+
+        let cached_file = build_test_file_header("large-encrypted-qo.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_file_offset,
+            &cached_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_end_offset,
+            &cached_end,
+        ));
+
+        let password = "quick-open-pass";
+        let salt = [0x15; 16];
+        let iv = [0x96; 16];
+        let kdf_count = 4;
+        let (key, _) = crate::crypto::derive_key(password, &salt, kdf_count).unwrap();
+        let mut encrypted_payload = encrypt_cbc_blocks(&key, &iv, &qopen_payload);
+        encrypted_payload.resize(common::MAX_HEADER_BODY as usize + 16, 0);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&build_test_main_with_qopen_locator(qopen_offset - 8));
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_encrypted_qopen_service(
+            &qopen_payload,
+            &encrypted_payload,
+            &salt,
+            &iv,
+            kdf_count,
+        ));
+        archive.extend_from_slice(&encrypted_payload);
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, Some(password)).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].header.name, "large-encrypted-qo.bin");
+        assert_eq!(
+            parsed.files[0].header.data_offset,
+            cached_file_offset + cached_file.len() as u64
+        );
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
+    fn encrypted_quick_open_without_or_wrong_password_falls_back_to_physical_headers() {
+        let qopen_offset = 512u64;
+        let main = build_test_main_with_qopen_locator(qopen_offset - 8);
+        let physical_file = build_test_file_header("physical.bin", 0, 0);
+        let physical_end = build_test_end_header();
+
+        let cached_file = build_test_file_header("encrypted-cached.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(qopen_offset, 96, &cached_file));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(qopen_offset, 160, &cached_end));
+
+        let password = "quick-open-pass";
+        let salt = [0x23; 16];
+        let iv = [0x64; 16];
+        let kdf_count = 4;
+        let (key, _) = crate::crypto::derive_key(password, &salt, kdf_count).unwrap();
+        let encrypted_payload = encrypt_cbc_blocks(&key, &iv, &qopen_payload);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&main);
+        let physical_file_offset = archive.len() as u64;
+        archive.extend_from_slice(&physical_file);
+        archive.extend_from_slice(&physical_end);
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_encrypted_qopen_service(
+            &qopen_payload,
+            &encrypted_payload,
+            &salt,
+            &iv,
+            kdf_count,
+        ));
+        archive.extend_from_slice(&encrypted_payload);
+
+        for supplied_password in [None, Some("wrong-pass")] {
+            let mut cursor = std::io::Cursor::new(archive.clone());
+            cursor
+                .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+                .unwrap();
+            let parsed = parse_all_headers(&mut cursor, supplied_password).unwrap();
+
+            assert_eq!(parsed.files.len(), 1);
+            assert_eq!(parsed.files[0].header.name, "physical.bin");
+            assert_eq!(
+                parsed.files[0].header.data_offset,
+                physical_file_offset + physical_file.len() as u64
+            );
+            assert!(parsed.end.is_some());
+        }
+    }
+
+    #[test]
     fn encrypted_header_size_above_cap_is_rejected() {
         let oversized = common::MAX_HEADER_BODY + 1;
         let size_vint = vint::encode_vint(oversized);
@@ -1029,8 +1358,8 @@ mod tests {
 
         let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed);
         assert!(
-            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("exceeds maximum")),
-            "expected oversize encrypted header to be rejected, got: {result:?}"
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
+            "expected non-UnRAR header-size vint to be rejected, got: {result:?}"
         );
     }
 }

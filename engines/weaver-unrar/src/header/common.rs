@@ -15,14 +15,16 @@ use std::io::{Read, Seek, SeekFrom};
 use tracing::warn;
 
 use crate::error::{RarError, RarResult};
+use crate::limits::UNRAR_RAR5_MAX_HEADER_BODY;
 use crate::vint;
 
 /// Maximum header body size accepted by the RAR5 parser.
 ///
-/// Legitimate RAR5 headers are much smaller than this. Keeping a hard cap
-/// prevents malformed header sizes from turning into large allocations before
-/// the parser can reject the archive as corrupt.
-pub(crate) const MAX_HEADER_BODY: u64 = 16 * 1024 * 1024;
+/// Match UnRAR's `MAX_HEADER_SIZE_RAR5` (2 MiB). Keeping the same cap prevents
+/// malformed header sizes from turning into large allocations before the parser
+/// can reject the archive as corrupt.
+pub(crate) const MAX_HEADER_BODY: u64 = UNRAR_RAR5_MAX_HEADER_BODY;
+const MAX_HEADER_SIZE_VINT_BYTES: usize = 3;
 
 /// Common header flags shared by all header types.
 pub mod flags {
@@ -126,20 +128,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
     // Read header size vint
     let (header_size, header_size_vint_len) = vint::read_vint_from(reader)?;
 
-    if header_size == 0 {
-        return Err(RarError::CorruptArchive {
-            detail: format!("zero header size at offset {offset}"),
-        });
-    }
-
-    if header_size > MAX_HEADER_BODY {
-        return Err(RarError::CorruptArchive {
-            detail: format!(
-                "header size {} exceeds maximum {}",
-                header_size, MAX_HEADER_BODY
-            ),
-        });
-    }
+    validate_header_size(offset, header_size, header_size_vint_len)?;
 
     // Read the full header body (header_size bytes: type + flags + extras + type-specific)
     let body_len = header_size as usize;
@@ -243,6 +232,38 @@ pub(crate) fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
     result
 }
 
+pub(crate) fn validate_header_size(
+    offset: u64,
+    header_size: u64,
+    header_size_vint_len: usize,
+) -> RarResult<()> {
+    if header_size == 0 {
+        return Err(RarError::CorruptArchive {
+            detail: format!("zero header size at offset {offset}"),
+        });
+    }
+
+    if header_size_vint_len > MAX_HEADER_SIZE_VINT_BYTES {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "header size vint at offset {} uses {} bytes, exceeding UnRAR RAR5 maximum {}",
+                offset, header_size_vint_len, MAX_HEADER_SIZE_VINT_BYTES
+            ),
+        });
+    }
+
+    if header_size > MAX_HEADER_BODY {
+        return Err(RarError::CorruptArchive {
+            detail: format!(
+                "header size {} exceeds maximum {}",
+                header_size, MAX_HEADER_BODY
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Build a RawHeader from pre-validated parts (used by encrypted header parser).
 pub(crate) fn parse_raw_header_from_parts(
     offset: u64,
@@ -252,6 +273,8 @@ pub(crate) fn parse_raw_header_from_parts(
     body: Vec<u8>,
 ) -> crate::error::RarResult<RawHeader> {
     use crate::vint;
+
+    validate_header_size(offset, header_size, header_size_vint_len)?;
 
     let mut pos = 0;
     let (header_type_val, n) = vint::read_vint(&body[pos..])?;
@@ -401,28 +424,51 @@ mod tests {
     }
 
     #[test]
-    fn test_huge_header_rejected() {
-        // Construct a header with header_size > 16 MB.
-        // We can't easily build the full body, but we can craft bytes where
-        // the header_size vint decodes to a huge value.
-        // Build: CRC32(header_size_vint + body) | header_size_vint | body
-        // We need the CRC to match so read_raw_header reaches the size check.
-        // Instead, just encode a vint for a large header_size and provide
-        // a valid CRC over the (vint + fake body). But we don't need the body
-        // to be present -- the size check happens before the read.
-        //
-        // Actually, the CRC check happens after reading the body, so let's
-        // just test that the error fires by providing a vint that decodes
-        // to > 16 MB. The read_exact will fail with TruncatedHeader or the
-        // size guard will fire first.
-        //
-        // The size guard fires BEFORE the allocation/read, so we just need:
-        // CRC32 (4 bytes) + vint encoding of 17_000_000
+    fn max_header_body_matches_unrar_rar5_limit() {
+        assert_eq!(MAX_HEADER_BODY, 0x200000);
+    }
 
+    #[test]
+    fn header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        // Non-minimal four-byte vint encoding of value 1. UnRAR rejects RAR5
+        // header-size vints that occupy more than three bytes regardless of
+        // decoded value.
+        data.extend_from_slice(&[0x81, 0x80, 0x80, 0x00]);
+
+        let mut cursor = std::io::Cursor::new(data);
+        let result = read_raw_header(&mut cursor);
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
+            "expected CorruptArchive error for long header-size vint, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pre_parsed_header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+        let result = parse_raw_header_from_parts(0, 0, 1, 4, vec![1]);
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
+            "expected CorruptArchive error for long pre-parsed header-size vint, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pre_parsed_header_size_above_unrar_limit_is_rejected() {
+        let result = parse_raw_header_from_parts(0, 0, MAX_HEADER_BODY + 1, 3, vec![1]);
+        assert!(
+            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("exceeds maximum")),
+            "expected CorruptArchive error for oversized pre-parsed header, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_huge_header_rejected() {
         let huge_size: u64 = 17_000_000;
         let header_size_bytes = crate::vint::encode_vint(huge_size);
 
-        // CRC doesn't matter since we'll error before checking it
+        // CRC doesn't matter since we'll error before checking it.
         let fake_crc: u32 = 0;
         let mut data = Vec::new();
         data.extend_from_slice(&fake_crc.to_le_bytes());
@@ -431,7 +477,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(data);
         let result = read_raw_header(&mut cursor);
         assert!(
-            matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("exceeds maximum")),
+            matches!(result, Err(RarError::CorruptArchive { .. })),
             "expected CorruptArchive error for huge header, got: {result:?}"
         );
     }

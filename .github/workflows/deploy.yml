@@ -415,10 +415,6 @@ jobs:
             runs_on: macos-26
             lane: apple-m1
           - target: x86_64-apple-darwin
-            platform: darwin-x86_64-portable
-            runs_on: macos-26
-            lane: portable
-          - target: x86_64-apple-darwin
             platform: darwin-x86_64-haswell
             runs_on: macos-26
             lane: haswell
@@ -720,68 +716,6 @@ jobs:
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
           path: weaver-linux-arm64-cortex-a76.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
-  rust-package-darwin-x86_64-portable:
-    name: rust-package-darwin-x86_64-portable
-    runs-on: macos-26
-    timeout-minutes: 60
-    needs: [web-build]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add x86_64-apple-darwin
-      - name: Install NASM
-        run: brew install nasm
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: package-darwin-x86_64-portable
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: cargo build -p weaver --release --locked --target x86_64-apple-darwin
-      - name: Codesign binary
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        env:
-          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
-        run: |
-          KEYCHAIN="build.keychain-db"
-          KEYCHAIN_PASS="ci-ephemeral"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
-          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
-          codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
-          rm /tmp/cert.p12
-          security delete-keychain "$KEYCHAIN"
-      - name: Package tarball
-        run: |
-          mkdir -p dist/package
-          cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
-          test -f weaver-darwin-x86_64-portable.tar.gz
-      - name: Upload release package
-        uses: actions/upload-artifact@v7
-        with:
-          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
-          path: weaver-darwin-x86_64-portable.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -1709,7 +1643,6 @@ jobs:
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
       - rust-package-linux-arm64-cortex-a76
-      - rust-package-darwin-x86_64-portable
       - rust-package-darwin-x86_64-haswell
       - rust-package-darwin-arm64-portable
       - rust-package-darwin-arm64-apple-m1
@@ -1738,11 +1671,6 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin x86_64 portable artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
           path: artifacts
       - name: Download darwin x86_64 haswell artifact
         uses: actions/download-artifact@v8
@@ -1788,7 +1716,6 @@ jobs:
           LINUX_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-haswell.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_CORTEX_A76_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-cortex-a76.tar.gz | cut -d ' ' -f1)
-          DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-haswell.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_APPLE_M1_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-apple-m1.tar.gz | cut -d ' ' -f1)
@@ -1875,7 +1802,10 @@ jobs:
                     sysctl_values["machdep.cpu.leaf7_features"],
                   ),
                 )
-                normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
+                unless normalized.superset?(X86_HASWELL_FEATURES.to_set)
+                  raise "macOS x86_64 release requires Haswell CPU features; no portable macOS x86_64 artifact is published"
+                end
+                "haswell"
               when ["linux", "x86_64"]
                 normalized = normalize_x86_features(cpuinfo_feature_tokens(linux_cpuinfo))
                 normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
@@ -1906,7 +1836,6 @@ jobs:
               when ["linux", "x86_64", "haswell"] then "weaver-linux-x86_64-haswell.tar.gz"
               when ["linux", "arm64", "portable"] then "weaver-linux-arm64-portable.tar.gz"
               when ["linux", "arm64", "cortex-a76"] then "weaver-linux-arm64-cortex-a76.tar.gz"
-              when ["macos", "x86_64", "portable"] then "weaver-darwin-x86_64-portable.tar.gz"
               when ["macos", "x86_64", "haswell"] then "weaver-darwin-x86_64-haswell.tar.gz"
               when ["macos", "arm64", "portable"] then "weaver-darwin-arm64-portable.tar.gz"
               when ["macos", "arm64", "apple-m1"] then "weaver-darwin-arm64-apple-m1.tar.gz"
@@ -2041,7 +1970,6 @@ jobs:
               "weaver-linux-x86_64-haswell.tar.gz" => "${LINUX_X86_HASWELL_SHA}",
               "weaver-linux-arm64-portable.tar.gz" => "${LINUX_ARM_PORTABLE_SHA}",
               "weaver-linux-arm64-cortex-a76.tar.gz" => "${LINUX_ARM_CORTEX_A76_SHA}",
-              "weaver-darwin-x86_64-portable.tar.gz" => "${DARWIN_X86_PORTABLE_SHA}",
               "weaver-darwin-x86_64-haswell.tar.gz" => "${DARWIN_X86_HASWELL_SHA}",
               "weaver-darwin-arm64-portable.tar.gz" => "${DARWIN_ARM_PORTABLE_SHA}",
               "weaver-darwin-arm64-apple-m1.tar.gz" => "${DARWIN_ARM_APPLE_M1_SHA}",
@@ -2141,6 +2069,16 @@ jobs:
             raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
           end
 
+          def assert_raises_message(expected_message, label)
+            yield
+          rescue RuntimeError => error
+            unless error.message.include?(expected_message)
+              raise "#{label}: expected error containing #{expected_message.inspect}, got #{error.message.inspect}"
+            end
+          else
+            raise "#{label}: expected error containing #{expected_message.inspect}"
+          end
+
           linux_x86_full = <<~CPUINFO
             flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
           CPUINFO
@@ -2180,7 +2118,9 @@ jobs:
           assert_equal("cortex-a76", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_full), "linux arm optimized lane")
           assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_portable), "linux arm portable lane")
           assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_full), "macos x86 optimized lane")
-          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable), "macos x86 portable lane")
+          assert_raises_message("macOS x86_64 release requires Haswell CPU features", "macos x86 pre-Haswell lane") do
+            WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable)
+          end
           assert_equal("apple-m1", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_full), "macos arm optimized lane")
           assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_portable), "macos arm portable lane")
 
@@ -2189,7 +2129,6 @@ jobs:
             "weaver-linux-x86_64-haswell.tar.gz" => "linux-x86-haswell",
             "weaver-linux-arm64-portable.tar.gz" => "linux-arm-portable",
             "weaver-linux-arm64-cortex-a76.tar.gz" => "linux-arm-cortex-a76",
-            "weaver-darwin-x86_64-portable.tar.gz" => "darwin-x86-portable",
             "weaver-darwin-x86_64-haswell.tar.gz" => "darwin-x86-haswell",
             "weaver-darwin-arm64-portable.tar.gz" => "darwin-arm-portable",
             "weaver-darwin-arm64-apple-m1.tar.gz" => "darwin-arm-apple-m1",
@@ -2206,8 +2145,8 @@ jobs:
             "linux arm sha",
           )
           assert_equal(
-            "darwin-x86-portable",
-            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "portable", checksums: checksums),
+            "darwin-x86-haswell",
+            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "haswell", checksums: checksums),
             "macos x86 sha",
           )
           RUBY

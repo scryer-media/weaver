@@ -315,7 +315,13 @@ pub fn verify_password_check(
     check_data: &[u8; 12],
 ) -> bool {
     derive_rar5_material(password, salt, kdf_count)
-        .map(|material| password_check_matches(&material.psw_check, check_data))
+        .map(|mut material| {
+            let matches = password_check_matches(&material.psw_check, check_data);
+            material.key.zeroize();
+            material.hash_key.zeroize();
+            material.psw_check.zeroize();
+            matches
+        })
         .unwrap_or(false)
 }
 

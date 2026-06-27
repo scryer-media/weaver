@@ -82,6 +82,7 @@ fn extract_and_assert(dir: &Path, prefix: &str, expected: &[u8], password: Optio
     let opts = weaver_unrar::ExtractOptions {
         verify: true,
         password: password.map(str::to_owned),
+        restore_owners: false,
     };
     let extracted = archive.extract_member(0, &opts, None).unwrap();
     assert_eq!(extracted, expected);
@@ -300,6 +301,7 @@ fn repairs_heavy_damage_28_regions_rar5() {
     let opts = weaver_unrar::ExtractOptions {
         verify: true,
         password: None,
+        restore_owners: false,
     };
     let _extracted = archive.extract_member(0, &opts, None).unwrap();
     // If extract_member didn't panic/error, the CRC matched.

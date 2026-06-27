@@ -46,7 +46,7 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
         id: "test5",
         source: "tests/test5",
         status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation coverage; Weaver has no create path yet.",
+        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
     },
     ImportedCase {
         id: "test5rk",
@@ -88,7 +88,7 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
         id: "test11",
         source: "tests/test11",
         status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation and 100-block generation coverage.",
+        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
     },
     ImportedCase {
         id: "test12",
@@ -135,8 +135,8 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
     ImportedCase {
         id: "test19",
         source: "tests/test19",
-        status: ImportStatus::Unsupported,
-        note: "Requires legacy skip-data/skip-leaway repair options.",
+        status: ImportStatus::Runnable,
+        note: "Repair honors the upstream skip-data/skip-leeway boundary using a synthetic PAR2 fixture.",
     },
     ImportedCase {
         id: "test20",
@@ -148,13 +148,13 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
         id: "test21",
         source: "tests/test21",
         status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation with external base-dir layout.",
+        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
     },
     ImportedCase {
         id: "test22",
         source: "tests/test22",
         status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation from a different process working directory.",
+        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
     },
     ImportedCase {
         id: "test23",
@@ -233,6 +233,60 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
         source: "tests/test35",
         status: ImportStatus::Unsupported,
         note: "Requires create-path symbolic-link semantics and dead-link handling.",
+    },
+    ImportedCase {
+        id: "test36",
+        source: "tests/test36",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation from an @filelist, which is outside the repair-only parity scope.",
+    },
+    ImportedCase {
+        id: "test37",
+        source: "tests/test37",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation from an @filelist, which is outside the repair-only parity scope.",
+    },
+    ImportedCase {
+        id: "test38",
+        source: "tests/test38",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation from mixed explicit paths and @filelist input.",
+    },
+    ImportedCase {
+        id: "test39",
+        source: "tests/test39",
+        status: ImportStatus::Unsupported,
+        note: "Requires recursive PAR2 creation from folder entries in @filelist input.",
+    },
+    ImportedCase {
+        id: "test40",
+        source: "tests/test40",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation from a stdin filelist.",
+    },
+    ImportedCase {
+        id: "test41",
+        source: "tests/test41",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation from mixed explicit paths and stdin filelist input.",
+    },
+    ImportedCase {
+        id: "test42",
+        source: "tests/test42",
+        status: ImportStatus::Runnable,
+        note: "Reject oversized source block counts without attempting repair.",
+    },
+    ImportedCase {
+        id: "test43",
+        source: "tests/test43",
+        status: ImportStatus::Runnable,
+        note: "Repair rejects dangling symlink targets using a synthetic PAR2 fixture.",
+    },
+    ImportedCase {
+        id: "test44",
+        source: "tests/test44",
+        status: ImportStatus::Unsupported,
+        note: "Requires PAR2 creation for more than 2000 input files.",
     },
     ImportedCase {
         id: "testMem",

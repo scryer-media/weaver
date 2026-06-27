@@ -1,7 +1,8 @@
 //! Archive encryption header (type 4) parsing.
 //!
-//! When present, all subsequent headers are AES-256-CBC encrypted.
-//! We only detect encryption and return an error -- decryption is not supported.
+//! When present, all subsequent headers are AES-256-CBC encrypted. This module
+//! parses and validates the encryption parameters; archive-level header
+//! decryption is performed by the header reader once a password is available.
 //!
 //! Fields:
 //! - Encryption version (vint, 0 = AES-256)

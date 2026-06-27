@@ -168,6 +168,8 @@ pub fn turbo_args(
     memory_mib: Option<usize>,
     threads: Option<usize>,
     quiet: bool,
+    skip_data: bool,
+    skip_leeway: Option<u64>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     args.push(match mode {
@@ -182,6 +184,12 @@ pub fn turbo_args(
     }
     if let Some(threads) = threads {
         args.push(format!("-t{threads}"));
+    }
+    if skip_data {
+        args.push("-N".to_owned());
+        if let Some(skip_leeway) = skip_leeway {
+            args.push(format!("-S{skip_leeway}"));
+        }
     }
     args.push(
         staged

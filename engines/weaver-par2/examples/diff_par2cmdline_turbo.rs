@@ -38,6 +38,8 @@ struct Config {
     turbo_binary: PathBuf,
     turbo_threads: Option<usize>,
     turbo_memory_mib: Option<usize>,
+    scan_skip_data: bool,
+    scan_skip_leeway: Option<u64>,
     quiet: bool,
 }
 
@@ -52,9 +54,11 @@ Options:
   --engine <weaver|turbo|both>
   --mode <verify|repair>
   --scenario <name-fragment> Repeatable scenario filter
-    --turbo-binary <path>      Defaults to par2 on PATH
+  --turbo-binary <path>      Defaults to par2 on PATH
   --turbo-threads <n>        Passed to par2cmdline-turbo as -t<n>
   --turbo-memory-mib <n>     Passed to par2cmdline-turbo as -m<n>
+  --scan-skip-data           Use oracle-style block skip scanning (-N in par2cmdline-turbo)
+  --scan-skip-leeway <bytes> Use this skip leeway with --scan-skip-data (-S<n>)
   --no-quiet                 Omit -q when invoking par2cmdline-turbo
   --help
 "
@@ -89,7 +93,13 @@ fn main() {
             if config.execute {
                 let staged = stage_scenario(&scenario);
                 let started = Instant::now();
-                let outcome = run_weaver(&staged, config.mode).expect("weaver run");
+                let outcome = run_weaver(
+                    &staged,
+                    config.mode,
+                    config.scan_skip_data,
+                    config.scan_skip_leeway,
+                )
+                .expect("weaver run");
                 println!(
                     "  weaver: {:?} in {:.3}s (missing={} available={} reconstructed={} copied={})",
                     outcome.status,
@@ -116,6 +126,8 @@ fn main() {
                     config.turbo_memory_mib,
                     config.turbo_threads,
                     config.quiet,
+                    config.scan_skip_data,
+                    config.scan_skip_leeway,
                 );
                 let started = Instant::now();
                 let output = Command::new(&config.turbo_binary)
@@ -143,6 +155,8 @@ fn main() {
                     config.turbo_memory_mib,
                     config.turbo_threads,
                     config.quiet,
+                    config.scan_skip_data,
+                    config.scan_skip_leeway,
                 );
                 let preview =
                     format_shell_command(&config.turbo_binary, &args, preview.temp.path());
@@ -170,6 +184,8 @@ fn parse_config() -> Config {
         turbo_memory_mib: std::env::var("PAR2_TURBO_MEMORY_MIB")
             .ok()
             .and_then(|value| value.parse().ok()),
+        scan_skip_data: false,
+        scan_skip_leeway: None,
         quiet: true,
     };
 
@@ -226,6 +242,16 @@ fn parse_config() -> Config {
                 });
                 config.turbo_memory_mib = Some(value.parse().expect("valid memory size"));
             }
+            "--scan-skip-data" => config.scan_skip_data = true,
+            "--scan-skip-leeway" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("missing value for --scan-skip-leeway");
+                    eprintln!("{}", usage());
+                    std::process::exit(2);
+                });
+                config.scan_skip_data = true;
+                config.scan_skip_leeway = Some(value.parse().expect("valid skip leeway"));
+            }
             "--no-quiet" => config.quiet = false,
             "--help" | "-h" => {
                 println!("{}", usage());
@@ -270,6 +296,8 @@ fn parse_mode(value: &str) -> TurboMode {
 fn run_weaver(
     staged: &benchmark_support::StagedScenario,
     mode: TurboMode,
+    scan_skip_data: bool,
+    scan_skip_leeway: Option<u64>,
 ) -> weaver_par2::Result<Par2RepairOutcome> {
     let mut options = Par2RepairerOptions::new(
         staged.temp.path().to_path_buf(),
@@ -277,6 +305,10 @@ fn run_weaver(
     );
     options.recovery_paths = staged.recovery_par2.clone();
     options.repair = matches!(mode, TurboMode::Repair);
+    options.scan_skip_data = scan_skip_data;
+    if let Some(scan_skip_leeway) = scan_skip_leeway {
+        options.scan_skip_leeway = scan_skip_leeway;
+    }
     Par2Repairer::new(options).verify_or_repair()
 }
 

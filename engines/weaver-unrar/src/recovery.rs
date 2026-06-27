@@ -172,7 +172,7 @@ struct Rar5RevHeader {
     rec_num: usize,
     rev_crc: u32,
     data_offset: u64,
-    data_volumes: Vec<Rar5DataVolumeInfo>,
+    data_volumes: Option<Vec<Rar5DataVolumeInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,13 +202,21 @@ fn restore_rar5(
     options: &RecoveryOptions,
     rev_headers: Vec<Rar5RevHeader>,
 ) -> RarResult<RecoveryReport> {
-    let first = &rev_headers[0];
+    let first = rev_headers
+        .iter()
+        .find(|header| header.data_volumes.is_some())
+        .ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR5 recovery set is missing data volume metadata".into(),
+        })?;
     let data_count = first.data_count;
     let rec_count = first.rec_count;
     let total_count = data_count + rec_count;
-
-    let mut data_slots = first
+    let data_volumes = first
         .data_volumes
+        .as_ref()
+        .expect("selected RAR5 recovery header has data volume metadata");
+
+    let mut data_slots = data_volumes
         .iter()
         .map(|info| Rar5DataSlot {
             path: None,
@@ -230,10 +238,12 @@ fn restore_rar5(
     let reference_name = rar5_recovery_reference_name(paths, &rev_headers)?;
 
     for header in rev_headers {
-        if header.data_count != data_count
-            || header.rec_count != rec_count
-            || header.data_volumes.len() != data_count
-        {
+        let counts_mismatch = header.data_count != data_count || header.rec_count != rec_count;
+        let table_mismatch = header
+            .data_volumes
+            .as_ref()
+            .is_some_and(|volumes| volumes.len() != data_count);
+        if counts_mismatch || table_mismatch {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "RAR5 recovery volume {} does not match the first recovery set",
@@ -377,8 +387,10 @@ fn rar5_recovery_reference_name(
     paths: &[PathBuf],
     rev_headers: &[Rar5RevHeader],
 ) -> RarResult<PathBuf> {
-    if let Some(path) = paths.iter().find(|path| !is_rev_path(path)) {
-        return Ok(path.clone());
+    for path in paths.iter().filter(|path| !is_rev_path(path)) {
+        if probe_rar5_volume_number(path)?.is_some() {
+            return Ok(path.clone());
+        }
     }
 
     rev_headers
@@ -598,7 +610,12 @@ fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
     }
 
     let mut raw = vec![0u8; header_size];
-    file.read_exact(&mut raw).map_err(RarError::Io)?;
+    if let Err(err) = file.read_exact(&mut raw) {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(RarError::Io(err));
+    }
     let mut crc_input = Vec::with_capacity(4 + raw.len());
     crc_input.extend_from_slice(&prefix[REV5_SIGN.len() + 4..REV5_SIGN.len() + 8]);
     crc_input.extend_from_slice(&raw);
@@ -606,29 +623,62 @@ fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
         return Ok(None);
     }
 
-    let mut reader = SliceReader::new(&raw);
-    let version = reader.get_u8()?;
+    parse_rar5_rev_body(path, &raw, REV5_PREFIX_LEN as u64 + header_size as u64)
+}
+
+fn parse_rar5_rev_body(
+    path: &Path,
+    raw: &[u8],
+    data_offset: u64,
+) -> RarResult<Option<Rar5RevHeader>> {
+    let mut reader = SliceReader::new(raw);
+    let version = match reader.get_u8() {
+        Ok(version) => version,
+        Err(RarError::CorruptArchive { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
     if version != 1 {
         return Ok(None);
     }
 
-    let data_count = reader.get_u16()? as usize;
-    let rec_count = reader.get_u16()? as usize;
+    let Some(data_count) = read_rar5_rev_u16(&mut reader)? else {
+        return Ok(None);
+    };
+    let Some(rec_count) = read_rar5_rev_u16(&mut reader)? else {
+        return Ok(None);
+    };
     let total_count = data_count + rec_count;
-    let rec_num = reader.get_u16()? as usize;
+    let Some(rec_num) = read_rar5_rev_u16(&mut reader)? else {
+        return Ok(None);
+    };
     if data_count == 0 || rec_count == 0 || total_count > MAX_RAR5_VOLUMES || rec_num >= total_count
     {
         return Ok(None);
     }
-    let rev_crc = reader.get_u32()?;
+    let Some(rev_crc) = read_rar5_rev_u32(&mut reader)? else {
+        return Ok(None);
+    };
 
-    let mut data_volumes = Vec::with_capacity(data_count);
-    for _ in 0..data_count {
-        data_volumes.push(Rar5DataVolumeInfo {
-            file_size: reader.get_u64()?,
-            crc32: reader.get_u32()?,
-        });
-    }
+    let table_size = data_count
+        .checked_mul(12)
+        .ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR5 recovery data table size overflow".into(),
+        })?;
+    let data_volumes = if raw.len().saturating_sub(reader.pos) >= table_size {
+        let mut volumes = Vec::with_capacity(data_count);
+        for _ in 0..data_count {
+            let Some(file_size) = read_rar5_rev_u64(&mut reader)? else {
+                return Ok(None);
+            };
+            let Some(crc32) = read_rar5_rev_u32(&mut reader)? else {
+                return Ok(None);
+            };
+            volumes.push(Rar5DataVolumeInfo { file_size, crc32 });
+        }
+        Some(volumes)
+    } else {
+        None
+    };
 
     Ok(Some(Rar5RevHeader {
         path: path.to_path_buf(),
@@ -636,9 +686,33 @@ fn read_rar5_rev_header(path: &Path) -> RarResult<Option<Rar5RevHeader>> {
         rec_count,
         rec_num,
         rev_crc,
-        data_offset: REV5_PREFIX_LEN as u64 + header_size as u64,
+        data_offset,
         data_volumes,
     }))
+}
+
+fn read_rar5_rev_u16(reader: &mut SliceReader<'_>) -> RarResult<Option<usize>> {
+    match reader.get_u16() {
+        Ok(value) => Ok(Some(value as usize)),
+        Err(RarError::CorruptArchive { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_rar5_rev_u32(reader: &mut SliceReader<'_>) -> RarResult<Option<u32>> {
+    match reader.get_u32() {
+        Ok(value) => Ok(Some(value)),
+        Err(RarError::CorruptArchive { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_rar5_rev_u64(reader: &mut SliceReader<'_>) -> RarResult<Option<u64>> {
+    match reader.get_u64() {
+        Ok(value) => Ok(Some(value)),
+        Err(RarError::CorruptArchive { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +721,7 @@ struct Rar3RevHeader {
     rec_position: usize,
     rec_count: usize,
     data_count: usize,
+    new_style: bool,
 }
 
 fn restore_rar3(
@@ -657,6 +732,7 @@ fn restore_rar3(
     let first = &rev_headers[0];
     let data_count = first.data_count;
     let rec_count = first.rec_count;
+    let new_style = first.new_style;
     let total_count = data_count + rec_count;
     if total_count > 255 {
         return Err(RarError::CorruptArchive {
@@ -670,7 +746,10 @@ fn restore_rar3(
     let mut slots = vec![None::<PathBuf>; total_count];
     let mut invalid_data_paths = vec![None::<PathBuf>; data_count];
     for header in rev_headers {
-        if header.data_count != data_count || header.rec_count != rec_count {
+        if header.data_count != data_count
+            || header.rec_count != rec_count
+            || header.new_style != new_style
+        {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "RAR3 recovery volume {} does not match the first recovery set",
@@ -752,6 +831,7 @@ fn restore_rar3(
         &missing_volume_numbers,
         &restored_paths,
         options,
+        new_style,
     )?;
 
     if options.verify_restored {
@@ -866,6 +946,7 @@ fn reconstruct_rar3(
     missing_volume_numbers: &[usize],
     restored_paths: &[PathBuf],
     options: &RecoveryOptions,
+    new_style: bool,
 ) -> RarResult<()> {
     let total_count = data_count + rec_count;
     let mut chunk_size = (RAR3_TOTAL_BUFFER_SIZE / total_count.max(1)).max(1);
@@ -951,8 +1032,23 @@ fn reconstruct_rar3(
         }
     }
 
-    for output in &mut outputs {
-        output.flush().map_err(RarError::Io)?;
+    for (out_idx, output) in outputs.iter_mut().enumerate() {
+        let is_last_data_volume = missing_volume_numbers[out_idx] + 1 == data_count;
+        finalize_rar3_restored_output(output, new_style, is_last_data_volume)?;
+    }
+    Ok(())
+}
+
+fn finalize_rar3_restored_output(
+    output: &mut File,
+    new_style: bool,
+    is_last_data_volume: bool,
+) -> RarResult<()> {
+    output.flush().map_err(RarError::Io)?;
+
+    // UnRAR clears the synthetic 7-byte footer only for RAR 3.10+ recovery
+    // sets. Old-style name#_#_#.rev volumes do not carry this footer.
+    if new_style {
         let len = output.seek(SeekFrom::End(0)).map_err(RarError::Io)?;
         if len >= 7 {
             output
@@ -962,6 +1058,50 @@ fn reconstruct_rar3(
             output.flush().map_err(RarError::Io)?;
         }
     }
+
+    if is_last_data_volume {
+        truncate_rar3_last_volume_padding(output)?;
+    }
+    Ok(())
+}
+
+fn truncate_rar3_last_volume_padding(output: &mut File) -> RarResult<()> {
+    output.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
+    match crate::signature::read_signature(output) {
+        Ok(format) if format.is_rar4_family() => {}
+        Ok(_) => return Ok(()),
+        Err(RarError::InvalidSignature) => return Ok(()),
+        Err(err) => return Err(err),
+    }
+
+    while let Some(raw) = crate::rar4::header::read_raw_header(output)? {
+        let next_offset = raw
+            .offset
+            .saturating_add(u64::from(raw.header_size))
+            .saturating_add(raw.data_area_size);
+        if raw.header_type == crate::rar4::types::Rar4HeaderType::EndArchive {
+            let file_len = output.seek(SeekFrom::End(0)).map_err(RarError::Io)?;
+            if next_offset >= file_len {
+                return Ok(());
+            }
+            output
+                .seek(SeekFrom::Start(next_offset))
+                .map_err(RarError::Io)?;
+            let mut probe = [0u8; 8192];
+            let read = output.read(&mut probe).map_err(RarError::Io)?;
+            if read > 0 && probe[..read].iter().all(|&byte| byte == 0) {
+                output.set_len(next_offset).map_err(RarError::Io)?;
+            }
+            return Ok(());
+        }
+
+        if raw.data_area_size > 0 {
+            output
+                .seek(SeekFrom::Start(next_offset))
+                .map_err(RarError::Io)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -978,6 +1118,7 @@ fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
                     rec_position,
                     rec_count,
                     data_count,
+                    new_style: false,
                 }
             }),
         );
@@ -1010,6 +1151,7 @@ fn read_rar3_rev_header(path: &Path) -> RarResult<Option<Rar3RevHeader>> {
         rec_position,
         rec_count,
         data_count,
+        new_style: true,
     }))
 }
 
@@ -1063,14 +1205,42 @@ fn parse_rar3_rev_param(value: &str) -> Option<usize> {
 }
 
 fn probe_rar5_volume_number(path: &Path) -> RarResult<Option<usize>> {
+    if !rar5_recovery_data_candidate_allowed(path)? {
+        return Ok(None);
+    }
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) => return Err(RarError::Io(e)),
     };
     match probe_volume(&mut file) {
-        Ok(probe) if probe.format == ArchiveFormat::Rar5 => Ok(probe.volume_number.or(Some(0))),
+        Ok(probe) if probe.format == ArchiveFormat::Rar5 && probe.is_multi_volume => {
+            Ok(parse_part_number(path).and_then(|number| number.checked_sub(1)))
+        }
         Ok(_) | Err(RarError::InvalidSignature) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+fn rar5_recovery_data_candidate_allowed(path: &Path) -> RarResult<bool> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("rar"))
+    {
+        return Ok(true);
+    }
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(RarError::Io(err)),
+    };
+    match crate::signature::read_signature(&mut file) {
+        Ok(ArchiveFormat::Rar5) => {
+            let pos = file.stream_position().map_err(RarError::Io)?;
+            Ok(pos > crate::signature::RAR5_SIGNATURE_LEN as u64)
+        }
+        Ok(_) | Err(RarError::InvalidSignature) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -1473,11 +1643,71 @@ mod tests {
             rec_num: 1,
             rev_crc: 0,
             data_offset: 0,
-            data_volumes: vec![Rar5DataVolumeInfo {
+            data_volumes: Some(vec![Rar5DataVolumeInfo {
                 file_size: 0,
                 crc32: 0,
-            }],
+            }]),
         }
+    }
+
+    fn build_rar5_rev_from_raw(raw: &[u8]) -> Vec<u8> {
+        let mut bytes = REV5_SIGN.to_vec();
+        let header_size = raw.len() as u32;
+        let mut crc_input = header_size.to_le_bytes().to_vec();
+        crc_input.extend_from_slice(raw);
+        bytes.extend_from_slice(&crc32fast::hash(&crc_input).to_le_bytes());
+        bytes.extend_from_slice(&header_size.to_le_bytes());
+        bytes.extend_from_slice(raw);
+        bytes
+    }
+
+    fn build_rar5_rev_bytes(include_table: bool) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.push(1); // version
+        raw.extend_from_slice(&1u16.to_le_bytes()); // data count
+        raw.extend_from_slice(&1u16.to_le_bytes()); // recovery count
+        raw.extend_from_slice(&1u16.to_le_bytes()); // recovery volume number
+        raw.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes()); // recovery data CRC
+        if include_table {
+            raw.extend_from_slice(&123u64.to_le_bytes());
+            raw.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        }
+
+        build_rar5_rev_from_raw(&raw)
+    }
+
+    fn build_rar5_header(header_type: u64, header_flags: u64, type_body: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::vint::encode_vint(header_type));
+        body.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        body.extend_from_slice(type_body);
+
+        let header_size = body.len() as u64;
+        let header_size_bytes = crate::vint::encode_vint(header_size);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header_size_bytes);
+        hasher.update(&body);
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&hasher.finalize().to_le_bytes());
+        result.extend_from_slice(&header_size_bytes);
+        result.extend_from_slice(&body);
+        result
+    }
+
+    fn build_probe_rar5_archive(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
+        let mut buf = crate::signature::RAR5_SIGNATURE.to_vec();
+        let mut main_body = crate::vint::encode_vint(archive_flags);
+        if let Some(volume_number) = volume_number {
+            main_body.extend_from_slice(&crate::vint::encode_vint(volume_number));
+        }
+        buf.extend_from_slice(&build_rar5_header(1, 0, &main_body));
+        buf.extend_from_slice(&build_rar5_header(5, 0, &crate::vint::encode_vint(0)));
+        buf
+    }
+
+    fn path_list_contains(paths: &[PathBuf], needle: &Path) -> bool {
+        paths.iter().any(|path| path == needle)
     }
 
     #[test]
@@ -1488,16 +1718,227 @@ mod tests {
     }
 
     #[test]
+    fn recovery_path_expansion_discovers_rar5_siblings_from_rev() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("movie.part0002.rev");
+        let data = dir.path().join("movie.part0001.rar");
+        let next_rev = dir.path().join("movie.part0003.rev");
+        let unrelated = dir.path().join("other.part0001.rar");
+        for path in [&input, &data, &next_rev, &unrelated] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let expanded = expand_recovery_paths(std::slice::from_ref(&input)).unwrap();
+
+        assert!(path_list_contains(&expanded, &input));
+        assert!(path_list_contains(&expanded, &data));
+        assert!(path_list_contains(&expanded, &next_rev));
+        assert!(!path_list_contains(&expanded, &unrelated));
+    }
+
+    #[test]
+    fn recovery_path_expansion_discovers_rar3_old_style_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("movie5_3_1.rev");
+        let data = dir.path().join("movie.rar");
+        let next_rev = dir.path().join("movie5_3_2.rev");
+        let unrelated = dir.path().join("other5_3_1.rev");
+        for path in [&input, &data, &next_rev, &unrelated] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let expanded = expand_recovery_paths(std::slice::from_ref(&input)).unwrap();
+
+        assert!(path_list_contains(&expanded, &input));
+        assert!(path_list_contains(&expanded, &data));
+        assert!(path_list_contains(&expanded, &next_rev));
+        assert!(!path_list_contains(&expanded, &unrelated));
+    }
+
+    #[test]
+    fn rar5_recovery_data_candidate_accepts_rar_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part01.rar");
+        std::fs::write(&path, b"not checked before extension acceptance").unwrap();
+
+        assert!(rar5_recovery_data_candidate_allowed(&path).unwrap());
+    }
+
+    #[test]
+    fn rar5_recovery_data_candidate_rejects_non_rar_direct_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part01.bin");
+        std::fs::write(&path, crate::signature::RAR5_SIGNATURE).unwrap();
+
+        assert!(!rar5_recovery_data_candidate_allowed(&path).unwrap());
+    }
+
+    #[test]
+    fn rar5_recovery_data_candidate_accepts_non_rar_sfx_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part01.exe");
+        let mut bytes = vec![0xCCu8; 16];
+        bytes.extend_from_slice(&crate::signature::RAR5_SIGNATURE);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(rar5_recovery_data_candidate_allowed(&path).unwrap());
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_rejects_non_volume_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part01.rar");
+        std::fs::write(&path, build_probe_rar5_archive(0, None)).unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_accepts_first_volume_without_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part01.rar");
+        std::fs::write(
+            &path,
+            build_probe_rar5_archive(crate::header::main_archive::flags::VOLUME, None),
+        )
+        .unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_accepts_numbered_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part03.rar");
+        std::fs::write(
+            &path,
+            build_probe_rar5_archive(
+                crate::header::main_archive::flags::VOLUME
+                    | crate::header::main_archive::flags::VOLUME_NUMBER,
+                Some(2),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_uses_filename_number_like_unrar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part03.rar");
+        std::fs::write(
+            &path,
+            build_probe_rar5_archive(
+                crate::header::main_archive::flags::VOLUME
+                    | crate::header::main_archive::flags::VOLUME_NUMBER,
+                Some(9),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rar5_recovery_slot_probe_rejects_volume_without_filename_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.rar");
+        std::fs::write(
+            &path,
+            build_probe_rar5_archive(crate::header::main_archive::flags::VOLUME, None),
+        )
+        .unwrap();
+
+        assert_eq!(probe_rar5_volume_number(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn rar5_rev_parser_reads_full_data_volume_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part0002.rev");
+        std::fs::write(&path, build_rar5_rev_bytes(true)).unwrap();
+
+        let header = read_rar5_rev_header(&path).unwrap().unwrap();
+        let volumes = header.data_volumes.unwrap();
+
+        assert_eq!(header.data_count, 1);
+        assert_eq!(header.rec_count, 1);
+        assert_eq!(header.rec_num, 1);
+        assert_eq!(volumes[0].file_size, 123);
+        assert_eq!(volumes[0].crc32, 0x1122_3344);
+    }
+
+    #[test]
+    fn rar5_rev_parser_accepts_compact_non_first_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part0002.rev");
+        std::fs::write(&path, build_rar5_rev_bytes(false)).unwrap();
+
+        let header = read_rar5_rev_header(&path).unwrap().unwrap();
+
+        assert_eq!(header.data_count, 1);
+        assert_eq!(header.rec_count, 1);
+        assert_eq!(header.rec_num, 1);
+        assert!(header.data_volumes.is_none());
+    }
+
+    #[test]
+    fn rar5_rev_parser_ignores_truncated_header_body_like_unrar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part0002.rev");
+        let mut bytes = REV5_SIGN.to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0, 1]);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(read_rar5_rev_header(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn rar5_rev_parser_ignores_crc_valid_short_metadata_like_unrar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part0002.rev");
+        std::fs::write(&path, build_rar5_rev_from_raw(&[1, 1, 0])).unwrap();
+
+        assert!(read_rar5_rev_header(&path).unwrap().is_none());
+    }
+
+    #[test]
     fn rar5_recovery_reference_prefers_existing_data_volume() {
-        let paths = vec![
-            PathBuf::from("/tmp/movie.part01.rar"),
-            PathBuf::from("/tmp/movie.part0000000002.rev"),
-        ];
-        let headers = vec![test_rar5_rev_header("/tmp/movie.part0000000002.rev")];
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("movie.part01.rar");
+        let rev_path = dir.path().join("movie.part0000000002.rev");
+        std::fs::write(
+            &data_path,
+            build_probe_rar5_archive(crate::header::main_archive::flags::VOLUME, None),
+        )
+        .unwrap();
+        let paths = vec![data_path.clone(), rev_path.clone()];
+        let headers = vec![test_rar5_rev_header(rev_path.to_str().unwrap())];
 
         let reference = rar5_recovery_reference_name(&paths, &headers).unwrap();
 
-        assert_eq!(reference.as_path(), Path::new("/tmp/movie.part01.rar"));
+        assert_eq!(reference.as_path(), data_path);
+    }
+
+    #[test]
+    fn rar5_recovery_reference_ignores_non_volume_rar_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("movie.part01.rar");
+        let short_rev_path = dir.path().join("movie.part2.rev");
+        let long_rev_path = dir.path().join("movie.part0000000010.rev");
+        std::fs::write(&data_path, build_probe_rar5_archive(0, None)).unwrap();
+        let paths = vec![data_path, short_rev_path.clone(), long_rev_path.clone()];
+        let headers = vec![
+            test_rar5_rev_header(short_rev_path.to_str().unwrap()),
+            test_rar5_rev_header(long_rev_path.to_str().unwrap()),
+        ];
+
+        let reference = rar5_recovery_reference_name(&paths, &headers).unwrap();
+
+        assert_eq!(reference.as_path(), long_rev_path);
     }
 
     #[test]
@@ -1784,6 +2225,7 @@ mod tests {
         assert_eq!(header.data_count, 3);
         assert_eq!(header.rec_count, 2);
         assert_eq!(header.rec_position, 1);
+        assert!(header.new_style);
     }
 
     #[test]
@@ -1797,6 +2239,69 @@ mod tests {
         assert_eq!(header.data_count, 5);
         assert_eq!(header.rec_count, 3);
         assert_eq!(header.rec_position, 1);
+        assert!(!header.new_style);
+    }
+
+    #[test]
+    fn rar3_restored_output_footer_scrub_is_new_style_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_style = dir.path().join("old-style.rar");
+        let new_style = dir.path().join("new-style.rar");
+        let payload = b"archive bytes plus footer";
+        std::fs::write(&old_style, payload).unwrap();
+        std::fs::write(&new_style, payload).unwrap();
+
+        let mut old_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&old_style)
+            .unwrap();
+        finalize_rar3_restored_output(&mut old_file, false, false).unwrap();
+        drop(old_file);
+
+        let mut new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&new_style)
+            .unwrap();
+        finalize_rar3_restored_output(&mut new_file, true, false).unwrap();
+        drop(new_file);
+
+        assert_eq!(std::fs::read(&old_style).unwrap(), payload);
+
+        let mut expected = payload.to_vec();
+        let len = expected.len();
+        expected[len - 7..].fill(0);
+        assert_eq!(std::fs::read(&new_style).unwrap(), expected);
+    }
+
+    #[test]
+    fn rar3_last_restored_volume_truncates_zero_padding_after_endarc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-volume.rar");
+        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[
+            0x00, 0x00, // CRC16 placeholder; raw parser tolerates mismatch.
+            0x7B, // ENDARC
+            0x00, 0x00, // flags
+            0x07, 0x00, // header size
+        ]);
+        let endarc_offset = bytes.len();
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        finalize_rar3_restored_output(&mut file, false, true).unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            endarc_offset as u64
+        );
     }
 
     #[test]

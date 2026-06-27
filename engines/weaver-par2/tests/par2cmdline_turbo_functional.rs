@@ -5,11 +5,28 @@ mod support;
 
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 
 use support::{
-    assert_file_matches, assert_repaired_or_verified, assert_verified, extract_fixture, run_repair,
-    run_verify, temp_case_dir,
+    Rng, SyntheticPar2, assert_file_matches, assert_repaired_or_verified, assert_verified,
+    build_synthetic_par2, extract_fixture, run_repair, run_verify, temp_case_dir,
 };
+use weaver_par2::{Par2Error, Par2RepairStatus, Par2Repairer, Par2RepairerOptions};
+
+fn run_synthetic_repair_with_skip_leeway(
+    base_dir: &Path,
+    synthetic: &SyntheticPar2,
+    skip_leeway: u64,
+) -> weaver_par2::Par2RepairOutcome {
+    let mut options = Par2RepairerOptions::new(base_dir.to_path_buf(), Vec::new());
+    options.file_set = Some(synthetic.par2_set.clone());
+    options.repair = true;
+    options.scan_skip_data = true;
+    options.scan_skip_leeway = skip_leeway;
+    Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("run synthetic par2 repairer")
+}
 
 #[test]
 fn upstream_test2_verify_par2_flatdata() {
@@ -252,6 +269,40 @@ fn upstream_test18_repair_single_file_archive() {
 }
 
 #[test]
+fn upstream_test19_skip_leeway_boundary() {
+    let temp = temp_case_dir("test19");
+    let mut rng = Rng::new(873_945_932);
+    let synthetic = build_synthetic_par2(&[1024], 200, 1, &mut rng);
+    let file = synthetic.files.first().expect("synthetic file");
+    let path = temp.path().join(&file.filename);
+
+    fs::write(&path, &file.data[100..]).expect("write shifted data file");
+
+    let too_narrow = run_synthetic_repair_with_skip_leeway(temp.path(), &synthetic, 99);
+    assert_eq!(
+        too_narrow.status,
+        Par2RepairStatus::Insufficient,
+        "test19: leeway 99 should skip over every shifted block boundary"
+    );
+    assert!(
+        too_narrow.verification.total_missing_blocks > 1,
+        "test19: leeway 99 should leave more damage than one recovery block can repair"
+    );
+
+    let repairable = run_synthetic_repair_with_skip_leeway(temp.path(), &synthetic, 100);
+    assert_eq!(
+        repairable.status,
+        Par2RepairStatus::Repaired,
+        "test19: leeway 100 should scan the shifted block boundaries"
+    );
+    assert_eq!(
+        fs::read(&path).expect("read repaired data file"),
+        file.data,
+        "test19: repaired bytes differed from original"
+    );
+}
+
+#[test]
 fn upstream_test20_repair_from_split_fragments() {
     let temp = temp_case_dir("test20");
     extract_fixture("test20-generated.tar.gz", temp.path());
@@ -347,10 +398,12 @@ fn upstream_test33_renamed_files_repair_cleanly() {
     extract_fixture("flatdata.tar.gz", temp.path());
     extract_fixture("flatdata-par2files.tar.gz", temp.path());
 
-    for name in ["test-0.data", "test-1.data", "test-2.data"] {
-        let path = temp.path().join(name);
-        fs::copy(&path, temp.path().join(format!("{name}.orig"))).expect("copy original");
-    }
+    let originals = ["test-0.data", "test-1.data", "test-2.data"].map(|name| {
+        (
+            name,
+            fs::read(temp.path().join(name)).expect("read original"),
+        )
+    });
 
     fs::rename(
         temp.path().join("test-0.data"),
@@ -380,13 +433,27 @@ fn upstream_test33_renamed_files_repair_cleanly() {
         "test33: pre-repair verify should detect either missing or renamed files"
     );
 
-    let repair = run_repair(temp.path(), temp.path().join("testdata.par2"), &[]);
+    let renamed_paths = [
+        "renamed-file-a.data",
+        "renamed-file-b.data",
+        "renamed-file-c.data",
+    ]
+    .map(|name| temp.path().join(name));
+    let repair = run_repair(
+        temp.path(),
+        temp.path().join("testdata.par2"),
+        &renamed_paths,
+    );
     assert_repaired_or_verified(&repair, "test33");
-    for name in ["test-0.data", "test-1.data", "test-2.data"] {
-        assert_file_matches(
-            temp.path().join(name),
-            temp.path().join(format!("{name}.orig")),
-            "test33 repaired file",
+    for (name, original) in originals {
+        let repaired = fs::read(temp.path().join(name)).expect("read repaired file");
+        assert_eq!(repaired, original, "test33 repaired file {name}");
+    }
+    for name in renamed_paths {
+        assert!(
+            !name.exists(),
+            "test33 should consume complete renamed source {}",
+            name.display()
         );
     }
 }
@@ -424,5 +491,99 @@ fn upstream_test34_damaged_renamed_candidate_does_not_confuse_repair() {
         temp.path().join("test-0.data"),
         temp.path().join("test-0.data.orig"),
         "test34 repaired file",
+    );
+}
+
+#[test]
+fn upstream_test42_rejects_oversized_source_block_counts() {
+    let temp = temp_case_dir("test42");
+    let mut rng = Rng::new(42_424_242);
+    let mut synthetic = build_synthetic_par2(&[4, 4], 4, 1, &mut rng);
+    for (file, length) in synthetic
+        .files
+        .iter()
+        .zip([0x8000_0000u64 * 4, 0x8000_0001u64 * 4])
+    {
+        synthetic
+            .par2_set
+            .files
+            .get_mut(&file.file_id)
+            .expect("synthetic file description")
+            .length = length;
+    }
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    options.file_set = Some(synthetic.par2_set);
+    let error = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect_err("test42: oversized source block counts should be rejected");
+
+    match error {
+        Par2Error::ResourceLimitExceeded { reason } => {
+            assert!(
+                reason.contains("max is") || reason.contains("addressable PAR2 slices"),
+                "test42: unexpected resource-limit reason: {reason}"
+            );
+        }
+        other => panic!("test42: expected ResourceLimitExceeded, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_test43_rejects_repair_through_dangling_symlink() {
+    let temp = temp_case_dir("test43");
+    let outside = temp.path().join("outside");
+    let work = temp.path().join("work");
+    let target_rel = ".config/autostart/poc.desktop";
+    let target = work.join(target_rel);
+    let escaped = outside.join("escaped-by-repair");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("create target parent");
+    fs::create_dir_all(&outside).expect("create outside dir");
+
+    let mut rng = Rng::new(43_043_043);
+    let mut synthetic =
+        build_synthetic_par2(&[b"symlink escape file body\n".len()], 64, 1, &mut rng);
+    let file_id = synthetic.files[0].file_id;
+    let original_filename = synthetic.files[0].filename.clone();
+    let desc = synthetic
+        .par2_set
+        .files
+        .get_mut(&file_id)
+        .expect("synthetic file description");
+    desc.filename = target_rel.to_owned();
+    desc.par2_name = target_rel.to_owned();
+
+    std::os::unix::fs::symlink(&escaped, &target).expect("create dangling symlink target");
+
+    let mut options = Par2RepairerOptions::new(work, Vec::new());
+    options.file_set = Some(synthetic.par2_set);
+    let error = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect_err("test43: dangling symlink repair target should be rejected");
+
+    match error {
+        Par2Error::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("symbolic link"),
+                "test43: unexpected symlink rejection error: {error}"
+            );
+        }
+        other => panic!("test43: expected symlink I/O rejection, got {other:?}"),
+    }
+    assert!(
+        !escaped.exists(),
+        "test43: repair wrote through dangling symlink outside repair tree"
+    );
+    assert!(
+        target
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink()),
+        "test43: dangling symlink target should remain in place"
+    );
+    assert_ne!(
+        original_filename, target_rel,
+        "test43 setup should exercise a rewritten synthetic PAR2 target"
     );
 }
