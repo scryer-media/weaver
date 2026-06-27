@@ -799,11 +799,7 @@ fn parse_rar3_data_volume_number(path: &Path) -> Option<usize> {
         }
         return Some(0);
     }
-    if ext.len() == 3 && ext.starts_with('r') {
-        let number = ext[1..].parse::<usize>().ok()?;
-        return Some(number + 1);
-    }
-    None
+    parse_old_rar3_numbered_extension(&ext)
 }
 
 fn has_old_rar3_extension(path: &Path) -> bool {
@@ -813,7 +809,22 @@ fn has_old_rar3_extension(path: &Path) -> bool {
     else {
         return false;
     };
-    ext.len() == 3 && ext.starts_with('r') && ext[1..].parse::<usize>().is_ok()
+    parse_old_rar3_numbered_extension(&ext).is_some()
+}
+
+fn parse_old_rar3_numbered_extension(ext: &str) -> Option<usize> {
+    let bytes = ext.as_bytes();
+    if bytes.len() != 3 || !bytes[1].is_ascii_digit() || !bytes[2].is_ascii_digit() {
+        return None;
+    }
+
+    let prefix = bytes[0].to_ascii_lowercase();
+    if prefix < b'r' {
+        return None;
+    }
+
+    let number = usize::from(bytes[1] - b'0') * 10 + usize::from(bytes[2] - b'0');
+    Some((usize::from(prefix - b'r') * 100) + number + 1)
 }
 
 fn rar3_uses_old_numbering(paths: &[PathBuf]) -> RarResult<bool> {
@@ -865,19 +876,20 @@ fn infer_old_rar3_volume_path(reference: &Path, output_dir: &Path, volume_index:
     let ext = if volume_index == 0 {
         "rar".to_string()
     } else {
-        format!("r{:02}", volume_index - 1)
+        old_rar3_numbered_extension(volume_index)
     };
     output_dir.join(format!("{stem}.{ext}"))
 }
 
+fn old_rar3_numbered_extension(volume_index: usize) -> String {
+    let old_index = volume_index - 1;
+    let prefix = char::from_u32(u32::from(b'r') + (old_index / 100) as u32).unwrap_or('r');
+    format!("{prefix}{:02}", old_index % 100)
+}
+
 fn parse_part_number(path: &Path) -> Option<usize> {
     let stem = path.file_stem()?.to_string_lossy();
-    let bytes = stem.as_bytes();
-    let end = bytes.iter().rposition(|b| b.is_ascii_digit())? + 1;
-    let start = bytes[..end]
-        .iter()
-        .rposition(|b| !b.is_ascii_digit())
-        .map_or(0, |idx| idx + 1);
+    let (start, end) = unrar_volume_digit_run(&stem)?;
     stem[start..end].parse::<usize>().ok()
 }
 
@@ -892,7 +904,7 @@ fn infer_numbered_volume_path(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or(file_name.clone());
-    let generated_name = if let Some((start, end)) = last_digit_run(&stem) {
+    let generated_name = if let Some((start, end)) = unrar_volume_digit_run(&stem) {
         let width = end - start;
         let number = volume_index + 1;
         let mut next_stem = stem.clone();
@@ -907,13 +919,32 @@ fn infer_numbered_volume_path(
     output_dir.join(generated_name)
 }
 
-fn last_digit_run(value: &str) -> Option<(usize, usize)> {
+fn unrar_volume_digit_run(value: &str) -> Option<(usize, usize)> {
     let bytes = value.as_bytes();
     let end = bytes.iter().rposition(|b| b.is_ascii_digit())? + 1;
     let start = bytes[..end]
         .iter()
         .rposition(|b| !b.is_ascii_digit())
         .map_or(0, |idx| idx + 1);
+
+    // Match UnRAR's GetVolNumPos: for names like `name.part##of##.rar`,
+    // select the first numeric run after a dot, not the final total count.
+    let mut scan = start;
+    while scan > 0 && bytes[scan - 1] != b'.' {
+        scan -= 1;
+        if bytes[scan].is_ascii_digit() {
+            let candidate_end = scan + 1;
+            let candidate_start = bytes[..candidate_end]
+                .iter()
+                .rposition(|b| !b.is_ascii_digit())
+                .map_or(0, |idx| idx + 1);
+            if bytes[..candidate_start].contains(&b'.') {
+                return Some((candidate_start, candidate_end));
+            }
+            break;
+        }
+    }
+
     Some((start, end))
 }
 
@@ -1079,9 +1110,10 @@ mod tests {
     }
 
     #[test]
-    fn last_digit_run_finds_part_number() {
-        assert_eq!(last_digit_run("movie.part0007"), Some((10, 14)));
-        assert_eq!(last_digit_run("movie"), None);
+    fn unrar_volume_digit_run_finds_part_number() {
+        assert_eq!(unrar_volume_digit_run("movie.part0007"), Some((10, 14)));
+        assert_eq!(unrar_volume_digit_run("movie.part01of10"), Some((10, 12)));
+        assert_eq!(unrar_volume_digit_run("movie"), None);
     }
 
     #[test]
@@ -1089,6 +1121,13 @@ mod tests {
         let path = Path::new("/tmp/movie.part0001.rar");
         let output = infer_numbered_volume_path(path, Path::new("/out"), 6, "rar");
         assert_eq!(output, Path::new("/out/movie.part0007.rar"));
+    }
+
+    #[test]
+    fn infer_numbered_volume_uses_first_part_digits_like_unrar() {
+        let path = Path::new("/tmp/movie.part01of10.rar");
+        let output = infer_numbered_volume_path(path, Path::new("/out"), 1, "rar");
+        assert_eq!(output, Path::new("/out/movie.part02of10.rar"));
     }
 
     #[test]
@@ -1107,6 +1146,14 @@ mod tests {
             infer_old_rar3_volume_path(reference, Path::new("/out"), 2),
             Path::new("/out/movie.r01")
         );
+        assert_eq!(
+            infer_old_rar3_volume_path(reference, Path::new("/out"), 100),
+            Path::new("/out/movie.r99")
+        );
+        assert_eq!(
+            infer_old_rar3_volume_path(reference, Path::new("/out"), 101),
+            Path::new("/out/movie.s00")
+        );
     }
 
     #[test]
@@ -1122,6 +1169,14 @@ mod tests {
         assert_eq!(
             parse_rar3_data_volume_number(Path::new("movie.r01")),
             Some(2)
+        );
+        assert_eq!(
+            parse_rar3_data_volume_number(Path::new("movie.r99")),
+            Some(100)
+        );
+        assert_eq!(
+            parse_rar3_data_volume_number(Path::new("movie.s00")),
+            Some(101)
         );
     }
 

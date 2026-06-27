@@ -966,6 +966,42 @@ mod tests {
     }
 
     #[test]
+    fn quick_open_crc_error_falls_back_to_physical_headers() {
+        let qopen_offset = 256u64;
+        let main = build_test_main_with_qopen_locator(qopen_offset - 8);
+        let physical_file = build_test_file_header("physical.bin", 0, 0);
+        let physical_end = build_test_end_header();
+
+        let cached_end = build_test_end_header();
+        let mut bad_qopen_record = build_test_qopen_record(qopen_offset, 160, &cached_end);
+        *bad_qopen_record.last_mut().unwrap() ^= 0xff;
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&main);
+        let physical_file_offset = archive.len() as u64;
+        archive.extend_from_slice(&physical_file);
+        archive.extend_from_slice(&physical_end);
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_qopen_service(&bad_qopen_record));
+        archive.extend_from_slice(&bad_qopen_record);
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, None).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].header.name, "physical.bin");
+        assert_eq!(
+            parsed.files[0].header.data_offset,
+            physical_file_offset + physical_file.len() as u64
+        );
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
     fn encrypted_header_size_above_cap_is_rejected() {
         let oversized = common::MAX_HEADER_BODY + 1;
         let size_vint = vint::encode_vint(oversized);

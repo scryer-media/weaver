@@ -5,7 +5,7 @@
 //! Symbol interpretation (LD table, 299 symbols):
 //! - 0-255: literal bytes
 //! - 256: end of block
-//! - 257: VM filter code (read and skip)
+//! - 257: VM filter code (current UnRAR only applies recognized standard filters)
 //! - 258: repeat previous match (last_length, dist_cache[0])
 //! - 259-262: repeat distance cache references (new length from RD table)
 //! - 263-270: short distance matches (length=2)
@@ -75,6 +75,8 @@ enum BlockType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rar4StandardFilter {
+    /// Non-standard VM bytecode. Current UnRAR leaves `VMSF_NONE` with
+    /// `FilteredDataSize == 0`, so the covered block is suppressed.
     None,
     E8,
     E8E9,
@@ -726,11 +728,11 @@ impl Rar4LzDecoder {
 
             let next_start = self.pending_vm_filters[0].block_start_total;
             if next_start < written_border {
-                return Err(RarError::CorruptArchive {
-                    detail: format!(
-                        "RAR4: pending VM filter starts before flushed border ({next_start} < {written_border})"
-                    ),
-                });
+                // Current UnRAR can leave a later same-start filter behind after
+                // a VMSF_NONE program suppresses the block to zero bytes. Once
+                // the raw block has been flushed, the later filter is inert.
+                self.pending_vm_filters.remove(0);
+                continue;
             }
 
             let raw_len = next_start.saturating_sub(written_border);
@@ -780,23 +782,18 @@ impl Rar4LzDecoder {
             let mut data = self
                 .window
                 .try_copy_output(next_start, filter_block_length)?;
-            let mut chain_len = 1usize;
+            let mut chain_len = 0usize;
             while chain_len < self.pending_vm_filters.len() {
-                let next = &self.pending_vm_filters[chain_len];
-                if next.block_start_total != next_start
-                    || next.block_length != self.pending_vm_filters[0].block_length
-                {
+                let filter = &self.pending_vm_filters[chain_len];
+                if filter.block_start_total != next_start || filter.block_length != data.len() {
                     break;
                 }
-                chain_len += 1;
-            }
-
-            for filter in self.pending_vm_filters.iter().take(chain_len) {
                 if filter.filter_type == Rar4StandardFilter::None {
                     data.clear();
-                    break;
+                } else {
+                    Self::execute_standard_filter(filter, self.current_file_base_total, &mut data)?;
                 }
-                Self::execute_standard_filter(filter, self.current_file_base_total, &mut data)?;
+                chain_len += 1;
             }
 
             if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
@@ -2251,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_none_filter_skips_block_like_unrar() {
+    fn test_vm_none_filter_suppresses_block_like_current_unrar() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
@@ -2271,6 +2268,33 @@ mod tests {
             decoder.window.total_flushed(),
             decoder.window.total_written()
         );
+    }
+
+    #[test]
+    fn test_vm_none_filter_discards_stale_same_start_filter_like_current_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"prefixBLOCKsuffix");
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::None,
+            block_start_total: 6,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 6,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"prefixsuffix");
+        assert!(decoder.pending_vm_filters.is_empty());
     }
 
     fn unrar_rgb_filter_reference(input: &[u8], width: usize, pos_r: usize) -> Vec<u8> {

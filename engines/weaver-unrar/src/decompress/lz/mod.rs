@@ -82,6 +82,11 @@ pub struct LzDecoder {
     pending_filters: Vec<PendingFilter>,
     /// Absolute output offset where the current file begins in the window.
     current_file_base_total: u64,
+    /// Logical UnRAR `WrittenFileSize` for the current file after filters.
+    ///
+    /// This advances by filter block length even when unsupported filters
+    /// suppress the corresponding output bytes.
+    current_file_written_size: u64,
     /// Reusable decoded-item buffers for RAR5 multithreaded block decode.
     parallel_item_buffers: Vec<Vec<parallel::DecodedItem>>,
 }
@@ -117,6 +122,7 @@ impl LzDecoder {
             is_last_block: false,
             pending_filters: Vec::new(),
             current_file_base_total: 0,
+            current_file_written_size: 0,
             parallel_item_buffers: Vec::new(),
         })
     }
@@ -128,6 +134,7 @@ impl LzDecoder {
     fn begin_file_decode(&mut self) {
         self.pending_filters.clear();
         self.current_file_base_total = self.window.total_written();
+        self.current_file_written_size = 0;
         self.window.mark_flushed(self.current_file_base_total);
     }
 
@@ -389,34 +396,73 @@ impl LzDecoder {
         // Extract output from the window.
         let start = self.current_file_base_total;
         let len = unpacked_size as usize;
-        let mut output = self.window.try_copy_output(start, len)?;
+        let output = self.window.try_copy_output(start, len)?;
 
         // Apply pending filters to the output buffer.
-        self.apply_filters(&mut output, start);
+        let output = self.apply_filters_to_vec(output, start);
 
         Ok(output)
     }
 
-    /// Apply pending filters to an output buffer.
-    fn apply_filters(&mut self, output: &mut [u8], base_offset: u64) {
-        for f in &self.pending_filters {
-            if f.block_start >= base_offset && f.block_length > 0 {
-                let rel_start = (f.block_start - base_offset) as usize;
-                let rel_end = rel_start + f.block_length;
-                if rel_end <= output.len() {
-                    let block = &mut output[rel_start..rel_end];
-                    let file_block_start = f.block_start - self.current_file_base_total;
-                    match f.filter_type {
-                        FilterType::Delta => filter::apply_delta(block, f.channels),
-                        FilterType::E8 => filter::apply_e8(block, file_block_start),
-                        FilterType::E8E9 => filter::apply_e8e9(block, file_block_start),
-                        FilterType::Arm => filter::apply_arm(block, file_block_start),
-                        FilterType::Unsupported(_) => {}
-                    }
-                }
-            }
+    /// Apply pending filters to an in-memory output buffer using UnRAR's write
+    /// semantics: invalid filters suppress their covered block, but the logical
+    /// `WrittenFileSize` used for later filters still advances by block length.
+    fn apply_filters_to_vec(&mut self, output: Vec<u8>, base_offset: u64) -> Vec<u8> {
+        if self.pending_filters.is_empty() {
+            return output;
         }
+
+        let total = base_offset + output.len() as u64;
+        let mut filtered = Vec::with_capacity(output.len());
+        let mut written_up_to = base_offset;
+        let mut logical_written_size = 0u64;
+        let mut pending_filters = std::mem::take(&mut self.pending_filters);
+        pending_filters.sort_by_key(|filter| filter.block_start);
+
+        for f in pending_filters {
+            if f.block_start < written_up_to || f.block_start > total {
+                continue;
+            }
+            if f.block_start > written_up_to {
+                let rel_start = (written_up_to - base_offset) as usize;
+                let rel_end = (f.block_start - base_offset) as usize;
+                filtered.extend_from_slice(&output[rel_start..rel_end]);
+                logical_written_size += f.block_start - written_up_to;
+                written_up_to = f.block_start;
+            }
+
+            let block_end = f.block_start.saturating_add(f.block_length as u64);
+            if block_end > total {
+                continue;
+            }
+
+            let rel_start = (f.block_start - base_offset) as usize;
+            let rel_end = (block_end - base_offset) as usize;
+            let mut block = output[rel_start..rel_end].to_vec();
+            let file_block_start = logical_written_size;
+            match f.filter_type {
+                FilterType::Delta => filter::apply_delta(&mut block, f.channels),
+                FilterType::E8 => filter::apply_e8(&mut block, file_block_start),
+                FilterType::E8E9 => filter::apply_e8e9(&mut block, file_block_start),
+                FilterType::Arm => filter::apply_arm(&mut block, file_block_start),
+                FilterType::Unsupported(_) => {}
+            }
+            if f.filter_type.emits_output() {
+                filtered.extend_from_slice(&block);
+            }
+            logical_written_size += f.block_length as u64;
+            written_up_to = block_end;
+        }
+
+        if written_up_to < total {
+            let rel_start = (written_up_to - base_offset) as usize;
+            filtered.extend_from_slice(&output[rel_start..]);
+            logical_written_size += total - written_up_to;
+        }
+
         self.pending_filters.clear();
+        self.current_file_written_size = logical_written_size;
+        filtered
     }
 
     /// Apply distance-based length adjustment per RAR5 spec.
@@ -1101,7 +1147,9 @@ impl LzDecoder {
     /// Flush pending filters and remaining window data to a writer.
     fn flush_filters_and_write<W: Write + ?Sized>(&mut self, writer: &mut W) -> RarResult<()> {
         if self.pending_filters.is_empty() {
+            let unflushed = self.window.unflushed_bytes();
             self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+            self.current_file_written_size += unflushed;
             return Ok(());
         }
 
@@ -1138,6 +1186,7 @@ impl LzDecoder {
             if filter.block_start > written_up_to {
                 let prefix_len = (filter.block_start - written_up_to) as usize;
                 self.write_window_range(writer, written_up_to, prefix_len)?;
+                self.current_file_written_size += prefix_len as u64;
                 written_up_to = filter.block_start;
             }
 
@@ -1145,15 +1194,7 @@ impl LzDecoder {
                 .block_start
                 .saturating_add(filter.block_length as u64);
             if block_end <= total {
-                let file_block_start = filter
-                    .block_start
-                    .checked_sub(self.current_file_base_total)
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR5 filter block starts before current file base ({} < {})",
-                            filter.block_start, self.current_file_base_total
-                        ),
-                    })?;
+                let file_block_start = self.current_file_written_size;
                 let mut buf = self
                     .window
                     .try_copy_output(filter.block_start, filter.block_length)?;
@@ -1167,6 +1208,7 @@ impl LzDecoder {
                 if filter.filter_type.emits_output() {
                     writer.write_all(&buf).map_err(RarError::Io)?;
                 }
+                self.current_file_written_size += filter.block_length as u64;
                 written_up_to = block_end;
             } else {
                 remaining_filters.push(filter);
@@ -1176,7 +1218,9 @@ impl LzDecoder {
         }
 
         if remaining_filters.is_empty() && written_up_to < total {
-            self.write_window_range(writer, written_up_to, (total - written_up_to) as usize)?;
+            let tail_len = (total - written_up_to) as usize;
+            self.write_window_range(writer, written_up_to, tail_len)?;
+            self.current_file_written_size += tail_len as u64;
             written_up_to = total;
         }
 
@@ -1200,6 +1244,7 @@ impl LzDecoder {
         self.is_last_block = false;
         self.pending_filters.clear();
         self.current_file_base_total = 0;
+        self.current_file_written_size = 0;
     }
 
     /// Prepare for the next member in a solid archive.
@@ -1212,6 +1257,7 @@ impl LzDecoder {
         self.is_last_block = false;
         self.pending_filters.clear();
         self.current_file_base_total = self.window.total_written();
+        self.current_file_written_size = 0;
     }
 }
 
@@ -1589,6 +1635,72 @@ mod tests {
             decoder.window.total_flushed(),
             decoder.window.total_written()
         );
+        assert!(decoder.pending_filters.is_empty());
+    }
+
+    #[test]
+    fn test_apply_filters_to_vec_uses_logical_offset_after_suppressed_block() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        let mut output = b"preXXX".to_vec();
+        output.extend_from_slice(&[0xE8, 10, 0, 0, 0]);
+        output.extend_from_slice(b"tail");
+        decoder.pending_filters = vec![
+            PendingFilter {
+                filter_type: FilterType::Unsupported(7),
+                block_start: 3,
+                block_length: 3,
+                channels: 0,
+            },
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 6,
+                block_length: 5,
+                channels: 0,
+            },
+        ];
+
+        let filtered = decoder.apply_filters_to_vec(output, 0);
+
+        let mut expected_e8 = [0xE8, 10, 0, 0, 0];
+        filter::apply_e8(&mut expected_e8, 6);
+        let mut expected = b"pre".to_vec();
+        expected.extend_from_slice(&expected_e8);
+        expected.extend_from_slice(b"tail");
+        assert_eq!(filtered, expected);
+        assert!(decoder.pending_filters.is_empty());
+    }
+
+    #[test]
+    fn test_flush_filters_uses_logical_offset_after_suppressed_block() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.window.put_bytes(b"preXXX");
+        decoder.window.put_bytes(&[0xE8, 10, 0, 0, 0]);
+        decoder.window.put_bytes(b"tail");
+        decoder.pending_filters = vec![
+            PendingFilter {
+                filter_type: FilterType::Unsupported(7),
+                block_start: 3,
+                block_length: 3,
+                channels: 0,
+            },
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 6,
+                block_length: 5,
+                channels: 0,
+            },
+        ];
+
+        let mut out = Vec::new();
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
+        let mut expected_e8 = [0xE8, 10, 0, 0, 0];
+        filter::apply_e8(&mut expected_e8, 6);
+        let mut expected = b"pre".to_vec();
+        expected.extend_from_slice(&expected_e8);
+        expected.extend_from_slice(b"tail");
+        assert_eq!(out, expected);
+        assert_eq!(decoder.current_file_written_size, 15);
         assert!(decoder.pending_filters.is_empty());
     }
 
