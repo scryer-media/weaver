@@ -320,11 +320,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
         let copy_len = (rest.len() - name_start).min(name_len);
         target_bytes[..copy_len].copy_from_slice(&rest[name_start..name_start + copy_len]);
     }
-    let target_end = target_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(target_bytes.len());
-    let target = String::from_utf8_lossy(&target_bytes[..target_end]).into_owned();
+    let target = crate::header::common::decode_utf8_prefix_until_nul(&target_bytes);
 
     ExtraRecord::Redirection {
         redir_type,
@@ -815,6 +811,42 @@ mod tests {
         match &records[0] {
             ExtraRecord::Redirection { target, .. } => {
                 assert_eq!(target, "ab");
+            }
+            other => panic!("expected Redirection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_redirection_invalid_utf8_target_keeps_prefix_like_unrar() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(1));
+        body.extend_from_slice(&encode_vint(0));
+        body.extend_from_slice(&encode_vint(11));
+        body.extend_from_slice(b"ab/\xffignored");
+
+        let data = build_extra_record(record_type::REDIRECTION, &body);
+        let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
+        match &records[0] {
+            ExtraRecord::Redirection { target, .. } => {
+                assert_eq!(target, "ab/");
+            }
+            other => panic!("expected Redirection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_redirection_overlong_utf8_target_decodes_like_unrar() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(1));
+        body.extend_from_slice(&encode_vint(0));
+        body.extend_from_slice(&encode_vint(6));
+        body.extend_from_slice(b"ab\xc0\xafcd");
+
+        let data = build_extra_record(record_type::REDIRECTION, &body);
+        let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
+        match &records[0] {
+            ExtraRecord::Redirection { target, .. } => {
+                assert_eq!(target, "ab/cd");
             }
             other => panic!("expected Redirection, got {other:?}"),
         }

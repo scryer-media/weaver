@@ -93,17 +93,17 @@ impl RarArchive {
         if Self::rar4_comment_is_raw_unicode(&service) {
             return Ok(Some(Self::decode_raw_utf16le_comment(&payload)));
         }
-        let end = payload
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(payload.len());
-        Ok(Some(String::from_utf8_lossy(&payload[..end]).into_owned()))
+        Ok(Some(Self::decode_rar5_comment_text(&payload)))
     }
 
     fn rar4_comment_is_raw_unicode(service: &ServiceEntry) -> bool {
         service.file_header.compression.format.is_rar4_family()
             && service.file_header.name == "CMT"
             && (service.file_header.attributes.0 & 0x0001) != 0
+    }
+
+    fn decode_rar5_comment_text(payload: &[u8]) -> String {
+        crate::header::common::decode_utf8_prefix_until_nul(payload)
     }
 
     fn decode_raw_utf16le_comment(payload: &[u8]) -> String {
@@ -380,14 +380,20 @@ impl RarArchive {
             });
         }
 
+        Self::decode_rar3_link_target_payload(fh, &payload, options.verify)
+    }
+
+    fn decode_rar3_link_target_payload(
+        fh: &FileHeader,
+        payload: &[u8],
+        verify: bool,
+    ) -> RarResult<String> {
         let nul_pos = payload
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(payload.len());
         let target_bytes = &payload[..nul_pos];
-        if options.verify
-            && let Some(expected) = fh.data_crc32
-        {
+        if verify && let Some(expected) = fh.data_crc32 {
             let actual = crc32fast::hash(target_bytes);
             if actual != expected {
                 return Err(RarError::DataCrcMismatch {
@@ -398,7 +404,20 @@ impl RarArchive {
             }
         }
 
-        Ok(String::from_utf8_lossy(target_bytes).into_owned())
+        if target_bytes.is_empty() {
+            return Err(RarError::CorruptArchive {
+                detail: format!("RAR3 Unix symlink target for {} is empty", fh.name),
+            });
+        }
+
+        std::str::from_utf8(target_bytes)
+            .map(|target| target.to_owned())
+            .map_err(|_| RarError::CorruptArchive {
+                detail: format!(
+                    "RAR3 Unix symlink target for {} is not valid UTF-8",
+                    fh.name
+                ),
+            })
     }
 
     fn remove_existing_link_output(out_path: &std::path::Path) -> RarResult<()> {
@@ -506,7 +525,12 @@ impl RarArchive {
         allow_windows_drive_relative: bool,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
-        if !crate::path::is_safe_symlink_target(member_name, target, allow_windows_drive_relative) {
+        if !crate::path::is_safe_symlink_target_for_member(
+            member_name,
+            raw_member_name,
+            target,
+            allow_windows_drive_relative,
+        ) {
             return Err(RarError::UnsafeLinkTarget {
                 member: raw_member_name.to_string(),
                 target: target.to_string(),
@@ -4884,6 +4908,60 @@ mod tests {
         }
     }
 
+    fn test_rar3_symlink_header(expected_crc: Option<u32>) -> FileHeader {
+        FileHeader {
+            name: "link".into(),
+            unpacked_size: Some(0),
+            attributes: FileAttributes(0xA000),
+            mtime: None,
+            ctime: None,
+            atime: None,
+            data_crc32: expected_crc,
+            data_hash: expected_crc.map(crate::types::DataHash::Crc32),
+            compression: CompressionInfo {
+                format: ArchiveFormat::Rar4,
+                version: 29,
+                solid: false,
+                method: CompressionMethod::Store,
+                dict_size: 0,
+            },
+            host_os: HostOs::Unix,
+            is_directory: false,
+            file_flags: 0,
+            data_size: 0,
+            split_before: false,
+            split_after: false,
+            data_offset: 0,
+            is_encrypted: false,
+            version: None,
+            service_subdata: None,
+        }
+    }
+
+    #[test]
+    fn rar5_comment_text_stops_at_nul_like_unrar() {
+        assert_eq!(
+            RarArchive::decode_rar5_comment_text(b"comment\0ignored"),
+            "comment"
+        );
+    }
+
+    #[test]
+    fn rar5_comment_text_keeps_prefix_before_invalid_utf8_like_unrar() {
+        assert_eq!(
+            RarArchive::decode_rar5_comment_text(b"hello/\xffignored"),
+            "hello/"
+        );
+    }
+
+    #[test]
+    fn rar5_comment_text_decodes_overlong_utf8_like_unrar() {
+        assert_eq!(
+            RarArchive::decode_rar5_comment_text(b"hello\xc0\xafworld"),
+            "hello/world"
+        );
+    }
+
     fn empty_rar5_archive() -> RarArchive {
         RarArchive {
             format: ArchiveFormat::Rar5,
@@ -4925,6 +5003,44 @@ mod tests {
         let mut buf = [0u8; 1];
         let err = reader.read(&mut buf).unwrap_err();
         assert!(err.to_string().contains("exceeds limit 8"));
+    }
+
+    #[test]
+    fn rar3_symlink_target_truncates_at_nul_and_hashes_visible_target_like_unrar() {
+        let target = b"safe/target";
+        let fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
+
+        let decoded =
+            RarArchive::decode_rar3_link_target_payload(&fh, b"safe/target\0ignored", true)
+                .unwrap();
+
+        assert_eq!(decoded, "safe/target");
+    }
+
+    #[test]
+    fn rar3_symlink_target_rejects_empty_target_like_unrar() {
+        let fh = test_rar3_symlink_header(None);
+
+        let err =
+            RarArchive::decode_rar3_link_target_payload(&fh, b"\0ignored", false).unwrap_err();
+
+        assert!(
+            matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("empty")),
+            "expected empty target CorruptArchive, got {err}"
+        );
+    }
+
+    #[test]
+    fn rar3_symlink_target_rejects_invalid_utf8_like_unrar_safe_char_to_wide() {
+        let fh = test_rar3_symlink_header(None);
+
+        let err = RarArchive::decode_rar3_link_target_payload(&fh, b"safe/\xfftarget", false)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("valid UTF-8")),
+            "expected invalid UTF-8 CorruptArchive, got {err}"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! stage/copy known-good blocks, run RS reconstruction for the missing blocks,
 //! and verify repaired output before installing it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -292,7 +292,10 @@ impl Par2Repairer {
             });
         }
 
-        state.install_repaired_files(&repair, &self.options)?;
+        if let Err(error) = state.install_repaired_files(&repair, &self.options) {
+            let _ = fs::remove_dir_all(&repair.install_dir);
+            return Err(error);
+        }
         let _ = fs::remove_dir_all(&repair.install_dir);
 
         Ok(state.outcome(
@@ -320,13 +323,19 @@ impl Par2Repairer {
             .par2_paths
             .iter()
             .chain(self.options.recovery_paths.iter())
+            .chain(
+                self.options
+                    .extra_paths
+                    .iter()
+                    .filter(|path| has_par2_marker(path)),
+            )
         {
             if seen.insert(path.clone()) {
                 paths.push(path.clone());
             }
         }
 
-        for adjacent in discover_adjacent_par2_files(&self.options.base_dir)? {
+        for adjacent in discover_adjacent_par2_files(&self.options.par2_paths)? {
             if seen.insert(adjacent.clone()) {
                 paths.push(adjacent);
             }
@@ -845,19 +854,26 @@ impl RepairState {
             return Ok(diagnostics);
         }
 
-        let mut extra_candidates = Vec::new();
+        let source_file_keys: HashSet<PathBuf> = self
+            .files
+            .iter()
+            .map(|file| canonical_extra_path(&file.safe_path))
+            .collect();
+        let mut extra_candidates = BTreeMap::new();
         for path in discover_candidate_files(&options.base_dir)? {
-            extra_candidates.push(path);
+            extra_candidates
+                .entry(canonical_extra_path(&path))
+                .or_insert(path);
         }
         for path in &options.extra_paths {
-            extra_candidates.push(path.clone());
+            if !has_par2_marker(path) {
+                let canonical = canonical_extra_path(path);
+                extra_candidates.insert(canonical.clone(), canonical);
+            }
         }
 
-        extra_candidates.sort();
-        extra_candidates.dedup();
-
-        for path in extra_candidates {
-            if self.files.iter().any(|file| file.safe_path == path) {
+        for (key, path) in extra_candidates {
+            if source_file_keys.contains(&key) {
                 continue;
             }
             self.scan_candidate(options, path, BlockLocationKind::Extra, &mut diagnostics)?;
@@ -1298,65 +1314,81 @@ impl RepairState {
         repair: &RepairInstall,
         options: &Par2RepairerOptions,
     ) -> Result<()> {
-        let canonical_paths: HashSet<&Path> = self
+        let canonical_paths: HashSet<PathBuf> = self
             .files
             .iter()
             .filter(|file| file.recoverable)
-            .map(|file| file.safe_path.as_path())
+            .map(|file| canonical_extra_path(&file.safe_path))
             .collect();
-        let explicit_extra_paths: HashSet<&Path> =
-            options.extra_paths.iter().map(PathBuf::as_path).collect();
+        let explicit_extra_paths: HashSet<PathBuf> = options
+            .extra_paths
+            .iter()
+            .filter(|path| !has_par2_marker(path))
+            .map(|path| canonical_extra_path(path))
+            .collect();
         let consumed_complete_sources: HashSet<PathBuf> = self
             .files
             .iter()
             .filter(|file| repair.staged_file_ids.contains(&file.file_id))
             .filter_map(|file| {
                 let location = file.complete_location.as_ref()?;
-                (location.path != file.safe_path
+                let source = canonical_extra_path(&location.path);
+                (source != canonical_extra_path(&file.safe_path)
                     && file.non_canonical_complete_source_count == 1
-                    && explicit_extra_paths.contains(location.path.as_path())
-                    && !canonical_paths.contains(location.path.as_path()))
-                .then(|| location.path.clone())
+                    && explicit_extra_paths.contains(&source)
+                    && !canonical_paths.contains(&source))
+                .then_some(source)
             })
             .collect();
 
-        for file in self
-            .files
-            .iter()
-            .filter(|file| repair.staged_file_ids.contains(&file.file_id))
-        {
-            let src = repair.install_dir.join(&file.safe_name);
-            let dst = &file.safe_path;
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match fs::symlink_metadata(dst) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(Par2Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("repair target is a symbolic link: {}", dst.display()),
-                    )));
+        let mut installed_targets = Vec::new();
+        let mut backups = Vec::new();
+        let install_result = (|| -> Result<()> {
+            for file in self
+                .files
+                .iter()
+                .filter(|file| repair.staged_file_ids.contains(&file.file_id))
+            {
+                let src = repair.install_dir.join(&file.safe_name);
+                let dst = &file.safe_path;
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
                 }
-                Ok(_) => {
-                    let backup = unique_backup_path(dst);
-                    fs::rename(dst, &backup)?;
-                    crate::file_cache::drop_path_cache(&backup);
+                match fs::symlink_metadata(dst) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(Par2Error::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("repair target is a symbolic link: {}", dst.display()),
+                        )));
+                    }
+                    Ok(_) => {
+                        let backup = unique_backup_path(dst)?;
+                        fs::rename(dst, &backup)?;
+                        crate::file_cache::drop_path_cache(&backup);
+                        backups.push((dst.clone(), backup));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                fs::rename(src, dst)?;
+                crate::file_cache::drop_path_cache(dst);
+                installed_targets.push(dst.clone());
             }
-            fs::rename(src, dst)?;
-            crate::file_cache::drop_path_cache(dst);
-        }
 
-        for source in consumed_complete_sources {
-            match fs::remove_file(&source) {
-                Ok(()) => crate::file_cache::drop_path_cache(&source),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            for source in consumed_complete_sources {
+                match fs::remove_file(&source) {
+                    Ok(()) => crate::file_cache::drop_path_cache(&source),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
+            Ok(())
+        })();
+
+        if install_result.is_err() {
+            rollback_installed_files(&installed_targets, &backups);
         }
-        Ok(())
+        install_result
     }
 
     fn outcome(
@@ -2840,21 +2872,109 @@ fn check_cancel(options: &Par2RepairerOptions) -> Result<()> {
     Ok(())
 }
 
-fn discover_adjacent_par2_files(base_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    discover_files_matching(base_dir, |path| {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("par2"))
-    })
+fn discover_adjacent_par2_files(par2_paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for path in par2_paths {
+        out.extend(discover_related_par2_files(path)?);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn discover_related_par2_files(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let Some(dir) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(stem) = turbo_par2_base_name(path) else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        if candidate == path {
+            continue;
+        }
+        if !is_par2_path(&candidate) || !related_par2_name_matches(&stem, &candidate) {
+            continue;
+        }
+        out.push(candidate);
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn related_par2_name_matches(stem: &str, path: &Path) -> bool {
+    if stem.is_empty() {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let suffix = name.strip_prefix(stem).unwrap_or_default();
+            suffix.starts_with('.') && suffix[1..].contains('.')
+        })
+}
+
+fn turbo_par2_base_name(path: &Path) -> Option<String> {
+    let mut name = path.file_name()?.to_str()?.to_owned();
+    loop {
+        let dot = name.rfind('.')?;
+        let tail = name[dot + 1..].to_owned();
+        name.truncate(dot);
+        if tail.eq_ignore_ascii_case("par2") {
+            break;
+        }
+    }
+
+    if let Some(dot) = name.rfind('.')
+        && turbo_volume_suffix_matches(&name[dot + 1..])
+    {
+        name.truncate(dot);
+    }
+
+    Some(name)
+}
+
+fn turbo_volume_suffix_matches(tail: &str) -> bool {
+    let mut state = 0u8;
+    for byte in tail.bytes() {
+        match state {
+            0 if byte.eq_ignore_ascii_case(&b'v') => state = 1,
+            1 if byte.eq_ignore_ascii_case(&b'o') => state = 2,
+            2 if byte.eq_ignore_ascii_case(&b'l') => state = 3,
+            3 if byte.is_ascii_digit() => {}
+            3 if byte == b'-' || byte == b'+' => state = 4,
+            4 if byte.is_ascii_digit() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn discover_candidate_files(base_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    discover_files_matching(base_dir, |path| {
-        !path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("par2"))
-    })
+    discover_files_matching(base_dir, |path| !has_par2_marker(path))
+}
+
+fn is_par2_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("par2"))
+}
+
+fn has_par2_marker(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    path.contains(".par2") || path.contains(".PAR2")
+}
+
+fn canonical_extra_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn discover_files_matching<F>(base_dir: &Path, mut matches: F) -> io::Result<Vec<PathBuf>>
@@ -2867,11 +2987,12 @@ where
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
                 if !should_skip_candidate(&path) {
                     stack.push(path);
                 }
-            } else if path.is_file() && matches(&path) {
+            } else if file_type.is_file() && matches(&path) {
                 out.push(path);
             }
         }
@@ -2955,16 +3076,38 @@ fn unique_repair_dir(base_dir: &Path) -> PathBuf {
     base_dir.join(format!(".weaver-par2-repair-{stamp}"))
 }
 
-fn unique_backup_path(path: &Path) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
+fn unique_backup_path(path: &Path) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("target");
-    path.with_file_name(format!("{name}.weaver-par2-backup.{stamp}"))
+    for index in 1u32.. {
+        let candidate = path.with_file_name(format!("{name}.{index}"));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no available backup suffix for {}", path.display()),
+    ))
+}
+
+fn rollback_installed_files(installed_targets: &[PathBuf], backups: &[(PathBuf, PathBuf)]) {
+    for target in installed_targets.iter().rev() {
+        let _ = fs::remove_file(target);
+        crate::file_cache::drop_path_cache(target);
+    }
+
+    for (target, backup) in backups.iter().rev() {
+        let _ = fs::remove_file(target);
+        if fs::rename(backup, target).is_ok() {
+            crate::file_cache::drop_path_cache(backup);
+            crate::file_cache::drop_path_cache(target);
+        }
+    }
 }
 
 fn padded_crc(data: &[u8], pad_to: u64) -> u32 {
@@ -3155,6 +3298,101 @@ mod tests {
         data.extend_from_slice(packet_type);
         data.extend_from_slice(body);
         data
+    }
+
+    #[test]
+    fn load_inventory_reads_par2_marker_extra_paths_as_packets() {
+        let dir = tempdir().unwrap();
+        let file_id = FileId::from_bytes([1; 16]);
+        let file_data = b"abcd";
+        let slice_size = 4u64;
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&slice_size.to_le_bytes());
+        main_body.extend_from_slice(&1u32.to_le_bytes());
+        main_body.extend_from_slice(file_id.as_bytes());
+        let rsid = checksum::md5(&main_body);
+
+        let mut fd_body = Vec::new();
+        fd_body.extend_from_slice(file_id.as_bytes());
+        fd_body.extend_from_slice(&checksum::md5(file_data));
+        fd_body.extend_from_slice(&checksum::md5(file_data));
+        fd_body.extend_from_slice(&(file_data.len() as u64).to_le_bytes());
+        fd_body.extend_from_slice(b"target.bin");
+        while fd_body.len() % 4 != 0 {
+            fd_body.push(0);
+        }
+
+        let mut slice_state = SliceChecksumState::new();
+        slice_state.update(file_data);
+        let (crc32, md5) = slice_state.finalize(None);
+        let mut ifsc_body = Vec::new();
+        ifsc_body.extend_from_slice(file_id.as_bytes());
+        ifsc_body.extend_from_slice(&md5);
+        ifsc_body.extend_from_slice(&crc32.to_le_bytes());
+
+        let mut main_stream = Vec::new();
+        main_stream.extend_from_slice(&make_full_packet(
+            crate::packet::header::TYPE_MAIN,
+            &main_body,
+            rsid,
+        ));
+        main_stream.extend_from_slice(&make_full_packet(
+            crate::packet::header::TYPE_FILE_DESC,
+            &fd_body,
+            rsid,
+        ));
+        main_stream.extend_from_slice(&make_full_packet(
+            crate::packet::header::TYPE_IFSC,
+            &ifsc_body,
+            rsid,
+        ));
+
+        let mut recovery_body = Vec::new();
+        recovery_body.extend_from_slice(&0u32.to_le_bytes());
+        recovery_body.extend_from_slice(&[0xAB; 4]);
+        let mut recovery_stream = Vec::new();
+        recovery_stream.extend_from_slice(&make_full_packet(
+            crate::packet::header::TYPE_MAIN,
+            &main_body,
+            rsid,
+        ));
+        recovery_stream.extend_from_slice(&make_full_packet(
+            crate::packet::header::TYPE_RECOVERY,
+            &recovery_body,
+            rsid,
+        ));
+
+        let main_path = dir.path().join("target.par2");
+        let extra_recovery_path = dir.path().join("target.par2.bak");
+        fs::write(&main_path, main_stream).unwrap();
+        fs::write(&extra_recovery_path, recovery_stream).unwrap();
+
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), vec![main_path]);
+        options.extra_paths.push(extra_recovery_path);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        assert_eq!(inventory.set.recovery_block_count(), 1);
+        assert!(inventory.set.recovery_slices.contains_key(&0));
+    }
+
+    #[test]
+    fn unique_backup_path_uses_turbo_numbered_suffixes() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        fs::write(&target, b"target").unwrap();
+
+        assert_eq!(
+            unique_backup_path(&target).unwrap(),
+            dir.path().join("target.bin.1")
+        );
+        fs::write(dir.path().join("target.bin.1"), b"first backup").unwrap();
+        fs::write(dir.path().join("target.bin.2"), b"second backup").unwrap();
+
+        assert_eq!(
+            unique_backup_path(&target).unwrap(),
+            dir.path().join("target.bin.3")
+        );
     }
 
     #[test]
@@ -3851,6 +4089,20 @@ mod tests {
             1
         );
 
+        let wrong_block_source = dir.path().join("wrong-block.bin");
+        fs::write(&wrong_block_source, vec![0u8; data.len()]).unwrap();
+        let file = state
+            .files
+            .iter()
+            .find(|file| file.safe_name == "nested/movie.r00")
+            .unwrap();
+        state.blocks[file.first_block].location = Some(BlockLocation {
+            path: wrong_block_source,
+            offset: 0,
+            len: state.blocks[file.first_block].expected_len,
+            kind: BlockLocationKind::Extra,
+        });
+
         let repair = state.repair(&options, &verification).unwrap();
         let access = DiskFileAccess::new(repair.install_dir.clone(), &state.set);
         let post = verify_all(&state.set, &access);
@@ -3961,6 +4213,89 @@ mod tests {
         assert_eq!(verification.total_missing_blocks, 0);
         assert!(state.files_are_canonical_complete());
         assert!(matches!(verification.repairable, Repairability::NotNeeded));
+    }
+
+    #[test]
+    fn scan_skips_par2_marker_extra_paths() {
+        let dir = tempdir().unwrap();
+        let data = b"complete-target-hidden-in-par2-path".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let marker_paths = [
+            dir.path().join("extra.par2"),
+            dir.path().join("extra.PAR2"),
+            dir.path().join("extra.par2.bak"),
+        ];
+        for path in &marker_paths {
+            fs::write(path, &data).unwrap();
+        }
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.extra_paths.extend(marker_paths.iter().cloned());
+        let scan = state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(verification.total_missing_blocks, state.blocks.len() as u32);
+        assert!(state.blocks.iter().all(|block| block.location.is_none()));
+    }
+
+    #[test]
+    fn scan_canonicalizes_explicit_extra_paths_before_deduping() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let data = b"complete-target-from-extra".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let extra = dir.path().join("extra.bin");
+        fs::write(&extra, &data).unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let mut state = RepairState::from_set(&base, set).unwrap();
+        let mut options = Par2RepairerOptions::new(base, Vec::new());
+        options.extra_paths.push(extra.clone());
+        options
+            .extra_paths
+            .push(dir.path().join("subdir").join("..").join("extra.bin"));
+        let scan = state.scan(&options).unwrap();
+        let verification = state.verification_result();
+        let canonical_extra = canonical_extra_path(&extra);
+
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert_eq!(
+            state.blocks[0]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&canonical_extra)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_symlinked_extra_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        let data = b"outside-complete-target".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        fs::write(outside.join("candidate.bin"), &data).unwrap();
+        symlink(&outside, base.join("linked-outside")).unwrap();
+
+        let mut state = RepairState::from_set(&base, set).unwrap();
+        let options = Par2RepairerOptions::new(base.clone(), Vec::new());
+        let scan = state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(verification.total_missing_blocks, state.blocks.len() as u32);
+        assert!(state.blocks.iter().all(|block| block.location.is_none()));
     }
 
     #[test]
@@ -4110,6 +4445,58 @@ mod tests {
         state.install_repaired_files(&repair, &options).unwrap();
 
         assert_eq!(fs::read(dir.path().join("target.bin")).unwrap(), data);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_repaired_files_rolls_back_previous_targets_on_later_error() {
+        let dir = tempdir().unwrap();
+        let first = b"first---first---".to_vec();
+        let second = b"second--second--".to_vec();
+        let first_damaged = b"damaged-first---".to_vec();
+        let set = synthetic_set(&[("first.bin", &first), ("second.bin", &second)], 8);
+        let first_extra = dir.path().join("first.extra");
+        let second_extra = dir.path().join("second.extra");
+        let link_target = dir.path().join("link-target.bin");
+
+        fs::write(dir.path().join("first.bin"), &first_damaged).unwrap();
+        fs::write(&first_extra, &first).unwrap();
+        fs::write(&second_extra, &second).unwrap();
+        fs::write(&link_target, b"not the target").unwrap();
+        std::os::unix::fs::symlink(&link_target, dir.path().join("second.bin")).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.extra_paths = vec![first_extra, second_extra];
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(verification.total_missing_blocks, 0);
+        let repair = state.repair(&options, &verification).unwrap();
+        let error = state
+            .install_repaired_files(&repair, &options)
+            .expect_err("second symlink target should fail install");
+
+        assert!(matches!(error, Par2Error::Io(_)));
+        assert_eq!(
+            fs::read(dir.path().join("first.bin")).unwrap(),
+            first_damaged
+        );
+        assert!(
+            fs::symlink_metadata(dir.path().join("second.bin"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".weaver-par2-backup."))
+        );
     }
 
     #[test]

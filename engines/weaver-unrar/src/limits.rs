@@ -27,9 +27,9 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_header_size: UNRAR_RAR5_MAX_HEADER_BODY,
-            max_data_segment: 2 * 1024 * 1024 * 1024,  // 2 GB
+            max_data_segment: 2 * 1024 * 1024 * 1024, // 2 GB
             max_unpacked_size: 4 * 1024 * 1024 * 1024, // 4 GB
-            max_dict_size: 256 * 1024 * 1024,          // 256 MB
+            max_dict_size: 256 * 1024 * 1024,         // 256 MB
         }
     }
 }

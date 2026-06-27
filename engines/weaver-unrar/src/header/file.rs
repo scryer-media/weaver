@@ -67,11 +67,7 @@ fn repair_private_use_utf8_name(name: &str) -> Option<String> {
 }
 
 fn decode_rar5_name(name_bytes: &[u8]) -> String {
-    let nul_end = name_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(name_bytes.len());
-    let decoded = String::from_utf8_lossy(&name_bytes[..nul_end]).into_owned();
+    let decoded = common::decode_utf8_prefix_until_nul(name_bytes);
     repair_private_use_utf8_name(&decoded).unwrap_or(decoded)
 }
 
@@ -431,6 +427,30 @@ mod tests {
         let fh = parse(&raw, data_offset).unwrap();
         assert_eq!(fh.name.len(), MAXPATHSIZE);
         assert!(fh.name.bytes().all(|byte| byte == b'a'));
+    }
+
+    #[test]
+    fn test_file_header_invalid_utf8_name_keeps_prefix_like_unrar() {
+        let data =
+            build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 16, b"valid/\xffignored");
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let data_offset = cursor.position();
+
+        let fh = parse(&raw, data_offset).unwrap();
+        assert_eq!(fh.name, "valid/");
+    }
+
+    #[test]
+    fn test_file_header_overlong_utf8_name_decodes_like_unrar() {
+        let data =
+            build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 10, b"valid\xc0\xafok");
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let data_offset = cursor.position();
+
+        let fh = parse(&raw, data_offset).unwrap();
+        assert_eq!(fh.name, "valid/ok");
     }
 
     #[test]

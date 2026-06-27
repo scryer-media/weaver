@@ -232,6 +232,71 @@ pub(crate) fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
     result
 }
 
+/// Decode RAR5 UTF-8 text the way UnRAR callers use `UtfToWide`.
+///
+/// The official decoder validates only continuation-byte shapes, so overlong
+/// sequences are decoded instead of rejected. It returns `false` at the first
+/// malformed byte, but several header readers ignore that return value and keep
+/// the prefix decoded before the error. They also stop at the first NUL byte.
+pub(crate) fn decode_utf8_prefix_until_nul(bytes: &[u8]) -> String {
+    let mut decoded = String::new();
+    let mut pos = 0usize;
+
+    while let Some(&first) = bytes.get(pos) {
+        if first == 0 {
+            break;
+        }
+        pos += 1;
+
+        let scalar = if first < 0x80 {
+            u32::from(first)
+        } else if first >> 5 == 0b110 {
+            let Some(&b1) = bytes.get(pos) else {
+                break;
+            };
+            if b1 & 0xc0 != 0x80 {
+                break;
+            }
+            pos += 1;
+            (u32::from(first & 0x1f) << 6) | u32::from(b1 & 0x3f)
+        } else if first >> 4 == 0b1110 {
+            let (Some(&b1), Some(&b2)) = (bytes.get(pos), bytes.get(pos + 1)) else {
+                break;
+            };
+            if b1 & 0xc0 != 0x80 || b2 & 0xc0 != 0x80 {
+                break;
+            }
+            pos += 2;
+            (u32::from(first & 0x0f) << 12) | (u32::from(b1 & 0x3f) << 6) | u32::from(b2 & 0x3f)
+        } else if first >> 3 == 0b11110 {
+            let (Some(&b1), Some(&b2), Some(&b3)) =
+                (bytes.get(pos), bytes.get(pos + 1), bytes.get(pos + 2))
+            else {
+                break;
+            };
+            if b1 & 0xc0 != 0x80 || b2 & 0xc0 != 0x80 || b3 & 0xc0 != 0x80 {
+                break;
+            }
+            pos += 3;
+            (u32::from(first & 0x07) << 18)
+                | (u32::from(b1 & 0x3f) << 12)
+                | (u32::from(b2 & 0x3f) << 6)
+                | u32::from(b3 & 0x3f)
+        } else {
+            break;
+        };
+
+        if scalar > 0x10ffff {
+            continue;
+        }
+        if let Some(ch) = char::from_u32(scalar) {
+            decoded.push(ch);
+        }
+    }
+
+    decoded
+}
+
 pub(crate) fn validate_header_size(
     offset: u64,
     header_size: u64,
@@ -355,6 +420,27 @@ pub fn extra_area_bytes(raw: &RawHeader) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utf8_prefix_decoder_accepts_overlong_sequences_like_unrar() {
+        assert_eq!(decode_utf8_prefix_until_nul(b"a\xc0\xafpath"), "a/path");
+    }
+
+    #[test]
+    fn utf8_prefix_decoder_keeps_prefix_before_malformed_continuation_like_unrar() {
+        assert_eq!(decode_utf8_prefix_until_nul(b"valid/\xffignored"), "valid/");
+        assert_eq!(decode_utf8_prefix_until_nul(b"valid/\xe2bad"), "valid/");
+    }
+
+    #[test]
+    fn utf8_prefix_decoder_stops_at_nul_like_unrar() {
+        assert_eq!(decode_utf8_prefix_until_nul(b"abc\0ignored"), "abc");
+    }
+
+    #[test]
+    fn utf8_prefix_decoder_skips_out_of_range_four_byte_scalars_like_unrar() {
+        assert_eq!(decode_utf8_prefix_until_nul(b"a\xf7\xbf\xbf\xbfb"), "ab");
+    }
 
     fn build_header(header_type: u64, header_flags: u64, type_body: &[u8]) -> Vec<u8> {
         // Build the body: type vint + flags vint + type-specific

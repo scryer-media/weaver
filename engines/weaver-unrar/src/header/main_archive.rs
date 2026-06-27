@@ -202,12 +202,7 @@ fn parse_metadata_extra(data: &[u8], metadata: &mut MainExtraMetadata) {
             name_bytes[..copied].copy_from_slice(&available[..copied]);
             pos = pos.saturating_add(copied).min(data.len());
             if name_bytes.first().copied().unwrap_or(0) != 0 {
-                let nul = name_bytes
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .unwrap_or(name_bytes.len());
-                metadata.original_name =
-                    Some(String::from_utf8_lossy(&name_bytes[..nul]).into_owned());
+                metadata.original_name = Some(common::decode_utf8_prefix_until_nul(&name_bytes));
             }
         }
     }
@@ -467,6 +462,38 @@ mod tests {
         let main = parse(&raw).unwrap();
 
         assert_eq!(main.original_name.as_deref(), Some("rel"));
+    }
+
+    #[test]
+    fn test_main_metadata_invalid_utf8_name_keeps_prefix_like_unrar() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(main_extra::METADATA_NAME));
+        body.extend_from_slice(&encode_vint(15));
+        body.extend_from_slice(b"release/\xfftail");
+        let extra = build_extra_record(main_extra::METADATA, &body);
+        let data = build_main_header_with_extra(0, None, &extra);
+
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let main = parse(&raw).unwrap();
+
+        assert_eq!(main.original_name.as_deref(), Some("release/"));
+    }
+
+    #[test]
+    fn test_main_metadata_overlong_utf8_name_decodes_like_unrar() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(main_extra::METADATA_NAME));
+        body.extend_from_slice(&encode_vint(11));
+        body.extend_from_slice(b"release\xc0\xafok");
+        let extra = build_extra_record(main_extra::METADATA, &body);
+        let data = build_main_header_with_extra(0, None, &extra);
+
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let main = parse(&raw).unwrap();
+
+        assert_eq!(main.original_name.as_deref(), Some("release/ok"));
     }
 
     #[test]

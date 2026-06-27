@@ -772,15 +772,14 @@ fn decode_rar4_unicode_name(data: &[u8]) -> String {
     let null_pos = data.iter().position(|&b| b == 0);
 
     let Some(null_pos) = null_pos else {
-        // No null found — treat as plain ASCII.
-        return String::from_utf8_lossy(data).into_owned();
+        return decode_rar4_plain_name(data);
     };
 
     let ascii_name = &data[..null_pos];
     let unicode_data = &data[null_pos + 1..];
 
     if unicode_data.is_empty() {
-        return String::from_utf8_lossy(ascii_name).into_owned();
+        return decode_rar4_plain_name(ascii_name);
     }
 
     let mut enc_pos = 0usize;
@@ -875,7 +874,7 @@ fn decode_rar4_unicode_name(data: &[u8]) -> String {
     }
 
     if result.is_empty() {
-        return String::from_utf8_lossy(ascii_name).into_owned();
+        return decode_rar4_plain_name(ascii_name);
     }
 
     if let Some(zero_pos) = result.iter().position(|unit| *unit == 0) {
@@ -890,7 +889,11 @@ fn decode_rar4_c_string_name(data: &[u8]) -> String {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..nul_end]).into_owned()
+    decode_rar4_plain_name(&data[..nul_end])
+}
+
+fn decode_rar4_plain_name(data: &[u8]) -> String {
+    crate::header::common::decode_utf8_prefix_until_nul(data)
 }
 
 /// Read one raw RAR4 header from an encrypted stream.
@@ -1730,6 +1733,18 @@ mod tests {
         let name = b"simple.txt";
         let result = decode_rar4_unicode_name(name);
         assert_eq!(result, "simple.txt");
+    }
+
+    #[test]
+    fn test_plain_name_invalid_utf8_keeps_prefix_like_unrar() {
+        let result = decode_rar4_unicode_name(b"safe/\xffhidden");
+        assert_eq!(result, "safe/");
+    }
+
+    #[test]
+    fn test_plain_name_overlong_utf8_decodes_like_unrar() {
+        let result = decode_rar4_unicode_name(b"safe\xc0\xafname.txt");
+        assert_eq!(result, "safe/name.txt");
     }
 
     #[test]
