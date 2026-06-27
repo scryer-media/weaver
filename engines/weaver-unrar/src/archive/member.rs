@@ -35,7 +35,6 @@ fn current_umask() -> u32 {
     0
 }
 
-#[derive(Clone)]
 struct Rar5ReaderCrypto {
     key: [u8; 32],
     hash_key: [u8; 32],
@@ -164,7 +163,8 @@ impl RarArchive {
         };
 
         let base_reader =
-            ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &service.segments, &fh.name);
+            ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &service.segments, &fh.name)
+                .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
         let reader: Box<dyn Read + '_> = if let Some(crypto) = rar5_crypto.as_ref() {
             Box::new(crate::crypto::DecryptingReader::new_rar5(
                 base_reader,
@@ -222,7 +222,9 @@ impl RarArchive {
                     })?;
                 let mut packed = Vec::with_capacity(packed_capacity);
                 let mut reader = reader;
-                reader.read_to_end(&mut packed).map_err(RarError::Io)?;
+                reader
+                    .read_to_end(&mut packed)
+                    .map_err(Self::read_error_to_rar)?;
                 if packed.len() as u64 != packed_len {
                     return Err(RarError::CorruptArchive {
                         detail: format!(
@@ -515,28 +517,18 @@ impl RarArchive {
         raw_member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
-        Self::ensure_safe_symlink_target(member_name, target, raw_member_name, false, out_path)
-    }
-
-    fn ensure_safe_symlink_target(
-        member_name: &str,
-        target: &str,
-        raw_member_name: &str,
-        allow_windows_drive_relative: bool,
-        out_path: &std::path::Path,
-    ) -> RarResult<()> {
         if !crate::path::is_safe_symlink_target_for_member(
             member_name,
             raw_member_name,
             target,
-            allow_windows_drive_relative,
+            true,
         ) {
             return Err(RarError::UnsafeLinkTarget {
                 member: raw_member_name.to_string(),
                 target: target.to_string(),
             });
         }
-        if Self::link_target_has_parent_traversal(target)
+        if Self::link_target_has_parent_traversal(target, true)
             && Self::source_path_has_existing_link_or_non_dir(member_name, out_path)?
         {
             return Err(RarError::UnsafeLinkTarget {
@@ -547,11 +539,44 @@ impl RarArchive {
         Ok(())
     }
 
-    fn link_target_has_parent_traversal(target: &str) -> bool {
-        target
-            .replace('\\', "/")
-            .split('/')
-            .any(|part| part == "..")
+    fn ensure_safe_symlink_target(
+        fh: &FileHeader,
+        member_name: &str,
+        target: &str,
+        raw_member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        if !crate::path::is_safe_symlink_target_for_archive_member(
+            fh.compression.format,
+            member_name,
+            raw_member_name,
+            target,
+        ) {
+            return Err(RarError::UnsafeLinkTarget {
+                member: raw_member_name.to_string(),
+                target: target.to_string(),
+            });
+        }
+        if Self::link_target_has_parent_traversal(target, false)
+            && Self::source_path_has_existing_link_or_non_dir(member_name, out_path)?
+        {
+            return Err(RarError::UnsafeLinkTarget {
+                member: raw_member_name.to_string(),
+                target: target.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn link_target_has_parent_traversal(target: &str, backslash_is_separator: bool) -> bool {
+        if backslash_is_separator {
+            target
+                .replace('\\', "/")
+                .split('/')
+                .any(|part| part == "..")
+        } else {
+            target.split('/').any(|part| part == "..")
+        }
     }
 
     fn source_path_has_existing_link_or_non_dir(
@@ -593,17 +618,21 @@ impl RarArchive {
         target.replace('\\', "/")
     }
 
+    fn normalize_file_redirection_target(target: &str) -> String {
+        crate::path::sanitize_file_redirection_path(target)
+    }
+
     fn normalized_rar5_redirection_target(
         redir_type: header::RedirectionType,
         target: &str,
     ) -> String {
         match redir_type {
             header::RedirectionType::UnixSymlink => target.to_string(),
-            header::RedirectionType::WindowsSymlink
-            | header::RedirectionType::WindowsJunction
-            | header::RedirectionType::Hardlink
-            | header::RedirectionType::FileCopy => {
+            header::RedirectionType::WindowsSymlink | header::RedirectionType::WindowsJunction => {
                 Self::normalize_windows_redirection_target(target)
+            }
+            header::RedirectionType::Hardlink | header::RedirectionType::FileCopy => {
+                Self::normalize_file_redirection_target(target)
             }
             header::RedirectionType::Unknown(_) => target.to_string(),
         }
@@ -634,7 +663,7 @@ impl RarArchive {
         out_path: &std::path::Path,
     ) -> std::path::PathBuf {
         Self::redirection_target_root(member_name, out_path)
-            .join(crate::path::sanitize_path(target))
+            .join(crate::path::sanitize_file_redirection_path(target))
     }
 
     fn create_symlink_output(
@@ -644,17 +673,10 @@ impl RarArchive {
         member_name: &str,
         raw_member_name: &str,
         target: &str,
-        allow_windows_drive_relative: bool,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
-        Self::ensure_safe_symlink_target(
-            member_name,
-            target,
-            raw_member_name,
-            allow_windows_drive_relative,
-            out_path,
-        )?;
+        Self::ensure_safe_symlink_target(fh, member_name, target, raw_member_name, out_path)?;
         Self::remove_existing_link_output(out_path)?;
 
         #[cfg(unix)]
@@ -807,7 +829,7 @@ impl RarArchive {
         let mut uid = owner.uid.map(Self::uid_from_archive).transpose()?;
         let mut gid = owner.gid.map(Self::gid_from_archive).transpose()?;
 
-        if let Some(name) = owner.user_name.as_deref().filter(|name| !name.is_empty()) {
+        if let Some(name) = owner.user_name_bytes().filter(|name| !name.is_empty()) {
             match Self::lookup_uid_by_name(name)? {
                 Some(resolved) => uid = Some(resolved),
                 None if uid.is_none() => return Ok(None),
@@ -815,7 +837,7 @@ impl RarArchive {
             }
         }
 
-        if let Some(name) = owner.group_name.as_deref().filter(|name| !name.is_empty()) {
+        if let Some(name) = owner.group_name_bytes().filter(|name| !name.is_empty()) {
             match Self::lookup_gid_by_name(name)? {
                 Some(resolved) => gid = Some(resolved),
                 None if gid.is_none() => return Ok(None),
@@ -845,7 +867,7 @@ impl RarArchive {
     }
 
     #[cfg(unix)]
-    fn lookup_uid_by_name(name: &str) -> RarResult<Option<libc::uid_t>> {
+    fn lookup_uid_by_name(name: &[u8]) -> RarResult<Option<libc::uid_t>> {
         let name = match std::ffi::CString::new(name) {
             Ok(name) => name,
             Err(_) => return Ok(None),
@@ -859,7 +881,7 @@ impl RarArchive {
     }
 
     #[cfg(unix)]
-    fn lookup_gid_by_name(name: &str) -> RarResult<Option<libc::gid_t>> {
+    fn lookup_gid_by_name(name: &[u8]) -> RarResult<Option<libc::gid_t>> {
         let name = match std::ffi::CString::new(name) {
             Ok(name) => name,
             Err(_) => return Ok(None),
@@ -1010,7 +1032,7 @@ impl RarArchive {
             return Ok(written);
         }
 
-        let target_member_name = crate::path::sanitize_path(target);
+        let target_member_name = crate::path::sanitize_file_redirection_path(target);
         if target_member_name == member_name {
             return Err(RarError::UnsupportedLinkType {
                 member: raw_member_name.to_string(),
@@ -1022,7 +1044,11 @@ impl RarArchive {
             .members
             .iter()
             .position(|entry| {
-                crate::path::sanitize_path(&entry.file_header.name) == target_member_name
+                crate::path::sanitize_member_path(
+                    self.format,
+                    entry.file_header.host_os,
+                    &entry.file_header.name,
+                ) == target_member_name
             })
             .ok_or_else(|| {
                 RarError::Io(std::io::Error::new(
@@ -1083,7 +1109,7 @@ impl RarArchive {
         redirection: Option<header::Redirection>,
         out_path: &std::path::Path,
     ) -> RarResult<Option<u64>> {
-        let member_name = crate::path::sanitize_path(&fh.name);
+        let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
 
         if let Some(redir) = redirection {
             let link_type = format!("{:?}", redir.redir_type);
@@ -1098,11 +1124,6 @@ impl RarArchive {
                     &member_name,
                     &fh.name,
                     &target,
-                    matches!(
-                        redir.redir_type,
-                        header::RedirectionType::WindowsSymlink
-                            | header::RedirectionType::WindowsJunction
-                    ),
                     out_path,
                 )
                 .map(Some),
@@ -1142,13 +1163,42 @@ impl RarArchive {
                 &member_name,
                 &fh.name,
                 &target,
-                false,
                 out_path,
             )
             .map(Some);
         }
 
         Ok(None)
+    }
+
+    fn unsupported_non_file_link_type(
+        &self,
+        entry: &MemberEntry,
+        fh: &FileHeader,
+    ) -> Option<String> {
+        if let Some(redirection) = &entry.redirection {
+            return Some(format!("{:?}", redirection.redir_type));
+        }
+
+        let rar3_unix_symlink = self.format.is_rar4_family()
+            && matches!(fh.host_os, crate::types::HostOs::Unix)
+            && (fh.attributes.0 & 0xF000) == 0xA000;
+        rar3_unix_symlink.then(|| "RAR3 Unix symlink".to_string())
+    }
+
+    fn reject_link_member_without_file_target(
+        &self,
+        entry: &MemberEntry,
+        fh: &FileHeader,
+    ) -> RarResult<()> {
+        if let Some(link_type) = self.unsupported_non_file_link_type(entry, fh) {
+            return Err(RarError::UnsupportedLinkType {
+                member: fh.name.clone(),
+                link_type: format!("{link_type} requires extract_member_to_file"),
+            });
+        }
+
+        Ok(())
     }
 
     fn advance_solid_cursor_to(&mut self, index: usize, fh: &FileHeader) -> RarResult<()> {
@@ -1187,7 +1237,8 @@ impl RarArchive {
                     &self.limits,
                     &skip_entry.segments,
                     &skip_fh.name,
-                );
+                )
+                .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
                 if skip_entry.is_encrypted {
                     let password = self
@@ -1294,6 +1345,7 @@ impl RarArchive {
                 let skip_unpacked = self.target_unpacked_size(&skip_fh);
                 let (segments, _) = Self::normalized_provider_segments(&skip_entry.segments);
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
+                    .with_member_name(&skip_fh.name)
                     .with_max_data_segment(self.limits.max_data_segment)
                     .with_continuation(skip_fh.split_after, self.format, self.password.clone());
 
@@ -1329,6 +1381,7 @@ impl RarArchive {
                             &password,
                             skip_entry.file_encryption.as_ref(),
                         )?;
+                        let base_reader = base_reader.with_packed_hash_key(Some(crypto.hash_key));
                         let reader = crate::crypto::DecryptingReader::new_rar5(
                             base_reader,
                             &crypto.key,
@@ -1440,7 +1493,7 @@ impl RarArchive {
         }
 
         let mut probe = [0u8; 1];
-        let read = reader.read(&mut probe).map_err(RarError::Io)?;
+        let read = reader.read(&mut probe).map_err(Self::read_error_to_rar)?;
         if read == 0 {
             return Ok(());
         }
@@ -1666,6 +1719,18 @@ impl RarArchive {
         Ok(())
     }
 
+    fn read_error_to_rar(error: std::io::Error) -> RarError {
+        let kind = error.kind();
+        let message = error.to_string();
+        match error.into_inner() {
+            Some(inner) => match inner.downcast::<RarError>() {
+                Ok(error) => *error,
+                Err(inner) => RarError::Io(std::io::Error::new(kind, inner)),
+            },
+            None => RarError::Io(std::io::Error::new(kind, message)),
+        }
+    }
+
     fn copy_reader_to_writer<R: Read, W: Write>(
         mut reader: R,
         writer: &mut W,
@@ -1682,7 +1747,9 @@ impl RarArchive {
                 break;
             }
 
-            let read = reader.read(&mut buffer[..to_read]).map_err(RarError::Io)?;
+            let read = reader
+                .read(&mut buffer[..to_read])
+                .map_err(Self::read_error_to_rar)?;
             if read == 0 {
                 if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
@@ -1735,7 +1802,9 @@ impl RarArchive {
                 break;
             }
 
-            let read = reader.read(&mut buffer[..to_read]).map_err(RarError::Io)?;
+            let read = reader
+                .read(&mut buffer[..to_read])
+                .map_err(Self::read_error_to_rar)?;
             if read == 0 {
                 if limit.is_exact() {
                     return Err(RarError::Io(std::io::Error::new(
@@ -1800,6 +1869,7 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
+        self.reject_link_member_without_file_target(entry, &fh)?;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
         let store_limit = self.store_copy_limit(&fh);
@@ -1838,7 +1908,8 @@ impl RarArchive {
             let (written, actual_crc, actual_data_hash, actual_blake) = {
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 let mut hash_writer = HashingWriter::new_with_data_hash(
                     &mut output,
                     tracked_data_hash,
@@ -1954,7 +2025,8 @@ impl RarArchive {
             let (actual_crc, actual_blake) = {
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 let mut hash_writer = HashingWriter::new(
                     &mut output,
                     expected_crc.is_some(),
@@ -2046,7 +2118,8 @@ impl RarArchive {
             let (actual_crc, actual_data_hash, actual_blake) = {
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 let mut hash_writer = HashingWriter::new_with_data_hash(
                     &mut output,
                     tracked_data_hash,
@@ -2133,7 +2206,8 @@ impl RarArchive {
                 self.advance_solid_cursor_to(index, &fh)?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 if let Some(ref pwd) = member_password {
                     if archive_format.is_rar4_family() {
                         let reader = Self::wrap_rar4_encrypted_reader(
@@ -2274,7 +2348,7 @@ impl RarArchive {
         };
 
         let fh = entry.file_header.clone();
-        let member_name = crate::path::sanitize_path(&fh.name);
+        let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
         let hash = entry.hash.clone();
         let file_enc = entry.file_encryption.clone();
         let redirection = entry.redirection.clone();
@@ -2349,7 +2423,8 @@ impl RarArchive {
             let (written, actual_crc, actual_data_hash, actual_blake) = {
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 let mut hash_writer = HashingWriter::new_with_data_hash(
                     &mut writer,
                     tracked_data_hash,
@@ -2457,7 +2532,8 @@ impl RarArchive {
 
             let segments = self.members[index].segments.clone();
             let base_reader =
-                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                    .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
             let (actual_crc, actual_blake) = {
                 let mut hash_writer = HashingWriter::new(
@@ -2538,7 +2614,8 @@ impl RarArchive {
 
             let segments = self.members[index].segments.clone();
             let base_reader =
-                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                    .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
             let tracked_data_hash =
                 expected_data_hash.or(expected_crc.map(crate::types::DataHash::Crc32));
@@ -2622,7 +2699,8 @@ impl RarArchive {
                 self.advance_solid_cursor_to(index, &fh)?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
-                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name);
+                    ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                        .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
                 let written = if let Some(ref pwd) = member_password {
                     if archive_format.is_rar4_family() {
                         let reader = Self::wrap_rar4_encrypted_reader(
@@ -2801,6 +2879,7 @@ impl RarArchive {
             let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
             let base_reader =
                 ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                    .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
                     .with_volume_tracker(Arc::clone(&volume_tracker));
             let tracking_reader = VolumeTrackingReader::new(base_reader, volume_tracker)
                 .with_shared_transitions(Arc::clone(&shared_transitions));
@@ -2910,6 +2989,7 @@ impl RarArchive {
         ));
         let base_reader =
             ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
+                .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
                 .with_volume_tracker(Arc::clone(&volume_tracker));
 
         let shared_crc =
@@ -3218,6 +3298,7 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
+        self.reject_link_member_without_file_target(entry, &fh)?;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
 
@@ -3378,6 +3459,7 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
 
@@ -3385,14 +3467,15 @@ impl RarArchive {
 
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
         let unpacked_size = self.target_unpacked_size(fh);
 
         let (written, actual_crc, actual_blake) = {
-            let mut hash_writer =
-                HashingWriter::new(writer, expected_crc.is_some(), compute_blake2);
+            let mut hash_writer = HashingWriter::new(writer, compute_crc, compute_blake2);
 
             let written = if let Some(pwd) = password {
                 if self.format.is_rar4_family() {
@@ -3445,7 +3528,7 @@ impl RarArchive {
 
             (
                 written,
-                expected_crc.map(|_| hash_writer.finalize_crc()),
+                compute_crc.then(|| hash_writer.finalize_crc()),
                 compute_blake2.then(|| hash_writer.finalize_blake2()),
             )
         };
@@ -3490,11 +3573,6 @@ impl RarArchive {
         rar4_salt: Option<[u8; 8]>,
         split_after: bool,
     ) -> RarResult<u64> {
-        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
-        let chained = ChainedSegmentReader::new(segments, provider)
-            .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
-            .with_metadata_sink(Rc::clone(&cont_meta));
         let rar5_crypto = if self.format == ArchiveFormat::Rar5 {
             password
                 .map(|pwd| self.prepare_rar5_encrypted_member(&fh.name, pwd, file_encryption))
@@ -3502,6 +3580,13 @@ impl RarArchive {
         } else {
             None
         };
+        let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
+        let chained = ChainedSegmentReader::new(segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
+            .with_max_data_segment(self.limits.max_data_segment)
+            .with_continuation(split_after, self.format, self.password.clone())
+            .with_metadata_sink(Rc::clone(&cont_meta));
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
         let expected_blake = if options.verify {
@@ -3512,11 +3597,12 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
 
         // Wrap in DecryptingReader if encrypted, otherwise read directly.
-        let mut hasher = if expected_crc.is_some() {
+        let mut hasher = if compute_crc {
             Some(crc32fast::Hasher::new())
         } else {
             None
@@ -3564,7 +3650,9 @@ impl RarArchive {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
             }
-            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
+            let n = reader
+                .read(&mut chunk[..to_read])
+                .map_err(Self::read_error_to_rar)?;
             if n == 0 {
                 break;
             }
@@ -3640,6 +3728,8 @@ impl RarArchive {
         // because its PPM path depends on contiguous remaining bytes.
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta));
@@ -3679,9 +3769,10 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
-        let mut hash_writer = HashingWriter::new(writer, expected_crc.is_some(), compute_blake2);
+        let mut hash_writer = HashingWriter::new(writer, compute_crc, compute_blake2);
 
         let written = if self.format == ArchiveFormat::Rar5 {
             let mut buf_reader = BufReader::with_capacity(1024 * 1024, inner);
@@ -3714,7 +3805,7 @@ impl RarArchive {
         let final_use_hash_mac = use_hash_mac || final_meta.use_hash_mac;
         drop(final_meta);
 
-        let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
+        let actual_crc = compute_crc.then(|| hash_writer.finalize_crc());
         let actual_blake = compute_blake2.then(|| hash_writer.finalize_blake2());
         Self::verify_member_crc32(
             &fh.name,
@@ -3769,6 +3860,7 @@ impl RarArchive {
         let hash = entry.hash.clone();
         let file_encryption = entry.file_encryption.clone();
         let rar4_salt = entry.rar4_salt;
+        self.reject_link_member_without_file_target(entry, &fh)?;
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
 
@@ -3890,6 +3982,8 @@ impl RarArchive {
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
@@ -3903,9 +3997,10 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
-        let mut hasher = if expected_crc.is_some() {
+        let mut hasher = if compute_crc {
             Some(crc32fast::Hasher::new())
         } else {
             None
@@ -3952,7 +4047,9 @@ impl RarArchive {
                 Self::enforce_store_ceiling_not_exceeded(&mut reader, store_limit, &fh.name)?;
                 break;
             }
-            let n = reader.read(&mut chunk[..to_read]).map_err(RarError::Io)?;
+            let n = reader
+                .read(&mut chunk[..to_read])
+                .map_err(Self::read_error_to_rar)?;
             if n == 0 {
                 break;
             }
@@ -4064,6 +4161,8 @@ impl RarArchive {
         let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
@@ -4080,10 +4179,11 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc =
-            expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
+            compute_crc.then(|| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
         let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
             compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
 
@@ -4210,6 +4310,8 @@ impl RarArchive {
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(segments, provider)
+            .with_member_name(&fh.name)
+            .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
             .with_metadata_sink(Rc::clone(&cont_meta))
@@ -4251,10 +4353,11 @@ impl RarArchive {
         } else {
             None
         };
+        let compute_crc = expected_crc.is_some() || (options.verify && split_after);
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
         let shared_crc: Option<Arc<std::sync::Mutex<crc32fast::Hasher>>> =
-            expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
+            compute_crc.then(|| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
         let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
             compute_blake2.then(|| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
 
@@ -4476,6 +4579,109 @@ fn finalize_shared_blake2(shared: Arc<std::sync::Mutex<Blake2spHasher>>) -> RarR
     Ok(hasher.finalize())
 }
 
+enum SegmentPackedHashState {
+    Crc32(crc32fast::Hasher),
+    Blake2sp(Blake2spHasher),
+}
+
+struct SegmentPackedHashVerifier {
+    member_name: String,
+    volume_index: usize,
+    expected: PackedDataHash,
+    uses_mac: bool,
+    hash_key: Option<[u8; 32]>,
+    state: SegmentPackedHashState,
+}
+
+impl SegmentPackedHashVerifier {
+    fn new(member_name: &str, segment: &DataSegment, hash_key: Option<[u8; 32]>) -> Option<Self> {
+        let expected = segment.packed_hash?;
+        let state = match expected {
+            PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crc32fast::Hasher::new()),
+            PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Blake2spHasher::new()),
+        };
+        Some(Self {
+            member_name: member_name.to_string(),
+            volume_index: segment.volume_index,
+            expected,
+            uses_mac: segment.packed_hash_uses_mac,
+            hash_key,
+            state,
+        })
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match &mut self.state {
+            SegmentPackedHashState::Crc32(hasher) => hasher.update(data),
+            SegmentPackedHashState::Blake2sp(hasher) => hasher.update(data),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        match (self.expected, self.state) {
+            (PackedDataHash::Crc32(expected), SegmentPackedHashState::Crc32(hasher)) => {
+                let mut actual = hasher.finalize();
+                if self.uses_mac {
+                    actual = crate::crypto::convert_crc32_to_mac(
+                        actual,
+                        self.hash_key.as_ref().ok_or_else(|| {
+                            packed_hash_io_error(RarError::CorruptArchive {
+                                detail: format!(
+                                    "packed segment for {} in volume {} is missing a RAR5 hash key",
+                                    self.member_name, self.volume_index
+                                ),
+                            })
+                        })?,
+                    );
+                }
+                if actual != expected {
+                    return Err(packed_hash_io_error(RarError::PackedDataCrcMismatch {
+                        member: self.member_name,
+                        volume: self.volume_index,
+                        expected,
+                        actual,
+                    }));
+                }
+            }
+            (PackedDataHash::Blake2sp(expected), SegmentPackedHashState::Blake2sp(hasher)) => {
+                let mut actual = hasher.finalize();
+                if self.uses_mac {
+                    actual = crate::crypto::convert_blake2_to_mac(
+                        actual,
+                        self.hash_key.as_ref().ok_or_else(|| {
+                            packed_hash_io_error(RarError::CorruptArchive {
+                                detail: format!(
+                                    "packed segment for {} in volume {} is missing a RAR5 hash key",
+                                    self.member_name, self.volume_index
+                                ),
+                            })
+                        })?,
+                    );
+                }
+                if actual != expected {
+                    return Err(packed_hash_io_error(RarError::PackedDataBlake2Mismatch {
+                        member: self.member_name,
+                        volume: self.volume_index,
+                    }));
+                }
+            }
+            _ => {
+                return Err(packed_hash_io_error(RarError::CorruptArchive {
+                    detail: format!(
+                        "packed segment for {} in volume {} used mismatched hash state",
+                        self.member_name, self.volume_index
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn packed_hash_io_error(error: RarError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
 /// Metadata captured from continuation headers discovered during streaming.
 ///
 /// As `ChainedSegmentReader` discovers continuation volumes, it updates
@@ -4504,6 +4710,7 @@ pub(super) struct ContinuationMetadata {
 pub struct ChainedSegmentReader<'a> {
     segments: Vec<DataSegment>,
     provider: &'a dyn VolumeProvider,
+    member_name: String,
     max_data_segment: u64,
     current_seg: usize,
     current_reader: Option<Box<dyn ReadSeek>>,
@@ -4523,6 +4730,8 @@ pub struct ChainedSegmentReader<'a> {
     /// new segment, allowing callers (even behind wrapper layers like
     /// DecryptingReader) to observe which volume is currently being read.
     volume_tracker: Option<Arc<AtomicUsize>>,
+    packed_hash_key: Option<[u8; 32]>,
+    current_packed_hash: Option<SegmentPackedHashVerifier>,
 }
 
 struct ArchiveSegmentReader<'a> {
@@ -4533,6 +4742,8 @@ struct ArchiveSegmentReader<'a> {
     current_seg: usize,
     remaining_in_segment: u64,
     volume_tracker: Option<Arc<AtomicUsize>>,
+    packed_hash_key: Option<[u8; 32]>,
+    current_packed_hash: Option<SegmentPackedHashVerifier>,
 }
 
 impl<'a> ArchiveSegmentReader<'a> {
@@ -4552,12 +4763,26 @@ impl<'a> ArchiveSegmentReader<'a> {
             current_seg: 0,
             remaining_in_segment: 0,
             volume_tracker: None,
+            packed_hash_key: None,
+            current_packed_hash: None,
         }
     }
 
     fn with_volume_tracker(mut self, tracker: Arc<AtomicUsize>) -> Self {
         self.volume_tracker = Some(tracker);
         self
+    }
+
+    fn with_packed_hash_key(mut self, hash_key: Option<[u8; 32]>) -> Self {
+        self.packed_hash_key = hash_key;
+        self
+    }
+
+    fn finish_current_packed_hash(&mut self) -> std::io::Result<()> {
+        if let Some(verifier) = self.current_packed_hash.take() {
+            verifier.finish()?;
+        }
+        Ok(())
     }
 
     fn advance_segment(&mut self) -> std::io::Result<bool> {
@@ -4589,6 +4814,11 @@ impl<'a> ArchiveSegmentReader<'a> {
             tracker.store(seg.volume_index, Ordering::Release);
         }
         self.remaining_in_segment = seg.data_size;
+        self.current_packed_hash =
+            SegmentPackedHashVerifier::new(&self.member_name, seg, self.packed_hash_key);
+        if self.remaining_in_segment == 0 {
+            self.finish_current_packed_hash()?;
+        }
         self.current_seg += 1;
         Ok(true)
     }
@@ -4618,6 +4848,12 @@ impl Read for ArchiveSegmentReader<'_> {
                     ));
                 }
                 self.remaining_in_segment -= n as u64;
+                if let Some(verifier) = self.current_packed_hash.as_mut() {
+                    verifier.update(&buf[..n]);
+                }
+                if self.remaining_in_segment == 0 {
+                    self.finish_current_packed_hash()?;
+                }
                 return Ok(n);
             }
 
@@ -4634,6 +4870,7 @@ impl<'a> ChainedSegmentReader<'a> {
         Self {
             segments: segments.to_vec(),
             provider,
+            member_name: "RAR member".to_string(),
             max_data_segment: crate::limits::Limits::default().max_data_segment,
             current_seg: 0,
             current_reader: None,
@@ -4644,11 +4881,18 @@ impl<'a> ChainedSegmentReader<'a> {
             password: None,
             metadata_sink: None,
             volume_tracker: None,
+            packed_hash_key: None,
+            current_packed_hash: None,
         }
     }
 
     pub fn with_max_data_segment(mut self, max_data_segment: u64) -> Self {
         self.max_data_segment = max_data_segment;
+        self
+    }
+
+    fn with_member_name(mut self, member_name: &str) -> Self {
+        self.member_name = member_name.to_string();
         self
     }
 
@@ -4676,6 +4920,18 @@ impl<'a> ChainedSegmentReader<'a> {
     pub fn with_volume_tracker(mut self, tracker: Arc<AtomicUsize>) -> Self {
         self.volume_tracker = Some(tracker);
         self
+    }
+
+    fn with_packed_hash_key(mut self, hash_key: Option<[u8; 32]>) -> Self {
+        self.packed_hash_key = hash_key;
+        self
+    }
+
+    fn finish_current_packed_hash(&mut self) -> std::io::Result<()> {
+        if let Some(verifier) = self.current_packed_hash.take() {
+            verifier.finish()?;
+        }
+        Ok(())
     }
 
     fn advance_segment(&mut self) -> std::io::Result<bool> {
@@ -4708,6 +4964,11 @@ impl<'a> ChainedSegmentReader<'a> {
             .map_err(std::io::Error::other)?;
         self.current_reader = Some(reader);
         self.remaining_in_segment = seg.data_size;
+        self.current_packed_hash =
+            SegmentPackedHashVerifier::new(&self.member_name, seg, self.packed_hash_key);
+        if self.remaining_in_segment == 0 {
+            self.finish_current_packed_hash()?;
+        }
         self.current_seg += 1;
         Ok(true)
     }
@@ -4739,11 +5000,15 @@ impl<'a> ChainedSegmentReader<'a> {
                             fh.packed_size, self.max_data_segment
                         )));
                     }
-                    self.segments.push(DataSegment {
-                        volume_index: vol_idx,
-                        data_offset: fh.data_offset,
-                        data_size: fh.packed_size,
-                    });
+                    let file_header =
+                        RarArchive::rar4_to_file_header(fh, parsed.archive_header.is_solid);
+                    self.segments.push(DataSegment::with_packed_hash(
+                        vol_idx,
+                        fh.data_offset,
+                        fh.packed_size,
+                        RarArchive::packed_hash_for_split_segment(&file_header, None),
+                        false,
+                    ));
                     self.split_after = fh.split_after;
                     self.next_discover_vol = vol_idx + 1;
                     if let Some(ref sink) = self.metadata_sink {
@@ -4768,11 +5033,19 @@ impl<'a> ChainedSegmentReader<'a> {
                             pf.header.data_size, self.max_data_segment
                         )));
                     }
-                    self.segments.push(DataSegment {
-                        volume_index: vol_idx,
-                        data_offset: pf.header.data_offset,
-                        data_size: pf.header.data_size,
-                    });
+                    let packed_hash =
+                        RarArchive::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+                    let packed_hash_uses_mac = pf
+                        .file_encryption
+                        .as_ref()
+                        .is_some_and(|fe| fe.use_hash_mac);
+                    self.segments.push(DataSegment::with_packed_hash(
+                        vol_idx,
+                        pf.header.data_offset,
+                        pf.header.data_size,
+                        packed_hash,
+                        packed_hash_uses_mac,
+                    ));
                     self.split_after = pf.header.split_after;
                     self.next_discover_vol = vol_idx + 1;
                     if let Some(ref sink) = self.metadata_sink {
@@ -4816,6 +5089,12 @@ impl Read for ChainedSegmentReader<'_> {
                     ));
                 }
                 self.remaining_in_segment -= n as u64;
+                if let Some(verifier) = self.current_packed_hash.as_mut() {
+                    verifier.update(&buf[..n]);
+                }
+                if self.remaining_in_segment == 0 {
+                    self.finish_current_packed_hash()?;
+                }
                 return Ok(n);
             }
 
@@ -4962,6 +5241,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rar5_windows_symlink_target_strips_absolute_prefix_like_unrar() {
+        assert_eq!(
+            RarArchive::normalized_rar5_redirection_target(
+                header::RedirectionType::WindowsSymlink,
+                "\\??\\C:\\target"
+            ),
+            "C:/target"
+        );
+    }
+
+    #[test]
+    fn rar5_hardlink_target_keeps_prefix_after_slash_to_native_like_unrar() {
+        assert_eq!(
+            RarArchive::normalized_rar5_redirection_target(
+                header::RedirectionType::Hardlink,
+                "\\??\\C:\\target"
+            ),
+            "??/C:/target"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rar5_file_reference_drive_prefix_is_relative_like_unrar_on_unix() {
+        assert_eq!(
+            RarArchive::normalized_rar5_redirection_target(
+                header::RedirectionType::FileCopy,
+                "C:\\dir\\source.txt"
+            ),
+            "C:/dir/source.txt"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rar5_file_reference_target_path_preserves_drive_relative_prefix_on_unix() {
+        assert_eq!(
+            RarArchive::redirection_target_path(
+                "copy.bin",
+                "C:/dir/source.txt",
+                std::path::Path::new("/tmp/out/copy.bin"),
+            ),
+            std::path::Path::new("/tmp/out/C:/dir/source.txt")
+        );
+    }
+
+    #[test]
+    fn rar5_filecopy_target_uses_slash_to_native_and_convert_path_like_unrar() {
+        assert_eq!(
+            RarArchive::normalized_rar5_redirection_target(
+                header::RedirectionType::FileCopy,
+                "old\\..\\dir\\source.txt"
+            ),
+            "dir/source.txt"
+        );
+    }
+
     fn empty_rar5_archive() -> RarArchive {
         RarArchive {
             format: ArchiveFormat::Rar5,
@@ -4993,16 +5330,44 @@ mod tests {
     #[test]
     fn chained_segment_reader_rejects_oversized_segment_before_reading() {
         let provider = TestVolumeProvider { data: vec![0; 8] };
-        let segments = [DataSegment {
-            volume_index: 0,
-            data_offset: 0,
-            data_size: 9,
-        }];
+        let segments = [DataSegment::new(0, 0, 9)];
         let mut reader = ChainedSegmentReader::new(&segments, &provider).with_max_data_segment(8);
 
         let mut buf = [0u8; 1];
         let err = reader.read(&mut buf).unwrap_err();
         assert!(err.to_string().contains("exceeds limit 8"));
+    }
+
+    #[test]
+    fn non_file_extraction_rejects_rar3_unix_symlink_member() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let fh = test_rar3_symlink_header(None);
+        let entry = MemberEntry {
+            file_header: fh.clone(),
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: Vec::new(),
+        };
+
+        let err = archive
+            .reject_link_member_without_file_target(&entry, &fh)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RarError::UnsupportedLinkType {
+                    ref member,
+                    ref link_type
+                } if member == "link" && link_type.contains("requires extract_member_to_file")
+            ),
+            "expected UnsupportedLinkType, got {err}"
+        );
     }
 
     #[test]

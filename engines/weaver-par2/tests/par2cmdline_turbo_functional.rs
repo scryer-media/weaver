@@ -28,6 +28,30 @@ fn run_synthetic_repair_with_skip_leeway(
         .expect("run synthetic par2 repairer")
 }
 
+fn split_synthetic_packet_stream(stream: &[u8]) -> Vec<&[u8]> {
+    let mut packets = Vec::new();
+    let mut offset = 0usize;
+    while offset < stream.len() {
+        assert!(
+            stream.len() - offset >= 64,
+            "synthetic packet stream ended mid-header"
+        );
+        assert_eq!(&stream[offset..offset + 8], b"PAR2\0PKT");
+        let length =
+            u64::from_le_bytes(stream[offset + 8..offset + 16].try_into().unwrap()) as usize;
+        assert!(length >= 64, "synthetic packet length was too short");
+        assert!(
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= stream.len()),
+            "synthetic packet length exceeded stream"
+        );
+        packets.push(&stream[offset..offset + length]);
+        offset += length;
+    }
+    packets
+}
+
 #[test]
 fn upstream_test2_verify_par2_flatdata() {
     let temp = temp_case_dir("test2");
@@ -62,6 +86,88 @@ fn upstream_test4_repair_two_missing_files() {
         temp.path().join("test-3.data.orig"),
         "test4 test-3.data",
     );
+}
+
+#[test]
+fn upstream_test5_repair_full_multifile_loss() {
+    let temp = temp_case_dir("test5");
+    let mut rng = Rng::new(5_005_005);
+    let synthetic = build_synthetic_par2(&[192, 381, 572, 763, 954], 192, 16, &mut rng);
+
+    for file in &synthetic.files {
+        fs::write(temp.path().join(&file.filename), &file.data).expect("write source file");
+        fs::write(
+            temp.path().join(format!("{}.orig", file.filename)),
+            &file.data,
+        )
+        .expect("write reference file");
+        fs::remove_file(temp.path().join(&file.filename)).expect("remove source file");
+    }
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    options.file_set = Some(synthetic.par2_set);
+    let outcome = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("test5 full loss repair should succeed");
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+
+    for file in &synthetic.files {
+        assert_file_matches(
+            temp.path().join(&file.filename),
+            temp.path().join(format!("{}.orig", file.filename)),
+            &format!("test5 repaired {}", file.filename),
+        );
+    }
+}
+
+#[test]
+fn upstream_test11_repairs_repeated_damage_from_same_recovery_set() {
+    let temp = temp_case_dir("test11");
+    let mut rng = Rng::new(11_011_011);
+    let sizes = vec![64usize; 100];
+    let synthetic = build_synthetic_par2(&sizes, 64, 5, &mut rng);
+
+    for file in &synthetic.files {
+        fs::write(temp.path().join(&file.filename), &file.data).expect("write source file");
+    }
+
+    for index in [0usize, 1, 3] {
+        fs::remove_file(temp.path().join(&synthetic.files[index].filename))
+            .expect("remove first-round source file");
+    }
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    options.file_set = Some(synthetic.par2_set.clone());
+    let first = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("test11 first repair should succeed");
+    assert_eq!(first.status, Par2RepairStatus::Repaired);
+    for file in &synthetic.files {
+        assert_eq!(
+            fs::read(temp.path().join(&file.filename)).expect("read first repaired file"),
+            file.data,
+            "test11 first repair {}",
+            file.filename
+        );
+    }
+
+    fs::remove_file(temp.path().join(&synthetic.files[5].filename))
+        .expect("remove second-round source file");
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    options.file_set = Some(synthetic.par2_set);
+    let second = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("test11 second repair should succeed");
+    assert_eq!(second.status, Par2RepairStatus::Repaired);
+    for file in &synthetic.files {
+        assert_eq!(
+            fs::read(temp.path().join(&file.filename)).expect("read second repaired file"),
+            file.data,
+            "test11 second repair {}",
+            file.filename
+        );
+    }
 }
 
 #[test]
@@ -359,6 +465,206 @@ fn upstream_test24_repair_faraway_base_dir() {
 }
 
 #[test]
+fn upstream_test25_repairs_when_primary_input_is_source_file() {
+    let temp = temp_case_dir("test25");
+    let mut rng = Rng::new(25_025_025);
+    let synthetic = build_synthetic_par2(&[128], 64, 2, &mut rng);
+    let file = &synthetic.files[0];
+    let source = temp.path().join(&file.filename);
+    let par2 = temp.path().join(format!("{}.par2", file.filename));
+
+    fs::write(&source, &file.data).expect("write source file");
+    fs::write(&par2, &synthetic.packet_bytes).expect("write sibling par2 file");
+    let mut damaged = file.data.clone();
+    damaged[0] ^= 0x5a;
+    fs::write(&source, &damaged).expect("damage source file");
+
+    let outcome = run_repair(temp.path(), &source, &[]);
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&source).expect("read repaired source file"),
+        file.data,
+        "test25 repaired source file differed"
+    );
+}
+
+#[test]
+fn upstream_repair_purge_removes_backups_and_loaded_par2_files() {
+    let temp = temp_case_dir("purge");
+    let mut rng = Rng::new(25_125_125);
+    let synthetic = build_synthetic_par2(&[128], 64, 2, &mut rng);
+    let file = &synthetic.files[0];
+    let source = temp.path().join(&file.filename);
+    let par2 = temp.path().join(format!("{}.par2", file.filename));
+
+    fs::write(&source, &file.data).expect("write source file");
+    fs::write(&par2, &synthetic.packet_bytes).expect("write sibling par2 file");
+    let mut damaged = file.data.clone();
+    damaged[0] ^= 0xc3;
+    fs::write(&source, &damaged).expect("damage source file");
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), vec![source.clone()]);
+    options.purge = true;
+    let outcome = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("purge repair should succeed");
+
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&source).expect("read repaired source file"),
+        file.data,
+        "purge repaired source file differed"
+    );
+    assert!(
+        !par2.exists(),
+        "purge should remove the loaded sibling par2 file"
+    );
+    assert!(
+        !temp.path().join(format!("{}.1", file.filename)).exists(),
+        "purge should remove the numbered backup"
+    );
+}
+
+#[test]
+fn upstream_repair_purge_keeps_extra_par2_marker_packet_inputs() {
+    let temp = temp_case_dir("purge-extra-par2-marker");
+    let mut rng = Rng::new(25_175_175);
+    let synthetic = build_synthetic_par2(&[128], 64, 1, &mut rng);
+    let file = &synthetic.files[0];
+    let source = temp.path().join(&file.filename);
+    let par2 = temp.path().join(format!("{}.par2", file.filename));
+    let extra_recovery = temp.path().join(format!("{}.par2.bak", file.filename));
+    let packets = split_synthetic_packet_stream(&synthetic.packet_bytes);
+
+    fs::write(&source, &file.data).expect("write source file");
+    fs::write(&par2, packets[..3].concat()).expect("write primary par2 file");
+    fs::write(&extra_recovery, packets[3..].concat()).expect("write extra recovery packet file");
+    let mut damaged = file.data.clone();
+    damaged[0] ^= 0x6d;
+    fs::write(&source, &damaged).expect("damage source file");
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), vec![source.clone()]);
+    options.extra_paths.push(extra_recovery.clone());
+    options.purge = true;
+    let outcome = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("purge repair with extra PAR marker packets should succeed");
+
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&source).expect("read repaired source file"),
+        file.data,
+        "purge extra PAR marker repaired source file differed"
+    );
+    assert!(
+        !par2.exists(),
+        "purge should remove the primary sibling par2 file"
+    );
+    assert!(
+        extra_recovery.exists(),
+        "purge should keep command-line extra PAR marker packet inputs"
+    );
+    assert!(
+        !temp.path().join(format!("{}.1", file.filename)).exists(),
+        "purge should still remove the numbered backup"
+    );
+}
+
+#[test]
+fn upstream_verify_purge_removes_all_loaded_par2_files() {
+    let temp = temp_case_dir("verify-purge");
+    let mut rng = Rng::new(25_225_225);
+    let synthetic = build_synthetic_par2(&[128], 64, 2, &mut rng);
+    let file = &synthetic.files[0];
+    let source = temp.path().join(&file.filename);
+    let par2 = temp.path().join(format!("{}.par2", file.filename));
+    let volume = temp.path().join(format!("{}.vol0+2.par2", file.filename));
+    let packets = split_synthetic_packet_stream(&synthetic.packet_bytes);
+
+    fs::write(&source, &file.data).expect("write source file");
+    fs::write(&par2, packets[..3].concat()).expect("write primary par2 file");
+    fs::write(&volume, packets[3..].concat()).expect("write recovery volume file");
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), vec![source.clone()]);
+    options.repair = false;
+    options.purge = true;
+    let outcome = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("verify purge should succeed");
+
+    assert_eq!(outcome.status, Par2RepairStatus::Verified);
+    assert_eq!(
+        fs::read(&source).expect("read verified source file"),
+        file.data,
+        "verify purge should leave the verified source file intact"
+    );
+    assert!(
+        !par2.exists(),
+        "verify purge should remove the primary par2"
+    );
+    assert!(
+        !volume.exists(),
+        "verify purge should remove the loaded recovery volume"
+    );
+}
+
+#[test]
+fn upstream_test26_repairs_source_file_inside_subfolder() {
+    let temp = temp_case_dir("test26");
+    let work = temp.path().join("subfolder");
+    fs::create_dir_all(&work).expect("create subfolder");
+    let mut rng = Rng::new(26_026_026);
+    let synthetic = build_synthetic_par2(&[128], 64, 2, &mut rng);
+    let file = &synthetic.files[0];
+    let source = work.join(&file.filename);
+    let par2 = work.join(format!("{}.par2", file.filename));
+
+    fs::write(&source, &file.data).expect("write subfolder source file");
+    fs::write(&par2, &synthetic.packet_bytes).expect("write subfolder sibling par2 file");
+    let mut damaged = file.data.clone();
+    damaged[0] ^= 0xa5;
+    fs::write(&source, &damaged).expect("damage subfolder source file");
+
+    let outcome = run_repair(&work, &source, &[]);
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&source).expect("read repaired subfolder source file"),
+        file.data,
+        "test26 repaired subfolder source file differed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_test27_repairs_source_file_inside_symlinked_directory() {
+    let temp = temp_case_dir("test27");
+    let real_work = temp.path().join("folder/subfolder");
+    let link_work = temp.path().join("tmp");
+    fs::create_dir_all(&real_work).expect("create real subfolder");
+    std::os::unix::fs::symlink(&real_work, &link_work).expect("create directory symlink");
+
+    let mut rng = Rng::new(27_027_027);
+    let synthetic = build_synthetic_par2(&[128], 64, 2, &mut rng);
+    let file = &synthetic.files[0];
+    let source = link_work.join(&file.filename);
+    let par2 = link_work.join(format!("{}.par2", file.filename));
+
+    fs::write(&source, &file.data).expect("write symlinked source file");
+    fs::write(&par2, &synthetic.packet_bytes).expect("write symlinked sibling par2 file");
+    let mut damaged = file.data.clone();
+    damaged[0] ^= 0x33;
+    fs::write(&source, &damaged).expect("damage symlinked source file");
+
+    let outcome = run_repair(&link_work, &source, &[]);
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&source).expect("read repaired symlinked source file"),
+        file.data,
+        "test27 repaired symlinked source file differed"
+    );
+}
+
+#[test]
 fn upstream_test29_repair_issue_190_bitflip() {
     let temp = temp_case_dir("test29");
     extract_fixture("test29-generated.tar.gz", temp.path());
@@ -491,6 +797,105 @@ fn upstream_test34_damaged_renamed_candidate_does_not_confuse_repair() {
         temp.path().join("test-0.data"),
         temp.path().join("test-0.data.orig"),
         "test34 repaired file",
+    );
+}
+
+#[test]
+fn upstream_test34_rename_only_ignores_damaged_candidate_blocks() {
+    let temp = temp_case_dir("test34-rename-only");
+    let mut rng = Rng::new(34_034_034);
+    let synthetic = build_synthetic_par2(&[128], 64, 1, &mut rng);
+    let file = &synthetic.files[0];
+    let damaged = temp.path().join("renamed-damaged.data");
+
+    let mut damaged_data = file.data.clone();
+    damaged_data[80] ^= 0x7f;
+    fs::write(&damaged, &damaged_data).expect("write damaged renamed candidate");
+
+    let mut normal_options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    normal_options.file_set = Some(synthetic.par2_set.clone());
+    normal_options.extra_paths = vec![damaged.clone()];
+    let normal = Par2Repairer::new(normal_options)
+        .verify_or_repair()
+        .expect("test34 normal repair should use intact blocks from damaged candidate");
+    assert_eq!(normal.status, Par2RepairStatus::Repaired);
+    assert_eq!(
+        fs::read(temp.path().join(&file.filename)).expect("read normal repaired file"),
+        file.data,
+        "test34 normal repaired file"
+    );
+
+    let temp = temp_case_dir("test34-rename-only");
+    let damaged = temp.path().join("renamed-damaged.data");
+    fs::write(&damaged, &damaged_data).expect("write damaged renamed candidate");
+    let mut rename_only_options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    rename_only_options.file_set = Some(synthetic.par2_set);
+    rename_only_options.extra_paths = vec![damaged];
+    rename_only_options.rename_only = true;
+    let rename_only = Par2Repairer::new(rename_only_options)
+        .verify_or_repair()
+        .expect("test34 rename-only repair should return an outcome");
+    assert_eq!(rename_only.status, Par2RepairStatus::Insufficient);
+    assert!(
+        !temp.path().join(&file.filename).exists(),
+        "test34 rename-only should not reconstruct from partial renamed data"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_test35_repairs_existing_primary_symlink_without_following_target() {
+    let temp = temp_case_dir("test35");
+    let original = b"01234567890abcdef".to_vec();
+    let mut rng = Rng::new(35_035_035);
+    let synthetic = build_synthetic_par2(&[original.len()], 64, 1, &mut rng);
+    let original = synthetic.files[0].data.clone();
+    let file_id = synthetic.files[0].file_id;
+
+    let target = temp.path().join("test_file");
+    let link = temp.path().join("test_link");
+    fs::write(&target, &original).expect("write symlink target");
+    std::os::unix::fs::symlink(&target, &link).expect("create primary symlink");
+
+    let mut damaged = original.clone();
+    damaged.push(b'!');
+    fs::write(&target, &damaged).expect("damage symlink target");
+
+    let mut set = synthetic.par2_set;
+    let desc = set
+        .files
+        .get_mut(&file_id)
+        .expect("synthetic file description");
+    desc.filename = "test_link".to_owned();
+    desc.par2_name = "test_link".to_owned();
+
+    let mut options = Par2RepairerOptions::new(temp.path().to_path_buf(), Vec::new());
+    options.file_set = Some(set);
+    let outcome = Par2Repairer::new(options)
+        .verify_or_repair()
+        .expect("test35 existing symlink repair should succeed");
+
+    assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+    assert_eq!(fs::read(&link).expect("read repaired link path"), original);
+    assert!(
+        !link
+            .symlink_metadata()
+            .expect("link path metadata")
+            .file_type()
+            .is_symlink(),
+        "test35 should replace the symlink itself with a repaired regular file"
+    );
+    assert_eq!(
+        fs::read(&target).expect("read original symlink target"),
+        damaged,
+        "test35 should not write through the original symlink target"
+    );
+    assert!(
+        temp.path()
+            .join("test_link.1")
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "test35 should keep the original symlink as the numbered backup"
     );
 }
 

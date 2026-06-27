@@ -3,50 +3,47 @@
 //! Prevents path traversal attacks by stripping dangerous components
 //! from file paths extracted from RAR archives.
 
+use crate::types::{ArchiveFormat, HostOs};
+
 /// Sanitize a file path from an archive to prevent path traversal.
 ///
 /// - Strip leading `/` and `\`
 /// - Cut to the suffix after the last `../` or `..\` traversal
 /// - Strip Windows drive letters (e.g., `C:`)
-/// - Collapse `./` to empty
-/// - Remove null bytes
+/// - Strip leading dot/slash prefixes
+/// - Truncate at the first null byte
 /// - Convert backslashes to forward slashes
-/// - Collapse multiple consecutive slashes
 pub fn sanitize_path(raw: &str) -> String {
-    // Remove null bytes first.
-    let cleaned: String = raw.chars().filter(|&c| c != '\0').collect();
+    let cleaned = raw.split_once('\0').map_or(raw, |(prefix, _)| prefix);
 
     // Convert backslashes to forward slashes.
     let normalized = cleaned.replace('\\', "/");
 
-    let start = unrar_convert_path_start(&normalized);
-    let suffix = &normalized[start..];
-
-    let mut parts: Vec<&str> = Vec::new();
-
-    for component in suffix.split('/') {
-        match component {
-            // Skip empty components (from leading/multiple slashes).
-            "" => continue,
-            // Skip parent directory traversal.
-            ".." => continue,
-            // Skip current directory references.
-            "." => continue,
-            other => {
-                // Strip Windows drive letter (e.g., "C:" or "D:") — only for
-                // the very first real component.
-                if parts.is_empty() && is_drive_letter(other) {
-                    continue;
-                }
-                parts.push(other);
-            }
-        }
-    }
-
-    parts.join("/")
+    let start = unrar_convert_path_start(&normalized, true);
+    normalized[start..].to_string()
 }
 
-fn unrar_convert_path_start(path: &str) -> usize {
+pub(crate) fn sanitize_file_redirection_path(raw: &str) -> String {
+    let cleaned = raw.split_once('\0').map_or(raw, |(prefix, _)| prefix);
+    let normalized = cleaned.replace('\\', "/");
+
+    let start = unrar_convert_path_start(&normalized, cfg!(windows));
+    normalized[start..].to_string()
+}
+
+pub(crate) fn sanitize_member_path(format: ArchiveFormat, host_os: HostOs, raw: &str) -> String {
+    let cleaned = raw.split_once('\0').map_or(raw, |(prefix, _)| prefix);
+    let converted = match format {
+        ArchiveFormat::Rar5 if matches!(host_os, HostOs::Windows) => cleaned.replace('\\', "_"),
+        ArchiveFormat::Rar5 => cleaned.to_string(),
+        ArchiveFormat::Rar4 | ArchiveFormat::Rar14 => cleaned.replace('\\', "/"),
+    };
+
+    let start = unrar_convert_path_start(&converted, true);
+    converted[start..].to_string()
+}
+
+fn unrar_convert_path_start(path: &str, strip_drive_specs: bool) -> usize {
     let bytes = path.as_bytes();
     let mut dest_pos = 0usize;
 
@@ -68,7 +65,7 @@ fn unrar_convert_path_start(path: &str) -> usize {
     while dest_pos < bytes.len() {
         let mut i = dest_pos;
 
-        if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+        if strip_drive_specs && i + 1 < bytes.len() && bytes[i + 1] == b':' {
             i += 2;
         }
 
@@ -111,7 +108,7 @@ fn unrar_convert_path_start(path: &str) -> usize {
 /// `member_path` is the sanitized path of the symlink member itself.
 /// `target` is the raw link target from the archive.
 pub fn is_safe_link_target(member_path: &str, target: &str) -> bool {
-    is_safe_link_target_inner(member_path, target, false)
+    is_safe_link_target_inner(member_path, target, false, true, true, true)
 }
 
 pub(crate) fn is_safe_symlink_target_for_member(
@@ -120,22 +117,57 @@ pub(crate) fn is_safe_symlink_target_for_member(
     target: &str,
     allow_windows_drive_relative: bool,
 ) -> bool {
-    is_safe_link_target_inner(member_path, target, allow_windows_drive_relative)
-        && is_safe_link_target_inner(raw_member_path, target, allow_windows_drive_relative)
+    is_safe_link_target_inner(
+        member_path,
+        target,
+        allow_windows_drive_relative,
+        true,
+        true,
+        true,
+    ) && is_safe_link_target_inner(
+        raw_member_path,
+        target,
+        allow_windows_drive_relative,
+        true,
+        true,
+        true,
+    )
+}
+
+pub(crate) fn is_safe_symlink_target_for_archive_member(
+    format: ArchiveFormat,
+    member_path: &str,
+    raw_member_path: &str,
+    target: &str,
+) -> bool {
+    let raw_member_backslash_is_separator = !matches!(format, ArchiveFormat::Rar5);
+    is_safe_link_target_inner(member_path, target, true, false, false, false)
+        && is_safe_link_target_inner(
+            raw_member_path,
+            target,
+            true,
+            raw_member_backslash_is_separator,
+            false,
+            false,
+        )
 }
 
 fn is_safe_link_target_inner(
     member_path: &str,
     target: &str,
     allow_windows_drive_relative: bool,
+    member_backslash_is_separator: bool,
+    target_backslash_is_separator: bool,
+    member_windows_drive_is_root: bool,
 ) -> bool {
-    let member_path = member_path.replace('\\', "/");
-    if is_full_root_path(&member_path) {
+    let member_path =
+        normalize_backslash_for_path_check(member_path, member_backslash_is_separator);
+    if is_full_root_path(&member_path, member_windows_drive_is_root) {
         return false;
     }
 
     // Reject absolute paths.
-    let target = target.replace('\\', "/");
+    let target = normalize_backslash_for_path_check(target, target_backslash_is_separator);
     if target.starts_with('/') {
         return false;
     }
@@ -158,9 +190,18 @@ fn is_safe_link_target_inner(
     target_parent_traversal_count(&target) <= allowed_link_source_depth(&member_path)
 }
 
-fn is_full_root_path(path: &str) -> bool {
+fn normalize_backslash_for_path_check(path: &str, backslash_is_separator: bool) -> String {
+    if backslash_is_separator {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    }
+}
+
+fn is_full_root_path(path: &str, windows_drive_is_root: bool) -> bool {
     path.starts_with('/')
-        || (path.as_bytes().len() >= 2
+        || (windows_drive_is_root
+            && path.as_bytes().len() >= 2
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':')
 }
@@ -193,12 +234,6 @@ fn target_parent_traversal_count(target: &str) -> usize {
         .split('/')
         .filter(|component| *component == "..")
         .count()
-}
-
-/// Check if a path component is a Windows drive letter like `C:` or `D:`.
-fn is_drive_letter(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[cfg(test)]
@@ -256,9 +291,39 @@ mod tests {
         assert_eq!(sanitize_path("c:/users/file.txt"), "users/file.txt");
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn null_bytes_removed() {
-        assert_eq!(sanitize_path("foo\0bar.txt"), "foobar.txt");
+    fn file_redirection_drive_prefix_is_relative_like_unrar_on_unix() {
+        assert_eq!(
+            sanitize_file_redirection_path("C:\\dir\\source.txt"),
+            "C:/dir/source.txt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_redirection_drive_prefix_is_stripped_like_unrar_on_windows() {
+        assert_eq!(
+            sanitize_file_redirection_path("C:\\dir\\source.txt"),
+            "dir/source.txt"
+        );
+    }
+
+    #[test]
+    fn file_redirection_still_strips_roots_and_traversal() {
+        assert_eq!(
+            sanitize_file_redirection_path("//server/share/dir/source.txt"),
+            "dir/source.txt"
+        );
+        assert_eq!(
+            sanitize_file_redirection_path("a/../dir/source.txt"),
+            "dir/source.txt"
+        );
+    }
+
+    #[test]
+    fn null_byte_truncates_like_unrar() {
+        assert_eq!(sanitize_path("foo\0bar.txt"), "foo");
     }
 
     #[test]
@@ -267,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn multiple_slashes_collapsed() {
-        assert_eq!(sanitize_path("foo///bar//baz.txt"), "foo/bar/baz.txt");
+    fn internal_multiple_slashes_preserved_like_unrar() {
+        assert_eq!(sanitize_path("foo///bar//baz.txt"), "foo///bar//baz.txt");
     }
 
     #[test]
@@ -302,13 +367,18 @@ mod tests {
 
     #[test]
     fn complex_traversal() {
-        assert_eq!(sanitize_path("/../.././foo/../bar/./baz"), "bar/baz");
+        assert_eq!(sanitize_path("/../.././foo/../bar/./baz"), "bar/./baz");
     }
 
     #[test]
     fn repeated_internal_traversal_uses_last_suffix_like_unrar() {
         assert_eq!(sanitize_path("foo/../../bar/baz.txt"), "bar/baz.txt");
         assert_eq!(sanitize_path("a/../b/../c.txt"), "c.txt");
+    }
+
+    #[test]
+    fn internal_dot_components_preserved_like_unrar() {
+        assert_eq!(sanitize_path("foo/./bar.txt"), "foo/./bar.txt");
     }
 
     #[test]
@@ -319,6 +389,42 @@ mod tests {
     #[test]
     fn unc_prefix_stripped_like_unrar() {
         assert_eq!(sanitize_path("//server/share/dir/file.txt"), "dir/file.txt");
+    }
+
+    #[test]
+    fn rar5_windows_member_backslash_becomes_underscore_like_unrar_on_unix() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Windows, "dir\\file.txt"),
+            "dir_file.txt"
+        );
+    }
+
+    #[test]
+    fn rar5_unix_member_backslash_remains_literal_like_unrar_on_unix() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Unix, "dir\\file.txt"),
+            "dir\\file.txt"
+        );
+    }
+
+    #[test]
+    fn rar4_member_backslash_remains_path_separator_like_unrar() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar4, HostOs::Unix, "dir\\file.txt"),
+            "dir/file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar4, HostOs::Windows, "dir\\file.txt"),
+            "dir/file.txt"
+        );
+    }
+
+    #[test]
+    fn rar5_windows_slash_traversal_still_cuts_after_backslash_conversion() {
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Windows, "a/../b\\c.txt"),
+            "b_c.txt"
+        );
     }
 
     // Link target validation tests
@@ -342,6 +448,56 @@ mod tests {
     fn unsafe_traversal_link() {
         // dir/link -> ../../escape — goes above root
         assert!(!is_safe_link_target("dir/link", "../../escape"));
+    }
+
+    #[test]
+    fn rar5_unix_backslash_member_does_not_grant_symlink_parent_depth() {
+        assert!(!is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "dir\\link",
+            "dir\\link",
+            "../escape"
+        ));
+    }
+
+    #[test]
+    fn rar4_backslash_member_still_grants_symlink_parent_depth_like_unrar() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar4,
+            "dir/link",
+            "dir\\link",
+            "../sibling"
+        ));
+    }
+
+    #[test]
+    fn unix_symlink_target_backslash_dotdot_is_literal_like_unrar() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "link",
+            "link",
+            "..\\not-parent"
+        ));
+    }
+
+    #[test]
+    fn archive_symlink_target_drive_letter_is_relative_like_unrar_on_unix() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "link",
+            "link",
+            "C:\\literal"
+        ));
+    }
+
+    #[test]
+    fn archive_symlink_member_drive_letter_is_not_root_like_unrar_on_unix() {
+        assert!(is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "_literal",
+            "C:\\literal",
+            "target"
+        ));
     }
 
     #[test]

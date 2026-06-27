@@ -207,61 +207,88 @@ impl Default for FileHashState {
 }
 
 /// Combine two CRC32 values as if the underlying data were concatenated.
-pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
-    if len2 == 0 {
-        return crc1;
-    }
+const CRC32_COMBINE_POLY: u32 = 0xEDB8_8320;
 
-    const POLY: u32 = 0xEDB8_8320;
+#[derive(Debug, Clone)]
+pub(crate) struct Crc32CombineOp {
+    op: Option<[u32; 32]>,
+    crc2: u32,
+}
 
-    #[inline]
-    fn mat_vec(mat: &[u32; 32], vec: u32) -> u32 {
-        let mut result = 0u32;
-        let mut v = vec;
-        let mut i = 0;
-        while v != 0 {
-            if v & 1 != 0 {
-                result ^= mat[i];
-            }
-            v >>= 1;
-            i += 1;
+impl Crc32CombineOp {
+    pub(crate) fn new(len2: u64, crc2: u32) -> Self {
+        if len2 == 0 {
+            return Self { op: None, crc2 };
         }
-        result
-    }
 
-    fn mat_square(square: &mut [u32; 32], mat: &[u32; 32]) {
-        for n in 0..32 {
-            square[n] = mat_vec(mat, mat[n]);
+        let mut op = [0u32; 32];
+        op[0] = CRC32_COMBINE_POLY;
+        for (n, item) in op.iter_mut().enumerate().skip(1) {
+            *item = 1 << (n - 1);
         }
-    }
 
-    let mut op = [0u32; 32];
-    op[0] = POLY;
-    for (n, item) in op.iter_mut().enumerate().skip(1) {
-        *item = 1 << (n - 1);
-    }
-
-    let mut tmp = [0u32; 32];
-    for _ in 0..3 {
-        mat_square(&mut tmp, &op);
-        op = tmp;
-    }
-
-    let mut result = crc1;
-    let mut remaining = len2;
-
-    while remaining > 0 {
-        if remaining & 1 != 0 {
-            result = mat_vec(&op, result);
-        }
-        remaining >>= 1;
-        if remaining > 0 {
-            mat_square(&mut tmp, &op);
+        let mut tmp = [0u32; 32];
+        for _ in 0..3 {
+            crc32_mat_square(&mut tmp, &op);
             op = tmp;
         }
+
+        let mut remaining = len2;
+        let mut combined = [0u32; 32];
+        for (n, item) in combined.iter_mut().enumerate() {
+            *item = 1 << n;
+        }
+        while remaining > 0 {
+            if remaining & 1 != 0 {
+                let previous = combined;
+                for n in 0..32 {
+                    combined[n] = crc32_mat_vec(&op, previous[n]);
+                }
+            }
+            remaining >>= 1;
+            if remaining > 0 {
+                crc32_mat_square(&mut tmp, &op);
+                op = tmp;
+            }
+        }
+
+        Self {
+            op: Some(combined),
+            crc2,
+        }
     }
 
-    result ^ crc2
+    pub(crate) fn combine(&self, crc1: u32) -> u32 {
+        match &self.op {
+            Some(op) => crc32_mat_vec(op, crc1) ^ self.crc2,
+            None => crc1,
+        }
+    }
+}
+
+#[inline]
+fn crc32_mat_vec(mat: &[u32; 32], vec: u32) -> u32 {
+    let mut result = 0u32;
+    let mut v = vec;
+    let mut i = 0;
+    while v != 0 {
+        if v & 1 != 0 {
+            result ^= mat[i];
+        }
+        v >>= 1;
+        i += 1;
+    }
+    result
+}
+
+fn crc32_mat_square(square: &mut [u32; 32], mat: &[u32; 32]) {
+    for n in 0..32 {
+        square[n] = crc32_mat_vec(mat, mat[n]);
+    }
+}
+
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    Crc32CombineOp::new(len2, crc2).combine(crc1)
 }
 
 /// Compute CRC32 of a byte slice.
@@ -317,5 +344,18 @@ mod tests {
         state.update(b"par2");
         state.update(b"-state");
         assert_eq!(state.finalize(), md5(b"par2-state"));
+    }
+
+    #[test]
+    fn crc32_combine_op_matches_one_shot_combine() {
+        let first = crc32(b"short-tail");
+        let padding = [0u8; 17];
+        let second = crc32(&padding);
+        let mut concatenated = b"short-tail".to_vec();
+        concatenated.extend_from_slice(&padding);
+
+        let op = Crc32CombineOp::new(padding.len() as u64, second);
+        assert_eq!(op.combine(first), crc32_combine(first, second, 17));
+        assert_eq!(op.combine(first), crc32(&concatenated));
     }
 }

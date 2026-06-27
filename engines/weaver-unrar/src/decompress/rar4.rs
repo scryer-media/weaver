@@ -169,7 +169,7 @@ impl Rar4LzDecoder {
         let (ddecode, dbits) = build_ddecode_tables();
         Ok(Self {
             window: Window::try_new(dict_size)?,
-            dist_cache: [0; 4],
+            dist_cache: [usize::MAX; 4],
             last_length: 0,
             ld_table: None,
             dd_table: None,
@@ -482,9 +482,7 @@ impl Rar4LzDecoder {
             Rar4StandardFilter::None => {}
             Rar4StandardFilter::E8 | Rar4StandardFilter::E8E9 => {
                 if !(4..=VM_MEM_SIZE).contains(&data_size) {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("RAR4: invalid E8 filter block length {data_size}"),
-                    });
+                    return Ok(());
                 }
 
                 if filter.filter_type == Rar4StandardFilter::E8E9 {
@@ -495,9 +493,7 @@ impl Rar4LzDecoder {
             }
             Rar4StandardFilter::Itanium => {
                 if !(21..=VM_MEM_SIZE).contains(&data_size) {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!("RAR4: invalid Itanium filter block length {data_size}"),
-                    });
+                    return Ok(());
                 }
 
                 let masks = [4u8, 4, 6, 6, 0, 0, 7, 7, 4, 4, 0, 0, 4, 4, 0, 0];
@@ -534,11 +530,7 @@ impl Rar4LzDecoder {
             Rar4StandardFilter::Delta => {
                 let channels = filter.init_regs[0];
                 if data_size > VM_MEM_SIZE / 2 || channels == 0 || channels > MAX3_UNPACK_CHANNELS {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4: invalid DELTA filter params size={data_size} channels={channels}"
-                        ),
-                    });
+                    return Ok(());
                 }
 
                 let mut dest = vec![0u8; data_size];
@@ -556,19 +548,10 @@ impl Rar4LzDecoder {
                 *data = dest;
             }
             Rar4StandardFilter::Rgb => {
-                let width =
-                    filter.init_regs[0]
-                        .checked_sub(3)
-                        .ok_or_else(|| RarError::CorruptArchive {
-                            detail: "RAR4: RGB filter width underflow".into(),
-                        })? as usize;
+                let width = filter.init_regs[0].wrapping_sub(3) as usize;
                 let pos_r = filter.init_regs[1] as usize;
                 if !(3..=VM_MEM_SIZE / 2).contains(&data_size) || width > data_size || pos_r > 2 {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4: invalid RGB filter params size={data_size} width={width} pos_r={pos_r}"
-                        ),
-                    });
+                    return Ok(());
                 }
 
                 let mut dest = vec![0u8; data_size];
@@ -620,11 +603,7 @@ impl Rar4LzDecoder {
             Rar4StandardFilter::Audio => {
                 let channels = filter.init_regs[0] as usize;
                 if data_size > VM_MEM_SIZE / 2 || channels == 0 || channels > 128 {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4: invalid AUDIO filter params size={data_size} channels={channels}"
-                        ),
-                    });
+                    return Ok(());
                 }
 
                 let mut dest = vec![0u8; data_size];
@@ -1186,7 +1165,7 @@ impl Rar4LzDecoder {
     /// Read Huffman tables from the bitstream (ReadTables30 equivalent).
     ///
     /// Byte-aligns first, then reads:
-    /// 1. Block type flag (PPM not supported, LZ only)
+    /// 1. Block type flag (PPM or LZ)
     /// 2. Table inheritance flag
     /// 3. BC code lengths (20 x 4-bit, with 15+zero_count special case)
     /// 4. Main code lengths using BC table (delta encoded)
@@ -1457,25 +1436,15 @@ impl Rar4LzDecoder {
                     let distance = self.dist_cache[0];
                     let remaining = (unpacked_size - output_size) as usize;
                     let visible_len = self.last_length.min(remaining);
-                    if distance > 0 {
-                        self.window.copy_with_visible_len(
-                            distance,
-                            self.last_length,
-                            visible_len,
-                        )?;
-                        output_size += visible_len as u64;
-                        should_check_yield = true;
-                    }
+                    self.window
+                        .copy_with_visible_len(distance, self.last_length, visible_len)?;
+                    output_size += visible_len as u64;
+                    should_check_yield = true;
                 }
             } else if number < 263 {
                 // Repeat distance from cache (259-262).
                 let cache_idx = number - 259;
                 let distance = self.dist_cache[cache_idx];
-                if distance == 0 {
-                    return Err(RarError::CorruptArchive {
-                        detail: "RAR4: distance cache entry is zero".into(),
-                    });
-                }
 
                 // Rotate cache.
                 for j in (1..=cache_idx).rev() {
@@ -1957,7 +1926,7 @@ impl Rar4LzDecoder {
 
     /// Reset the decoder for a new non-solid file.
     pub fn reset(&mut self) {
-        self.dist_cache = [0; 4];
+        self.dist_cache = [usize::MAX; 4];
         self.last_length = 0;
         self.ld_table = None;
         self.dd_table = None;
@@ -2091,7 +2060,7 @@ mod tests {
     fn test_decoder_creation() {
         let decoder = Rar4LzDecoder::new(4 * 1024 * 1024);
         assert_eq!(decoder.window.dict_size(), 4 * 1024 * 1024);
-        assert_eq!(decoder.dist_cache, [0; 4]);
+        assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
         assert_eq!(decoder.last_length, 0);
     }
 
@@ -2106,15 +2075,28 @@ mod tests {
     fn test_insert_old_dist() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.insert_old_dist(100);
-        assert_eq!(decoder.dist_cache, [100, 0, 0, 0]);
+        assert_eq!(decoder.dist_cache, [100, usize::MAX, usize::MAX, usize::MAX]);
         decoder.insert_old_dist(200);
-        assert_eq!(decoder.dist_cache, [200, 100, 0, 0]);
+        assert_eq!(decoder.dist_cache, [200, 100, usize::MAX, usize::MAX]);
         decoder.insert_old_dist(300);
-        assert_eq!(decoder.dist_cache, [300, 200, 100, 0]);
+        assert_eq!(decoder.dist_cache, [300, 200, 100, usize::MAX]);
         decoder.insert_old_dist(400);
         assert_eq!(decoder.dist_cache, [400, 300, 200, 100]);
         decoder.insert_old_dist(500);
         assert_eq!(decoder.dist_cache, [500, 400, 300, 200]);
+    }
+
+    #[test]
+    fn test_uninitialized_old_dist_zero_fills_like_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        let distance = decoder.dist_cache[0];
+
+        decoder
+            .window
+            .copy_with_visible_len(distance, 3, 3)
+            .unwrap();
+
+        assert_eq!(decoder.window.try_copy_output(0, 3).unwrap(), [0, 0, 0]);
     }
 
     #[test]
@@ -2172,6 +2154,34 @@ mod tests {
         let mut data = vec![1u8, 2, 3, 4];
         Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut data).unwrap();
         assert_eq!(data, vec![255, 253, 250, 246]);
+    }
+
+    #[test]
+    fn test_invalid_standard_filters_leave_block_unchanged_like_unrar() {
+        for (filter_type, data, init_regs) in [
+            (Rar4StandardFilter::E8, vec![0xe8, 1, 2], [0; 7]),
+            (Rar4StandardFilter::Itanium, vec![0x10; 20], [0; 7]),
+            (Rar4StandardFilter::Delta, vec![1, 2, 3, 4], [0; 7]),
+            (
+                Rar4StandardFilter::Rgb,
+                vec![1, 2, 3],
+                [2, 0, 0, 0, 3, 0, 0],
+            ),
+            (Rar4StandardFilter::Audio, vec![1, 2, 3, 4], [0; 7]),
+        ] {
+            let filter = Rar4PendingVmFilter {
+                filter_type,
+                block_start_total: 0,
+                block_length: data.len(),
+                init_regs,
+            };
+            let expected = data.clone();
+            let mut actual = data;
+
+            Rar4LzDecoder::execute_standard_filter(&filter, 0, &mut actual).unwrap();
+
+            assert_eq!(actual, expected, "filter {filter_type:?}");
+        }
     }
 
     #[test]

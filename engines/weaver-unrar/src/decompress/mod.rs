@@ -57,7 +57,7 @@ pub fn decompress_with_limits(
 ) -> RarResult<Vec<u8>> {
     enforce_direct_input_limit(input.len(), limits)?;
     enforce_direct_output_limit(unpacked_size, limits)?;
-    enforce_supported_rar4_compression(info)?;
+    enforce_supported_compression(info)?;
 
     match info.method {
         CompressionMethod::Store => {
@@ -155,9 +155,20 @@ fn effective_direct_dict_size(info: &CompressionInfo) -> u64 {
     }
 }
 
-fn enforce_supported_rar4_compression(info: &CompressionInfo) -> RarResult<()> {
-    if info.format.is_rar4_family() && info.method != CompressionMethod::Store {
+fn enforce_supported_compression(info: &CompressionInfo) -> RarResult<()> {
+    if info.method == CompressionMethod::Store {
+        return Ok(());
+    }
+
+    if info.format.is_rar4_family() {
         return rar4_old::ensure_supported_rar4_version(info.version, info.method.code());
+    }
+
+    if info.version > 1 {
+        return Err(RarError::UnsupportedCompression {
+            method: info.method.code(),
+            version: info.version,
+        });
     }
 
     Ok(())
@@ -202,7 +213,7 @@ fn decompress_to_writer_with_max_dict_size<W: Write>(
     writer: &mut W,
     max_dict_size: u64,
 ) -> RarResult<u64> {
-    enforce_supported_rar4_compression(info)?;
+    enforce_supported_compression(info)?;
 
     match info.method {
         CompressionMethod::Store => {
@@ -255,7 +266,7 @@ pub fn decompress_to_writer_chunked<F>(
 where
     F: FnMut(usize) -> RarResult<Box<dyn Write>>,
 {
-    enforce_supported_rar4_compression(info)?;
+    enforce_supported_compression(info)?;
 
     match info.method {
         CompressionMethod::Store => Err(RarError::CorruptArchive {
@@ -332,6 +343,73 @@ mod tests {
         assert!(matches!(
             result,
             Err(RarError::UnsupportedCompression { method: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn rar4_store_allows_future_unpack_version_like_unrar() {
+        let data = b"stored data ignores unpack version";
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar4,
+            version: 30,
+            solid: false,
+            method: CompressionMethod::Store,
+            dict_size: 0,
+        };
+
+        let result = decompress(data, data.len() as u64, &info, None).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn rar4_compressed_rejects_future_unpack_version_like_unrar() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar4,
+            version: 30,
+            solid: false,
+            method: CompressionMethod::Normal,
+            dict_size: 0x40000,
+        };
+
+        let result = decompress(&[], 0, &info, None);
+        assert!(matches!(
+            result,
+            Err(RarError::UnsupportedCompression { version: 30, .. })
+        ));
+    }
+
+    #[test]
+    fn rar5_store_allows_future_unpack_version_like_unrar() {
+        let data = b"stored rar5 data ignores unpack version";
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 2,
+            solid: false,
+            method: CompressionMethod::Store,
+            dict_size: 0,
+        };
+
+        let result = decompress(data, data.len() as u64, &info, None).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn rar5_compressed_rejects_future_unpack_version_like_unrar() {
+        let info = CompressionInfo {
+            format: ArchiveFormat::Rar5,
+            version: 2,
+            solid: false,
+            method: CompressionMethod::Normal,
+            dict_size: 0x40000,
+        };
+
+        let result = decompress(&[], 0, &info, None);
+        assert!(matches!(
+            result,
+            Err(RarError::UnsupportedCompression {
+                method: 3,
+                version: 2
+            })
         ));
     }
 

@@ -53,7 +53,8 @@ pub mod volume;
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeMemberFacts, ReadSeek,
+    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeMemberFacts,
+    RarVolumeServiceFacts, ReadSeek,
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};

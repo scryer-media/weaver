@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::{DataSegment, FileEncryptionInfo, MemberEntry, RarArchive};
+use super::{
+    DataSegment, FileEncryptionInfo, MemberEntry, PackedDataHash, RarArchive, ServiceEntry,
+};
 use crate::header::file::FileHeader;
 use crate::header::{Redirection, RedirectionType};
 use crate::limits::Limits;
@@ -49,6 +51,8 @@ pub struct CachedArchiveHeaders {
     #[serde(default)]
     pub last_volume_seen: bool,
     pub members: Vec<CachedMember>,
+    #[serde(default)]
+    pub services: Vec<CachedService>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,9 +96,48 @@ pub struct CachedMember {
     #[serde(default)]
     pub owner_group_name: Option<String>,
     #[serde(default)]
+    pub owner_user_name_raw: Option<Vec<u8>>,
+    #[serde(default)]
+    pub owner_group_name_raw: Option<Vec<u8>>,
+    #[serde(default)]
     pub owner_uid: Option<u64>,
     #[serde(default)]
     pub owner_gid: Option<u64>,
+    pub segments: Vec<CachedSegment>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CachedService {
+    pub name: String,
+    pub unpacked_size: Option<u64>,
+    #[serde(default)]
+    pub mtime_ns: Option<u64>,
+    #[serde(default)]
+    pub ctime_ns: Option<u64>,
+    #[serde(default)]
+    pub atime_ns: Option<u64>,
+    pub data_crc32: Option<u32>,
+    pub compression_method: u8,
+    #[serde(default)]
+    pub compression_version: u8,
+    pub compression_solid: bool,
+    pub dict_size: u64,
+    pub split_before: bool,
+    pub split_after: bool,
+    pub is_encrypted: bool,
+    pub encryption: Option<CachedEncryption>,
+    #[serde(default)]
+    pub version: Option<u64>,
+    #[serde(default)]
+    pub blake2_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub comment_crc16: Option<u16>,
+    #[serde(default)]
+    pub attributes: u64,
+    #[serde(default = "default_host_os_code")]
+    pub host_os: u64,
+    #[serde(default)]
+    pub service_subdata: Option<Vec<u8>>,
     pub segments: Vec<CachedSegment>,
 }
 
@@ -114,6 +157,12 @@ pub struct CachedSegment {
     pub volume_index: usize,
     pub data_offset: u64,
     pub data_size: u64,
+    #[serde(default)]
+    pub packed_crc32: Option<u32>,
+    #[serde(default)]
+    pub packed_blake2_hash: Option<[u8; 32]>,
+    #[serde(default)]
+    pub packed_hash_uses_mac: bool,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +216,7 @@ impl From<LegacyCachedArchiveHeaders> for CachedArchiveHeaders {
             last_volume_seen: value.last_volume_seen,
             recovery_records: Vec::new(),
             members: value.members.into_iter().map(CachedMember::from).collect(),
+            services: Vec::new(),
         }
     }
 }
@@ -199,6 +249,8 @@ impl From<LegacyCachedMember> for CachedMember {
             host_os: default_host_os_code(),
             owner_user_name: None,
             owner_group_name: None,
+            owner_user_name_raw: None,
+            owner_group_name_raw: None,
             owner_uid: None,
             owner_gid: None,
             segments: value.segments,
@@ -266,6 +318,68 @@ fn decode_host_os(host_os: u64) -> HostOs {
     }
 }
 
+fn cached_segments(segments: &[DataSegment]) -> Vec<CachedSegment> {
+    segments
+        .iter()
+        .map(|s| {
+            let (packed_crc32, packed_blake2_hash) = match s.packed_hash {
+                Some(PackedDataHash::Crc32(value)) => (Some(value), None),
+                Some(PackedDataHash::Blake2sp(value)) => (None, Some(value)),
+                None => (None, None),
+            };
+            CachedSegment {
+                volume_index: s.volume_index,
+                data_offset: s.data_offset,
+                data_size: s.data_size,
+                packed_crc32,
+                packed_blake2_hash,
+                packed_hash_uses_mac: s.packed_hash_uses_mac,
+            }
+        })
+        .collect()
+}
+
+fn data_segments(segments: Vec<CachedSegment>) -> Vec<DataSegment> {
+    segments
+        .into_iter()
+        .map(|s| {
+            let packed_hash = s
+                .packed_blake2_hash
+                .map(PackedDataHash::Blake2sp)
+                .or_else(|| s.packed_crc32.map(PackedDataHash::Crc32));
+            DataSegment::with_packed_hash(
+                s.volume_index,
+                s.data_offset,
+                s.data_size,
+                packed_hash,
+                s.packed_hash_uses_mac,
+            )
+        })
+        .collect()
+}
+
+fn cached_encryption(encryption: &FileEncryptionInfo) -> CachedEncryption {
+    CachedEncryption {
+        version: encryption.version,
+        kdf_count: encryption.kdf_count,
+        salt: encryption.salt,
+        iv: encryption.iv,
+        check_data: encryption.check_data,
+        use_hash_mac: encryption.use_hash_mac,
+    }
+}
+
+fn file_encryption(encryption: CachedEncryption) -> FileEncryptionInfo {
+    FileEncryptionInfo {
+        version: encryption.version,
+        kdf_count: encryption.kdf_count,
+        salt: encryption.salt,
+        iv: encryption.iv,
+        check_data: encryption.check_data,
+        use_hash_mac: encryption.use_hash_mac,
+    }
+}
+
 impl RarArchive {
     /// Export parsed headers for journal persistence.
     pub fn export_headers(&self) -> CachedArchiveHeaders {
@@ -307,14 +421,7 @@ impl RarArchive {
                     split_after: m.file_header.split_after,
                     is_directory: m.file_header.is_directory,
                     is_encrypted: m.is_encrypted,
-                    encryption: m.file_encryption.as_ref().map(|e| CachedEncryption {
-                        version: e.version,
-                        kdf_count: e.kdf_count,
-                        salt: e.salt,
-                        iv: e.iv,
-                        check_data: e.check_data,
-                        use_hash_mac: e.use_hash_mac,
-                    }),
+                    encryption: m.file_encryption.as_ref().map(cached_encryption),
                     rar4_salt: m.rar4_salt,
                     version: m.file_header.version,
                     blake2_hash: m.hash.as_ref().map(|h| match h {
@@ -333,17 +440,46 @@ impl RarArchive {
                     host_os: encode_host_os(m.file_header.host_os),
                     owner_user_name: m.owner.as_ref().and_then(|owner| owner.user_name.clone()),
                     owner_group_name: m.owner.as_ref().and_then(|owner| owner.group_name.clone()),
+                    owner_user_name_raw: m
+                        .owner
+                        .as_ref()
+                        .and_then(|owner| owner.user_name_raw.clone()),
+                    owner_group_name_raw: m
+                        .owner
+                        .as_ref()
+                        .and_then(|owner| owner.group_name_raw.clone()),
                     owner_uid: m.owner.as_ref().and_then(|owner| owner.uid),
                     owner_gid: m.owner.as_ref().and_then(|owner| owner.gid),
-                    segments: m
-                        .segments
-                        .iter()
-                        .map(|s| CachedSegment {
-                            volume_index: s.volume_index,
-                            data_offset: s.data_offset,
-                            data_size: s.data_size,
-                        })
-                        .collect(),
+                    segments: cached_segments(&m.segments),
+                })
+                .collect(),
+            services: self
+                .services
+                .iter()
+                .map(|service| CachedService {
+                    name: service.file_header.name.clone(),
+                    unpacked_size: service.file_header.unpacked_size,
+                    mtime_ns: encode_system_time(service.file_header.mtime),
+                    ctime_ns: encode_system_time(service.file_header.ctime),
+                    atime_ns: encode_system_time(service.file_header.atime),
+                    data_crc32: service.file_header.data_crc32,
+                    compression_method: service.file_header.compression.method.code(),
+                    compression_version: service.file_header.compression.version,
+                    compression_solid: service.file_header.compression.solid,
+                    dict_size: service.file_header.compression.dict_size,
+                    split_before: service.file_header.split_before,
+                    split_after: service.file_header.split_after,
+                    is_encrypted: service.is_encrypted,
+                    encryption: service.file_encryption.as_ref().map(cached_encryption),
+                    version: service.file_header.version,
+                    blake2_hash: service.hash.as_ref().map(|h| match h {
+                        FileHash::Blake2sp(b) => *b,
+                    }),
+                    comment_crc16: service.comment_crc16,
+                    attributes: service.file_header.attributes.0,
+                    host_os: encode_host_os(service.file_header.host_os),
+                    service_subdata: service.file_header.service_subdata.clone(),
+                    segments: cached_segments(&service.segments),
                 })
                 .collect(),
         }
@@ -421,14 +557,7 @@ impl RarArchive {
                         service_subdata: None,
                     },
                     is_encrypted: cm.is_encrypted,
-                    file_encryption: cm.encryption.map(|e| FileEncryptionInfo {
-                        version: e.version,
-                        kdf_count: e.kdf_count,
-                        salt: e.salt,
-                        iv: e.iv,
-                        check_data: e.check_data,
-                        use_hash_mac: e.use_hash_mac,
-                    }),
+                    file_encryption: cm.encryption.map(file_encryption),
                     rar4_salt: cm.rar4_salt,
                     hash: cm.blake2_hash.map(FileHash::Blake2sp),
                     redirection: cm.redirection_type.map(|redir_type| Redirection {
@@ -438,23 +567,61 @@ impl RarArchive {
                     }),
                     owner: (cm.owner_user_name.is_some()
                         || cm.owner_group_name.is_some()
+                        || cm.owner_user_name_raw.is_some()
+                        || cm.owner_group_name_raw.is_some()
                         || cm.owner_uid.is_some()
                         || cm.owner_gid.is_some())
                     .then_some(UnixOwnerInfo {
                         user_name: cm.owner_user_name,
                         group_name: cm.owner_group_name,
+                        user_name_raw: cm.owner_user_name_raw,
+                        group_name_raw: cm.owner_group_name_raw,
                         uid: cm.owner_uid,
                         gid: cm.owner_gid,
                     }),
-                    segments: cm
-                        .segments
-                        .into_iter()
-                        .map(|s| DataSegment {
-                            volume_index: s.volume_index,
-                            data_offset: s.data_offset,
-                            data_size: s.data_size,
-                        })
-                        .collect(),
+                    segments: data_segments(cm.segments),
+                }
+            })
+            .collect();
+        let services: Vec<ServiceEntry> = cached
+            .services
+            .into_iter()
+            .map(|service| {
+                let compression = CompressionInfo {
+                    format,
+                    version: service.compression_version,
+                    solid: service.compression_solid,
+                    method: CompressionMethod::from_code(service.compression_method),
+                    dict_size: service.dict_size,
+                };
+
+                ServiceEntry {
+                    file_header: FileHeader {
+                        name: service.name,
+                        unpacked_size: service.unpacked_size,
+                        attributes: FileAttributes(service.attributes),
+                        mtime: decode_system_time(service.mtime_ns),
+                        ctime: decode_system_time(service.ctime_ns),
+                        atime: decode_system_time(service.atime_ns),
+                        data_crc32: service.data_crc32,
+                        data_hash: service.data_crc32.map(crate::types::DataHash::Crc32),
+                        compression,
+                        host_os: decode_host_os(service.host_os),
+                        is_directory: false,
+                        file_flags: 0,
+                        data_size: 0,
+                        split_before: service.split_before,
+                        split_after: service.split_after,
+                        data_offset: 0,
+                        is_encrypted: service.is_encrypted,
+                        version: service.version,
+                        service_subdata: service.service_subdata,
+                    },
+                    is_encrypted: service.is_encrypted,
+                    file_encryption: service.encryption.map(file_encryption),
+                    hash: service.blake2_hash.map(FileHash::Blake2sp),
+                    comment_crc16: service.comment_crc16,
+                    segments: data_segments(service.segments),
                 }
             })
             .collect();
@@ -473,7 +640,7 @@ impl RarArchive {
             original_creation_time: decode_system_time(cached.original_creation_time_ns),
             volume_set: VolumeSet::from_presence(cached.volume_presence, cached.last_volume_seen),
             members,
-            services: Vec::new(),
+            services,
             more_volumes: cached.more_volumes,
             volumes: Vec::new(),
             solid_decoder: None,
@@ -543,6 +710,26 @@ mod tests {
     }
 
     #[derive(Serialize)]
+    struct PriorNamedCachedArchiveHeaders {
+        format: u8,
+        is_solid: bool,
+        is_encrypted: bool,
+        has_recovery_record: bool,
+        recovery_records: Vec<RecoveryRecordInfo>,
+        is_locked: bool,
+        has_authenticity_verification: bool,
+        has_locator: bool,
+        quick_open_offset: Option<u64>,
+        recovery_record_offset: Option<u64>,
+        original_name: Option<String>,
+        original_creation_time_ns: Option<u64>,
+        more_volumes: bool,
+        volume_presence: Vec<bool>,
+        last_volume_seen: bool,
+        members: Vec<CachedMember>,
+    }
+
+    #[derive(Serialize)]
     struct OldCachedMember {
         name: String,
         unpacked_size: Option<u64>,
@@ -597,6 +784,9 @@ mod tests {
                     volume_index: 0,
                     data_offset: 128,
                     data_size: 256,
+                    packed_crc32: None,
+                    packed_blake2_hash: None,
+                    packed_hash_uses_mac: false,
                 }],
             }],
         };
@@ -647,6 +837,7 @@ mod tests {
             volume_presence: vec![true],
             last_volume_seen: true,
             members: Vec::new(),
+            services: Vec::new(),
         };
         let bytes = rmp_serde::to_vec(&cached).expect("cache should serialize");
 
@@ -655,6 +846,187 @@ mod tests {
 
         assert!(metadata.has_recovery_record);
         assert_eq!(metadata.recovery_records, vec![record]);
+    }
+
+    #[test]
+    fn deserialize_headers_accepts_named_cache_without_services() {
+        let cached = PriorNamedCachedArchiveHeaders {
+            format: 5,
+            is_solid: false,
+            is_encrypted: false,
+            has_recovery_record: false,
+            recovery_records: Vec::new(),
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            recovery_record_offset: None,
+            original_name: None,
+            original_creation_time_ns: None,
+            more_volumes: false,
+            volume_presence: vec![true],
+            last_volume_seen: true,
+            members: Vec::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&cached).expect("prior cache should serialize");
+
+        let archive = RarArchive::deserialize_headers(&bytes).expect("prior cache should decode");
+
+        assert!(archive.services.is_empty());
+    }
+
+    #[test]
+    fn cached_headers_preserve_service_entries() {
+        let blake2_hash = [0x5a; 32];
+        let cached = CachedArchiveHeaders {
+            format: 5,
+            is_solid: false,
+            is_encrypted: false,
+            has_recovery_record: false,
+            recovery_records: Vec::new(),
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            recovery_record_offset: None,
+            original_name: None,
+            original_creation_time_ns: None,
+            more_volumes: false,
+            volume_presence: vec![true],
+            last_volume_seen: true,
+            members: Vec::new(),
+            services: vec![CachedService {
+                name: "CMT".to_string(),
+                unpacked_size: Some(12),
+                mtime_ns: None,
+                ctime_ns: None,
+                atime_ns: None,
+                data_crc32: Some(0xA1B2_C3D4),
+                compression_method: CompressionMethod::Store.code(),
+                compression_version: 5,
+                compression_solid: false,
+                dict_size: 0,
+                split_before: false,
+                split_after: true,
+                is_encrypted: true,
+                encryption: Some(CachedEncryption {
+                    version: 0,
+                    kdf_count: 12,
+                    salt: [0x11; 16],
+                    iv: [0x22; 16],
+                    check_data: Some([0x33; 12]),
+                    use_hash_mac: true,
+                }),
+                version: Some(7),
+                blake2_hash: Some(blake2_hash),
+                comment_crc16: Some(0x4567),
+                attributes: 0x20,
+                host_os: encode_host_os(HostOs::Unix),
+                service_subdata: Some(vec![1, 2, 3]),
+                segments: vec![CachedSegment {
+                    volume_index: 3,
+                    data_offset: 4096,
+                    data_size: 8192,
+                    packed_crc32: Some(0x0102_0304),
+                    packed_blake2_hash: None,
+                    packed_hash_uses_mac: true,
+                }],
+            }],
+        };
+        let bytes = rmp_serde::to_vec_named(&cached).expect("cache should serialize");
+
+        let archive = RarArchive::deserialize_headers(&bytes).expect("cache should decode");
+        let service = &archive.services[0];
+
+        assert_eq!(service.file_header.name, "CMT");
+        assert_eq!(service.file_header.unpacked_size, Some(12));
+        assert_eq!(service.file_header.data_crc32, Some(0xA1B2_C3D4));
+        assert_eq!(
+            service.file_header.compression.method,
+            CompressionMethod::Store
+        );
+        assert_eq!(service.file_header.version, Some(7));
+        assert_eq!(
+            service.file_header.service_subdata.as_deref(),
+            Some(&[1, 2, 3][..])
+        );
+        assert_eq!(service.hash, Some(FileHash::Blake2sp(blake2_hash)));
+        assert_eq!(service.comment_crc16, Some(0x4567));
+        assert!(service.is_encrypted);
+        assert!(
+            service
+                .file_encryption
+                .as_ref()
+                .is_some_and(|enc| enc.use_hash_mac)
+        );
+        assert_eq!(service.segments.len(), 1);
+        assert_eq!(service.segments[0].volume_index, 3);
+        assert_eq!(
+            service.segments[0].packed_hash,
+            Some(PackedDataHash::Crc32(0x0102_0304))
+        );
+        assert!(service.segments[0].packed_hash_uses_mac);
+    }
+
+    #[test]
+    fn cached_headers_preserve_raw_unix_owner_names() {
+        let cached = CachedArchiveHeaders {
+            format: 5,
+            is_solid: false,
+            is_encrypted: false,
+            has_recovery_record: false,
+            recovery_records: Vec::new(),
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            recovery_record_offset: None,
+            original_name: None,
+            original_creation_time_ns: None,
+            more_volumes: false,
+            volume_presence: vec![true],
+            last_volume_seen: true,
+            members: vec![CachedMember {
+                name: "file.txt".to_string(),
+                unpacked_size: Some(0),
+                mtime_ns: None,
+                ctime_ns: None,
+                atime_ns: None,
+                data_crc32: None,
+                compression_method: CompressionMethod::Store.code(),
+                compression_version: 5,
+                compression_solid: false,
+                dict_size: 0,
+                split_before: false,
+                split_after: false,
+                is_directory: false,
+                is_encrypted: false,
+                encryption: None,
+                rar4_salt: None,
+                version: None,
+                blake2_hash: None,
+                redirection_type: None,
+                redirection_target: None,
+                redirection_target_is_directory: false,
+                attributes: 0,
+                host_os: default_host_os_code(),
+                owner_user_name: Some("al\u{fffd}ice".to_string()),
+                owner_group_name: Some("gr\u{fffd}up".to_string()),
+                owner_user_name_raw: Some(b"al\xffice".to_vec()),
+                owner_group_name_raw: Some(b"gr\xf0up".to_vec()),
+                owner_uid: None,
+                owner_gid: None,
+                segments: Vec::new(),
+            }],
+            services: Vec::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&cached).expect("cache should serialize");
+
+        let archive = RarArchive::deserialize_headers(&bytes).expect("cache should decode");
+        let owner = archive.members[0].owner.as_ref().expect("owner restored");
+
+        assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));
+        assert_eq!(owner.group_name_raw.as_deref(), Some(&b"gr\xf0up"[..]));
     }
 
     #[test]
@@ -677,6 +1049,7 @@ mod tests {
             volume_presence: vec![true],
             last_volume_seen: true,
             members: Vec::new(),
+            services: Vec::new(),
         };
         let bytes = rmp_serde::to_vec_named(&cached).expect("cache should serialize");
 

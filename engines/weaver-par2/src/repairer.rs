@@ -33,6 +33,7 @@ use crate::types::{
 };
 use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult, verify_all};
 use memmap2::MmapOptions;
+use rayon::prelude::*;
 use tracing::{debug, warn};
 
 const ZERO_PAD_CHUNK: [u8; 8192] = [0u8; 8192];
@@ -112,6 +113,111 @@ impl FileScanStats {
 }
 
 #[derive(Debug, Clone)]
+struct ScanCandidate {
+    path: PathBuf,
+    kind: BlockLocationKind,
+}
+
+#[derive(Debug, Clone)]
+struct CompleteFileMatch {
+    file_index: usize,
+    location: BlockLocation,
+}
+
+type CompleteScanMatches = (Vec<CompleteFileMatch>, Vec<(usize, BlockLocation)>);
+
+struct ScanBlockState<'a> {
+    blocks: &'a [SourceBlock],
+    locations: Vec<Option<BlockLocation>>,
+}
+
+impl<'a> ScanBlockState<'a> {
+    fn new(blocks: &'a [SourceBlock]) -> Self {
+        Self {
+            blocks,
+            locations: blocks
+                .iter()
+                .map(|block| block.location.clone())
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    fn block(&self, block_index: usize) -> &SourceBlock {
+        &self.blocks[block_index]
+    }
+
+    fn location(&self, block_index: usize) -> Option<&BlockLocation> {
+        self.locations[block_index].as_ref()
+    }
+
+    fn record_location(&mut self, block_index: usize, location: BlockLocation) {
+        let replace = self.locations[block_index].as_ref().is_none_or(|existing| {
+            location.kind < existing.kind
+                || (location.kind == existing.kind && location.path < existing.path)
+        });
+        if replace {
+            self.locations[block_index] = Some(location);
+        }
+    }
+
+    fn changed_locations(&self) -> Vec<(usize, BlockLocation)> {
+        self.locations
+            .iter()
+            .zip(self.blocks.iter())
+            .enumerate()
+            .filter_map(|(idx, (location, block))| {
+                (location != &block.location)
+                    .then(|| location.clone().map(|location| (idx, location)))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn apply_to_blocks(self, blocks: &mut [SourceBlock]) {
+        for (block, location) in blocks.iter_mut().zip(self.locations) {
+            block.location = location;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CandidateScanResult {
+    path: PathBuf,
+    kind: BlockLocationKind,
+    files_scanned: u32,
+    files_skipped: u32,
+    bytes_scanned: u64,
+    stats: Option<FileScanStats>,
+    elapsed: Duration,
+    complete_files: Vec<CompleteFileMatch>,
+    block_locations: Vec<(usize, BlockLocation)>,
+}
+
+impl CandidateScanResult {
+    fn ignored(path: &Path, kind: BlockLocationKind) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            kind,
+            files_scanned: 0,
+            files_skipped: 0,
+            bytes_scanned: 0,
+            stats: None,
+            elapsed: Duration::ZERO,
+            complete_files: Vec::new(),
+            block_locations: Vec::new(),
+        }
+    }
+
+    fn skipped(path: &Path, kind: BlockLocationKind) -> Self {
+        Self {
+            files_skipped: 1,
+            ..Self::ignored(path, kind)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Par2RepairOutcome {
     pub status: Par2RepairStatus,
     pub files_complete: u32,
@@ -138,6 +244,8 @@ pub struct Par2RepairerOptions {
     pub extra_paths: Vec<PathBuf>,
     pub repair: bool,
     pub memory_limit: Option<usize>,
+    pub rename_only: bool,
+    pub purge: bool,
     pub scan_skip_data: bool,
     pub scan_skip_leeway: u64,
     pub cancel: Option<CancellationToken>,
@@ -154,6 +262,8 @@ impl Par2RepairerOptions {
             extra_paths: Vec::new(),
             repair: true,
             memory_limit: Some(DEFAULT_REPAIR_MEMORY_LIMIT),
+            rename_only: false,
+            purge: false,
             scan_skip_data: false,
             scan_skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
             cancel: None,
@@ -175,6 +285,28 @@ pub struct BlockLocation {
     pub offset: u64,
     pub len: u64,
     pub kind: BlockLocationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockCopyRange {
+    src: PathBuf,
+    src_offset: u64,
+    dst: PathBuf,
+    dst_offset: u64,
+    len: u64,
+}
+
+impl BlockCopyRange {
+    fn can_extend(&self, next: &Self) -> bool {
+        self.src == next.src
+            && self.dst == next.dst
+            && self.src_offset.checked_add(self.len) == Some(next.src_offset)
+            && self.dst_offset.checked_add(self.len) == Some(next.dst_offset)
+    }
+
+    fn extend(&mut self, next: &Self) {
+        self.len += next.len;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +341,14 @@ pub struct SourceFileEntry {
 pub struct PacketInventory {
     pub set: Par2FileSet,
     pub diagnostics: PacketDiagnostics,
+    pub purge_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct PacketInputPath {
+    path: PathBuf,
+    optional: bool,
+    purgeable: bool,
 }
 
 pub struct Par2Repairer {
@@ -221,9 +361,13 @@ impl Par2Repairer {
     }
 
     pub fn verify_or_repair(&self) -> Result<Par2RepairOutcome> {
-        let inventory = self.load_inventory()?;
-        let mut state = RepairState::from_set(&self.options.base_dir, inventory.set)?;
-        let mut packet_diagnostics = inventory.diagnostics;
+        let PacketInventory {
+            set,
+            diagnostics,
+            purge_paths,
+        } = self.load_inventory()?;
+        let mut state = RepairState::from_set(&self.options.base_dir, set)?;
+        let mut packet_diagnostics = diagnostics;
 
         packet_diagnostics.discarded_recovery_blocks = state.discarded_recovery_blocks;
         packet_diagnostics.inconsistent_packets = state.inconsistent_packets;
@@ -239,6 +383,9 @@ impl Par2Repairer {
         }
 
         if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
+            if self.options.purge {
+                purge_files_best_effort(&purge_paths);
+            }
             return Ok(state.outcome(
                 Par2RepairStatus::Verified,
                 0,
@@ -297,6 +444,9 @@ impl Par2Repairer {
             return Err(error);
         }
         let _ = fs::remove_dir_all(&repair.install_dir);
+        if self.options.purge {
+            purge_files_best_effort(&purge_paths);
+        }
 
         Ok(state.outcome(
             Par2RepairStatus::Repaired,
@@ -313,31 +463,102 @@ impl Par2Repairer {
             return Ok(PacketInventory {
                 set,
                 diagnostics: PacketDiagnostics::default(),
+                purge_paths: Vec::new(),
             });
         }
 
-        let mut paths = Vec::<PathBuf>::new();
+        let mut paths = Vec::<PacketInputPath>::new();
         let mut seen = HashSet::<PathBuf>::new();
-        for path in self
-            .options
-            .par2_paths
-            .iter()
-            .chain(self.options.recovery_paths.iter())
-            .chain(
-                self.options
-                    .extra_paths
-                    .iter()
-                    .filter(|path| has_par2_marker(path)),
-            )
-        {
+        let mut primary_par2_paths = Vec::new();
+
+        for path in &self.options.par2_paths {
+            if is_par2_path(path) {
+                if seen.insert(path.clone()) {
+                    paths.push(PacketInputPath {
+                        path: path.clone(),
+                        optional: false,
+                        purgeable: true,
+                    });
+                }
+                primary_par2_paths.push(path.clone());
+                continue;
+            }
+
+            if let Some(primary) = discover_source_primary_par2_file(path)? {
+                if seen.insert(primary.clone()) {
+                    paths.push(PacketInputPath {
+                        path: primary.clone(),
+                        optional: false,
+                        purgeable: true,
+                    });
+                }
+                primary_par2_paths.push(primary);
+                continue;
+            }
+
             if seen.insert(path.clone()) {
-                paths.push(path.clone());
+                paths.push(PacketInputPath {
+                    path: path.clone(),
+                    optional: false,
+                    purgeable: false,
+                });
             }
         }
 
-        for adjacent in discover_adjacent_par2_files(&self.options.par2_paths)? {
+        for path in &self.options.recovery_paths {
+            if is_par2_path(path) {
+                if seen.insert(path.clone()) {
+                    paths.push(PacketInputPath {
+                        path: path.clone(),
+                        optional: false,
+                        purgeable: true,
+                    });
+                }
+                continue;
+            }
+
+            if let Some(primary) = discover_source_primary_par2_file(path)? {
+                if seen.insert(primary.clone()) {
+                    paths.push(PacketInputPath {
+                        path: primary,
+                        optional: false,
+                        purgeable: true,
+                    });
+                }
+                continue;
+            }
+
+            if seen.insert(path.clone()) {
+                paths.push(PacketInputPath {
+                    path: path.clone(),
+                    optional: false,
+                    purgeable: false,
+                });
+            }
+        }
+
+        for adjacent in discover_adjacent_par2_files(&primary_par2_paths)? {
             if seen.insert(adjacent.clone()) {
-                paths.push(adjacent);
+                paths.push(PacketInputPath {
+                    path: adjacent,
+                    optional: true,
+                    purgeable: true,
+                });
+            }
+        }
+
+        for path in self
+            .options
+            .extra_paths
+            .iter()
+            .filter(|path| has_par2_marker(path))
+        {
+            if seen.insert(path.clone()) {
+                paths.push(PacketInputPath {
+                    path: path.clone(),
+                    optional: true,
+                    purgeable: false,
+                });
             }
         }
 
@@ -345,10 +566,25 @@ impl Par2Repairer {
         let mut recovery_set_id = None;
         let mut scanned_files = Vec::new();
 
-        for path in paths {
-            let packet_list = scan_packets_from_path_with_set_ids(&path)?;
+        for input in paths {
+            let path = input.path;
+            let packet_list = match scan_packets_from_path_with_set_ids(&path) {
+                Ok(packet_list) => packet_list,
+                Err(_) if input.optional => {
+                    if input.purgeable {
+                        scanned_files.push((path, input.purgeable, Vec::new()));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if packet_list.is_empty() {
-                diagnostics.corrupt_packets += 1;
+                if !input.optional {
+                    diagnostics.corrupt_packets += 1;
+                }
+                if input.purgeable {
+                    scanned_files.push((path, input.purgeable, packet_list));
+                }
                 continue;
             }
 
@@ -359,6 +595,9 @@ impl Par2Repairer {
                 if let Some(existing) = recovery_set_id {
                     if existing != file_set_id {
                         diagnostics.conflicting_packets += packet_list.len() as u32;
+                        if input.purgeable {
+                            scanned_files.push((path, input.purgeable, Vec::new()));
+                        }
                         continue;
                     }
                 } else {
@@ -366,16 +605,18 @@ impl Par2Repairer {
                 }
             }
 
-            scanned_files.push(packet_list);
+            scanned_files.push((path, input.purgeable, packet_list));
         }
 
         let mut packets = Vec::new();
+        let mut purge_paths = Vec::new();
         let mut main_seen = false;
         let mut creator_seen = false;
         let mut file_desc_ids = HashSet::<FileId>::new();
         let mut ifsc_ids = HashSet::<FileId>::new();
         let mut recovery_exponents = HashSet::<u32>::new();
-        for packet_list in scanned_files {
+        for (path, purgeable, packet_list) in scanned_files {
+            let mut file_contributed = false;
             for scanned in packet_list {
                 if let Some(active_set_id) = recovery_set_id
                     && scanned.recovery_set_id != active_set_id
@@ -406,11 +647,19 @@ impl Par2Repairer {
                 }
                 diagnostics.packets_loaded += 1;
                 packets.push(scanned.packet);
+                file_contributed = true;
+            }
+            if purgeable && (file_contributed || !path.exists() || is_par2_path(&path)) {
+                purge_paths.push(path);
             }
         }
 
         let set = Par2FileSet::from_packets(packets)?;
-        Ok(PacketInventory { set, diagnostics })
+        Ok(PacketInventory {
+            set,
+            diagnostics,
+            purge_paths,
+        })
     }
 }
 
@@ -835,19 +1084,14 @@ impl RepairState {
         let mut canonical_candidates = self
             .files
             .iter()
-            .map(|file| file.safe_path.clone())
+            .map(|file| ScanCandidate {
+                path: file.safe_path.clone(),
+                kind: BlockLocationKind::Canonical,
+            })
             .collect::<Vec<_>>();
-        canonical_candidates.sort();
-        canonical_candidates.dedup();
-
-        for path in canonical_candidates {
-            self.scan_candidate(
-                options,
-                path,
-                BlockLocationKind::Canonical,
-                &mut diagnostics,
-            )?;
-        }
+        canonical_candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        canonical_candidates.dedup_by(|left, right| left.path == right.path);
+        self.scan_candidates(options, &canonical_candidates, &mut diagnostics)?;
 
         self.refresh_file_states();
         if self.files_are_canonical_complete() {
@@ -867,121 +1111,221 @@ impl RepairState {
         }
         for path in &options.extra_paths {
             if !has_par2_marker(path) {
+                let Ok(metadata) = fs::symlink_metadata(path) else {
+                    continue;
+                };
+                if !metadata.file_type().is_file() {
+                    continue;
+                }
                 let canonical = canonical_extra_path(path);
                 extra_candidates.insert(canonical.clone(), canonical);
             }
         }
 
-        for (key, path) in extra_candidates {
-            if source_file_keys.contains(&key) {
-                continue;
-            }
-            self.scan_candidate(options, path, BlockLocationKind::Extra, &mut diagnostics)?;
-        }
+        let extra_candidates = extra_candidates
+            .into_iter()
+            .filter_map(|(key, path)| {
+                (!source_file_keys.contains(&key)).then_some(ScanCandidate {
+                    path,
+                    kind: BlockLocationKind::Extra,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.scan_candidates(options, &extra_candidates, &mut diagnostics)?;
 
         self.refresh_file_states();
         Ok(diagnostics)
     }
 
-    fn scan_candidate(
+    fn scan_candidates(
         &mut self,
         options: &Par2RepairerOptions,
-        path: PathBuf,
-        kind: BlockLocationKind,
+        candidates: &[ScanCandidate],
         diagnostics: &mut ScanDiagnostics,
     ) -> Result<()> {
-        check_cancel(options)?;
-        if should_skip_candidate(&path) {
-            diagnostics.files_skipped += 1;
-            return Ok(());
-        }
-        if !path.is_file() {
+        if candidates.is_empty() {
             return Ok(());
         }
 
-        let metadata = fs::metadata(&path)?;
-        diagnostics.files_scanned += 1;
-        diagnostics.bytes_scanned += metadata.len();
+        let baseline_blocks = &self.blocks;
+        let files = &self.files;
+        let file_index_by_id = &self.file_index_by_id;
+        let block_index_by_file_slice = &self.block_index_by_file_slice;
+        let hash_table = &self.hash_table;
+        let slice_size = self.set.slice_size;
+
+        let results = if candidates.len() > 1 && rayon::current_num_threads() > 1 {
+            candidates
+                .par_iter()
+                .map(|candidate| {
+                    Self::scan_candidate_snapshot(
+                        options,
+                        candidate,
+                        files,
+                        file_index_by_id,
+                        block_index_by_file_slice,
+                        baseline_blocks,
+                        hash_table,
+                        slice_size,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| {
+                    Self::scan_candidate_snapshot(
+                        options,
+                        candidate,
+                        files,
+                        file_index_by_id,
+                        block_index_by_file_slice,
+                        baseline_blocks,
+                        hash_table,
+                        slice_size,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for result in results {
+            self.apply_scan_result(result, diagnostics);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_candidate_snapshot(
+        options: &Par2RepairerOptions,
+        candidate: &ScanCandidate,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        block_index_by_file_slice: &HashMap<(FileId, u32), usize>,
+        baseline_blocks: &[SourceBlock],
+        hash_table: &VerificationHashTable,
+        slice_size: u64,
+    ) -> Result<CandidateScanResult> {
+        let path = &candidate.path;
+        let kind = candidate.kind;
+        check_cancel(options)?;
+        if should_skip_candidate(path) {
+            return Ok(CandidateScanResult::skipped(path, kind));
+        }
+        let metadata = if kind == BlockLocationKind::Extra {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                return Ok(CandidateScanResult::ignored(path, kind));
+            };
+            if !metadata.file_type().is_file() {
+                return Ok(CandidateScanResult::ignored(path, kind));
+            }
+            metadata
+        } else {
+            if !path.is_file() {
+                return Ok(CandidateScanResult::ignored(path, kind));
+            }
+            fs::metadata(path)?
+        };
+
+        let mut result = CandidateScanResult {
+            path: path.clone(),
+            kind,
+            files_scanned: 1,
+            files_skipped: 0,
+            bytes_scanned: metadata.len(),
+            stats: None,
+            elapsed: Duration::ZERO,
+            complete_files: Vec::new(),
+            block_locations: Vec::new(),
+        };
+        if kind == BlockLocationKind::Extra && metadata.len() == 0 {
+            return Ok(result);
+        }
 
         let started = Instant::now();
-        let found_before = self
-            .blocks
-            .iter()
-            .filter(|block| block.location.is_some())
-            .count();
-        if self.scan_complete_file(&path, kind)? {
-            let found_after = self
-                .blocks
-                .iter()
-                .filter(|block| block.location.is_some())
-                .count();
-            let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
-            diagnostics.blocks_found += blocks_confirmed;
-            log_file_scan(
-                &path,
-                kind,
-                FileScanStats::new(FileScanMode::Complete, metadata.len()),
-                blocks_confirmed,
-                started.elapsed(),
-            );
-            return Ok(());
+        let (complete_files, block_locations) = Self::scan_complete_file_matches(
+            path,
+            kind,
+            metadata.len(),
+            files,
+            block_index_by_file_slice,
+            baseline_blocks,
+            slice_size,
+        )?;
+        if !complete_files.is_empty() {
+            result.complete_files = complete_files;
+            result.block_locations = block_locations;
+            result.stats = Some(FileScanStats::new(FileScanMode::Complete, metadata.len()));
+            result.elapsed = started.elapsed();
+            return Ok(result);
         }
+        if options.rename_only && kind == BlockLocationKind::Extra {
+            result.stats = Some(FileScanStats::new(FileScanMode::Complete, metadata.len()));
+            result.elapsed = started.elapsed();
+            return Ok(result);
+        }
+
         let ordered_target = (kind == BlockLocationKind::Canonical)
             .then(|| {
-                self.files
+                files
                     .iter()
-                    .find(|file| file.safe_path == path && file.recoverable && file.block_count > 0)
+                    .find(|file| {
+                        file.safe_path == *path && file.recoverable && file.block_count > 0
+                    })
                     .cloned()
             })
             .flatten();
-        let scanner = RollingBlockScanner::new(&self.hash_table, self.set.slice_size);
+        let scanner = RollingBlockScanner::new(hash_table, slice_size);
+        let mut scan_blocks = ScanBlockState::new(baseline_blocks);
         let stats = if let Some(target_file) = ordered_target.as_ref() {
-            scanner.scan_file_ordered_canonical(
-                &path,
+            scanner.scan_file_ordered_canonical_state(
+                path,
                 kind,
                 SourceFileScanLookup {
-                    files: &self.files,
-                    file_index_by_id: &self.file_index_by_id,
+                    files,
+                    file_index_by_id,
                 },
                 target_file,
-                &mut self.blocks,
+                &mut scan_blocks,
                 ScanSkipOptions {
                     skip_data: options.scan_skip_data,
                     skip_leeway: options.scan_skip_leeway,
                 },
             )?
         } else {
-            scanner.scan_file_with_options(
-                &path,
+            scanner.scan_file_with_state_options(
+                path,
                 kind,
-                &self.files,
-                &self.file_index_by_id,
-                &mut self.blocks,
+                files,
+                file_index_by_id,
+                &mut scan_blocks,
                 ScanSkipOptions {
                     skip_data: options.scan_skip_data,
                     skip_leeway: options.scan_skip_leeway,
                 },
             )?
         };
-        let found_after = self
-            .blocks
-            .iter()
-            .filter(|block| block.location.is_some())
-            .count();
-        let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
-        diagnostics.blocks_found += blocks_confirmed;
-        log_file_scan(&path, kind, stats, blocks_confirmed, started.elapsed());
 
-        Ok(())
+        result.block_locations = scan_blocks.changed_locations();
+        result.stats = Some(stats);
+        result.elapsed = started.elapsed();
+
+        Ok(result)
     }
 
-    fn scan_complete_file(&mut self, path: &Path, kind: BlockLocationKind) -> Result<bool> {
-        let len = fs::metadata(path)?.len();
+    fn scan_complete_file_matches(
+        path: &Path,
+        kind: BlockLocationKind,
+        len: u64,
+        files: &[SourceFileEntry],
+        block_index_by_file_slice: &HashMap<(FileId, u32), usize>,
+        baseline_blocks: &[SourceBlock],
+        slice_size: u64,
+    ) -> Result<CompleteScanMatches> {
         let first = read_first_16k(path)?;
         let hash_16k = checksum::md5(&first);
 
-        let candidates: Vec<usize> = self
-            .files
+        let candidates: Vec<usize> = files
             .iter()
             .enumerate()
             .filter_map(|(idx, file)| {
@@ -990,53 +1334,54 @@ impl RepairState {
             .collect();
 
         if candidates.is_empty() {
-            return Ok(false);
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let should_skip_full_hash = kind == BlockLocationKind::Canonical
-            && len >= CANONICAL_COMPLETE_HASH_SKIP_BYTES.max(self.set.slice_size.saturating_mul(4))
+            && len >= CANONICAL_COMPLETE_HASH_SKIP_BYTES.max(slice_size.saturating_mul(4))
             && candidates
                 .iter()
                 .copied()
-                .any(|idx| self.files[idx].safe_path == path);
+                .any(|idx| files[idx].safe_path == path && files[idx].block_count > 0);
         if should_skip_full_hash {
-            return Ok(false);
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let full = hash_file(path)?;
-        let mut found_complete = false;
+        let mut complete_files = Vec::new();
+        let mut block_locations = Vec::new();
         for idx in candidates {
-            if self.files[idx].hash_full != full {
+            if files[idx].hash_full != full {
                 continue;
             }
 
-            let file_id = self.files[idx].file_id;
-            let complete_kind = if self.files[idx].safe_path == path {
+            let file = &files[idx];
+            let file_id = file.file_id;
+            let complete_kind = if file.safe_path == path {
                 BlockLocationKind::Canonical
             } else {
-                self.files[idx].non_canonical_complete_source_count = self.files[idx]
-                    .non_canonical_complete_source_count
-                    .saturating_add(1);
                 kind
             };
-            self.files[idx].complete_location = Some(BlockLocation {
-                path: path.to_path_buf(),
-                offset: 0,
-                len,
-                kind: complete_kind,
+            complete_files.push(CompleteFileMatch {
+                file_index: idx,
+                location: BlockLocation {
+                    path: path.to_path_buf(),
+                    offset: 0,
+                    len,
+                    kind: complete_kind,
+                },
             });
 
-            for local_index in 0..self.files[idx].block_count {
-                let Some(block_index) = self
-                    .block_index_by_file_slice
+            for local_index in 0..file.block_count {
+                let Some(block_index) = block_index_by_file_slice
                     .get(&(file_id, local_index as u32))
                     .copied()
                 else {
                     continue;
                 };
-                let offset = local_index as u64 * self.set.slice_size;
-                let expected_len = self.blocks[block_index].expected_len;
-                self.record_block_location(
+                let offset = local_index as u64 * slice_size;
+                let expected_len = baseline_blocks[block_index].expected_len;
+                block_locations.push((
                     block_index,
                     BlockLocation {
                         path: path.to_path_buf(),
@@ -1044,14 +1389,63 @@ impl RepairState {
                         len: expected_len,
                         kind: complete_kind,
                     },
-                );
+                ));
             }
-            found_complete = true;
         }
 
-        Ok(found_complete)
+        Ok((complete_files, block_locations))
     }
 
+    fn apply_scan_result(
+        &mut self,
+        result: CandidateScanResult,
+        diagnostics: &mut ScanDiagnostics,
+    ) {
+        diagnostics.files_scanned = diagnostics
+            .files_scanned
+            .saturating_add(result.files_scanned);
+        diagnostics.files_skipped = diagnostics
+            .files_skipped
+            .saturating_add(result.files_skipped);
+        diagnostics.bytes_scanned = diagnostics
+            .bytes_scanned
+            .saturating_add(result.bytes_scanned);
+
+        let found_before = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        for complete in result.complete_files {
+            if self.files[complete.file_index].safe_path != result.path {
+                self.files[complete.file_index].non_canonical_complete_source_count = self.files
+                    [complete.file_index]
+                    .non_canonical_complete_source_count
+                    .saturating_add(1);
+            }
+            self.files[complete.file_index].complete_location = Some(complete.location);
+        }
+        for (block_index, location) in result.block_locations {
+            self.record_block_location(block_index, location);
+        }
+        let found_after = self
+            .blocks
+            .iter()
+            .filter(|block| block.location.is_some())
+            .count();
+        let blocks_confirmed = found_after.saturating_sub(found_before) as u32;
+        diagnostics.blocks_found = diagnostics.blocks_found.saturating_add(blocks_confirmed);
+
+        if let Some(stats) = result.stats {
+            log_file_scan(
+                &result.path,
+                result.kind,
+                stats,
+                blocks_confirmed,
+                result.elapsed,
+            );
+        }
+    }
     fn record_block_location(&mut self, block_index: usize, location: BlockLocation) {
         let replace = self.blocks[block_index]
             .location
@@ -1092,7 +1486,16 @@ impl RepairState {
             return false;
         }
         if file.block_count == 0 {
-            return true;
+            return file.length == 0
+                && fs::metadata(&file.safe_path)
+                    .map(|metadata| metadata.len() == 0)
+                    .unwrap_or(false);
+        }
+        if fs::metadata(&file.safe_path)
+            .map(|metadata| metadata.len() != file.length)
+            .unwrap_or(true)
+        {
+            return false;
         }
 
         (0..file.block_count).all(|local| {
@@ -1245,6 +1648,7 @@ impl RepairState {
             whole_file_copied_ids.insert(file.file_id);
         }
 
+        let mut block_copy_ranges = Vec::new();
         for block in &self.blocks {
             check_cancel(options)?;
             if !staged_file_ids.contains(&block.file_id)
@@ -1259,14 +1663,27 @@ impl RepairState {
                 continue;
             };
             let target = install_dir.join(&self.files[file_idx].safe_name);
-            copy_range(
-                &location.path,
-                location.offset,
-                &target,
-                block.local_index as u64 * self.set.slice_size,
-                block.expected_len,
-            )?;
+            push_block_copy_range(
+                &mut block_copy_ranges,
+                BlockCopyRange {
+                    src: location.path.clone(),
+                    src_offset: location.offset,
+                    dst: target,
+                    dst_offset: block.local_index as u64 * self.set.slice_size,
+                    len: block.expected_len,
+                },
+            );
             bytes_copied += block.expected_len;
+        }
+        for range in &block_copy_ranges {
+            check_cancel(options)?;
+            copy_range(
+                &range.src,
+                range.src_offset,
+                &range.dst,
+                range.dst_offset,
+                range.len,
+            )?;
         }
 
         let mut bytes_reconstructed = 0u64;
@@ -1356,10 +1773,28 @@ impl RepairState {
                 }
                 match fs::symlink_metadata(dst) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(Par2Error::Io(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("repair target is a symbolic link: {}", dst.display()),
-                        )));
+                        let target_metadata = fs::metadata(dst).map_err(|error| {
+                            Par2Error::Io(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "repair target is a dangling symbolic link: {} ({error})",
+                                    dst.display()
+                                ),
+                            ))
+                        })?;
+                        if !target_metadata.file_type().is_file() {
+                            return Err(Par2Error::Io(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "repair target symbolic link does not point to a file: {}",
+                                    dst.display()
+                                ),
+                            )));
+                        }
+                        let backup = unique_backup_path(dst)?;
+                        fs::rename(dst, &backup)?;
+                        crate::file_cache::drop_path_cache(&backup);
+                        backups.push((dst.clone(), backup));
                     }
                     Ok(_) => {
                         let backup = unique_backup_path(dst)?;
@@ -1387,6 +1822,8 @@ impl RepairState {
 
         if install_result.is_err() {
             rollback_installed_files(&installed_targets, &backups);
+        } else if options.purge {
+            purge_files_best_effort(backups.iter().map(|(_, backup)| backup));
         }
         install_result
     }
@@ -1549,11 +1986,11 @@ impl RollingScanProgress {
     }
 }
 
-struct BufferedWindowScan<'a, 'scanner> {
+struct BufferedWindowScan<'a, 'scanner, 'blocks> {
     scanner: &'a RollingBlockScanner<'scanner>,
     path: &'a Path,
     kind: BlockLocationKind,
-    blocks: &'a mut [SourceBlock],
+    blocks: &'a mut ScanBlockState<'blocks>,
     scan_options: ScanSkipOptions,
     progress: &'a mut RollingScanProgress,
     stats: &'a mut FileScanStats,
@@ -1758,6 +2195,7 @@ impl<'a> RollingBlockScanner<'a> {
         )
     }
 
+    #[cfg(test)]
     fn scan_file_with_options(
         &self,
         path: &Path,
@@ -1767,8 +2205,31 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut [SourceBlock],
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
+        let baseline = blocks.to_vec();
+        let mut state = ScanBlockState::new(&baseline);
+        let stats = self.scan_file_with_state_options(
+            path,
+            kind,
+            files,
+            file_index_by_id,
+            &mut state,
+            scan_options,
+        )?;
+        state.apply_to_blocks(blocks);
+        Ok(stats)
+    }
+
+    fn scan_file_with_state_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        blocks: &mut ScanBlockState<'_>,
+        scan_options: ScanSkipOptions,
+    ) -> Result<FileScanStats> {
         if scanner_uses_mmap_fallback(self.table.slice_size) {
-            return self.scan_file_mmap_with_options(
+            return self.scan_file_mmap_with_state_options(
                 path,
                 kind,
                 files,
@@ -1778,7 +2239,7 @@ impl<'a> RollingBlockScanner<'a> {
             );
         }
 
-        self.scan_file_buffered_with_target_options(
+        self.scan_file_buffered_with_target_state_options(
             path,
             kind,
             SourceFileScanLookup {
@@ -1791,6 +2252,7 @@ impl<'a> RollingBlockScanner<'a> {
         )
     }
 
+    #[cfg(test)]
     fn scan_file_ordered_canonical(
         &self,
         path: &Path,
@@ -1798,6 +2260,29 @@ impl<'a> RollingBlockScanner<'a> {
         lookup: SourceFileScanLookup<'_>,
         target_file: &SourceFileEntry,
         blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
+    ) -> Result<FileScanStats> {
+        let baseline = blocks.to_vec();
+        let mut state = ScanBlockState::new(&baseline);
+        let stats = self.scan_file_ordered_canonical_state(
+            path,
+            kind,
+            lookup,
+            target_file,
+            &mut state,
+            scan_options,
+        )?;
+        state.apply_to_blocks(blocks);
+        Ok(stats)
+    }
+
+    fn scan_file_ordered_canonical_state(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        target_file: &SourceFileEntry,
+        blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
         let len = fs::metadata(path)?.len() as usize;
@@ -1820,7 +2305,7 @@ impl<'a> RollingBlockScanner<'a> {
         }
         let ordered_full_blocks: Vec<usize> = (0..target_file.block_count)
             .map(|local| target_file.first_block + local)
-            .filter(|block_index| blocks[*block_index].expected_len == self.table.slice_size)
+            .filter(|block_index| blocks.block(*block_index).expected_len == self.table.slice_size)
             .collect();
         let mut cursor = OrderedWindowCursor::new(path, slice_size, &self.window_table)?;
         let mut preferred_next = (!ordered_full_blocks.is_empty()).then_some(0usize);
@@ -1851,7 +2336,7 @@ impl<'a> RollingBlockScanner<'a> {
             );
 
             if let Some(selected) = selected {
-                if blocks[selected].file_id == target_file.file_id {
+                if blocks.block(selected).file_id == target_file.file_id {
                     preferred_next = ordered_full_blocks
                         .iter()
                         .position(|block_index| *block_index == selected)
@@ -1867,7 +2352,7 @@ impl<'a> RollingBlockScanner<'a> {
                 current_step_run = 0;
                 scan_offset = scan_distance / 2;
 
-                if !cursor.jump(blocks[selected].expected_len as usize)? {
+                if !cursor.jump(blocks.block(selected).expected_len as usize)? {
                     break;
                 }
                 continue;
@@ -1914,13 +2399,13 @@ impl<'a> RollingBlockScanner<'a> {
     fn scan_ordered_window(
         &self,
         window: OrderedWindowMatch<'_>,
-        blocks: &mut [SourceBlock],
+        blocks: &mut ScanBlockState<'_>,
     ) -> Option<usize> {
         let mut selected = None;
         let mut md5 = None;
 
         if let Some(expected_block) = window.expected_block {
-            let block = &blocks[expected_block];
+            let block = blocks.block(expected_block);
             if block.expected_len == self.table.slice_size && block.checksum.crc32 == window.crc {
                 let digest = checksum::md5(window.data);
                 md5 = Some(digest);
@@ -1939,7 +2424,7 @@ impl<'a> RollingBlockScanner<'a> {
 
         if let Some(candidates) = self.table.by_crc.get(&window.crc) {
             for block_index in candidates {
-                let block = &blocks[*block_index];
+                let block = blocks.block(*block_index);
                 if block.expected_len != self.table.slice_size {
                     continue;
                 }
@@ -1970,7 +2455,7 @@ impl<'a> RollingBlockScanner<'a> {
         }
 
         if let Some(selected) = selected {
-            let block = &blocks[selected];
+            let block = blocks.block(selected);
             record_block_location(
                 blocks,
                 selected,
@@ -2009,12 +2494,36 @@ impl<'a> RollingBlockScanner<'a> {
         )
     }
 
+    #[cfg(test)]
     fn scan_file_buffered_with_target_options(
         &self,
         path: &Path,
         kind: BlockLocationKind,
         lookup: SourceFileScanLookup<'_>,
         blocks: &mut [SourceBlock],
+        read_target: usize,
+        scan_options: ScanSkipOptions,
+    ) -> Result<FileScanStats> {
+        let baseline = blocks.to_vec();
+        let mut state = ScanBlockState::new(&baseline);
+        let stats = self.scan_file_buffered_with_target_state_options(
+            path,
+            kind,
+            lookup,
+            &mut state,
+            read_target,
+            scan_options,
+        )?;
+        state.apply_to_blocks(blocks);
+        Ok(stats)
+    }
+
+    fn scan_file_buffered_with_target_state_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        blocks: &mut ScanBlockState<'_>,
         read_target: usize,
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
@@ -2111,6 +2620,7 @@ impl<'a> RollingBlockScanner<'a> {
         )
     }
 
+    #[cfg(test)]
     fn scan_file_mmap_with_options(
         &self,
         path: &Path,
@@ -2118,6 +2628,29 @@ impl<'a> RollingBlockScanner<'a> {
         files: &[SourceFileEntry],
         file_index_by_id: &HashMap<FileId, usize>,
         blocks: &mut [SourceBlock],
+        scan_options: ScanSkipOptions,
+    ) -> Result<FileScanStats> {
+        let baseline = blocks.to_vec();
+        let mut state = ScanBlockState::new(&baseline);
+        let stats = self.scan_file_mmap_with_state_options(
+            path,
+            kind,
+            files,
+            file_index_by_id,
+            &mut state,
+            scan_options,
+        )?;
+        state.apply_to_blocks(blocks);
+        Ok(stats)
+    }
+
+    fn scan_file_mmap_with_state_options(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        files: &[SourceFileEntry],
+        file_index_by_id: &HashMap<FileId, usize>,
+        blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
     ) -> Result<FileScanStats> {
         let file = File::open(path)?;
@@ -2147,8 +2680,11 @@ impl<'a> RollingBlockScanner<'a> {
                 let mut saw_crc_candidate = false;
                 if let Some(candidates) = self.table.by_crc.get(&crc) {
                     for block_index in candidates {
-                        let block = &blocks[*block_index];
+                        let block = blocks.block(*block_index);
                         if block.expected_len != self.table.slice_size {
+                            continue;
+                        }
+                        if !can_record_block_location(blocks, *block_index, path, kind) {
                             continue;
                         }
                         saw_crc_candidate = true;
@@ -2214,10 +2750,10 @@ impl<'a> RollingBlockScanner<'a> {
         }
 
         for block_index in &self.table.short_blocks {
-            if blocks[*block_index].location.is_some() {
+            if blocks.location(*block_index).is_some() {
                 continue;
             }
-            let block = &blocks[*block_index];
+            let block = blocks.block(*block_index);
             let short_len = block.expected_len as usize;
             if short_len == 0 || short_len > len {
                 continue;
@@ -2282,12 +2818,12 @@ fn ordered_match_rank(
     block_index: usize,
     expected_block: Option<usize>,
     preferred_file_id: FileId,
-    blocks: &[SourceBlock],
+    blocks: &ScanBlockState<'_>,
 ) -> (u8, usize) {
     if Some(block_index) == expected_block {
         return (0, block_index);
     }
-    if blocks[block_index].file_id == preferred_file_id {
+    if blocks.block(block_index).file_id == preferred_file_id {
         return (1, block_index);
     }
     (2, block_index)
@@ -2297,9 +2833,9 @@ fn can_select_ordered_match(
     block_index: usize,
     expected_block: Option<usize>,
     path: &Path,
-    blocks: &[SourceBlock],
+    blocks: &ScanBlockState<'_>,
 ) -> bool {
-    match blocks[block_index].location.as_ref() {
+    match blocks.location(block_index) {
         None => true,
         Some(location) if Some(block_index) == expected_block => location.path != path,
         Some(_) => false,
@@ -2311,7 +2847,7 @@ fn preferred_ordered_match(
     candidate: usize,
     expected_block: Option<usize>,
     preferred_file_id: FileId,
-    blocks: &[SourceBlock],
+    blocks: &ScanBlockState<'_>,
 ) -> bool {
     let candidate_rank = ordered_match_rank(candidate, expected_block, preferred_file_id, blocks);
     current.is_none_or(|current| {
@@ -2358,7 +2894,7 @@ fn log_file_scan(
 }
 
 fn scan_buffered_windows(
-    scan: &mut BufferedWindowScan<'_, '_>,
+    scan: &mut BufferedWindowScan<'_, '_, '_>,
     buffer: &[u8],
     base_offset: usize,
     next_unscanned_offset: &mut usize,
@@ -2392,8 +2928,11 @@ fn scan_buffered_windows(
         let mut saw_crc_candidate = false;
         if let Some(candidates) = scanner.table.by_crc.get(&crc) {
             for block_index in candidates {
-                let expected_len = scan.blocks[*block_index].expected_len;
+                let expected_len = scan.blocks.block(*block_index).expected_len;
                 if expected_len != scanner.table.slice_size {
+                    continue;
+                }
+                if !can_record_block_location(scan.blocks, *block_index, path, kind) {
                     continue;
                 }
                 saw_crc_candidate = true;
@@ -2480,16 +3019,17 @@ fn scan_short_blocks_from_file(
     kind: BlockLocationKind,
     files: &[SourceFileEntry],
     file_index_by_id: &HashMap<FileId, usize>,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     len: usize,
 ) -> Result<()> {
     let max_tail_len = table
         .short_blocks
         .iter()
         .filter_map(|block_index| {
-            let block = &blocks[*block_index];
+            let block = blocks.block(*block_index);
             let short_len = block.expected_len as usize;
-            (block.location.is_none() && short_len > 0 && short_len <= len).then_some(short_len)
+            (blocks.location(*block_index).is_none() && short_len > 0 && short_len <= len)
+                .then_some(short_len)
         })
         .max()
         .unwrap_or(0);
@@ -2501,10 +3041,10 @@ fn scan_short_blocks_from_file(
     };
 
     for block_index in &table.short_blocks {
-        if blocks[*block_index].location.is_some() {
+        if blocks.location(*block_index).is_some() {
             continue;
         }
-        let block = &blocks[*block_index];
+        let block = blocks.block(*block_index);
         let short_len = block.expected_len as usize;
         if short_len == 0 || short_len > len {
             continue;
@@ -2561,7 +3101,7 @@ fn scan_shifted_short_blocks_from_file(
     table: &VerificationHashTable,
     path: &Path,
     kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     len: usize,
 ) -> Result<()> {
     let lengths = unmatched_short_lengths(table, blocks, len);
@@ -2576,7 +3116,7 @@ fn scan_shifted_short_blocks_from_slice(
     table: &VerificationHashTable,
     path: &Path,
     kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     data: &[u8],
 ) {
     let lengths = unmatched_short_lengths(table, blocks, data.len());
@@ -2587,16 +3127,17 @@ fn scan_shifted_short_blocks_from_slice(
 
 fn unmatched_short_lengths(
     table: &VerificationHashTable,
-    blocks: &[SourceBlock],
+    blocks: &ScanBlockState<'_>,
     len: usize,
 ) -> Vec<usize> {
     let mut lengths: Vec<usize> = table
         .short_blocks
         .iter()
         .filter_map(|block_index| {
-            let block = &blocks[*block_index];
+            let block = blocks.block(*block_index);
             let short_len = block.expected_len as usize;
-            (block.location.is_none() && short_len > 0 && short_len <= len).then_some(short_len)
+            (blocks.location(*block_index).is_none() && short_len > 0 && short_len <= len)
+                .then_some(short_len)
         })
         .collect();
     lengths.sort_unstable();
@@ -2608,7 +3149,7 @@ fn scan_shifted_short_len_from_file(
     table: &VerificationHashTable,
     path: &Path,
     kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     len: usize,
     short_len: usize,
 ) -> Result<()> {
@@ -2639,6 +3180,7 @@ fn scan_shifted_short_len_from_file(
     let window_table = generate_window_table(short_len as u64);
     let pad_len = table.slice_size.saturating_sub(short_len as u64);
     let zero_crc = crc32_zeros(pad_len);
+    let zero_combine = checksum::Crc32CombineOp::new(pad_len, zero_crc);
 
     loop {
         if valid_len == buffer.len() {
@@ -2661,8 +3203,7 @@ fn scan_shifted_short_len_from_file(
             kind,
             blocks,
             short_len,
-            pad_len,
-            zero_crc,
+            &zero_combine,
             &window_table,
         );
 
@@ -2679,7 +3220,7 @@ fn scan_shifted_short_len_from_slice(
     table: &VerificationHashTable,
     path: &Path,
     kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     data: &[u8],
     short_len: usize,
 ) {
@@ -2689,6 +3230,7 @@ fn scan_shifted_short_len_from_slice(
 
     let pad_len = table.slice_size.saturating_sub(short_len as u64);
     let zero_crc = crc32_zeros(pad_len);
+    let zero_combine = checksum::Crc32CombineOp::new(pad_len, zero_crc);
     let window_table = generate_window_table(short_len as u64);
     let mut next_unscanned_offset = 0usize;
     scan_shifted_short_windows(
@@ -2700,8 +3242,7 @@ fn scan_shifted_short_len_from_slice(
         kind,
         blocks,
         short_len,
-        pad_len,
-        zero_crc,
+        &zero_combine,
         &window_table,
     );
 }
@@ -2714,10 +3255,9 @@ fn scan_shifted_short_windows(
     next_unscanned_offset: &mut usize,
     path: &Path,
     kind: BlockLocationKind,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     short_len: usize,
-    pad_len: u64,
-    zero_crc: u32,
+    zero_combine: &checksum::Crc32CombineOp,
     window_table: &[u32; 256],
 ) {
     if short_len == 0 || buffer.len() < short_len {
@@ -2732,13 +3272,15 @@ fn scan_shifted_short_windows(
 
     let mut crc = checksum::crc32(&buffer[local_offset..local_offset + short_len]);
     loop {
-        let padded_crc = checksum::crc32_combine(crc, zero_crc, pad_len);
+        let padded_crc = zero_combine.combine(crc);
         if let Some(candidates) = table.by_crc.get(&padded_crc) {
             let data = &buffer[local_offset..local_offset + short_len];
             let absolute_offset = (base_offset + local_offset) as u64;
             for block_index in candidates {
-                let block = &blocks[*block_index];
-                if block.location.is_some() || block.expected_len as usize != short_len {
+                let block = blocks.block(*block_index);
+                if blocks.location(*block_index).is_some()
+                    || block.expected_len as usize != short_len
+                {
                     continue;
                 }
                 if short_block_matches(data, table.slice_size, block) {
@@ -2786,17 +3328,23 @@ fn scanner_uses_mmap_fallback(slice_size: u64) -> bool {
     slice_size > SCANNER_MMAP_FALLBACK_SLICE_BYTES as u64
 }
 
-fn record_block_location(blocks: &mut [SourceBlock], block_index: usize, location: BlockLocation) {
-    let replace = blocks[block_index]
-        .location
-        .as_ref()
-        .is_none_or(|existing| {
-            location.kind < existing.kind
-                || (location.kind == existing.kind && location.path < existing.path)
-        });
-    if replace {
-        blocks[block_index].location = Some(location);
-    }
+fn record_block_location(
+    blocks: &mut ScanBlockState<'_>,
+    block_index: usize,
+    location: BlockLocation,
+) {
+    blocks.record_location(block_index, location);
+}
+
+fn can_record_block_location(
+    blocks: &ScanBlockState<'_>,
+    block_index: usize,
+    path: &Path,
+    kind: BlockLocationKind,
+) -> bool {
+    blocks.location(block_index).is_none_or(|existing| {
+        kind < existing.kind || (kind == existing.kind && path < existing.path.as_path())
+    })
 }
 
 fn scanner_md5_batch_lanes(slice_size: usize) -> usize {
@@ -2807,7 +3355,7 @@ fn scanner_md5_batch_lanes(slice_size: usize) -> usize {
 }
 
 fn record_matching_md5_block(
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     block_index: usize,
     data: &[u8],
     path: &Path,
@@ -2815,8 +3363,11 @@ fn record_matching_md5_block(
     len: u64,
     kind: BlockLocationKind,
 ) {
+    if !can_record_block_location(blocks, block_index, path, kind) {
+        return;
+    }
     let md5 = checksum::md5(data);
-    if blocks[block_index].checksum.md5 == md5 {
+    if blocks.block(block_index).checksum.md5 == md5 {
         record_block_location(
             blocks,
             block_index,
@@ -2832,7 +3383,7 @@ fn record_matching_md5_block(
 
 fn flush_pending_md5_checks(
     pending: &mut Vec<PendingMd5Check<'_>>,
-    blocks: &mut [SourceBlock],
+    blocks: &mut ScanBlockState<'_>,
     path: &Path,
 ) {
     if pending.is_empty() {
@@ -2842,7 +3393,10 @@ fn flush_pending_md5_checks(
     let inputs = pending.iter().map(|check| check.data).collect::<Vec<_>>();
     let md5s = md5_simd::md5_multi(&inputs, None);
     for (check, md5) in pending.iter().zip(md5s) {
-        if blocks[check.block_index].checksum.md5 == md5 {
+        if !can_record_block_location(blocks, check.block_index, path, check.kind) {
+            continue;
+        }
+        if blocks.block(check.block_index).checksum.md5 == md5 {
             record_block_location(
                 blocks,
                 check.block_index,
@@ -2883,17 +3437,25 @@ fn discover_adjacent_par2_files(par2_paths: &[PathBuf]) -> io::Result<Vec<PathBu
 }
 
 fn discover_related_par2_files(path: &Path) -> io::Result<Vec<PathBuf>> {
-    let Some(dir) = path.parent() else {
-        return Ok(Vec::new());
-    };
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let Some(stem) = turbo_par2_base_name(path) else {
         return Ok(Vec::new());
     };
 
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(out);
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if !file_type.is_file() {
             continue;
         }
@@ -2908,6 +3470,28 @@ fn discover_related_par2_files(path: &Path) -> io::Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+fn discover_source_primary_par2_file(path: &Path) -> io::Result<Option<PathBuf>> {
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(stem) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+
+    let lower = dir.join(format!("{stem}.par2"));
+    if lower.is_file() {
+        return Ok(Some(lower));
+    }
+
+    let upper = dir.join(format!("{stem}.PAR2"));
+    if upper.is_file() {
+        return Ok(Some(upper));
+    }
+
+    Ok(None)
 }
 
 fn related_par2_name_matches(stem: &str, path: &Path) -> bool {
@@ -2965,7 +3549,7 @@ fn discover_candidate_files(base_dir: &Path) -> io::Result<Vec<PathBuf>> {
 fn is_par2_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("par2"))
+        .is_some_and(|ext| ext == "par2" || ext == "PAR2")
 }
 
 fn has_par2_marker(path: &Path) -> bool {
@@ -2984,10 +3568,17 @@ where
     let mut out = Vec::new();
     let mut stack = vec![base_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
-            let file_type = entry.file_type()?;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             if file_type.is_dir() {
                 if !should_skip_candidate(&path) {
                     stack.push(path);
@@ -3068,6 +3659,19 @@ fn copy_range(
     Ok(())
 }
 
+fn push_block_copy_range(ranges: &mut Vec<BlockCopyRange>, next: BlockCopyRange) {
+    if next.len == 0 {
+        return;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.can_extend(&next)
+    {
+        last.extend(&next);
+        return;
+    }
+    ranges.push(next);
+}
+
 fn unique_repair_dir(base_dir: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3106,6 +3710,21 @@ fn rollback_installed_files(installed_targets: &[PathBuf], backups: &[(PathBuf, 
         if fs::rename(backup, target).is_ok() {
             crate::file_cache::drop_path_cache(backup);
             crate::file_cache::drop_path_cache(target);
+        }
+    }
+}
+
+fn purge_files_best_effort<I, P>(paths: I)
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    for path in paths {
+        let path = path.as_ref();
+        match fs::remove_file(path) {
+            Ok(()) => crate::file_cache::drop_path_cache(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
         }
     }
 }
@@ -3301,6 +3920,207 @@ mod tests {
     }
 
     #[test]
+    fn turbo_par2_base_name_strips_volume_suffix() {
+        assert_eq!(
+            turbo_par2_base_name(Path::new("movie.vol000+001.par2")).as_deref(),
+            Some("movie")
+        );
+        assert_eq!(
+            turbo_par2_base_name(Path::new("movie.vol000-001.PAR2")).as_deref(),
+            Some("movie")
+        );
+        assert_eq!(
+            turbo_par2_base_name(Path::new("movie.extra.par2")).as_deref(),
+            Some("movie.extra")
+        );
+    }
+
+    #[test]
+    fn discover_adjacent_par2_files_matches_turbo_sibling_scope() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+
+        let main = dir.path().join("movie.par2");
+        let sibling_recovery = dir.path().join("movie.vol000+001.par2");
+        let sibling_upper = dir.path().join("movie.vol001+001.PAR2");
+        let sibling_mixed_extension = dir.path().join("movie.vol002+001.Par2");
+        let sibling_main_upper = dir.path().join("movie.PAR2");
+        let unrelated = dir.path().join("other.vol000+001.par2");
+        let nested_recovery = nested.join("movie.vol002+001.par2");
+
+        for path in [
+            &main,
+            &sibling_recovery,
+            &sibling_upper,
+            &sibling_mixed_extension,
+            &sibling_main_upper,
+            &unrelated,
+            &nested_recovery,
+        ] {
+            fs::write(path, b"not parsed in this test").unwrap();
+        }
+
+        let discovered = discover_adjacent_par2_files(std::slice::from_ref(&main)).unwrap();
+
+        assert_eq!(discovered, vec![sibling_recovery, sibling_upper]);
+    }
+
+    #[test]
+    fn discover_source_primary_par2_file_matches_turbo_setparfilename() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("movie.mkv");
+        let volume_only = dir.path().join("movie.mkv.vol000+001.par2");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&volume_only, b"volume").unwrap();
+
+        assert_eq!(discover_source_primary_par2_file(&source).unwrap(), None);
+
+        let lower_primary = dir.path().join("movie.mkv.par2");
+        let upper_primary = dir.path().join("movie.mkv.PAR2");
+        fs::write(&upper_primary, b"primary").unwrap();
+        let expected_upper_only = if lower_primary.is_file() {
+            lower_primary.clone()
+        } else {
+            upper_primary
+        };
+        assert_eq!(
+            discover_source_primary_par2_file(&source).unwrap(),
+            Some(expected_upper_only)
+        );
+
+        fs::write(&lower_primary, b"primary").unwrap();
+        assert_eq!(
+            discover_source_primary_par2_file(&source).unwrap(),
+            Some(lower_primary)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_adjacent_par2_files_skips_unreadable_sibling_directory_like_turbo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let main = dir.path().join("movie.par2");
+        fs::write(&main, b"not parsed in this test").unwrap();
+
+        let original_perms = fs::metadata(dir.path()).unwrap().permissions();
+        let mut closed_perms = original_perms.clone();
+        closed_perms.set_mode(0o0);
+        fs::set_permissions(dir.path(), closed_perms).unwrap();
+
+        let discovered = discover_adjacent_par2_files(std::slice::from_ref(&main));
+
+        fs::set_permissions(dir.path(), original_perms).unwrap();
+
+        assert_eq!(discovered.unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn load_inventory_ignores_unusable_par2_marker_extra_paths() {
+        let dir = tempdir().unwrap();
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&4u64.to_le_bytes());
+        main_body.extend_from_slice(&0u32.to_le_bytes());
+        let rsid = checksum::md5(&main_body);
+        let main_path = dir.path().join("target.par2");
+        fs::write(
+            &main_path,
+            make_full_packet(crate::packet::header::TYPE_MAIN, &main_body, rsid),
+        )
+        .unwrap();
+
+        let junk_marker_path = dir.path().join("junk.par2.bak");
+        fs::write(&junk_marker_path, b"not a PAR2 packet stream").unwrap();
+
+        let mut options =
+            Par2RepairerOptions::new(dir.path().to_path_buf(), vec![main_path.clone()]);
+        options
+            .extra_paths
+            .push(dir.path().join("missing.par2.bak"));
+        options.extra_paths.push(junk_marker_path);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        assert_eq!(inventory.set.recovery_block_count(), 0);
+        assert_eq!(inventory.diagnostics.corrupt_packets, 0);
+        assert_eq!(inventory.purge_paths, vec![main_path]);
+    }
+
+    #[test]
+    fn load_inventory_remembers_optional_adjacent_par2_files_for_purge() {
+        let dir = tempdir().unwrap();
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&4u64.to_le_bytes());
+        main_body.extend_from_slice(&0u32.to_le_bytes());
+        let rsid = checksum::md5(&main_body);
+        let main_path = dir.path().join("target.par2");
+        let corrupt_adjacent = dir.path().join("target.vol000+001.par2");
+        fs::write(
+            &main_path,
+            make_full_packet(crate::packet::header::TYPE_MAIN, &main_body, rsid),
+        )
+        .unwrap();
+        fs::write(&corrupt_adjacent, b"not a PAR2 packet stream").unwrap();
+
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), vec![main_path.clone()]);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        assert_eq!(inventory.diagnostics.corrupt_packets, 0);
+        assert_eq!(inventory.purge_paths, vec![main_path, corrupt_adjacent]);
+    }
+
+    #[test]
+    fn load_inventory_prefers_adjacent_recovery_over_duplicate_marker_extra() {
+        let dir = tempdir().unwrap();
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&4u64.to_le_bytes());
+        main_body.extend_from_slice(&0u32.to_le_bytes());
+        let rsid = checksum::md5(&main_body);
+
+        let main_path = dir.path().join("target.par2");
+        fs::write(
+            &main_path,
+            make_full_packet(crate::packet::header::TYPE_MAIN, &main_body, rsid),
+        )
+        .unwrap();
+
+        let mut sibling_recovery_body = Vec::new();
+        sibling_recovery_body.extend_from_slice(&0u32.to_le_bytes());
+        sibling_recovery_body.extend_from_slice(&[0x11; 4]);
+        fs::write(
+            dir.path().join("target.vol000+001.par2"),
+            make_full_packet(
+                crate::packet::header::TYPE_RECOVERY,
+                &sibling_recovery_body,
+                rsid,
+            ),
+        )
+        .unwrap();
+
+        let mut extra_recovery_body = Vec::new();
+        extra_recovery_body.extend_from_slice(&0u32.to_le_bytes());
+        extra_recovery_body.extend_from_slice(&[0x22; 4]);
+        let extra_path = dir.path().join("target.par2.bak");
+        fs::write(
+            &extra_path,
+            make_full_packet(
+                crate::packet::header::TYPE_RECOVERY,
+                &extra_recovery_body,
+                rsid,
+            ),
+        )
+        .unwrap();
+
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), vec![main_path]);
+        options.extra_paths.push(extra_path);
+        let inventory = Par2Repairer::new(options).load_inventory().unwrap();
+
+        let recovery = inventory.set.recovery_slices.get(&0).unwrap();
+        assert_eq!(recovery.data.to_vec().unwrap(), vec![0x11; 4]);
+    }
+
+    #[test]
     fn load_inventory_reads_par2_marker_extra_paths_as_packets() {
         let dir = tempdir().unwrap();
         let file_id = FileId::from_bytes([1; 16]);
@@ -3393,6 +4213,73 @@ mod tests {
             unique_backup_path(&target).unwrap(),
             dir.path().join("target.bin.3")
         );
+    }
+
+    #[test]
+    fn block_copy_ranges_coalesce_contiguous_runs() {
+        let src = PathBuf::from("source.bin");
+        let other_src = PathBuf::from("other-source.bin");
+        let dst = PathBuf::from("target.bin");
+        let other_dst = PathBuf::from("other-target.bin");
+        let mut ranges = Vec::new();
+
+        push_block_copy_range(
+            &mut ranges,
+            BlockCopyRange {
+                src: src.clone(),
+                src_offset: 0,
+                dst: dst.clone(),
+                dst_offset: 0,
+                len: 1024,
+            },
+        );
+        push_block_copy_range(
+            &mut ranges,
+            BlockCopyRange {
+                src: src.clone(),
+                src_offset: 1024,
+                dst: dst.clone(),
+                dst_offset: 1024,
+                len: 1024,
+            },
+        );
+        push_block_copy_range(
+            &mut ranges,
+            BlockCopyRange {
+                src: src.clone(),
+                src_offset: 4096,
+                dst: dst.clone(),
+                dst_offset: 4096,
+                len: 1024,
+            },
+        );
+        push_block_copy_range(
+            &mut ranges,
+            BlockCopyRange {
+                src: other_src,
+                src_offset: 5120,
+                dst: dst.clone(),
+                dst_offset: 5120,
+                len: 1024,
+            },
+        );
+        push_block_copy_range(
+            &mut ranges,
+            BlockCopyRange {
+                src,
+                src_offset: 6144,
+                dst: other_dst,
+                dst_offset: 6144,
+                len: 1024,
+            },
+        );
+
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].src_offset, 0);
+        assert_eq!(ranges[0].dst_offset, 0);
+        assert_eq!(ranges[0].len, 2048);
+        assert_eq!(ranges[1].src_offset, 4096);
+        assert_eq!(ranges[1].len, 1024);
     }
 
     #[test]
@@ -4137,6 +5024,58 @@ mod tests {
     }
 
     #[test]
+    fn scan_parallel_extra_batch_merges_partial_blocks() {
+        let dir = tempdir().unwrap();
+        let target = b"aaaabbbbccccdddd".to_vec();
+        let set = synthetic_set(&[("target.bin", &target)], 4);
+        let first = dir.path().join("first.partial");
+        let second = dir.path().join("second.partial");
+        fs::write(&first, b"aaaaxxxxccccyyyy").unwrap();
+        fs::write(&second, b"zzzzbbbbqqqqdddd").unwrap();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let scan = pool.install(|| state.scan(&options)).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(scan.files_scanned, 2);
+        assert_eq!(scan.blocks_found, 4);
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert_eq!(
+            state.blocks[0]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&first)
+        );
+        assert_eq!(
+            state.blocks[1]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&second)
+        );
+        assert_eq!(
+            state.blocks[2]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&first)
+        );
+        assert_eq!(
+            state.blocks[3]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&second)
+        );
+    }
+
+    #[test]
     fn copy_only_repair_assembles_mixed_target_from_extra_blocks() {
         let dir = tempdir().unwrap();
         let target = b"aaaabbbbccccdddd".to_vec();
@@ -4241,6 +5180,22 @@ mod tests {
     }
 
     #[test]
+    fn scan_ignores_zero_byte_extra_as_complete_source() {
+        let dir = tempdir().unwrap();
+        let set = synthetic_set(&[("target.bin", b"")], 4);
+        let extra = dir.path().join("renamed-empty.bin");
+        fs::write(&extra, []).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.extra_paths.push(extra);
+        let scan = state.scan(&options).unwrap();
+
+        assert_eq!(scan.files_scanned, 1);
+        assert!(state.files[0].complete_location.is_none());
+    }
+
+    #[test]
     fn scan_canonicalizes_explicit_extra_paths_before_deduping() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("base");
@@ -4298,6 +5253,69 @@ mod tests {
         assert!(state.blocks.iter().all(|block| block.location.is_none()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_explicit_symlinked_extra_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let data = b"symlinked-complete-target".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let outside = dir.path().join("outside.bin");
+        let linked = base.join("linked-extra.bin");
+        fs::write(&outside, &data).unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let mut state = RepairState::from_set(&base, set).unwrap();
+        let mut options = Par2RepairerOptions::new(base, Vec::new());
+        options.extra_paths.push(linked);
+        let scan = state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(scan.files_scanned, 0);
+        assert_eq!(verification.total_missing_blocks, state.blocks.len() as u32);
+        assert!(state.blocks.iter().all(|block| block.location.is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_unreadable_extra_directories_like_turbo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base");
+        let closed = base.join("closed");
+        fs::create_dir_all(&closed).unwrap();
+
+        let data = b"visible-complete-target".to_vec();
+        let set = synthetic_set(&[("target.bin", &data)], 4);
+        let visible = base.join("candidate.bin");
+        fs::write(&visible, &data).unwrap();
+
+        let original_perms = fs::metadata(&closed).unwrap().permissions();
+        let mut closed_perms = original_perms.clone();
+        closed_perms.set_mode(0o0);
+        fs::set_permissions(&closed, closed_perms).unwrap();
+
+        let mut state = RepairState::from_set(&base, set).unwrap();
+        let options = Par2RepairerOptions::new(base.clone(), Vec::new());
+        let scan = state.scan(&options);
+
+        fs::set_permissions(&closed, original_perms).unwrap();
+
+        let scan = scan.unwrap();
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(
+            state.blocks[0]
+                .location
+                .as_ref()
+                .map(|location| &location.path),
+            Some(&visible)
+        );
+    }
+
     #[test]
     fn duplicate_basenames_in_different_directories_stay_distinct() {
         let dir = tempdir().unwrap();
@@ -4347,6 +5365,57 @@ mod tests {
     }
 
     #[test]
+    fn large_recoverable_file_without_ifsc_does_not_skip_full_hash() {
+        let dir = tempdir().unwrap();
+        let data = (0..CANONICAL_COMPLETE_HASH_SKIP_BYTES + 17)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut set = synthetic_set(&[("target.bin", &data)], 64);
+        set.slice_checksums.clear();
+        fs::write(dir.path().join("target.bin"), &data).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(state.inconsistent_packets, 1);
+        assert_eq!(state.files[0].block_count, 0);
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert!(matches!(
+            verification.files.first().map(|file| &file.status),
+            Some(FileStatus::Complete)
+        ));
+        assert!(matches!(verification.repairable, Repairability::NotNeeded));
+    }
+
+    #[test]
+    fn recoverable_file_without_ifsc_rejects_wrong_existing_target() {
+        let dir = tempdir().unwrap();
+        let data = b"aaaabbbb".to_vec();
+        let mut set = synthetic_set(&[("target.bin", &data)], 4);
+        set.slice_checksums.clear();
+        fs::write(dir.path().join("target.bin"), b"ccccdddd").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(state.inconsistent_packets, 1);
+        assert_eq!(state.files[0].block_count, 0);
+        assert_eq!(verification.total_missing_blocks, 2);
+        assert!(matches!(
+            verification.files.first().map(|file| &file.status),
+            Some(FileStatus::Damaged(2))
+        ));
+        assert!(matches!(
+            verification.repairable,
+            Repairability::Insufficient { .. }
+        ));
+    }
+
+    #[test]
     fn recoverable_file_with_invalid_ifsc_stays_visible_but_unrepairable() {
         let dir = tempdir().unwrap();
         let data = b"aaaabbbb".to_vec();
@@ -4368,6 +5437,30 @@ mod tests {
             verification.repairable,
             Repairability::Insufficient { .. }
         ));
+    }
+
+    #[test]
+    fn recoverable_file_with_invalid_ifsc_verifies_by_full_hash() {
+        let dir = tempdir().unwrap();
+        let data = b"aaaabbbb".to_vec();
+        let mut set = synthetic_set(&[("target.bin", &data)], 4);
+        let file_id = set.recovery_file_ids[0];
+        set.slice_checksums.get_mut(&file_id).unwrap().pop();
+        fs::write(dir.path().join("target.bin"), &data).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(state.inconsistent_packets, 1);
+        assert_eq!(state.files[0].block_count, 0);
+        assert_eq!(verification.total_missing_blocks, 0);
+        assert!(matches!(
+            verification.files.first().map(|file| &file.status),
+            Some(FileStatus::Complete)
+        ));
+        assert!(matches!(verification.repairable, Repairability::NotNeeded));
     }
 
     #[test]
@@ -4457,13 +5550,12 @@ mod tests {
         let set = synthetic_set(&[("first.bin", &first), ("second.bin", &second)], 8);
         let first_extra = dir.path().join("first.extra");
         let second_extra = dir.path().join("second.extra");
-        let link_target = dir.path().join("link-target.bin");
+        let dangling_target = dir.path().join("missing-link-target.bin");
 
         fs::write(dir.path().join("first.bin"), &first_damaged).unwrap();
         fs::write(&first_extra, &first).unwrap();
         fs::write(&second_extra, &second).unwrap();
-        fs::write(&link_target, b"not the target").unwrap();
-        std::os::unix::fs::symlink(&link_target, dir.path().join("second.bin")).unwrap();
+        std::os::unix::fs::symlink(&dangling_target, dir.path().join("second.bin")).unwrap();
 
         let mut state = RepairState::from_set(dir.path(), set).unwrap();
         let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
@@ -4475,7 +5567,7 @@ mod tests {
         let repair = state.repair(&options, &verification).unwrap();
         let error = state
             .install_repaired_files(&repair, &options)
-            .expect_err("second symlink target should fail install");
+            .expect_err("dangling second symlink target should fail install");
 
         assert!(matches!(error, Par2Error::Io(_)));
         assert_eq!(
@@ -4563,8 +5655,9 @@ mod tests {
         let mut recovery_body = Vec::new();
         recovery_body.extend_from_slice(&0u32.to_le_bytes());
         recovery_body.extend_from_slice(&[0xAA; 4]);
+        let conflicting_recovery = dir.path().join("other.vol00+01.par2");
         fs::write(
-            dir.path().join("other.vol00+01.par2"),
+            &conflicting_recovery,
             make_full_packet(
                 crate::packet::header::TYPE_RECOVERY,
                 &recovery_body,
@@ -4573,10 +5666,12 @@ mod tests {
         )
         .unwrap();
 
-        let repairer = Par2Repairer::new(Par2RepairerOptions::new(
+        let mut options = Par2RepairerOptions::new(
             dir.path().to_path_buf(),
             vec![dir.path().join("active.par2")],
-        ));
+        );
+        options.recovery_paths.push(conflicting_recovery);
+        let repairer = Par2Repairer::new(options);
         let inventory = repairer.load_inventory().unwrap();
 
         assert_eq!(inventory.set.recovery_block_count(), 0);

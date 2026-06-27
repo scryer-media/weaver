@@ -173,6 +173,7 @@ pub struct SyntheticFile {
 pub struct SyntheticPar2 {
     pub par2_set: Par2FileSet,
     pub files: Vec<SyntheticFile>,
+    pub packet_bytes: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -365,6 +366,15 @@ pub fn build_synthetic_par2(
             mul_acc_region(factor, &all_slices[slice_index], &mut recovery);
         }
 
+        let mut recovery_body = Vec::with_capacity(4 + recovery.len());
+        recovery_body.extend_from_slice(&exponent.to_le_bytes());
+        recovery_body.extend_from_slice(&recovery);
+        stream.extend_from_slice(&make_full_packet(
+            header::TYPE_RECOVERY,
+            &recovery_body,
+            recovery_set_id,
+        ));
+
         set.recovery_slices.insert(
             exponent,
             RecoverySlice {
@@ -377,6 +387,7 @@ pub fn build_synthetic_par2(
     SyntheticPar2 {
         par2_set: set,
         files,
+        packet_bytes: stream,
     }
 }
 

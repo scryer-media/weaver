@@ -68,11 +68,19 @@ const fn default_rar_crypto_backend() -> RarCryptoBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rar5KeyMaterial {
     pub key: [u8; 32],
     pub hash_key: [u8; 32],
     pub psw_check: [u8; 8],
+}
+
+impl Drop for Rar5KeyMaterial {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.hash_key.zeroize();
+        self.psw_check.zeroize();
+    }
 }
 
 fn hmac_sha256_rustcrypto(password: &HmacSha256, data: &[u8]) -> [u8; 32] {

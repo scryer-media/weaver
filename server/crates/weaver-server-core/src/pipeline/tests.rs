@@ -1323,6 +1323,7 @@ fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
         is_solid: false,
         is_encrypted: false,
         members: Vec::new(),
+        services: Vec::new(),
     }
 }
 
@@ -1336,6 +1337,9 @@ fn dummy_named_rar_volume_facts(
             name: member_name.to_string(),
             unpacked_size: Some(1024),
             data_crc32: None,
+            packed_crc32: None,
+            packed_blake2_hash: None,
+            packed_hash_uses_mac: false,
             split_before: volume_number > 0,
             split_after: true,
             is_directory: false,

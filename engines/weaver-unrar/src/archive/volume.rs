@@ -58,6 +58,7 @@ impl RarArchive {
             .as_ref()
             .and_then(|m| m.volume_number)
             .unwrap_or(index as u64) as usize;
+        self.ensure_volume_header_encryption_matches(vol_num, parsed.is_encrypted)?;
 
         // Register this volume.
         self.volume_set.add_volume(vol_num);
@@ -71,11 +72,18 @@ impl RarArchive {
 
         // Process file headers from this volume.
         for pf in parsed.files {
-            let segment = DataSegment {
-                volume_index: vol_num,
-                data_offset: pf.header.data_offset,
-                data_size: pf.header.data_size,
-            };
+            let packed_hash = Self::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+            let packed_hash_uses_mac = pf
+                .file_encryption
+                .as_ref()
+                .is_some_and(|enc| enc.use_hash_mac);
+            let segment = DataSegment::with_packed_hash(
+                vol_num,
+                pf.header.data_offset,
+                pf.header.data_size,
+                packed_hash,
+                packed_hash_uses_mac,
+            );
 
             let mut file_header = pf.header;
             file_header.is_encrypted = pf.is_encrypted;
@@ -94,11 +102,19 @@ impl RarArchive {
         }
 
         for service in parsed.services {
-            let segment = DataSegment {
-                volume_index: vol_num,
-                data_offset: service.header.inner.data_offset,
-                data_size: service.header.inner.data_size,
-            };
+            let packed_hash =
+                Self::packed_hash_for_split_segment(&service.header.inner, service.hash.as_ref());
+            let packed_hash_uses_mac = service
+                .file_encryption
+                .as_ref()
+                .is_some_and(|enc| enc.use_hash_mac);
+            let segment = DataSegment::with_packed_hash(
+                vol_num,
+                service.header.inner.data_offset,
+                service.header.inner.data_size,
+                packed_hash,
+                packed_hash_uses_mac,
+            );
             let mut file_header = service.header.inner;
             file_header.is_encrypted = service.is_encrypted;
             let entry = ServiceEntry {
@@ -136,6 +152,12 @@ impl RarArchive {
                 .retain(|segment| segment.volume_index != index);
         }
         self.members.retain(|member| !member.segments.is_empty());
+        for service in &mut self.services {
+            service
+                .segments
+                .retain(|segment| segment.volume_index != index);
+        }
+        self.services.retain(|service| !service.segments.is_empty());
         self.reconcile_member_chains();
     }
 
@@ -172,6 +194,7 @@ impl RarArchive {
             .and_then(|e| e.volume_number)
             .map(|v| v as usize)
             .unwrap_or(index);
+        self.ensure_volume_header_encryption_matches(vol_num, parsed.archive_header.is_encrypted)?;
         self.volume_set.add_volume(vol_num);
 
         let more_volumes = parsed.end.as_ref().is_some_and(|e| e.more_volumes);
@@ -180,14 +203,17 @@ impl RarArchive {
             self.more_volumes = false;
         }
         for fh in &parsed.files {
-            let segment = DataSegment {
-                volume_index: vol_num,
-                data_offset: fh.data_offset,
-                data_size: fh.packed_size,
-            };
+            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
+            let segment = DataSegment::with_packed_hash(
+                vol_num,
+                fh.data_offset,
+                fh.packed_size,
+                Self::packed_hash_for_split_segment(&file_header, None),
+                false,
+            );
 
             let entry = MemberEntry {
-                file_header: Self::rar4_to_file_header(fh, parsed.archive_header.is_solid),
+                file_header,
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
                 rar4_salt: fh.salt,
@@ -201,17 +227,20 @@ impl RarArchive {
         }
 
         for fh in &parsed.services {
+            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
-                file_header: Self::rar4_to_file_header(fh, parsed.archive_header.is_solid),
+                file_header: file_header.clone(),
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
                 hash: None,
                 comment_crc16: None,
-                segments: vec![DataSegment {
-                    volume_index: vol_num,
-                    data_offset: fh.data_offset,
-                    data_size: fh.packed_size,
-                }],
+                segments: vec![DataSegment::with_packed_hash(
+                    vol_num,
+                    fh.data_offset,
+                    fh.packed_size,
+                    Self::packed_hash_for_split_segment(&file_header, None),
+                    false,
+                )],
             };
             Self::integrate_service_entry(&mut self.services, vol_num, entry);
         }
@@ -530,6 +559,22 @@ impl RarArchive {
         }
     }
 
+    fn ensure_volume_header_encryption_matches(
+        &self,
+        vol_num: usize,
+        next_is_encrypted: bool,
+    ) -> RarResult<()> {
+        if self.is_encrypted != next_is_encrypted {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "volume {vol_num} changed header encryption state from {} to {}",
+                    self.is_encrypted, next_is_encrypted
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Store a volume reader at the given index.
     pub(super) fn store_volume_reader(&mut self, vol_num: usize, reader: Box<dyn ReadSeek>) {
         while self.volumes.len() <= vol_num {
@@ -599,11 +644,23 @@ mod tests {
             hash: None,
             redirection: None,
             owner: None,
-            segments: vec![DataSegment {
-                volume_index: first_volume,
-                data_offset: 0,
-                data_size: 8,
-            }],
+            segments: vec![DataSegment::new(first_volume, 0, 8)],
+        }
+    }
+
+    fn test_service(
+        name: &str,
+        first_volume: usize,
+        split_before: bool,
+        split_after: bool,
+    ) -> ServiceEntry {
+        ServiceEntry {
+            file_header: test_file_header(name, split_before, split_after, Some(0xAABB_CCDD)),
+            is_encrypted: false,
+            file_encryption: None,
+            hash: None,
+            comment_crc16: Some(0xCCDD),
+            segments: vec![DataSegment::new(first_volume, 16, 8)],
         }
     }
 
@@ -647,6 +704,52 @@ mod tests {
             password: None,
             kdf_cache: std::sync::Arc::new(crate::crypto::KdfCache::new()),
         }
+    }
+
+    #[test]
+    fn volume_header_encryption_state_must_match_unrar_merge_guard() {
+        let mut archive = empty_archive(Vec::new());
+        assert!(
+            archive
+                .ensure_volume_header_encryption_matches(1, false)
+                .is_ok()
+        );
+        let err = archive
+            .ensure_volume_header_encryption_matches(1, true)
+            .unwrap_err();
+        assert!(
+            matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("changed header encryption state")),
+            "expected header encryption mismatch, got {err:?}"
+        );
+
+        archive.is_encrypted = true;
+        assert!(
+            archive
+                .ensure_volume_header_encryption_matches(2, true)
+                .is_ok()
+        );
+        let err = archive
+            .ensure_volume_header_encryption_matches(2, false)
+            .unwrap_err();
+        assert!(
+            matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("volume 2")),
+            "expected volume-specific mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_volume_removes_stale_service_segments() {
+        let mut archive = empty_archive(Vec::new());
+        archive.services = vec![
+            test_service("CMT", 0, false, false),
+            test_service("RR", 1, false, false),
+        ];
+
+        archive.remove_volume_segments(1);
+
+        assert_eq!(archive.services.len(), 1);
+        assert_eq!(archive.services[0].file_header.name, "CMT");
+        assert_eq!(archive.services[0].segments[0].volume_index, 0);
     }
 
     #[test]

@@ -341,11 +341,17 @@ fn parse_unix_owner(data: &[u8]) -> ExtraRecord {
     let mut owner = UnixOwnerInfo::default();
 
     if flags & OWNER_USER_NAME != 0 {
-        owner.user_name = read_unix_owner_name(data, &mut pos);
+        if let Some(name) = read_unix_owner_name(data, &mut pos) {
+            owner.user_name = Some(String::from_utf8_lossy(&name).into_owned());
+            owner.user_name_raw = Some(name);
+        }
     }
 
     if flags & OWNER_GROUP_NAME != 0 {
-        owner.group_name = read_unix_owner_name(data, &mut pos);
+        if let Some(name) = read_unix_owner_name(data, &mut pos) {
+            owner.group_name = Some(String::from_utf8_lossy(&name).into_owned());
+            owner.group_name_raw = Some(name);
+        }
     }
 
     if flags & OWNER_USER_UID != 0 {
@@ -362,7 +368,7 @@ fn parse_unix_owner(data: &[u8]) -> ExtraRecord {
     ExtraRecord::UnixOwner { owner }
 }
 
-fn read_unix_owner_name(data: &[u8], pos: &mut usize) -> Option<String> {
+fn read_unix_owner_name(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     let (name_len, n) = read_raw_vint_lossy(data.get(*pos..).unwrap_or(&[]));
     *pos = (*pos).saturating_add(n).min(data.len());
     let copy_len = usize::try_from(name_len)
@@ -377,7 +383,7 @@ fn read_unix_owner_name(data: &[u8], pos: &mut usize) -> Option<String> {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    Some(String::from_utf8_lossy(&bytes[..nul_end]).into_owned())
+    Some(bytes[..nul_end].to_vec())
 }
 
 fn parse_file_encryption(data: &[u8], owner: ExtraAreaOwner) -> ExtraRecord {
@@ -926,6 +932,29 @@ mod tests {
         match &records[0] {
             ExtraRecord::UnixOwner { owner } => {
                 assert_eq!(owner.user_name.as_deref(), Some("alice"));
+                assert_eq!(owner.user_name_raw.as_deref(), Some(&b"alice"[..]));
+            }
+            other => panic!("expected UnixOwner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unix_owner_preserves_non_utf8_raw_bytes_for_lookup_like_unrar() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(OWNER_USER_NAME | OWNER_GROUP_NAME));
+        body.extend_from_slice(&encode_vint(6));
+        body.extend_from_slice(b"al\xffice");
+        body.extend_from_slice(&encode_vint(5));
+        body.extend_from_slice(b"gr\xf0up");
+
+        let data = build_extra_record(record_type::UNIX_OWNER, &body);
+        let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
+        match &records[0] {
+            ExtraRecord::UnixOwner { owner } => {
+                assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));
+                assert_eq!(owner.group_name_raw.as_deref(), Some(&b"gr\xf0up"[..]));
+                assert_eq!(owner.user_name.as_deref(), Some("al\u{fffd}ice"));
+                assert_eq!(owner.group_name.as_deref(), Some("gr\u{fffd}up"));
             }
             other => panic!("expected UnixOwner, got {other:?}"),
         }

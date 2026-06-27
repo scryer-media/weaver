@@ -25,8 +25,21 @@ pub enum RarError {
         actual: u32,
     },
 
+    #[error(
+        "packed data CRC mismatch for {member} in volume {volume}: expected {expected:#010x}, got {actual:#010x}"
+    )]
+    PackedDataCrcMismatch {
+        member: String,
+        volume: usize,
+        expected: u32,
+        actual: u32,
+    },
+
     #[error("BLAKE2 hash mismatch for {member}")]
     Blake2Mismatch { member: String },
+
+    #[error("packed data BLAKE2 hash mismatch for {member} in volume {volume}")]
+    PackedDataBlake2Mismatch { member: String, volume: usize },
 
     #[error("missing volume {volume} required for member {member}")]
     MissingVolume { volume: usize, member: String },

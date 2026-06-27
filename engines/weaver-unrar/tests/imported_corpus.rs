@@ -172,6 +172,8 @@ fn imported_rar5_metadata_and_hash_fixtures_are_exercised() {
         Some(UnixOwnerInfo {
             user_name: Some("root".to_string()),
             group_name: Some("wheel".to_string()),
+            user_name_raw: Some(b"root".to_vec()),
+            group_name_raw: Some(b"wheel".to_vec()),
             uid: None,
             gid: None,
         })
@@ -181,6 +183,8 @@ fn imported_rar5_metadata_and_hash_fixtures_are_exercised() {
         Some(UnixOwnerInfo {
             user_name: Some("nobody".to_string()),
             group_name: Some("nogroup".to_string()),
+            user_name_raw: Some(b"nobody".to_vec()),
+            group_name_raw: Some(b"nogroup".to_vec()),
             uid: None,
             gid: None,
         })
@@ -190,6 +194,8 @@ fn imported_rar5_metadata_and_hash_fixtures_are_exercised() {
         Some(UnixOwnerInfo {
             user_name: None,
             group_name: None,
+            user_name_raw: None,
+            group_name_raw: None,
             uid: Some(9999),
             gid: Some(8888),
         })

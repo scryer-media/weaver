@@ -144,10 +144,30 @@ impl VolumeSpan {
 /// Unix ownership metadata from a RAR5 owner extra field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnixOwnerInfo {
+    /// UTF-8/lossy display form retained for existing metadata callers.
     pub user_name: Option<String>,
+    /// UTF-8/lossy display form retained for existing metadata callers.
     pub group_name: Option<String>,
+    /// Raw owner name bytes used for UnRAR-parity Unix account lookup.
+    pub user_name_raw: Option<Vec<u8>>,
+    /// Raw group name bytes used for UnRAR-parity Unix group lookup.
+    pub group_name_raw: Option<Vec<u8>>,
     pub uid: Option<u64>,
     pub gid: Option<u64>,
+}
+
+impl UnixOwnerInfo {
+    pub(crate) fn user_name_bytes(&self) -> Option<&[u8]> {
+        self.user_name_raw
+            .as_deref()
+            .or_else(|| self.user_name.as_deref().map(str::as_bytes))
+    }
+
+    pub(crate) fn group_name_bytes(&self) -> Option<&[u8]> {
+        self.group_name_raw
+            .as_deref()
+            .or_else(|| self.group_name.as_deref().map(str::as_bytes))
+    }
 }
 
 /// Metadata for a single file/directory in the archive.

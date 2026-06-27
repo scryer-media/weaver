@@ -45,8 +45,8 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
     ImportedCase {
         id: "test5",
         source: "tests/test5",
-        status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalent covers full multifile loss from an existing synthetic PAR2 set; creation remains out of scope.",
     },
     ImportedCase {
         id: "test5rk",
@@ -87,8 +87,8 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
     ImportedCase {
         id: "test11",
         source: "tests/test11",
-        status: ImportStatus::Unsupported,
-        note: "Requires PAR2 creation, which is outside the repair-only parity scope.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalent covers repeated damage from the same existing synthetic recovery set; creation remains out of scope.",
     },
     ImportedCase {
         id: "test12",
@@ -171,20 +171,20 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
     ImportedCase {
         id: "test25",
         source: "tests/test25",
-        status: ImportStatus::Unsupported,
-        note: "Requires create support for full-path primary input behavior.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalent covers source-file primary input resolving its sibling PAR2 file.",
     },
     ImportedCase {
         id: "test26",
         source: "tests/test26",
-        status: ImportStatus::Unsupported,
-        note: "Requires create support for subdirectory full-path behavior.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalent covers source-file primary input from a subdirectory.",
     },
     ImportedCase {
         id: "test27",
         source: "tests/test27",
-        status: ImportStatus::Unsupported,
-        note: "Requires create support for symlinked working-path behavior.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalent covers source-file primary input through a symlinked working directory.",
     },
     ImportedCase {
         id: "test28",
@@ -231,8 +231,8 @@ const FUNCTIONAL_CASES: &[ImportedCase] = &[
     ImportedCase {
         id: "test35",
         source: "tests/test35",
-        status: ImportStatus::Unsupported,
-        note: "Requires create-path symbolic-link semantics and dead-link handling.",
+        status: ImportStatus::Runnable,
+        note: "Repair-only equivalents cover replacing an existing symlink target path and rejecting dangling symlink repair.",
     },
     ImportedCase {
         id: "test36",

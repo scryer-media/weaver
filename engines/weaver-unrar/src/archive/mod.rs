@@ -10,7 +10,7 @@ mod parse;
 mod volume;
 
 pub use cache::CachedArchiveHeaders;
-pub use facts::{RarVolumeFacts, RarVolumeMemberFacts};
+pub use facts::{RarVolumeFacts, RarVolumeMemberFacts, RarVolumeServiceFacts};
 
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -75,6 +75,16 @@ pub(super) struct ServiceEntry {
     pub(super) segments: Vec<DataSegment>,
 }
 
+/// Integrity hash for a split segment's packed bytes.
+///
+/// UnRAR treats hashes on split-after headers as `Pack-CRC32`/`Pack-BLAKE2`;
+/// only the final continuation's hash is the whole unpacked file hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PackedDataHash {
+    Crc32(u32),
+    Blake2sp([u8; 32]),
+}
+
 /// A contiguous data segment within a single volume.
 #[derive(Debug, Clone)]
 pub struct DataSegment {
@@ -84,6 +94,64 @@ pub struct DataSegment {
     pub data_offset: u64,
     /// Size of this data segment.
     pub data_size: u64,
+    /// Optional hash of this segment's packed bytes, present on split-after
+    /// headers and verified as we leave the segment.
+    pub(super) packed_hash: Option<PackedDataHash>,
+    pub(super) packed_hash_uses_mac: bool,
+}
+
+impl DataSegment {
+    pub(super) fn new(volume_index: usize, data_offset: u64, data_size: u64) -> Self {
+        Self {
+            volume_index,
+            data_offset,
+            data_size,
+            packed_hash: None,
+            packed_hash_uses_mac: false,
+        }
+    }
+
+    pub(super) fn with_packed_hash(
+        volume_index: usize,
+        data_offset: u64,
+        data_size: u64,
+        packed_hash: Option<PackedDataHash>,
+        packed_hash_uses_mac: bool,
+    ) -> Self {
+        Self {
+            volume_index,
+            data_offset,
+            data_size,
+            packed_hash,
+            packed_hash_uses_mac: packed_hash.is_some() && packed_hash_uses_mac,
+        }
+    }
+}
+
+impl RarArchive {
+    pub(super) fn packed_hash_for_split_segment(
+        file_header: &FileHeader,
+        hash: Option<&FileHash>,
+    ) -> Option<PackedDataHash> {
+        if !file_header.split_after {
+            return None;
+        }
+
+        if file_header.compression.format == ArchiveFormat::Rar5 {
+            return hash
+                .map(|hash| match hash {
+                    FileHash::Blake2sp(value) => PackedDataHash::Blake2sp(*value),
+                })
+                .or_else(|| file_header.data_crc32.map(PackedDataHash::Crc32));
+        }
+
+        if file_header.compression.format.is_rar4_family() && file_header.compression.version >= 20
+        {
+            return file_header.data_crc32.map(PackedDataHash::Crc32);
+        }
+
+        None
+    }
 }
 
 /// Holder for a volume's reader and parsed metadata.
@@ -307,7 +375,11 @@ impl RarArchive {
                 }
 
                 MemberPlannerState {
-                    name: crate::path::sanitize_path(&entry.file_header.name),
+                    name: crate::path::sanitize_member_path(
+                        self.format,
+                        entry.file_header.host_os,
+                        &entry.file_header.name,
+                    ),
                     extractable,
                     missing_volumes,
                 }
@@ -348,7 +420,11 @@ impl RarArchive {
         self.members
             .iter()
             .map(|entry| TopologyMemberInfo {
-                name: crate::path::sanitize_path(&entry.file_header.name),
+                name: crate::path::sanitize_member_path(
+                    self.format,
+                    entry.file_header.host_os,
+                    &entry.file_header.name,
+                ),
                 unpacked_size: entry.file_header.unpacked_size,
                 is_directory: entry.file_header.is_directory,
                 volumes: VolumeSpan {
@@ -405,9 +481,13 @@ impl RarArchive {
     /// each member's name before comparison. Use this when the caller has a
     /// sanitized name (e.g., from the pipeline topology).
     pub fn find_member_sanitized(&self, sanitized_name: &str) -> Option<usize> {
-        self.members
-            .iter()
-            .position(|m| crate::path::sanitize_path(&m.file_header.name) == sanitized_name)
+        self.members.iter().position(|m| {
+            crate::path::sanitize_member_path(
+                self.format,
+                m.file_header.host_os,
+                &m.file_header.name,
+            ) == sanitized_name
+        })
     }
 
     /// Get member info by index.
@@ -430,7 +510,7 @@ impl RarArchive {
         let rar4_unix_symlink = self.format == ArchiveFormat::Rar4
             && matches!(fh.host_os, crate::types::HostOs::Unix)
             && (fh.attributes.0 & 0xF000) == 0xA000;
-        let member_name = crate::path::sanitize_path(&fh.name);
+        let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
         let (is_symlink, is_hardlink, is_file_copy, link_target) = match &entry.redirection {
             Some(redir) => {
                 let is_sym = matches!(
@@ -662,6 +742,19 @@ mod tests {
         }
     }
 
+    fn archive_with_member(
+        format: ArchiveFormat,
+        host_os: HostOs,
+        member_name: &str,
+    ) -> RarArchive {
+        let mut archive = archive_with_redirection(member_name, "");
+        archive.format = format;
+        archive.members[0].redirection = None;
+        archive.members[0].file_header.host_os = host_os;
+        archive.members[0].file_header.compression.format = format;
+        archive
+    }
+
     #[test]
     fn metadata_exposes_rar5_main_header_locator_and_metadata_extras() {
         let creation_nanos = 1_700_000_123_456_789_000u64;
@@ -781,5 +874,34 @@ mod tests {
         assert!(info.is_symlink);
         assert!(!info.is_hardlink);
         assert_eq!(info.link_target.as_deref(), Some("/etc/passwd"));
+    }
+
+    #[test]
+    fn member_info_uses_unrar_rar5_windows_backslash_conversion() {
+        let archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Windows, "dir\\file.txt");
+        let info = archive.member_info(0).unwrap();
+
+        assert_eq!(info.name, "dir_file.txt");
+        assert_eq!(archive.find_member_sanitized("dir_file.txt"), Some(0));
+        assert_eq!(archive.topology_members()[0].name, "dir_file.txt");
+    }
+
+    #[test]
+    fn member_info_uses_unrar_rar5_unix_backslash_conversion() {
+        let archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Unix, "dir\\file.txt");
+        let info = archive.member_info(0).unwrap();
+
+        assert_eq!(info.name, "dir\\file.txt");
+        assert_eq!(archive.find_member_sanitized("dir\\file.txt"), Some(0));
+        assert_eq!(archive.find_member_sanitized("dir/file.txt"), None);
+    }
+
+    #[test]
+    fn member_info_uses_unrar_rar4_backslash_separator_conversion() {
+        let archive = archive_with_member(ArchiveFormat::Rar4, HostOs::Windows, "dir\\file.txt");
+        let info = archive.member_info(0).unwrap();
+
+        assert_eq!(info.name, "dir/file.txt");
+        assert_eq!(archive.find_member_sanitized("dir/file.txt"), Some(0));
     }
 }

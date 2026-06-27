@@ -99,7 +99,13 @@ impl LzDecoder {
 
     /// Fallibly create a new LZ decoder with the specified dictionary size.
     pub fn try_new(dict_size: usize, version: u8) -> RarResult<Self> {
-        let extra_dist = version == 1;
+        let extra_dist = match version {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(RarError::UnsupportedCompression { method: 0, version });
+            }
+        };
         let total_symbols = huffman::HUFF_NC
             + if extra_dist {
                 huffman::HUFF_DCX
@@ -110,7 +116,7 @@ impl LzDecoder {
             + huffman::HUFF_RC;
         Ok(Self {
             window: Window::try_new(dict_size)?,
-            dist_cache: [0; DIST_CACHE_SIZE],
+            dist_cache: [usize::MAX; DIST_CACHE_SIZE],
             last_length: 0,
             nc_table: None,
             dc_table: None,
@@ -149,11 +155,6 @@ impl LzDecoder {
     #[inline]
     pub(super) fn promote_old_dist(&mut self, cache_idx: usize) -> RarResult<usize> {
         let distance = self.dist_cache[cache_idx];
-        if distance == 0 {
-            return Err(RarError::CorruptArchive {
-                detail: "distance cache entry is zero".into(),
-            });
-        }
 
         if cache_idx > 0 {
             for index in (1..=cache_idx).rev() {
@@ -1233,7 +1234,7 @@ impl LzDecoder {
     /// Reset the decoder for a new file (non-solid mode).
     pub fn reset(&mut self) {
         self.window.reset();
-        self.dist_cache = [0; DIST_CACHE_SIZE];
+        self.dist_cache = [usize::MAX; DIST_CACHE_SIZE];
         self.last_length = 0;
         self.nc_table = None;
         self.dc_table = None;
@@ -1483,7 +1484,23 @@ mod tests {
     fn test_decoder_creation() {
         let decoder = LzDecoder::new(128 * 1024, 0);
         assert_eq!(decoder.window.dict_size(), 128 * 1024);
-        assert_eq!(decoder.dist_cache, [0; 4]);
+        assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
+    }
+
+    #[test]
+    fn test_uninitialized_old_dist_uses_unrar_sentinel() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+
+        assert_eq!(decoder.promote_old_dist(2).unwrap(), usize::MAX);
+        assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
+    }
+
+    #[test]
+    fn lz_decoder_rejects_future_rar5_unpack_versions_like_unrar() {
+        assert!(matches!(
+            LzDecoder::try_new(128 * 1024, 2),
+            Err(RarError::UnsupportedCompression { version: 2, .. })
+        ));
     }
 
     #[test]
@@ -1561,7 +1578,7 @@ mod tests {
         decoder.dist_cache = [10, 20, 30, 40];
         decoder.block_bits_remaining = 100;
         decoder.reset();
-        assert_eq!(decoder.dist_cache, [0; 4]);
+        assert_eq!(decoder.dist_cache, [usize::MAX; 4]);
         assert_eq!(decoder.block_bits_remaining, 0);
         assert!(decoder.nc_table.is_none());
     }

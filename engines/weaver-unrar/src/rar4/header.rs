@@ -723,7 +723,9 @@ pub fn parse_old_service_header(raw: &RawRar4Header) -> RarResult<Rar4OldService
                 unpack_version,
                 method,
                 crc32,
-                stream_name: String::from_utf8_lossy(&stream_name_bytes[..nul_end]).into_owned(),
+                stream_name: crate::header::common::decode_utf8_prefix_until_nul(
+                    &stream_name_bytes[..nul_end],
+                ),
             }
         }
         _ => Rar4OldServiceData::Unknown,
@@ -1196,21 +1198,7 @@ mod tests {
     #[test]
     fn test_parse_old_service_stream_name_is_capped_like_unrar() {
         let long_name = vec![b'a'; MAX_STREAM_NAME20 + 10];
-        let mut extra = Vec::new();
-        extra.extend_from_slice(&55u32.to_le_bytes());
-        extra.extend_from_slice(&OLD_SERVICE_STREAM.to_le_bytes());
-        extra.push(1);
-        extra.extend_from_slice(&99u32.to_le_bytes());
-        extra.push(20);
-        extra.push(0x30);
-        extra.extend_from_slice(&0x1122_3344u32.to_le_bytes());
-        extra.extend_from_slice(&(long_name.len() as u16).to_le_bytes());
-        extra.extend_from_slice(&long_name);
-
-        let data = build_raw_header(0x77, common_flags::HAS_DATA, &extra);
-        let mut cursor = Cursor::new(data);
-        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
-        let old = parse_old_service_header(&raw).unwrap();
+        let old = parse_test_old_service_stream(&long_name);
 
         match old.data {
             Rar4OldServiceData::Stream {
@@ -1229,6 +1217,48 @@ mod tests {
             }
             other => panic!("expected Stream old service, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_old_service_stream_name_overlong_utf8_decodes_like_unrar() {
+        let old = parse_test_old_service_stream(b":safe\xc0\xafstream");
+
+        match old.data {
+            Rar4OldServiceData::Stream { stream_name, .. } => {
+                assert_eq!(stream_name, ":safe/stream");
+            }
+            other => panic!("expected Stream old service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_old_service_stream_name_invalid_utf8_keeps_prefix_like_unrar() {
+        let old = parse_test_old_service_stream(b":safe/\xffhidden");
+
+        match old.data {
+            Rar4OldServiceData::Stream { stream_name, .. } => {
+                assert_eq!(stream_name, ":safe/");
+            }
+            other => panic!("expected Stream old service, got {other:?}"),
+        }
+    }
+
+    fn parse_test_old_service_stream(name: &[u8]) -> Rar4OldServiceHeader {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&55u32.to_le_bytes());
+        extra.extend_from_slice(&OLD_SERVICE_STREAM.to_le_bytes());
+        extra.push(1);
+        extra.extend_from_slice(&99u32.to_le_bytes());
+        extra.push(20);
+        extra.push(0x30);
+        extra.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        extra.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        extra.extend_from_slice(name);
+
+        let data = build_raw_header(0x77, common_flags::HAS_DATA, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        parse_old_service_header(&raw).unwrap()
     }
 
     #[test]

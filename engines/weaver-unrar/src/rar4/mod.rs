@@ -287,12 +287,15 @@ pub(crate) fn parse_rar4_uowner_subdata(data: &[u8]) -> Option<UnixOwnerInfo> {
     if owner.is_empty() || group_end == 0 {
         return None;
     }
+    let group = &group[..group_end];
     let user_name = Some(String::from_utf8_lossy(owner).into_owned());
-    let group_name = Some(String::from_utf8_lossy(&group[..group_end]).into_owned());
+    let group_name = Some(String::from_utf8_lossy(group).into_owned());
 
     Some(UnixOwnerInfo {
         user_name,
         group_name,
+        user_name_raw: Some(owner.to_vec()),
+        group_name_raw: Some(group.to_vec()),
         uid: None,
         gid: None,
     })
@@ -844,6 +847,16 @@ mod tests {
 
         fh.host_os = Rar4HostOs::Unknown(42);
         assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Unknown(42));
+    }
+
+    #[test]
+    fn test_parse_rar4_uowner_preserves_raw_bytes_for_lookup_like_unrar() {
+        let owner = parse_rar4_uowner_subdata(b"al\xffice\0gr\xf0up").unwrap();
+
+        assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));
+        assert_eq!(owner.group_name_raw.as_deref(), Some(&b"gr\xf0up"[..]));
+        assert_eq!(owner.user_name.as_deref(), Some("al\u{fffd}ice"));
+        assert_eq!(owner.group_name.as_deref(), Some("gr\u{fffd}up"));
     }
 
     #[test]

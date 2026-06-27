@@ -82,11 +82,18 @@ impl RarArchive {
         let mut members = Vec::new();
 
         for pf in parsed.files {
-            let segment = DataSegment {
-                volume_index: volume_number,
-                data_offset: pf.header.data_offset,
-                data_size: pf.header.data_size,
-            };
+            let packed_hash = Self::packed_hash_for_split_segment(&pf.header, pf.hash.as_ref());
+            let packed_hash_uses_mac = pf
+                .file_encryption
+                .as_ref()
+                .is_some_and(|enc| enc.use_hash_mac);
+            let segment = DataSegment::with_packed_hash(
+                volume_number,
+                pf.header.data_offset,
+                pf.header.data_size,
+                packed_hash,
+                packed_hash_uses_mac,
+            );
             let mut file_header = pf.header;
             file_header.is_encrypted = pf.is_encrypted;
             members.push(MemberEntry {
@@ -104,11 +111,21 @@ impl RarArchive {
         let mut services = Vec::new();
         for service in parsed.services {
             let entry = {
-                let segment = DataSegment {
-                    volume_index: volume_number,
-                    data_offset: service.header.inner.data_offset,
-                    data_size: service.header.inner.data_size,
-                };
+                let packed_hash = Self::packed_hash_for_split_segment(
+                    &service.header.inner,
+                    service.hash.as_ref(),
+                );
+                let packed_hash_uses_mac = service
+                    .file_encryption
+                    .as_ref()
+                    .is_some_and(|enc| enc.use_hash_mac);
+                let segment = DataSegment::with_packed_hash(
+                    volume_number,
+                    service.header.inner.data_offset,
+                    service.header.inner.data_size,
+                    packed_hash,
+                    packed_hash_uses_mac,
+                );
                 let mut file_header = service.header.inner;
                 file_header.is_encrypted = service.is_encrypted;
                 ServiceEntry {
@@ -203,13 +220,16 @@ impl RarArchive {
 
         let mut members = Vec::new();
         for fh in &parsed.files {
-            let segment = DataSegment {
-                volume_index: 0,
-                data_offset: fh.data_offset,
-                data_size: fh.packed_size,
-            };
+            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
+            let segment = DataSegment::with_packed_hash(
+                0,
+                fh.data_offset,
+                fh.packed_size,
+                Self::packed_hash_for_split_segment(&file_header, None),
+                false,
+            );
             members.push(MemberEntry {
-                file_header: Self::rar4_to_file_header(fh, parsed.archive_header.is_solid),
+                file_header,
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
                 rar4_salt: fh.salt,
@@ -222,17 +242,20 @@ impl RarArchive {
 
         let mut services = Vec::new();
         for fh in &parsed.services {
+            let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
-                file_header: Self::rar4_to_file_header(fh, parsed.archive_header.is_solid),
+                segments: vec![DataSegment::with_packed_hash(
+                    0,
+                    fh.data_offset,
+                    fh.packed_size,
+                    Self::packed_hash_for_split_segment(&file_header, None),
+                    false,
+                )],
+                file_header,
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
                 hash: None,
                 comment_crc16: None,
-                segments: vec![DataSegment {
-                    volume_index: 0,
-                    data_offset: fh.data_offset,
-                    data_size: fh.packed_size,
-                }],
             };
             Self::integrate_service_entry(&mut services, 0, entry);
         }
@@ -392,11 +415,11 @@ impl RarArchive {
             file_encryption: None,
             hash: None,
             comment_crc16: (format != crate::types::ArchiveFormat::Rar14).then_some(comment.crc16),
-            segments: vec![DataSegment {
+            segments: vec![DataSegment::new(
                 volume_index,
-                data_offset: comment.data_offset,
-                data_size: comment.packed_size,
-            }],
+                comment.data_offset,
+                comment.packed_size,
+            )],
         }
     }
 

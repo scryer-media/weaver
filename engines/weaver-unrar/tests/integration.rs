@@ -475,13 +475,32 @@ fn build_two_volume_stored_archive(
     content: &[u8],
     split_at: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let part1 = &content[..split_at];
-    let part2 = &content[split_at..];
-
-    // Compute CRC of the full unpacked content.
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(content);
     let full_crc = hasher.finalize();
+    let (vol0, vol1) =
+        build_two_volume_stored_archive_with_final_crc(filename, content, split_at, full_crc);
+    (vol0, vol1, content.to_vec())
+}
+
+fn build_two_volume_stored_archive_with_final_crc(
+    filename: &str,
+    content: &[u8],
+    split_at: usize,
+    final_crc: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    build_two_volume_stored_archive_with_split_crc(filename, content, split_at, None, final_crc)
+}
+
+fn build_two_volume_stored_archive_with_split_crc(
+    filename: &str,
+    content: &[u8],
+    split_at: usize,
+    first_packed_crc: Option<u32>,
+    final_crc: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    let part1 = &content[..split_at];
+    let part2 = &content[split_at..];
 
     // --- Volume 0 ---
     let mut vol0 = Vec::new();
@@ -489,14 +508,14 @@ fn build_two_volume_stored_archive(
     // Main archive header: VOLUME flag (0x0001), no volume number field (first volume)
     vol0.extend_from_slice(&build_main_archive_header(0x0001, None));
     // File header: SPLIT_AFTER (0x0010), data_size = part1.len()
-    // CRC is on the final segment, not here.
+    // If present, this CRC is UnRAR's Pack-CRC32 for this split segment.
     vol0.extend_from_slice(&build_file_header_ex(
         filename,
         0x0010, // SPLIT_AFTER
         part1.len() as u64,
         content.len() as u64,
-        None, // CRC on last segment
-        0,    // store, version 0, dict 128KB
+        first_packed_crc,
+        0, // store, version 0, dict 128KB
     ));
     vol0.extend_from_slice(part1);
     // End of archive: more volumes follow
@@ -513,14 +532,28 @@ fn build_two_volume_stored_archive(
         0x0008, // SPLIT_BEFORE
         part2.len() as u64,
         content.len() as u64,
-        Some(full_crc),
+        Some(final_crc),
         0, // store
     ));
     vol1.extend_from_slice(part2);
     // End of archive: no more volumes
     vol1.extend_from_slice(&build_end_header(false));
 
-    (vol0, vol1, content.to_vec())
+    (vol0, vol1)
+}
+
+fn write_two_temp_volumes(
+    vol0: &[u8],
+    vol1: &[u8],
+) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let paths = vec![
+        temp_dir.path().join("part1.rar"),
+        temp_dir.path().join("part2.rar"),
+    ];
+    std::fs::write(&paths[0], vol0).unwrap();
+    std::fs::write(&paths[1], vol1).unwrap();
+    (temp_dir, paths)
 }
 
 /// Build a solid archive with two stored files.
@@ -920,6 +953,245 @@ fn test_multivolume_extract_with_crc() {
 }
 
 #[test]
+fn test_multivolume_split_after_pack_crc_is_verified() {
+    let content = b"first split segment carries an UnRAR Pack-CRC32 value";
+    let split_at = 28;
+    let first_packed_crc = crc32fast::hash(&content[..split_at]);
+    let final_crc = crc32fast::hash(content);
+    let (vol0, vol1) = build_two_volume_stored_archive_with_split_crc(
+        "packed.bin",
+        content,
+        split_at,
+        Some(first_packed_crc),
+        final_crc,
+    );
+
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
+    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+
+    let result = archive
+        .extract_by_name(
+            "packed.bin",
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(result, content);
+}
+
+#[test]
+fn test_rar5_volume_facts_expose_split_after_pack_crc() {
+    let content = b"facts should label split-after CRC as Pack-CRC32";
+    let split_at = 24;
+    let first_packed_crc = crc32fast::hash(&content[..split_at]);
+    let final_crc = crc32fast::hash(content);
+    let (vol0, vol1) = build_two_volume_stored_archive_with_split_crc(
+        "facts.bin",
+        content,
+        split_at,
+        Some(first_packed_crc),
+        final_crc,
+    );
+
+    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    assert_eq!(facts0.members.len(), 1);
+    assert!(facts0.members[0].split_after);
+    assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
+    assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
+    assert!(facts0.members[0].packed_blake2_hash.is_none());
+    assert!(!facts0.members[0].packed_hash_uses_mac);
+
+    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    assert_eq!(facts1.members.len(), 1);
+    assert!(!facts1.members[0].split_after);
+    assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
+    assert_eq!(facts1.members[0].packed_crc32, None);
+}
+
+#[test]
+fn test_rar5_volume_facts_expose_split_comment_pack_crc() {
+    let comment = b"RAR5 service facts should label split CMT CRC as Pack-CRC32";
+    let split_at = 31;
+    let first_packed_crc = crc32fast::hash(&comment[..split_at]);
+    let full_crc = crc32fast::hash(comment);
+    let (vol0, vol1) = build_two_volume_rar5_comment_archive(comment, split_at);
+
+    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    assert!(facts0.members.is_empty());
+    assert_eq!(facts0.services.len(), 1);
+    assert_eq!(facts0.services[0].name, "CMT");
+    assert!(facts0.services[0].split_after);
+    assert_eq!(facts0.services[0].data_crc32, Some(first_packed_crc));
+    assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
+    assert!(!facts0.services[0].packed_hash_uses_mac);
+
+    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    assert_eq!(facts1.services.len(), 1);
+    assert_eq!(facts1.services[0].name, "CMT");
+    assert!(!facts1.services[0].split_after);
+    assert_eq!(facts1.services[0].data_crc32, Some(full_crc));
+    assert_eq!(facts1.services[0].packed_crc32, None);
+}
+
+#[test]
+fn test_multivolume_split_after_pack_crc_mismatch_fails_before_completion() {
+    let content = b"final CRC is correct but the first packed segment CRC is wrong";
+    let split_at = 27;
+    let wrong_first_packed_crc = crc32fast::hash(&content[..split_at]) ^ 0x55AA_00FF;
+    let final_crc = crc32fast::hash(content);
+    let (vol0, vol1) = build_two_volume_stored_archive_with_split_crc(
+        "bad-packed.bin",
+        content,
+        split_at,
+        Some(wrong_first_packed_crc),
+        final_crc,
+    );
+
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
+    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+
+    let err = archive
+        .extract_by_name(
+            "bad-packed.bin",
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::PackedDataCrcMismatch {
+            member,
+            volume: 0,
+            expected,
+            actual,
+        } if member == "bad-packed.bin" && expected == wrong_first_packed_crc && actual != expected
+    ));
+}
+
+#[test]
+fn test_streaming_split_after_pack_crc_mismatch_fails() {
+    let content = b"streaming catches the first split header Pack-CRC32 too";
+    let split_at = 26;
+    let wrong_first_packed_crc = crc32fast::hash(&content[..split_at]) ^ 0xCAFE_BABE;
+    let final_crc = crc32fast::hash(content);
+    let (vol0, vol1) = build_two_volume_stored_archive_with_split_crc(
+        "stream-packed.bin",
+        content,
+        split_at,
+        Some(wrong_first_packed_crc),
+        final_crc,
+    );
+    let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
+    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let mut out = Vec::new();
+
+    let err = archive
+        .extract_member_streaming(
+            0,
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            &provider,
+            &mut out,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::PackedDataCrcMismatch {
+            member,
+            volume: 0,
+            expected,
+            actual,
+        } if member == "stream-packed.bin" && expected == wrong_first_packed_crc && actual != expected
+    ));
+}
+
+#[test]
+fn test_streaming_continuation_final_crc_is_verified_when_first_header_has_none() {
+    let content = b"streaming continuation final crc should be authoritative";
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(content);
+    let wrong_final_crc = hasher.finalize() ^ 0xFFFF_FFFF;
+    let (vol0, vol1) =
+        build_two_volume_stored_archive_with_final_crc("stream.bin", content, 25, wrong_final_crc);
+    let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
+    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let mut out = Vec::new();
+
+    let err = archive
+        .extract_member_streaming(
+            0,
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            &provider,
+            &mut out,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::DataCrcMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == wrong_final_crc && actual != wrong_final_crc
+    ));
+}
+
+#[test]
+fn test_streaming_chunked_continuation_final_crc_is_verified_when_first_header_has_none() {
+    let content = b"chunked streaming continuation final crc should be authoritative";
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(content);
+    let wrong_final_crc = hasher.finalize() ^ 0xA5A5_A5A5;
+    let (vol0, vol1) =
+        build_two_volume_stored_archive_with_final_crc("chunk.bin", content, 30, wrong_final_crc);
+    let (_temp_dir, paths) = write_two_temp_volumes(&vol0, &vol1);
+    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(paths);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol0)).unwrap();
+    let chunk_dir = tempfile::tempdir().unwrap();
+
+    let err = archive
+        .extract_member_streaming_chunked(
+            0,
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            &provider,
+            |volume_index| {
+                let path = chunk_dir.path().join(format!("vol{volume_index}.chunk"));
+                std::fs::File::create(path)
+                    .map(|file| Box::new(file) as Box<dyn std::io::Write>)
+                    .map_err(weaver_unrar::RarError::Io)
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::DataCrcMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == wrong_final_crc && actual != wrong_final_crc
+    ));
+}
+
+#[test]
 fn test_multivolume_incremental_add() {
     let content = b"Incremental volume addition test data here!";
     let (vol0, vol1, _full) = build_two_volume_stored_archive("file.dat", content, 25);
@@ -1297,6 +1569,55 @@ fn build_rar4_old_comment_header(comment: &[u8], crc16: u16) -> Vec<u8> {
     build_rar4_old_comment_header_ex(comment, comment.len() as u16, 29, 0x30, crc16)
 }
 
+fn build_rar4_old_service_ntacl_header(
+    packed_size: u32,
+    unpacked_size: u32,
+    unpack_version: u8,
+    method: u8,
+    crc32: u32,
+) -> Vec<u8> {
+    let header_size = 7usize + 4 + 2 + 1 + 4 + 1 + 1 + 4;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.push(0x77); // old service header
+    buf.extend_from_slice(&0x8000u16.to_le_bytes()); // HAS_DATA
+    buf.extend_from_slice(&(header_size as u16).to_le_bytes());
+    buf.extend_from_slice(&packed_size.to_le_bytes());
+    buf.extend_from_slice(&0x0104u16.to_le_bytes()); // NT ACL
+    buf.push(0);
+    buf.extend_from_slice(&unpacked_size.to_le_bytes());
+    buf.push(unpack_version);
+    buf.push(method);
+    buf.extend_from_slice(&crc32.to_le_bytes());
+    finalize_rar4_header_crc(buf)
+}
+
+fn build_rar4_old_service_stream_header(
+    stream_name: &[u8],
+    packed_size: u32,
+    unpacked_size: u32,
+    unpack_version: u8,
+    method: u8,
+    crc32: u32,
+) -> Vec<u8> {
+    let header_size = 7usize + 4 + 2 + 1 + 4 + 1 + 1 + 4 + 2 + stream_name.len();
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.push(0x77); // old service header
+    buf.extend_from_slice(&0x8000u16.to_le_bytes()); // HAS_DATA
+    buf.extend_from_slice(&(header_size as u16).to_le_bytes());
+    buf.extend_from_slice(&packed_size.to_le_bytes());
+    buf.extend_from_slice(&0x0105u16.to_le_bytes()); // NTFS stream
+    buf.push(0);
+    buf.extend_from_slice(&unpacked_size.to_le_bytes());
+    buf.push(unpack_version);
+    buf.push(method);
+    buf.extend_from_slice(&crc32.to_le_bytes());
+    buf.extend_from_slice(&(stream_name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(stream_name);
+    finalize_rar4_header_crc(buf)
+}
+
 fn build_rar4_old_comment_header_ex(
     packed_comment: &[u8],
     unpacked_size: u16,
@@ -1323,6 +1644,44 @@ fn build_rar4_old_comment_archive(comment: &[u8], crc16: u16) -> Vec<u8> {
     vol.extend_from_slice(&RAR4_SIG);
     vol.extend_from_slice(&build_rar4_archive_header(0x0002));
     vol.extend_from_slice(&build_rar4_old_comment_header(comment, crc16));
+    vol.extend_from_slice(&build_rar4_end_header(false));
+    vol
+}
+
+fn build_rar4_archive_with_old_services() -> Vec<u8> {
+    let file = b"host file for old services";
+    let acl_payload = b"acl-data";
+    let stream_payload = b"stream-data";
+    let stream_name = b":metadata";
+
+    let mut vol = Vec::new();
+    vol.extend_from_slice(&RAR4_SIG);
+    vol.extend_from_slice(&build_rar4_archive_header(0));
+    vol.extend_from_slice(&build_rar4_file_header(
+        "host.txt",
+        file.len() as u32,
+        file.len() as u32,
+        crc32fast::hash(file),
+        0,
+    ));
+    vol.extend_from_slice(file);
+    vol.extend_from_slice(&build_rar4_old_service_ntacl_header(
+        acl_payload.len() as u32,
+        acl_payload.len() as u32,
+        29,
+        0x30,
+        crc32fast::hash(acl_payload),
+    ));
+    vol.extend_from_slice(acl_payload);
+    vol.extend_from_slice(&build_rar4_old_service_stream_header(
+        stream_name,
+        stream_payload.len() as u32,
+        stream_payload.len() as u32,
+        29,
+        0x30,
+        crc32fast::hash(stream_payload),
+    ));
+    vol.extend_from_slice(stream_payload);
     vol.extend_from_slice(&build_rar4_end_header(false));
     vol
 }
@@ -1399,9 +1758,18 @@ fn build_two_volume_rar4_comment_service_archive(
     comment: &[u8],
     split_at: usize,
 ) -> (Vec<u8>, Vec<u8>) {
+    build_two_volume_rar4_comment_service_archive_ex(comment, split_at, None)
+}
+
+fn build_two_volume_rar4_comment_service_archive_ex(
+    comment: &[u8],
+    split_at: usize,
+    first_packed_crc_override: Option<u32>,
+) -> (Vec<u8>, Vec<u8>) {
     let part1 = &comment[..split_at];
     let part2 = &comment[split_at..];
     let full_crc = crc32fast::hash(comment);
+    let first_packed_crc = first_packed_crc_override.unwrap_or_else(|| crc32fast::hash(part1));
 
     let mut vol0 = Vec::new();
     vol0.extend_from_slice(&RAR4_SIG);
@@ -1410,7 +1778,7 @@ fn build_two_volume_rar4_comment_service_archive(
         "CMT",
         part1.len() as u32,
         comment.len() as u32,
-        0,
+        first_packed_crc,
         0x0002, // SPLIT_AFTER
         0,
     ));
@@ -1446,6 +1814,7 @@ fn build_two_volume_rar4_stored_archive(
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(content);
     let full_crc = hasher.finalize();
+    let first_packed_crc = crc32fast::hash(part1);
 
     // --- Volume 0 ---
     let mut vol0 = Vec::new();
@@ -1457,7 +1826,7 @@ fn build_two_volume_rar4_stored_archive(
         filename,
         part1.len() as u32,
         content.len() as u32,
-        full_crc,
+        first_packed_crc,
         0x0002, // SPLIT_AFTER
     ));
     vol0.extend_from_slice(part1);
@@ -1508,6 +1877,84 @@ fn test_rar4_multivolume_open_volumes() {
         )
         .unwrap();
     assert_eq!(result, content);
+}
+
+#[test]
+fn test_rar4_volume_facts_expose_split_after_pack_crc() {
+    let content = b"RAR4 facts expose Pack-CRC32 on split-after headers";
+    let split_at = 22;
+    let first_packed_crc = crc32fast::hash(&content[..split_at]);
+    let final_crc = crc32fast::hash(content);
+    let (vol0, vol1) = build_two_volume_rar4_stored_archive("facts-rar4.bin", content, split_at);
+
+    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    assert_eq!(facts0.members.len(), 1);
+    assert!(facts0.members[0].split_after);
+    assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
+    assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
+    assert!(facts0.members[0].packed_blake2_hash.is_none());
+
+    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    assert_eq!(facts1.members.len(), 1);
+    assert!(!facts1.members[0].split_after);
+    assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
+    assert_eq!(facts1.members[0].packed_crc32, None);
+}
+
+#[test]
+fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
+    let comment = b"RAR4 CMT service facts should expose split-after Pack-CRC32";
+    let split_at = 28;
+    let first_packed_crc = crc32fast::hash(&comment[..split_at]);
+    let full_crc = crc32fast::hash(comment);
+    let (vol0, vol1) = build_two_volume_rar4_comment_service_archive(comment, split_at);
+
+    let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
+    assert!(facts0.members.is_empty());
+    assert_eq!(facts0.services.len(), 1);
+    assert_eq!(facts0.services[0].name, "CMT");
+    assert!(facts0.services[0].split_after);
+    assert_eq!(facts0.services[0].data_crc32, Some(first_packed_crc));
+    assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
+
+    let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
+    assert_eq!(facts1.services.len(), 1);
+    assert_eq!(facts1.services[0].name, "CMT");
+    assert!(!facts1.services[0].split_after);
+    assert_eq!(facts1.services[0].data_crc32, Some(full_crc));
+    assert_eq!(facts1.services[0].packed_crc32, None);
+}
+
+#[test]
+fn test_rar4_volume_facts_expose_old_acl_and_stream_services() {
+    let facts = weaver_unrar::RarArchive::parse_volume_facts(
+        Cursor::new(build_rar4_archive_with_old_services()),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(facts.members.len(), 1);
+    assert_eq!(facts.services.len(), 2);
+
+    let acl = &facts.services[0];
+    assert_eq!(acl.name, "ACL");
+    assert_eq!(acl.subtype, Some(0x0104));
+    assert_eq!(acl.level, Some(0));
+    assert_eq!(acl.unpacked_size, Some(8));
+    assert_eq!(acl.data_size, 8);
+    assert_eq!(acl.data_crc32, Some(crc32fast::hash(b"acl-data")));
+    assert_eq!(acl.compression_method, 0);
+    assert_eq!(acl.compression_version, 29);
+    assert_eq!(acl.dict_size, 0x10000);
+    assert!(acl.stream_name.is_none());
+
+    let stream = &facts.services[1];
+    assert_eq!(stream.name, "STM");
+    assert_eq!(stream.subtype, Some(0x0105));
+    assert_eq!(stream.unpacked_size, Some(11));
+    assert_eq!(stream.data_size, 11);
+    assert_eq!(stream.data_crc32, Some(crc32fast::hash(b"stream-data")));
+    assert_eq!(stream.stream_name.as_deref(), Some(":metadata"));
 }
 
 #[test]
@@ -2151,8 +2598,17 @@ fn build_rar5_comment_archive(comment_payload: &[u8], expected_crc: Option<u32>)
 }
 
 fn build_two_volume_rar5_comment_archive(comment: &[u8], split_at: usize) -> (Vec<u8>, Vec<u8>) {
+    build_two_volume_rar5_comment_archive_ex(comment, split_at, None)
+}
+
+fn build_two_volume_rar5_comment_archive_ex(
+    comment: &[u8],
+    split_at: usize,
+    first_packed_crc_override: Option<u32>,
+) -> (Vec<u8>, Vec<u8>) {
     let part1 = &comment[..split_at];
     let part2 = &comment[split_at..];
+    let first_packed_crc = first_packed_crc_override.unwrap_or_else(|| crc32fast::hash(part1));
     let full_crc = crc32fast::hash(comment);
 
     let mut vol0 = Vec::new();
@@ -2163,7 +2619,7 @@ fn build_two_volume_rar5_comment_archive(comment: &[u8], split_at: usize) -> (Ve
         0x0010, // SPLIT_AFTER
         part1.len() as u64,
         comment.len() as u64,
-        None,
+        Some(first_packed_crc),
         0,
         &[],
     ));
@@ -2255,6 +2711,29 @@ fn test_rar5_split_comment_service_is_read() {
         archive.comment().unwrap().as_deref(),
         Some("RAR5 split CMT service comment across two volumes")
     );
+}
+
+#[test]
+fn test_rar5_split_comment_pack_crc_mismatch_fails() {
+    let comment = b"RAR5 split CMT service should verify first packed CRC";
+    let split_at = 22;
+    let wrong_first_packed_crc = crc32fast::hash(&comment[..split_at]) ^ 0xA5A5_5A5A;
+    let (vol0, vol1) =
+        build_two_volume_rar5_comment_archive_ex(comment, split_at, Some(wrong_first_packed_crc));
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
+    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+
+    let err = archive.comment().unwrap_err();
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::PackedDataCrcMismatch {
+            member,
+            volume: 0,
+            expected,
+            actual,
+        } if member == "CMT" && expected == wrong_first_packed_crc && actual != expected
+    ));
 }
 
 #[test]
@@ -2518,6 +2997,86 @@ fn redirection_extra(redir_type: u64, target: &str) -> Vec<u8> {
     redir_body.extend_from_slice(&encode_vint(target.len() as u64));
     redir_body.extend_from_slice(target.as_bytes());
     build_extra_record(0x05, &redir_body)
+}
+
+fn assert_unsupported_link_without_file_target(err: weaver_unrar::RarError, member: &str) {
+    match err {
+        weaver_unrar::RarError::UnsupportedLinkType {
+            member: actual,
+            link_type,
+        } => {
+            assert_eq!(actual, member);
+            assert!(
+                link_type.contains("requires extract_member_to_file"),
+                "unexpected link type detail: {link_type}"
+            );
+        }
+        other => panic!("expected UnsupportedLinkType, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_extract_member_rejects_rar5_link_without_file_target() {
+    let extra = redirection_extra(1, "target.txt");
+    let archive_bytes = build_stored_archive_with_extra("link", b"", &extra);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+    let err = archive
+        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .unwrap_err();
+
+    assert_unsupported_link_without_file_target(err, "link");
+}
+
+#[test]
+fn test_extract_member_streaming_rejects_rar5_link_without_file_target() {
+    let extra = redirection_extra(4, "target.txt");
+    let archive_bytes = build_stored_archive_with_extra("hardlink", b"", &extra);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let provider =
+        weaver_unrar::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
+            "/not-needed-before-link-guard.rar",
+        )]);
+    let mut out = Vec::new();
+
+    let err = archive
+        .extract_member_streaming(
+            0,
+            &weaver_unrar::ExtractOptions::default(),
+            &provider,
+            &mut out,
+        )
+        .unwrap_err();
+
+    assert!(out.is_empty());
+    assert_unsupported_link_without_file_target(err, "hardlink");
+}
+
+#[test]
+fn test_extract_member_streaming_chunked_rejects_rar5_link_without_file_target() {
+    let extra = redirection_extra(5, "target.txt");
+    let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+    let provider =
+        weaver_unrar::StaticVolumeProvider::from_ordered(vec![std::path::PathBuf::from(
+            "/not-needed-before-link-guard.rar",
+        )]);
+    let mut factory_called = false;
+
+    let err = archive
+        .extract_member_streaming_chunked(
+            0,
+            &weaver_unrar::ExtractOptions::default(),
+            &provider,
+            |_| {
+                factory_called = true;
+                Ok(Box::new(Vec::<u8>::new()) as Box<dyn std::io::Write>)
+            },
+        )
+        .unwrap_err();
+
+    assert!(!factory_called);
+    assert_unsupported_link_without_file_target(err, "copy.txt");
 }
 
 #[test]
@@ -3124,6 +3683,32 @@ fn test_extract_member_to_file_extracts_archive_filecopy_source() {
 }
 
 #[test]
+fn test_extract_member_to_file_uses_later_rar5_filecopy_source_like_unrar_reflist() {
+    let extra = redirection_extra(5, "original.txt");
+    let archive_bytes = build_two_stored_members_with_extra(
+        "copy.txt",
+        b"",
+        &extra,
+        "original.txt",
+        b"future archive source",
+        &[],
+    );
+    let cursor = Cursor::new(archive_bytes);
+    let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let out_path = temp_dir.path().join("copy.txt");
+
+    // UnRAR registers the file-copy reference in RefList, extracts a later
+    // source member to a temporary file, then copies/moves it to the target.
+    let written = archive
+        .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
+        .unwrap();
+
+    assert_eq!(written, b"future archive source".len() as u64);
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"future archive source");
+}
+
+#[test]
 fn test_extract_member_to_file_copies_archive_hardlink_source_like_unrar() {
     let hardlink_extra = redirection_extra(4, "original.txt");
     let filecopy_extra = redirection_extra(5, "source-link");
@@ -3175,22 +3760,23 @@ fn test_extract_member_to_file_normalizes_archive_rar5_filecopy_source() {
 }
 
 #[test]
-fn test_extract_member_to_file_rejects_unsafe_rar5_filecopy_target() {
+fn test_extract_member_to_file_sanitizes_absolute_rar5_filecopy_target_like_unrar() {
     let extra = redirection_extra(5, "/etc/passwd");
     let archive_bytes = build_stored_archive_with_extra("copy.txt", b"", &extra);
     let cursor = Cursor::new(archive_bytes);
     let mut archive = weaver_unrar::RarArchive::open(cursor).unwrap();
     let temp_dir = tempfile::tempdir().unwrap();
+    let normalized_source = temp_dir.path().join("etc/passwd");
+    std::fs::create_dir_all(normalized_source.parent().unwrap()).unwrap();
+    std::fs::write(&normalized_source, b"safe normalized source").unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
-    let err = archive
+    let written = archive
         .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        err,
-        weaver_unrar::RarError::UnsafeLinkTarget { .. }
-    ));
+    assert_eq!(written, b"safe normalized source".len() as u64);
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"safe normalized source");
 }
 
 #[test]
@@ -5120,6 +5706,32 @@ fn test_rar4_split_modern_comment_service_is_read() {
         archive.comment().unwrap().as_deref(),
         Some("RAR4 split modern CMT service comment across volumes")
     );
+}
+
+#[test]
+fn test_rar4_split_modern_comment_pack_crc_mismatch_fails() {
+    let comment = b"RAR4 split modern CMT service should verify first packed CRC";
+    let split_at = 25;
+    let wrong_first_packed_crc = crc32fast::hash(&comment[..split_at]) ^ 0x1357_2468;
+    let (vol0, vol1) = build_two_volume_rar4_comment_service_archive_ex(
+        comment,
+        split_at,
+        Some(wrong_first_packed_crc),
+    );
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> =
+        vec![Box::new(Cursor::new(vol0)), Box::new(Cursor::new(vol1))];
+    let mut archive = weaver_unrar::RarArchive::open_volumes(readers).unwrap();
+
+    let err = archive.comment().unwrap_err();
+    assert!(matches!(
+        err,
+        weaver_unrar::RarError::PackedDataCrcMismatch {
+            member,
+            volume: 0,
+            expected,
+            actual,
+        } if member == "CMT" && expected == wrong_first_packed_crc && actual != expected
+    ));
 }
 
 #[test]
