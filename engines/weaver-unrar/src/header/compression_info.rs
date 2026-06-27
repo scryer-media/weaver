@@ -33,16 +33,26 @@ fn rar7_dict_size(raw: u64) -> RarResult<u64> {
 
 /// Decode compression info from the raw vint value.
 pub fn decode_compression_info(raw: u64) -> RarResult<CompressionInfo> {
+    decode_compression_info_for_file(raw, false)
+}
+
+pub(crate) fn decode_compression_info_for_file(
+    raw: u64,
+    is_directory: bool,
+) -> RarResult<CompressionInfo> {
     let raw_version = (raw & 0x3F) as u8; // bits 0-5
     let solid = (raw >> 6) & 1 != 0; // bit 6
     let method_code = ((raw >> 7) & 0x07) as u8; // bits 7-9
 
     let (version, dict_size) = match raw_version {
+        0 if is_directory => (0, 0),
         0 => (0, rar5_dict_size(((raw >> 10) & 0x0F) as u8)?),
+        1 if is_directory => (1, 0),
         1 => {
             let version = if raw & FCI_RAR5_COMPAT != 0 { 0 } else { 1 };
             (version, rar7_dict_size(raw)?)
         }
+        other if method_code == 0 => (other, 0),
         other => {
             return Err(RarError::UnsupportedCompression {
                 method: method_code,
@@ -124,12 +134,21 @@ mod tests {
 
     #[test]
     fn test_version_field() {
-        let raw = 5u64; // version=5
+        let raw = 5u64 | (3u64 << 7); // version=5, method=normal
         let err = decode_compression_info(raw).unwrap_err();
         assert!(matches!(
             err,
             crate::error::RarError::UnsupportedCompression { version: 5, .. }
         ));
+    }
+
+    #[test]
+    fn test_unknown_version_store_is_allowed_like_unrar() {
+        let raw = 5u64; // version=5, method=store
+        let info = decode_compression_info(raw).unwrap();
+        assert_eq!(info.version, 5);
+        assert_eq!(info.method, CompressionMethod::Store);
+        assert_eq!(info.dict_size, 0);
     }
 
     #[test]
@@ -197,5 +216,14 @@ mod tests {
                 max: UNRAR_UNPACK_MAX_DICT_SIZE
             } if size > UNRAR_UNPACK_MAX_DICT_SIZE
         ));
+    }
+
+    #[test]
+    fn test_directory_ignores_dictionary_size_like_unrar() {
+        let raw = 1u64 | FCI_RAR5_COMPAT | (20u64 << 10);
+        let info = decode_compression_info_for_file(raw, true).unwrap();
+        assert_eq!(info.version, 1);
+        assert_eq!(info.method, CompressionMethod::Store);
+        assert_eq!(info.dict_size, 0);
     }
 }

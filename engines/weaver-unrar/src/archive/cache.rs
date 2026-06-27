@@ -108,6 +108,8 @@ pub struct CachedMember {
 
 #[derive(Serialize, Deserialize)]
 pub struct CachedService {
+    #[serde(default)]
+    pub header_offset: u64,
     pub name: String,
     pub unpacked_size: Option<u64>,
     #[serde(default)]
@@ -457,6 +459,7 @@ impl RarArchive {
                 .services
                 .iter()
                 .map(|service| CachedService {
+                    header_offset: service.header_offset,
                     name: service.file_header.name.clone(),
                     unpacked_size: service.file_header.unpacked_size,
                     mtime_ns: encode_system_time(service.file_header.mtime),
@@ -596,6 +599,7 @@ impl RarArchive {
                 };
 
                 ServiceEntry {
+                    header_offset: service.header_offset,
                     file_header: FileHeader {
                         name: service.name,
                         unpacked_size: service.unpacked_size,
@@ -896,6 +900,7 @@ mod tests {
             last_volume_seen: true,
             members: Vec::new(),
             services: vec![CachedService {
+                header_offset: 0x1234,
                 name: "CMT".to_string(),
                 unpacked_size: Some(12),
                 mtime_ns: None,
@@ -938,6 +943,7 @@ mod tests {
         let archive = RarArchive::deserialize_headers(&bytes).expect("cache should decode");
         let service = &archive.services[0];
 
+        assert_eq!(service.header_offset, 0x1234);
         assert_eq!(service.file_header.name, "CMT");
         assert_eq!(service.file_header.unpacked_size, Some(12));
         assert_eq!(service.file_header.data_crc32, Some(0xA1B2_C3D4));

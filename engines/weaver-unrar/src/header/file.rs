@@ -200,7 +200,7 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
     // Compression info (vint, bit-packed)
     let (comp_raw, n) = read_raw_vint_lossy(&type_fields[pos..]);
     pos += n;
-    let compression = compression_info::decode_compression_info(comp_raw)?;
+    let compression = compression_info::decode_compression_info_for_file(comp_raw, is_directory)?;
 
     // Host OS
     let (os_val, n) = read_raw_vint_lossy(&type_fields[pos..]);
@@ -359,6 +359,54 @@ mod tests {
     fn test_decode_rar5_private_use_utf8_name() {
         let raw = b"tmp/uni/\xef\xbf\xbe\xee\x83\xa6\xee\x82\x98\xee\x82\xa0\xee\x83\xa7\xee\x82\x94\xee\x82\xbb\xee\x83\xa3\xee\x82\x83\xee\x82\x86\xee\x83\xa3\xee\x82\x82\xee\x82\xb9\xee\x83\xa3\xee\x82\x83\xee\x82\x88.mkv";
         assert_eq!(decode_rar5_name(raw), "tmp/uni/映画テスト.mkv");
+    }
+
+    #[test]
+    fn test_file_header_unknown_algorithm_store_is_allowed_like_unrar() {
+        let data = build_file_header(TestFileHeaderArgs {
+            file_flags: 0,
+            unpacked_size: 0,
+            attributes: 0,
+            mtime: None,
+            crc32: None,
+            comp_info: 5, // unknown algorithm selector, method=store.
+            host_os: 1,
+            name: "stored.bin",
+        });
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let data_offset = cursor.position();
+        let fh = parse(&raw, data_offset).unwrap();
+
+        assert_eq!(fh.name, "stored.bin");
+        assert_eq!(fh.compression.version, 5);
+        assert_eq!(
+            fh.compression.method,
+            crate::types::CompressionMethod::Store
+        );
+        assert_eq!(fh.compression.dict_size, 0);
+    }
+
+    #[test]
+    fn test_directory_header_ignores_rar7_dictionary_size_like_unrar() {
+        let data = build_file_header(TestFileHeaderArgs {
+            file_flags: flags::DIRECTORY,
+            unpacked_size: 0,
+            attributes: 0,
+            mtime: None,
+            crc32: None,
+            comp_info: 1u64 | (20u64 << 10),
+            host_os: 1,
+            name: "dir",
+        });
+        let mut cursor = std::io::Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let data_offset = cursor.position();
+        let fh = parse(&raw, data_offset).unwrap();
+
+        assert!(fh.is_directory);
+        assert_eq!(fh.compression.version, 1);
+        assert_eq!(fh.compression.dict_size, 0);
     }
 
     #[test]

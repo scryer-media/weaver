@@ -93,7 +93,7 @@ impl Rar4Decoder {
     pub(crate) fn new(version: u8, dict_size: usize, method: u8) -> RarResult<Self> {
         let dict_size = old_rar_window_size(dict_size);
         match version {
-            13 | 15 => Ok(Self::V15(Rar15Decoder::try_new(dict_size)?)),
+            13..=15 => Ok(Self::V15(Rar15Decoder::try_new(dict_size)?)),
             20 | 26 => Ok(Self::V20(Rar20Decoder::try_new(dict_size)?)),
             29 => Ok(Self::V29(Rar4LzDecoder::try_new(dict_size)?)),
             _ => Err(RarError::UnsupportedCompression { method, version }),
@@ -109,7 +109,7 @@ impl Rar4Decoder {
     pub(crate) fn supports_version(&self, version: u8) -> bool {
         matches!(
             (self, version),
-            (Self::V15(_), 13 | 15) | (Self::V20(_), 20 | 26) | (Self::V29(_), 29)
+            (Self::V15(_), 13..=15) | (Self::V20(_), 20 | 26) | (Self::V29(_), 29)
         )
     }
 
@@ -178,7 +178,7 @@ impl Rar4Decoder {
 
 pub(crate) fn ensure_supported_rar4_version(version: u8, method: u8) -> RarResult<()> {
     match version {
-        13 | 15 | 20 | 26 | 29 => Ok(()),
+        13..=15 | 20 | 26 | 29 => Ok(()),
         _ => Err(RarError::UnsupportedCompression { method, version }),
     }
 }
@@ -1641,13 +1641,15 @@ mod tests {
 
     #[test]
     fn old_rar_version_gate_matches_unrar_dispatch() {
+        assert!(ensure_supported_rar4_version(13, 3).is_ok());
+        assert!(ensure_supported_rar4_version(14, 3).is_ok());
         assert!(ensure_supported_rar4_version(15, 3).is_ok());
         assert!(ensure_supported_rar4_version(20, 3).is_ok());
         assert!(ensure_supported_rar4_version(26, 3).is_ok());
         assert!(ensure_supported_rar4_version(29, 3).is_ok());
         assert!(matches!(
-            ensure_supported_rar4_version(14, 3),
-            Err(RarError::UnsupportedCompression { version: 14, .. })
+            ensure_supported_rar4_version(12, 3),
+            Err(RarError::UnsupportedCompression { version: 12, .. })
         ));
         assert!(matches!(
             ensure_supported_rar4_version(30, 3),
@@ -1679,6 +1681,11 @@ mod tests {
         match Rar4Decoder::new(20, 128 * 1024, 3).unwrap() {
             Rar4Decoder::V20(decoder) => assert_eq!(decoder.window.dict_size(), 0x40000),
             _ => panic!("expected RAR20 decoder"),
+        }
+
+        match Rar4Decoder::new(14, 128 * 1024, 3).unwrap() {
+            Rar4Decoder::V15(decoder) => assert_eq!(decoder.window.dict_size(), 0x40000),
+            _ => panic!("expected RAR15-family decoder"),
         }
 
         match Rar4Decoder::new(29, 128 * 1024, 3).unwrap() {

@@ -118,6 +118,7 @@ impl RarArchive {
             let mut file_header = service.header.inner;
             file_header.is_encrypted = service.is_encrypted;
             let entry = ServiceEntry {
+                header_offset: service.header.header_offset,
                 file_header,
                 is_encrypted: service.is_encrypted,
                 file_encryption: service.file_encryption.map(Self::file_encryption_info),
@@ -127,6 +128,7 @@ impl RarArchive {
             };
             Self::integrate_service_entry(&mut self.services, vol_num, entry);
         }
+        self.refresh_rar5_recovery_records_from_services();
 
         // Store the reader.
         self.store_volume_reader(vol_num, reader);
@@ -159,6 +161,8 @@ impl RarArchive {
         }
         self.services.retain(|service| !service.segments.is_empty());
         self.reconcile_member_chains();
+        Self::reconcile_service_chains(&mut self.services);
+        self.refresh_rar5_recovery_records_from_services();
     }
 
     /// Add a RAR4 volume incrementally.
@@ -229,6 +233,7 @@ impl RarArchive {
         for fh in &parsed.services {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
+                header_offset: fh.data_offset,
                 file_header: file_header.clone(),
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
@@ -288,17 +293,38 @@ impl RarArchive {
 
             if let Some(existing) = existing {
                 // We already have a later continuation — insert this segment at front.
+                let authoritative_data_crc32 =
+                    (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
+                let authoritative_data_hash =
+                    (!existing.file_header.split_after).then(|| existing.file_header.data_hash);
                 let authoritative_hash =
                     (!existing.file_header.split_after).then(|| existing.hash.clone());
+                let authoritative_encryption =
+                    (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
                 existing.segments.insert(0, segment);
                 existing.file_header = entry.file_header;
                 existing.is_encrypted = entry.is_encrypted;
                 existing.file_encryption = entry.file_encryption;
                 existing.rar4_salt = entry.rar4_salt;
+                if let Some(data_crc32) = authoritative_data_crc32 {
+                    existing.file_header.data_crc32 = data_crc32;
+                }
+                if let Some(data_hash) = authoritative_data_hash {
+                    existing.file_header.data_hash = data_hash;
+                }
                 if let Some(hash) = authoritative_hash {
                     existing.hash = hash;
                 } else if entry.hash.is_some() {
                     existing.hash = entry.hash;
+                }
+                if let Some(Some(final_encryption)) = authoritative_encryption {
+                    if existing.file_encryption.is_none() {
+                        existing.file_encryption = Some(final_encryption);
+                    } else if final_encryption.use_hash_mac
+                        && let Some(existing_encryption) = existing.file_encryption.as_mut()
+                    {
+                        existing_encryption.use_hash_mac = true;
+                    }
                 }
                 if entry.redirection.is_some() {
                     existing.redirection = entry.redirection;
@@ -478,14 +504,26 @@ impl RarArchive {
             });
 
             if let Some(existing) = existing {
+                let authoritative_data_crc32 =
+                    (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
+                let authoritative_data_hash =
+                    (!existing.file_header.split_after).then(|| existing.file_header.data_hash);
                 let authoritative_hash =
                     (!existing.file_header.split_after).then(|| existing.hash.clone());
                 let authoritative_comment_crc16 =
                     (!existing.file_header.split_after).then_some(existing.comment_crc16);
+                let authoritative_encryption =
+                    (!existing.file_header.split_after).then(|| existing.file_encryption.clone());
                 existing.segments.insert(0, segment);
                 existing.file_header = entry.file_header;
                 existing.is_encrypted = entry.is_encrypted;
                 existing.file_encryption = entry.file_encryption;
+                if let Some(data_crc32) = authoritative_data_crc32 {
+                    existing.file_header.data_crc32 = data_crc32;
+                }
+                if let Some(data_hash) = authoritative_data_hash {
+                    existing.file_header.data_hash = data_hash;
+                }
                 if let Some(hash) = authoritative_hash {
                     existing.hash = hash;
                 } else if entry.hash.is_some() {
@@ -496,10 +534,85 @@ impl RarArchive {
                 } else if entry.comment_crc16.is_some() {
                     existing.comment_crc16 = entry.comment_crc16;
                 }
+                if let Some(Some(final_encryption)) = authoritative_encryption {
+                    if existing.file_encryption.is_none() {
+                        existing.file_encryption = Some(final_encryption);
+                    } else if final_encryption.use_hash_mac
+                        && let Some(existing_encryption) = existing.file_encryption.as_mut()
+                    {
+                        existing_encryption.use_hash_mac = true;
+                    }
+                }
             } else {
                 services.push(entry);
             }
         }
+
+        Self::reconcile_service_chains(services);
+    }
+
+    fn reconcile_service_chains(services: &mut Vec<ServiceEntry>) {
+        while let Some((left_idx, right_idx)) = Self::find_mergeable_service_pair(services) {
+            debug_assert_ne!(left_idx, right_idx);
+            let right = services.remove(right_idx);
+            let adjusted_left_idx = if right_idx < left_idx {
+                left_idx - 1
+            } else {
+                left_idx
+            };
+            let left = &mut services[adjusted_left_idx];
+            Self::merge_service_chain(left, right);
+        }
+        services.sort_by_key(Self::service_physical_order_key);
+    }
+
+    fn find_mergeable_service_pair(services: &[ServiceEntry]) -> Option<(usize, usize)> {
+        for left_idx in 0..services.len() {
+            let left = &services[left_idx];
+            if !left.file_header.split_after {
+                continue;
+            }
+            let Some(last_vol) = left.segments.last().map(|s| s.volume_index) else {
+                continue;
+            };
+
+            for right_idx in 0..services.len() {
+                if left_idx == right_idx {
+                    continue;
+                }
+                let right = &services[right_idx];
+                let Some(first_vol) = right.segments.first().map(|s| s.volume_index) else {
+                    continue;
+                };
+
+                if !right.file_header.split_before || first_vol != last_vol + 1 {
+                    continue;
+                }
+
+                if Self::service_names_compatible(left, right) {
+                    return Some((left_idx, right_idx));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn merge_service_chain(existing: &mut ServiceEntry, mut continuation: ServiceEntry) {
+        existing.segments.append(&mut continuation.segments);
+        existing
+            .segments
+            .sort_by_key(|segment| segment.volume_index);
+        Self::merge_service_metadata(existing, &continuation);
+    }
+
+    fn service_physical_order_key(service: &ServiceEntry) -> (usize, u64) {
+        service
+            .segments
+            .iter()
+            .map(|segment| (segment.volume_index, segment.data_offset))
+            .min()
+            .unwrap_or((usize::MAX, service.file_header.data_offset))
     }
 
     fn service_names_compatible(left: &ServiceEntry, right: &ServiceEntry) -> bool {
@@ -592,6 +705,7 @@ mod tests {
     use crate::limits::Limits;
     use crate::types::{
         ArchiveFormat, CompressionInfo, CompressionMethod, FileAttributes, FileHash, HostOs,
+        RecoveryRecordKind,
     };
 
     fn test_file_header(
@@ -655,6 +769,7 @@ mod tests {
         split_after: bool,
     ) -> ServiceEntry {
         ServiceEntry {
+            header_offset: 100 + first_volume as u64,
             file_header: test_file_header(name, split_before, split_after, Some(0xAABB_CCDD)),
             is_encrypted: false,
             file_encryption: None,
@@ -753,6 +868,102 @@ mod tests {
     }
 
     #[test]
+    fn rar5_recovery_records_refresh_from_integrated_services() {
+        let mut archive = empty_archive(Vec::new());
+        let mut rr = test_service("RR", 2, false, false);
+        rr.header_offset = 0x1234;
+        rr.file_header.data_offset = 0x1300;
+        rr.file_header.data_size = 0x2000;
+        rr.file_header.service_subdata = Some(crate::vint::encode_vint(375));
+        archive.services = vec![rr];
+
+        archive.refresh_rar5_recovery_records_from_services();
+
+        assert!(archive.has_recovery_record);
+        assert_eq!(archive.recovery_records.len(), 1);
+        let record = &archive.recovery_records[0];
+        assert_eq!(record.format, ArchiveFormat::Rar5);
+        assert_eq!(record.kind, RecoveryRecordKind::Rar5Service);
+        assert_eq!(record.offset, 0x1234);
+        assert_eq!(record.data_offset, 0x1300);
+        assert_eq!(record.data_size, 0x2000);
+        assert_eq!(record.protected_size, Some(0x1234));
+        assert_eq!(record.recovery_percent, Some(375));
+    }
+
+    #[test]
+    fn removing_rr_service_drops_stale_rar5_recovery_records() {
+        let mut archive = empty_archive(Vec::new());
+        archive.services = vec![test_service("RR", 1, false, false)];
+        archive.refresh_rar5_recovery_records_from_services();
+        assert_eq!(archive.recovery_records.len(), 1);
+
+        archive.remove_volume_segments(1);
+
+        assert!(archive.recovery_records.is_empty());
+    }
+
+    #[test]
+    fn reconcile_service_chains_handles_right_index_before_left_index() {
+        let mut archive = empty_archive(Vec::new());
+        archive.services = vec![
+            test_service("", 2, true, false),
+            test_service("RR", 1, false, true),
+        ];
+        archive.services[0].file_header.data_crc32 = Some(0x2222_2222);
+        archive.services[0].comment_crc16 = Some(0x2222);
+        archive.services[1].file_header.data_crc32 = None;
+        archive.services[1].comment_crc16 = None;
+
+        RarArchive::reconcile_service_chains(&mut archive.services);
+
+        assert_eq!(archive.services.len(), 1);
+        let merged = &archive.services[0];
+        assert_eq!(merged.file_header.name, "RR");
+        assert!(!merged.file_header.split_after);
+        assert_eq!(merged.file_header.data_crc32, Some(0x2222_2222));
+        assert_eq!(merged.comment_crc16, Some(0x2222));
+        assert_eq!(
+            merged
+                .segments
+                .iter()
+                .map(|segment| segment.volume_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn integrate_service_preserves_out_of_order_final_hash_and_crc() {
+        let first_hash = [0x11; 32];
+        let final_hash = [0x22; 32];
+        let mut continuation = test_service("CMT", 2, true, false);
+        continuation.file_header.data_crc32 = Some(0x2222_2222);
+        continuation.hash = Some(FileHash::Blake2sp(final_hash));
+        continuation.comment_crc16 = Some(0x2222);
+        let mut services = vec![continuation];
+
+        let mut first = test_service("CMT", 1, false, true);
+        first.file_header.data_crc32 = Some(0x1111_1111);
+        first.hash = Some(FileHash::Blake2sp(first_hash));
+        first.comment_crc16 = Some(0x1111);
+        RarArchive::integrate_service_entry(&mut services, 1, first);
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].file_header.data_crc32, Some(0x2222_2222));
+        assert_eq!(services[0].hash, Some(FileHash::Blake2sp(final_hash)));
+        assert_eq!(services[0].comment_crc16, Some(0x2222));
+        assert_eq!(
+            services[0]
+                .segments
+                .iter()
+                .map(|segment| segment.volume_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
     fn reconcile_member_chains_handles_right_index_before_left_index() {
         let mut archive = empty_archive(vec![
             test_member("", 2, true, false, Some(0x2222_2222)),
@@ -811,6 +1022,11 @@ mod tests {
 
         archive.integrate_member(1, first);
 
+        assert_eq!(archive.members[0].file_header.data_crc32, Some(0x2222_2222));
+        assert_eq!(
+            archive.members[0].file_header.data_hash,
+            Some(crate::types::DataHash::Crc32(0x2222_2222))
+        );
         assert_eq!(
             archive.members[0].hash,
             Some(FileHash::Blake2sp(final_hash))

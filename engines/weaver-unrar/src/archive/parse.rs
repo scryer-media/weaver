@@ -129,6 +129,7 @@ impl RarArchive {
                 let mut file_header = service.header.inner;
                 file_header.is_encrypted = service.is_encrypted;
                 ServiceEntry {
+                    header_offset: service.header.header_offset,
                     file_header,
                     is_encrypted: service.is_encrypted,
                     file_encryption: service.file_encryption.map(Self::file_encryption_info),
@@ -244,6 +245,7 @@ impl RarArchive {
         for fh in &parsed.services {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
+                header_offset: fh.data_offset,
                 segments: vec![DataSegment::with_packed_hash(
                     0,
                     fh.data_offset,
@@ -300,23 +302,64 @@ impl RarArchive {
         services
             .iter()
             .filter(|service| service.header.service_name() == "RR")
-            .map(|service| RecoveryRecordInfo {
-                format: ArchiveFormat::Rar5,
-                kind: RecoveryRecordKind::Rar5Service,
-                offset: service.header.header_offset,
-                data_offset: service.header.inner.data_offset,
-                data_size: service.header.inner.data_size,
-                protected_size: Some(service.header.header_offset),
-                recovery_sectors: None,
-                total_blocks: None,
-                recovery_percent: service
-                    .header
-                    .inner
-                    .service_subdata
-                    .as_deref()
-                    .and_then(|data| crate::vint::read_vint(data).ok().map(|(value, _)| value)),
+            .map(|service| {
+                Self::rar5_recovery_record_info(
+                    service.header.header_offset,
+                    service.header.inner.data_offset,
+                    service.header.inner.data_size,
+                    service.header.inner.service_subdata.as_deref(),
+                )
             })
             .collect()
+    }
+
+    fn rar5_service_entry_recovery_records(services: &[ServiceEntry]) -> Vec<RecoveryRecordInfo> {
+        services
+            .iter()
+            .filter(|service| service.file_header.name == "RR")
+            .map(|service| {
+                Self::rar5_recovery_record_info(
+                    service.header_offset,
+                    service.file_header.data_offset,
+                    service.file_header.data_size,
+                    service.file_header.service_subdata.as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    fn rar5_recovery_record_info(
+        header_offset: u64,
+        data_offset: u64,
+        data_size: u64,
+        service_subdata: Option<&[u8]>,
+    ) -> RecoveryRecordInfo {
+        RecoveryRecordInfo {
+            format: ArchiveFormat::Rar5,
+            kind: RecoveryRecordKind::Rar5Service,
+            offset: header_offset,
+            data_offset,
+            data_size,
+            protected_size: Some(header_offset),
+            recovery_sectors: None,
+            total_blocks: None,
+            recovery_percent: service_subdata
+                .and_then(|data| crate::vint::read_vint(data).ok().map(|(value, _)| value)),
+        }
+    }
+
+    pub(super) fn refresh_rar5_recovery_records_from_services(&mut self) {
+        if self.format != ArchiveFormat::Rar5 {
+            return;
+        }
+
+        self.recovery_records
+            .retain(|record| record.format != ArchiveFormat::Rar5);
+        let records = Self::rar5_service_entry_recovery_records(&self.services);
+        if !records.is_empty() {
+            self.has_recovery_record = true;
+            self.recovery_records.extend(records);
+        }
     }
 
     fn rar5_locator_rr_service(
@@ -376,6 +419,7 @@ impl RarArchive {
         format: crate::types::ArchiveFormat,
     ) -> ServiceEntry {
         ServiceEntry {
+            header_offset: comment.header_offset,
             file_header: FileHeader {
                 name: "CMT".to_string(),
                 unpacked_size: Some(comment.unpacked_size as u64),
