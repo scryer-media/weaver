@@ -298,10 +298,10 @@ impl SubAllocator {
     fn glue_free_blocks(&mut self) {
         let mut blocks = Vec::new();
 
-        for idx in 0..NUM_INDEXES {
+        for (idx, units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
             while !self.free_lists[idx].is_null() {
                 let node = self.remove_node(idx);
-                let units = INDEX_TO_UNITS[idx] as usize;
+                let units = *units as usize;
                 self.write_glue_block(node, units);
                 blocks.push(GlueBlock { node, units });
             }

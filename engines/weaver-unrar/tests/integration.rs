@@ -999,6 +999,7 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
 
     let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert_eq!(facts0.members.len(), 1);
+    assert_eq!(facts0.members[0].name_raw.as_deref(), Some(&b"facts.bin"[..]));
     assert!(facts0.members[0].split_after);
     assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
@@ -1007,6 +1008,7 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
 
     let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.members.len(), 1);
+    assert_eq!(facts1.members[0].name_raw.as_deref(), Some(&b"facts.bin"[..]));
     assert!(!facts1.members[0].split_after);
     assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
     assert_eq!(facts1.members[0].packed_crc32, None);
@@ -1024,6 +1026,7 @@ fn test_rar5_volume_facts_expose_split_comment_pack_crc() {
     assert!(facts0.members.is_empty());
     assert_eq!(facts0.services.len(), 1);
     assert_eq!(facts0.services[0].name, "CMT");
+    assert_eq!(facts0.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
     assert!(facts0.services[0].split_after);
     assert_eq!(facts0.services[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
@@ -1032,6 +1035,7 @@ fn test_rar5_volume_facts_expose_split_comment_pack_crc() {
     let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.services.len(), 1);
     assert_eq!(facts1.services[0].name, "CMT");
+    assert_eq!(facts1.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
     assert!(!facts1.services[0].split_after);
     assert_eq!(facts1.services[0].data_crc32, Some(full_crc));
     assert_eq!(facts1.services[0].packed_crc32, None);
@@ -1889,6 +1893,10 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
 
     let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert_eq!(facts0.members.len(), 1);
+    assert_eq!(
+        facts0.members[0].name_raw.as_deref(),
+        Some(&b"facts-rar4.bin"[..])
+    );
     assert!(facts0.members[0].split_after);
     assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
@@ -1896,6 +1904,10 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
 
     let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.members.len(), 1);
+    assert_eq!(
+        facts1.members[0].name_raw.as_deref(),
+        Some(&b"facts-rar4.bin"[..])
+    );
     assert!(!facts1.members[0].split_after);
     assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
     assert_eq!(facts1.members[0].packed_crc32, None);
@@ -1913,6 +1925,7 @@ fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
     assert!(facts0.members.is_empty());
     assert_eq!(facts0.services.len(), 1);
     assert_eq!(facts0.services[0].name, "CMT");
+    assert_eq!(facts0.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
     assert!(facts0.services[0].split_after);
     assert_eq!(facts0.services[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.services[0].packed_crc32, Some(first_packed_crc));
@@ -1920,6 +1933,7 @@ fn test_rar4_volume_facts_expose_split_comment_pack_crc() {
     let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.services.len(), 1);
     assert_eq!(facts1.services[0].name, "CMT");
+    assert_eq!(facts1.services[0].name_raw.as_deref(), Some(&b"CMT"[..]));
     assert!(!facts1.services[0].split_after);
     assert_eq!(facts1.services[0].data_crc32, Some(full_crc));
     assert_eq!(facts1.services[0].packed_crc32, None);
@@ -1938,6 +1952,7 @@ fn test_rar4_volume_facts_expose_old_acl_and_stream_services() {
 
     let acl = &facts.services[0];
     assert_eq!(acl.name, "ACL");
+    assert_eq!(acl.name_raw, None);
     assert_eq!(acl.subtype, Some(0x0104));
     assert_eq!(acl.level, Some(0));
     assert_eq!(acl.unpacked_size, Some(8));
@@ -1950,11 +1965,13 @@ fn test_rar4_volume_facts_expose_old_acl_and_stream_services() {
 
     let stream = &facts.services[1];
     assert_eq!(stream.name, "STM");
+    assert_eq!(stream.name_raw, None);
     assert_eq!(stream.subtype, Some(0x0105));
     assert_eq!(stream.unpacked_size, Some(11));
     assert_eq!(stream.data_size, 11);
     assert_eq!(stream.data_crc32, Some(crc32fast::hash(b"stream-data")));
     assert_eq!(stream.stream_name.as_deref(), Some(":metadata"));
+    assert_eq!(stream.stream_name_raw.as_deref(), Some(&b":metadata"[..]));
 }
 
 #[test]

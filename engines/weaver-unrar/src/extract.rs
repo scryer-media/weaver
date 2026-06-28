@@ -605,6 +605,7 @@ mod tests {
 
         FileHeader {
             name: name.to_string(),
+            name_raw: Some(name.as_bytes().to_vec()),
             unpacked_size: Some(data.len() as u64),
             attributes: FileAttributes(0o644),
             mtime: None,

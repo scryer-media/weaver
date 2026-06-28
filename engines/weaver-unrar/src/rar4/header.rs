@@ -160,19 +160,19 @@ fn parse_extended_times(
     let flags = cursor.get2();
     let mut times = [dos_datetime_to_system_time(base_mtime), None, None];
 
-    for index in 0..3 {
+    for (index, slot) in times.iter_mut().enumerate() {
         let rmode = flags >> ((3 - index) * 4);
         if rmode & 8 == 0 {
             continue;
         }
 
         if index != 0 {
-            times[index] = dos_datetime_to_system_time(cursor.get4());
+            *slot = dos_datetime_to_system_time(cursor.get4());
         }
 
-        if let Some(mut time) = times[index] {
+        if let Some(mut time) = *slot {
             if rmode & 4 != 0 {
-                time = time + Duration::from_secs(1);
+                time += Duration::from_secs(1);
             }
 
             let mut hundred_ns = 0u32;
@@ -180,8 +180,8 @@ fn parse_extended_times(
             for j in 0..count {
                 hundred_ns |= u32::from(cursor.get1()) << ((j + 3 - count) * 8);
             }
-            time = time + Duration::from_nanos(u64::from(hundred_ns) * 100);
-            times[index] = Some(time);
+            time += Duration::from_nanos(u64::from(hundred_ns) * 100);
+            *slot = Some(time);
         }
     }
 
@@ -461,7 +461,8 @@ pub fn parse_rar14_file_header(data: &[u8], offset: u64) -> RarResult<Option<Rar
         return Err(RarError::TruncatedHeader { offset });
     }
 
-    let name = decode_rar4_c_string_name(&data[21..21 + name_len]);
+    let name_raw = data[21..21 + name_len].to_vec();
+    let name = decode_rar4_c_string_name(&name_raw);
     let is_directory = attributes & 0x10 != 0;
     let is_encrypted = flags & file_flags::ENCRYPTED != 0;
 
@@ -481,6 +482,7 @@ pub fn parse_rar14_file_header(data: &[u8], offset: u64) -> RarResult<Option<Rar
         method,
         dict_size: 0x10000,
         name,
+        name_raw: Some(name_raw),
         is_directory,
         is_unix_symlink: false,
         is_encrypted,
@@ -544,6 +546,7 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
     } else {
         decode_rar4_c_string_name(&name_bytes)
     };
+    let name_raw = Some(name_bytes);
     let version = if raw.flags & file_flags::VERSION != 0 {
         parse_version_file_name(&name)
     } else {
@@ -619,6 +622,7 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
         method,
         dict_size,
         name,
+        name_raw,
         is_directory,
         is_unix_symlink,
         is_encrypted,
@@ -726,6 +730,7 @@ pub fn parse_old_service_header(raw: &RawRar4Header) -> RarResult<Rar4OldService
                 stream_name: crate::header::common::decode_utf8_prefix_until_nul(
                     &stream_name_bytes[..nul_end],
                 ),
+                stream_name_raw: stream_name_bytes[..nul_end].to_vec(),
             }
         }
         _ => Rar4OldServiceData::Unknown,
@@ -1207,6 +1212,7 @@ mod tests {
                 method,
                 crc32,
                 stream_name,
+                stream_name_raw,
             } => {
                 assert_eq!(unpacked_size, 99);
                 assert_eq!(unpack_version, 20);
@@ -1214,6 +1220,8 @@ mod tests {
                 assert_eq!(crc32, 0x1122_3344);
                 assert_eq!(stream_name.len(), MAX_STREAM_NAME20);
                 assert!(stream_name.bytes().all(|byte| byte == b'a'));
+                assert_eq!(stream_name_raw.len(), MAX_STREAM_NAME20);
+                assert!(stream_name_raw.iter().all(|byte| *byte == b'a'));
             }
             other => panic!("expected Stream old service, got {other:?}"),
         }
@@ -1224,8 +1232,13 @@ mod tests {
         let old = parse_test_old_service_stream(b":safe\xc0\xafstream");
 
         match old.data {
-            Rar4OldServiceData::Stream { stream_name, .. } => {
+            Rar4OldServiceData::Stream {
+                stream_name,
+                stream_name_raw,
+                ..
+            } => {
                 assert_eq!(stream_name, ":safe/stream");
+                assert_eq!(stream_name_raw, b":safe\xc0\xafstream");
             }
             other => panic!("expected Stream old service, got {other:?}"),
         }
@@ -1236,8 +1249,13 @@ mod tests {
         let old = parse_test_old_service_stream(b":safe/\xffhidden");
 
         match old.data {
-            Rar4OldServiceData::Stream { stream_name, .. } => {
+            Rar4OldServiceData::Stream {
+                stream_name,
+                stream_name_raw,
+                ..
+            } => {
                 assert_eq!(stream_name, ":safe/");
+                assert_eq!(stream_name_raw, b":safe/\xffhidden");
             }
             other => panic!("expected Stream old service, got {other:?}"),
         }
@@ -1286,6 +1304,7 @@ mod tests {
         let fh = parse_file_header(&raw).unwrap();
 
         assert_eq!(fh.name, "test.txt");
+        assert_eq!(fh.name_raw.as_deref(), Some(&b"test.txt"[..]));
         assert_eq!(fh.packed_size, 100);
         assert_eq!(fh.unpacked_size, Some(200));
         assert_eq!(fh.host_os, Rar4HostOs::Unix);
@@ -1305,6 +1324,7 @@ mod tests {
         let fh = parse_file_header(&raw).unwrap();
 
         assert_eq!(fh.name, "");
+        assert_eq!(fh.name_raw.as_deref(), Some(&[][..]));
         assert_eq!(fh.packed_size, 0);
         assert_eq!(fh.unpacked_size, Some(0));
         assert_eq!(fh.host_os, Rar4HostOs::MsDos);

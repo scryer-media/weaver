@@ -50,6 +50,9 @@ pub struct MainArchiveHeader {
     pub recovery_record_offset: Option<u64>,
     /// Original archive name from the metadata extra record.
     pub original_name: Option<String>,
+    /// Raw original archive name bytes after UnRAR's metadata-name cap and
+    /// short-read zero-fill behavior.
+    pub original_name_raw: Option<Vec<u8>>,
     /// Original archive creation time from the metadata extra record.
     pub original_creation_time: Option<SystemTime>,
 }
@@ -77,6 +80,7 @@ struct MainExtraMetadata {
     quick_open_offset: Option<u64>,
     recovery_record_offset: Option<u64>,
     original_name: Option<String>,
+    original_name_raw: Option<Vec<u8>>,
     original_creation_time: Option<SystemTime>,
 }
 
@@ -118,6 +122,7 @@ pub fn parse(raw: &RawHeader) -> RarResult<MainArchiveHeader> {
         quick_open_offset: extras.quick_open_offset,
         recovery_record_offset: extras.recovery_record_offset,
         original_name: extras.original_name,
+        original_name_raw: extras.original_name_raw,
         original_creation_time: extras.original_creation_time,
     })
 }
@@ -203,6 +208,7 @@ fn parse_metadata_extra(data: &[u8], metadata: &mut MainExtraMetadata) {
             pos = pos.saturating_add(copied).min(data.len());
             if name_bytes.first().copied().unwrap_or(0) != 0 {
                 metadata.original_name = Some(common::decode_utf8_prefix_until_nul(&name_bytes));
+                metadata.original_name_raw = Some(name_bytes);
             }
         }
     }
@@ -427,6 +433,10 @@ mod tests {
 
         assert_eq!(main.original_name.as_deref(), Some("release.rar"));
         assert_eq!(
+            main.original_name_raw.as_deref(),
+            Some(&b"release.rar\0"[..])
+        );
+        assert_eq!(
             main.original_creation_time,
             Some(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789))
         );
@@ -446,6 +456,7 @@ mod tests {
         let main = parse(&raw).unwrap();
 
         assert_eq!(main.original_name, None);
+        assert_eq!(main.original_name_raw, None);
     }
 
     #[test]
@@ -462,6 +473,10 @@ mod tests {
         let main = parse(&raw).unwrap();
 
         assert_eq!(main.original_name.as_deref(), Some("rel"));
+        assert_eq!(
+            main.original_name_raw.as_deref(),
+            Some(&[b'r', b'e', b'l', 0, 0, 0, 0, 0, 0, 0, 0, 0][..])
+        );
     }
 
     #[test]
@@ -478,6 +493,9 @@ mod tests {
         let main = parse(&raw).unwrap();
 
         assert_eq!(main.original_name.as_deref(), Some("release/"));
+        let raw = main.original_name_raw.as_deref().unwrap();
+        assert_eq!(&raw[..13], b"release/\xfftail");
+        assert_eq!(&raw[13..], &[0, 0]);
     }
 
     #[test]
@@ -494,6 +512,10 @@ mod tests {
         let main = parse(&raw).unwrap();
 
         assert_eq!(main.original_name.as_deref(), Some("release/ok"));
+        assert_eq!(
+            main.original_name_raw.as_deref(),
+            Some(&b"release\xc0\xafok"[..])
+        );
     }
 
     #[test]

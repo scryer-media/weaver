@@ -239,7 +239,12 @@ pub(crate) fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
 /// malformed byte, but several header readers ignore that return value and keep
 /// the prefix decoded before the error. They also stop at the first NUL byte.
 pub(crate) fn decode_utf8_prefix_until_nul(bytes: &[u8]) -> String {
+    decode_utf8_prefix_until_nul_with_unrar_bytes(bytes).0
+}
+
+pub(crate) fn decode_utf8_prefix_until_nul_with_unrar_bytes(bytes: &[u8]) -> (String, Vec<u8>) {
     let mut decoded = String::new();
+    let mut unrar_bytes = Vec::new();
     let mut pos = 0usize;
 
     while let Some(&first) = bytes.get(pos) {
@@ -289,12 +294,37 @@ pub(crate) fn decode_utf8_prefix_until_nul(bytes: &[u8]) -> String {
         if scalar > 0x10ffff {
             continue;
         }
-        if let Some(ch) = char::from_u32(scalar) {
-            decoded.push(ch);
-        }
+        let ch = if (0xd800..=0xdfff).contains(&scalar) {
+            char::REPLACEMENT_CHARACTER
+        } else {
+            let Some(ch) = char::from_u32(scalar) else {
+                continue;
+            };
+            ch
+        };
+        decoded.push(ch);
+        append_unrar_utf8(scalar, &mut unrar_bytes);
     }
 
-    decoded
+    (decoded, unrar_bytes)
+}
+
+fn append_unrar_utf8(scalar: u32, out: &mut Vec<u8>) {
+    if scalar <= 0x7f {
+        out.push(scalar as u8);
+    } else if scalar <= 0x7ff {
+        out.push((0xc0 | ((scalar >> 6) & 0x1f)) as u8);
+        out.push((0x80 | (scalar & 0x3f)) as u8);
+    } else if scalar <= 0xffff {
+        out.push((0xe0 | ((scalar >> 12) & 0x0f)) as u8);
+        out.push((0x80 | ((scalar >> 6) & 0x3f)) as u8);
+        out.push((0x80 | (scalar & 0x3f)) as u8);
+    } else if scalar <= 0x10ffff {
+        out.push((0xf0 | ((scalar >> 18) & 0x07)) as u8);
+        out.push((0x80 | ((scalar >> 12) & 0x3f)) as u8);
+        out.push((0x80 | ((scalar >> 6) & 0x3f)) as u8);
+        out.push((0x80 | (scalar & 0x3f)) as u8);
+    }
 }
 
 pub(crate) fn validate_header_size(
@@ -440,6 +470,21 @@ mod tests {
     #[test]
     fn utf8_prefix_decoder_skips_out_of_range_four_byte_scalars_like_unrar() {
         assert_eq!(decode_utf8_prefix_until_nul(b"a\xf7\xbf\xbf\xbfb"), "ab");
+    }
+
+    #[test]
+    fn utf8_prefix_decoder_preserves_surrogate_position_like_unrar() {
+        assert_eq!(
+            decode_utf8_prefix_until_nul(b"a\xed\xa0\x80b"),
+            "a\u{fffd}b"
+        );
+    }
+
+    #[test]
+    fn utf8_prefix_decoder_exposes_unrar_wide_to_char_bytes() {
+        let (text, bytes) = decode_utf8_prefix_until_nul_with_unrar_bytes(b"a\xc0\xaf\xed\xa0\x80");
+        assert_eq!(text, "a/\u{fffd}");
+        assert_eq!(bytes, b"a/\xed\xa0\x80");
     }
 
     fn build_header(header_type: u64, header_flags: u64, type_body: &[u8]) -> Vec<u8> {

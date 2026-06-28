@@ -23,6 +23,8 @@ pub struct RarVolumeFacts {
 pub struct RarVolumeMemberFacts {
     pub order: u32,
     pub name: String,
+    #[serde(default)]
+    pub name_raw: Option<Vec<u8>>,
     pub unpacked_size: Option<u64>,
     pub data_crc32: Option<u32>,
     #[serde(default)]
@@ -53,6 +55,8 @@ pub struct RarVolumeServiceFacts {
     pub order: u32,
     pub name: String,
     #[serde(default)]
+    pub name_raw: Option<Vec<u8>>,
+    #[serde(default)]
     pub subtype: Option<u16>,
     #[serde(default)]
     pub level: Option<u8>,
@@ -78,6 +82,8 @@ pub struct RarVolumeServiceFacts {
     pub use_hash_mac: bool,
     #[serde(default)]
     pub stream_name: Option<String>,
+    #[serde(default)]
+    pub stream_name_raw: Option<Vec<u8>>,
 }
 
 impl RarVolumeFacts {
@@ -99,6 +105,7 @@ impl RarVolumeServiceFacts {
         Self {
             order: order as u32,
             name: fh.name.clone(),
+            name_raw: fh.name_raw.clone(),
             subtype: None,
             level: None,
             unpacked_size: fh.unpacked_size,
@@ -118,6 +125,7 @@ impl RarVolumeServiceFacts {
             dict_size: fh.dict_size,
             use_hash_mac: false,
             stream_name: None,
+            stream_name_raw: None,
         }
     }
 
@@ -125,6 +133,7 @@ impl RarVolumeServiceFacts {
         Self {
             order: order as u32,
             name: "CMT".to_string(),
+            name_raw: Some(b"CMT".to_vec()),
             subtype: None,
             level: None,
             unpacked_size: Some(u64::from(comment.unpacked_size)),
@@ -144,6 +153,7 @@ impl RarVolumeServiceFacts {
             dict_size: 0,
             use_hash_mac: false,
             stream_name: None,
+            stream_name_raw: None,
         }
     }
 
@@ -153,7 +163,15 @@ impl RarVolumeServiceFacts {
     ) -> Self {
         use crate::rar4::types::Rar4OldServiceData;
 
-        let (name, unpacked_size, data_crc32, compression_method, compression_version, stream_name) =
+        let (
+            name,
+            unpacked_size,
+            data_crc32,
+            compression_method,
+            compression_version,
+            stream_name,
+            stream_name_raw,
+        ) =
             match &service.data {
                 Rar4OldServiceData::NtAcl {
                     unpacked_size,
@@ -167,6 +185,7 @@ impl RarVolumeServiceFacts {
                     rar4_method_to_compression_method(*method).code(),
                     *unpack_version,
                     None,
+                    None,
                 ),
                 Rar4OldServiceData::Stream {
                     unpacked_size,
@@ -174,6 +193,7 @@ impl RarVolumeServiceFacts {
                     method,
                     crc32,
                     stream_name,
+                    stream_name_raw,
                 } => (
                     "STM".to_string(),
                     Some(u64::from(*unpacked_size)),
@@ -181,6 +201,7 @@ impl RarVolumeServiceFacts {
                     rar4_method_to_compression_method(*method).code(),
                     *unpack_version,
                     Some(stream_name.clone()),
+                    Some(stream_name_raw.clone()),
                 ),
                 Rar4OldServiceData::Unknown => (
                     format!("0x{:04x}", service.subtype),
@@ -189,12 +210,14 @@ impl RarVolumeServiceFacts {
                     CompressionMethod::Store.code(),
                     0,
                     None,
+                    None,
                 ),
             };
 
         Self {
             order: order as u32,
             name,
+            name_raw: None,
             subtype: Some(service.subtype),
             level: Some(service.level),
             unpacked_size,
@@ -214,6 +237,7 @@ impl RarVolumeServiceFacts {
             dict_size: 0x10000,
             use_hash_mac: false,
             stream_name,
+            stream_name_raw,
         }
     }
 
@@ -229,6 +253,7 @@ impl RarVolumeServiceFacts {
         Self {
             order: order as u32,
             name: service.header.service_name().to_string(),
+            name_raw: service.header.inner.name_raw.clone(),
             subtype: None,
             level: None,
             unpacked_size: service.header.inner.unpacked_size,
@@ -251,6 +276,7 @@ impl RarVolumeServiceFacts {
                 .as_ref()
                 .is_some_and(|info| info.use_hash_mac),
             stream_name: None,
+            stream_name_raw: None,
         }
     }
 }
@@ -324,6 +350,7 @@ impl RarArchive {
                     RarVolumeMemberFacts {
                         order: order as u32,
                         name: fh.name.clone(),
+                        name_raw: fh.name_raw.clone(),
                         unpacked_size: fh.unpacked_size,
                         data_crc32: (!fh.is_rar14).then_some(fh.crc32),
                         packed_crc32,
@@ -416,6 +443,7 @@ impl RarArchive {
                 RarVolumeMemberFacts {
                     order: order as u32,
                     name: parsed_file.header.name,
+                    name_raw: parsed_file.header.name_raw,
                     unpacked_size: parsed_file.header.unpacked_size,
                     data_crc32: parsed_file.header.data_crc32,
                     packed_crc32,
@@ -540,6 +568,7 @@ mod tests {
 
         assert!(decoded.services.is_empty());
         assert_eq!(decoded.members.len(), 1);
+        assert_eq!(decoded.members[0].name_raw, None);
         assert_eq!(decoded.members[0].packed_crc32, None);
         assert_eq!(decoded.members[0].packed_blake2_hash, None);
         assert!(!decoded.members[0].packed_hash_uses_mac);

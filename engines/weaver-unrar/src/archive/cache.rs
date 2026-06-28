@@ -44,6 +44,8 @@ pub struct CachedArchiveHeaders {
     #[serde(default)]
     pub original_name: Option<String>,
     #[serde(default)]
+    pub original_name_raw: Option<Vec<u8>>,
+    #[serde(default)]
     pub original_creation_time_ns: Option<u64>,
     pub more_volumes: bool,
     #[serde(default)]
@@ -58,6 +60,8 @@ pub struct CachedArchiveHeaders {
 #[derive(Serialize, Deserialize)]
 pub struct CachedMember {
     pub name: String,
+    #[serde(default)]
+    pub name_raw: Option<Vec<u8>>,
     pub unpacked_size: Option<u64>,
     #[serde(default)]
     pub mtime_ns: Option<u64>,
@@ -86,6 +90,8 @@ pub struct CachedMember {
     #[serde(default)]
     pub redirection_target: Option<String>,
     #[serde(default)]
+    pub redirection_target_raw: Option<Vec<u8>>,
+    #[serde(default)]
     pub redirection_target_is_directory: bool,
     #[serde(default)]
     pub attributes: u64,
@@ -111,6 +117,8 @@ pub struct CachedService {
     #[serde(default)]
     pub header_offset: u64,
     pub name: String,
+    #[serde(default)]
+    pub name_raw: Option<Vec<u8>>,
     pub unpacked_size: Option<u64>,
     #[serde(default)]
     pub mtime_ns: Option<u64>,
@@ -212,6 +220,7 @@ impl From<LegacyCachedArchiveHeaders> for CachedArchiveHeaders {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time_ns: None,
             more_volumes: value.more_volumes,
             volume_presence: value.volume_presence,
@@ -227,6 +236,7 @@ impl From<LegacyCachedMember> for CachedMember {
     fn from(value: LegacyCachedMember) -> Self {
         Self {
             name: value.name,
+            name_raw: None,
             unpacked_size: value.unpacked_size,
             mtime_ns: None,
             ctime_ns: None,
@@ -246,6 +256,7 @@ impl From<LegacyCachedMember> for CachedMember {
             blake2_hash: value.blake2_hash,
             redirection_type: None,
             redirection_target: None,
+            redirection_target_raw: None,
             redirection_target_is_directory: false,
             attributes: 0,
             host_os: default_host_os_code(),
@@ -401,6 +412,7 @@ impl RarArchive {
             quick_open_offset: self.quick_open_offset,
             recovery_record_offset: self.recovery_record_offset,
             original_name: self.original_name.clone(),
+            original_name_raw: self.original_name_raw.clone(),
             original_creation_time_ns: encode_system_time(self.original_creation_time),
             more_volumes: self.more_volumes,
             volume_presence: self.volume_set.presence(),
@@ -410,6 +422,7 @@ impl RarArchive {
                 .iter()
                 .map(|m| CachedMember {
                     name: m.file_header.name.clone(),
+                    name_raw: m.file_header.name_raw.clone(),
                     unpacked_size: m.file_header.unpacked_size,
                     mtime_ns: encode_system_time(m.file_header.mtime),
                     ctime_ns: encode_system_time(m.file_header.ctime),
@@ -434,6 +447,10 @@ impl RarArchive {
                         .as_ref()
                         .map(|redir| encode_redirection_type(&redir.redir_type)),
                     redirection_target: m.redirection.as_ref().map(|redir| redir.target.clone()),
+                    redirection_target_raw: m
+                        .redirection
+                        .as_ref()
+                        .and_then(|redir| redir.target_raw.clone()),
                     redirection_target_is_directory: m
                         .redirection
                         .as_ref()
@@ -461,6 +478,7 @@ impl RarArchive {
                 .map(|service| CachedService {
                     header_offset: service.header_offset,
                     name: service.file_header.name.clone(),
+                    name_raw: service.file_header.name_raw.clone(),
                     unpacked_size: service.file_header.unpacked_size,
                     mtime_ns: encode_system_time(service.file_header.mtime),
                     ctime_ns: encode_system_time(service.file_header.ctime),
@@ -540,6 +558,7 @@ impl RarArchive {
                 MemberEntry {
                     file_header: FileHeader {
                         name: cm.name,
+                        name_raw: cm.name_raw,
                         unpacked_size: cm.unpacked_size,
                         attributes: FileAttributes(cm.attributes),
                         mtime: decode_system_time(cm.mtime_ns),
@@ -566,6 +585,7 @@ impl RarArchive {
                     redirection: cm.redirection_type.map(|redir_type| Redirection {
                         redir_type: RedirectionType::from(redir_type),
                         target: cm.redirection_target.unwrap_or_default(),
+                        target_raw: cm.redirection_target_raw,
                         target_is_directory: cm.redirection_target_is_directory,
                     }),
                     owner: (cm.owner_user_name.is_some()
@@ -602,6 +622,7 @@ impl RarArchive {
                     header_offset: service.header_offset,
                     file_header: FileHeader {
                         name: service.name,
+                        name_raw: service.name_raw,
                         unpacked_size: service.unpacked_size,
                         attributes: FileAttributes(service.attributes),
                         mtime: decode_system_time(service.mtime_ns),
@@ -641,6 +662,7 @@ impl RarArchive {
             quick_open_offset: cached.quick_open_offset,
             recovery_record_offset: cached.recovery_record_offset,
             original_name: cached.original_name,
+            original_name_raw: cached.original_name_raw,
             original_creation_time: decode_system_time(cached.original_creation_time_ns),
             volume_set: VolumeSet::from_presence(cached.volume_presence, cached.last_volume_seen),
             members,
@@ -836,6 +858,7 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time_ns: None,
             more_volumes: false,
             volume_presence: vec![true],
@@ -894,6 +917,7 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time_ns: None,
             more_volumes: false,
             volume_presence: vec![true],
@@ -902,6 +926,7 @@ mod tests {
             services: vec![CachedService {
                 header_offset: 0x1234,
                 name: "CMT".to_string(),
+                name_raw: Some(b"CMT".to_vec()),
                 unpacked_size: Some(12),
                 mtime_ns: None,
                 ctime_ns: None,
@@ -945,6 +970,10 @@ mod tests {
 
         assert_eq!(service.header_offset, 0x1234);
         assert_eq!(service.file_header.name, "CMT");
+        assert_eq!(
+            service.file_header.name_raw.as_deref(),
+            Some(&b"CMT"[..])
+        );
         assert_eq!(service.file_header.unpacked_size, Some(12));
         assert_eq!(service.file_header.data_crc32, Some(0xA1B2_C3D4));
         assert_eq!(
@@ -988,12 +1017,14 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time_ns: None,
             more_volumes: false,
             volume_presence: vec![true],
             last_volume_seen: true,
             members: vec![CachedMember {
                 name: "file.txt".to_string(),
+                name_raw: Some(b"file.txt".to_vec()),
                 unpacked_size: Some(0),
                 mtime_ns: None,
                 ctime_ns: None,
@@ -1011,8 +1042,9 @@ mod tests {
                 rar4_salt: None,
                 version: None,
                 blake2_hash: None,
-                redirection_type: None,
-                redirection_target: None,
+                redirection_type: Some(1),
+                redirection_target: Some("a\u{fffd}b".to_string()),
+                redirection_target_raw: Some(b"a\xed\xa0\x80b".to_vec()),
                 redirection_target_is_directory: false,
                 attributes: 0,
                 host_os: default_host_os_code(),
@@ -1031,8 +1063,21 @@ mod tests {
         let archive = RarArchive::deserialize_headers(&bytes).expect("cache should decode");
         let owner = archive.members[0].owner.as_ref().expect("owner restored");
 
+        assert_eq!(
+            archive.members[0].file_header.name_raw.as_deref(),
+            Some(&b"file.txt"[..])
+        );
         assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));
         assert_eq!(owner.group_name_raw.as_deref(), Some(&b"gr\xf0up"[..]));
+        let redirection = archive.members[0]
+            .redirection
+            .as_ref()
+            .expect("redirection restored");
+        assert_eq!(redirection.target, "a\u{fffd}b");
+        assert_eq!(
+            redirection.target_raw.as_deref(),
+            Some(&b"a\xed\xa0\x80b"[..])
+        );
     }
 
     #[test]
@@ -1050,6 +1095,7 @@ mod tests {
             quick_open_offset: Some(4096),
             recovery_record_offset: Some(8192),
             original_name: Some("release.rar".to_string()),
+            original_name_raw: Some(b"release.rar".to_vec()),
             original_creation_time_ns: encode_system_time(Some(ctime)),
             more_volumes: false,
             volume_presence: vec![true],
@@ -1066,6 +1112,10 @@ mod tests {
         assert_eq!(metadata.quick_open_offset, Some(4096));
         assert_eq!(metadata.recovery_record_offset, Some(8192));
         assert_eq!(metadata.original_name.as_deref(), Some("release.rar"));
+        assert_eq!(
+            metadata.original_name_bytes.as_deref(),
+            Some(&b"release.rar"[..])
+        );
         assert_eq!(metadata.original_creation_time, Some(ctime));
     }
 }

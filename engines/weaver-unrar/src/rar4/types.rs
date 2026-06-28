@@ -215,6 +215,7 @@ pub enum Rar4OldServiceData {
         method: Rar4Method,
         crc32: u32,
         stream_name: String,
+        stream_name_raw: Vec<u8>,
     },
     Unknown,
 }
@@ -249,6 +250,9 @@ pub struct Rar4FileHeader {
     pub method: Rar4Method,
     pub dict_size: u64,
     pub name: String,
+    /// Raw RAR4 header name bytes, capped and zero-filled like UnRAR's
+    /// ReadHeader paths before Unicode/OEM conversion.
+    pub name_raw: Option<Vec<u8>>,
     pub is_directory: bool,
     pub is_unix_symlink: bool,
     pub is_encrypted: bool,

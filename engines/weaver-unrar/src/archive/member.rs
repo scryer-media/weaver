@@ -49,6 +49,12 @@ impl Drop for Rar5ReaderCrypto {
     }
 }
 
+#[derive(Debug)]
+struct Rar3UnixLinkTarget {
+    raw: Vec<u8>,
+    safety_target: String,
+}
+
 #[derive(Clone, Copy)]
 enum StoreCopyLimit {
     Exact(u64),
@@ -89,10 +95,12 @@ impl RarArchive {
         };
 
         let payload = self.read_service_subdata_to_memory(&service)?;
-        if Self::rar4_comment_is_raw_unicode(&service) {
-            return Ok(Some(Self::decode_raw_utf16le_comment(&payload)));
-        }
-        Ok(Some(Self::decode_rar5_comment_text(&payload)))
+        let comment = if Self::rar4_comment_is_raw_unicode(&service) {
+            Self::decode_raw_utf16le_comment(&payload)
+        } else {
+            Self::decode_rar5_comment_text(&payload)
+        };
+        Ok((!comment.is_empty()).then_some(comment))
     }
 
     fn rar4_comment_is_raw_unicode(service: &ServiceEntry) -> bool {
@@ -129,6 +137,16 @@ impl RarArchive {
                     fh.name, unpacked_size, MAX_COMMENT_BYTES
                 ),
             });
+        }
+        let packed_len = service.segments.iter().try_fold(0u64, |total, segment| {
+            total
+                .checked_add(segment.data_size)
+                .ok_or_else(|| RarError::ResourceLimit {
+                    detail: format!("RAR service {} packed size overflows u64", fh.name),
+                })
+        })?;
+        if packed_len == 0 && !fh.split_after {
+            return Ok(Vec::new());
         }
 
         let expected_crc = fh.data_crc32;
@@ -194,16 +212,8 @@ impl RarArchive {
                 hash_writer.flush().map_err(RarError::Io)?;
                 let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
                 let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
-                drop(hash_writer);
                 (output, written, actual_crc, actual_blake)
             } else {
-                let packed_len = service.segments.iter().try_fold(0u64, |total, segment| {
-                    total
-                        .checked_add(segment.data_size)
-                        .ok_or_else(|| RarError::ResourceLimit {
-                            detail: format!("RAR service {} packed size overflows u64", fh.name),
-                        })
-                })?;
                 if packed_len > self.limits.max_data_segment {
                     return Err(RarError::ResourceLimit {
                         detail: format!(
@@ -362,14 +372,23 @@ impl RarArchive {
         index: usize,
         options: &ExtractOptions,
         fh: &FileHeader,
-    ) -> RarResult<String> {
+    ) -> RarResult<Rar3UnixLinkTarget> {
+        if fh.data_size > MAX_LINK_TARGET_BYTES as u64 {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "RAR3 Unix symlink target for {} is {} bytes, exceeding MAXPATHSIZE {}",
+                    fh.name, fh.data_size, MAX_LINK_TARGET_BYTES
+                ),
+            });
+        }
+
         let link_options = ExtractOptions {
             verify: false,
             password: options.password.clone(),
             restore_owners: false,
         };
         let payload = self
-            .extract_member(index, &link_options, None)?
+            .extract_member_with_link_policy(index, &link_options, None, true)?
             .into_bytes()?;
         if payload.len() > MAX_LINK_TARGET_BYTES {
             return Err(RarError::ResourceLimit {
@@ -382,14 +401,14 @@ impl RarArchive {
             });
         }
 
-        Self::decode_rar3_link_target_payload(fh, &payload, options.verify)
+        Self::decode_rar3_unix_link_target_payload(fh, &payload, options.verify)
     }
 
-    fn decode_rar3_link_target_payload(
+    fn decode_rar3_unix_link_target_payload(
         fh: &FileHeader,
         payload: &[u8],
         verify: bool,
-    ) -> RarResult<String> {
+    ) -> RarResult<Rar3UnixLinkTarget> {
         let nul_pos = payload
             .iter()
             .position(|&b| b == 0)
@@ -412,14 +431,100 @@ impl RarArchive {
             });
         }
 
-        std::str::from_utf8(target_bytes)
-            .map(|target| target.to_owned())
-            .map_err(|_| RarError::CorruptArchive {
+        let safety_target = Self::decode_rar3_unix_link_target_for_safety(fh, target_bytes)?;
+        Ok(Rar3UnixLinkTarget {
+            raw: target_bytes.to_vec(),
+            safety_target,
+        })
+    }
+
+    fn decode_rar3_unix_link_target_for_safety(
+        fh: &FileHeader,
+        target_bytes: &[u8],
+    ) -> RarResult<String> {
+        let Some(target) = Self::decode_unrar_utf8_for_link_safety(target_bytes) else {
+            return Err(RarError::CorruptArchive {
                 detail: format!(
                     "RAR3 Unix symlink target for {} is not valid UTF-8",
                     fh.name
                 ),
-            })
+            });
+        };
+
+        let raw_path_chars = target_bytes
+            .iter()
+            .filter(|byte| matches!(byte, b'/' | b'.'))
+            .count();
+        let decoded_path_chars = target
+            .chars()
+            .filter(|ch| matches!(ch, '/' | '.'))
+            .count();
+        if raw_path_chars != decoded_path_chars {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR3 Unix symlink target for {} changes path metacharacters when decoded",
+                    fh.name
+                ),
+            });
+        }
+
+        Ok(target)
+    }
+
+    fn decode_unrar_utf8_for_link_safety(bytes: &[u8]) -> Option<String> {
+        let mut out = String::new();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            if byte == 0 {
+                break;
+            }
+            pos += 1;
+
+            let decoded = if byte < 0x80 {
+                u32::from(byte)
+            } else if byte >> 5 == 6 {
+                let b0 = *bytes.get(pos)?;
+                if b0 & 0xc0 != 0x80 {
+                    return None;
+                }
+                pos += 1;
+                (u32::from(byte & 0x1f) << 6) | u32::from(b0 & 0x3f)
+            } else if byte >> 4 == 14 {
+                let b0 = *bytes.get(pos)?;
+                let b1 = *bytes.get(pos + 1)?;
+                if b0 & 0xc0 != 0x80 || b1 & 0xc0 != 0x80 {
+                    return None;
+                }
+                pos += 2;
+                (u32::from(byte & 0x0f) << 12)
+                    | (u32::from(b0 & 0x3f) << 6)
+                    | u32::from(b1 & 0x3f)
+            } else if byte >> 3 == 30 {
+                let b0 = *bytes.get(pos)?;
+                let b1 = *bytes.get(pos + 1)?;
+                let b2 = *bytes.get(pos + 2)?;
+                if b0 & 0xc0 != 0x80 || b1 & 0xc0 != 0x80 || b2 & 0xc0 != 0x80 {
+                    return None;
+                }
+                pos += 3;
+                (u32::from(byte & 0x07) << 18)
+                    | (u32::from(b0 & 0x3f) << 12)
+                    | (u32::from(b1 & 0x3f) << 6)
+                    | u32::from(b2 & 0x3f)
+            } else {
+                return None;
+            };
+
+            let ch = if (0xd800..=0xdfff).contains(&decoded) {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                char::from_u32(decoded)?
+            };
+            out.push(ch);
+        }
+
+        Some(out)
     }
 
     fn remove_existing_link_output(out_path: &std::path::Path) -> RarResult<()> {
@@ -666,6 +771,7 @@ impl RarArchive {
             .join(crate::path::sanitize_file_redirection_path(target))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_symlink_output(
         fh: &FileHeader,
         owner: Option<&crate::types::UnixOwnerInfo>,
@@ -673,6 +779,7 @@ impl RarArchive {
         member_name: &str,
         raw_member_name: &str,
         target: &str,
+        target_raw: Option<&[u8]>,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
@@ -681,6 +788,11 @@ impl RarArchive {
 
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStrExt;
+
+            let target = target_raw
+                .map(std::ffi::OsStr::from_bytes)
+                .unwrap_or_else(|| std::ffi::OsStr::new(target));
             std::os::unix::fs::symlink(target, out_path).map_err(RarError::Io)?;
             Self::apply_symlink_times(fh, out_path)?;
             if options.restore_owners {
@@ -694,10 +806,58 @@ impl RarArchive {
             let _ = fh;
             let _ = owner;
             let _ = options;
+            let _ = target;
+            let _ = target_raw;
             let _ = out_path;
             Err(RarError::UnsupportedLinkType {
                 member: raw_member_name.to_string(),
                 link_type: "symlink".to_string(),
+            })
+        }
+    }
+
+    fn create_rar3_unix_symlink_output(
+        fh: &FileHeader,
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        options: &ExtractOptions,
+        member_name: &str,
+        raw_member_name: &str,
+        target: &Rar3UnixLinkTarget,
+        out_path: &std::path::Path,
+    ) -> RarResult<u64> {
+        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        Self::ensure_safe_symlink_target(
+            fh,
+            member_name,
+            &target.safety_target,
+            raw_member_name,
+            out_path,
+        )?;
+        Self::remove_existing_link_output(out_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let raw_target = std::ffi::OsStr::from_bytes(&target.raw);
+            std::os::unix::fs::symlink(raw_target, out_path).map_err(RarError::Io)?;
+            Self::apply_symlink_times(fh, out_path)?;
+            if options.restore_owners {
+                Self::apply_unix_owner(owner, out_path, false)?;
+            }
+            Ok(0)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = fh;
+            let _ = owner;
+            let _ = options;
+            let _ = member_name;
+            let _ = out_path;
+            Err(RarError::UnsupportedLinkType {
+                member: raw_member_name.to_string(),
+                link_type: "RAR3 Unix symlink".to_string(),
             })
         }
     }
@@ -996,6 +1156,7 @@ impl RarArchive {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_filecopy_output(
         &mut self,
         index: usize,
@@ -1005,16 +1166,8 @@ impl RarArchive {
         member_name: &str,
         raw_member_name: &str,
         target: &str,
-        target_is_directory: bool,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
-        if target_is_directory {
-            return Err(RarError::UnsupportedLinkType {
-                member: raw_member_name.to_string(),
-                link_type: "file-copy directory target".to_string(),
-            });
-        }
-
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
         Self::ensure_safe_link_target(member_name, target, raw_member_name, out_path)?;
         let target_path = Self::redirection_target_path(member_name, target, out_path);
@@ -1114,6 +1267,11 @@ impl RarArchive {
         if let Some(redir) = redirection {
             let link_type = format!("{:?}", redir.redir_type);
             let target = Self::normalized_rar5_redirection_target(redir.redir_type, &redir.target);
+            let target_raw = if matches!(redir.redir_type, header::RedirectionType::UnixSymlink) {
+                redir.target_raw.as_deref()
+            } else {
+                None
+            };
             return match redir.redir_type {
                 header::RedirectionType::UnixSymlink
                 | header::RedirectionType::WindowsSymlink
@@ -1124,6 +1282,7 @@ impl RarArchive {
                     &member_name,
                     &fh.name,
                     &target,
+                    target_raw,
                     out_path,
                 )
                 .map(Some),
@@ -1140,7 +1299,6 @@ impl RarArchive {
                         &member_name,
                         &fh.name,
                         &target,
-                        redir.target_is_directory,
                         out_path,
                     )
                     .map(Some),
@@ -1156,7 +1314,7 @@ impl RarArchive {
             && (fh.attributes.0 & 0xF000) == 0xA000;
         if rar3_unix_symlink {
             let target = self.link_target_from_rar3_payload(index, options, fh)?;
-            return Self::create_symlink_output(
+            return Self::create_rar3_unix_symlink_output(
                 fh,
                 owner,
                 options,
@@ -1842,6 +2000,16 @@ impl RarArchive {
         options: &ExtractOptions,
         progress: Option<&dyn ProgressHandler>,
     ) -> RarResult<crate::extract::ExtractedMember> {
+        self.extract_member_with_link_policy(index, options, progress, false)
+    }
+
+    fn extract_member_with_link_policy(
+        &mut self,
+        index: usize,
+        options: &ExtractOptions,
+        progress: Option<&dyn ProgressHandler>,
+        allow_link_payload: bool,
+    ) -> RarResult<crate::extract::ExtractedMember> {
         let entry = self
             .members
             .get(index)
@@ -1869,7 +2037,9 @@ impl RarArchive {
         let mi = self.member_info(index);
         let is_solid = fh.compression.solid;
         let archive_format = self.format;
-        self.reject_link_member_without_file_target(entry, &fh)?;
+        if !allow_link_payload {
+            self.reject_link_member_without_file_target(entry, &fh)?;
+        }
         self.enforce_archive_member_limits(&fh)?;
         let unpacked_size = self.target_unpacked_size(&fh);
         let store_limit = self.store_copy_limit(&fh);
@@ -3471,6 +3641,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
         let unpacked_size = self.target_unpacked_size(fh);
 
@@ -3586,6 +3757,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -3732,6 +3904,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
 
         // Wrap in DecryptingReader if encrypted.
@@ -3986,6 +4159,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let expected_crc = if options.verify { fh.data_crc32 } else { None };
@@ -4165,6 +4339,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
         let tracking_reader = VolumeTrackingReader::new(chained, volume_tracker)
@@ -4314,6 +4489,7 @@ impl RarArchive {
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
             .with_continuation(split_after, self.format, self.password.clone())
+            .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
 
@@ -4581,7 +4757,7 @@ fn finalize_shared_blake2(shared: Arc<std::sync::Mutex<Blake2spHasher>>) -> RarR
 
 enum SegmentPackedHashState {
     Crc32(crc32fast::Hasher),
-    Blake2sp(Blake2spHasher),
+    Blake2sp(Box<Blake2spHasher>),
 }
 
 struct SegmentPackedHashVerifier {
@@ -4598,7 +4774,7 @@ impl SegmentPackedHashVerifier {
         let expected = segment.packed_hash?;
         let state = match expected {
             PackedDataHash::Crc32(_) => SegmentPackedHashState::Crc32(crc32fast::Hasher::new()),
-            PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Blake2spHasher::new()),
+            PackedDataHash::Blake2sp(_) => SegmentPackedHashState::Blake2sp(Box::default()),
         };
         Some(Self {
             member_name: member_name.to_string(),
@@ -4723,6 +4899,8 @@ pub struct ChainedSegmentReader<'a> {
     format: ArchiveFormat,
     /// Password for encrypted header parsing.
     password: Option<String>,
+    /// Shared KDF cache for encrypted continuation headers.
+    kdf_cache: Arc<crate::crypto::KdfCache>,
     /// Shared metadata sink updated when continuation headers are discovered.
     /// The caller holds an Rc clone to read final values after streaming.
     metadata_sink: Option<Rc<RefCell<ContinuationMetadata>>>,
@@ -4879,6 +5057,7 @@ impl<'a> ChainedSegmentReader<'a> {
             next_discover_vol: next_vol,
             format: ArchiveFormat::Rar5,
             password: None,
+            kdf_cache: Arc::new(crate::crypto::KdfCache::new()),
             metadata_sink: None,
             volume_tracker: None,
             packed_hash_key: None,
@@ -4906,6 +5085,11 @@ impl<'a> ChainedSegmentReader<'a> {
         self.split_after = split_after;
         self.format = format;
         self.password = password;
+        self
+    }
+
+    fn with_kdf_cache(mut self, kdf_cache: Arc<crate::crypto::KdfCache>) -> Self {
+        self.kdf_cache = kdf_cache;
         self
     }
 
@@ -4989,8 +5173,12 @@ impl<'a> ChainedSegmentReader<'a> {
 
         if format.is_rar4_family() {
             // RAR4: parse headers to find the continuation file entry.
-            let parsed = crate::rar4::parse_rar4_headers(&mut reader, self.password.as_deref())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let parsed = crate::rar4::parse_rar4_headers_with_kdf_cache(
+                &mut reader,
+                self.password.as_deref(),
+                &self.kdf_cache,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file with split_before (continuation).
             for fh in &parsed.files {
                 if fh.split_before {
@@ -5022,8 +5210,12 @@ impl<'a> ChainedSegmentReader<'a> {
             }
         } else {
             // RAR5: parse headers.
-            let parsed = crate::header::parse_all_headers(&mut reader, self.password.as_deref())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let parsed = crate::header::parse_all_headers_with_kdf_cache(
+                &mut reader,
+                self.password.as_deref(),
+                &self.kdf_cache,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Find the first file header with split_before.
             for pf in &parsed.files {
                 if pf.header.split_before {
@@ -5190,6 +5382,7 @@ mod tests {
     fn test_rar3_symlink_header(expected_crc: Option<u32>) -> FileHeader {
         FileHeader {
             name: "link".into(),
+            name_raw: Some(b"link".to_vec()),
             unpacked_size: Some(0),
             attributes: FileAttributes(0xA000),
             mtime: None,
@@ -5299,6 +5492,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rar5_filecopy_ignores_dir_target_flag_like_unrar() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.bin");
+        let out_path = temp.path().join("copy.bin");
+        std::fs::write(&source, b"copied bytes").unwrap();
+
+        let mut archive = empty_rar5_archive();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.name = "copy.bin".to_string();
+        fh.attributes = FileAttributes(0);
+        fh.host_os = HostOs::Unix;
+        fh.compression.format = ArchiveFormat::Rar5;
+
+        let written = archive
+            .extract_link_member_to_file(
+                0,
+                &ExtractOptions::default(),
+                &fh,
+                None,
+                Some(header::Redirection {
+                    redir_type: header::RedirectionType::FileCopy,
+                    target: "source.bin".to_string(),
+                    target_raw: Some(b"source.bin".to_vec()),
+                    target_is_directory: true,
+                }),
+                &out_path,
+            )
+            .unwrap();
+
+        assert_eq!(written, Some(b"copied bytes".len() as u64));
+        assert_eq!(std::fs::read(out_path).unwrap(), b"copied bytes");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn rar5_unix_symlink_uses_unrar_target_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("link.bin");
+
+        let mut archive = empty_rar5_archive();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.name = "link.bin".to_string();
+        fh.attributes = FileAttributes(0);
+        fh.host_os = HostOs::Unix;
+        fh.compression.format = ArchiveFormat::Rar5;
+
+        let written = archive
+            .extract_link_member_to_file(
+                0,
+                &ExtractOptions::default(),
+                &fh,
+                None,
+                Some(header::Redirection {
+                    redir_type: header::RedirectionType::UnixSymlink,
+                    target: "safe\u{fffd}target".to_string(),
+                    target_raw: Some(b"safe\xed\xa0\x80target".to_vec()),
+                    target_is_directory: false,
+                }),
+                &out_path,
+            )
+            .unwrap();
+
+        assert_eq!(written, Some(0));
+        let link = std::fs::read_link(out_path).unwrap();
+        assert_eq!(link.as_os_str().as_bytes(), b"safe\xed\xa0\x80target");
+    }
+
     fn empty_rar5_archive() -> RarArchive {
         RarArchive {
             format: ArchiveFormat::Rar5,
@@ -5312,6 +5575,7 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time: None,
             volume_set: crate::volume::VolumeSet::single(),
             members: Vec::new(),
@@ -5325,6 +5589,64 @@ mod tests {
             password: None,
             kdf_cache: Arc::new(crate::crypto::KdfCache::default()),
         }
+    }
+
+    fn test_rar5_service(name: &str, unpacked_size: u64, data_size: u64) -> ServiceEntry {
+        ServiceEntry {
+            header_offset: 0,
+            file_header: FileHeader {
+                name: name.to_string(),
+                name_raw: Some(name.as_bytes().to_vec()),
+                unpacked_size: Some(unpacked_size),
+                attributes: FileAttributes(0),
+                mtime: None,
+                ctime: None,
+                atime: None,
+                data_crc32: None,
+                data_hash: None,
+                compression: CompressionInfo {
+                    format: ArchiveFormat::Rar5,
+                    version: 0,
+                    solid: false,
+                    method: CompressionMethod::Store,
+                    dict_size: 0,
+                },
+                host_os: HostOs::Unix,
+                is_directory: false,
+                file_flags: 0,
+                data_size,
+                split_before: false,
+                split_after: false,
+                data_offset: 0,
+                is_encrypted: false,
+                version: None,
+                service_subdata: None,
+            },
+            is_encrypted: false,
+            file_encryption: None,
+            hash: None,
+            comment_crc16: None,
+            segments: vec![DataSegment::new(0, 0, data_size)],
+        }
+    }
+
+    #[test]
+    fn empty_comment_service_returns_none_like_unrar() {
+        let mut archive = empty_rar5_archive();
+        archive.services.push(test_rar5_service("CMT", 42, 0));
+
+        assert_eq!(archive.comment().unwrap(), None);
+    }
+
+    #[test]
+    fn zero_packed_service_payload_returns_empty_like_unrar() {
+        let mut archive = empty_rar5_archive();
+        let service = test_rar5_service("UOW", 42, 0);
+
+        assert_eq!(
+            archive.read_service_subdata_to_memory(&service).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -5371,23 +5693,143 @@ mod tests {
     }
 
     #[test]
+    fn rar3_symlink_payload_reader_bypasses_non_file_extraction_guard() {
+        let target = b"safe/target";
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        archive.volumes.push(Some(VolumeData {
+            reader: Box::new(Cursor::new(target.to_vec())),
+        }));
+
+        let mut fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
+        fh.unpacked_size = Some(target.len() as u64);
+        fh.data_size = target.len() as u64;
+        archive.members.push(MemberEntry {
+            file_header: fh.clone(),
+            is_encrypted: false,
+            file_encryption: None,
+            rar4_salt: None,
+            hash: None,
+            redirection: None,
+            owner: None,
+            segments: vec![DataSegment::new(0, 0, target.len() as u64)],
+        });
+
+        let decoded = archive
+            .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+            .unwrap();
+
+        assert_eq!(decoded.raw, b"safe/target");
+        assert_eq!(decoded.safety_target, "safe/target");
+    }
+
+    #[test]
+    fn rar3_symlink_target_rejects_oversized_packed_target_before_reading_like_unrar() {
+        let mut archive = empty_rar5_archive();
+        archive.format = ArchiveFormat::Rar4;
+        let mut fh = test_rar3_symlink_header(None);
+        fh.data_size = MAX_LINK_TARGET_BYTES as u64 + 1;
+        fh.unpacked_size = Some(fh.data_size);
+
+        let err = archive
+            .link_target_from_rar3_payload(0, &ExtractOptions::default(), &fh)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RarError::ResourceLimit { ref detail } if detail.contains("MAXPATHSIZE")),
+            "expected ResourceLimit, got {err}"
+        );
+    }
+
+    #[test]
     fn rar3_symlink_target_truncates_at_nul_and_hashes_visible_target_like_unrar() {
         let target = b"safe/target";
         let fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
 
         let decoded =
-            RarArchive::decode_rar3_link_target_payload(&fh, b"safe/target\0ignored", true)
-                .unwrap();
+            RarArchive::decode_rar3_unix_link_target_payload(
+                &fh,
+                b"safe/target\0ignored",
+                true,
+            )
+            .unwrap()
+            .safety_target;
 
         assert_eq!(decoded, "safe/target");
+    }
+
+    #[test]
+    fn rar3_symlink_target_preserves_raw_bytes_after_unrar_safety_decode() {
+        let fh = test_rar3_symlink_header(None);
+
+        let decoded =
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"\xc1\x81-target", false)
+                .unwrap();
+
+        assert_eq!(decoded.raw, b"\xc1\x81-target");
+        assert_eq!(decoded.safety_target, "A-target");
+    }
+
+    #[test]
+    fn rar3_symlink_target_accepts_utf8_surrogate_values_like_unrar_safety_decode() {
+        let fh = test_rar3_symlink_header(None);
+
+        let decoded =
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe-\xed\xa0\x80", false)
+                .unwrap();
+
+        assert_eq!(decoded.raw, b"safe-\xed\xa0\x80");
+        assert_eq!(decoded.safety_target, "safe-\u{fffd}");
+    }
+
+    #[test]
+    fn rar3_symlink_target_rejects_decoded_path_metacharacter_mismatch_like_unrar() {
+        let fh = test_rar3_symlink_header(None);
+
+        let err =
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe\xc0\xaftarget", false)
+                .unwrap_err();
+
+        assert!(
+            matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("path metacharacters")),
+            "expected path metacharacter CorruptArchive, got {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rar3_symlink_output_creates_raw_byte_target_like_unrar() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("link");
+        let fh = test_rar3_symlink_header(None);
+        let target = Rar3UnixLinkTarget {
+            raw: b"\xc1\x81-target".to_vec(),
+            safety_target: "A-target".to_string(),
+        };
+
+        RarArchive::create_rar3_unix_symlink_output(
+            &fh,
+            None,
+            &ExtractOptions::default(),
+            "link",
+            "link",
+            &target,
+            &out_path,
+        )
+        .unwrap();
+
+        let actual = std::fs::read_link(out_path).unwrap();
+        assert_eq!(actual.as_os_str().as_bytes(), b"\xc1\x81-target");
     }
 
     #[test]
     fn rar3_symlink_target_rejects_empty_target_like_unrar() {
         let fh = test_rar3_symlink_header(None);
 
-        let err =
-            RarArchive::decode_rar3_link_target_payload(&fh, b"\0ignored", false).unwrap_err();
+        let err = RarArchive::decode_rar3_unix_link_target_payload(&fh, b"\0ignored", false)
+            .unwrap_err();
 
         assert!(
             matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("empty")),
@@ -5399,8 +5841,9 @@ mod tests {
     fn rar3_symlink_target_rejects_invalid_utf8_like_unrar_safe_char_to_wide() {
         let fh = test_rar3_symlink_header(None);
 
-        let err = RarArchive::decode_rar3_link_target_payload(&fh, b"safe/\xfftarget", false)
-            .unwrap_err();
+        let err =
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe/\xfftarget", false)
+                .unwrap_err();
 
         assert!(
             matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("valid UTF-8")),
@@ -5412,6 +5855,7 @@ mod tests {
     fn archive_member_limits_use_effective_rar4_dictionary_size() {
         let fh = FileHeader {
             name: "rar4-small-dict.bin".into(),
+            name_raw: Some(b"rar4-small-dict.bin".to_vec()),
             unpacked_size: Some(0),
             attributes: FileAttributes(0),
             mtime: None,
@@ -5445,6 +5889,7 @@ mod tests {
     fn archive_member_limits_use_effective_rar5_dictionary_size() {
         let fh = FileHeader {
             name: "rar5-small-dict.bin".into(),
+            name_raw: Some(b"rar5-small-dict.bin".to_vec()),
             unpacked_size: Some(0),
             attributes: FileAttributes(0),
             mtime: None,

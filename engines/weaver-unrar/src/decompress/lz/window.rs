@@ -67,11 +67,11 @@ impl Window {
             return;
         }
 
-        if let Some((last_start, last_len)) = self.visible_ranges.back_mut() {
-            if last_start.saturating_add(*last_len as u64) == start_total {
-                *last_len += len;
-                return;
-            }
+        if let Some((last_start, last_len)) = self.visible_ranges.back_mut()
+            && last_start.saturating_add(*last_len as u64) == start_total
+        {
+            *last_len += len;
+            return;
         }
 
         self.visible_ranges.push_back((start_total, len));
@@ -188,11 +188,16 @@ impl Window {
                     self.pos = 0;
                 }
             } else {
-                let first = dict_size - dst;
-                self.buf[dst..dict_size].fill(byte);
-                let second = length - first;
-                self.buf[..second].fill(byte);
-                self.pos = second;
+                let mut remaining = length;
+                while remaining > 0 {
+                    let chunk = remaining.min(dict_size - self.pos);
+                    self.buf[self.pos..self.pos + chunk].fill(byte);
+                    self.pos += chunk;
+                    if self.pos == dict_size {
+                        self.pos = 0;
+                    }
+                    remaining -= chunk;
+                }
             }
             self.total_written += length as u64;
             return Ok(());
@@ -493,10 +498,7 @@ impl Window {
     /// Used when data is extracted via `copy_output` and written externally.
     pub fn mark_flushed(&mut self, up_to: u64) {
         let up_to = up_to.min(self.total_written);
-        loop {
-            let Some((start, len)) = self.visible_ranges.front().copied() else {
-                break;
-            };
+        while let Some((start, len)) = self.visible_ranges.front().copied() {
             let end = start.saturating_add(len as u64);
             if end <= up_to {
                 self.visible_ranges.pop_front();
@@ -714,6 +716,19 @@ mod tests {
         assert_eq!(w.total_written(), 256);
         let output = w.copy_output(0, 256);
         assert!(output.iter().all(|&b| b == b'Z'));
+    }
+
+    #[test]
+    fn test_distance_one_fill_handles_multiple_wraps() {
+        let mut w = Window::new(4);
+        w.put_byte(b'Z');
+        w.copy(1, 10).unwrap();
+
+        assert_eq!(w.total_written(), 11);
+        assert_eq!(w.position(), 3);
+        for distance in 1..=4 {
+            assert_eq!(w.get_byte(distance), b'Z');
+        }
     }
 
     #[test]

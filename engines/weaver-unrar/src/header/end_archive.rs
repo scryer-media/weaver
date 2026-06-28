@@ -71,7 +71,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(header_type));
         body.extend_from_slice(&encode_vint(header_flags));
-        body.extend_from_slice(&type_body);
+        body.extend_from_slice(type_body);
 
         let header_size = body.len() as u64;
         let header_size_bytes = encode_vint(header_size);

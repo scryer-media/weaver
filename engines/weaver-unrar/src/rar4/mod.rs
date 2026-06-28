@@ -125,6 +125,15 @@ pub fn parse_rar4_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
 ) -> RarResult<Rar4ParsedVolume> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    parse_rar4_headers_with_kdf_cache(reader, password, &kdf_cache)
+}
+
+pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+) -> RarResult<Rar4ParsedVolume> {
     let mut archive_header = None;
     let mut files = Vec::new();
     let mut services = Vec::new();
@@ -156,6 +165,7 @@ pub fn parse_rar4_headers<R: Read + Seek>(
                         &mut services,
                         &mut old_services,
                         &mut end,
+                        kdf_cache,
                     )?;
                     break;
                 }
@@ -313,9 +323,8 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
     services: &mut Vec<Rar4FileHeader>,
     old_services: &mut Vec<Rar4OldServiceHeader>,
     end: &mut Option<Rar4EndHeader>,
+    kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<()> {
-    let kdf_cache = crate::crypto::KdfCache::new();
-
     loop {
         // Each encrypted header is preceded by its own 8-byte salt.
         let mut salt = [0u8; 8];
@@ -436,6 +445,7 @@ pub fn to_member_info_with_archive_solid(
     MemberInfo {
         name: fh.name.clone(),
         raw_name: fh.name.clone(),
+        raw_name_bytes: fh.name_raw.clone(),
         unpacked_size: fh.unpacked_size,
         compressed_size: fh.packed_size,
         is_directory: fh.is_directory,
@@ -465,6 +475,7 @@ pub fn to_member_info_with_archive_solid(
         is_hardlink: false,
         is_file_copy: false,
         link_target: None,
+        link_target_bytes: None,
     }
 }
 
@@ -721,6 +732,7 @@ mod tests {
             method: Rar4Method::Normal,
             dict_size: 0x10000,
             name: "old-solid.txt".to_string(),
+            name_raw: Some(b"old-solid.txt".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,
@@ -773,6 +785,7 @@ mod tests {
             method: Rar4Method::Store,
             dict_size: 0,
             name: "times.txt".to_string(),
+            name_raw: Some(b"times.txt".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,
@@ -790,6 +803,7 @@ mod tests {
         };
 
         let mi = to_member_info(&fh, 0);
+        assert_eq!(mi.raw_name_bytes.as_deref(), Some(&b"times.txt"[..]));
         assert_eq!(mi.mtime, Some(mtime));
         assert_eq!(mi.ctime, Some(ctime));
         assert_eq!(mi.atime, Some(atime));
@@ -814,6 +828,7 @@ mod tests {
             method: Rar4Method::Store,
             dict_size: 0,
             name: "host.txt".to_string(),
+            name_raw: Some(b"host.txt".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,
@@ -888,7 +903,7 @@ mod tests {
     fn test_parse_rar4_hp_encrypted_headers() {
         // Test against a real RAR4 -hp archive from local Weaver fixtures.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/rar4/rar4_hp_large.rar");
+            .join("tests/fixtures/rar4/rar4_hp_large.rar");
         if !path.exists() {
             eprintln!("skipping test: e2e fixture not found at {}", path.display());
             return;
@@ -912,9 +927,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rar4_hp_encrypted_headers_uses_shared_kdf_cache() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar4/rar4_hp_large.rar");
+        if !path.exists() {
+            eprintln!("skipping test: e2e fixture not found at {}", path.display());
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let cache = crate::crypto::KdfCache::new();
+        assert_eq!(cache.rar4_cached_entry_count(), 0);
+
+        let mut cursor = Cursor::new(&data[7..]);
+        let vol = parse_rar4_headers_with_kdf_cache(&mut cursor, Some("e2e-test-password"), &cache)
+            .unwrap();
+
+        assert!(vol.archive_header.is_encrypted);
+        assert!(!vol.files.is_empty());
+        assert!(
+            cache.rar4_cached_entry_count() > 0,
+            "encrypted header parsing should populate the caller-provided RAR4 KDF cache"
+        );
+    }
+
+    #[test]
     fn test_parse_rar4_hp_no_password_returns_error() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/rar4/rar4_hp_large.rar");
+            .join("tests/fixtures/rar4/rar4_hp_large.rar");
         if !path.exists() {
             return;
         }

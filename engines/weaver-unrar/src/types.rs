@@ -177,6 +177,10 @@ pub struct MemberInfo {
     pub name: String,
     /// The original unsanitized name from the archive header.
     pub raw_name: String,
+    /// Raw archive name bytes after UnRAR-compatible header read/cap behavior.
+    /// This is needed for byte-preserving Unix extraction of names that cannot
+    /// be represented losslessly in `raw_name`.
+    pub raw_name_bytes: Option<Vec<u8>>,
     pub unpacked_size: Option<u64>,
     pub compressed_size: u64,
     pub is_directory: bool,
@@ -197,6 +201,10 @@ pub struct MemberInfo {
     pub is_hardlink: bool,
     pub is_file_copy: bool,
     pub link_target: Option<String>,
+    /// Raw RAR5 redirection target bytes after UnRAR-compatible UTF-8
+    /// decoding/re-encoding. RAR3 Unix symlink targets live in the member
+    /// payload, so they are not available in header-only metadata.
+    pub link_target_bytes: Option<Vec<u8>>,
 }
 
 /// Topology-oriented member info, including unresolved continuation entries.
@@ -204,6 +212,8 @@ pub struct MemberInfo {
 pub struct TopologyMemberInfo {
     /// The sanitized file name if known. Continuation-only entries may be empty.
     pub name: String,
+    /// Raw archive name bytes if the starting header is available.
+    pub name_raw: Option<Vec<u8>>,
     pub unpacked_size: Option<u64>,
     pub is_directory: bool,
     pub volumes: VolumeSpan,
@@ -226,6 +236,7 @@ pub struct ArchiveMetadata {
     pub quick_open_offset: Option<u64>,
     pub recovery_record_offset: Option<u64>,
     pub original_name: Option<String>,
+    pub original_name_bytes: Option<Vec<u8>>,
     pub original_creation_time: Option<SystemTime>,
     pub volume_count: Option<usize>,
     pub members: Vec<MemberInfo>,

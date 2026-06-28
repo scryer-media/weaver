@@ -15,6 +15,7 @@ pub mod service;
 use std::io::{Read, Seek, SeekFrom};
 
 use tracing::{debug, warn};
+use zeroize::Zeroize;
 
 use crate::error::{RarError, RarResult};
 use crate::vint;
@@ -70,6 +71,7 @@ pub struct ParsedService {
 pub struct Redirection {
     pub redir_type: RedirectionType,
     pub target: String,
+    pub target_raw: Option<Vec<u8>>,
     pub target_is_directory: bool,
 }
 
@@ -134,6 +136,15 @@ pub fn parse_all_headers<R: Read + Seek>(
     reader: &mut R,
     password: Option<&str>,
 ) -> RarResult<ParsedHeaders> {
+    let kdf_cache = crate::crypto::KdfCache::new();
+    parse_all_headers_with_kdf_cache(reader, password, &kdf_cache)
+}
+
+pub(crate) fn parse_all_headers_with_kdf_cache<R: Read + Seek>(
+    reader: &mut R,
+    password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
+) -> RarResult<ParsedHeaders> {
     let mut result = empty_parsed_headers();
 
     // Parse plaintext headers until we hit an encryption header or end.
@@ -169,21 +180,18 @@ pub fn parse_all_headers<R: Read + Seek>(
                 };
 
                 if let Some(check_data) = enc.check_data
-                    && !crate::crypto::verify_password_check(
-                        pwd,
-                        &enc.salt,
-                        enc.kdf_count,
-                        &check_data,
-                    )
+                    && !kdf_cache.verify_password_rar5(pwd, &enc.salt, enc.kdf_count, &check_data)
                 {
                     return Err(RarError::InvalidPassword);
                 }
 
                 // Derive key (IV comes per-header from stream, not PBKDF2).
-                let (key, _) = crate::crypto::derive_key(pwd, &enc.salt, enc.kdf_count)?;
+                let mut key = kdf_cache.derive_key_rar5(pwd, &enc.salt, enc.kdf_count)?;
 
                 // Parse remaining headers — each has its own IV + padded encryption.
-                parse_encrypted_headers(reader, &key, &mut result)?;
+                let encrypted_result = parse_encrypted_headers(reader, &key, &mut result);
+                key.zeroize();
+                encrypted_result?;
                 return Ok(result);
             }
             HeaderType::EndArchive => {
@@ -194,7 +202,9 @@ pub fn parse_all_headers<R: Read + Seek>(
             }
             HeaderType::MainArchive => {
                 dispatch_header(&raw, data_offset, &mut result)?;
-                if let Some(quick_open) = try_parse_quick_open_headers(reader, &result, password)? {
+                if let Some(quick_open) =
+                    try_parse_quick_open_headers(reader, &result, password, kdf_cache)?
+                {
                     return Ok(quick_open);
                 }
                 common::skip_data_area(reader, &raw)?;
@@ -398,6 +408,7 @@ fn try_parse_quick_open_headers<R: Read + Seek>(
     reader: &mut R,
     parsed: &ParsedHeaders,
     password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<Option<ParsedHeaders>> {
     let Some(main) = parsed.main.as_ref() else {
         return Ok(None);
@@ -407,7 +418,8 @@ fn try_parse_quick_open_headers<R: Read + Seek>(
     };
 
     let restore_pos = reader.stream_position().map_err(RarError::Io)?;
-    let attempt = parse_quick_open_headers_at(reader, quick_open_offset, main.clone(), password);
+    let attempt =
+        parse_quick_open_headers_at(reader, quick_open_offset, main.clone(), password, kdf_cache);
     reader
         .seek(SeekFrom::Start(restore_pos))
         .map_err(RarError::Io)?;
@@ -429,6 +441,7 @@ fn parse_quick_open_headers_at<R: Read + Seek>(
     quick_open_offset: u64,
     main: main_archive::MainArchiveHeader,
     password: Option<&str>,
+    kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<Option<ParsedHeaders>> {
     reader
         .seek(SeekFrom::Start(quick_open_offset))
@@ -458,12 +471,19 @@ fn parse_quick_open_headers_at<R: Read + Seek>(
             password,
             quick_open_offset,
             main,
+            kdf_cache,
         );
     }
 
+    let unpacked_size = qopen_service
+        .header
+        .inner
+        .unpacked_size
+        .unwrap_or(qopen_raw.data_area_size);
+
     parse_quick_open_records(
         reader,
-        qopen_raw.data_area_size,
+        unpacked_size,
         qopen_raw.offset,
         quick_open_offset,
         main,
@@ -477,6 +497,7 @@ fn parse_encrypted_quick_open_records<R: Read>(
     password: Option<&str>,
     quick_open_offset: u64,
     main: main_archive::MainArchiveHeader,
+    kdf_cache: &crate::crypto::KdfCache,
 ) -> RarResult<Option<ParsedHeaders>> {
     let Some(password) = password else {
         return Ok(None);
@@ -487,15 +508,15 @@ fn parse_encrypted_quick_open_records<R: Read>(
     if encryption.version != 0 {
         return Ok(None);
     }
-    if let Some(check_data) = encryption.check_data.as_ref() {
-        if !crate::crypto::verify_password_check(
+    if let Some(check_data) = encryption.check_data.as_ref()
+        && !kdf_cache.verify_password_rar5(
             password,
             &encryption.salt,
             encryption.kdf_count,
             check_data,
-        ) {
-            return Ok(None);
-        }
+        )
+    {
+        return Ok(None);
     }
 
     let unpacked_size = qopen_service
@@ -503,15 +524,15 @@ fn parse_encrypted_quick_open_records<R: Read>(
         .inner
         .unpacked_size
         .unwrap_or(qopen_raw.data_area_size);
-    if qopen_raw.data_area_size % 16 != 0 {
+    if !qopen_raw.data_area_size.is_multiple_of(16) {
         return Ok(None);
     }
 
-    let (mut key, _) = crate::crypto::derive_key(password, &encryption.salt, encryption.kdf_count)?;
+    let mut key = kdf_cache.derive_key_rar5(password, &encryption.salt, encryption.kdf_count)?;
     let limited = reader.take(qopen_raw.data_area_size);
     let mut decrypted_reader =
         crate::crypto::DecryptingReader::new_rar5(limited, &key, &encryption.iv);
-    key.fill(0);
+    key.zeroize();
 
     parse_quick_open_records(
         &mut decrypted_reader,
@@ -829,11 +850,13 @@ fn apply_extra_records(
             extra::ExtraRecord::Redirection {
                 redir_type,
                 target,
+                target_raw,
                 target_is_directory,
             } => {
                 redirection = Some(Redirection {
                     redir_type: RedirectionType::from(*redir_type),
                     target: target.clone(),
+                    target_raw: Some(target_raw.clone()),
                     target_is_directory: *target_is_directory,
                 });
             }
@@ -871,6 +894,41 @@ mod tests {
     use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
     const RAR5_SIGNATURE: &[u8; 8] = b"Rar!\x1a\x07\x01\0";
+
+    fn fixture_path(parts: &[&str]) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
+    #[test]
+    fn rar5_hp_encrypted_headers_use_shared_kdf_cache() {
+        let path = fixture_path(&["tests", "fixtures", "rar5", "rar5_hp_store.rar"]);
+        let data = std::fs::read(&path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read checked-in fixture {}: {err}",
+                path.display()
+            )
+        });
+        let cache = crate::crypto::KdfCache::new();
+        assert_eq!(cache.rar5_cached_entry_count(), 0);
+
+        let mut cursor = std::io::Cursor::new(data);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed =
+            parse_all_headers_with_kdf_cache(&mut cursor, Some("secretpass"), &cache).unwrap();
+
+        assert!(parsed.is_encrypted);
+        assert!(!parsed.files.is_empty());
+        assert!(
+            cache.rar5_cached_entry_count() > 0,
+            "encrypted RAR5 header parsing should populate the caller-provided KDF cache"
+        );
+    }
 
     fn build_test_extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
         let type_bytes = vint::encode_vint(record_type);
@@ -946,15 +1004,19 @@ mod tests {
     }
 
     fn build_test_qopen_service(payload: &[u8]) -> Vec<u8> {
+        build_test_qopen_service_with_sizes(payload.len() as u64, payload.len() as u64)
+    }
+
+    fn build_test_qopen_service_with_sizes(unpacked_size: u64, data_area_size: u64) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&vint::encode_vint(0)); // service flags.
-        body.extend_from_slice(&vint::encode_vint(payload.len() as u64));
+        body.extend_from_slice(&vint::encode_vint(unpacked_size));
         body.extend_from_slice(&vint::encode_vint(0)); // attributes.
         body.extend_from_slice(&vint::encode_vint(0)); // RAR5 Store.
         body.extend_from_slice(&vint::encode_vint(1)); // Unix host OS.
         body.extend_from_slice(&vint::encode_vint(2));
         body.extend_from_slice(b"QO");
-        build_test_raw_header(3, 0, &body, &[], Some(payload.len() as u64))
+        build_test_raw_header(3, 0, &body, &[], Some(data_area_size))
     }
 
     fn build_test_encrypted_qopen_service(
@@ -1040,7 +1102,7 @@ mod tests {
         let padded_len = if plaintext.is_empty() {
             0
         } else {
-            ((plaintext.len() + 15) / 16) * 16
+            plaintext.len().div_ceil(16) * 16
         };
         let mut encrypted = plaintext.to_vec();
         encrypted.resize(padded_len, 0);
@@ -1099,6 +1161,49 @@ mod tests {
             parsed.files[0].header.data_offset,
             cached_file_offset + cached_file.len() as u64
         );
+        assert!(parsed.end.is_some());
+    }
+
+    #[test]
+    fn quick_open_uses_unpacked_size_not_data_area_size_like_unrar() {
+        let qopen_offset = 256u64;
+        let cached_file_offset = 96u64;
+        let cached_end_offset = 160u64;
+
+        let cached_file = build_test_file_header("cached.bin", 4, 4);
+        let cached_end = build_test_end_header();
+        let mut qopen_payload = Vec::new();
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_file_offset,
+            &cached_file,
+        ));
+        qopen_payload.extend_from_slice(&build_test_qopen_record(
+            qopen_offset,
+            cached_end_offset,
+            &cached_end,
+        ));
+        let valid_qopen_len = qopen_payload.len() as u64;
+        qopen_payload.extend_from_slice(b"trailing bytes outside QO UnpSize");
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR5_SIGNATURE);
+        archive.extend_from_slice(&build_test_main_with_qopen_locator(qopen_offset - 8));
+        archive.resize(qopen_offset as usize, 0);
+        archive.extend_from_slice(&build_test_qopen_service_with_sizes(
+            valid_qopen_len,
+            qopen_payload.len() as u64,
+        ));
+        archive.extend_from_slice(&qopen_payload);
+
+        let mut cursor = std::io::Cursor::new(archive);
+        cursor
+            .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
+            .unwrap();
+        let parsed = parse_all_headers(&mut cursor, None).unwrap();
+
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].header.name, "cached.bin");
         assert!(parsed.end.is_some());
     }
 
@@ -1210,7 +1315,9 @@ mod tests {
         cursor
             .seek(SeekFrom::Start(RAR5_SIGNATURE.len() as u64))
             .unwrap();
-        let parsed = parse_all_headers(&mut cursor, Some(password)).unwrap();
+        let cache = crate::crypto::KdfCache::new();
+        assert_eq!(cache.rar5_cached_entry_count(), 0);
+        let parsed = parse_all_headers_with_kdf_cache(&mut cursor, Some(password), &cache).unwrap();
 
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].header.name, "encrypted-cached.bin");
@@ -1219,6 +1326,10 @@ mod tests {
             cached_file_offset + cached_file.len() as u64
         );
         assert!(parsed.end.is_some());
+        assert!(
+            cache.rar5_cached_entry_count() > 0,
+            "encrypted QuickOpen should use the caller-provided RAR5 KDF cache"
+        );
     }
 
     #[test]

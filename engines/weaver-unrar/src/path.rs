@@ -201,7 +201,7 @@ fn normalize_backslash_for_path_check(path: &str, backslash_is_separator: bool) 
 fn is_full_root_path(path: &str, windows_drive_is_root: bool) -> bool {
     path.starts_with('/')
         || (windows_drive_is_root
-            && path.as_bytes().len() >= 2
+            && path.len() >= 2
             && path.as_bytes()[0].is_ascii_alphabetic()
             && path.as_bytes()[1] == b':')
 }

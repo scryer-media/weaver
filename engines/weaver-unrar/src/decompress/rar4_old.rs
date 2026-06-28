@@ -84,18 +84,18 @@ const DECHF4: [u32; 6] = [0xff00, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff];
 const POSHF4: [usize; 13] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0];
 
 pub(crate) enum Rar4Decoder {
-    V15(Rar15Decoder),
-    V20(Rar20Decoder),
-    V29(Rar4LzDecoder),
+    V15(Box<Rar15Decoder>),
+    V20(Box<Rar20Decoder>),
+    V29(Box<Rar4LzDecoder>),
 }
 
 impl Rar4Decoder {
     pub(crate) fn new(version: u8, dict_size: usize, method: u8) -> RarResult<Self> {
         let dict_size = old_rar_window_size(dict_size);
         match version {
-            13..=15 => Ok(Self::V15(Rar15Decoder::try_new(dict_size)?)),
-            20 | 26 => Ok(Self::V20(Rar20Decoder::try_new(dict_size)?)),
-            29 => Ok(Self::V29(Rar4LzDecoder::try_new(dict_size)?)),
+            13..=15 => Ok(Self::V15(Box::new(Rar15Decoder::try_new(dict_size)?))),
+            20 | 26 => Ok(Self::V20(Box::new(Rar20Decoder::try_new(dict_size)?))),
+            29 => Ok(Self::V29(Box::new(Rar4LzDecoder::try_new(dict_size)?))),
             _ => Err(RarError::UnsupportedCompression { method, version }),
         }
     }
@@ -209,6 +209,7 @@ pub(crate) fn decompress_rar4_reader_to_writer<R: Read, W: Write>(
     decoder.decompress_reader_to_writer(input, unpacked_size, writer)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_rar4_reader_to_writer_chunked<R: Read, F>(
     input: R,
     unpacked_size: u64,
@@ -233,6 +234,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decompress_rar4_to_writer_chunked<F>(
     input: &[u8],
     unpacked_size: u64,
@@ -1397,8 +1399,7 @@ impl Rar15Decoder {
         self.ch_set_b[distance_place] = self.ch_set_b[new_distance_place];
         self.ch_set_b[new_distance_place] = distance as u16;
 
-        let distance =
-            (((distance & 0xff00) | ((reader.peek_16_raw()? >> 8) as usize)) >> 1) as usize;
+        let distance = ((distance & 0xff00) | ((reader.peek_16_raw()? >> 8) as usize)) >> 1;
         reader.consume_bits(7)?;
 
         let old_avr3 = self.avr_ln3;

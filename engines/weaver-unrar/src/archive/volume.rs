@@ -51,7 +51,11 @@ impl RarArchive {
         }
 
         // Parse headers (RAR5).
-        let parsed = header::parse_all_headers(&mut reader, self.password.as_deref())?;
+        let parsed = header::parse_all_headers_with_kdf_cache(
+            &mut reader,
+            self.password.as_deref(),
+            &self.kdf_cache,
+        )?;
 
         let vol_num = parsed
             .main
@@ -171,7 +175,11 @@ impl RarArchive {
         index: usize,
         mut reader: Box<dyn ReadSeek>,
     ) -> RarResult<()> {
-        let parsed = crate::rar4::parse_rar4_headers(&mut reader, self.password.as_deref())?;
+        let parsed = crate::rar4::parse_rar4_headers_with_kdf_cache(
+            &mut reader,
+            self.password.as_deref(),
+            &self.kdf_cache,
+        )?;
         self.add_volume_rar4_parsed(index, reader, parsed)
     }
 
@@ -296,7 +304,7 @@ impl RarArchive {
                 let authoritative_data_crc32 =
                     (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
                 let authoritative_data_hash =
-                    (!existing.file_header.split_after).then(|| existing.file_header.data_hash);
+                    (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
                 let authoritative_hash =
                     (!existing.file_header.split_after).then(|| existing.hash.clone());
                 let authoritative_encryption =
@@ -507,7 +515,7 @@ impl RarArchive {
                 let authoritative_data_crc32 =
                     (!existing.file_header.split_after).then_some(existing.file_header.data_crc32);
                 let authoritative_data_hash =
-                    (!existing.file_header.split_after).then(|| existing.file_header.data_hash);
+                    (!existing.file_header.split_after).then_some(existing.file_header.data_hash);
                 let authoritative_hash =
                     (!existing.file_header.split_after).then(|| existing.hash.clone());
                 let authoritative_comment_crc16 =
@@ -576,11 +584,10 @@ impl RarArchive {
                 continue;
             };
 
-            for right_idx in 0..services.len() {
+            for (right_idx, right) in services.iter().enumerate() {
                 if left_idx == right_idx {
                     continue;
                 }
-                let right = &services[right_idx];
                 let Some(first_vol) = right.segments.first().map(|s| s.volume_index) else {
                     continue;
                 };
@@ -716,6 +723,7 @@ mod tests {
     ) -> FileHeader {
         FileHeader {
             name: name.to_string(),
+            name_raw: Some(name.as_bytes().to_vec()),
             unpacked_size: Some(16),
             attributes: FileAttributes(0),
             mtime: None,
@@ -806,6 +814,7 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time: None,
             volume_set: VolumeSet::new(),
             members,

@@ -192,6 +192,8 @@ pub struct RarArchive {
     pub(super) recovery_record_offset: Option<u64>,
     /// Original archive name from the RAR5 main-header metadata extra.
     pub(super) original_name: Option<String>,
+    /// Raw original archive name bytes from the RAR5 main-header metadata extra.
+    pub(super) original_name_raw: Option<Vec<u8>>,
     /// Original archive creation time from the RAR5 main-header metadata extra.
     pub(super) original_creation_time: Option<SystemTime>,
     /// Volume topology.
@@ -409,6 +411,7 @@ impl RarArchive {
             quick_open_offset: self.quick_open_offset,
             recovery_record_offset: self.recovery_record_offset,
             original_name: self.original_name.clone(),
+            original_name_bytes: self.original_name_raw.clone(),
             original_creation_time: self.original_creation_time,
             volume_count: self.volume_set.expected_count(),
             members,
@@ -426,6 +429,7 @@ impl RarArchive {
                     entry.file_header.host_os,
                     &entry.file_header.name,
                 ),
+                name_raw: entry.file_header.name_raw.clone(),
                 unpacked_size: entry.file_header.unpacked_size,
                 is_directory: entry.file_header.is_directory,
                 volumes: VolumeSpan {
@@ -512,7 +516,8 @@ impl RarArchive {
             && matches!(fh.host_os, crate::types::HostOs::Unix)
             && (fh.attributes.0 & 0xF000) == 0xA000;
         let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
-        let (is_symlink, is_hardlink, is_file_copy, link_target) = match &entry.redirection {
+        let (is_symlink, is_hardlink, is_file_copy, link_target, link_target_bytes) =
+            match &entry.redirection {
             Some(redir) => {
                 let is_sym = matches!(
                     redir.redir_type,
@@ -522,13 +527,20 @@ impl RarArchive {
                 );
                 let is_hard = matches!(redir.redir_type, header::RedirectionType::Hardlink);
                 let is_copy = matches!(redir.redir_type, header::RedirectionType::FileCopy);
-                (is_sym, is_hard, is_copy, Some(redir.target.clone()))
+                (
+                    is_sym,
+                    is_hard,
+                    is_copy,
+                    Some(redir.target.clone()),
+                    redir.target_raw.clone(),
+                )
             }
-            None => (rar4_unix_symlink, false, false, None),
+            None => (rar4_unix_symlink, false, false, None, None),
         };
         MemberInfo {
             name: member_name,
             raw_name: fh.name.clone(),
+            raw_name_bytes: fh.name_raw.clone(),
             unpacked_size: fh.unpacked_size,
             compressed_size: total_compressed,
             is_directory: fh.is_directory,
@@ -551,6 +563,7 @@ impl RarArchive {
             is_hardlink,
             is_file_copy,
             link_target,
+            link_target_bytes,
         }
     }
 
@@ -625,6 +638,7 @@ mod tests {
     fn test_file_header(name: &str) -> FileHeader {
         FileHeader {
             name: name.to_string(),
+            name_raw: Some(name.as_bytes().to_vec()),
             unpacked_size: Some(0),
             attributes: FileAttributes(0o644),
             mtime: None,
@@ -715,6 +729,7 @@ mod tests {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time: None,
             volume_set: VolumeSet::new(),
             members: vec![MemberEntry {
@@ -726,6 +741,7 @@ mod tests {
                 redirection: Some(header::Redirection {
                     redir_type: header::RedirectionType::UnixSymlink,
                     target: target.to_string(),
+                    target_raw: Some(target.as_bytes().to_vec()),
                     target_is_directory: false,
                 }),
                 owner: None,
@@ -784,6 +800,10 @@ mod tests {
         assert_eq!(metadata.quick_open_offset, Some(8 + 512));
         assert_eq!(metadata.recovery_record_offset, Some(8 + 1024));
         assert_eq!(metadata.original_name.as_deref(), Some("release.rar"));
+        assert_eq!(
+            metadata.original_name_bytes.as_deref(),
+            Some(&b"release.rar\0"[..])
+        );
         assert_eq!(
             metadata.original_creation_time,
             Some(UNIX_EPOCH + Duration::new(1_700_000_123, 456_789_000))
@@ -865,6 +885,10 @@ mod tests {
 
         assert!(info.is_symlink);
         assert_eq!(info.link_target.as_deref(), Some("../target.txt"));
+        assert_eq!(
+            info.link_target_bytes.as_deref(),
+            Some(&b"../target.txt"[..])
+        );
     }
 
     #[test]
@@ -883,8 +907,13 @@ mod tests {
         let info = archive.member_info(0).unwrap();
 
         assert_eq!(info.name, "dir_file.txt");
+        assert_eq!(info.raw_name_bytes.as_deref(), Some(&b"dir\\file.txt"[..]));
         assert_eq!(archive.find_member_sanitized("dir_file.txt"), Some(0));
         assert_eq!(archive.topology_members()[0].name, "dir_file.txt");
+        assert_eq!(
+            archive.topology_members()[0].name_raw.as_deref(),
+            Some(&b"dir\\file.txt"[..])
+        );
     }
 
     #[test]
@@ -893,6 +922,7 @@ mod tests {
         let info = archive.member_info(0).unwrap();
 
         assert_eq!(info.name, "dir\\file.txt");
+        assert_eq!(info.raw_name_bytes.as_deref(), Some(&b"dir\\file.txt"[..]));
         assert_eq!(archive.find_member_sanitized("dir\\file.txt"), Some(0));
         assert_eq!(archive.find_member_sanitized("dir/file.txt"), None);
     }
@@ -903,6 +933,7 @@ mod tests {
         let info = archive.member_info(0).unwrap();
 
         assert_eq!(info.name, "dir/file.txt");
+        assert_eq!(info.raw_name_bytes.as_deref(), Some(&b"dir\\file.txt"[..]));
         assert_eq!(archive.find_member_sanitized("dir/file.txt"), Some(0));
     }
 }

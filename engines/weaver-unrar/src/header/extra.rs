@@ -80,6 +80,7 @@ pub enum ExtraRecord {
     Redirection {
         redir_type: u64,
         target: String,
+        target_raw: Vec<u8>,
         target_is_directory: bool,
     },
     /// Unix owner info.
@@ -320,11 +321,13 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
         let copy_len = (rest.len() - name_start).min(name_len);
         target_bytes[..copy_len].copy_from_slice(&rest[name_start..name_start + copy_len]);
     }
-    let target = crate::header::common::decode_utf8_prefix_until_nul(&target_bytes);
+    let (target, target_raw) =
+        crate::header::common::decode_utf8_prefix_until_nul_with_unrar_bytes(&target_bytes);
 
     ExtraRecord::Redirection {
         redir_type,
         target,
+        target_raw,
         target_is_directory: flags & FHEXTRA_REDIR_DIR != 0,
     }
 }
@@ -340,18 +343,18 @@ fn parse_unix_owner(data: &[u8]) -> ExtraRecord {
 
     let mut owner = UnixOwnerInfo::default();
 
-    if flags & OWNER_USER_NAME != 0 {
-        if let Some(name) = read_unix_owner_name(data, &mut pos) {
-            owner.user_name = Some(String::from_utf8_lossy(&name).into_owned());
-            owner.user_name_raw = Some(name);
-        }
+    if flags & OWNER_USER_NAME != 0
+        && let Some(name) = read_unix_owner_name(data, &mut pos)
+    {
+        owner.user_name = Some(String::from_utf8_lossy(&name).into_owned());
+        owner.user_name_raw = Some(name);
     }
 
-    if flags & OWNER_GROUP_NAME != 0 {
-        if let Some(name) = read_unix_owner_name(data, &mut pos) {
-            owner.group_name = Some(String::from_utf8_lossy(&name).into_owned());
-            owner.group_name_raw = Some(name);
-        }
+    if flags & OWNER_GROUP_NAME != 0
+        && let Some(name) = read_unix_owner_name(data, &mut pos)
+    {
+        owner.group_name = Some(String::from_utf8_lossy(&name).into_owned());
+        owner.group_name_raw = Some(name);
     }
 
     if flags & OWNER_USER_UID != 0 {
@@ -742,10 +745,12 @@ mod tests {
         match &records[0] {
             ExtraRecord::Redirection {
                 target,
+                target_raw,
                 target_is_directory,
                 ..
             } => {
                 assert_eq!(target, "dest");
+                assert_eq!(target_raw, b"dest");
                 assert!(*target_is_directory);
             }
             other => panic!("expected Redirection, got {other:?}"),
@@ -797,8 +802,11 @@ mod tests {
         let data = build_extra_record(record_type::REDIRECTION, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
-            ExtraRecord::Redirection { target, .. } => {
+            ExtraRecord::Redirection {
+                target, target_raw, ..
+            } => {
                 assert_eq!(target, "xy");
+                assert_eq!(target_raw, b"xy");
             }
             other => panic!("expected Redirection, got {other:?}"),
         }
@@ -815,8 +823,11 @@ mod tests {
         let data = build_extra_record(record_type::REDIRECTION, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
-            ExtraRecord::Redirection { target, .. } => {
+            ExtraRecord::Redirection {
+                target, target_raw, ..
+            } => {
                 assert_eq!(target, "ab");
+                assert_eq!(target_raw, b"ab");
             }
             other => panic!("expected Redirection, got {other:?}"),
         }
@@ -833,8 +844,11 @@ mod tests {
         let data = build_extra_record(record_type::REDIRECTION, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
-            ExtraRecord::Redirection { target, .. } => {
+            ExtraRecord::Redirection {
+                target, target_raw, ..
+            } => {
                 assert_eq!(target, "ab/");
+                assert_eq!(target_raw, b"ab/");
             }
             other => panic!("expected Redirection, got {other:?}"),
         }
@@ -851,8 +865,32 @@ mod tests {
         let data = build_extra_record(record_type::REDIRECTION, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
-            ExtraRecord::Redirection { target, .. } => {
+            ExtraRecord::Redirection {
+                target, target_raw, ..
+            } => {
                 assert_eq!(target, "ab/cd");
+                assert_eq!(target_raw, b"ab/cd");
+            }
+            other => panic!("expected Redirection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_redirection_surrogate_target_preserves_unrar_bytes() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_vint(1));
+        body.extend_from_slice(&encode_vint(0));
+        body.extend_from_slice(&encode_vint(5));
+        body.extend_from_slice(b"a\xed\xa0\x80b");
+
+        let data = build_extra_record(record_type::REDIRECTION, &body);
+        let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
+        match &records[0] {
+            ExtraRecord::Redirection {
+                target, target_raw, ..
+            } => {
+                assert_eq!(target, "a\u{fffd}b");
+                assert_eq!(target_raw, b"a\xed\xa0\x80b");
             }
             other => panic!("expected Redirection, got {other:?}"),
         }

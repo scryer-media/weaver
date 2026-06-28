@@ -36,7 +36,8 @@ impl RarArchive {
         }
 
         // Parse all headers (RAR5)
-        let mut parsed = header::parse_all_headers(&mut reader, password)?;
+        let mut parsed =
+            header::parse_all_headers_with_kdf_cache(&mut reader, password, &kdf_cache)?;
 
         if let Some(rr_offset) = parsed.main.as_ref().and_then(|m| m.recovery_record_offset) {
             let already_parsed = parsed
@@ -160,6 +161,7 @@ impl RarArchive {
             quick_open_offset: main.and_then(|m| m.quick_open_offset),
             recovery_record_offset: main.and_then(|m| m.recovery_record_offset),
             original_name: main.and_then(|m| m.original_name.clone()),
+            original_name_raw: main.and_then(|m| m.original_name_raw.clone()),
             original_creation_time: main.and_then(|m| m.original_creation_time),
             volume_set,
             members,
@@ -181,7 +183,8 @@ impl RarArchive {
         password: Option<&str>,
         kdf_cache: Arc<crate::crypto::KdfCache>,
     ) -> RarResult<Self> {
-        let parsed = crate::rar4::parse_rar4_headers(&mut reader, password)?;
+        let parsed =
+            crate::rar4::parse_rar4_headers_with_kdf_cache(&mut reader, password, &kdf_cache)?;
         Self::open_rar4_parsed(reader, password, kdf_cache, ArchiveFormat::Rar4, parsed)
     }
 
@@ -281,6 +284,7 @@ impl RarArchive {
             quick_open_offset: None,
             recovery_record_offset: None,
             original_name: None,
+            original_name_raw: None,
             original_creation_time: None,
             volume_set,
             members,
@@ -422,6 +426,7 @@ impl RarArchive {
             header_offset: comment.header_offset,
             file_header: FileHeader {
                 name: "CMT".to_string(),
+                name_raw: Some(b"CMT".to_vec()),
                 unpacked_size: Some(comment.unpacked_size as u64),
                 attributes: crate::types::FileAttributes(0),
                 mtime: None,
@@ -474,6 +479,7 @@ impl RarArchive {
     ) -> FileHeader {
         FileHeader {
             name: fh.name.clone(),
+            name_raw: fh.name_raw.clone(),
             unpacked_size: fh.unpacked_size,
             attributes: crate::types::FileAttributes(fh.attributes as u64),
             mtime: fh
@@ -553,6 +559,7 @@ mod tests {
             header_offset: 123,
             inner: Rar5FileHeader {
                 name: name.to_string(),
+                name_raw: Some(name.as_bytes().to_vec()),
                 unpacked_size: Some(0),
                 attributes: FileAttributes(0),
                 mtime: None,
@@ -655,6 +662,7 @@ mod tests {
             method: crate::rar4::types::Rar4Method::Store,
             dict_size: 0,
             name: "report.txt;42".to_string(),
+            name_raw: Some(b"report.txt;42".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,
@@ -672,6 +680,10 @@ mod tests {
         };
 
         let converted = RarArchive::rar4_to_file_header(&fh, false);
+        assert_eq!(
+            converted.name_raw.as_deref(),
+            Some(&b"report.txt;42"[..])
+        );
         assert_eq!(converted.mtime, Some(mtime));
         assert_eq!(converted.ctime, Some(ctime));
         assert_eq!(converted.atime, Some(atime));
@@ -700,6 +712,7 @@ mod tests {
             method: crate::rar4::types::Rar4Method::Store,
             dict_size: 0,
             name: "host.txt".to_string(),
+            name_raw: Some(b"host.txt".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,
@@ -765,6 +778,7 @@ mod tests {
             method: crate::rar4::types::Rar4Method::Normal,
             dict_size: 0x10000,
             name: "old-solid.txt".to_string(),
+            name_raw: Some(b"old-solid.txt".to_vec()),
             is_directory: false,
             is_unix_symlink: false,
             is_encrypted: false,

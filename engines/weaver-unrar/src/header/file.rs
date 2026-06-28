@@ -105,6 +105,10 @@ fn read_raw_u32_lossy(data: &[u8], pos: &mut usize) -> u32 {
 pub struct FileHeader {
     /// File name (UTF-8).
     pub name: String,
+    /// Raw archive name bytes after UnRAR's MAXPATHSIZE cap and short-read
+    /// zero-fill behavior. This preserves filename data that cannot be
+    /// represented losslessly in `name`.
+    pub name_raw: Option<Vec<u8>>,
     /// Unpacked size in bytes (None if unknown).
     pub unpacked_size: Option<u64>,
     /// File attributes.
@@ -221,6 +225,7 @@ pub fn parse(raw: &RawHeader, data_offset: u64) -> RarResult<FileHeader> {
 
     Ok(FileHeader {
         name,
+        name_raw: Some(name_bytes),
         unpacked_size,
         attributes: FileAttributes(attrs),
         mtime,
@@ -273,6 +278,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_file_header_with_raw_name(
         file_flags: u64,
         unpacked_size: u64,
@@ -309,7 +315,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(header_type));
         body.extend_from_slice(&encode_vint(common_flags));
-        body.extend_from_slice(&type_body);
+        body.extend_from_slice(type_body);
 
         let header_size = body.len() as u64;
         let header_size_bytes = encode_vint(header_size);
@@ -475,6 +481,13 @@ mod tests {
         let fh = parse(&raw, data_offset).unwrap();
         assert_eq!(fh.name.len(), MAXPATHSIZE);
         assert!(fh.name.bytes().all(|byte| byte == b'a'));
+        assert_eq!(fh.name_raw.as_ref().map(Vec::len), Some(MAXPATHSIZE));
+        assert!(fh
+            .name_raw
+            .as_deref()
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == b'a'));
     }
 
     #[test]
@@ -487,6 +500,9 @@ mod tests {
 
         let fh = parse(&raw, data_offset).unwrap();
         assert_eq!(fh.name, "valid/");
+        let raw = fh.name_raw.as_deref().unwrap();
+        assert_eq!(&raw[..14], b"valid/\xffignored");
+        assert_eq!(&raw[14..], &[0, 0]);
     }
 
     #[test]

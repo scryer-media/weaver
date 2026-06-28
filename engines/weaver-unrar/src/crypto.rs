@@ -574,6 +574,16 @@ impl KdfCache {
 
         (key, iv)
     }
+
+    #[cfg(test)]
+    pub(crate) fn rar4_cached_entry_count(&self) -> usize {
+        self.rar4.lock().unwrap().0.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rar5_cached_entry_count(&self) -> usize {
+        self.rar5.lock().unwrap().0.len()
+    }
 }
 
 impl Default for KdfCache {
@@ -1312,6 +1322,13 @@ pub struct DecryptingReader<R: Read> {
     out_len: usize,
     /// Inner reader hit EOF.
     inner_eof: bool,
+}
+
+impl<R: Read> Drop for DecryptingReader<R> {
+    fn drop(&mut self) {
+        self.pending.zeroize();
+        self.out_buf.zeroize();
+    }
 }
 
 impl<R: Read> DecryptingReader<R> {
