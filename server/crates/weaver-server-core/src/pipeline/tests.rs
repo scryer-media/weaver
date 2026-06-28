@@ -4747,7 +4747,7 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
 }
 
 #[tokio::test]
-async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
+async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -4816,7 +4816,7 @@ async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(
         pipeline
@@ -4825,12 +4825,12 @@ async fn dispatch_downloads_prefers_more_progressed_job_within_priority_band() {
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
 }
 
 #[tokio::test]
-async fn dispatch_downloads_shares_slots_within_priority_band_after_top_pick() {
+async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -4921,6 +4921,74 @@ async fn dispatch_downloads_shares_slots_within_priority_band_after_top_pick() {
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
         Some(&1)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+
+    let hot_job_id = JobId(20023);
+    let secondary_job_id = JobId(20024);
+
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Hot Normal",
+                &[
+                    ("hot-0.bin".to_string(), 512u32),
+                    ("hot-1.bin".to_string(), 512u32),
+                    ("hot-2.bin".to_string(), 512u32),
+                ],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        secondary_job_id,
+        with_priority(
+            standalone_job_spec("Secondary Normal", &[("secondary.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(
+        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&secondary_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert!(
+        !pipeline
+            .active_downloads_by_job
+            .contains_key(&secondary_job_id)
     );
 }
 

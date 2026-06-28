@@ -86,7 +86,7 @@ fn initial_params_ssd() {
     let tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
     let p = tuner.params();
     assert_eq!(p.max_concurrent_downloads, 20); // SSD uses all connections
-    assert_eq!(p.max_decode_queue, 40); // 20 * 2
+    assert_eq!(p.max_decode_queue, 160); // 20 * 8
     assert_eq!(p.max_write_queue, 40);
     assert_eq!(p.min_free_buffers, 4);
     assert_eq!(p.decode_thread_count, 8);
@@ -97,7 +97,7 @@ fn initial_params_hdd() {
     let tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
     let p = tuner.params();
     assert_eq!(p.max_concurrent_downloads, 20); // all configured connections
-    assert_eq!(p.max_decode_queue, 40);
+    assert_eq!(p.max_decode_queue, 160);
     assert_eq!(p.max_write_queue, 40);
     assert_eq!(p.decode_thread_count, 8);
 }
@@ -247,7 +247,7 @@ fn set_connection_limit_increases_capacity() {
     // Add a server with 20 connections.
     tuner.set_connection_limit(20);
     assert_eq!(tuner.params().max_concurrent_downloads, 20); // SSD uses all
-    assert_eq!(tuner.params().max_decode_queue, 40);
+    assert_eq!(tuner.params().max_decode_queue, 160);
 }
 
 #[test]

@@ -11,6 +11,7 @@ use crate::operations::metrics::MetricsSnapshot;
 /// throttle to avoid disk contention.
 const FAST_STORAGE_IOPS: f64 = 1_000.0;
 const MAX_CONCURRENT_EXTRACTIONS_ENV: &str = "WEAVER_MAX_CONCURRENT_EXTRACTIONS";
+const DECODE_QUEUE_PER_CONNECTION: usize = 8;
 
 /// Runtime-tunable parameters. The tuner adjusts these based on observed performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +70,7 @@ impl RuntimeTuner {
 
         let current = TunedParameters {
             max_concurrent_downloads,
-            max_decode_queue: max_concurrent_downloads * 2,
+            max_decode_queue: max_concurrent_downloads * DECODE_QUEUE_PER_CONNECTION,
             max_write_queue: max_concurrent_downloads * 2,
             min_free_buffers: 4,
             decode_thread_count: cores,
@@ -177,7 +178,7 @@ impl RuntimeTuner {
         // Re-derive max_concurrent_downloads the same way as initial construction,
         // so adding a server immediately makes those connections available.
         self.current.max_concurrent_downloads = limit;
-        self.current.max_decode_queue = limit * 2;
+        self.current.max_decode_queue = limit * DECODE_QUEUE_PER_CONNECTION;
         self.current.max_write_queue = limit * 2;
     }
 

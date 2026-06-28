@@ -40,14 +40,6 @@ impl Pipeline {
             .unwrap_or(1)
     }
 
-    fn job_downloaded_segment_count(state: &JobState) -> u64 {
-        state
-            .assembly
-            .files()
-            .map(|file| (file.total_segments() - file.missing_count()) as u64)
-            .sum()
-    }
-
     pub(crate) fn note_retry_scheduled(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
@@ -340,18 +332,18 @@ impl Pipeline {
         self.pending_decode = remaining;
     }
 
-    /// Dispatch downloads across eligible jobs with job priority and progress ordering.
+    /// Dispatch downloads across eligible jobs with hot-job-first ordering.
     ///
-    /// Eligible jobs are ranked by submitted priority metadata (`HIGH`,
-    /// `NORMAL`, `LOW`), then by completed segment count within the same
-    /// priority band, with FIFO submission order as a final tie-breaker.
+    /// Eligible jobs are grouped by submitted priority metadata (`HIGH`,
+    /// `NORMAL`, `LOW`). Within the top runnable band, an already-active job
+    /// keeps ownership so pooled NNTP connections stay hot; otherwise the
+    /// earliest submitted runnable job becomes hot.
     ///
     /// This lets a newly submitted higher-priority job take newly freed slots
     /// immediately while preserving already in-flight work on lower-priority
-    /// jobs. Within the same priority band, the most-progressed job gets the
-    /// next slot first, but each dispatch sweep only assigns one segment per job
-    /// before looping back, preventing one same-band job from monopolizing all
-    /// newly freed capacity.
+    /// jobs. Within a priority band, the hot job gets all usable capacity
+    /// first; spare capacity is shared only after that job cannot fill another
+    /// slot from its own queue.
     ///
     /// A job is eligible if it is `Downloading` with queued segments, or in a
     /// post-processing state (`QueuedExtract`/`Extracting`/`Verifying`/
@@ -421,9 +413,10 @@ impl Pipeline {
         let cap_tight = self.bandwidth_cap.cap_enabled()
             && self.bandwidth_cap.remaining_bytes() <= self.bandwidth_cap.limit_bytes() * 15 / 100;
 
-        // Prefer higher submitted priority first. Within the same priority
-        // band, keep advancing the most-progressed job before falling back to
-        // FIFO submission order.
+        // Prefer higher submitted priority first. Within the top runnable band,
+        // keep the already-active job hot when possible; otherwise choose FIFO
+        // submission order. This matches NZBGet/SAB-style hot reuse more closely
+        // than same-band round-robin.
         let mut eligible = self
             .job_order
             .iter()
@@ -435,18 +428,10 @@ impl Pipeline {
                 {
                     return None;
                 }
-                Some((
-                    Self::job_dispatch_priority(state),
-                    std::cmp::Reverse(Self::job_downloaded_segment_count(state)),
-                    index,
-                    *id,
-                ))
+                Some((Self::job_dispatch_priority(state), index, *id))
             })
             .collect::<Vec<_>>();
         eligible.sort_unstable();
-        if cap_tight {
-            eligible.truncate(1);
-        }
 
         if eligible.is_empty() && self.active_downloads == 0 {
             let mut drained_parked_recovery_jobs = Vec::new();
@@ -516,8 +501,45 @@ impl Pipeline {
             );
         }
 
-        if cap_tight {
-            if let Some((_, _, _, job_id)) = eligible.first().copied() {
+        let Some((hot_priority, _, mut hot_job_id)) = eligible.first().copied() else {
+            self.update_queue_metrics();
+            return;
+        };
+
+        let top_band_end = eligible
+            .iter()
+            .position(|(priority, _, _)| *priority != hot_priority)
+            .unwrap_or(eligible.len());
+        let mut hot_active = self
+            .active_downloads_by_job
+            .get(&hot_job_id)
+            .copied()
+            .unwrap_or(0);
+        for (_, _, candidate_job_id) in &eligible[..top_band_end] {
+            let candidate_active = self
+                .active_downloads_by_job
+                .get(candidate_job_id)
+                .copied()
+                .unwrap_or(0);
+            if candidate_active > hot_active {
+                hot_active = candidate_active;
+                hot_job_id = *candidate_job_id;
+            }
+        }
+
+        while self.active_downloads < max && !self.rate_limiter.should_wait() {
+            match self.try_dispatch_download_for_job(hot_job_id) {
+                DispatchAttempt::Dispatched => {}
+                DispatchAttempt::NoWork => break,
+                DispatchAttempt::StopAll => return,
+            }
+        }
+
+        if !cap_tight {
+            for (_, _, job_id) in eligible {
+                if job_id == hot_job_id {
+                    continue;
+                }
                 while self.active_downloads < max && !self.rate_limiter.should_wait() {
                     match self.try_dispatch_download_for_job(job_id) {
                         DispatchAttempt::Dispatched => {}
@@ -525,43 +547,9 @@ impl Pipeline {
                         DispatchAttempt::StopAll => return,
                     }
                 }
-            }
-        } else {
-            let mut group_start = 0;
-            while group_start < eligible.len() && self.active_downloads < max {
-                if self.rate_limiter.should_wait() {
+                if self.active_downloads >= max || self.rate_limiter.should_wait() {
                     break;
                 }
-
-                let group_priority = eligible[group_start].0;
-                let mut group_end = group_start + 1;
-                while group_end < eligible.len() && eligible[group_end].0 == group_priority {
-                    group_end += 1;
-                }
-
-                loop {
-                    let mut dispatched_in_round = false;
-                    for (_, _, _, job_id) in &eligible[group_start..group_end] {
-                        if self.active_downloads >= max || self.rate_limiter.should_wait() {
-                            break;
-                        }
-
-                        match self.try_dispatch_download_for_job(*job_id) {
-                            DispatchAttempt::Dispatched => dispatched_in_round = true,
-                            DispatchAttempt::NoWork => {}
-                            DispatchAttempt::StopAll => return,
-                        }
-                    }
-
-                    if !dispatched_in_round
-                        || self.active_downloads >= max
-                        || self.rate_limiter.should_wait()
-                    {
-                        break;
-                    }
-                }
-
-                group_start = group_end;
             }
         }
 
