@@ -80,6 +80,7 @@ pub struct CachedMember {
     pub is_directory: bool,
     pub is_encrypted: bool,
     pub encryption: Option<CachedEncryption>,
+    #[serde(default)]
     pub rar4_salt: Option<[u8; 8]>,
     #[serde(default)]
     pub version: Option<u64>,
@@ -140,6 +141,8 @@ pub struct CachedService {
     pub is_inherited: bool,
     pub is_encrypted: bool,
     pub encryption: Option<CachedEncryption>,
+    #[serde(default)]
+    pub rar4_salt: Option<[u8; 8]>,
     #[serde(default)]
     pub version: Option<u64>,
     #[serde(default)]
@@ -517,6 +520,7 @@ impl RarArchive {
                     is_inherited: service.is_inherited,
                     is_encrypted: service.is_encrypted,
                     encryption: service.file_encryption.as_ref().map(cached_encryption),
+                    rar4_salt: service.rar4_salt,
                     version: service.file_header.version,
                     blake2_hash: service.hash.as_ref().map(|h| match h {
                         FileHash::Blake2sp(b) => *b,
@@ -672,6 +676,7 @@ impl RarArchive {
                     },
                     is_encrypted: service.is_encrypted,
                     file_encryption: service.encryption.map(file_encryption),
+                    rar4_salt: service.rar4_salt,
                     hash: service.blake2_hash.map(FileHash::Blake2sp),
                     comment_crc16: service.comment_crc16,
                     ntfs_stream_name: service.ntfs_stream_name,
@@ -978,6 +983,7 @@ mod tests {
                     check_data: Some([0x33; 12]),
                     use_hash_mac: true,
                 }),
+                rar4_salt: None,
                 version: Some(7),
                 blake2_hash: Some(blake2_hash),
                 comment_crc16: Some(0x4567),

@@ -5526,7 +5526,7 @@ fn test_rar5_solid_reopen_archive_for_later_member() {
         weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
     let actual_second = reopened_archive.extract_member(1, &options, None).unwrap();
 
-    assert_eq!(actual_second, expected_second);
+    assert_eq!(actual_second.to_bytes().unwrap(), expected_second);
 }
 
 #[test]
@@ -5626,6 +5626,63 @@ fn test_rar5_solid_encrypted_chunked_preserves_solid_continuation() {
         actual_second.extend_from_slice(&data);
     }
     assert_eq!(actual_second, expected_second);
+}
+
+#[test]
+fn test_rar5_solid_encrypted_later_member_uses_per_call_password_for_skip() {
+    let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
+    let options = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+        restore_owners: false,
+    };
+
+    let mut expected_archive = weaver_unrar::RarArchive::open_with_password(
+        std::fs::File::open(&fixture).unwrap(),
+        "e2e-test-password",
+    )
+    .unwrap();
+    let expected_second = expected_archive.extract_member(1, &options, None).unwrap();
+
+    let mut archive =
+        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let actual_second = archive.extract_member(1, &options, None).unwrap();
+
+    assert_eq!(
+        actual_second.to_bytes().unwrap(),
+        expected_second.to_bytes().unwrap()
+    );
+}
+
+#[test]
+fn test_rar5_solid_encrypted_streaming_chunked_later_member_uses_per_call_password_for_skip() {
+    let fixture = fixture("rar5", "rar5_solid_encrypted.rar");
+    let provider = weaver_unrar::StaticVolumeProvider::from_ordered(vec![fixture.clone()]);
+    let options = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: Some("e2e-test-password".into()),
+        restore_owners: false,
+    };
+
+    let mut archive =
+        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture).unwrap()).unwrap();
+    let expected_size = archive.member_info(1).unwrap().unpacked_size.unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let chunk_dir = temp_dir.path().join("per-call-password-second");
+
+    let chunks = archive
+        .extract_member_streaming_chunked(1, &options, &provider, |volume_index| {
+            let path = chunk_dir.join(format!("{volume_index:05}.chunk"));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(weaver_unrar::RarError::Io)?;
+            }
+            let file = std::fs::File::create(&path).map_err(weaver_unrar::RarError::Io)?;
+            Ok(Box::new(file))
+        })
+        .unwrap();
+
+    let actual_size: u64 = chunks.iter().map(|(_, bytes)| *bytes).sum();
+    assert_eq!(actual_size, expected_size);
 }
 
 #[test]

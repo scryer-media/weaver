@@ -76,6 +76,7 @@ pub(super) struct ServiceEntry {
     pub(super) is_inherited: bool,
     pub(super) is_encrypted: bool,
     pub(super) file_encryption: Option<FileEncryptionInfo>,
+    pub(super) rar4_salt: Option<[u8; 8]>,
     pub(super) hash: Option<FileHash>,
     pub(super) comment_crc16: Option<u16>,
     pub(super) ntfs_stream_name: Option<String>,
@@ -694,9 +695,21 @@ mod tests {
     }
 
     fn build_rar5_raw_header(header_type: u64, header_flags: u64, type_body: &[u8]) -> Vec<u8> {
+        build_rar5_raw_header_with_data(header_type, header_flags, type_body, None)
+    }
+
+    fn build_rar5_raw_header_with_data(
+        header_type: u64,
+        header_flags: u64,
+        type_body: &[u8],
+        data_area_size: Option<u64>,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&crate::vint::encode_vint(header_type));
         body.extend_from_slice(&crate::vint::encode_vint(header_flags));
+        if let Some(data_area_size) = data_area_size {
+            body.extend_from_slice(&crate::vint::encode_vint(data_area_size));
+        }
         body.extend_from_slice(type_body);
 
         let header_size = body.len() as u64;
@@ -710,6 +723,49 @@ mod tests {
         raw.extend_from_slice(&header_size_bytes);
         raw.extend_from_slice(&body);
         raw
+    }
+
+    fn build_rar5_qopen_service(payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // service flags.
+        body.extend_from_slice(&crate::vint::encode_vint(payload.len() as u64));
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // attributes.
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // RAR5 Store.
+        body.extend_from_slice(&crate::vint::encode_vint(1)); // Unix host OS.
+        body.extend_from_slice(&crate::vint::encode_vint(2));
+        body.extend_from_slice(b"QO");
+
+        build_rar5_raw_header_with_data(
+            3,
+            header::common::flags::DATA_AREA,
+            &body,
+            Some(payload.len() as u64),
+        )
+    }
+
+    fn build_rar5_qopen_record(
+        qopen_header_offset: u64,
+        original_header_offset: u64,
+        cached_header: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // flags, unused by UnRAR.
+        body.extend_from_slice(&crate::vint::encode_vint(
+            qopen_header_offset - original_header_offset,
+        ));
+        body.extend_from_slice(&crate::vint::encode_vint(cached_header.len() as u64));
+        body.extend_from_slice(cached_header);
+
+        let size = crate::vint::encode_vint(body.len() as u64);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&size);
+        hasher.update(&body);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&hasher.finalize().to_le_bytes());
+        out.extend_from_slice(&size);
+        out.extend_from_slice(&body);
+        out
     }
 
     fn build_rar5_main_header_archive(extra_area: &[u8]) -> Vec<u8> {
@@ -887,6 +943,73 @@ mod tests {
         assert_eq!(record.kind, crate::types::RecoveryRecordKind::Rar5Service);
         assert_eq!(record.offset, rr_offset as u64);
         assert_eq!(record.recovery_percent, Some(42));
+    }
+
+    #[test]
+    fn metadata_scans_rar5_rr_service_when_quick_open_hides_bad_locator_like_unrar() {
+        let qopen_offset = 512usize;
+        let cached_end_offset = 160u64;
+
+        let mut locator = Vec::new();
+        locator.extend_from_slice(&crate::vint::encode_vint(0x03)); // QLIST | RR.
+        locator.extend_from_slice(&crate::vint::encode_vint((qopen_offset - 8) as u64));
+        locator.extend_from_slice(&crate::vint::encode_vint((qopen_offset - 8) as u64));
+        let extra_area = encode_main_extra_record(0x01, &locator);
+
+        let mut main_body = Vec::new();
+        main_body.extend_from_slice(&crate::vint::encode_vint(extra_area.len() as u64));
+        main_body.extend_from_slice(&crate::vint::encode_vint(
+            header::main_archive::flags::RECOVERY_RECORD,
+        ));
+        main_body.extend_from_slice(&extra_area);
+
+        let mut archive_bytes = crate::signature::RAR5_SIGNATURE.to_vec();
+        archive_bytes.extend_from_slice(&build_rar5_raw_header(
+            1,
+            header::common::flags::EXTRA_AREA,
+            &main_body,
+        ));
+
+        let rr_offset = archive_bytes.len() as u64;
+        let percent = crate::vint::encode_vint(17);
+        let rr_extra = encode_main_extra_record(0x07, &percent);
+        let mut rr_body = Vec::new();
+        rr_body.extend_from_slice(&crate::vint::encode_vint(rr_extra.len() as u64));
+        rr_body.extend_from_slice(&crate::vint::encode_vint(0)); // file flags.
+        rr_body.extend_from_slice(&crate::vint::encode_vint(0)); // unpacked size.
+        rr_body.extend_from_slice(&crate::vint::encode_vint(0)); // attributes.
+        rr_body.extend_from_slice(&crate::vint::encode_vint(0)); // compression info.
+        rr_body.extend_from_slice(&crate::vint::encode_vint(0)); // host OS.
+        rr_body.extend_from_slice(&crate::vint::encode_vint(2)); // name length.
+        rr_body.extend_from_slice(b"RR");
+        rr_body.extend_from_slice(&rr_extra);
+        archive_bytes.extend_from_slice(&build_rar5_raw_header(
+            3,
+            header::common::flags::EXTRA_AREA,
+            &rr_body,
+        ));
+
+        let mut end_body = Vec::new();
+        end_body.extend_from_slice(&crate::vint::encode_vint(0));
+        archive_bytes.extend_from_slice(&build_rar5_raw_header(5, 0, &end_body));
+
+        let cached_end = build_rar5_raw_header(5, 0, &end_body);
+        let qopen_payload =
+            build_rar5_qopen_record(qopen_offset as u64, cached_end_offset, &cached_end);
+        assert!(archive_bytes.len() < qopen_offset);
+        archive_bytes.resize(qopen_offset, 0);
+        archive_bytes.extend_from_slice(&build_rar5_qopen_service(&qopen_payload));
+        archive_bytes.extend_from_slice(&qopen_payload);
+
+        let archive = RarArchive::open(std::io::Cursor::new(archive_bytes)).unwrap();
+        let metadata = archive.metadata();
+
+        assert_eq!(metadata.recovery_record_offset, Some(qopen_offset as u64));
+        assert_eq!(metadata.recovery_records.len(), 1);
+        let record = &metadata.recovery_records[0];
+        assert_eq!(record.kind, crate::types::RecoveryRecordKind::Rar5Service);
+        assert_eq!(record.offset, rr_offset);
+        assert_eq!(record.recovery_percent, Some(17));
     }
 
     #[test]

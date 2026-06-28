@@ -189,27 +189,42 @@ impl RarArchive {
             .file_encryption
             .as_ref()
             .is_some_and(|enc| enc.use_hash_mac);
-        let rar5_crypto = if service.is_encrypted {
-            if fh.compression.format != ArchiveFormat::Rar5 {
-                return Err(RarError::EncryptedMember {
-                    member: fh.name.clone(),
-                });
-            }
-            let password = self
-                .password
-                .as_deref()
-                .ok_or_else(|| RarError::EncryptedMember {
-                    member: fh.name.clone(),
-                })?
-                .to_owned();
+        let service_password = if service.is_encrypted {
+            Some(
+                self.password
+                    .as_deref()
+                    .ok_or_else(|| RarError::EncryptedMember {
+                        member: fh.name.clone(),
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let rar5_crypto = if service.is_encrypted && fh.compression.format == ArchiveFormat::Rar5 {
+            let password =
+                service_password
+                    .as_deref()
+                    .ok_or_else(|| RarError::EncryptedMember {
+                        member: fh.name.clone(),
+                    })?;
             Some(self.prepare_rar5_encrypted_member(
                 &fh.name,
-                &password,
+                password,
                 service.file_encryption.as_ref(),
             )?)
         } else {
             None
         };
+
+        if service.is_encrypted
+            && fh.compression.format != ArchiveFormat::Rar5
+            && !fh.compression.format.is_rar4_family()
+        {
+            return Err(RarError::EncryptedMember {
+                member: fh.name.clone(),
+            });
+        }
 
         let base_reader =
             ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &service.segments, &fh.name)
@@ -220,6 +235,14 @@ impl RarArchive {
                 &crypto.key,
                 &crypto.iv,
             ))
+        } else if let Some(password) = service_password.as_deref() {
+            Box::new(Self::wrap_rar4_encrypted_reader(
+                &self.kdf_cache,
+                base_reader,
+                fh,
+                password,
+                service.rar4_salt,
+            )?)
         } else {
             Box::new(base_reader)
         };
@@ -846,28 +869,44 @@ impl RarArchive {
             .file_encryption
             .as_ref()
             .is_some_and(|enc| enc.use_hash_mac);
-        let rar5_crypto = if service.is_encrypted {
-            if fh.compression.format != ArchiveFormat::Rar5 {
-                return Err(RarError::EncryptedMember {
-                    member: fh.name.clone(),
-                });
-            }
-            let password = options
-                .password
-                .as_deref()
-                .or(self.password.as_deref())
-                .ok_or_else(|| RarError::EncryptedMember {
-                    member: fh.name.clone(),
-                })?
-                .to_owned();
+        let service_password = if service.is_encrypted {
+            Some(
+                options
+                    .password
+                    .as_deref()
+                    .or(self.password.as_deref())
+                    .ok_or_else(|| RarError::EncryptedMember {
+                        member: fh.name.clone(),
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let rar5_crypto = if service.is_encrypted && fh.compression.format == ArchiveFormat::Rar5 {
+            let password =
+                service_password
+                    .as_deref()
+                    .ok_or_else(|| RarError::EncryptedMember {
+                        member: fh.name.clone(),
+                    })?;
             Some(self.prepare_rar5_encrypted_member(
                 &fh.name,
-                &password,
+                password,
                 service.file_encryption.as_ref(),
             )?)
         } else {
             None
         };
+
+        if service.is_encrypted
+            && fh.compression.format != ArchiveFormat::Rar5
+            && !fh.compression.format.is_rar4_family()
+        {
+            return Err(RarError::EncryptedMember {
+                member: fh.name.clone(),
+            });
+        }
 
         let base_reader =
             ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &service.segments, &fh.name)
@@ -878,6 +917,14 @@ impl RarArchive {
                 &crypto.key,
                 &crypto.iv,
             ))
+        } else if let Some(password) = service_password.as_deref() {
+            Box::new(Self::wrap_rar4_encrypted_reader(
+                &self.kdf_cache,
+                base_reader,
+                fh,
+                password,
+                service.rar4_salt,
+            )?)
         } else {
             Box::new(base_reader)
         };
@@ -3177,7 +3224,16 @@ impl RarArchive {
         Ok(())
     }
 
-    fn advance_solid_cursor_to(&mut self, index: usize, fh: &FileHeader) -> RarResult<()> {
+    fn advance_solid_cursor_to(
+        &mut self,
+        index: usize,
+        fh: &FileHeader,
+        password: Option<&str>,
+    ) -> RarResult<()> {
+        let effective_password = password
+            .map(str::to_owned)
+            .or_else(|| self.password.clone());
+
         if index < self.solid_next_index {
             return Err(RarError::SolidOrderViolation {
                 required: format!("member index {}", self.solid_next_index),
@@ -3195,7 +3251,7 @@ impl RarArchive {
                 let skip_unpacked = self.target_unpacked_size(&skip_fh);
                 let rar5_crypto = if skip_entry.is_encrypted && self.format == ArchiveFormat::Rar5 {
                     let password =
-                        self.password
+                        effective_password
                             .as_deref()
                             .ok_or_else(|| RarError::EncryptedMember {
                                 member: skip_fh.name.clone(),
@@ -3217,8 +3273,7 @@ impl RarArchive {
                 .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
 
                 if skip_entry.is_encrypted {
-                    let password = self
-                        .password
+                    let password = effective_password
                         .as_deref()
                         .ok_or_else(|| RarError::EncryptedMember {
                             member: skip_fh.name.clone(),
@@ -3303,7 +3358,12 @@ impl RarArchive {
         index: usize,
         fh: &FileHeader,
         provider: &dyn VolumeProvider,
+        password: Option<&str>,
     ) -> RarResult<()> {
+        let effective_password = password
+            .map(str::to_owned)
+            .or_else(|| self.password.clone());
+
         if index < self.solid_next_index {
             return Err(RarError::SolidOrderViolation {
                 required: format!("member index {}", self.solid_next_index),
@@ -3323,11 +3383,11 @@ impl RarArchive {
                 let base_reader = ChainedSegmentReader::new(&segments, provider)
                     .with_member_name(&skip_fh.name)
                     .with_max_data_segment(self.limits.max_data_segment)
-                    .with_continuation(skip_fh.split_after, self.format, self.password.clone());
+                    .with_continuation(skip_fh.split_after, self.format, effective_password.clone())
+                    .with_kdf_cache(Arc::clone(&self.kdf_cache));
 
                 if skip_entry.is_encrypted {
-                    let password = self
-                        .password
+                    let password = effective_password
                         .as_deref()
                         .ok_or_else(|| RarError::EncryptedMember {
                             member: skip_fh.name.clone(),
@@ -4197,7 +4257,7 @@ impl RarArchive {
                     expected_crc.is_some(),
                     expected_blake.is_some(),
                 );
-                self.advance_solid_cursor_to(index, &fh)?;
+                self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
@@ -4696,7 +4756,7 @@ impl RarArchive {
                     expected_crc.is_some(),
                     expected_blake.is_some(),
                 );
-                self.advance_solid_cursor_to(index, &fh)?;
+                self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
                 let segments = self.members[index].segments.clone();
                 let base_reader =
                     ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &segments, &fh.name)
@@ -4873,7 +4933,7 @@ impl RarArchive {
                 expected_crc.map(|_| Arc::new(std::sync::Mutex::new(crc32fast::Hasher::new())));
             let shared_blake: Option<Arc<std::sync::Mutex<Blake2spHasher>>> =
                 expected_blake.map(|_| Arc::new(std::sync::Mutex::new(Blake2spHasher::new())));
-            self.advance_solid_cursor_to(index, &fh)?;
+            self.advance_solid_cursor_to(index, &fh, options.password.as_deref())?;
 
             let volume_tracker = Arc::new(AtomicUsize::new(
                 segments.first().map_or(0, |segment| segment.volume_index),
@@ -5465,14 +5525,20 @@ impl RarArchive {
         let compute_blake2 = expected_blake.is_some()
             || (options.verify && split_after && self.format == ArchiveFormat::Rar5);
 
-        self.advance_solid_cursor_to_streaming(index, fh, provider)?;
+        self.advance_solid_cursor_to_streaming(index, fh, provider, options.password.as_deref())?;
 
         let cont_meta = Rc::new(RefCell::new(ContinuationMetadata::default()));
         let chained = ChainedSegmentReader::new(&segments, provider)
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
         let unpacked_size = self.target_unpacked_size(fh);
@@ -5588,7 +5654,13 @@ impl RarArchive {
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
         let use_hash_mac = file_encryption.is_some_and(|enc| enc.use_hash_mac);
@@ -5735,7 +5807,13 @@ impl RarArchive {
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta));
 
@@ -5990,7 +6068,13 @@ impl RarArchive {
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -6161,7 +6245,7 @@ impl RarArchive {
             );
         }
 
-        self.advance_solid_cursor_to_streaming(index, fh, provider)?;
+        self.advance_solid_cursor_to_streaming(index, fh, provider, options.password.as_deref())?;
 
         let volume_tracker = Arc::new(AtomicUsize::new(first_vol));
         let shared_transitions = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6170,7 +6254,13 @@ impl RarArchive {
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -6320,7 +6410,13 @@ impl RarArchive {
             .with_member_name(&fh.name)
             .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key))
             .with_max_data_segment(self.limits.max_data_segment)
-            .with_continuation(split_after, self.format, self.password.clone())
+            .with_continuation(
+                split_after,
+                self.format,
+                password
+                    .map(str::to_owned)
+                    .or_else(|| self.password.clone()),
+            )
             .with_kdf_cache(Arc::clone(&self.kdf_cache))
             .with_metadata_sink(Rc::clone(&cont_meta))
             .with_volume_tracker(Arc::clone(&volume_tracker));
@@ -7992,6 +8088,7 @@ mod tests {
             },
             is_encrypted: false,
             file_encryption: None,
+            rar4_salt: None,
             hash: None,
             comment_crc16: None,
             ntfs_stream_name: None,
@@ -8067,6 +8164,46 @@ mod tests {
         let mut out = Vec::new();
         let written = archive
             .write_service_subdata_to_writer(&service, &ExtractOptions::default(), &mut out)
+            .unwrap();
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn rar4_encrypted_service_payload_uses_legacy_decryptor() {
+        let password = "service-password";
+        let payload = b"rar4 service dat";
+        let salt = *b"svc-salt";
+        let (key, iv) = crate::crypto::KdfCache::default().derive_key_rar4(password, Some(&salt));
+        let encrypted = crate::crypto::encrypt_aes128_cbc_for_test(&key, &iv, payload);
+
+        let mut service = test_rar5_service("CMT", payload.len() as u64, encrypted.len() as u64);
+        service.file_header.compression.format = ArchiveFormat::Rar4;
+        service.file_header.compression.version = 29;
+        service.file_header.data_crc32 = Some(crc32fast::hash(payload));
+        service.file_header.is_encrypted = true;
+        service.is_encrypted = true;
+        service.rar4_salt = Some(salt);
+
+        let mut archive = archive_with_single_volume(&encrypted);
+        archive.set_password(password);
+        assert_eq!(
+            archive.read_service_subdata_to_memory(&service).unwrap(),
+            payload
+        );
+
+        let mut archive = archive_with_single_volume(&encrypted);
+        let mut out = Vec::new();
+        let written = archive
+            .write_service_subdata_to_writer(
+                &service,
+                &ExtractOptions {
+                    password: Some(password.to_string()),
+                    ..ExtractOptions::default()
+                },
+                &mut out,
+            )
             .unwrap();
 
         assert_eq!(written, payload.len() as u64);

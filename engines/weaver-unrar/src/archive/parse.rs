@@ -25,6 +25,7 @@ impl RarArchive {
 
         // Read and validate signature
         let format = signature::read_signature(&mut reader)?;
+        let headers_start = reader.stream_position().map_err(RarError::Io)?;
         tracing::debug!("detected format: {:?}", format);
 
         // Dispatch based on format.
@@ -39,14 +40,22 @@ impl RarArchive {
         let mut parsed =
             header::parse_all_headers_with_kdf_cache(&mut reader, password, &kdf_cache)?;
 
-        if let Some(rr_offset) = parsed.main.as_ref().and_then(|m| m.recovery_record_offset) {
-            let already_parsed = parsed
-                .services
-                .iter()
-                .any(|service| service.header.service_name() == "RR");
-            if !already_parsed
-                && let Some(service) = Self::rar5_locator_rr_service(&mut reader, rr_offset)?
-            {
+        let rr_already_parsed = parsed
+            .services
+            .iter()
+            .any(|service| service.header.service_name() == "RR");
+        if !rr_already_parsed {
+            let main = parsed.main.as_ref();
+            let locator_rr = main.and_then(|m| m.recovery_record_offset);
+            let mut rr_service = if let Some(rr_offset) = locator_rr {
+                Self::rar5_locator_rr_service(&mut reader, rr_offset)?
+            } else {
+                None
+            };
+            if rr_service.is_none() && main.is_some_and(|m| m.has_recovery_record) {
+                rr_service = Self::rar5_scan_rr_service(&mut reader, headers_start)?;
+            }
+            if let Some(service) = rr_service {
                 parsed.services.push(service);
             }
         }
@@ -144,6 +153,7 @@ impl RarArchive {
                     file_header,
                     is_encrypted: service.is_encrypted,
                     file_encryption: service.file_encryption.map(Self::file_encryption_info),
+                    rar4_salt: None,
                     hash: service.hash,
                     comment_crc16: None,
                     ntfs_stream_name,
@@ -272,6 +282,7 @@ impl RarArchive {
                 file_header,
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
+                rar4_salt: fh.salt,
                 hash: None,
                 comment_crc16: None,
                 ntfs_stream_name: None,
@@ -417,6 +428,50 @@ impl RarArchive {
         Ok(parsed)
     }
 
+    fn rar5_scan_rr_service(
+        reader: &mut Box<dyn ReadSeek>,
+        headers_start: u64,
+    ) -> RarResult<Option<crate::header::ParsedService>> {
+        let current = reader.stream_position().map_err(RarError::Io)?;
+        let mut parsed = None;
+
+        if reader.seek(SeekFrom::Start(headers_start)).is_ok() {
+            loop {
+                let raw = {
+                    let mut rr_reader = reader.as_mut();
+                    crate::header::common::read_raw_header(&mut rr_reader)
+                };
+                let Ok(Some(raw)) = raw else {
+                    break;
+                };
+
+                if raw.header_type == crate::header::common::HeaderType::EndArchive {
+                    break;
+                }
+
+                if raw.header_type == crate::header::common::HeaderType::Service {
+                    let data_offset =
+                        raw.offset + 4 + raw.header_size_vint_len as u64 + raw.header_size;
+                    if let Ok(service) = crate::header::parse_service_from_raw(&raw, data_offset)
+                        && service.header.service_name() == "RR"
+                    {
+                        parsed = Some(service);
+                        break;
+                    }
+                }
+
+                if crate::header::common::skip_data_area(reader, &raw).is_err() {
+                    break;
+                }
+            }
+        }
+
+        reader
+            .seek(SeekFrom::Start(current))
+            .map_err(RarError::Io)?;
+        Ok(parsed)
+    }
+
     fn rar4_recovery_records(
         records: &[crate::rar4::types::Rar4RecoveryRecord],
     ) -> Vec<RecoveryRecordInfo> {
@@ -483,6 +538,7 @@ impl RarArchive {
             },
             is_encrypted: false,
             file_encryption: None,
+            rar4_salt: None,
             hash: None,
             comment_crc16: (format != crate::types::ArchiveFormat::Rar14).then_some(comment.crc16),
             ntfs_stream_name: None,
@@ -598,6 +654,7 @@ impl RarArchive {
             },
             is_encrypted: false,
             file_encryption: None,
+            rar4_salt: None,
             hash: None,
             comment_crc16: None,
             ntfs_stream_name,
