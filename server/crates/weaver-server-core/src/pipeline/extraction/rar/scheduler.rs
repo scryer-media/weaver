@@ -78,7 +78,7 @@ impl Pipeline {
         set_name: &str,
         member_name: &str,
     ) -> Option<RarRefreshRequest> {
-        let (_, last_volume) = self.member_volume_span(job_id, set_name, member_name)?;
+        let (first_volume, last_volume) = self.member_volume_span(job_id, set_name, member_name)?;
         let state = self
             .rar_refresh_state
             .get(&(job_id, set_name.to_string()))?;
@@ -95,7 +95,7 @@ impl Pipeline {
                 reason: RefreshReason::IdentityRebind,
             });
         }
-        if last_volume > state.refreshed_through_volume {
+        if !(first_volume..=last_volume).all(|volume| state.refreshed_volumes.contains(&volume)) {
             return Some(RarRefreshRequest {
                 target_completed_volume,
                 reason: RefreshReason::CoverageExpansion,

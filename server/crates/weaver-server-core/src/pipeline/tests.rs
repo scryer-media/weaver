@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::Database;
@@ -1992,7 +1992,7 @@ async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
         if pipeline
             .rar_refresh_state
             .values()
-            .all(|state| state.in_flight.is_none())
+            .all(|state| state.in_flight.is_none() && state.queued.is_none())
         {
             return;
         }
@@ -2054,6 +2054,18 @@ async fn write_and_complete_rar_volume(
     filename: &str,
     bytes: &[u8],
 ) {
+    write_and_complete_rar_volume_without_drain(pipeline, job_id, file_index, filename, bytes)
+        .await;
+    drain_rar_refreshes(pipeline).await;
+}
+
+async fn write_and_complete_rar_volume_without_drain(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    file_index: u32,
+    filename: &str,
+    bytes: &[u8],
+) {
     let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
     tokio::fs::write(working_dir.join(filename), bytes)
         .await
@@ -2073,7 +2085,6 @@ async fn write_and_complete_rar_volume(
     pipeline
         .refresh_archive_state_for_completed_file(job_id, file_id, true)
         .await;
-    drain_rar_refreshes(pipeline).await;
 }
 
 async fn write_and_complete_file(
@@ -2223,6 +2234,79 @@ async fn completed_rar_volume_queues_refresh_without_inline_recompute() {
 }
 
 #[tokio::test]
+async fn rar_refresh_follow_up_covers_holey_inflight_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40124);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Holey Refresh Follow-up", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let key = (job_id, "show".to_string());
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    assert_eq!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .map(|state| state.refreshed_volumes.clone()),
+        Some(BTreeSet::from([0]))
+    );
+
+    write_and_complete_rar_volume_without_drain(&mut pipeline, job_id, 2, &files[2].0, &files[2].1)
+        .await;
+    let stale_done =
+        tokio::time::timeout(Duration::from_secs(5), pipeline.rar_refresh_done_rx.recv())
+            .await
+            .expect("holey RAR refresh result should arrive")
+            .expect("RAR refresh channel should stay open");
+
+    write_and_complete_rar_volume_without_drain(&mut pipeline, job_id, 1, &files[1].0, &files[1].1)
+        .await;
+    assert!(
+        pipeline
+            .rar_refresh_state
+            .get(&key)
+            .and_then(|state| state.queued)
+            .is_some(),
+        "volume 1 completion should queue a refresh behind the stale in-flight result"
+    );
+
+    pipeline.handle_rar_refresh_done(stale_done).await;
+    {
+        let refresh = pipeline
+            .rar_refresh_state
+            .get(&key)
+            .expect("RAR refresh state should remain present");
+        assert_eq!(refresh.refreshed_volumes, BTreeSet::from([0, 2]));
+        assert!(
+            refresh.in_flight.is_some(),
+            "stale holey coverage should schedule a follow-up refresh"
+        );
+    }
+
+    drain_rar_refreshes(&mut pipeline).await;
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("RAR refresh state should remain present");
+    assert_eq!(refresh.refreshed_volumes, BTreeSet::from([0, 1, 2]));
+
+    let plan = pipeline
+        .rar_sets
+        .get(&key)
+        .and_then(|state| state.plan.as_ref())
+        .expect("RAR plan should be rebuilt after follow-up");
+    assert!(
+        !plan.waiting_on_volumes.contains(&1),
+        "volume 1 is present and must not remain in the waiting set"
+    );
+    assert!(
+        !plan.waiting_on_volumes.contains(&2),
+        "volume 2 is present and must not remain in the waiting set"
+    );
+}
+
+#[tokio::test]
 async fn rar_refresh_done_uses_actual_refreshed_frontier() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2245,7 +2329,7 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
             in_flight: Some(request),
             queued: None,
             latest_completed_volume: 3,
-            refreshed_through_volume: 1,
+            refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
         },
@@ -2277,8 +2361,8 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
         pipeline
             .rar_refresh_state
             .get(&key)
-            .map(|state| state.refreshed_through_volume),
-        Some(1),
+            .map(|state| state.refreshed_volumes.clone()),
+        Some(BTreeSet::from([0, 1])),
         "refresh completion should keep the actual rebuilt frontier"
     );
 }
@@ -2303,7 +2387,7 @@ async fn rar_member_refresh_request_retries_after_refresh_error() {
             in_flight: None,
             queued: None,
             latest_completed_volume: 1,
-            refreshed_through_volume: 1,
+            refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: Some("refresh failed".to_string()),
         },
@@ -2337,7 +2421,7 @@ async fn rar_member_refresh_request_ignores_verified_suspects_when_covered() {
             in_flight: None,
             queued: None,
             latest_completed_volume: 1,
-            refreshed_through_volume: 1,
+            refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
             last_error: None,
         },
@@ -13001,7 +13085,7 @@ async fn rar_completion_waits_for_pending_refresh_before_terminal_decision() {
             }),
             queued: None,
             latest_completed_volume: 3,
-            refreshed_through_volume: 2,
+            refreshed_volumes: BTreeSet::from([0, 1, 2]),
             structure_dirty: false,
             last_error: None,
         },

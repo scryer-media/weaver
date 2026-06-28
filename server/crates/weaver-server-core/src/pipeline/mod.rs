@@ -257,7 +257,7 @@ pub(super) struct RarRefreshState {
     pub(super) in_flight: Option<RarRefreshRequest>,
     pub(super) queued: Option<RarRefreshRequest>,
     pub(super) latest_completed_volume: u32,
-    pub(super) refreshed_through_volume: u32,
+    pub(super) refreshed_volumes: BTreeSet<u32>,
     pub(super) structure_dirty: bool,
     pub(super) last_error: Option<String>,
 }

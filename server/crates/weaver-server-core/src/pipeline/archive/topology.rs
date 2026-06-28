@@ -778,26 +778,27 @@ impl Pipeline {
             rebuild_source = computed.rebuild_source.as_str(),
             "RAR plan rebuilt"
         );
-        let refreshed_through_volume = computed
+        let refreshed_volumes: BTreeSet<u32> = computed
             .plan
             .topology
             .complete_volumes
             .iter()
             .copied()
-            .max()
-            .unwrap_or(0);
+            .collect();
+        let latest_refreshed_volume = refreshed_volumes.iter().next_back().copied().unwrap_or(0);
         self.set_rar_snapshot(job_id, set_name, computed.headers);
         self.apply_rar_plan(job_id, set_name, computed.plan);
         if let Some(refresh_state) = self
             .rar_refresh_state
             .get_mut(&(job_id, set_name.to_string()))
         {
-            refresh_state.refreshed_through_volume = refresh_state
-                .refreshed_through_volume
-                .max(refreshed_through_volume);
+            // Per-set refreshes are serialized; exact replacement here is only
+            // safe while that invariant holds. Concurrent refreshes would need
+            // generation/staleness guards before applying computed plans.
+            refresh_state.refreshed_volumes = refreshed_volumes;
             refresh_state.latest_completed_volume = refresh_state
                 .latest_completed_volume
-                .max(refreshed_through_volume);
+                .max(latest_refreshed_volume);
         }
     }
 
@@ -860,17 +861,16 @@ impl Pipeline {
             target_completed_volume,
             reason,
         };
-        let current_plan_through = self
+        let current_plan_volumes: BTreeSet<u32> = self
             .rar_sets
             .get(&key)
             .and_then(|state| state.plan.as_ref())
-            .and_then(|plan| plan.topology.complete_volumes.iter().copied().max())
-            .unwrap_or(0);
+            .map(|plan| plan.topology.complete_volumes.iter().copied().collect())
+            .unwrap_or_default();
         let mut launch = None;
         {
             let state = self.rar_refresh_state.entry(key.clone()).or_default();
-            state.refreshed_through_volume =
-                state.refreshed_through_volume.max(current_plan_through);
+            state.refreshed_volumes = current_plan_volumes;
             state.latest_completed_volume =
                 state.latest_completed_volume.max(target_completed_volume);
             if reason >= RefreshReason::IdentityRebind {
@@ -943,6 +943,12 @@ impl Pipeline {
             }
         };
         let success = error.is_none();
+        let live_fact_volumes: BTreeSet<u32> = self
+            .rar_sets
+            .get(&key)
+            .map(|set_state| set_state.facts.keys().copied().collect())
+            .unwrap_or_default();
+        let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
 
         let mut follow_up = None;
         if let Some(state) = self.rar_refresh_state.get_mut(&key) {
@@ -953,8 +959,16 @@ impl Pipeline {
                 state.last_error = None;
             }
 
-            if let Some(queued) = state.queued.take() {
-                let still_needed = queued.target_completed_volume > state.refreshed_through_volume
+            let coverage_gap = success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
+            if let Some(mut queued) = state.queued.take() {
+                if coverage_gap {
+                    queued.target_completed_volume = queued
+                        .target_completed_volume
+                        .max(state.latest_completed_volume)
+                        .max(latest_live_volume);
+                    queued.reason = queued.reason.max(RefreshReason::CoverageExpansion);
+                }
+                let still_needed = coverage_gap
                     || queued.reason > done.request.reason
                     || state.structure_dirty
                     || !success;
@@ -962,6 +976,16 @@ impl Pipeline {
                     state.in_flight = Some(queued);
                     follow_up = Some(queued);
                 }
+            } else if coverage_gap {
+                let request = RarRefreshRequest {
+                    target_completed_volume: state
+                        .latest_completed_volume
+                        .max(latest_live_volume)
+                        .max(done.request.target_completed_volume),
+                    reason: RefreshReason::CoverageExpansion,
+                };
+                state.in_flight = Some(request);
+                follow_up = Some(request);
             }
 
             if follow_up.is_none() && success {
