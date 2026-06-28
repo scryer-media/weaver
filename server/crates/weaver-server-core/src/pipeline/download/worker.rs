@@ -608,13 +608,13 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let fetch_started = Instant::now();
-            let trace = if exclude_servers.is_empty() {
-                nntp.fetch_body_with_groups_traced(&message_id, &groups)
-                    .await
-            } else {
-                nntp.fetch_body_with_groups_excluding_traced(&message_id, &groups, &exclude_servers)
-                    .await
-            };
+            let trace = nntp
+                .fetch_body_with_groups_prefer_excluding_traced(
+                    &message_id,
+                    &groups,
+                    &exclude_servers,
+                )
+                .await;
             crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
             let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
                 matches!(
@@ -626,7 +626,7 @@ impl Pipeline {
             let data = trace
                 .result
                 .map(DownloadPayload::Raw)
-                .map_err(|e| DownloadError::Fetch(e.to_string()));
+                .map_err(DownloadError::from_nntp);
 
             let _ = tx
                 .send(DownloadResult {
@@ -758,11 +758,10 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Err(DownloadError::Fetch(e)) => {
-                let article_not_found =
-                    e.contains("no such article") || e.contains("article not found");
-
-                if article_not_found && excluded_servers.is_empty() {
+            Err(DownloadError::Fetch(failure)) => {
+                if failure.kind == DownloadFailureKind::ArticleNotFound
+                    && excluded_servers.is_empty()
+                {
                     self.metrics
                         .articles_not_found
                         .fetch_add(1, Ordering::Relaxed);
@@ -787,35 +786,25 @@ impl Pipeline {
                     self.mark_promoted_recovery_segment_unavailable(seg_id);
                     self.check_health(job_id);
                 } else {
-                    // Transient failure — re-queue for retry if under limit.
                     let seg_id = result.segment_id;
-                    let next_retry = result.retry_count + 1;
+                    let capacity_unavailable =
+                        failure.kind == DownloadFailureKind::CapacityUnavailable;
+                    let next_retry = if capacity_unavailable {
+                        result.retry_count
+                    } else {
+                        result.retry_count + 1
+                    };
 
                     if next_retry > MAX_SEGMENT_RETRIES {
                         warn!(
                             segment = %seg_id,
-                            error = %e,
+                            error = %failure.message,
                             retries = MAX_SEGMENT_RETRIES,
                             "segment failed permanently after max retries"
                         );
                         self.metrics
                             .segments_failed_permanent
                             .fetch_add(1, Ordering::Relaxed);
-                        // Track failed bytes for health calculation.
-                        if let Some(state) = self.jobs.get_mut(&job_id) {
-                            let file_idx = seg_id.file_id.file_index as usize;
-                            if let Some(file_spec) = state.spec.files.get(file_idx)
-                                && file_spec.role.counts_toward_health()
-                                && let Some(seg_spec) = file_spec
-                                    .segments
-                                    .iter()
-                                    .find(|s| s.ordinal == seg_id.segment_number)
-                            {
-                                state.failed_bytes += seg_spec.bytes as u64;
-                            }
-                        }
-                        self.mark_promoted_recovery_segment_unavailable(seg_id);
-                        self.check_health(job_id);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)
@@ -838,11 +827,15 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = std::time::Duration::from_secs(1 << (next_retry - 1));
+                            let delay = if capacity_unavailable {
+                                std::time::Duration::from_secs(1)
+                            } else {
+                                std::time::Duration::from_secs(1 << (next_retry - 1))
+                            };
                             self.note_retry_scheduled(seg_id);
                             debug!(
                                 segment = %seg_id,
-                                error = %e,
+                                error = %failure.message,
                                 retry = next_retry,
                                 delay_secs = delay.as_secs(),
                                 "download failed, scheduling retry"
@@ -856,7 +849,7 @@ impl Pipeline {
                     } else {
                         warn!(
                             segment = %seg_id,
-                            error = %e,
+                            error = %failure.message,
                             "download failed (job gone, not retrying)"
                         );
                     }

@@ -422,6 +422,29 @@ impl NntpClient {
         }
     }
 
+    pub async fn fetch_body_with_groups_prefer_excluding_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> FetchBodyTrace {
+        if exclude.is_empty() {
+            return self.fetch_body_with_groups_traced(message_id, groups).await;
+        }
+
+        let preferred = self
+            .fetch_body_with_groups_excluding_traced(message_id, groups, exclude)
+            .await;
+
+        if preferred.attempts.is_empty()
+            && matches!(preferred.result, Err(NntpError::PoolExhausted))
+        {
+            self.fetch_body_with_groups_traced(message_id, groups).await
+        } else {
+            preferred
+        }
+    }
+
     /// Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
     pub async fn fetch_body_decoded_with_groups(
         &self,
@@ -1757,6 +1780,92 @@ mod tests {
         assert!(trace.result.is_ok(), "traced fetch should succeed");
         assert_eq!(trace.attempts.len(), 1);
         assert_eq!(trace.attempts[0].server_idx, 0);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_prefer_excluding_falls_back_when_only_server_excluded() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <exists@example.com>\r\npayload\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let trace = client
+            .fetch_body_with_groups_prefer_excluding_traced(
+                "<exists@example.com>",
+                &[String::from("alt.binaries.test")],
+                &[0],
+            )
+            .await;
+
+        assert!(trace.result.is_ok(), "fallback fetch should succeed");
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].server_idx, 0);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_prefer_excluding_uses_alternate_server_first() {
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <exists@example.com>\r\nbackup\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(1, 0), scripted_server(backup_port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let trace = client
+            .fetch_body_with_groups_prefer_excluding_traced(
+                "<exists@example.com>",
+                &[String::from("alt.binaries.test")],
+                &[0],
+            )
+            .await;
+
+        assert!(trace.result.is_ok(), "alternate fetch should succeed");
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].server_idx, 1);
         assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
     }
 

@@ -203,8 +203,72 @@ pub(super) enum DownloadPayload {
     Raw(Bytes),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DownloadFailureKind {
+    ArticleNotFound,
+    CapacityUnavailable,
+    Transient,
+    Auth,
+    Permanent,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadFailure {
+    pub(super) kind: DownloadFailureKind,
+    pub(super) message: String,
+}
+
+impl DownloadFailure {
+    pub(super) fn new(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
+        use weaver_nntp::NntpError;
+
+        let kind = match &error {
+            NntpError::ArticleNotFound
+            | NntpError::NoSuchArticle { .. }
+            | NntpError::NoArticleWithNumber => DownloadFailureKind::ArticleNotFound,
+            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
+                DownloadFailureKind::CapacityUnavailable
+            }
+            NntpError::AuthenticationFailed
+            | NntpError::AuthenticationRejected
+            | NntpError::AuthenticationRequired
+            | NntpError::AccessDenied => DownloadFailureKind::Auth,
+            NntpError::ServiceUnavailable
+            | NntpError::Timeout
+            | NntpError::SoftTimeout(_)
+            | NntpError::ConnectionClosed
+            | NntpError::ServerDisconnectedMidBody
+            | NntpError::TruncatedMultilineBody
+            | NntpError::MalformedMultilineTerminator
+            | NntpError::Io(_) => DownloadFailureKind::Transient,
+            _ => DownloadFailureKind::Permanent,
+        };
+
+        Self::new(kind, error.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum DownloadError {
-    Fetch(String),
+    Fetch(DownloadFailure),
+}
+
+impl DownloadError {
+    #[cfg(test)]
+    pub(super) fn fetch(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
+        Self::Fetch(DownloadFailure::new(kind, message))
+    }
+
+    pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
+        Self::Fetch(DownloadFailure::from_nntp(error))
+    }
 }
 
 /// Successful download payload waiting for decode scheduling.

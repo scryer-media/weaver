@@ -2777,7 +2777,10 @@ async fn shutdown_drain_consumes_inflight_download_results() {
         .download_done_tx
         .send(DownloadResult {
             segment_id,
-            data: Err(DownloadError::Fetch("shutdown test".to_string())),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::Transient,
+                "shutdown test",
+            )),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: false,
@@ -4009,7 +4012,10 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
                 },
                 segment_number: 0,
             },
-            data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::Transient,
+                "connection reset by peer",
+            )),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: false,
@@ -4027,6 +4033,78 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Downloading)
     );
+}
+
+#[tokio::test]
+async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20013);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Pool Capacity Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::CapacityUnavailable,
+                "no connections available",
+            )),
+            attempts: Vec::new(),
+            source_server_idx: None,
+            is_recovery: false,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: vec![0],
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert!(pipeline.unavailable_promoted_recovery_segments.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("pool capacity miss should requeue without poisoning health");
+    assert_eq!(work.segment_id, segment_id);
+    assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES);
+    assert_eq!(work.exclude_servers, vec![0]);
 }
 
 #[tokio::test]
@@ -4056,7 +4134,10 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
                 },
                 segment_number: 0,
             },
-            data: Err(DownloadError::Fetch("article not found".to_string())),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found",
+            )),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: false,
@@ -4115,7 +4196,10 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
                 },
                 segment_number: 0,
             },
-            data: Err(DownloadError::Fetch("article not found".to_string())),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found",
+            )),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: true,
@@ -4207,7 +4291,10 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 },
                 segment_number: 1,
             },
-            data: Err(DownloadError::Fetch("connection reset by peer".to_string())),
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::Transient,
+                "connection reset by peer",
+            )),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: false,
@@ -5236,7 +5323,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
                 b"not a yenc article",
             ))),
             attempts: Vec::new(),
-            source_server_idx: Some(1),
+            source_server_idx: Some(0),
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
@@ -5257,17 +5344,22 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         panic!("expected decode failure");
     };
     assert_eq!(*failed_segment, segment_id);
-    assert_eq!(*source_server_idx, Some(1));
+    assert_eq!(*source_server_idx, Some(0));
     assert!(exclude_servers.is_empty());
 
     pipeline.handle_decode_done(done).await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
         .try_recv()
         .expect("decode failure should schedule a retry");
-    assert_eq!(work.exclude_servers, vec![1]);
+    assert_eq!(work.exclude_servers, vec![0]);
 }
 
 #[test]
@@ -5287,6 +5379,32 @@ fn decode_retry_exclude_servers_appends_actual_source_server_once() {
     assert_eq!(
         Pipeline::decode_retry_exclude_servers(&[1, 0], None),
         vec![1, 0]
+    );
+}
+
+#[tokio::test]
+async fn repeated_data_decode_failures_mark_failed_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20016);
+    let spec = segmented_job_spec("Repeated Decode Failure", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    for _ in 0..=MAX_SEGMENT_RETRIES {
+        pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    }
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(64)
     );
 }
 
