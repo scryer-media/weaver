@@ -129,6 +129,14 @@ impl RarArchive {
                 );
                 let mut file_header = service.header.inner;
                 file_header.is_encrypted = service.is_encrypted;
+                let ntfs_stream_name = (file_header.name == "STM")
+                    .then(|| {
+                        file_header
+                            .service_subdata
+                            .as_deref()
+                            .map(crate::header::common::decode_utf8_prefix_until_nul)
+                    })
+                    .flatten();
                 ServiceEntry {
                     header_offset: service.header.header_offset,
                     file_header,
@@ -136,6 +144,7 @@ impl RarArchive {
                     file_encryption: service.file_encryption.map(Self::file_encryption_info),
                     hash: service.hash,
                     comment_crc16: None,
+                    ntfs_stream_name,
                     segments: vec![segment],
                 }
             };
@@ -198,7 +207,7 @@ impl RarArchive {
         Self::open_rar4_parsed(reader, password, kdf_cache, ArchiveFormat::Rar14, parsed)
     }
 
-    fn open_rar4_parsed(
+    pub(super) fn open_rar4_parsed(
         reader: Box<dyn ReadSeek>,
         password: Option<&str>,
         kdf_cache: Arc<crate::crypto::KdfCache>,
@@ -261,8 +270,14 @@ impl RarArchive {
                 file_encryption: None,
                 hash: None,
                 comment_crc16: None,
+                ntfs_stream_name: None,
             };
             Self::integrate_service_entry(&mut services, 0, entry);
+        }
+        for old_service in &parsed.old_services {
+            if let Some(entry) = Self::rar4_old_service_to_service_entry(old_service, 0, format) {
+                Self::integrate_service_entry(&mut services, 0, entry);
+            }
         }
         for comment in &parsed.comments {
             let entry = Self::rar4_comment_to_service_entry(comment, 0, format);
@@ -464,12 +479,126 @@ impl RarArchive {
             file_encryption: None,
             hash: None,
             comment_crc16: (format != crate::types::ArchiveFormat::Rar14).then_some(comment.crc16),
+            ntfs_stream_name: None,
             segments: vec![DataSegment::new(
                 volume_index,
                 comment.data_offset,
                 comment.packed_size,
             )],
         }
+    }
+
+    pub(super) fn rar4_old_service_to_service_entry(
+        service: &crate::rar4::types::Rar4OldServiceHeader,
+        volume_index: usize,
+        format: crate::types::ArchiveFormat,
+    ) -> Option<ServiceEntry> {
+        let (
+            name,
+            unpacked_size,
+            unpack_version,
+            method,
+            crc32,
+            ntfs_stream_name,
+            service_subdata,
+            host_os,
+        ) = match &service.data {
+            crate::rar4::types::Rar4OldServiceData::UnixOwner => (
+                "UOW",
+                service.data_size.min(u64::from(u32::MAX)) as u32,
+                0,
+                crate::rar4::types::Rar4Method::Store,
+                None,
+                None,
+                None,
+                crate::types::HostOs::Unix,
+            ),
+            crate::rar4::types::Rar4OldServiceData::NtAcl {
+                unpacked_size,
+                unpack_version,
+                method,
+                crc32,
+            } => (
+                "ACL",
+                *unpacked_size,
+                *unpack_version,
+                *method,
+                Some(*crc32),
+                None,
+                None,
+                crate::types::HostOs::Windows,
+            ),
+            crate::rar4::types::Rar4OldServiceData::Stream {
+                unpacked_size,
+                unpack_version,
+                method,
+                crc32,
+                stream_name,
+                stream_name_raw,
+            } => (
+                "STM",
+                *unpacked_size,
+                *unpack_version,
+                *method,
+                Some(*crc32),
+                Some(stream_name.clone()),
+                Some(stream_name_raw.clone()),
+                crate::types::HostOs::Windows,
+            ),
+            crate::rar4::types::Rar4OldServiceData::Unknown => return None,
+        };
+
+        let method = match method {
+            crate::rar4::types::Rar4Method::Store => CompressionMethod::Store,
+            crate::rar4::types::Rar4Method::Fastest => CompressionMethod::Fastest,
+            crate::rar4::types::Rar4Method::Fast => CompressionMethod::Fast,
+            crate::rar4::types::Rar4Method::Normal => CompressionMethod::Normal,
+            crate::rar4::types::Rar4Method::Good => CompressionMethod::Good,
+            crate::rar4::types::Rar4Method::Best => CompressionMethod::Best,
+            crate::rar4::types::Rar4Method::Unknown(c) => CompressionMethod::Unknown(c),
+        };
+
+        Some(ServiceEntry {
+            header_offset: service.header_offset,
+            file_header: FileHeader {
+                name: name.to_string(),
+                name_raw: Some(name.as_bytes().to_vec()),
+                unpacked_size: Some(u64::from(unpacked_size)),
+                attributes: crate::types::FileAttributes(0),
+                mtime: None,
+                ctime: None,
+                atime: None,
+                data_crc32: crc32,
+                data_hash: None,
+                compression: crate::types::CompressionInfo {
+                    format,
+                    version: unpack_version,
+                    solid: false,
+                    method,
+                    dict_size: 0x10000,
+                },
+                host_os,
+                is_directory: false,
+                file_flags: 0,
+                data_size: service.data_size,
+                split_before: false,
+                split_after: false,
+                data_offset: service.data_offset,
+                is_encrypted: false,
+                version: None,
+                service_subdata,
+            },
+            is_encrypted: false,
+            file_encryption: None,
+            hash: None,
+            comment_crc16: None,
+            ntfs_stream_name,
+            segments: vec![DataSegment::new(
+                volume_index,
+                service.data_offset,
+                service.data_size,
+            )],
+        })
     }
 
     /// Convert a RAR4 file header to the unified FileHeader type.
@@ -514,13 +643,16 @@ impl RarArchive {
             },
             is_directory: fh.is_directory,
             host_os: match fh.host_os {
-                crate::rar4::types::Rar4HostOs::Unix | crate::rar4::types::Rar4HostOs::BeOs => {
-                    crate::types::HostOs::Unix
-                }
-                crate::rar4::types::Rar4HostOs::Windows
-                | crate::rar4::types::Rar4HostOs::MsDos
-                | crate::rar4::types::Rar4HostOs::Os2
-                | crate::rar4::types::Rar4HostOs::MacOs => crate::types::HostOs::Windows,
+                crate::rar4::types::Rar4HostOs::Windows => crate::types::HostOs::Windows,
+                crate::rar4::types::Rar4HostOs::Unix => crate::types::HostOs::Unix,
+                crate::rar4::types::Rar4HostOs::MacOs => crate::types::HostOs::Darwin,
+                // Scryer only needs Darwin/macOS, Linux/Unix, and Windows
+                // behavior. Other RAR4 host ids are legacy archive origins,
+                // not supported extraction targets, so keep them intentionally
+                // unmapped.
+                crate::rar4::types::Rar4HostOs::MsDos => crate::types::HostOs::Unknown(0),
+                crate::rar4::types::Rar4HostOs::Os2 => crate::types::HostOs::Unknown(1),
+                crate::rar4::types::Rar4HostOs::BeOs => crate::types::HostOs::Unknown(5),
                 crate::rar4::types::Rar4HostOs::Unknown(v) => {
                     crate::types::HostOs::Unknown(v as u64)
                 }
@@ -642,6 +774,104 @@ mod tests {
     }
 
     #[test]
+    fn rar4_old_stream_service_becomes_ntfs_stream_entry() {
+        let service = crate::rar4::types::Rar4OldServiceHeader {
+            header_offset: 100,
+            data_offset: 200,
+            data_size: 12,
+            subtype: 2,
+            level: 0,
+            data: crate::rar4::types::Rar4OldServiceData::Stream {
+                unpacked_size: 12,
+                unpack_version: 20,
+                method: crate::rar4::types::Rar4Method::Store,
+                crc32: 0x1234_5678,
+                stream_name: ":stream".to_string(),
+                stream_name_raw: b":stream".to_vec(),
+            },
+        };
+
+        let entry = RarArchive::rar4_old_service_to_service_entry(&service, 2, ArchiveFormat::Rar4)
+            .expect("stream service should convert");
+
+        assert_eq!(entry.file_header.name, "STM");
+        assert_eq!(entry.file_header.data_crc32, Some(0x1234_5678));
+        assert_eq!(entry.file_header.unpacked_size, Some(12));
+        assert_eq!(entry.file_header.compression.version, 20);
+        assert_eq!(
+            entry.file_header.service_subdata.as_deref(),
+            Some(&b":stream"[..])
+        );
+        assert_eq!(entry.ntfs_stream_name.as_deref(), Some(":stream"));
+        assert_eq!(entry.segments[0].volume_index, 2);
+        assert_eq!(entry.segments[0].data_offset, 200);
+    }
+
+    #[test]
+    fn rar4_old_uowner_service_becomes_unix_owner_entry() {
+        let service = crate::rar4::types::Rar4OldServiceHeader {
+            header_offset: 100,
+            data_offset: 200,
+            data_size: 17,
+            subtype: 0x101,
+            level: 0,
+            data: crate::rar4::types::Rar4OldServiceData::UnixOwner,
+        };
+
+        let entry = RarArchive::rar4_old_service_to_service_entry(&service, 2, ArchiveFormat::Rar4)
+            .expect("UOW service should convert");
+
+        assert_eq!(entry.file_header.name, "UOW");
+        assert_eq!(entry.file_header.data_crc32, None);
+        assert_eq!(entry.file_header.unpacked_size, Some(17));
+        assert_eq!(entry.file_header.compression.version, 0);
+        assert_eq!(
+            entry.file_header.compression.method,
+            CompressionMethod::Store
+        );
+        assert_eq!(entry.file_header.host_os, HostOs::Unix);
+        assert_eq!(entry.file_header.service_subdata, None);
+        assert_eq!(entry.ntfs_stream_name, None);
+        assert_eq!(entry.segments[0].volume_index, 2);
+        assert_eq!(entry.segments[0].data_offset, 200);
+        assert_eq!(entry.segments[0].data_size, 17);
+    }
+
+    #[test]
+    fn rar4_old_acl_service_becomes_ntfs_acl_entry() {
+        let service = crate::rar4::types::Rar4OldServiceHeader {
+            header_offset: 100,
+            data_offset: 200,
+            data_size: 12,
+            subtype: 1,
+            level: 0,
+            data: crate::rar4::types::Rar4OldServiceData::NtAcl {
+                unpacked_size: 34,
+                unpack_version: 20,
+                method: crate::rar4::types::Rar4Method::Normal,
+                crc32: 0x1234_5678,
+            },
+        };
+
+        let entry = RarArchive::rar4_old_service_to_service_entry(&service, 2, ArchiveFormat::Rar4)
+            .expect("ACL service should convert");
+
+        assert_eq!(entry.file_header.name, "ACL");
+        assert_eq!(entry.file_header.data_crc32, Some(0x1234_5678));
+        assert_eq!(entry.file_header.unpacked_size, Some(34));
+        assert_eq!(entry.file_header.compression.version, 20);
+        assert_eq!(
+            entry.file_header.compression.method,
+            CompressionMethod::Normal
+        );
+        assert_eq!(entry.file_header.host_os, HostOs::Windows);
+        assert_eq!(entry.file_header.service_subdata, None);
+        assert_eq!(entry.ntfs_stream_name, None);
+        assert_eq!(entry.segments[0].volume_index, 2);
+        assert_eq!(entry.segments[0].data_offset, 200);
+    }
+
+    #[test]
     fn rar4_file_header_conversion_preserves_times_and_version() {
         let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
         let ctime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(20);
@@ -680,10 +910,7 @@ mod tests {
         };
 
         let converted = RarArchive::rar4_to_file_header(&fh, false);
-        assert_eq!(
-            converted.name_raw.as_deref(),
-            Some(&b"report.txt;42"[..])
-        );
+        assert_eq!(converted.name_raw.as_deref(), Some(&b"report.txt;42"[..]));
         assert_eq!(converted.mtime, Some(mtime));
         assert_eq!(converted.ctime, Some(ctime));
         assert_eq!(converted.atime, Some(atime));
@@ -729,27 +956,33 @@ mod tests {
             owner: None,
         };
 
-        for host in [
-            crate::rar4::types::Rar4HostOs::MsDos,
-            crate::rar4::types::Rar4HostOs::Os2,
-            crate::rar4::types::Rar4HostOs::Windows,
-            crate::rar4::types::Rar4HostOs::MacOs,
-        ] {
-            fh.host_os = host;
-            assert_eq!(
-                RarArchive::rar4_to_file_header(&fh, false).host_os,
-                HostOs::Windows
-            );
-        }
+        fh.host_os = crate::rar4::types::Rar4HostOs::Windows;
+        assert_eq!(
+            RarArchive::rar4_to_file_header(&fh, false).host_os,
+            HostOs::Windows
+        );
 
-        for host in [
-            crate::rar4::types::Rar4HostOs::Unix,
-            crate::rar4::types::Rar4HostOs::BeOs,
+        fh.host_os = crate::rar4::types::Rar4HostOs::Unix;
+        assert_eq!(
+            RarArchive::rar4_to_file_header(&fh, false).host_os,
+            HostOs::Unix
+        );
+
+        fh.host_os = crate::rar4::types::Rar4HostOs::MacOs;
+        assert_eq!(
+            RarArchive::rar4_to_file_header(&fh, false).host_os,
+            HostOs::Darwin
+        );
+
+        for (host, expected) in [
+            (crate::rar4::types::Rar4HostOs::MsDos, 0),
+            (crate::rar4::types::Rar4HostOs::Os2, 1),
+            (crate::rar4::types::Rar4HostOs::BeOs, 5),
         ] {
             fh.host_os = host;
             assert_eq!(
                 RarArchive::rar4_to_file_header(&fh, false).host_os,
-                HostOs::Unix
+                HostOs::Unknown(expected)
             );
         }
 

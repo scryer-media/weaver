@@ -73,6 +73,24 @@ fn build_test_rar_file_header(
     unpacked_size: u64,
     data_crc: Option<u32>,
 ) -> Vec<u8> {
+    build_test_rar_file_header_with_extra(
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+    )
+}
+
+fn build_test_rar_file_header_with_extra(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -86,21 +104,28 @@ fn build_test_rar_file_header(
     type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
     type_body.extend_from_slice(filename.as_bytes());
 
+    let mut file_body = Vec::new();
+    file_body.extend_from_slice(&encode_test_rar_vint(data_size));
+    file_body.extend_from_slice(&type_body);
+
+    build_test_rar_header(2, 0x0002 | common_flags_extra, &file_body, extra)
+}
+
+fn build_test_extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
+    let type_bytes = encode_test_rar_vint(record_type);
+    let record_size = type_bytes.len() + body.len();
+    let mut data = Vec::new();
+    data.extend_from_slice(&encode_test_rar_vint(record_size as u64));
+    data.extend_from_slice(&type_bytes);
+    data.extend_from_slice(body);
+    data
+}
+
+fn build_test_file_version_extra(version: u64) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(2));
-    body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
-    body.extend_from_slice(&encode_test_rar_vint(data_size));
-    body.extend_from_slice(&type_body);
-
-    let header_size = body.len() as u64;
-    let header_size_bytes = encode_test_rar_vint(header_size);
-    let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&crc.to_le_bytes());
-    result.extend_from_slice(&header_size_bytes);
-    result.extend_from_slice(&body);
-    result
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&encode_test_rar_vint(version));
+    build_test_extra_record(0x04, &body)
 }
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
@@ -188,6 +213,77 @@ fn push_unique_ready_member_preserves_order_and_dedupes_names() {
         .map(|member| member.name.as_str())
         .collect();
     assert_eq!(names, vec!["E10.mkv", "E11.mkv"]);
+}
+
+#[test]
+fn build_plan_skips_versioned_members_like_unrar_default_extraction() {
+    let payload = b"python launcher\n";
+    let payload_crc = checksum::crc32(payload);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "bin/2to3",
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(payload_crc),
+        &build_test_file_version_extra(1),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        "bin/2to3",
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(payload_crc),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+
+    let archive = RarArchive::open(Cursor::new(bytes.clone())).unwrap();
+    let metadata = archive.metadata();
+    let metadata_names = metadata
+        .members
+        .iter()
+        .map(|member| (member.name.as_str(), member.version))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metadata_names,
+        vec![("bin/2to3;1", Some(1)), ("bin/2to3", None)]
+    );
+
+    let facts = BTreeMap::from([(
+        0,
+        RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap(),
+    )]);
+    let volume_map = HashMap::from([("versioned.rar".to_string(), 0)]);
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(plan.member_names, vec!["bin/2to3"]);
+    assert_eq!(
+        plan.ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bin/2to3"]
+    );
+    assert_eq!(
+        plan.topology
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bin/2to3"]
+    );
 }
 
 #[test]

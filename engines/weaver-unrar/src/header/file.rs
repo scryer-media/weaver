@@ -482,12 +482,13 @@ mod tests {
         assert_eq!(fh.name.len(), MAXPATHSIZE);
         assert!(fh.name.bytes().all(|byte| byte == b'a'));
         assert_eq!(fh.name_raw.as_ref().map(Vec::len), Some(MAXPATHSIZE));
-        assert!(fh
-            .name_raw
-            .as_deref()
-            .unwrap()
-            .iter()
-            .all(|byte| *byte == b'a'));
+        assert!(
+            fh.name_raw
+                .as_deref()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == b'a')
+        );
     }
 
     #[test]

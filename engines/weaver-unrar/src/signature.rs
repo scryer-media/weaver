@@ -25,7 +25,7 @@ pub const RAR4_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 pub const RAR14_SIGNATURE: [u8; 4] = [0x52, 0x45, 0x7E, 0x5E];
 
 /// RAR 1.4 SFX marker checked by UnRAR at absolute offset 28.
-const RAR14_SFX_MARKER: [u8; 4] = [0x52, 0x53, 0x46, 0x58]; // "RSFX"
+pub(crate) const RAR14_SFX_MARKER: [u8; 4] = [0x52, 0x53, 0x46, 0x58]; // "RSFX"
 
 /// Length of the RAR5 signature.
 pub const RAR5_SIGNATURE_LEN: usize = 8;

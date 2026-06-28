@@ -39,6 +39,7 @@ impl DataHash {
 pub enum HostOs {
     Windows,
     Unix,
+    Darwin,
     Unknown(u64),
 }
 
@@ -156,6 +157,7 @@ pub struct UnixOwnerInfo {
     pub gid: Option<u64>,
 }
 
+#[cfg(any(unix, test))]
 impl UnixOwnerInfo {
     pub(crate) fn user_name_bytes(&self) -> Option<&[u8]> {
         self.user_name_raw
@@ -245,7 +247,8 @@ pub struct ArchiveMetadata {
 /// Metadata for embedded recovery records discovered in archive headers.
 ///
 /// This describes RAR4 protect headers and RAR5 `RR` service records. It does
-/// not imply that embedded recovery-record self-repair is implemented.
+/// not feed volume restoration; official UnRAR's `RecVolumesRestore` path also
+/// restores standalone `.rev` volumes rather than consuming embedded RR data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRecordInfo {
     pub format: ArchiveFormat,

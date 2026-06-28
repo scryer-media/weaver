@@ -567,26 +567,25 @@ fn decode_distance(
         });
     }
 
-    let distance = if dist_code < 4 {
-        dist_code
-    } else {
-        let num_bits = (dist_code >> 1) - 1;
-        let base = (2 | (dist_code & 1)) << num_bits;
+    if dist_code < 4 {
+        return Ok(dist_code + 1);
+    }
 
-        if num_bits >= 4 {
-            let high = if num_bits > 4 {
-                (reader.read_bits64((num_bits - 4) as u8)? as usize) << 4
-            } else {
-                0
-            };
-            let low = ldc.decode_bitreader(reader)? as usize;
-            base + high + low
+    let num_bits = (dist_code >> 1) - 1;
+    let distance = if num_bits >= 4 {
+        let high = if num_bits > 4 {
+            reader.read_bits64((num_bits - 4) as u8)? << 4
         } else {
-            base + reader.read_bits64(num_bits as u8)? as usize
-        }
+            0
+        };
+        let low = ldc.decode_bitreader(reader)? as u64;
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, high, low, usize::BITS)?
+    } else {
+        let extra = reader.read_bits64(num_bits as u8)?;
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, extra, 0, usize::BITS)?
     };
 
-    Ok(distance + 1)
+    Ok(distance)
 }
 
 fn adjust_length_for_distance(length: usize, distance: usize) -> usize {
@@ -821,7 +820,7 @@ impl LzDecoder {
 
             if self.pending_filters.is_empty() {
                 if self.window.unflushed_bytes() as usize >= flush_threshold {
-                    self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                    self.flush_unfiltered_stream_output(writer)?;
                 }
             } else {
                 self.flush_filters_and_write(writer)?;
@@ -906,22 +905,18 @@ impl LzDecoder {
                         channels,
                     } => {
                         let ft = FilterType::from_code(filter_type);
-                        self.pending_filters.push(PendingFilter {
-                            filter_type: ft,
-                            block_start: *output_size + block_start_delta,
-                            block_length: block_length as usize,
-                            channels,
-                        });
-
-                        if self.pending_filters.len() > MAX_PENDING_FILTERS {
-                            return Err(RarError::CorruptArchive {
-                                detail: format!(
-                                    "RAR5 pending filter count {} exceeds limit {}",
-                                    self.pending_filters.len(),
-                                    MAX_PENDING_FILTERS
-                                ),
-                            });
-                        }
+                        super::filter::push_pending_filter(
+                            &mut self.pending_filters,
+                            PendingFilter {
+                                filter_type: ft,
+                                block_start: self.current_file_base_total
+                                    + *output_size
+                                    + block_start_delta,
+                                block_length: block_length as usize,
+                                channels,
+                            },
+                            MAX_PENDING_FILTERS,
+                        );
 
                         force_sync = true;
                     }
@@ -933,7 +928,7 @@ impl LzDecoder {
                 } else if produced != 0 {
                     bytes_since_flush += produced;
                     if bytes_since_flush >= flush_threshold {
-                        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                        self.flush_unfiltered_stream_output(writer)?;
                         bytes_since_flush = 0;
                     }
                 }
@@ -1066,6 +1061,13 @@ mod tests {
     }
 
     #[test]
+    fn parallel_distance_finalizer_uses_unrar_32bit_overflow_sentinel() {
+        let distance = super::LzDecoder::distance_from_slot_parts(62, 30, 0, 0, 32).unwrap();
+
+        assert_eq!(distance, u32::MAX as usize);
+    }
+
+    #[test]
     fn parallel_enabled_defaults_on() {
         assert!(parallel_enabled_from_disable_env(None));
     }
@@ -1091,6 +1093,59 @@ mod tests {
         assert!(active[0].is_empty());
         assert!(active[0].capacity() >= DECODED_ITEMS_CAPACITY);
         assert_eq!(active[0].as_ptr(), first_ptr);
+    }
+
+    #[test]
+    fn parallel_apply_keeps_filter_until_future_bytes_arrive() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        let mut output_size = 0u64;
+        let mut out = Vec::new();
+        let all_items = vec![vec![
+            DecodedItem::Filter {
+                filter_type: 7,
+                block_start_delta: 0,
+                block_length: 1,
+                channels: 0,
+            },
+            DecodedItem::Literals {
+                bytes: [b'X', 0, 0, 0, 0, 0, 0, 0],
+                count: 0,
+            },
+        ]];
+
+        decoder
+            .apply_decoded_items_parallel(&all_items, 1, &mut output_size, &mut out)
+            .unwrap();
+
+        assert_eq!(output_size, 1);
+        assert!(out.is_empty());
+        assert!(decoder.pending_filters.is_empty());
+        assert_eq!(decoder.current_file_written_size, 1);
+    }
+
+    #[test]
+    fn parallel_filter_offsets_include_current_file_base_total() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.current_file_base_total = 1_000;
+        let mut output_size = 7u64;
+        let mut out = Vec::new();
+        let all_items = vec![vec![DecodedItem::Filter {
+            filter_type: 1,
+            block_start_delta: 5,
+            block_length: 4,
+            channels: 0,
+        }]];
+
+        decoder
+            .apply_decoded_items_parallel(&all_items, 20, &mut output_size, &mut out)
+            .unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(decoder.pending_filters.len(), 1);
+        assert_eq!(
+            decoder.pending_filters[0].block_start,
+            decoder.current_file_base_total + output_size + 5
+        );
     }
 
     #[test]

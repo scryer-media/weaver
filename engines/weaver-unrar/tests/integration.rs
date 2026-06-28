@@ -4,6 +4,54 @@
 //! that the parser + decompressor produce correct output.
 
 use std::io::Cursor;
+use std::ptr::null_mut;
+
+use aws_lc_sys::{
+    EVP_CIPHER_CTX_free, EVP_CIPHER_CTX_new, EVP_CIPHER_CTX_set_padding, EVP_EncryptInit_ex,
+    EVP_EncryptUpdate, EVP_aes_128_cbc,
+};
+
+fn encrypt_aes128_cbc_for_test(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    assert!(plaintext.len().is_multiple_of(16));
+    assert!(plaintext.len() <= i32::MAX as usize);
+
+    let ctx = unsafe { EVP_CIPHER_CTX_new() };
+    assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
+
+    let init = unsafe {
+        EVP_EncryptInit_ex(
+            ctx,
+            EVP_aes_128_cbc(),
+            null_mut(),
+            key.as_ptr(),
+            iv.as_ptr(),
+        )
+    };
+    assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
+
+    let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
+    assert_eq!(
+        no_padding, 1,
+        "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
+    );
+
+    let mut ciphertext = vec![0u8; plaintext.len()];
+    let mut out_len = 0_i32;
+    let result = unsafe {
+        EVP_EncryptUpdate(
+            ctx,
+            ciphertext.as_mut_ptr(),
+            &mut out_len,
+            plaintext.as_ptr(),
+            plaintext.len() as i32,
+        )
+    };
+    unsafe { EVP_CIPHER_CTX_free(ctx) };
+
+    assert_eq!(result, 1, "aws-lc EVP_EncryptUpdate must succeed");
+    assert_eq!(out_len as usize, plaintext.len());
+    ciphertext
+}
 
 #[cfg(unix)]
 fn current_unix_owner_names() -> Option<(String, String)> {
@@ -984,6 +1032,51 @@ fn test_multivolume_split_after_pack_crc_is_verified() {
 }
 
 #[test]
+fn test_rar5_volume_facts_expose_redirection_target_raw_bytes() {
+    let target_bytes = b"safe\xc0\xaftarget";
+    let mut redirection_body = Vec::new();
+    redirection_body.extend_from_slice(&encode_vint(1)); // Unix symlink.
+    redirection_body.extend_from_slice(&encode_vint(0)); // flags.
+    redirection_body.extend_from_slice(&encode_vint(target_bytes.len() as u64));
+    redirection_body.extend_from_slice(target_bytes);
+    let extra = build_extra_record(0x05, &redirection_body);
+    let archive = build_stored_archive_with_extra("link", b"", &extra);
+
+    let facts = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
+    assert_eq!(facts.members.len(), 1);
+    let member = &facts.members[0];
+    assert_eq!(member.host_os, Some(weaver_unrar::RarVolumeHostOs::Unix));
+    assert_eq!(member.attributes, Some(0o644));
+    assert_eq!(member.redirection_type, Some(1));
+    assert_eq!(member.redirection_target.as_deref(), Some("safe/target"));
+    assert_eq!(
+        member.redirection_target_raw.as_deref(),
+        Some(&b"safe/target"[..])
+    );
+    assert!(!member.redirection_target_is_directory);
+}
+
+#[test]
+fn test_rar5_volume_facts_expose_member_timestamps() {
+    let mtime_secs = 1_700_000_000;
+    let archive = build_stored_rar5_archive_with_metadata(
+        "timed.bin",
+        b"timed content",
+        0o600,
+        Some(mtime_secs),
+        1,
+    );
+
+    let facts = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive), None).unwrap();
+    assert_eq!(facts.members.len(), 1);
+    let member = &facts.members[0];
+    assert_eq!(member.attributes, Some(0o600));
+    assert_eq!(member.mtime_ns, Some(mtime_secs as u64 * 1_000_000_000));
+    assert_eq!(member.ctime_ns, None);
+    assert_eq!(member.atime_ns, None);
+}
+
+#[test]
 fn test_rar5_volume_facts_expose_split_after_pack_crc() {
     let content = b"facts should label split-after CRC as Pack-CRC32";
     let split_at = 24;
@@ -999,7 +1092,10 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
 
     let facts0 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol0), None).unwrap();
     assert_eq!(facts0.members.len(), 1);
-    assert_eq!(facts0.members[0].name_raw.as_deref(), Some(&b"facts.bin"[..]));
+    assert_eq!(
+        facts0.members[0].name_raw.as_deref(),
+        Some(&b"facts.bin"[..])
+    );
     assert!(facts0.members[0].split_after);
     assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
@@ -1008,7 +1104,10 @@ fn test_rar5_volume_facts_expose_split_after_pack_crc() {
 
     let facts1 = weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol1), None).unwrap();
     assert_eq!(facts1.members.len(), 1);
-    assert_eq!(facts1.members[0].name_raw.as_deref(), Some(&b"facts.bin"[..]));
+    assert_eq!(
+        facts1.members[0].name_raw.as_deref(),
+        Some(&b"facts.bin"[..])
+    );
     assert!(!facts1.members[0].split_after);
     assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
     assert_eq!(facts1.members[0].packed_crc32, None);
@@ -1359,6 +1458,16 @@ fn build_rar4_archive_header(arch_flags: u16) -> Vec<u8> {
     finalize_rar4_header_crc(buf)
 }
 
+fn build_rar4_minimal_metadata_header(header_type: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let header_size: u16 = 7;
+    buf.extend_from_slice(&[0x00, 0x00]); // CRC16 placeholder
+    buf.push(header_type);
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&header_size.to_le_bytes());
+    finalize_rar4_header_crc(buf)
+}
+
 /// Build a RAR4 file header with configurable split flags.
 /// Returns the header bytes (no data area included — caller appends data).
 fn build_rar4_file_header(
@@ -1367,6 +1476,24 @@ fn build_rar4_file_header(
     unpacked_size: u32,
     crc32: u32,
     file_flags_extra: u16,
+) -> Vec<u8> {
+    build_rar4_file_header_with_host(
+        filename,
+        packed_size,
+        unpacked_size,
+        crc32,
+        file_flags_extra,
+        3,
+    )
+}
+
+fn build_rar4_file_header_with_host(
+    filename: &str,
+    packed_size: u32,
+    unpacked_size: u32,
+    crc32: u32,
+    file_flags_extra: u16,
+    host_os: u8,
 ) -> Vec<u8> {
     let name_bytes = filename.as_bytes();
     let header_size: u16 = 7 + 25 + name_bytes.len() as u16;
@@ -1380,7 +1507,7 @@ fn build_rar4_file_header(
     buf.extend_from_slice(&header_size.to_le_bytes());
     buf.extend_from_slice(&packed_size.to_le_bytes());
     buf.extend_from_slice(&unpacked_size.to_le_bytes());
-    buf.push(3); // Unix
+    buf.push(host_os);
     buf.extend_from_slice(&crc32.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // datetime
     buf.push(29); // version
@@ -1569,8 +1696,45 @@ fn build_rar4_archive_with_uowner_payload_service(
     vol
 }
 
+fn build_rar4_archive_with_old_uowner_service(
+    filename: &str,
+    content: &[u8],
+    owner: &str,
+    group: &str,
+) -> Vec<u8> {
+    let payload = build_rar4_uowner_subdata(owner, group);
+    let mut vol = Vec::new();
+    vol.extend_from_slice(&RAR4_SIG);
+    vol.extend_from_slice(&build_rar4_archive_header(0));
+    vol.extend_from_slice(&build_rar4_file_header(
+        filename,
+        content.len() as u32,
+        content.len() as u32,
+        crc32fast::hash(content),
+        0,
+    ));
+    vol.extend_from_slice(content);
+    vol.extend_from_slice(&build_rar4_old_service_uowner_header(payload.len() as u32));
+    vol.extend_from_slice(&payload);
+    vol.extend_from_slice(&build_rar4_end_header(false));
+    vol
+}
+
 fn build_rar4_old_comment_header(comment: &[u8], crc16: u16) -> Vec<u8> {
     build_rar4_old_comment_header_ex(comment, comment.len() as u16, 29, 0x30, crc16)
+}
+
+fn build_rar4_old_service_uowner_header(packed_size: u32) -> Vec<u8> {
+    let header_size = 7usize + 4 + 2 + 1;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0x00, 0x00]);
+    buf.push(0x77); // old service header
+    buf.extend_from_slice(&0x8000u16.to_le_bytes()); // HAS_DATA
+    buf.extend_from_slice(&(header_size as u16).to_le_bytes());
+    buf.extend_from_slice(&packed_size.to_le_bytes());
+    buf.extend_from_slice(&0x0101u16.to_le_bytes()); // Unix owner
+    buf.push(0);
+    finalize_rar4_header_crc(buf)
 }
 
 fn build_rar4_old_service_ntacl_header(
@@ -1884,6 +2048,41 @@ fn test_rar4_multivolume_open_volumes() {
 }
 
 #[test]
+fn test_rar4_volume_facts_map_only_supported_host_os_families() {
+    fn archive_with_host(host_os: u8) -> Vec<u8> {
+        let content = b"host-os";
+        let crc = crc32fast::hash(content);
+        let mut vol = Vec::new();
+        vol.extend_from_slice(&RAR4_SIG);
+        vol.extend_from_slice(&build_rar4_archive_header(0));
+        vol.extend_from_slice(&build_rar4_file_header_with_host(
+            "host.txt",
+            content.len() as u32,
+            content.len() as u32,
+            crc,
+            0,
+            host_os,
+        ));
+        vol.extend_from_slice(content);
+        vol.extend_from_slice(&build_rar4_end_header(false));
+        vol
+    }
+
+    let mac_facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(4)), None)
+            .unwrap();
+    assert_eq!(
+        mac_facts.members[0].host_os,
+        Some(weaver_unrar::RarVolumeHostOs::Darwin)
+    );
+
+    let msdos_facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_with_host(0)), None)
+            .unwrap();
+    assert_eq!(msdos_facts.members[0].host_os, None);
+}
+
+#[test]
 fn test_rar4_volume_facts_expose_split_after_pack_crc() {
     let content = b"RAR4 facts expose Pack-CRC32 on split-after headers";
     let split_at = 22;
@@ -1897,6 +2096,11 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
         facts0.members[0].name_raw.as_deref(),
         Some(&b"facts-rar4.bin"[..])
     );
+    assert_eq!(
+        facts0.members[0].host_os,
+        Some(weaver_unrar::RarVolumeHostOs::Unix)
+    );
+    assert_eq!(facts0.members[0].attributes, Some(0));
     assert!(facts0.members[0].split_after);
     assert_eq!(facts0.members[0].data_crc32, Some(first_packed_crc));
     assert_eq!(facts0.members[0].packed_crc32, Some(first_packed_crc));
@@ -1908,6 +2112,11 @@ fn test_rar4_volume_facts_expose_split_after_pack_crc() {
         facts1.members[0].name_raw.as_deref(),
         Some(&b"facts-rar4.bin"[..])
     );
+    assert_eq!(
+        facts1.members[0].host_os,
+        Some(weaver_unrar::RarVolumeHostOs::Unix)
+    );
+    assert_eq!(facts1.members[0].attributes, Some(0));
     assert!(!facts1.members[0].split_after);
     assert_eq!(facts1.members[0].data_crc32, Some(final_crc));
     assert_eq!(facts1.members[0].packed_crc32, None);
@@ -2081,9 +2290,67 @@ fn test_rar4_single_volume_stored() {
 }
 
 #[test]
+fn test_rar4_legacy_av_and_sign_headers_are_skipped() {
+    let content = b"RAR4 stored file after legacy auth headers";
+
+    let mut vol = Vec::new();
+    vol.extend_from_slice(&RAR4_SIG);
+    vol.extend_from_slice(&build_rar4_archive_header(0));
+    // HEAD3_AV and HEAD3_SIGN are legacy authenticity metadata. UnRAR skips
+    // them even when they are not marked SKIP_IF_UNKNOWN, so Weaver must not
+    // reject them as required unknown metadata.
+    vol.extend_from_slice(&build_rar4_minimal_metadata_header(0x76));
+    vol.extend_from_slice(&build_rar4_minimal_metadata_header(0x79));
+
+    let crc = crc32fast::hash(content);
+    vol.extend_from_slice(&build_rar4_file_header(
+        "signed.txt",
+        content.len() as u32,
+        content.len() as u32,
+        crc,
+        0,
+    ));
+    vol.extend_from_slice(content);
+    vol.extend_from_slice(&build_rar4_end_header(false));
+
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(vol.clone()), None).unwrap();
+    assert!(facts.has_authenticity_verification);
+
+    let mut archive = weaver_unrar::RarArchive::open(Cursor::new(vol)).unwrap();
+    assert!(archive.has_authenticity_verification());
+    let result = archive
+        .extract_by_name(
+            "signed.txt",
+            &weaver_unrar::ExtractOptions {
+                verify: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(result, content);
+}
+
+#[test]
 fn test_rar4_uowner_service_attaches_owner_metadata_to_previous_member() {
     let archive_bytes =
         build_rar4_archive_with_uowner_service("owned.txt", b"owned content", "alice", "media");
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
+            .unwrap();
+    assert_eq!(facts.members.len(), 1);
+    let facts_owner = facts.members[0]
+        .owner
+        .as_ref()
+        .expect("RAR4 volume facts should expose inline UOW owner metadata");
+    assert_eq!(facts_owner.user_name.as_deref(), Some("alice"));
+    assert_eq!(facts_owner.group_name.as_deref(), Some("media"));
+    assert_eq!(facts_owner.user_name_raw.as_deref(), Some(&b"alice"[..]));
+    assert_eq!(facts_owner.group_name_raw.as_deref(), Some(&b"media"[..]));
+    assert_eq!(facts_owner.uid, None);
+    assert_eq!(facts_owner.gid, None);
+
     let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let info = archive.member_info(0).unwrap();
@@ -2105,12 +2372,58 @@ fn test_rar4_uowner_payload_service_attaches_owner_metadata_to_previous_member()
         "media",
         None,
     );
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
+            .unwrap();
+    assert_eq!(facts.members.len(), 1);
+    let facts_owner = facts.members[0]
+        .owner
+        .as_ref()
+        .expect("RAR4 volume facts should expose payload UOW owner metadata");
+    assert_eq!(facts_owner.user_name.as_deref(), Some("alice"));
+    assert_eq!(facts_owner.group_name.as_deref(), Some("media"));
+    assert_eq!(facts_owner.user_name_raw.as_deref(), Some(&b"alice"[..]));
+    assert_eq!(facts_owner.group_name_raw.as_deref(), Some(&b"media"[..]));
+    assert_eq!(facts_owner.uid, None);
+    assert_eq!(facts_owner.gid, None);
+
     let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     let info = archive.member_info(0).unwrap();
     let owner = info
         .owner
         .expect("RAR4 UOW payload service should set owner metadata");
+    assert_eq!(owner.user_name.as_deref(), Some("alice"));
+    assert_eq!(owner.group_name.as_deref(), Some("media"));
+    assert_eq!(owner.uid, None);
+    assert_eq!(owner.gid, None);
+}
+
+#[test]
+fn test_rar4_old_uowner_service_attaches_owner_metadata_to_previous_member() {
+    let archive_bytes =
+        build_rar4_archive_with_old_uowner_service("owned.txt", b"owned content", "alice", "media");
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
+            .unwrap();
+    assert_eq!(facts.members.len(), 1);
+    let facts_owner = facts.members[0]
+        .owner
+        .as_ref()
+        .expect("RAR4 volume facts should expose old UOWNER metadata");
+    assert_eq!(facts_owner.user_name.as_deref(), Some("alice"));
+    assert_eq!(facts_owner.group_name.as_deref(), Some("media"));
+    assert_eq!(facts_owner.user_name_raw.as_deref(), Some(&b"alice"[..]));
+    assert_eq!(facts_owner.group_name_raw.as_deref(), Some(&b"media"[..]));
+    assert_eq!(facts_owner.uid, None);
+    assert_eq!(facts_owner.gid, None);
+
+    let archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+    let info = archive.member_info(0).unwrap();
+    let owner = info
+        .owner
+        .expect("RAR4 old UOWNER service should set owner metadata");
     assert_eq!(owner.user_name.as_deref(), Some("alice"));
     assert_eq!(owner.group_name.as_deref(), Some("media"));
     assert_eq!(owner.uid, None);
@@ -2127,6 +2440,11 @@ fn test_rar4_uowner_payload_crc_error_is_optional_metadata() {
         "media",
         Some(0xdead_beef),
     );
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
+            .unwrap();
+    assert!(facts.members[0].owner.is_none());
+
     let mut archive = weaver_unrar::RarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
     assert!(archive.member_info(0).unwrap().owner.is_none());
@@ -2227,19 +2545,10 @@ fn build_rar4_encrypted_file_header(
 }
 
 fn encrypt_rar4_stored_payload(content: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
-    use aes::Aes128;
-    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-
     let padded_len = (content.len() + 15) & !15;
-    let mut ciphertext = vec![0u8; padded_len];
-    ciphertext[..content.len()].copy_from_slice(content);
-    let encryptor = Aes128CbcEnc::new(key.into(), iv.into());
-    encryptor
-        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
-        .unwrap();
-    ciphertext
+    let mut padded = vec![0u8; padded_len];
+    padded[..content.len()].copy_from_slice(content);
+    encrypt_aes128_cbc_for_test(key, iv, &padded)
 }
 
 fn build_rar4_encrypted_stored_archive(
@@ -2531,22 +2840,14 @@ fn test_old_rar_oracle_fixtures_match_unrar_when_available() {
 
 #[test]
 fn test_rar4_encrypted_no_password_fails() {
-    use aes::Aes128;
-    use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-    type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-
     let salt: [u8; 8] = [0xAA; 8];
     let content = b"needs a password";
     let (key, iv) = weaver_unrar::crypto::rar4_derive_key("pass", Some(&salt));
 
     let padded_len = (content.len() + 15) & !15;
-    let mut ciphertext = vec![0u8; padded_len];
-    ciphertext[..content.len()].copy_from_slice(content);
-    let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
-    encryptor
-        .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, padded_len)
-        .unwrap();
+    let mut padded = vec![0u8; padded_len];
+    padded[..content.len()].copy_from_slice(content);
+    let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, &padded);
 
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(content);
@@ -2806,6 +3107,12 @@ fn test_blake2_hash_propagated_to_member_info() {
 
     let archive_bytes = build_stored_archive_with_extra("hashed.bin", b"data", &extra);
 
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes.clone()), None)
+            .unwrap();
+    assert_eq!(facts.members.len(), 1);
+    assert_eq!(facts.members[0].data_blake2_hash, Some(expected_hash));
+
     let cursor = Cursor::new(archive_bytes);
     let archive = weaver_unrar::RarArchive::open(cursor).unwrap();
 
@@ -2817,6 +3124,51 @@ fn test_blake2_hash_propagated_to_member_info() {
         }
         other => panic!("expected Some(Blake2sp(...)), got {other:?}"),
     }
+}
+
+#[test]
+fn test_file_version_propagated_to_volume_facts() {
+    // Extra record type 0x04 = FILE_VERSION.
+    // Body: flags/reserved vint followed by the version vint.
+    let mut version_body = Vec::new();
+    version_body.extend_from_slice(&encode_vint(0));
+    version_body.extend_from_slice(&encode_vint(7));
+    let extra = build_extra_record(0x04, &version_body);
+
+    let archive_bytes = build_stored_archive_with_extra("versioned.bin", b"data", &extra);
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
+
+    assert_eq!(facts.members.len(), 1);
+    assert_eq!(facts.members[0].version, Some(7));
+}
+
+#[test]
+fn test_unix_owner_propagated_to_volume_facts() {
+    // Extra record type 0x06 = UNIX_OWNER.
+    // Flags: user name, group name, numeric uid, numeric gid.
+    let mut owner_body = Vec::new();
+    owner_body.extend_from_slice(&encode_vint(0x0f));
+    owner_body.extend_from_slice(&encode_vint(5));
+    owner_body.extend_from_slice(b"alice");
+    owner_body.extend_from_slice(&encode_vint(10));
+    owner_body.extend_from_slice(b"media\0skip");
+    owner_body.extend_from_slice(&encode_vint(1001));
+    owner_body.extend_from_slice(&encode_vint(1002));
+    let extra = build_extra_record(0x06, &owner_body);
+
+    let archive_bytes = build_stored_archive_with_extra("owned.bin", b"data", &extra);
+    let facts =
+        weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(archive_bytes), None).unwrap();
+
+    assert_eq!(facts.members.len(), 1);
+    let owner = facts.members[0].owner.as_ref().unwrap();
+    assert_eq!(owner.user_name.as_deref(), Some("alice"));
+    assert_eq!(owner.group_name.as_deref(), Some("media"));
+    assert_eq!(owner.user_name_raw.as_deref(), Some(&b"alice"[..]));
+    assert_eq!(owner.group_name_raw.as_deref(), Some(&b"media"[..]));
+    assert_eq!(owner.uid, Some(1001));
+    assert_eq!(owner.gid, Some(1002));
 }
 
 #[test]
@@ -3343,7 +3695,7 @@ fn test_extract_member_to_file_creates_missing_parent_dirs_for_rar5_symlink() {
 
 #[test]
 #[cfg(unix)]
-fn test_extract_member_to_file_restores_rar5_symlink_times() {
+fn test_extract_member_to_file_restores_rar5_symlink_times_like_unrar() {
     let expected_mtime = 1_650_000_111u32;
     let expected_atime = 1_650_000_222u32;
     let mut time_body = Vec::new();

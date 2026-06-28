@@ -3,6 +3,42 @@ use crate::error::YencError;
 use crate::header;
 use crate::types::{DecodeResult, YencMetadata};
 
+/// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RapidyencDecodeState {
+    /// Previous decoded position is at a CRLF line boundary.
+    #[default]
+    CrLf,
+    /// Previous input ended after an escape marker.
+    Eq,
+    /// Previous input ended after a carriage return.
+    Cr,
+    /// No special boundary state is pending.
+    None,
+    /// Previous input ended after a raw `\r\n.` prefix.
+    CrLfDot,
+    /// Previous input ended after a raw `\r\n.\r` prefix.
+    CrLfDotCr,
+    /// Previous input ended after a line-start escape marker.
+    CrLfEq,
+}
+
+/// End marker reported by rapidyenc-style incremental decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RapidyencDecodeEnd {
+    None,
+    Control,
+    Article,
+}
+
+/// Progress reported by rapidyenc-style incremental decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RapidyencDecodeProgress {
+    pub source_consumed: usize,
+    pub bytes_written: usize,
+    pub end: RapidyencDecodeEnd,
+}
+
 /// Options for decoding.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
@@ -36,6 +72,36 @@ pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, Yenc
             dot_unstuffing: true,
         },
     )
+}
+
+/// Decode bytes with rapidyenc's `rapidyenc_decode` semantics.
+pub fn decode_rapidyenc(input: &[u8], output: &mut [u8]) -> Result<usize, YencError> {
+    let mut state = RapidyencDecodeState::default();
+    decode_rapidyenc_ex(true, input, output, &mut state)
+}
+
+/// Decode bytes with rapidyenc's `rapidyenc_decode_ex` semantics.
+pub fn decode_rapidyenc_ex(
+    is_raw: bool,
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut RapidyencDecodeState,
+) -> Result<usize, YencError> {
+    crate::simd::decode_rapidyenc_into(input, output, is_raw, state)
+}
+
+/// Decode bytes with rapidyenc's raw incremental end-detecting semantics.
+pub fn decode_rapidyenc_incremental(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut RapidyencDecodeState,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    let outcome = crate::simd::decode_rapidyenc_incremental_into(input, output, state)?;
+    Ok(RapidyencDecodeProgress {
+        source_consumed: outcome.consumed,
+        bytes_written: outcome.written,
+        end: outcome.end,
+    })
 }
 
 fn validate_ypart_decoded_size(
@@ -552,14 +618,6 @@ mod tests {
 
             if dot_unstuffing && at_crlf && byte == b'.' {
                 src += 1;
-                if src >= input.len() {
-                    break;
-                }
-
-                let next = input[src];
-                if matches!(next, b'\r' | b'\n') {
-                    break;
-                }
                 at_crlf = false;
                 continue;
             }
@@ -856,11 +914,12 @@ mod tests {
 
     #[test]
     fn decode_body_dot_unstuffing_nntp_terminator() {
-        // A line with just "." signals end of NNTP body.
+        // raw rapidyenc-style body decode strips the NNTP terminator's dot
+        // but does not stop; end detection is handled by incremental decode.
         let mut encoded = Vec::new();
         encoded.extend(yenc_encode_byte(b'A'));
         encoded.extend_from_slice(b"\r\n.\r\n");
-        encoded.extend(yenc_encode_byte(b'B')); // should not be decoded
+        encoded.extend(yenc_encode_byte(b'B'));
 
         let mut output = vec![0u8; 64];
         let mut crc = Crc32::new();
@@ -868,8 +927,9 @@ mod tests {
             dot_unstuffing: true,
         };
         let n = decode_body(&encoded, &mut output, &mut crc, opts).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
         assert_eq!(output[0], b'A');
+        assert_eq!(output[1], b'B');
     }
 
     #[test]
@@ -1472,6 +1532,8 @@ mod tests {
                 b'.'.wrapping_sub(42),
                 b'C'.wrapping_sub(42),
                 b'D'.wrapping_sub(42),
+                b'E'.wrapping_sub(42),
+                b'F'.wrapping_sub(42),
             ]
         );
     }
@@ -1490,7 +1552,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(decoded, vec![b'A'.wrapping_sub(42), b'B'.wrapping_sub(42)]);
+            assert_eq!(decoded, reference_decode_body(input, true).unwrap());
         }
     }
 

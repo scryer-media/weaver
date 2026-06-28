@@ -10,7 +10,10 @@ mod parse;
 mod volume;
 
 pub use cache::CachedArchiveHeaders;
-pub use facts::{RarVolumeFacts, RarVolumeMemberFacts, RarVolumeServiceFacts};
+pub use facts::{
+    RarVolumeFacts, RarVolumeHostOs, RarVolumeMemberFacts, RarVolumeServiceFacts,
+    RarVolumeUnixOwnerFacts,
+};
 
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -73,6 +76,7 @@ pub(super) struct ServiceEntry {
     pub(super) file_encryption: Option<FileEncryptionInfo>,
     pub(super) hash: Option<FileHash>,
     pub(super) comment_crc16: Option<u16>,
+    pub(super) ntfs_stream_name: Option<String>,
     pub(super) segments: Vec<DataSegment>,
 }
 
@@ -518,25 +522,25 @@ impl RarArchive {
         let member_name = crate::path::sanitize_member_path(self.format, fh.host_os, &fh.name);
         let (is_symlink, is_hardlink, is_file_copy, link_target, link_target_bytes) =
             match &entry.redirection {
-            Some(redir) => {
-                let is_sym = matches!(
-                    redir.redir_type,
-                    header::RedirectionType::UnixSymlink
-                        | header::RedirectionType::WindowsSymlink
-                        | header::RedirectionType::WindowsJunction
-                );
-                let is_hard = matches!(redir.redir_type, header::RedirectionType::Hardlink);
-                let is_copy = matches!(redir.redir_type, header::RedirectionType::FileCopy);
-                (
-                    is_sym,
-                    is_hard,
-                    is_copy,
-                    Some(redir.target.clone()),
-                    redir.target_raw.clone(),
-                )
-            }
-            None => (rar4_unix_symlink, false, false, None, None),
-        };
+                Some(redir) => {
+                    let is_sym = matches!(
+                        redir.redir_type,
+                        header::RedirectionType::UnixSymlink
+                            | header::RedirectionType::WindowsSymlink
+                            | header::RedirectionType::WindowsJunction
+                    );
+                    let is_hard = matches!(redir.redir_type, header::RedirectionType::Hardlink);
+                    let is_copy = matches!(redir.redir_type, header::RedirectionType::FileCopy);
+                    (
+                        is_sym,
+                        is_hard,
+                        is_copy,
+                        Some(redir.target.clone()),
+                        redir.target_raw.clone(),
+                    )
+                }
+                None => (rar4_unix_symlink, false, false, None, None),
+            };
         MemberInfo {
             name: member_name,
             raw_name: fh.name.clone(),
@@ -792,7 +796,7 @@ mod tests {
         extra_area.extend_from_slice(&encode_main_extra_record(0x02, &metadata));
 
         let archive_bytes = build_rar5_main_header_archive(&extra_area);
-        let archive = RarArchive::open(std::io::Cursor::new(archive_bytes)).unwrap();
+        let archive = RarArchive::open(std::io::Cursor::new(archive_bytes.clone())).unwrap();
         let metadata = archive.metadata();
 
         assert!(metadata.has_recovery_record);
@@ -808,6 +812,22 @@ mod tests {
             metadata.original_creation_time,
             Some(UNIX_EPOCH + Duration::new(1_700_000_123, 456_789_000))
         );
+
+        let facts =
+            RarArchive::parse_volume_facts(std::io::Cursor::new(archive_bytes), None).unwrap();
+        assert!(!facts.is_volume);
+        assert!(facts.has_recovery_record);
+        assert!(!facts.is_locked);
+        assert!(!facts.has_authenticity_verification);
+        assert!(facts.has_locator);
+        assert_eq!(facts.quick_open_offset, Some(8 + 512));
+        assert_eq!(facts.recovery_record_offset, Some(8 + 1024));
+        assert_eq!(facts.original_name.as_deref(), Some("release.rar"));
+        assert_eq!(
+            facts.original_name_raw.as_deref(),
+            Some(&b"release.rar\0"[..])
+        );
+        assert_eq!(facts.original_creation_time_ns, Some(creation_nanos));
     }
 
     #[test]

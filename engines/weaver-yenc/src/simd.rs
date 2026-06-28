@@ -7,14 +7,14 @@
 //! (Public Domain/CC0), especially `decoder.cc`, `decoder_common.h`,
 //! `decoder_avx2_base.h`, and `decoder_neon64.cc`.
 
-use crate::decode::DecodeState;
+use crate::decode::{DecodeState, RapidyencDecodeEnd, RapidyencDecodeState};
 use crate::error::YencError;
 
 #[cfg(target_arch = "x86_64")]
 type DecodeRunFn = fn(&[u8], usize, &mut [u8], usize) -> (usize, usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecoderState {
+pub(crate) enum DecoderState {
     CrLf,
     Eq,
     Cr,
@@ -25,7 +25,7 @@ enum DecoderState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeEnd {
+pub(crate) enum DecodeEnd {
     None,
     Article,
     Control,
@@ -35,6 +35,30 @@ enum DecodeEnd {
 struct KernelState {
     state: DecoderState,
     end: DecodeEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KernelOutcome {
+    pub(crate) consumed: usize,
+    pub(crate) written: usize,
+    pub(crate) end: RapidyencDecodeEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeStepMode {
+    dot_unstuffing: bool,
+    preserve_pending: bool,
+    search_end: bool,
+}
+
+impl From<DecodeEnd> for RapidyencDecodeEnd {
+    fn from(end: DecodeEnd) -> Self {
+        match end {
+            DecodeEnd::None => Self::None,
+            DecodeEnd::Article => Self::Article,
+            DecodeEnd::Control => Self::Control,
+        }
+    }
 }
 
 impl KernelState {
@@ -68,6 +92,22 @@ impl KernelState {
         }
     }
 
+    fn from_rapidyenc_state(state: RapidyencDecodeState) -> Self {
+        let state = match state {
+            RapidyencDecodeState::CrLf => DecoderState::CrLf,
+            RapidyencDecodeState::Eq => DecoderState::Eq,
+            RapidyencDecodeState::Cr => DecoderState::Cr,
+            RapidyencDecodeState::None => DecoderState::None,
+            RapidyencDecodeState::CrLfDot => DecoderState::CrLfDot,
+            RapidyencDecodeState::CrLfDotCr => DecoderState::CrLfDotCr,
+            RapidyencDecodeState::CrLfEq => DecoderState::CrLfEq,
+        };
+        Self {
+            state,
+            end: DecodeEnd::None,
+        }
+    }
+
     fn write_back(self, state: &mut DecodeState) {
         state.escape_pending = matches!(self.state, DecoderState::Eq | DecoderState::CrLfEq);
         state.dot_pending = matches!(self.state, DecoderState::CrLfDot | DecoderState::CrLfDotCr);
@@ -80,6 +120,18 @@ impl KernelState {
                 | DecoderState::CrLfEq
         );
     }
+
+    fn write_back_rapidyenc(self, state: &mut RapidyencDecodeState) {
+        *state = match self.state {
+            DecoderState::CrLf => RapidyencDecodeState::CrLf,
+            DecoderState::Eq => RapidyencDecodeState::Eq,
+            DecoderState::Cr => RapidyencDecodeState::Cr,
+            DecoderState::None => RapidyencDecodeState::None,
+            DecoderState::CrLfDot => RapidyencDecodeState::CrLfDot,
+            DecoderState::CrLfDotCr => RapidyencDecodeState::CrLfDotCr,
+            DecoderState::CrLfEq => RapidyencDecodeState::CrLfEq,
+        };
+    }
 }
 
 /// Decode a complete body buffer with the SIMD-capable internal kernel.
@@ -89,7 +141,7 @@ pub(crate) fn decode_body_into(
     dot_unstuffing: bool,
 ) -> Result<usize, YencError> {
     let mut state = KernelState::body();
-    decode_kernel(input, output, &mut state, dot_unstuffing, false)
+    Ok(decode_kernel(input, output, &mut state, dot_unstuffing, false, false)?.written)
 }
 
 /// Decode one streaming body chunk with carry state preserved across calls.
@@ -100,9 +152,77 @@ pub(crate) fn decode_chunk_into(
     dot_unstuffing: bool,
 ) -> Result<usize, YencError> {
     let mut kernel_state = KernelState::from_decode_state(state);
-    let written = decode_kernel(input, output, &mut kernel_state, dot_unstuffing, true)?;
+    let written = decode_kernel(
+        input,
+        output,
+        &mut kernel_state,
+        dot_unstuffing,
+        true,
+        false,
+    )?
+    .written;
     kernel_state.write_back(state);
     Ok(written)
+}
+
+/// Decode with rapidyenc's `decode_ex` semantics.
+pub(crate) fn decode_rapidyenc_into(
+    input: &[u8],
+    output: &mut [u8],
+    is_raw: bool,
+    state: &mut RapidyencDecodeState,
+) -> Result<usize, YencError> {
+    if input.is_empty() {
+        return Ok(0);
+    }
+
+    let initial_state = match (is_raw, *state) {
+        (false, RapidyencDecodeState::Eq) => RapidyencDecodeState::Eq,
+        (false, _) => RapidyencDecodeState::None,
+        (
+            true,
+            RapidyencDecodeState::CrLfDot
+            | RapidyencDecodeState::CrLfDotCr
+            | RapidyencDecodeState::CrLfEq,
+        ) => RapidyencDecodeState::None,
+        (true, state) => state,
+    };
+    let suppress_pending_raw_cr =
+        is_raw && initial_state == RapidyencDecodeState::Eq && matches!(input, b"\r" | b"\r\n");
+    let mut kernel_state = KernelState::from_rapidyenc_state(initial_state);
+    let mut written = decode_kernel(input, output, &mut kernel_state, is_raw, true, false)?.written;
+    if suppress_pending_raw_cr {
+        written = 0;
+    }
+    if is_raw {
+        *state = match kernel_state.state {
+            DecoderState::CrLfEq => RapidyencDecodeState::Eq,
+            DecoderState::CrLfDot => RapidyencDecodeState::None,
+            _ => {
+                kernel_state.write_back_rapidyenc(state);
+                *state
+            }
+        };
+    } else {
+        *state = if kernel_state.state == DecoderState::Eq {
+            RapidyencDecodeState::Eq
+        } else {
+            RapidyencDecodeState::None
+        };
+    }
+    Ok(written)
+}
+
+/// Decode with rapidyenc's `decode_incremental` semantics.
+pub(crate) fn decode_rapidyenc_incremental_into(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut RapidyencDecodeState,
+) -> Result<KernelOutcome, YencError> {
+    let mut kernel_state = KernelState::from_rapidyenc_state(*state);
+    let outcome = decode_kernel(input, output, &mut kernel_state, true, true, true)?;
+    kernel_state.write_back_rapidyenc(state);
+    Ok(outcome)
 }
 
 fn decode_kernel(
@@ -110,8 +230,9 @@ fn decode_kernel(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vbmi2")
@@ -121,11 +242,27 @@ fn decode_kernel(
             && is_x86_feature_detected!("avx2")
         {
             return unsafe {
-                decode_kernel_avx512_vbmi2(input, output, state, dot_unstuffing, streaming)
+                decode_kernel_avx512_vbmi2(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
             };
         }
         if is_x86_feature_detected!("avx2") {
-            return unsafe { decode_kernel_avx2(input, output, state, dot_unstuffing, streaming) };
+            return unsafe {
+                decode_kernel_avx2(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
+            };
         }
         if is_x86_feature_detected!("avx")
             && is_x86_feature_detected!("popcnt")
@@ -134,31 +271,85 @@ fn decode_kernel(
             && !x86_prefers_ssse3_over_sse41()
             && !x86_prefers_sse2_over_ssse3()
         {
-            return unsafe { decode_kernel_avx(input, output, state, dot_unstuffing, streaming) };
+            return unsafe {
+                decode_kernel_avx(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
+            };
         }
         if is_x86_feature_detected!("sse4.1")
             && is_x86_feature_detected!("ssse3")
             && !x86_prefers_ssse3_over_sse41()
             && !x86_prefers_sse2_over_ssse3()
         {
-            return unsafe { decode_kernel_sse41(input, output, state, dot_unstuffing, streaming) };
+            return unsafe {
+                decode_kernel_sse41(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
+            };
         }
         if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
-            return unsafe { decode_kernel_ssse3(input, output, state, dot_unstuffing, streaming) };
+            return unsafe {
+                decode_kernel_ssse3(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
+            };
         }
         if is_x86_feature_detected!("sse2") {
-            return unsafe { decode_kernel_sse2(input, output, state, dot_unstuffing, streaming) };
+            return unsafe {
+                decode_kernel_sse2(
+                    input,
+                    output,
+                    state,
+                    dot_unstuffing,
+                    preserve_pending,
+                    search_end,
+                )
+            };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { decode_kernel_neon(input, output, state, dot_unstuffing, streaming) }
+        unsafe {
+            decode_kernel_neon(
+                input,
+                output,
+                state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )
+        }
     }
 
     #[cfg(all(target_arch = "arm", target_feature = "neon"))]
     {
-        return unsafe { decode_kernel_arm_neon(input, output, state, dot_unstuffing, streaming) };
+        return unsafe {
+            decode_kernel_arm_neon(
+                input,
+                output,
+                state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )
+        };
     }
 
     #[cfg(not(any(
@@ -166,7 +357,14 @@ fn decode_kernel(
         all(target_arch = "arm", target_feature = "neon")
     )))]
     {
-        decode_kernel_scalar(input, output, state, dot_unstuffing, streaming)
+        decode_kernel_scalar(
+            input,
+            output,
+            state,
+            dot_unstuffing,
+            preserve_pending,
+            search_end,
+        )
     }
 }
 
@@ -182,26 +380,28 @@ fn decode_kernel_scalar(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     let mut src = 0usize;
     let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
 
-    while state.end == DecodeEnd::None && src < input.len() {
-        if !decode_scalar_step(
-            input,
-            &mut src,
-            output,
-            &mut dst,
-            state,
-            dot_unstuffing,
-            streaming,
-        )? {
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
     }
 
-    Ok(dst)
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
 }
 
 fn decode_scalar_step(
@@ -210,9 +410,14 @@ fn decode_scalar_step(
     output: &mut [u8],
     dst: &mut usize,
     state: &mut KernelState,
-    dot_unstuffing: bool,
-    streaming: bool,
+    mode: DecodeStepMode,
 ) -> Result<bool, YencError> {
+    let DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    } = mode;
+
     loop {
         if *src >= input.len() {
             return Ok(false);
@@ -232,7 +437,7 @@ fn decode_scalar_step(
             }
             DecoderState::CrLfEq => {
                 let byte = input[*src];
-                if dot_unstuffing && byte == b'y' {
+                if search_end && dot_unstuffing && byte == b'y' {
                     *src += 1;
                     state.state = DecoderState::None;
                     state.end = DecodeEnd::Control;
@@ -260,18 +465,40 @@ fn decode_scalar_step(
                 match byte {
                     b'\r' => {
                         *src += 1;
-                        state.state = DecoderState::CrLfDotCr;
+                        state.state = if search_end {
+                            DecoderState::CrLfDotCr
+                        } else {
+                            DecoderState::Cr
+                        };
                         return Ok(true);
                     }
                     b'\n' => {
                         *src += 1;
-                        state.state = DecoderState::CrLf;
-                        state.end = DecodeEnd::Article;
-                        return Ok(false);
+                        state.state = DecoderState::None;
+                        return Ok(true);
                     }
-                    b'=' if dot_unstuffing => {
+                    b'=' if dot_unstuffing && search_end => {
                         *src += 1;
                         state.state = DecoderState::CrLfEq;
+                        return Ok(true);
+                    }
+                    b'=' => {
+                        *src += 1;
+                        if *src >= input.len() {
+                            if preserve_pending {
+                                state.state = DecoderState::Eq;
+                                return Ok(false);
+                            }
+                            return Err(YencError::MalformedEscape(src.saturating_sub(1)));
+                        }
+                        let escaped = input[*src];
+                        write_decoded(output, dst, escaped.wrapping_sub(106))?;
+                        *src += 1;
+                        state.state = if dot_unstuffing && escaped == b'\r' {
+                            DecoderState::Cr
+                        } else {
+                            DecoderState::None
+                        };
                         return Ok(true);
                     }
                     b'.' => {
@@ -289,10 +516,13 @@ fn decode_scalar_step(
                 if input[*src] == b'\n' {
                     *src += 1;
                     state.state = DecoderState::CrLf;
-                    state.end = DecodeEnd::Article;
-                    return Ok(false);
+                    if search_end {
+                        state.end = DecodeEnd::Article;
+                        return Ok(false);
+                    }
+                    return Ok(true);
                 }
-                state.state = DecoderState::CrLf;
+                state.state = DecoderState::None;
             }
             DecoderState::CrLf | DecoderState::None => {
                 let at_line_start = state.state == DecoderState::CrLf;
@@ -312,17 +542,13 @@ fn decode_scalar_step(
                     }
                     b'\n' => {
                         *src += 1;
-                        state.state = if at_line_start {
-                            DecoderState::CrLf
-                        } else {
-                            DecoderState::None
-                        };
+                        state.state = DecoderState::None;
                         return Ok(true);
                     }
                     b'=' => {
                         *src += 1;
                         if *src >= input.len() {
-                            if streaming {
+                            if preserve_pending {
                                 state.state = if dot_unstuffing && at_line_start {
                                     DecoderState::CrLfEq
                                 } else {
@@ -332,7 +558,7 @@ fn decode_scalar_step(
                             }
                             return Err(YencError::MalformedEscape(src.saturating_sub(1)));
                         }
-                        if dot_unstuffing && at_line_start && input[*src] == b'y' {
+                        if search_end && dot_unstuffing && at_line_start && input[*src] == b'y' {
                             *src += 1;
                             state.state = DecoderState::None;
                             state.end = DecodeEnd::Control;
@@ -367,15 +593,17 @@ unsafe fn decode_kernel_sse2(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_sse2_block,
         )
     }
@@ -388,15 +616,17 @@ unsafe fn decode_kernel_ssse3(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_ssse3_block,
         )
     }
@@ -409,15 +639,17 @@ unsafe fn decode_kernel_sse41(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_sse41_block,
         )
     }
@@ -430,15 +662,17 @@ unsafe fn decode_kernel_avx(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_avx_block,
         )
     }
@@ -451,15 +685,17 @@ unsafe fn decode_kernel_avx2(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_avx2_block,
         )
     }
@@ -472,15 +708,17 @@ unsafe fn decode_kernel_avx512_vbmi2(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_avx512_vbmi2_block,
         )
     }
@@ -1188,15 +1426,17 @@ unsafe fn decode_kernel_neon(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd64(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_neon_block,
         )
     }
@@ -1208,15 +1448,17 @@ unsafe fn decode_kernel_arm_neon(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
-) -> Result<usize, YencError> {
+    preserve_pending: bool,
+    search_end: bool,
+) -> Result<KernelOutcome, YencError> {
     unsafe {
         decode_kernel_simd32(
             input,
             output,
             state,
             dot_unstuffing,
-            streaming,
+            preserve_pending,
+            search_end,
             try_decode_arm_neon_block,
         )
     }
@@ -1238,13 +1480,19 @@ unsafe fn decode_kernel_simd64(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
+    preserve_pending: bool,
+    search_end: bool,
     block: DecodeBlock64,
-) -> Result<usize, YencError> {
+) -> Result<KernelOutcome, YencError> {
     const WIDTH: usize = 64;
 
     let mut src = 0usize;
     let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
 
     // rapidyenc keeps enough trailing input for scalar epilogue handling so
     // cross-boundary CRLF, dot-stuffing, and end markers remain exact.
@@ -1256,7 +1504,7 @@ unsafe fn decode_kernel_simd64(
     let simd_limit = input.len().saturating_sub(tail_buffer);
 
     if input.len() > WIDTH * 2 {
-        while state.end == DecodeEnd::None && src + WIDTH <= simd_limit {
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
             if let Some(consumed) =
                 unsafe { block(input, src, output, &mut dst, state, dot_unstuffing)? }
             {
@@ -1264,35 +1512,23 @@ unsafe fn decode_kernel_simd64(
                 continue;
             }
 
-            if !decode_scalar_step(
-                input,
-                &mut src,
-                output,
-                &mut dst,
-                state,
-                dot_unstuffing,
-                streaming,
-            )? {
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
                 break;
             }
         }
     }
 
-    while state.end == DecodeEnd::None && src < input.len() {
-        if !decode_scalar_step(
-            input,
-            &mut src,
-            output,
-            &mut dst,
-            state,
-            dot_unstuffing,
-            streaming,
-        )? {
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
     }
 
-    Ok(dst)
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -1311,13 +1547,19 @@ unsafe fn decode_kernel_simd32(
     output: &mut [u8],
     state: &mut KernelState,
     dot_unstuffing: bool,
-    streaming: bool,
+    preserve_pending: bool,
+    search_end: bool,
     block: DecodeBlock32,
-) -> Result<usize, YencError> {
+) -> Result<KernelOutcome, YencError> {
     const WIDTH: usize = 32;
 
     let mut src = 0usize;
     let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
     let tail_buffer = if dot_unstuffing {
         WIDTH - 1 + 4
     } else {
@@ -1326,7 +1568,7 @@ unsafe fn decode_kernel_simd32(
     let simd_limit = input.len().saturating_sub(tail_buffer);
 
     if input.len() > WIDTH * 2 {
-        while state.end == DecodeEnd::None && src + WIDTH <= simd_limit {
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
             if let Some(consumed) =
                 unsafe { block(input, src, output, &mut dst, state, dot_unstuffing)? }
             {
@@ -1334,35 +1576,23 @@ unsafe fn decode_kernel_simd32(
                 continue;
             }
 
-            if !decode_scalar_step(
-                input,
-                &mut src,
-                output,
-                &mut dst,
-                state,
-                dot_unstuffing,
-                streaming,
-            )? {
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
                 break;
             }
         }
     }
 
-    while state.end == DecodeEnd::None && src < input.len() {
-        if !decode_scalar_step(
-            input,
-            &mut src,
-            output,
-            &mut dst,
-            state,
-            dot_unstuffing,
-            streaming,
-        )? {
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }
     }
 
-    Ok(dst)
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -2378,9 +2608,10 @@ mod tests {
             state: initial_state,
             end: DecodeEnd::None,
         };
-        let written =
-            decode_kernel_scalar(input, &mut output, &mut state, dot_unstuffing, false).unwrap();
-        output.truncate(written);
+        let outcome =
+            decode_kernel_scalar(input, &mut output, &mut state, dot_unstuffing, false, true)
+                .unwrap();
+        output.truncate(outcome.written);
         (output, state)
     }
 
@@ -2691,11 +2922,22 @@ mod tests {
         assert!(state.at_line_start);
 
         let n2 = decode_chunk_into(b"yignored", &mut output[n1..], &mut state, true).unwrap();
-        assert_eq!(n2, 0);
+        assert_eq!(n2, 8);
         assert!(!state.escape_pending);
         assert_eq!(
-            &output[..n1],
-            &[b'A'.wrapping_sub(42), b'B'.wrapping_sub(42)]
+            &output[..n1 + n2],
+            &[
+                b'A'.wrapping_sub(42),
+                b'B'.wrapping_sub(42),
+                b'y'.wrapping_sub(106),
+                b'i'.wrapping_sub(42),
+                b'g'.wrapping_sub(42),
+                b'n'.wrapping_sub(42),
+                b'o'.wrapping_sub(42),
+                b'r'.wrapping_sub(42),
+                b'e'.wrapping_sub(42),
+                b'd'.wrapping_sub(42),
+            ]
         );
     }
 

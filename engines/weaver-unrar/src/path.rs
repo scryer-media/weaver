@@ -4,6 +4,7 @@
 //! from file paths extracted from RAR archives.
 
 use crate::types::{ArchiveFormat, HostOs};
+use unicode_normalization::UnicodeNormalization;
 
 /// Sanitize a file path from an archive to prevent path traversal.
 ///
@@ -32,15 +33,79 @@ pub(crate) fn sanitize_file_redirection_path(raw: &str) -> String {
 }
 
 pub(crate) fn sanitize_member_path(format: ArchiveFormat, host_os: HostOs, raw: &str) -> String {
+    sanitize_member_path_for_target(format, host_os, raw, cfg!(windows))
+}
+
+fn sanitize_member_path_for_target(
+    format: ArchiveFormat,
+    host_os: HostOs,
+    raw: &str,
+    target_is_windows: bool,
+) -> String {
     let cleaned = raw.split_once('\0').map_or(raw, |(prefix, _)| prefix);
     let converted = match format {
-        ArchiveFormat::Rar5 if matches!(host_os, HostOs::Windows) => cleaned.replace('\\', "_"),
+        ArchiveFormat::Rar5 if target_is_windows || matches!(host_os, HostOs::Windows) => {
+            cleaned.replace('\\', "_")
+        }
         ArchiveFormat::Rar5 => cleaned.to_string(),
         ArchiveFormat::Rar4 | ArchiveFormat::Rar14 => cleaned.replace('\\', "/"),
     };
 
-    let start = unrar_convert_path_start(&converted, cfg!(windows));
-    converted[start..].to_string()
+    let start = unrar_convert_path_start(&converted, target_is_windows);
+    let mut sanitized = converted[start..].to_string();
+    if target_is_windows {
+        sanitized = sanitized.replace(':', "_");
+        if matches!(host_os, HostOs::Unix | HostOs::Darwin) {
+            sanitized = sanitized.nfc().collect();
+        }
+        sanitized = make_windows_member_name_compatible(&sanitized);
+    }
+    sanitized
+}
+
+fn make_windows_member_name_compatible(path: &str) -> String {
+    let mut converted = String::with_capacity(path.len());
+    for (idx, component) in path.split('/').enumerate() {
+        if idx != 0 {
+            converted.push('/');
+        }
+        converted.push_str(&make_windows_component_compatible(component));
+    }
+    converted
+}
+
+fn make_windows_component_compatible(component: &str) -> String {
+    let mut converted: String = component
+        .chars()
+        .map(|ch| {
+            if ch < '\u{20}' || matches!(ch, '?' | '*' | '<' | '>' | '|' | '"' | ':') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+
+    if !matches!(converted.as_str(), "." | "..")
+        && converted.ends_with(['.', ' '])
+        && let Some((idx, _)) = converted.char_indices().next_back()
+    {
+        converted.replace_range(idx.., "_");
+    }
+
+    if windows_reserved_device_component(&converted) {
+        converted.insert(0, '_');
+    }
+
+    converted
+}
+
+fn windows_reserved_device_component(component: &str) -> bool {
+    let upper = component.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
 }
 
 fn unrar_convert_path_start(path: &str, strip_drive_specs: bool) -> usize {
@@ -399,6 +464,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_member_names_replace_colon_to_avoid_ntfs_streams_like_unrar() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Unix,
+                "dir:name/file.txt",
+                true
+            ),
+            "dir_name/file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Darwin,
+                "dir\\literal.txt",
+                true
+            ),
+            "dir_literal.txt"
+        );
+    }
+
+    #[test]
+    fn windows_member_names_precompose_unix_origin_unicode_like_unrar() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Unix,
+                "Cafe\u{301}/resume\u{301}.txt",
+                true,
+            ),
+            "Caf\u{e9}/resum\u{e9}.txt"
+        );
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Darwin,
+                "A\u{30a}.txt",
+                true,
+            ),
+            "\u{c5}.txt"
+        );
+    }
+
+    #[test]
+    fn windows_member_names_do_not_precompose_windows_origin_unicode_like_unrar() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Windows,
+                "Cafe\u{301}.txt",
+                true,
+            ),
+            "Cafe\u{301}.txt"
+        );
+    }
+
+    #[test]
+    fn windows_member_names_replace_incompatible_chars_like_unrar_fallback() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Unix,
+                "bad?name*/a<b>|c\"d\u{1f}.txt",
+                true,
+            ),
+            "bad_name_/a_b__c_d_.txt"
+        );
+    }
+
+    #[test]
+    fn windows_member_names_replace_trailing_dot_or_space_like_unrar() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Unix,
+                "dir./file .txt/trailing./space ",
+                true,
+            ),
+            "dir_/file .txt/trailing_/space_"
+        );
+        assert_eq!(
+            sanitize_member_path_for_target(ArchiveFormat::Rar5, HostOs::Unix, "././file", true,),
+            "file"
+        );
+        assert_eq!(
+            make_windows_member_name_compatible("./../still"),
+            "./../still"
+        );
+    }
+
+    #[test]
+    fn windows_member_names_prefix_pure_reserved_devices_like_unrar() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Unix,
+                "aux/COM1/Lpt9",
+                true,
+            ),
+            "_aux/_COM1/_Lpt9"
+        );
+        assert_eq!(
+            sanitize_member_path_for_target(ArchiveFormat::Rar5, HostOs::Unix, "aux.txt", true,),
+            "aux.txt"
+        );
+    }
+
+    #[test]
+    fn windows_member_drive_prefix_is_stripped_before_colon_replacement() {
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar5,
+                HostOs::Windows,
+                "C:/dir/file.txt",
+                true
+            ),
+            "dir/file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path_for_target(
+                ArchiveFormat::Rar4,
+                HostOs::Windows,
+                "C:\\dir\\file.txt",
+                true
+            ),
+            "dir/file.txt"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn member_drive_prefix_is_relative_like_unrar_on_unix() {
@@ -429,6 +624,10 @@ mod tests {
     fn rar5_unix_member_backslash_remains_literal_like_unrar_on_unix() {
         assert_eq!(
             sanitize_member_path(ArchiveFormat::Rar5, HostOs::Unix, "dir\\file.txt"),
+            "dir\\file.txt"
+        );
+        assert_eq!(
+            sanitize_member_path(ArchiveFormat::Rar5, HostOs::Darwin, "dir\\file.txt"),
             "dir\\file.txt"
         );
     }

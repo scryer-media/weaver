@@ -13,9 +13,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
-
-use crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX;
+use crate::crypto::{CRYPT5_KDF_LG2_COUNT_MAX, sha256_digest};
 use crate::error::RarResult;
 use crate::types::{FileHash, UnixOwnerInfo};
 
@@ -126,7 +124,7 @@ fn read_raw_u64_lossy(data: &[u8], pos: &mut usize) -> u64 {
 }
 
 fn validated_password_check(check_data: [u8; 12]) -> Option<[u8; 12]> {
-    let digest = Sha256::digest(&check_data[..8]);
+    let digest = sha256_digest(&check_data[..8]);
     (digest[..4] == check_data[8..12]).then_some(check_data)
 }
 
@@ -453,6 +451,7 @@ pub fn blake2_hash(records: &[ExtraRecord]) -> Option<FileHash> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::sha256_digest;
     use crate::vint::encode_vint;
 
     fn build_extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
@@ -468,7 +467,7 @@ mod tests {
     #[test]
     fn test_parse_encryption_record() {
         let password_check = [0x55; 8];
-        let checksum: [u8; 4] = Sha256::digest(password_check)[..4].try_into().unwrap();
+        let checksum: [u8; 4] = sha256_digest(&password_check)[..4].try_into().unwrap();
 
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(0));

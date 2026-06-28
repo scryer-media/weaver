@@ -1,4 +1,4 @@
-//! `weaver-unrar` -- Pure Rust RAR archive reader and extractor.
+//! `weaver-unrar` -- RAR archive reader and extractor.
 //!
 //! This crate provides reading, decompression, and extraction of existing RAR
 //! archives only. It intentionally exposes no archive writer, builder, or
@@ -9,28 +9,28 @@
 //! - Metadata extraction (header-only mode)
 //! - Store (method 0) extraction with CRC32 verification
 //! - Multi-volume topology tracking
-//! - Detection of encrypted archives (returns clear error)
-//! - RAR4 archive support (header parsing, store extraction)
+//! - Detection and extraction of supported encrypted archives
+//! - RAR4 archive support, including legacy RAR 1.5/2.0/2.9 decompression
 //! - SFX (self-extracting) archive support
-//! - AES-256-CBC decryption with PBKDF2 key derivation
+//! - AES decryption with UnRAR-compatible key derivation
 //! - LZ decompression (methods 1-5) with Huffman decoding and sliding window
 //! - PPMd decompression (variant H)
 //! - Post-decompression filters (Delta, E8, E8E9, ARM)
 //! - Path sanitization to prevent traversal attacks
 
-#[cfg(all(
-    feature = "native-crypto",
-    not(any(
-        all(target_arch = "x86_64", target_os = "macos"),
-        all(target_arch = "aarch64", target_os = "macos"),
-        all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
-        all(target_arch = "aarch64", target_os = "linux", target_env = "musl"),
-        all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
-        all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
-    ))
-))]
+// Scryer's supported extraction targets are Darwin/macOS, Linux/Unix, and
+// Windows. Other RAR host OS values may be listed in metadata, but they do not
+// need AWS-LC target support here.
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_os = "macos",
+        target_os = "linux",
+        all(target_os = "windows", target_env = "msvc")
+    )
+)))]
 compile_error!(
-    "weaver-unrar native-crypto only supports x86_64/aarch64 on macOS, Linux musl, and Windows MSVC"
+    "weaver-unrar AWS-LC crypto only supports x86_64/aarch64 on macOS, Linux, and Windows MSVC"
 );
 
 pub mod archive;
@@ -53,8 +53,8 @@ pub mod volume;
 
 // Re-export primary public API types
 pub use archive::{
-    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeMemberFacts,
-    RarVolumeServiceFacts, ReadSeek,
+    CachedArchiveHeaders, DataSegment, RarArchive, RarVolumeFacts, RarVolumeHostOs,
+    RarVolumeMemberFacts, RarVolumeServiceFacts, RarVolumeUnixOwnerFacts, ReadSeek,
 };
 pub use early::{EncryptionStatus, detect_encryption};
 pub use error::{RarError, RarResult};

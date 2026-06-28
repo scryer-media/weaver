@@ -11,12 +11,14 @@ pub enum Rar4HeaderType {
     File,
     /// Comment header (0x75).
     Comment,
-    /// Extra info header (0x76).
+    /// Old authenticity verification header (HEAD3_AV / 0x76).
     Extra,
     /// Sub-block header (0x77).
     Sub,
     /// Recovery record (0x78).
     Recovery,
+    /// Old authenticity signature header (HEAD3_SIGN / 0x79).
+    Sign,
     /// New-style sub-header (0x7A) — comments, NTFS timestamps, ACL, streams.
     NewSub,
     /// End of archive header (0x7B).
@@ -35,6 +37,7 @@ impl From<u8> for Rar4HeaderType {
             0x76 => Self::Extra,
             0x77 => Self::Sub,
             0x78 => Self::Recovery,
+            0x79 => Self::Sign,
             0x7A => Self::NewSub,
             0x7B => Self::EndArchive,
             other => Self::Unknown(other),
@@ -203,6 +206,7 @@ pub struct Rar4CommentHeader {
 /// Old RAR 2.9 service subtype (`HEAD3_OLDSERVICE` / 0x77).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rar4OldServiceData {
+    UnixOwner,
     NtAcl {
         unpacked_size: u32,
         unpack_version: u8,
@@ -332,6 +336,8 @@ mod tests {
         assert_eq!(Rar4HeaderType::from(0x72), Rar4HeaderType::Mark);
         assert_eq!(Rar4HeaderType::from(0x73), Rar4HeaderType::Archive);
         assert_eq!(Rar4HeaderType::from(0x74), Rar4HeaderType::File);
+        assert_eq!(Rar4HeaderType::from(0x76), Rar4HeaderType::Extra);
+        assert_eq!(Rar4HeaderType::from(0x79), Rar4HeaderType::Sign);
         assert_eq!(Rar4HeaderType::from(0x7B), Rar4HeaderType::EndArchive);
         assert!(matches!(
             Rar4HeaderType::from(0xFF),

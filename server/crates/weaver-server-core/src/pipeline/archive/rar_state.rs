@@ -4,7 +4,8 @@ use std::sync::Arc;
 use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
 use weaver_unrar::{
-    RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache, sanitize_path,
+    MemberInfo, RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache,
+    sanitize_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,12 @@ fn push_unique_ready_member(
 fn sort_dedup(values: &mut Vec<String>) {
     values.sort();
     values.dedup();
+}
+
+fn is_default_extract_member(member: &MemberInfo) -> bool {
+    // UnRAR's default extraction mode skips versioned file records. They remain
+    // visible in listings, but require explicit version-control selection.
+    !member.is_directory && member.version.is_none()
 }
 
 #[derive(Default)]
@@ -260,7 +267,7 @@ pub(crate) fn build_plan(
         });
     }
     for member in &metadata.members {
-        if member.is_directory {
+        if !is_default_extract_member(member) {
             continue;
         }
         member_names.push(member.name.clone());
@@ -343,7 +350,7 @@ pub(crate) fn build_plan(
     let mut ready_member_names = HashSet::new();
     if metadata.is_solid {
         for member in &metadata.members {
-            if member.is_directory || extracted.contains(&member.name) {
+            if !is_default_extract_member(member) || extracted.contains(&member.name) {
                 continue;
             }
             let extractable = planner_states
@@ -366,7 +373,7 @@ pub(crate) fn build_plan(
         }
     } else {
         for member in &metadata.members {
-            if member.is_directory
+            if !is_default_extract_member(member)
                 || extracted.contains(&member.name)
                 || failed.contains(&member.name)
             {

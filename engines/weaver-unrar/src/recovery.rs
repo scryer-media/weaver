@@ -214,7 +214,9 @@ fn restore_rar5(
     let data_volumes = first
         .data_volumes
         .as_ref()
-        .expect("selected RAR5 recovery header has data volume metadata");
+        .ok_or_else(|| RarError::CorruptArchive {
+            detail: "RAR5 recovery set is missing data volume metadata".into(),
+        })?;
 
     let mut data_slots = data_volumes
         .iter()
@@ -1005,8 +1007,10 @@ fn reconstruct_rar3(
                 let mut column = (0..total_count)
                     .map(|idx| buffers[idx][pos])
                     .collect::<Vec<_>>();
-                let mut coder = Rar3RsCoder::new(rec_count)
-                    .expect("rec_count was validated before RAR3 reconstruction");
+                let mut coder =
+                    Rar3RsCoder::new(rec_count).ok_or_else(|| RarError::CorruptArchive {
+                        detail: "RAR3 recovery set has invalid recovery count".into(),
+                    })?;
                 if !coder.decode(&mut column, &erasures) {
                     return Err(RarError::CorruptArchive {
                         detail: "RAR3 recovery decoder failed".into(),

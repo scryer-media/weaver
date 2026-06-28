@@ -12,6 +12,7 @@
 //! - 271-298: inline length codes with extra bits (distance from DD/LDD tables)
 
 use std::io::Write;
+use std::sync::OnceLock;
 
 use tracing::trace;
 
@@ -21,6 +22,11 @@ use super::lz::window::Window;
 use super::ppmd::model::Model;
 use super::ppmd::range::{BitReadRangeDecoder, RangeCode};
 use crate::error::{RarError, RarResult};
+
+fn rar4_debug_filters_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some())
+}
 
 /// RAR4 Huffman table sizes.
 const NC: usize = 299; // Literal/Length codes
@@ -156,6 +162,8 @@ pub struct Rar4LzDecoder {
     last_vm_filter: usize,
     /// Absolute window position where the current file started.
     current_file_base_total: u64,
+    /// UnRAR's `WrittenFileSize` for RAR3 VM filter R6.
+    current_file_written_size: u64,
 }
 
 impl Rar4LzDecoder {
@@ -188,6 +196,7 @@ impl Rar4LzDecoder {
             pending_vm_filters: Vec::new(),
             last_vm_filter: 0,
             current_file_base_total: 0,
+            current_file_written_size: 0,
         })
     }
 
@@ -215,6 +224,7 @@ impl Rar4LzDecoder {
     fn begin_file_decode(&mut self) {
         self.pending_vm_filters.clear();
         self.current_file_base_total = self.window.total_written();
+        self.current_file_written_size = 0;
         self.window.mark_flushed(self.current_file_base_total);
     }
 
@@ -346,7 +356,7 @@ impl Rar4LzDecoder {
         }
 
         let new_filter = filter_pos == self.vm_filters.len();
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 add_vm_code: first_byte=0x{first_byte:02x} filter_pos={filter_pos} new={new_filter} bits_remaining={}",
                 vm_reader.bits_remaining()
@@ -358,7 +368,7 @@ impl Rar4LzDecoder {
         if (first_byte & 0x40) != 0 {
             block_start = block_start.saturating_add(258);
         }
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 add_vm_code block_start={block_start} bits_remaining={}",
                 vm_reader.bits_remaining()
@@ -377,7 +387,7 @@ impl Rar4LzDecoder {
         } else {
             0
         };
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 add_vm_code block_length={block_length} bits_remaining={}",
                 vm_reader.bits_remaining()
@@ -388,7 +398,7 @@ impl Rar4LzDecoder {
         init_regs[4] = block_length as u32;
         if (first_byte & 0x10) != 0 {
             let init_mask = vm_reader.read_bits(7)? as u8;
-            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+            if rar4_debug_filters_enabled() {
                 eprintln!(
                     "RAR4 add_vm_code init_mask=0x{init_mask:02x} bits_remaining={}",
                     vm_reader.bits_remaining()
@@ -404,7 +414,7 @@ impl Rar4LzDecoder {
         let filter_type = if new_filter {
             let code_size =
                 Self::vm_u32_to_usize(Self::read_vm_data(&mut vm_reader)?, "VM code size")?;
-            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+            if rar4_debug_filters_enabled() {
                 eprintln!(
                     "RAR4 add_vm_code code_size={code_size} bits_remaining={}",
                     vm_reader.bits_remaining()
@@ -431,7 +441,7 @@ impl Rar4LzDecoder {
         };
 
         self.last_vm_filter = filter_pos;
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 filter: output_size={output_size} start={} len={} type={:?} base={}",
                 block_start, block_length, filter_type, self.current_file_base_total
@@ -472,11 +482,11 @@ impl Rar4LzDecoder {
 
     fn execute_standard_filter(
         filter: &Rar4PendingVmFilter,
-        file_base_total: u64,
+        written_file_size: u64,
         data: &mut Vec<u8>,
     ) -> RarResult<()> {
         let data_size = data.len();
-        let file_offset = (filter.block_start_total - file_base_total) as u32;
+        let file_offset = written_file_size as u32;
 
         match filter.filter_type {
             Rar4StandardFilter::None => {}
@@ -692,16 +702,9 @@ impl Rar4LzDecoder {
             let total_written = self.window.total_written();
 
             if self.pending_vm_filters.is_empty() {
-                if total_written > written_border {
-                    self.window
-                        .write_range_to_writer(
-                            written_border,
-                            (total_written - written_border) as usize,
-                            writer,
-                        )
-                        .map_err(RarError::Io)?;
-                    self.window.mark_flushed(total_written);
-                }
+                let written = self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.current_file_written_size =
+                    self.current_file_written_size.saturating_add(written);
                 return Ok(());
             }
 
@@ -716,13 +719,15 @@ impl Rar4LzDecoder {
 
             let raw_len = next_start.saturating_sub(written_border);
             if raw_len > 0 {
-                if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                if rar4_debug_filters_enabled() {
                     eprintln!("RAR4 flush prefix: [{written_border}, {next_start}) len={raw_len}");
                 }
-                self.window
-                    .write_range_to_writer(written_border, raw_len as usize, writer)
+                let written = self
+                    .window
+                    .flush_visible_until(next_start, writer)
                     .map_err(RarError::Io)?;
-                self.window.mark_flushed(next_start);
+                self.current_file_written_size =
+                    self.current_file_written_size.saturating_add(written);
                 continue;
             }
 
@@ -734,17 +739,16 @@ impl Rar4LzDecoder {
                         detail: "RAR4: VM filter block end overflow".into(),
                     })?;
             if block_end > total_written {
-                if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                if rar4_debug_filters_enabled() {
                     eprintln!(
                         "RAR4 defer filter: [{next_start}, {block_end}) total={total_written} final={final_flush}"
                     );
                 }
                 if final_flush {
-                    return Err(RarError::CorruptArchive {
-                        detail: format!(
-                            "RAR4: VM filter block [{next_start}, {block_end}) is incomplete at EOF"
-                        ),
-                    });
+                    // UnRAR leaves the write border at the incomplete filter
+                    // and returns, so damaged streams surface later through
+                    // size/CRC validation instead of a filter-specific error.
+                    return Ok(());
                 }
                 return Ok(());
             }
@@ -770,15 +774,22 @@ impl Rar4LzDecoder {
                 if filter.filter_type == Rar4StandardFilter::None {
                     data.clear();
                 } else {
-                    Self::execute_standard_filter(filter, self.current_file_base_total, &mut data)?;
+                    Self::execute_standard_filter(
+                        filter,
+                        self.current_file_written_size,
+                        &mut data,
+                    )?;
                 }
                 chain_len += 1;
             }
 
-            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+            if rar4_debug_filters_enabled() {
                 eprintln!("RAR4 flush filter: [{next_start}, {block_end}) chain_len={chain_len}");
             }
             writer.write_all(&data).map_err(RarError::Io)?;
+            self.current_file_written_size = self
+                .current_file_written_size
+                .saturating_add(data.len() as u64);
             self.window.mark_flushed(block_end);
             self.pending_vm_filters.drain(..chain_len);
         }
@@ -1119,7 +1130,11 @@ impl Rar4LzDecoder {
 
             let byte_pos = reader.byte_position() as u64;
             let next_boundary = {
-                let guard = shared_transitions.lock().unwrap();
+                let guard = shared_transitions
+                    .lock()
+                    .map_err(|_| RarError::CorruptArchive {
+                        detail: "RAR4 volume transition state is poisoned".into(),
+                    })?;
                 guard.get(boundary_idx).cloned()
             };
 
@@ -1176,7 +1191,7 @@ impl Rar4LzDecoder {
                            total_written: u64|
          -> RarResult<HuffmanTable> {
             HuffmanTable::build(lengths).map_err(|err| {
-                if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                if rar4_debug_filters_enabled() {
                     eprintln!(
                         "RAR4 invalid {name} table at total_written={total_written}: lengths={lengths:?}"
                     );
@@ -1189,7 +1204,7 @@ impl Rar4LzDecoder {
 
         // Align to byte boundary.
         reader.align_byte()?;
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             let total_written = self.window.total_written();
             if (39_000_000..=41_000_000).contains(&total_written) {
                 let bitfield = reader.peek_16_left_aligned()?;
@@ -1257,7 +1272,7 @@ impl Rar4LzDecoder {
             i += 1;
         }
         let bc_table = build_table("BC", &bc_lengths, self.window.total_written())?;
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             let total_written = self.window.total_written();
             if (39_000_000..=41_000_000).contains(&total_written) {
                 eprintln!("RAR4 read_tables total_written={total_written} BC={bc_lengths:?}");
@@ -1415,7 +1430,7 @@ impl Rar4LzDecoder {
                 should_check_yield = true;
             } else if number == 256 {
                 // End of block.
-                if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                if rar4_debug_filters_enabled() {
                     eprintln!(
                         "RAR4 end_of_block: output_size={output_size} bits_remaining={}",
                         reader.bits_remaining()
@@ -1598,7 +1613,7 @@ impl Rar4LzDecoder {
         let bit = reader.read_bits(1)?;
         if bit != 0 {
             // "1" — no new file, new table immediately.
-            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+            if rar4_debug_filters_enabled() {
                 eprintln!(
                     "RAR4 read_end_of_block: immediate_table total_written={} bits_remaining={}",
                     self.window.total_written(),
@@ -1616,7 +1631,7 @@ impl Rar4LzDecoder {
         }
         let new_table_bit = reader.read_bits(1)?;
         self.tables_read = new_table_bit == 0;
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 read_end_of_block: new_file total_written={} new_table_bit={} tables_read={} bits_remaining={}",
                 self.window.total_written(),
@@ -1630,7 +1645,7 @@ impl Rar4LzDecoder {
 
     /// Read VM filter code (symbol 257) and queue a standard filter block.
     fn read_vm_code<R: BitRead>(&mut self, reader: &mut R, output_size: u64) -> RarResult<()> {
-        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+        if rar4_debug_filters_enabled() {
             eprintln!(
                 "RAR4 read_vm_code: output_size={output_size} bits_remaining={}",
                 reader.bits_remaining()
@@ -1737,7 +1752,7 @@ impl Rar4LzDecoder {
 
                 let Some(ch) = model.decode_char_result(&mut rc)? else {
                     // Corrupt PPM data — switch to LZ mode.
-                    if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                    if rar4_debug_filters_enabled() {
                         eprintln!("RAR4 PPM decode_char=-1 at output_size={output_size}");
                         if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
                             let bytes = self
@@ -1768,7 +1783,7 @@ impl Rar4LzDecoder {
                     // Escape sequence — decode the command byte.
                     let model = self.ppm_model_mut()?;
                     let Some(next_ch) = model.decode_char_result(&mut rc)? else {
-                        if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                        if rar4_debug_filters_enabled() {
                             eprintln!("RAR4 PPM next_ch=-1 at output_size={output_size}");
                             if let Some(path) = std::env::var_os("WEAVER_RAR4_DEBUG_DUMP_PATH") {
                                 let bytes = self
@@ -1797,14 +1812,14 @@ impl Rar4LzDecoder {
 
                     match next_ch {
                         0 => {
-                            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                            if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM switch_to_lz at output_size={output_size}");
                             }
                             switch_to_lz_tables = true;
                             break;
                         }
                         2 => {
-                            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                            if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM end_of_file at output_size={output_size}");
                             }
                             break;
@@ -1833,7 +1848,7 @@ impl Rar4LzDecoder {
                                 self.block_type = BlockType::Lz;
                                 break;
                             }
-                            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                            if rar4_debug_filters_enabled() {
                                 eprintln!(
                                     "RAR4 PPM lz_copy at output_size={output_size} distance={} length={}",
                                     distance + 2,
@@ -1855,7 +1870,7 @@ impl Rar4LzDecoder {
                                 self.block_type = BlockType::Lz;
                                 break;
                             };
-                            if std::env::var_os("WEAVER_RAR4_DEBUG_FILTERS").is_some() {
+                            if rar4_debug_filters_enabled() {
                                 eprintln!(
                                     "RAR4 PPM rle_copy at output_size={output_size} length={}",
                                     usize::from(len_byte) + 4
@@ -1922,6 +1937,7 @@ impl Rar4LzDecoder {
         self.prev_low_dist = 0;
         self.pending_vm_filters.clear();
         self.current_file_base_total = self.window.total_written();
+        self.current_file_written_size = 0;
     }
 
     /// Reset the decoder for a new non-solid file.
@@ -1943,6 +1959,7 @@ impl Rar4LzDecoder {
         self.pending_vm_filters.clear();
         self.last_vm_filter = 0;
         self.current_file_base_total = 0;
+        self.current_file_written_size = 0;
         self.window.reset();
     }
 }
@@ -2075,7 +2092,10 @@ mod tests {
     fn test_insert_old_dist() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.insert_old_dist(100);
-        assert_eq!(decoder.dist_cache, [100, usize::MAX, usize::MAX, usize::MAX]);
+        assert_eq!(
+            decoder.dist_cache,
+            [100, usize::MAX, usize::MAX, usize::MAX]
+        );
         decoder.insert_old_dist(200);
         assert_eq!(decoder.dist_cache, [200, 100, usize::MAX, usize::MAX]);
         decoder.insert_old_dist(300);
@@ -2227,6 +2247,102 @@ mod tests {
             .flush_ready_output_to_writer(&mut out, true)
             .unwrap();
         assert_eq!(out, vec![0xAA, 0xBB, 0xE8, 97, 0, 0, 0]);
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    #[test]
+    fn test_filter_flush_respects_hidden_match_tail() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"ABCD");
+        decoder.window.mark_flushed(4);
+        // The test pre-marks ABCD as flushed, so mirror UnRAR's
+        // WrittenFileSize for those already-emitted bytes.
+        decoder.current_file_written_size = 4;
+        decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
+        decoder.window.put_bytes(&[0xE8, 100, 0, 0, 0]);
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 8,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, vec![b'A', b'B', 0xE8, 93, 0, 0, 0]);
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    #[test]
+    fn test_filterless_flush_respects_hidden_match_tail() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"ABCD");
+        decoder.window.mark_flushed(4);
+        decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"AB");
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    #[test]
+    fn test_incomplete_final_vm_filter_defers_like_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"abcdef");
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 3,
+            block_length: 4,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"abc");
+        assert_eq!(decoder.window.total_flushed(), 3);
+        assert_eq!(decoder.pending_vm_filters.len(), 1);
+    }
+
+    #[test]
+    fn test_none_vm_filter_emits_zero_bytes_like_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"prefixBLOCKsuffix");
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::None,
+            block_start_total: 6,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"prefixsuffix");
         assert_eq!(
             decoder.window.total_flushed(),
             decoder.window.total_written()
@@ -2522,5 +2638,82 @@ mod tests {
         assert_eq!(decoder.vm_filters.len(), 1);
         assert_eq!(decoder.vm_filters[0].filter_type, Rar4StandardFilter::None);
         assert_eq!(decoder.vm_filters[0].last_block_length, 0);
+    }
+
+    #[test]
+    fn test_custom_vm_program_becomes_none_filter_like_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        // first_byte: new filter definition with explicit block length.
+        // VM data: slot=0, start=0, length=1, code_size=1, code=[0].
+        // The one-byte program is not one of UnRAR's standard-filter programs.
+        decoder
+            .add_vm_code(0xA0, &[0x00, 0x00, 0x41, 0x00], 0)
+            .unwrap();
+
+        assert_eq!(decoder.vm_filters.len(), 1);
+        assert_eq!(decoder.vm_filters[0].filter_type, Rar4StandardFilter::None);
+        assert_eq!(decoder.pending_vm_filters.len(), 1);
+        assert_eq!(
+            decoder.pending_vm_filters[0].filter_type,
+            Rar4StandardFilter::None
+        );
+    }
+
+    #[test]
+    fn test_custom_vm_program_suppresses_filtered_block_like_current_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"ABCD");
+
+        // Current official UnRAR's rarvm.cpp only executes recognized standard
+        // filters. Non-standard bytecode remains VMSF_NONE, leaving
+        // FilteredDataSize == 0, so the covered block is suppressed.
+        decoder
+            .add_vm_code(0xA0, &[0x00, 0x00, 0x41, 0x00], 0)
+            .unwrap();
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, b"BCD");
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+    }
+
+    #[test]
+    fn test_vm_filter_file_offset_uses_filtered_written_size_after_suppressed_block() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        decoder.begin_file_decode();
+        decoder.window.put_bytes(b"XXXXX");
+        decoder.window.put_bytes(&[0xE8, 100, 0, 0, 0]);
+
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::None,
+            block_start_total: 0,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+        decoder.pending_vm_filters.push(Rar4PendingVmFilter {
+            filter_type: Rar4StandardFilter::E8,
+            block_start_total: 5,
+            block_length: 5,
+            init_regs: [0; 7],
+        });
+
+        let mut out = Vec::new();
+        decoder
+            .flush_ready_output_to_writer(&mut out, true)
+            .unwrap();
+
+        assert_eq!(out, vec![0xE8, 99, 0, 0, 0]);
+        assert_eq!(decoder.current_file_written_size, 5);
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
     }
 }

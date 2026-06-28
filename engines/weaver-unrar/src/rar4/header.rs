@@ -10,7 +10,7 @@
 //! Reference: RAR 4.x technical note, libarchive (BSD).
 
 use std::io::{Read, Seek, SeekFrom};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use tracing::warn;
 
@@ -84,6 +84,7 @@ impl<'a> RawCursor<'a> {
     }
 }
 
+const OLD_SERVICE_UOWNER: u16 = 0x101;
 const OLD_SERVICE_NTACL: u16 = 0x104;
 const OLD_SERVICE_STREAM: u16 = 0x105;
 const MAX_STREAM_NAME20: usize = 260;
@@ -115,40 +116,7 @@ pub(crate) fn checksum14_update(mut crc: u16, data: &[u8]) -> u16 {
 }
 
 fn dos_datetime_to_system_time(dos_dt: u32) -> Option<SystemTime> {
-    let time_part = (dos_dt & 0xFFFF) as u16;
-    let date_part = (dos_dt >> 16) as u16;
-
-    let second = ((time_part & 0x1F) * 2) as u32;
-    let minute = ((time_part >> 5) & 0x3F) as u32;
-    let hour = ((time_part >> 11) & 0x1F) as u32;
-
-    let day = (date_part & 0x1F) as u32;
-    let month = ((date_part >> 5) & 0x0F) as u32;
-    let year = ((date_part >> 9) & 0x7F) as u32 + 1980;
-
-    if day == 0 || month == 0 || month > 12 || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-
-    let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = |y: u32| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-
-    let mut total_days: i64 = 0;
-    for y in 1970..year {
-        total_days += if is_leap(y) { 366 } else { 365 };
-    }
-    for m in 1..month {
-        total_days += days_in_month[m as usize];
-        if m == 2 && is_leap(year) {
-            total_days += 1;
-        }
-    }
-    total_days += (day - 1) as i64;
-
-    let total_seconds =
-        total_days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
-
-    Some(UNIX_EPOCH + Duration::from_secs(total_seconds as u64))
+    super::dos_datetime_to_system_time(dos_dt)
 }
 
 fn parse_extended_times(
@@ -321,7 +289,9 @@ pub fn parse_archive_header(raw: &RawRar4Header) -> RarResult<Rar4ArchiveHeader>
         is_encrypted: raw.flags & archive_flags::ENCRYPTED_HEADERS != 0,
         has_recovery_record: raw.flags & archive_flags::RECOVERY != 0,
         is_locked: raw.flags & archive_flags::LOCK != 0,
-        has_authenticity_verification: raw.flags & archive_flags::AUTH != 0,
+        has_authenticity_verification: raw.flags & archive_flags::AUTH != 0
+            || high_pos_av != 0
+            || pos_av != 0,
         is_first_volume: raw.flags & archive_flags::FIRST_VOLUME != 0,
         high_pos_av,
         pos_av,
@@ -705,6 +675,7 @@ pub fn parse_old_service_header(raw: &RawRar4Header) -> RarResult<Rar4OldService
     let subtype = cursor.get2();
     let level = cursor.get1();
     let service_data = match subtype {
+        OLD_SERVICE_UOWNER => Rar4OldServiceData::UnixOwner,
         OLD_SERVICE_NTACL => Rar4OldServiceData::NtAcl {
             unpacked_size: cursor.get4(),
             unpack_version: cursor.get1(),
@@ -1067,6 +1038,7 @@ mod tests {
         assert_eq!(arch.high_pos_av, 0x1234);
         assert_eq!(arch.pos_av, 0x5678_9abc);
         assert!(arch.is_signed);
+        assert!(arch.has_authenticity_verification);
     }
 
     #[test]
@@ -1183,6 +1155,24 @@ mod tests {
                 crc32: 0xAABB_CCDD,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_old_service_uowner_like_unrar() {
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&17u32.to_le_bytes());
+        extra.extend_from_slice(&OLD_SERVICE_UOWNER.to_le_bytes());
+        extra.push(0);
+
+        let data = build_raw_header(0x77, common_flags::HAS_DATA, &extra);
+        let mut cursor = Cursor::new(data);
+        let raw = read_raw_header(&mut cursor).unwrap().unwrap();
+        let old = parse_old_service_header(&raw).unwrap();
+
+        assert_eq!(old.data_size, 17);
+        assert_eq!(old.subtype, OLD_SERVICE_UOWNER);
+        assert_eq!(old.level, 0);
+        assert_eq!(old.data, Rar4OldServiceData::UnixOwner);
     }
 
     #[test]

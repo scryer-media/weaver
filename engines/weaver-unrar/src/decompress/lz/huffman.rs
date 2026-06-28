@@ -207,10 +207,6 @@ impl HuffmanTable {
     /// table, fall back to linear threshold scan.
     #[inline(always)]
     pub fn decode<R: BitRead>(&self, reader: &mut R) -> RarResult<u16> {
-        if self.max_length == 0 {
-            return Err(RarError::InvalidHuffmanTable);
-        }
-
         // Peek 16 left-aligned bits (or fewer if near end of stream), matching
         // unrar's `getbits() & 0xfffe` hot path.
         let bit_field = reader.peek_16_left_aligned()?;
@@ -235,10 +231,6 @@ impl HuffmanTable {
     /// unrar's `getbits()` / `addbits()` control flow as directly as possible.
     #[inline(always)]
     pub fn decode_bitreader(&self, reader: &mut BitReader<'_>) -> RarResult<u16> {
-        if self.max_length == 0 {
-            return Err(RarError::InvalidHuffmanTable);
-        }
-
         let bit_field = reader.getbits()?;
         let quick_bits = self.quick_bits as usize;
 
@@ -607,13 +599,20 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_table_decode_fails() {
-        // Decoding from an empty table should fail
+    fn test_empty_table_decode_matches_unrar_zero_symbol_recovery() {
+        // UnRAR keeps all-zero tables for damaged archives. DecodeNumber
+        // consumes the 15-bit slow path, clamps out-of-range positions to 0,
+        // and returns DecodeNum[0], which is zero-initialized.
         let lengths = [0u8; 8];
         let table = HuffmanTable::build(&lengths).unwrap();
-        let data = [0xFF];
+        let data = [0xFF, 0xFF];
         let mut reader = BitReader::new(&data);
-        assert!(table.decode(&mut reader).is_err());
+        assert_eq!(table.decode(&mut reader).unwrap(), 0);
+        assert_eq!(reader.position(), 15);
+
+        let mut reader = BitReader::new(&data);
+        assert_eq!(table.decode_bitreader(&mut reader).unwrap(), 0);
+        assert_eq!(reader.position(), 15);
     }
 
     #[test]

@@ -470,7 +470,7 @@ impl Rar20Decoder {
             &mut reader,
             unpacked_size,
             first_volume_index,
-            |idx| boundaries.get(idx).cloned(),
+            |idx| Ok(boundaries.get(idx).cloned()),
             writer_factory,
         )
     }
@@ -491,7 +491,14 @@ impl Rar20Decoder {
             &mut reader,
             unpacked_size,
             first_volume_index,
-            |idx| shared_transitions.lock().unwrap().get(idx).cloned(),
+            |idx| {
+                shared_transitions
+                    .lock()
+                    .map_err(|_| RarError::CorruptArchive {
+                        detail: "RAR old-format volume transition state is poisoned".into(),
+                    })
+                    .map(|guard| guard.get(idx).cloned())
+            },
             writer_factory,
         )
     }
@@ -506,7 +513,7 @@ impl Rar20Decoder {
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
-        G: FnMut(usize) -> Option<super::VolumeTransition>,
+        G: FnMut(usize) -> RarResult<Option<super::VolumeTransition>>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -535,7 +542,7 @@ impl Rar20Decoder {
             chunk_bytes += output_size - prev;
 
             if pending_boundary_volume.is_none()
-                && let Some(boundary) = boundary_at(boundary_idx)
+                && let Some(boundary) = boundary_at(boundary_idx)?
                 && reader.byte_position() as u64 >= boundary.compressed_offset
             {
                 pending_boundary_volume = Some(boundary.volume_index);
@@ -1074,7 +1081,7 @@ impl Rar15Decoder {
             &mut reader,
             unpacked_size,
             first_volume_index,
-            |idx| boundaries.get(idx).cloned(),
+            |idx| Ok(boundaries.get(idx).cloned()),
             writer_factory,
         )
     }
@@ -1095,7 +1102,14 @@ impl Rar15Decoder {
             &mut reader,
             unpacked_size,
             first_volume_index,
-            |idx| shared_transitions.lock().unwrap().get(idx).cloned(),
+            |idx| {
+                shared_transitions
+                    .lock()
+                    .map_err(|_| RarError::CorruptArchive {
+                        detail: "RAR old-format volume transition state is poisoned".into(),
+                    })
+                    .map(|guard| guard.get(idx).cloned())
+            },
             writer_factory,
         )
     }
@@ -1110,7 +1124,7 @@ impl Rar15Decoder {
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
-        G: FnMut(usize) -> Option<super::VolumeTransition>,
+        G: FnMut(usize) -> RarResult<Option<super::VolumeTransition>>,
     {
         if unpacked_size == 0 {
             return Ok(Vec::new());
@@ -1139,7 +1153,7 @@ impl Rar15Decoder {
             chunk_bytes += output_size - prev;
 
             if pending_boundary_volume.is_none()
-                && let Some(boundary) = boundary_at(boundary_idx)
+                && let Some(boundary) = boundary_at(boundary_idx)?
                 && reader.byte_position() as u64 >= boundary.compressed_offset
             {
                 pending_boundary_volume = Some(boundary.volume_index);

@@ -13,60 +13,29 @@
 
 use std::borrow::Cow;
 use std::io::Read;
+use std::ptr::null_mut;
 use std::sync::Mutex;
 
-#[cfg(not(feature = "native-crypto"))]
-use aes::cipher::{Block, BlockModeDecrypt, BlockSizeUser};
-#[cfg(not(feature = "native-crypto"))]
-use aes::{Aes128, Aes256};
-#[cfg(feature = "native-crypto")]
-use aws_lc_rs::hmac as aws_hmac;
-#[cfg(feature = "native-crypto")]
+use aws_lc_rs::{digest as aws_digest, hmac as aws_hmac};
 use aws_lc_sys::{
     EVP_CIPHER, EVP_CIPHER_CTX, EVP_CIPHER_CTX_free, EVP_CIPHER_CTX_new,
     EVP_CIPHER_CTX_set_padding, EVP_DecryptInit_ex, EVP_DecryptUpdate, EVP_aes_128_cbc,
     EVP_aes_256_cbc,
 };
+#[cfg(test)]
+use aws_lc_sys::{EVP_EncryptInit_ex, EVP_EncryptUpdate};
 use blake2s_simd::blake2sp;
-#[cfg(not(feature = "native-crypto"))]
-use cbc::cipher::KeyIvInit;
-use hmac::digest::KeyInit;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-#[cfg(feature = "native-crypto")]
-use std::ptr::null_mut;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::error::{RarError, RarResult};
 use crate::rar4::types::Rar4EncryptionMethod;
 
-#[cfg(not(feature = "native-crypto"))]
-type Aes256CbcDec = cbc::Decryptor<Aes256>;
-#[cfg(not(feature = "native-crypto"))]
-type Aes128CbcDec = cbc::Decryptor<Aes128>;
-type HmacSha256 = Hmac<Sha256>;
-
 pub const CRYPT5_KDF_LG2_COUNT_MAX: u8 = 24;
 
-#[cfg_attr(feature = "native-crypto", allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RarCryptoBackend {
-    RustCrypto,
-    #[cfg(feature = "native-crypto")]
-    NativeAwsLc,
-}
-
-const fn default_rar_crypto_backend() -> RarCryptoBackend {
-    #[cfg(feature = "native-crypto")]
-    {
-        RarCryptoBackend::NativeAwsLc
-    }
-    #[cfg(not(feature = "native-crypto"))]
-    {
-        RarCryptoBackend::RustCrypto
-    }
-}
+/// RAR standard crypto uses AWS-LC on Scryer's supported targets. RAR4's
+/// custom RAR29 SHA-1 KDF and legacy RAR 1.5/2.0 ciphers are UnRAR-specific
+/// algorithms, so they stay as local reference ports.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rar5KeyMaterial {
@@ -83,16 +52,16 @@ impl Drop for Rar5KeyMaterial {
     }
 }
 
-fn hmac_sha256_rustcrypto(password: &HmacSha256, data: &[u8]) -> [u8; 32] {
-    let mut mac = password.clone();
-    mac.update(data);
-    mac.finalize().into_bytes().into()
-}
-
-#[cfg(feature = "native-crypto")]
-fn hmac_sha256_native(password: &aws_hmac::Key, data: &[u8]) -> [u8; 32] {
+fn hmac_sha256_aws_lc(password: &aws_hmac::Key, data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(aws_hmac::sign(password, data).as_ref());
+    out
+}
+
+pub(crate) fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let digest = aws_digest::digest(&aws_digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
     out
 }
 
@@ -119,68 +88,41 @@ fn rar_password_compat(password: &str) -> Cow<'_, str> {
     Cow::Borrowed(password)
 }
 
-fn derive_rar5_material_rustcrypto(
-    password: &str,
-    salt: &[u8; 16],
-    kdf_count: u8,
-) -> RarResult<Rar5KeyMaterial> {
-    if kdf_count > CRYPT5_KDF_LG2_COUNT_MAX {
-        return Err(RarError::UnsupportedEncryptionKdf {
-            count: kdf_count,
-            max: CRYPT5_KDF_LG2_COUNT_MAX,
-        });
+const CP437_HIGH_CODEPOINTS: [u16; 128] = [
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7, 0x00EA, 0x00EB, 0x00E8, 0x00EF,
+    0x00EE, 0x00EC, 0x00C4, 0x00C5, 0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
+    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192, 0x00E1, 0x00ED, 0x00F3, 0x00FA,
+    0x00F1, 0x00D1, 0x00AA, 0x00BA, 0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557,
+    0x255D, 0x255C, 0x255B, 0x2510, 0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
+    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567, 0x2568, 0x2564, 0x2565, 0x2559,
+    0x2558, 0x2552, 0x2553, 0x256B, 0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4, 0x03A6, 0x0398, 0x03A9, 0x03B4,
+    0x221E, 0x03C6, 0x03B5, 0x2229, 0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
+    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+];
+
+fn encode_cp437_char(ch: char) -> u8 {
+    let codepoint = ch as u32;
+    if codepoint <= 0x7f {
+        return codepoint as u8;
     }
 
-    let count = 1u32 << kdf_count;
-    let password = rar_password_compat(password);
-    let password_mac = <HmacSha256 as KeyInit>::new_from_slice(password.as_bytes())
-        .expect("HMAC accepts arbitrary keys");
-
-    let mut salt_block = [0u8; 20];
-    salt_block[..salt.len()].copy_from_slice(salt);
-    salt_block[19] = 1;
-
-    let mut u = hmac_sha256_rustcrypto(&password_mac, &salt_block);
-    let mut fn_value = u;
-
-    let mut key = [0u8; 32];
-    let mut hash_key = [0u8; 32];
-    let mut psw_check_value = [0u8; 32];
-
-    for (rounds, output) in [
-        (count.saturating_sub(1), &mut key),
-        (16, &mut hash_key),
-        (16, &mut psw_check_value),
-    ] {
-        for _ in 0..rounds {
-            u = hmac_sha256_rustcrypto(&password_mac, &u);
-            for (acc, next) in fn_value.iter_mut().zip(u.iter()) {
-                *acc ^= *next;
-            }
-        }
-        *output = fn_value;
-    }
-
-    let mut psw_check = fold_password_check(&psw_check_value);
-    let material = Rar5KeyMaterial {
-        key,
-        hash_key,
-        psw_check,
-    };
-
-    salt_block.zeroize();
-    u.zeroize();
-    fn_value.zeroize();
-    key.zeroize();
-    hash_key.zeroize();
-    psw_check_value.zeroize();
-    psw_check.zeroize();
-
-    Ok(material)
+    CP437_HIGH_CODEPOINTS
+        .iter()
+        .position(|&mapped| u32::from(mapped) == codepoint)
+        .map(|index| 0x80u8 + index as u8)
+        .unwrap_or(b'?')
 }
 
-#[cfg(feature = "native-crypto")]
-fn derive_rar5_material_native(
+fn rar_password_oem_bytes_compat(password: &str) -> Vec<u8> {
+    rar_password_compat(password)
+        .chars()
+        .map(encode_cp437_char)
+        .collect()
+}
+
+pub fn derive_rar5_material(
     password: &str,
     salt: &[u8; 16],
     kdf_count: u8,
@@ -200,7 +142,7 @@ fn derive_rar5_material_native(
     salt_block[..salt.len()].copy_from_slice(salt);
     salt_block[19] = 1;
 
-    let mut u = hmac_sha256_native(&password_mac, &salt_block);
+    let mut u = hmac_sha256_aws_lc(&password_mac, &salt_block);
     let mut fn_value = u;
 
     let mut key = [0u8; 32];
@@ -213,7 +155,7 @@ fn derive_rar5_material_native(
         (16, &mut psw_check_value),
     ] {
         for _ in 0..rounds {
-            u = hmac_sha256_native(&password_mac, &u);
+            u = hmac_sha256_aws_lc(&password_mac, &u);
             for (acc, next) in fn_value.iter_mut().zip(u.iter()) {
                 *acc ^= *next;
             }
@@ -237,27 +179,6 @@ fn derive_rar5_material_native(
     psw_check.zeroize();
 
     Ok(material)
-}
-
-fn derive_rar5_material_with_backend(
-    backend: RarCryptoBackend,
-    password: &str,
-    salt: &[u8; 16],
-    kdf_count: u8,
-) -> RarResult<Rar5KeyMaterial> {
-    match backend {
-        RarCryptoBackend::RustCrypto => derive_rar5_material_rustcrypto(password, salt, kdf_count),
-        #[cfg(feature = "native-crypto")]
-        RarCryptoBackend::NativeAwsLc => derive_rar5_material_native(password, salt, kdf_count),
-    }
-}
-
-pub fn derive_rar5_material(
-    password: &str,
-    salt: &[u8; 16],
-    kdf_count: u8,
-) -> RarResult<Rar5KeyMaterial> {
-    derive_rar5_material_with_backend(default_rar_crypto_backend(), password, salt, kdf_count)
 }
 
 /// Derive AES-256 key from password and salt using PBKDF2-HMAC-SHA256.
@@ -338,17 +259,10 @@ fn password_check_matches(psw_check: &[u8; 8], check_data: &[u8; 12]) -> bool {
 }
 
 pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
-    let digest = match default_rar_crypto_backend() {
-        RarCryptoBackend::RustCrypto => hmac_sha256_rustcrypto(
-            &<HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts arbitrary keys"),
-            &value.to_le_bytes(),
-        ),
-        #[cfg(feature = "native-crypto")]
-        RarCryptoBackend::NativeAwsLc => hmac_sha256_native(
-            &aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key),
-            &value.to_le_bytes(),
-        ),
-    };
+    let digest = hmac_sha256_aws_lc(
+        &aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key),
+        &value.to_le_bytes(),
+    );
     let mut mac = 0u32;
     for (index, byte) in digest.iter().copied().enumerate() {
         mac ^= (byte as u32) << ((index & 3) * 8);
@@ -357,16 +271,7 @@ pub fn convert_crc32_to_mac(value: u32, key: &[u8; 32]) -> u32 {
 }
 
 pub fn convert_blake2_to_mac(value: [u8; 32], key: &[u8; 32]) -> [u8; 32] {
-    match default_rar_crypto_backend() {
-        RarCryptoBackend::RustCrypto => hmac_sha256_rustcrypto(
-            &<HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts arbitrary keys"),
-            &value,
-        ),
-        #[cfg(feature = "native-crypto")]
-        RarCryptoBackend::NativeAwsLc => {
-            hmac_sha256_native(&aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key), &value)
-        }
-    }
+    hmac_sha256_aws_lc(&aws_hmac::Key::new(aws_hmac::HMAC_SHA256, key), &value)
 }
 
 #[derive(Clone, Debug)]
@@ -628,8 +533,19 @@ struct Rar13Decryptor {
 impl Rar13Decryptor {
     fn new(password: &str) -> Self {
         let password = rar_password_compat(password);
+        Self::new_from_bytes(password.as_bytes())
+    }
+
+    fn new_dos(password: &str) -> Self {
+        let mut password = rar_password_oem_bytes_compat(password);
+        let decryptor = Self::new_from_bytes(&password);
+        password.zeroize();
+        decryptor
+    }
+
+    fn new_from_bytes(password: &[u8]) -> Self {
         let mut key = [0u8; 3];
-        for &byte in password.as_bytes() {
+        for &byte in password {
             key[0] = key[0].wrapping_add(byte);
             key[1] ^= byte;
             key[2] = key[2].wrapping_add(byte).rotate_left(1);
@@ -669,11 +585,22 @@ struct Rar15Decryptor {
 impl Rar15Decryptor {
     fn new(password: &str) -> Self {
         let password = rar_password_compat(password);
+        Self::new_from_bytes(password.as_bytes())
+    }
+
+    fn new_dos(password: &str) -> Self {
+        let mut password = rar_password_oem_bytes_compat(password);
+        let decryptor = Self::new_from_bytes(&password);
+        password.zeroize();
+        decryptor
+    }
+
+    fn new_from_bytes(password: &[u8]) -> Self {
         let crc_tab = crc32_table();
-        let psw_crc = !crc32fast::hash(password.as_bytes());
+        let psw_crc = !crc32fast::hash(password);
         let mut key = [(psw_crc & 0xFFFF) as u16, (psw_crc >> 16) as u16, 0, 0];
 
-        for &byte in password.as_bytes() {
+        for &byte in password {
             key[2] ^= (byte as u16) ^ (crc_tab[byte as usize] as u16);
             key[3] = key[3].wrapping_add(byte as u16 + ((crc_tab[byte as usize] >> 16) as u16));
         }
@@ -711,6 +638,18 @@ struct Rar20Decryptor {
 
 impl Rar20Decryptor {
     fn new(password: &str) -> Self {
+        let password = rar_password_compat(password);
+        Self::new_from_bytes(password.as_bytes())
+    }
+
+    fn new_dos(password: &str) -> Self {
+        let mut password = rar_password_oem_bytes_compat(password);
+        let decryptor = Self::new_from_bytes(&password);
+        password.zeroize();
+        decryptor
+    }
+
+    fn new_from_bytes(pwd_bytes: &[u8]) -> Self {
         const INIT_SUBST_TABLE20: [u8; 256] = [
             215, 19, 149, 35, 73, 197, 192, 205, 249, 28, 16, 119, 48, 221, 2, 42, 232, 1, 177,
             233, 14, 88, 219, 25, 223, 195, 244, 90, 87, 239, 153, 137, 255, 199, 147, 70, 92, 66,
@@ -729,8 +668,6 @@ impl Rar20Decryptor {
         ];
 
         let crc_tab = crc32_table();
-        let password = rar_password_compat(password);
-        let pwd_bytes = password.as_bytes();
         let key = [0xD3A3_B879, 0x3F6D_12F7, 0x7515_A235, 0xA4E7_F123];
         let mut subst = INIT_SUBST_TABLE20;
 
@@ -1067,16 +1004,8 @@ fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [
     result
 }
 
-fn rar4_derive_key_with_backend(
-    _backend: RarCryptoBackend,
-    password: &str,
-    salt: Option<&[u8; 8]>,
-) -> ([u8; 16], [u8; 16]) {
-    rar4_derive_key_unrar(password, salt)
-}
-
 pub fn rar4_derive_key(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
-    rar4_derive_key_with_backend(default_rar_crypto_backend(), password, salt)
+    rar4_derive_key_unrar(password, salt)
 }
 
 /// Decrypt data using AES-128-CBC (RAR4).
@@ -1110,32 +1039,76 @@ pub fn rar4_decrypt_data(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> RarResul
 
 const AES_BLOCK: usize = 16;
 
-#[cfg(not(feature = "native-crypto"))]
-fn cipher_blocks_mut<C>(data: &mut [u8]) -> &mut [Block<C>]
-where
-    C: BlockSizeUser,
-{
-    debug_assert_eq!(std::mem::size_of::<Block<C>>(), AES_BLOCK);
-    debug_assert!(data.len().is_multiple_of(AES_BLOCK));
+#[cfg(test)]
+fn encrypt_cbc_for_test(
+    cipher: *const EVP_CIPHER,
+    key: &[u8],
+    iv: &[u8; AES_BLOCK],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    assert!(plaintext.len().is_multiple_of(AES_BLOCK));
+    assert!(plaintext.len() <= i32::MAX as usize);
 
-    // SAFETY: `Block<C>` is a byte-backed fixed-size buffer. We only reinterpret
-    // a multiple-of-block-size `u8` slice, then immediately hand it to the
-    // cipher backend without changing its lifetime or aliasing guarantees.
-    let (prefix, blocks, suffix) = unsafe { data.align_to_mut::<Block<C>>() };
-    debug_assert!(prefix.is_empty());
-    debug_assert!(suffix.is_empty());
-    blocks
+    let ctx = unsafe { EVP_CIPHER_CTX_new() };
+    assert!(!ctx.is_null(), "aws-lc EVP_CIPHER_CTX_new must succeed");
+
+    let init = unsafe { EVP_EncryptInit_ex(ctx, cipher, null_mut(), key.as_ptr(), iv.as_ptr()) };
+    assert_eq!(init, 1, "aws-lc EVP_EncryptInit_ex must succeed");
+
+    let no_padding = unsafe { EVP_CIPHER_CTX_set_padding(ctx, 0) };
+    assert_eq!(
+        no_padding, 1,
+        "aws-lc EVP_CIPHER_CTX_set_padding(0) must succeed"
+    );
+
+    let mut ciphertext = vec![0u8; plaintext.len()];
+    let mut out_len = 0_i32;
+    let result = unsafe {
+        EVP_EncryptUpdate(
+            ctx,
+            ciphertext.as_mut_ptr(),
+            &mut out_len,
+            plaintext.as_ptr(),
+            plaintext.len() as i32,
+        )
+    };
+    unsafe { EVP_CIPHER_CTX_free(ctx) };
+
+    assert_eq!(result, 1, "aws-lc EVP_EncryptUpdate must succeed");
+    assert_eq!(
+        out_len as usize,
+        plaintext.len(),
+        "aws-lc CBC encrypt must write the full block-aligned input"
+    );
+    ciphertext
 }
 
-#[cfg(feature = "native-crypto")]
+#[cfg(test)]
+pub(crate) fn encrypt_aes128_cbc_for_test(
+    key: &[u8; 16],
+    iv: &[u8; AES_BLOCK],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    encrypt_cbc_for_test(unsafe { EVP_aes_128_cbc() }, key, iv, plaintext)
+}
+
+#[cfg(test)]
+pub(crate) fn encrypt_aes256_cbc_for_test(
+    key: &[u8; 32],
+    iv: &[u8; AES_BLOCK],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    encrypt_cbc_for_test(unsafe { EVP_aes_256_cbc() }, key, iv, plaintext)
+}
+
 struct AwsLcCbcDecryptor {
     ctx: *mut EVP_CIPHER_CTX,
 }
 
-#[cfg(feature = "native-crypto")]
+const AWS_LC_MAX_DECRYPT_UPDATE_LEN: usize = (i32::MAX as usize / AES_BLOCK) * AES_BLOCK;
+
 unsafe impl Send for AwsLcCbcDecryptor {}
 
-#[cfg(feature = "native-crypto")]
 impl AwsLcCbcDecryptor {
     fn new_aes256(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
         Self::new(unsafe { EVP_aes_256_cbc() }, key, iv)
@@ -1164,31 +1137,29 @@ impl AwsLcCbcDecryptor {
 
     fn decrypt_blocks(&mut self, data: &mut [u8]) {
         debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-        if data.is_empty() {
-            return;
+        for chunk in data.chunks_mut(AWS_LC_MAX_DECRYPT_UPDATE_LEN) {
+            let mut out_len = 0_i32;
+            let input_len = chunk.len() as i32;
+            let result = unsafe {
+                EVP_DecryptUpdate(
+                    self.ctx,
+                    chunk.as_mut_ptr(),
+                    &mut out_len,
+                    chunk.as_ptr(),
+                    input_len,
+                )
+            };
+            assert_eq!(result, 1, "aws-lc EVP_DecryptUpdate must succeed");
+            assert!(out_len >= 0, "aws-lc output length must be non-negative");
+            assert_eq!(
+                out_len as usize,
+                chunk.len(),
+                "aws-lc CBC decrypt must write the full block-aligned input"
+            );
         }
-
-        let mut out_len = 0_i32;
-        let input_len = i32::try_from(data.len()).expect("block-aligned CBC input fits in i32");
-        let result = unsafe {
-            EVP_DecryptUpdate(
-                self.ctx,
-                data.as_mut_ptr(),
-                &mut out_len,
-                data.as_ptr(),
-                input_len,
-            )
-        };
-        assert_eq!(result, 1, "aws-lc EVP_DecryptUpdate must succeed");
-        assert_eq!(
-            usize::try_from(out_len).expect("aws-lc output length must be non-negative"),
-            data.len(),
-            "aws-lc CBC decrypt must write the full block-aligned input"
-        );
     }
 }
 
-#[cfg(feature = "native-crypto")]
 impl Drop for AwsLcCbcDecryptor {
     fn drop(&mut self) {
         unsafe { EVP_CIPHER_CTX_free(self.ctx) };
@@ -1200,19 +1171,13 @@ impl Drop for AwsLcCbcDecryptor {
 /// Unlike `decrypt_data` which requires all data at once, this carries the
 /// CBC IV state across calls to `decrypt_blocks`.
 pub struct CbcDecryptor {
-    #[cfg(feature = "native-crypto")]
     decryptor: AwsLcCbcDecryptor,
-    #[cfg(not(feature = "native-crypto"))]
-    decryptor: Aes256CbcDec,
 }
 
 impl CbcDecryptor {
     pub fn new(key: &[u8; 32], iv: &[u8; AES_BLOCK]) -> Self {
         Self {
-            #[cfg(feature = "native-crypto")]
             decryptor: AwsLcCbcDecryptor::new_aes256(key, iv),
-            #[cfg(not(feature = "native-crypto"))]
-            decryptor: Aes256CbcDec::new(key.into(), iv.into()),
         }
     }
 
@@ -1220,40 +1185,26 @@ impl CbcDecryptor {
     /// Updates internal IV state for subsequent calls.
     pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
         debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-        #[cfg(feature = "native-crypto")]
         self.decryptor.decrypt_blocks(data);
-        #[cfg(not(feature = "native-crypto"))]
-        self.decryptor
-            .decrypt_blocks(cipher_blocks_mut::<Aes256CbcDec>(data));
     }
 }
 
 /// Stateful AES-128-CBC decryptor for RAR4 archives.
 pub struct Rar4CbcDecryptor {
-    #[cfg(feature = "native-crypto")]
     decryptor: AwsLcCbcDecryptor,
-    #[cfg(not(feature = "native-crypto"))]
-    decryptor: Aes128CbcDec,
 }
 
 impl Rar4CbcDecryptor {
     pub fn new(key: &[u8; 16], iv: &[u8; AES_BLOCK]) -> Self {
         Self {
-            #[cfg(feature = "native-crypto")]
             decryptor: AwsLcCbcDecryptor::new_aes128(key, iv),
-            #[cfg(not(feature = "native-crypto"))]
-            decryptor: Aes128CbcDec::new(key.into(), iv.into()),
         }
     }
 
     /// Decrypt `data` in-place. `data.len()` MUST be a multiple of 16.
     pub fn decrypt_blocks(&mut self, data: &mut [u8]) {
         debug_assert!(data.len().is_multiple_of(AES_BLOCK));
-        #[cfg(feature = "native-crypto")]
         self.decryptor.decrypt_blocks(data);
-        #[cfg(not(feature = "native-crypto"))]
-        self.decryptor
-            .decrypt_blocks(cipher_blocks_mut::<Aes128CbcDec>(data));
     }
 }
 
@@ -1369,6 +1320,26 @@ impl<R: Read> DecryptingReader<R> {
             }
             Rar4EncryptionMethod::Rar20 => {
                 CbcDecryptorAny::Rar20(Box::new(Rar20Decryptor::new(password)))
+            }
+            Rar4EncryptionMethod::Rar30 => unreachable!("RAR30 must use AES constructor"),
+        };
+        Self::new_with_decryptor(inner, decryptor)
+    }
+
+    pub(crate) fn new_rar4_legacy_dos(
+        inner: R,
+        method: Rar4EncryptionMethod,
+        password: &str,
+    ) -> Self {
+        let decryptor = match method {
+            Rar4EncryptionMethod::Rar13 => {
+                CbcDecryptorAny::Rar13(Rar13Decryptor::new_dos(password))
+            }
+            Rar4EncryptionMethod::Rar15 => {
+                CbcDecryptorAny::Rar15(Box::new(Rar15Decryptor::new_dos(password)))
+            }
+            Rar4EncryptionMethod::Rar20 => {
+                CbcDecryptorAny::Rar20(Box::new(Rar20Decryptor::new_dos(password)))
             }
             Rar4EncryptionMethod::Rar30 => unreachable!("RAR30 must use AES constructor"),
         };
@@ -1493,6 +1464,20 @@ mod tests {
     }
 
     #[test]
+    fn test_rar_dos_password_compat_uses_cp437_oem_bytes() {
+        assert_eq!(rar_password_oem_bytes_compat("Grüße"), b"Gr\x81\xe1e");
+        assert_eq!(rar_password_oem_bytes_compat("€"), b"?");
+    }
+
+    #[test]
+    fn test_rar_dos_password_compat_truncates_before_oem_encoding() {
+        let prefix = "a".repeat(RAR_PASSWORD_MAX_UNITS);
+        let long = format!("{prefix}ü");
+
+        assert_eq!(rar_password_oem_bytes_compat(&long), prefix.as_bytes());
+    }
+
+    #[test]
     fn test_rar5_kdf_ignores_password_tail_after_unrar_limit() {
         let salt = [0x5Au8; 16];
         let prefix = "p".repeat(RAR_PASSWORD_MAX_UNITS);
@@ -1541,6 +1526,33 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_rar_dos_password_uses_oem_bytes_for_non_ascii() {
+        assert_ne!(
+            Rar13Decryptor::new("ü").key,
+            Rar13Decryptor::new_dos("ü").key
+        );
+        assert_eq!(
+            Rar13Decryptor::new_dos("ü").key,
+            Rar13Decryptor::new_from_bytes(&[0x81]).key
+        );
+
+        assert_ne!(
+            Rar15Decryptor::new("ü").key,
+            Rar15Decryptor::new_dos("ü").key
+        );
+        assert_eq!(
+            Rar15Decryptor::new_dos("ü").key,
+            Rar15Decryptor::new_from_bytes(&[0x81]).key
+        );
+
+        let rar20_dos = Rar20Decryptor::new_dos("ü");
+        let rar20_bytes = Rar20Decryptor::new_from_bytes(&[0x81]);
+        assert_ne!(Rar20Decryptor::new("ü").key, rar20_dos.key);
+        assert_eq!(rar20_dos.key, rar20_bytes.key);
+        assert_eq!(rar20_dos.subst, rar20_bytes.subst);
+    }
+
+    #[test]
     fn test_rar14_packed_comment_decrypt_uses_unrar_fixed_key() {
         let mut data = [0x54, 0x55, 0x56];
 
@@ -1564,11 +1576,6 @@ mod tests {
 
     #[test]
     fn test_decrypt_round_trip() {
-        use aes::Aes256;
-        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-        type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-
         let key = [0x42u8; 32];
         let iv = [0x13u8; 16];
 
@@ -1576,12 +1583,7 @@ mod tests {
         let plaintext = b"Hello RAR world!"; // exactly 16 bytes
         assert_eq!(plaintext.len(), 16);
 
-        // Encrypt
-        let mut ciphertext = plaintext.to_vec();
-        let encryptor = Aes256CbcEnc::new((&key).into(), (&iv).into());
-        encryptor
-            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, 16)
-            .unwrap();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, plaintext);
 
         // Decrypt
         let decrypted = decrypt_data(&key, &iv, &ciphertext).unwrap();
@@ -1644,29 +1646,14 @@ mod tests {
         assert!(!password_check_matches(&psw_check, &check_data));
     }
 
-    #[cfg(feature = "native-crypto")]
     #[test]
-    fn test_rar5_native_backend_matches_reference_vector() {
+    fn test_rar5_aws_lc_material_matches_reference_vector() {
         let salt = [
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
             0x1E, 0x1F,
         ];
-        let rustcrypto = derive_rar5_material_with_backend(
-            RarCryptoBackend::RustCrypto,
-            "e2e-test-password",
-            &salt,
-            6,
-        )
-        .unwrap();
-        let native = derive_rar5_material_with_backend(
-            RarCryptoBackend::NativeAwsLc,
-            "e2e-test-password",
-            &salt,
-            6,
-        )
-        .unwrap();
+        let native = derive_rar5_material("e2e-test-password", &salt, 6).unwrap();
 
-        assert_eq!(native, rustcrypto);
         assert_eq!(
             hex(&native.key),
             "4e0cc9bdeddb830e9f03f0720ac32be4c8572ed5d250ae815dff1bf85e2af67e"
@@ -1767,23 +1754,13 @@ mod tests {
 
     #[test]
     fn test_rar4_decrypt_round_trip() {
-        use aes::Aes128;
-        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-
         let key = [0x42u8; 16];
         let iv = [0x13u8; 16];
 
         let plaintext = b"RAR4 encrypted!!"; // 16 bytes
         assert_eq!(plaintext.len(), 16);
 
-        // Encrypt
-        let mut ciphertext = plaintext.to_vec();
-        let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
-        encryptor
-            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, 16)
-            .unwrap();
+        let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, plaintext);
 
         // Decrypt
         let decrypted = rar4_decrypt_data(&key, &iv, &ciphertext).unwrap();
@@ -1808,12 +1785,6 @@ mod tests {
 
     #[test]
     fn test_rar4_kdf_with_derived_key_round_trip() {
-        // Derive key, encrypt, decrypt, verify round-trip.
-        use aes::Aes128;
-        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-
         let salt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let (key, iv) = rar4_derive_key("testpassword", Some(&salt));
 
@@ -1821,11 +1792,7 @@ mod tests {
         let plaintext = b"Hello from RAR4 encryption test!"; // 32 bytes
         assert_eq!(plaintext.len(), 32);
 
-        let mut ciphertext = plaintext.to_vec();
-        let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
-        encryptor
-            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(&mut ciphertext, 32)
-            .unwrap();
+        let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, plaintext);
 
         assert_ne!(&ciphertext, plaintext);
 
@@ -1833,24 +1800,20 @@ mod tests {
         assert_eq!(&decrypted, plaintext);
     }
 
-    #[cfg(feature = "native-crypto")]
     #[test]
-    fn test_rar4_native_backend_matches_reference_vector() {
+    fn test_rar4_custom_kdf_matches_reference_vector() {
         let salt = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let rustcrypto = rar4_derive_key_with_backend(
-            RarCryptoBackend::RustCrypto,
-            "e2e-test-password",
-            Some(&salt),
-        );
-        let native = rar4_derive_key_with_backend(
-            RarCryptoBackend::NativeAwsLc,
-            "e2e-test-password",
-            Some(&salt),
-        );
+        let (key, iv) = rar4_derive_key("e2e-test-password", Some(&salt));
 
-        assert_eq!(native, rustcrypto);
-        assert_eq!(hex(&native.0), "36b07b37fb4e20e63b54fd54aa00ede9");
-        assert_eq!(hex(&native.1), "57ea4f82b145f2aa06f7c23f546d9561");
+        assert_eq!(hex(&key), "36b07b37fb4e20e63b54fd54aa00ede9");
+        assert_eq!(hex(&iv), "57ea4f82b145f2aa06f7c23f546d9561");
+    }
+
+    #[test]
+    fn test_aws_lc_decrypt_update_chunk_limit_is_i32_aligned() {
+        assert_eq!(AWS_LC_MAX_DECRYPT_UPDATE_LEN % AES_BLOCK, 0);
+        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN <= i32::MAX as usize);
+        assert!(AWS_LC_MAX_DECRYPT_UPDATE_LEN + AES_BLOCK > i32::MAX as usize);
     }
 
     struct ChunkedCursor {
@@ -1876,22 +1839,10 @@ mod tests {
 
     #[test]
     fn test_rar4_streaming_reader_multi_block_round_trip() {
-        use aes::Aes128;
-        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-
         let key = [0x21u8; 16];
         let iv = [0x43u8; 16];
         let plaintext = [0x52u8; AES_BLOCK * 4];
-        let mut ciphertext = plaintext.to_vec();
-        let encryptor = Aes128CbcEnc::new((&key).into(), (&iv).into());
-        encryptor
-            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(
-                &mut ciphertext,
-                plaintext.len(),
-            )
-            .unwrap();
+        let ciphertext = encrypt_aes128_cbc_for_test(&key, &iv, &plaintext);
 
         let inner = ChunkedCursor::new(ciphertext, 23);
         let mut reader = DecryptingReader::new_rar4(inner, &key, &iv);
@@ -1910,22 +1861,10 @@ mod tests {
 
     #[test]
     fn test_rar5_streaming_reader_multi_block_round_trip() {
-        use aes::Aes256;
-        use cbc::cipher::{BlockModeEncrypt, KeyIvInit};
-
-        type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-
         let key = [0x34u8; 32];
         let iv = [0x56u8; 16];
         let plaintext = [0x35u8; AES_BLOCK * 4];
-        let mut ciphertext = plaintext.to_vec();
-        let encryptor = Aes256CbcEnc::new((&key).into(), (&iv).into());
-        encryptor
-            .encrypt_padded::<cbc::cipher::block_padding::NoPadding>(
-                &mut ciphertext,
-                plaintext.len(),
-            )
-            .unwrap();
+        let ciphertext = encrypt_aes256_cbc_for_test(&key, &iv, &plaintext);
 
         let inner = ChunkedCursor::new(ciphertext, 29);
         let mut reader = DecryptingReader::new_rar5(inner, &key, &iv);

@@ -189,9 +189,22 @@ impl LzDecoder {
         *staged_start = 0;
     }
 
+    fn flush_unfiltered_stream_output<W: Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let logical_advance = self
+            .window
+            .total_written()
+            .saturating_sub(self.window.total_flushed());
+        self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+        self.current_file_written_size += logical_advance;
+        Ok(())
+    }
+
     fn flush_stream_output<W: Write>(&mut self, writer: &mut W) -> RarResult<()> {
         if self.pending_filters.is_empty() {
-            self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+            self.flush_unfiltered_stream_output(writer)?;
         } else {
             self.flush_filters_and_write(writer)?;
             if self.window.unflushed_bytes() as usize > self.window.dict_size() {
@@ -377,34 +390,14 @@ impl LzDecoder {
             return Ok(Vec::new());
         }
 
-        self.begin_file_decode();
-        let mut reader = BitReader::new(input);
-        let mut output_size: u64 = 0;
-
-        while output_size < unpacked_size {
-            // Read a new block header if we've exhausted the current block.
-            if self.block_bits_remaining <= 0 {
-                if reader.bits_remaining() < 16 {
-                    break;
-                }
-                self.read_block_header(&mut reader)?;
-            }
-
-            // Decode symbols from the current block.
-            output_size = self.decode_block(&mut reader, unpacked_size, output_size, None)?;
-        }
-
-        // Extract output from the window.
-        let start = self.current_file_base_total;
-        let len = unpacked_size as usize;
-        let output = self.window.try_copy_output(start, len)?;
-
-        // Apply pending filters to the output buffer.
-        let output = self.apply_filters_to_vec(output, start);
-
+        let capacity = usize::try_from(unpacked_size).unwrap_or_else(|_| self.window.dict_size());
+        let capacity = capacity.min(self.window.dict_size());
+        let mut output = Vec::with_capacity(capacity);
+        self.decompress_to_writer(input, unpacked_size, &mut output)?;
         Ok(output)
     }
 
+    #[cfg(test)]
     /// Apply pending filters to an in-memory output buffer using UnRAR's write
     /// semantics: invalid filters suppress their covered block, but the logical
     /// `WrittenFileSize` used for later filters still advances by block length.
@@ -513,7 +506,13 @@ impl LzDecoder {
                 break;
             }
 
-            let sym = self.nc_table.as_ref().unwrap().decode(reader)? as u32;
+            let nc_table = self
+                .nc_table
+                .as_ref()
+                .ok_or_else(|| RarError::CorruptArchive {
+                    detail: "RAR5 LZ block is missing literal/length table".into(),
+                })?;
+            let sym = nc_table.decode(reader)? as u32;
             let mut should_check_yield = false;
 
             if sym < 256 {
@@ -525,8 +524,18 @@ impl LzDecoder {
                 // Inline length-distance pair (second most common).
                 let length_idx = (sym - 262) as usize;
                 let mut length = Self::slot_to_length(reader, length_idx)?;
-                let dc = self.dc_table.as_ref().unwrap();
-                let ldc = self.ldc_table.as_ref().unwrap();
+                let dc = self
+                    .dc_table
+                    .as_ref()
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: "RAR5 LZ block is missing distance table".into(),
+                    })?;
+                let ldc = self
+                    .ldc_table
+                    .as_ref()
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: "RAR5 LZ block is missing low-distance table".into(),
+                    })?;
                 let distance = self.decode_distance(reader, dc, ldc)?;
                 length = Self::adjust_length_for_distance(length, distance);
                 let remaining = (unpacked_size - output_size) as usize;
@@ -559,7 +568,12 @@ impl LzDecoder {
                 let cache_idx = (sym - 258) as usize;
                 let distance = self.promote_old_dist(cache_idx)?;
 
-                let rc = self.rc_table.as_ref().unwrap();
+                let rc = self
+                    .rc_table
+                    .as_ref()
+                    .ok_or_else(|| RarError::CorruptArchive {
+                        detail: "RAR5 LZ block is missing repeat-length table".into(),
+                    })?;
                 let length = self.decode_rc_length(reader, rc)?;
                 let remaining = (unpacked_size - output_size) as usize;
                 let visible_len = length.min(remaining);
@@ -638,29 +652,57 @@ impl LzDecoder {
             });
         }
 
-        let distance = if dist_code < 4 {
-            dist_code
-        } else {
-            let num_bits = (dist_code >> 1) - 1;
-            let base = (2 | (dist_code & 1)) << num_bits;
+        if dist_code < 4 {
+            return Ok(dist_code + 1);
+        }
 
-            if num_bits >= 4 {
-                // Split: high bits from bitstream, low 4 bits from AlignDecoder (LDC).
-                let high = if num_bits > 4 {
-                    (reader.read_bits64((num_bits - 4) as u8)? as usize) << 4
-                } else {
-                    0
-                };
-                let low = ldc.decode(reader)? as usize;
-                base + high + low
+        let num_bits = (dist_code >> 1) - 1;
+        let distance = if num_bits >= 4 {
+            // Split: high bits from bitstream, low 4 bits from AlignDecoder (LDC).
+            let high = if num_bits > 4 {
+                reader.read_bits64((num_bits - 4) as u8)? << 4
             } else {
-                // All extra bits from bitstream.
-                base + reader.read_bits64(num_bits as u8)? as usize
-            }
+                0
+            };
+            let low = ldc.decode(reader)? as u64;
+            Self::distance_from_slot_parts(dist_code, num_bits, high, low, usize::BITS)?
+        } else {
+            // All extra bits from bitstream.
+            let extra = reader.read_bits64(num_bits as u8)?;
+            Self::distance_from_slot_parts(dist_code, num_bits, extra, 0, usize::BITS)?
         };
 
-        // Distance is 1-based for the window copy.
-        Ok(distance + 1)
+        Ok(distance)
+    }
+
+    fn distance_from_slot_parts(
+        dist_code: usize,
+        num_bits: usize,
+        high_or_extra: u64,
+        low: u64,
+        pointer_bits: u32,
+    ) -> RarResult<usize> {
+        // Current UnRAR maps distances that would overflow 32-bit size_t to
+        // size_t(-1), so CopyString treats them as invalid and zero-fills.
+        if pointer_bits <= 32 && num_bits >= 30 {
+            return Ok(u32::MAX as usize);
+        }
+
+        let base = (2u64 | (dist_code as u64 & 1))
+            .checked_shl(num_bits as u32)
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: format!("RAR5 distance shift {num_bits} overflows"),
+            })?;
+        let distance = base
+            .checked_add(high_or_extra)
+            .and_then(|value| value.checked_add(low))
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5 distance overflows u64".into(),
+            })?;
+        usize::try_from(distance).map_err(|_| RarError::CorruptArchive {
+            detail: format!("RAR5 distance {distance} does not fit in usize"),
+        })
     }
 
     /// Handle a filter marker (symbol 256).
@@ -689,22 +731,16 @@ impl LzDecoder {
             output_size, filter_type, block_start, block_length, channels
         );
 
-        self.pending_filters.push(PendingFilter {
-            filter_type,
-            block_start,
-            block_length,
-            channels,
-        });
-
-        if self.pending_filters.len() > MAX_PENDING_FILTERS {
-            return Err(RarError::CorruptArchive {
-                detail: format!(
-                    "RAR5 pending filter count {} exceeds limit {}",
-                    self.pending_filters.len(),
-                    MAX_PENDING_FILTERS
-                ),
-            });
-        }
+        filter::push_pending_filter(
+            &mut self.pending_filters,
+            PendingFilter {
+                filter_type,
+                block_start,
+                block_length,
+                channels,
+            },
+            MAX_PENDING_FILTERS,
+        );
 
         Ok(output_size)
     }
@@ -761,7 +797,7 @@ impl LzDecoder {
 
             // Flush window periodically — but only up to filter boundaries.
             if self.pending_filters.is_empty() {
-                self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.flush_unfiltered_stream_output(writer)?;
             } else {
                 self.flush_filters_and_write(writer)?;
                 if self.window.unflushed_bytes() as usize > self.window.dict_size() {
@@ -930,7 +966,7 @@ impl LzDecoder {
             )?;
 
             if self.pending_filters.is_empty() {
-                self.window.flush_to_writer(writer).map_err(RarError::Io)?;
+                self.flush_unfiltered_stream_output(writer)?;
             } else {
                 self.flush_filters_and_write(writer)?;
                 if self.window.unflushed_bytes() as usize > self.window.dict_size() {
@@ -1018,9 +1054,7 @@ impl LzDecoder {
 
                 // Flush window periodically — but only up to filter boundaries.
                 if self.pending_filters.is_empty() {
-                    self.window
-                        .flush_to_writer(&mut *current_writer)
-                        .map_err(RarError::Io)?;
+                    self.flush_unfiltered_stream_output(&mut *current_writer)?;
                 } else {
                     self.flush_filters_and_write(&mut *current_writer)?;
                     if self.window.unflushed_bytes() as usize > self.window.dict_size() {
@@ -1108,9 +1142,7 @@ impl LzDecoder {
                 chunk_bytes += decoded_this_round;
 
                 if self.pending_filters.is_empty() {
-                    self.window
-                        .flush_to_writer(&mut *current_writer)
-                        .map_err(RarError::Io)?;
+                    self.flush_unfiltered_stream_output(&mut *current_writer)?;
                 } else {
                     self.flush_filters_and_write(&mut *current_writer)?;
                     if self.window.unflushed_bytes() as usize > self.window.dict_size() {
@@ -1131,38 +1163,20 @@ impl LzDecoder {
         Ok(chunks)
     }
 
-    fn write_window_range<W: Write + ?Sized>(
-        &self,
-        writer: &mut W,
-        start_total: u64,
-        len: usize,
-    ) -> RarResult<()> {
-        if len == 0 {
-            return Ok(());
-        }
-
-        let buf = self.window.try_copy_output(start_total, len)?;
-        writer.write_all(&buf).map_err(RarError::Io)
-    }
-
     /// Flush pending filters and remaining window data to a writer.
     fn flush_filters_and_write<W: Write + ?Sized>(&mut self, writer: &mut W) -> RarResult<()> {
         if self.pending_filters.is_empty() {
-            let unflushed = self.window.unflushed_bytes();
-            self.window.flush_to_writer(writer).map_err(RarError::Io)?;
-            self.current_file_written_size += unflushed;
-            return Ok(());
+            return self.flush_unfiltered_stream_output(writer);
         }
 
         let total = self.window.total_written();
-        let unflushed = self.window.unflushed_bytes();
-        if unflushed == 0 {
-            self.pending_filters.clear();
+        let mut written_up_to = self.window.total_flushed();
+        if written_up_to == total {
+            self.pending_filters
+                .retain(|filter| filter.block_start >= total);
             return Ok(());
         }
 
-        let flushed_total = total - unflushed;
-        let mut written_up_to = flushed_total;
         let mut pending_filters = std::mem::take(&mut self.pending_filters);
         pending_filters.sort_by_key(|filter| filter.block_start);
         let mut remaining_filters = Vec::with_capacity(pending_filters.len());
@@ -1186,7 +1200,9 @@ impl LzDecoder {
 
             if filter.block_start > written_up_to {
                 let prefix_len = (filter.block_start - written_up_to) as usize;
-                self.write_window_range(writer, written_up_to, prefix_len)?;
+                self.window
+                    .flush_visible_until(filter.block_start, writer)
+                    .map_err(RarError::Io)?;
                 self.current_file_written_size += prefix_len as u64;
                 written_up_to = filter.block_start;
             }
@@ -1207,10 +1223,18 @@ impl LzDecoder {
                     FilterType::Unsupported(_) => {}
                 }
                 if filter.filter_type.emits_output() {
-                    writer.write_all(&buf).map_err(RarError::Io)?;
+                    for (offset, len) in self
+                        .window
+                        .visible_subranges(filter.block_start, filter.block_length)
+                    {
+                        writer
+                            .write_all(&buf[offset..offset + len])
+                            .map_err(RarError::Io)?;
+                    }
                 }
                 self.current_file_written_size += filter.block_length as u64;
                 written_up_to = block_end;
+                self.window.mark_flushed(written_up_to);
             } else {
                 remaining_filters.push(filter);
                 remaining_filters.extend(pending_iter);
@@ -1220,7 +1244,9 @@ impl LzDecoder {
 
         if remaining_filters.is_empty() && written_up_to < total {
             let tail_len = (total - written_up_to) as usize;
-            self.write_window_range(writer, written_up_to, tail_len)?;
+            self.window
+                .flush_visible_until(total, writer)
+                .map_err(RarError::Io)?;
             self.current_file_written_size += tail_len as u64;
             written_up_to = total;
         }
@@ -1510,6 +1536,28 @@ mod tests {
     }
 
     #[test]
+    fn distance_slot_parts_keep_32bit_boundary_before_unrar_overflow_sentinel() {
+        let distance =
+            LzDecoder::distance_from_slot_parts(61, 29, (1u64 << 29) - 16, 15, 32).unwrap();
+
+        assert_eq!(distance, 0x8000_0000);
+    }
+
+    #[test]
+    fn distance_slot_parts_use_unrar_32bit_overflow_sentinel() {
+        let distance = LzDecoder::distance_from_slot_parts(62, 30, 0, 0, 32).unwrap();
+
+        assert_eq!(distance, u32::MAX as usize);
+    }
+
+    #[test]
+    fn distance_slot_parts_allow_rar7_extended_distance_on_64bit() {
+        let distance = LzDecoder::distance_from_slot_parts(79, 38, 0, 0, 64).unwrap();
+
+        assert_eq!(distance, (3u64 << 38) as usize + 1);
+    }
+
+    #[test]
     fn test_checked_lz_dict_size_enforces_effective_minimum() {
         let info = CompressionInfo {
             format: crate::types::ArchiveFormat::Rar5,
@@ -1634,6 +1682,107 @@ mod tests {
     }
 
     #[test]
+    fn test_filterless_flush_advances_hidden_match_tail_like_unrar() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.window.put_bytes(b"ABCD");
+        decoder.window.mark_flushed(4);
+        decoder.current_file_written_size = 4;
+        decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
+
+        let mut out = Vec::new();
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
+        assert_eq!(out, b"AB");
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+        assert_eq!(decoder.current_file_written_size, 8);
+    }
+
+    #[test]
+    fn test_raw_stream_flush_advances_later_filter_file_offset_like_unrar() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        let mut out = Vec::new();
+
+        decoder.window.put_bytes(b"prefix");
+        decoder.flush_stream_output(&mut out).unwrap();
+        assert_eq!(out, b"prefix");
+        assert_eq!(decoder.window.total_flushed(), 6);
+        assert_eq!(decoder.current_file_written_size, 6);
+
+        decoder.window.put_bytes(&[0xe8, 100, 0, 0, 0]);
+        decoder.pending_filters = vec![PendingFilter {
+            filter_type: FilterType::E8,
+            block_start: 6,
+            block_length: 5,
+            channels: 0,
+        }];
+
+        decoder.flush_stream_output(&mut out).unwrap();
+
+        let mut expected_filter_output = vec![0xe8, 100, 0, 0, 0];
+        filter::apply_e8(&mut expected_filter_output, 6);
+        assert_eq!(&out[..6], b"prefix");
+        assert_eq!(&out[6..], expected_filter_output.as_slice());
+        assert_ne!(&out[6..], &[0xe8, 99, 0, 0, 0]);
+        assert_eq!(decoder.current_file_written_size, 11);
+    }
+
+    #[test]
+    fn test_filter_block_emits_only_visible_hidden_tail_prefix() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.window.put_bytes(b"ABCD");
+        decoder.window.mark_flushed(4);
+        decoder.current_file_written_size = 4;
+        decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
+        decoder.pending_filters = vec![PendingFilter {
+            filter_type: FilterType::E8,
+            block_start: 4,
+            block_length: 4,
+            channels: 0,
+        }];
+
+        let mut out = Vec::new();
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
+        assert_eq!(out, b"AB");
+        assert_eq!(
+            decoder.window.total_flushed(),
+            decoder.window.total_written()
+        );
+        assert_eq!(decoder.current_file_written_size, 8);
+        assert!(decoder.pending_filters.is_empty());
+    }
+
+    #[test]
+    fn test_flush_filters_keeps_future_filter_when_no_output_is_ready() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.pending_filters = vec![
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 0,
+                block_length: 5,
+                channels: 0,
+            },
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 8,
+                block_length: 5,
+                channels: 0,
+            },
+        ];
+
+        let mut out = Vec::new();
+        decoder.flush_filters_and_write(&mut out).unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(decoder.pending_filters.len(), 2);
+        assert_eq!(decoder.pending_filters[0].block_start, 0);
+        assert_eq!(decoder.pending_filters[1].block_start, 8);
+    }
+
+    #[test]
     fn test_unsupported_filter_skips_block_like_unrar() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
@@ -1653,6 +1802,57 @@ mod tests {
             decoder.window.total_written()
         );
         assert!(decoder.pending_filters.is_empty());
+    }
+
+    fn write_test_bits(bits: &mut Vec<u8>, value: u32, count: u8) {
+        for shift in (0..count).rev() {
+            bits.push(((value >> shift) & 1) as u8);
+        }
+    }
+
+    fn pack_test_bits(bits: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
+        for chunk in bits.chunks(8) {
+            let mut byte = 0u8;
+            for (idx, bit) in chunk.iter().enumerate() {
+                byte |= *bit << (7 - idx);
+            }
+            bytes.push(byte);
+        }
+        bytes
+    }
+
+    fn rar5_filter_descriptor(block_start: u8, block_length: u8, filter_code: u8) -> Vec<u8> {
+        let mut bits = Vec::new();
+        write_test_bits(&mut bits, 0, 2);
+        write_test_bits(&mut bits, u32::from(block_start), 8);
+        write_test_bits(&mut bits, 0, 2);
+        write_test_bits(&mut bits, u32::from(block_length), 8);
+        write_test_bits(&mut bits, u32::from(filter_code), 3);
+        pack_test_bits(&bits)
+    }
+
+    #[test]
+    fn test_filter_descriptor_resets_full_queue_like_unrar() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.pending_filters = vec![
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 0,
+                block_length: 5,
+                channels: 0,
+            };
+            MAX_PENDING_FILTERS
+        ];
+
+        let descriptor = rar5_filter_descriptor(3, 5, 1);
+        let mut reader = BitReader::new(&descriptor);
+        decoder.handle_filter(&mut reader, 10).unwrap();
+
+        assert_eq!(decoder.pending_filters.len(), 1);
+        assert_eq!(decoder.pending_filters[0].filter_type, FilterType::E8);
+        assert_eq!(decoder.pending_filters[0].block_start, 13);
+        assert_eq!(decoder.pending_filters[0].block_length, 5);
     }
 
     #[test]

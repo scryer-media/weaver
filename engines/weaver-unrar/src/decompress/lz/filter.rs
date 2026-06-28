@@ -49,6 +49,23 @@ pub struct PendingFilter {
     pub channels: u8,
 }
 
+/// Add a pending RAR5 filter with UnRAR's defensive queue behavior.
+///
+/// UnRAR first tries to flush filters when `MAX_UNPACK_FILTERS` is reached and
+/// then calls `InitFilters` if the queue is still full. Weaver cannot always
+/// flush at descriptor-read time, so this helper implements the same bounded
+/// fallback: reset the queue before accepting the next malformed-stream filter.
+pub(crate) fn push_pending_filter(
+    filters: &mut Vec<PendingFilter>,
+    filter: PendingFilter,
+    max_filters: usize,
+) {
+    if filters.len() >= max_filters {
+        filters.clear();
+    }
+    filters.push(filter);
+}
+
 /// Apply the DELTA filter in-place.
 ///
 /// RAR5 stores bytes from the same channel in contiguous groups, so decoding
@@ -414,6 +431,39 @@ mod tests {
         assert_eq!(FilterType::from_code(4), FilterType::Unsupported(4));
         assert_eq!(FilterType::from_code(7), FilterType::Unsupported(7));
         assert!(!FilterType::Unsupported(7).emits_output());
+    }
+
+    #[test]
+    fn push_pending_filter_resets_full_queue_like_unrar() {
+        let mut filters = vec![
+            PendingFilter {
+                filter_type: FilterType::E8,
+                block_start: 0,
+                block_length: 5,
+                channels: 0,
+            },
+            PendingFilter {
+                filter_type: FilterType::Arm,
+                block_start: 8,
+                block_length: 4,
+                channels: 0,
+            },
+        ];
+
+        push_pending_filter(
+            &mut filters,
+            PendingFilter {
+                filter_type: FilterType::Delta,
+                block_start: 12,
+                block_length: 3,
+                channels: 1,
+            },
+            2,
+        );
+
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].filter_type, FilterType::Delta);
+        assert_eq!(filters[0].block_start, 12);
     }
 
     #[test]

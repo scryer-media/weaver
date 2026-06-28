@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["native-crypto"]
-native-crypto = ["dep:aws-lc-rs", "dep:aws-lc-sys"]
+default = []
+# Compatibility feature for existing workspace dependency declarations. RAR
+# standard crypto uses AWS-LC unconditionally on Scryer's supported targets.
+native-crypto = []
 slow-tests = []
 
 [dependencies]
@@ -17,24 +19,31 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 blake2s_simd = { workspace = true }
-aes = { workspace = true, default-features = false }
-cbc = { workspace = true }
-pbkdf2 = { workspace = true }
-sha1 = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true, default-features = false }
-aws-lc-rs = { workspace = true, optional = true }
-aws-lc-sys = { workspace = true, optional = true }
+aws-lc-rs = { workspace = true }
+aws-lc-sys = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 rayon = { workspace = true, default-features = false }
 tempfile = { workspace = true }
 memmap2 = { workspace = true, default-features = false }
 memchr = { workspace = true }
+unicode-normalization = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 filetime = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

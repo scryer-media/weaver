@@ -11,9 +11,7 @@
 //! - Salt (16 bytes)
 //! - Password check data (12 bytes, if flag 0x0001)
 
-use sha2::{Digest, Sha256};
-
-use crate::crypto::CRYPT5_KDF_LG2_COUNT_MAX;
+use crate::crypto::{CRYPT5_KDF_LG2_COUNT_MAX, sha256_digest};
 use crate::error::{RarError, RarResult};
 use crate::header::common::{self, RawHeader};
 
@@ -97,7 +95,7 @@ pub fn parse(raw: &RawHeader) -> RarResult<EncryptionHeader> {
     let has_password_check = enc_flags & 0x0001 != 0;
     let check_data = if has_password_check {
         let check_data = read_bytes_lossy::<12>(body, &mut pos);
-        let digest = Sha256::digest(&check_data[..8]);
+        let digest = sha256_digest(&check_data[..8]);
         if digest[..4] == check_data[8..12] {
             Some(check_data)
         } else {
@@ -120,6 +118,7 @@ pub fn parse(raw: &RawHeader) -> RarResult<EncryptionHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::sha256_digest;
     use crate::header::common::read_raw_header;
     use crate::vint::encode_vint;
 
@@ -150,7 +149,7 @@ mod tests {
     #[test]
     fn test_encryption_header() {
         let password_check = [0xBB; 8];
-        let checksum: [u8; 4] = Sha256::digest(password_check)[..4].try_into().unwrap();
+        let checksum: [u8; 4] = sha256_digest(&password_check)[..4].try_into().unwrap();
         let mut type_body = Vec::new();
         type_body.extend_from_slice(&encode_vint(0)); // version = AES-256
         type_body.extend_from_slice(&encode_vint(0x0001)); // password check present

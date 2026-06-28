@@ -121,6 +121,14 @@ impl RarArchive {
             );
             let mut file_header = service.header.inner;
             file_header.is_encrypted = service.is_encrypted;
+            let ntfs_stream_name = (file_header.name == "STM")
+                .then(|| {
+                    file_header
+                        .service_subdata
+                        .as_deref()
+                        .map(crate::header::common::decode_utf8_prefix_until_nul)
+                })
+                .flatten();
             let entry = ServiceEntry {
                 header_offset: service.header.header_offset,
                 file_header,
@@ -128,6 +136,7 @@ impl RarArchive {
                 file_encryption: service.file_encryption.map(Self::file_encryption_info),
                 hash: service.hash,
                 comment_crc16: None,
+                ntfs_stream_name,
                 segments: vec![segment],
             };
             Self::integrate_service_entry(&mut self.services, vol_num, entry);
@@ -247,6 +256,7 @@ impl RarArchive {
                 file_encryption: None,
                 hash: None,
                 comment_crc16: None,
+                ntfs_stream_name: None,
                 segments: vec![DataSegment::with_packed_hash(
                     vol_num,
                     fh.data_offset,
@@ -256,6 +266,13 @@ impl RarArchive {
                 )],
             };
             Self::integrate_service_entry(&mut self.services, vol_num, entry);
+        }
+        for old_service in &parsed.old_services {
+            if let Some(entry) =
+                Self::rar4_old_service_to_service_entry(old_service, vol_num, self.format)
+            {
+                Self::integrate_service_entry(&mut self.services, vol_num, entry);
+            }
         }
         for comment in &parsed.comments {
             let entry = Self::rar4_comment_to_service_entry(comment, vol_num, self.format);
@@ -677,6 +694,11 @@ impl RarArchive {
         {
             existing.comment_crc16 = incoming.comment_crc16;
         }
+        if !incoming_header.split_after
+            || (existing.ntfs_stream_name.is_none() && incoming.ntfs_stream_name.is_some())
+        {
+            existing.ntfs_stream_name = incoming.ntfs_stream_name.clone();
+        }
     }
 
     fn ensure_volume_header_encryption_matches(
@@ -783,6 +805,7 @@ mod tests {
             file_encryption: None,
             hash: None,
             comment_crc16: Some(0xCCDD),
+            ntfs_stream_name: None,
             segments: vec![DataSegment::new(first_volume, 16, 8)],
         }
     }

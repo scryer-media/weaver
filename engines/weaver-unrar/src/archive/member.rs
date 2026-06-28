@@ -15,6 +15,36 @@ use crate::volume::VolumeProvider;
 const STREAMING_STORE_CHUNK_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LINK_TARGET_BYTES: usize = 0x10000;
 const MAX_COMMENT_BYTES: u64 = 0x1000000;
+#[cfg(any(windows, test))]
+const WINDOWS_IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+#[cfg(any(windows, test))]
+const WINDOWS_IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+#[cfg(any(windows, test))]
+const WINDOWS_SYMLINK_FLAG_RELATIVE: u32 = 1;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+#[cfg(test)]
+const WINDOWS_FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+#[cfg(any(windows, test))]
+const WINDOWS_FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+#[cfg(any(windows, test))]
+const WINDOWS_OWNER_SECURITY_INFORMATION: u32 = 0x1;
+#[cfg(any(windows, test))]
+const WINDOWS_GROUP_SECURITY_INFORMATION: u32 = 0x2;
+#[cfg(any(windows, test))]
+const WINDOWS_DACL_SECURITY_INFORMATION: u32 = 0x4;
+#[cfg(any(windows, test))]
+const WINDOWS_SACL_SECURITY_INFORMATION: u32 = 0x8;
+
+#[cfg(windows)]
+struct WindowsHostMetadata {
+    attributes: u32,
+    mtime: Option<std::time::SystemTime>,
+    ctime: Option<std::time::SystemTime>,
+    atime: Option<std::time::SystemTime>,
+}
 
 #[cfg(unix)]
 fn current_umask() -> u32 {
@@ -30,7 +60,7 @@ fn current_umask() -> u32 {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), test))]
 fn current_umask() -> u32 {
     0
 }
@@ -51,6 +81,7 @@ impl Drop for Rar5ReaderCrypto {
 
 #[derive(Debug)]
 struct Rar3UnixLinkTarget {
+    #[cfg_attr(not(unix), allow(dead_code))]
     raw: Vec<u8>,
     safety_target: String,
 }
@@ -306,6 +337,621 @@ impl RarArchive {
         Ok(output)
     }
 
+    fn restore_ntfs_streams_for_member(
+        &mut self,
+        member_index: usize,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        let services: Vec<ServiceEntry> = self
+            .services
+            .iter()
+            .filter(|service| service.file_header.name == "STM")
+            .filter_map(|service| {
+                (self.rar4_service_parent_member_index(service) == Some(member_index))
+                    .then_some(service.clone())
+            })
+            .collect();
+
+        for service in services {
+            let Some(stream_name) = Self::ntfs_stream_name_from_service(&service) else {
+                continue;
+            };
+            if Self::is_broken_ntfs_stream_name(&stream_name) {
+                if Self::broken_ntfs_stream_name_is_fatal() {
+                    return Err(Self::broken_ntfs_stream_name_error(
+                        &self.members[member_index].file_header.name,
+                        &stream_name,
+                    ));
+                }
+                debug!(
+                    member = %self.members[member_index].file_header.name,
+                    stream = %stream_name,
+                    "skipping broken NTFS alternate stream name on non-Windows target"
+                );
+                continue;
+            }
+            if Self::is_prohibited_ntfs_stream_name(&stream_name) {
+                debug!(
+                    member = %self.members[member_index].file_header.name,
+                    stream = %stream_name,
+                    "skipping prohibited NTFS alternate stream type"
+                );
+                continue;
+            }
+            debug_assert!(Self::is_allowed_ntfs_stream_name(&stream_name));
+            self.restore_ntfs_stream(&service, options, out_path, &stream_name)?;
+        }
+
+        Ok(())
+    }
+
+    fn ntfs_stream_name_from_service(service: &ServiceEntry) -> Option<String> {
+        service.ntfs_stream_name.clone().or_else(|| {
+            service
+                .file_header
+                .service_subdata
+                .as_deref()
+                .map(crate::header::common::decode_utf8_prefix_until_nul)
+        })
+    }
+
+    fn is_allowed_ntfs_stream_name(stream_name: &str) -> bool {
+        !Self::is_broken_ntfs_stream_name(stream_name)
+            && !Self::is_prohibited_ntfs_stream_name(stream_name)
+    }
+
+    fn is_broken_ntfs_stream_name(stream_name: &str) -> bool {
+        !stream_name.starts_with(':') || stream_name.contains(['\\', '/'])
+    }
+
+    fn is_prohibited_ntfs_stream_name(stream_name: &str) -> bool {
+        stream_name.chars().filter(|ch| *ch == ':').count() > 1
+    }
+
+    fn broken_ntfs_stream_name_is_fatal() -> bool {
+        cfg!(windows)
+    }
+
+    fn broken_ntfs_stream_name_error(member_name: &str, stream_name: &str) -> RarError {
+        RarError::CorruptArchive {
+            detail: format!(
+                "broken NTFS alternate stream name {stream_name:?} for member {member_name:?}"
+            ),
+        }
+    }
+
+    fn restore_ntfs_acl_for_member(
+        &mut self,
+        member_index: usize,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        if !options.restore_owners {
+            return Ok(());
+        }
+
+        let services: Vec<ServiceEntry> = self
+            .services
+            .iter()
+            .filter(|service| service.file_header.name == "ACL")
+            .filter_map(|service| {
+                (self.rar4_service_parent_member_index(service) == Some(member_index))
+                    .then_some(service.clone())
+            })
+            .collect();
+
+        for service in services {
+            self.restore_ntfs_acl(&service, options, out_path)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn restore_ntfs_acl(
+        &mut self,
+        service: &ServiceEntry,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        let mut payload = Vec::new();
+        let written = self.write_service_subdata_to_writer(service, options, &mut payload)?;
+        if written == 0 {
+            return Ok(());
+        }
+
+        let read_sacl = Self::set_ntfs_acl_privileges();
+        let security_information = Self::ntfs_acl_security_information(read_sacl);
+        let set_ok =
+            Self::set_ntfs_acl_security(out_path, security_information, payload.as_mut_ptr());
+        if set_ok == 0 {
+            debug!(
+                member = %service.file_header.name,
+                path = %out_path.display(),
+                error = %std::io::Error::last_os_error(),
+                "could not restore NTFS ACL service data"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn set_ntfs_acl_security(
+        out_path: &std::path::Path,
+        security_information: u32,
+        security_descriptor: *mut u8,
+    ) -> i32 {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let set_ok = unsafe {
+            windows_sys::Win32::Security::SetFileSecurityW(
+                path.as_ptr(),
+                security_information,
+                security_descriptor.cast(),
+            )
+        };
+        if set_ok != 0 {
+            return set_ok;
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return set_ok;
+        };
+        unsafe {
+            windows_sys::Win32::Security::SetFileSecurityW(
+                long_path.as_ptr(),
+                security_information,
+                security_descriptor.cast(),
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_long_path_to_wide_nul(path: &std::path::Path) -> Option<Vec<u16>> {
+        let src = path.as_os_str().to_string_lossy();
+        let cur_dir = std::env::current_dir().ok()?;
+        let cur_dir = cur_dir.as_os_str().to_string_lossy();
+        Self::windows_long_path_string(&src, &cur_dir)
+            .map(|path| Self::windows_string_to_wide_nul(&path))
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_long_path_string(src: &str, cur_dir: &str) -> Option<String> {
+        if src.is_empty() {
+            return None;
+        }
+        let src = src.replace('/', "\\");
+        let cur_dir = cur_dir.replace('/', "\\");
+        const PREFIX: &str = "\\\\?\\";
+
+        if src.starts_with(PREFIX) {
+            return Some(src);
+        }
+        if Self::windows_path_has_drive_root(&src) {
+            return Some(format!("{PREFIX}{src}"));
+        }
+        if src.starts_with("\\\\") {
+            return Some(format!("{PREFIX}UNC{}", &src[1..]));
+        }
+        if let Some(rest) = src.strip_prefix('\\') {
+            let drive = cur_dir.get(..2)?;
+            return Some(format!("{PREFIX}{drive}\\{rest}"));
+        }
+
+        let relative = src.strip_prefix(".\\").unwrap_or(&src);
+        Some(format!(
+            "{PREFIX}{}\\{}",
+            cur_dir.trim_end_matches('\\'),
+            relative
+        ))
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_path_has_drive_root(path: &str) -> bool {
+        path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && path.as_bytes()[2] == b'\\'
+    }
+
+    #[cfg(any(windows, test))]
+    fn ntfs_acl_security_information(read_sacl: bool) -> u32 {
+        let base = WINDOWS_OWNER_SECURITY_INFORMATION
+            | WINDOWS_GROUP_SECURITY_INFORMATION
+            | WINDOWS_DACL_SECURITY_INFORMATION;
+        if read_sacl {
+            base | WINDOWS_SACL_SECURITY_INFORMATION
+        } else {
+            base
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_ntfs_acl_privileges() -> bool {
+        static READ_SACL: OnceLock<bool> = OnceLock::new();
+        *READ_SACL.get_or_init(|| {
+            let read_sacl =
+                Self::enable_windows_privilege(windows_sys::Win32::Security::SE_SECURITY_NAME);
+            let _ = Self::enable_windows_privilege(windows_sys::Win32::Security::SE_RESTORE_NAME);
+            read_sacl
+        })
+    }
+
+    #[cfg(windows)]
+    fn enable_windows_privilege(privilege_name: windows_sys::core::PCWSTR) -> bool {
+        let mut token = std::ptr::null_mut();
+        let opened = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                windows_sys::Win32::Security::TOKEN_ADJUST_PRIVILEGES,
+                &mut token,
+            )
+        };
+        if opened == 0 {
+            return false;
+        }
+
+        struct Token(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
+        }
+        let token = Token(token);
+
+        let mut privileges = windows_sys::Win32::Security::TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [windows_sys::Win32::Security::LUID_AND_ATTRIBUTES {
+                Luid: windows_sys::Win32::Foundation::LUID {
+                    LowPart: 0,
+                    HighPart: 0,
+                },
+                Attributes: windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let looked_up = unsafe {
+            windows_sys::Win32::Security::LookupPrivilegeValueW(
+                std::ptr::null(),
+                privilege_name,
+                &mut privileges.Privileges[0].Luid,
+            )
+        };
+        if looked_up == 0 {
+            return false;
+        }
+
+        unsafe {
+            windows_sys::Win32::Foundation::SetLastError(0);
+        }
+        let adjusted = unsafe {
+            windows_sys::Win32::Security::AdjustTokenPrivileges(
+                token.0,
+                0,
+                &privileges,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        adjusted != 0 && unsafe { windows_sys::Win32::Foundation::GetLastError() } == 0
+    }
+
+    #[cfg(not(windows))]
+    fn restore_ntfs_acl(
+        &mut self,
+        service: &ServiceEntry,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        let _ = self;
+        let _ = service;
+        let _ = options;
+        let _ = out_path;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn restore_ntfs_stream(
+        &mut self,
+        service: &ServiceEntry,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+        stream_name: &str,
+    ) -> RarResult<()> {
+        let host_metadata = Self::capture_windows_host_metadata(out_path)?;
+        Self::clear_windows_readonly_for_stream_write(out_path, &host_metadata)?;
+
+        let stream_path = Self::ntfs_stream_output_path(out_path, stream_name);
+        let write_result = (|| {
+            let file = std::fs::File::create(stream_path).map_err(RarError::Io)?;
+            let mut writer = BufWriter::new(file);
+            self.write_service_subdata_to_writer(service, options, &mut writer)?;
+            writer.flush().map_err(RarError::Io)
+        })();
+        let restore_result = Self::restore_windows_host_metadata(out_path, &host_metadata);
+        write_result?;
+        restore_result
+    }
+
+    #[cfg(windows)]
+    fn capture_windows_host_metadata(
+        out_path: &std::path::Path,
+    ) -> RarResult<Option<WindowsHostMetadata>> {
+        let attributes = Self::get_windows_file_attributes(out_path);
+        if attributes == u32::MAX {
+            return Ok(None);
+        }
+
+        let metadata = std::fs::metadata(out_path).map_err(RarError::Io)?;
+        Ok(Some(WindowsHostMetadata {
+            attributes,
+            mtime: metadata.modified().ok(),
+            ctime: metadata.created().ok(),
+            atime: metadata.accessed().ok(),
+        }))
+    }
+
+    #[cfg(windows)]
+    fn clear_windows_readonly_for_stream_write(
+        out_path: &std::path::Path,
+        metadata: &Option<WindowsHostMetadata>,
+    ) -> RarResult<()> {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+        let attributes = Self::windows_attributes_without_readonly(metadata.attributes);
+        if attributes == metadata.attributes {
+            return Ok(());
+        }
+        Self::set_windows_file_attributes(out_path, attributes)
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_attributes_without_readonly(attributes: u32) -> u32 {
+        attributes & !WINDOWS_FILE_ATTRIBUTE_READONLY
+    }
+
+    #[cfg(windows)]
+    fn restore_windows_host_metadata(
+        out_path: &std::path::Path,
+        metadata: &Option<WindowsHostMetadata>,
+    ) -> RarResult<()> {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+
+        if let Some(mtime) = metadata.mtime {
+            filetime::set_file_mtime(out_path, filetime::FileTime::from_system_time(mtime))
+                .map_err(RarError::Io)?;
+        }
+        if let Some(atime) = metadata.atime {
+            filetime::set_file_atime(out_path, filetime::FileTime::from_system_time(atime))
+                .map_err(RarError::Io)?;
+        }
+        Self::apply_creation_time(metadata.ctime, out_path)?;
+        Self::set_windows_file_attributes(out_path, metadata.attributes)
+    }
+
+    #[cfg(windows)]
+    fn set_windows_file_attributes(out_path: &std::path::Path, attributes: u32) -> RarResult<()> {
+        if Self::set_windows_file_attributes_raw(out_path, attributes) {
+            return Ok(());
+        }
+        Err(RarError::Io(std::io::Error::last_os_error()))
+    }
+
+    #[cfg(windows)]
+    fn get_windows_file_attributes(out_path: &std::path::Path) -> u32 {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let attributes =
+            unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(path.as_ptr()) };
+        if attributes != u32::MAX {
+            return attributes;
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return attributes;
+        };
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(long_path.as_ptr()) }
+    }
+
+    #[cfg(windows)]
+    fn set_windows_file_attributes_raw(out_path: &std::path::Path, attributes: u32) -> bool {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(path.as_ptr(), attributes)
+        };
+        if ok != 0 {
+            return true;
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return false;
+        };
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+                long_path.as_ptr(),
+                attributes,
+            ) != 0
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn restore_ntfs_stream(
+        &mut self,
+        service: &ServiceEntry,
+        options: &ExtractOptions,
+        out_path: &std::path::Path,
+        stream_name: &str,
+    ) -> RarResult<()> {
+        let _ = self;
+        let _ = service;
+        let _ = options;
+        let _ = out_path;
+        let _ = stream_name;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn ntfs_stream_output_path(
+        out_path: &std::path::Path,
+        stream_name: &str,
+    ) -> std::path::PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut base =
+            if out_path.parent().is_none() && out_path.as_os_str().encode_wide().count() == 1 {
+                let mut prefixed = OsString::from(".\\");
+                prefixed.push(out_path.as_os_str());
+                prefixed
+            } else {
+                out_path.as_os_str().to_os_string()
+            };
+        base.push(stream_name);
+        std::path::PathBuf::from(base)
+    }
+
+    #[cfg(any(windows, test))]
+    fn write_service_subdata_to_writer(
+        &mut self,
+        service: &ServiceEntry,
+        options: &ExtractOptions,
+        writer: &mut dyn Write,
+    ) -> RarResult<u64> {
+        let fh = &service.file_header;
+        let unpacked_size = fh.unpacked_size.ok_or_else(|| RarError::CorruptArchive {
+            detail: format!("RAR service {} has unknown unpacked size", fh.name),
+        })?;
+        let packed_len = service.segments.iter().try_fold(0u64, |total, segment| {
+            total
+                .checked_add(segment.data_size)
+                .ok_or_else(|| RarError::ResourceLimit {
+                    detail: format!("RAR service {} packed size overflows u64", fh.name),
+                })
+        })?;
+        if packed_len == 0 && !fh.split_after {
+            return Ok(0);
+        }
+
+        let expected_crc = fh.data_crc32;
+        let expected_blake = match service.hash.as_ref() {
+            Some(FileHash::Blake2sp(expected)) => Some(*expected),
+            _ => None,
+        };
+        let use_hash_mac = service
+            .file_encryption
+            .as_ref()
+            .is_some_and(|enc| enc.use_hash_mac);
+        let rar5_crypto = if service.is_encrypted {
+            if fh.compression.format != ArchiveFormat::Rar5 {
+                return Err(RarError::EncryptedMember {
+                    member: fh.name.clone(),
+                });
+            }
+            let password = options
+                .password
+                .as_deref()
+                .or(self.password.as_deref())
+                .ok_or_else(|| RarError::EncryptedMember {
+                    member: fh.name.clone(),
+                })?
+                .to_owned();
+            Some(self.prepare_rar5_encrypted_member(
+                &fh.name,
+                &password,
+                service.file_encryption.as_ref(),
+            )?)
+        } else {
+            None
+        };
+
+        let base_reader =
+            ArchiveSegmentReader::new(&mut self.volumes, &self.limits, &service.segments, &fh.name)
+                .with_packed_hash_key(rar5_crypto.as_ref().map(|crypto| crypto.hash_key));
+        let reader: Box<dyn Read + '_> = if let Some(crypto) = rar5_crypto.as_ref() {
+            Box::new(crate::crypto::DecryptingReader::new_rar5(
+                base_reader,
+                &crypto.key,
+                &crypto.iv,
+            ))
+        } else {
+            Box::new(base_reader)
+        };
+
+        let mut hash_writer =
+            HashingWriter::new(writer, expected_crc.is_some(), expected_blake.is_some());
+        let written = if fh.compression.method == CompressionMethod::Store {
+            Self::copy_reader_to_writer(
+                reader,
+                &mut hash_writer,
+                StoreCopyLimit::Exact(unpacked_size),
+                &fh.name,
+            )?
+        } else if fh.compression.format == ArchiveFormat::Rar5 {
+            let written = crate::decompress::lz::decompress_lz_reader_to_writer_with_max_dict_size(
+                reader,
+                unpacked_size,
+                &fh.compression,
+                &mut hash_writer,
+                self.limits.max_dict_size,
+            )?;
+            self.enforce_unknown_lz_output_limit(fh, written)?;
+            written
+        } else if fh.compression.format.is_rar4_family() {
+            let written = crate::decompress::rar4_old::decompress_rar4_reader_to_writer(
+                reader,
+                unpacked_size,
+                fh.compression.version,
+                fh.compression.method.code(),
+                fh.compression.dict_size,
+                &mut hash_writer,
+            )?;
+            self.enforce_unknown_lz_output_limit(fh, written)?;
+            written
+        } else {
+            return Err(RarError::UnsupportedFormat {
+                version: match fh.compression.format {
+                    ArchiveFormat::Rar14 => 14,
+                    ArchiveFormat::Rar4 => 4,
+                    ArchiveFormat::Rar5 => 5,
+                },
+            });
+        };
+        hash_writer.flush().map_err(RarError::Io)?;
+
+        if written != unpacked_size {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "RAR service {} produced {} bytes, expected {}",
+                    fh.name, written, unpacked_size
+                ),
+            });
+        }
+
+        let actual_crc = expected_crc.map(|_| hash_writer.finalize_crc());
+        let actual_blake = expected_blake.map(|_| hash_writer.finalize_blake2());
+        Self::verify_member_crc32(
+            &fh.name,
+            expected_crc,
+            actual_crc,
+            use_hash_mac,
+            rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+        )?;
+        Self::verify_member_blake2(
+            &fh.name,
+            expected_blake,
+            actual_blake,
+            use_hash_mac,
+            rar5_crypto.as_ref().map(|crypto| &crypto.hash_key),
+        )?;
+
+        Ok(written)
+    }
+
     pub(super) fn hydrate_rar4_uowner_payloads(&mut self) {
         if !self.format.is_rar4_family() {
             return;
@@ -455,10 +1101,7 @@ impl RarArchive {
             .iter()
             .filter(|byte| matches!(byte, b'/' | b'.'))
             .count();
-        let decoded_path_chars = target
-            .chars()
-            .filter(|ch| matches!(ch, '/' | '.'))
-            .count();
+        let decoded_path_chars = target.chars().filter(|ch| matches!(ch, '/' | '.')).count();
         if raw_path_chars != decoded_path_chars {
             return Err(RarError::CorruptArchive {
                 detail: format!(
@@ -497,9 +1140,7 @@ impl RarArchive {
                     return None;
                 }
                 pos += 2;
-                (u32::from(byte & 0x0f) << 12)
-                    | (u32::from(b0 & 0x3f) << 6)
-                    | u32::from(b1 & 0x3f)
+                (u32::from(byte & 0x0f) << 12) | (u32::from(b0 & 0x3f) << 6) | u32::from(b1 & 0x3f)
             } else if byte >> 3 == 30 {
                 let b0 = *bytes.get(pos)?;
                 let b1 = *bytes.get(pos + 1)?;
@@ -539,7 +1180,8 @@ impl RarArchive {
                         ),
                     )));
                 }
-                std::fs::remove_file(out_path).map_err(RarError::Io)?;
+                Self::clear_windows_readonly_before_delete(out_path)?;
+                Self::remove_output_file(out_path)?;
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(RarError::Io(err)),
@@ -550,12 +1192,88 @@ impl RarArchive {
     fn remove_existing_regular_output_symlink(out_path: &std::path::Path) -> RarResult<()> {
         match std::fs::symlink_metadata(out_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                std::fs::remove_file(out_path).map_err(RarError::Io)?;
+                Self::clear_windows_readonly_before_delete(out_path)?;
+                Self::remove_output_file(out_path)?;
             }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(RarError::Io(err)),
         }
+        Ok(())
+    }
+
+    fn clear_windows_readonly_before_delete(out_path: &std::path::Path) -> RarResult<()> {
+        Self::clear_windows_readonly_attribute(out_path)
+    }
+
+    fn clear_windows_readonly_before_overwrite(out_path: &std::path::Path) -> RarResult<()> {
+        Self::clear_windows_readonly_attribute(out_path)
+    }
+
+    fn remove_output_file(out_path: &std::path::Path) -> RarResult<()> {
+        #[cfg(windows)]
+        {
+            let path = Self::windows_path_to_wide_nul(out_path);
+            let ok = unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(path.as_ptr()) };
+            if ok != 0 {
+                return Ok(());
+            }
+
+            let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+                return Err(RarError::Io(std::io::Error::last_os_error()));
+            };
+            let ok =
+                unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(long_path.as_ptr()) };
+            if ok == 0 {
+                return Err(RarError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(out_path).map_err(RarError::Io)
+        }
+    }
+
+    #[cfg(windows)]
+    fn remove_output_dir(out_path: &std::path::Path) -> RarResult<()> {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let ok =
+            unsafe { windows_sys::Win32::Storage::FileSystem::RemoveDirectoryW(path.as_ptr()) };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        };
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::RemoveDirectoryW(long_path.as_ptr())
+        };
+        if ok == 0 {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    fn clear_windows_readonly_attribute(out_path: &std::path::Path) -> RarResult<()> {
+        #[cfg(windows)]
+        {
+            let attributes = Self::get_windows_file_attributes(out_path);
+            if attributes != u32::MAX && attributes & WINDOWS_FILE_ATTRIBUTE_READONLY != 0 {
+                Self::set_windows_file_attributes(
+                    out_path,
+                    Self::windows_attributes_without_readonly(attributes),
+                )?;
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = out_path;
+        }
+
         Ok(())
     }
 
@@ -593,7 +1311,8 @@ impl RarArchive {
             current.push(part);
             match std::fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    std::fs::remove_file(&current).map_err(RarError::Io)?;
+                    Self::clear_windows_readonly_before_delete(&current)?;
+                    Self::remove_output_file(&current)?;
                     std::fs::create_dir(&current).map_err(RarError::Io)?;
                 }
                 Ok(metadata) if metadata.is_dir() => {}
@@ -613,6 +1332,35 @@ impl RarArchive {
             }
         }
 
+        Ok(())
+    }
+
+    fn ensure_output_directory_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        match std::fs::symlink_metadata(out_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Self::clear_windows_readonly_before_delete(out_path)?;
+                Self::remove_output_file(out_path)?;
+                std::fs::create_dir(out_path).map_err(RarError::Io)?;
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(RarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "directory output path {} exists and is not a directory",
+                        out_path.display()
+                    ),
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(out_path).map_err(RarError::Io)?;
+            }
+            Err(err) => return Err(RarError::Io(err)),
+        }
         Ok(())
     }
 
@@ -780,6 +1528,8 @@ impl RarArchive {
         raw_member_name: &str,
         target: &str,
         target_raw: Option<&[u8]>,
+        windows_reparse_target: &str,
+        target_is_directory: bool,
         out_path: &std::path::Path,
     ) -> RarResult<u64> {
         Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
@@ -790,6 +1540,8 @@ impl RarArchive {
         {
             use std::os::unix::ffi::OsStrExt;
 
+            let _ = windows_reparse_target;
+            let _ = target_is_directory;
             let target = target_raw
                 .map(std::ffi::OsStr::from_bytes)
                 .unwrap_or_else(|| std::ffi::OsStr::new(target));
@@ -801,18 +1553,544 @@ impl RarArchive {
             Ok(0)
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let _ = owner;
+            let _ = options;
+            let _ = target_raw;
+
+            Self::ensure_safe_windows_reparse_target(windows_reparse_target, raw_member_name)?;
+            Self::create_windows_symlink_reparse_point(
+                windows_reparse_target,
+                out_path,
+                fh.is_directory || target_is_directory,
+            )?;
+            Self::apply_symlink_times(fh, out_path)?;
+            Ok(0)
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = fh;
             let _ = owner;
             let _ = options;
             let _ = target;
             let _ = target_raw;
+            let _ = windows_reparse_target;
+            let _ = target_is_directory;
             let _ = out_path;
             Err(RarError::UnsupportedLinkType {
                 member: raw_member_name.to_string(),
                 link_type: "symlink".to_string(),
             })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_windows_junction_output(
+        fh: &FileHeader,
+        owner: Option<&crate::types::UnixOwnerInfo>,
+        options: &ExtractOptions,
+        member_name: &str,
+        raw_member_name: &str,
+        safety_target: &str,
+        reparse_target: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<u64> {
+        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        Self::ensure_safe_symlink_target(
+            fh,
+            member_name,
+            safety_target,
+            raw_member_name,
+            out_path,
+        )?;
+        Self::remove_existing_link_output(out_path)?;
+
+        #[cfg(windows)]
+        {
+            let _ = owner;
+            let _ = options;
+
+            Self::create_windows_junction_reparse_point(reparse_target, out_path, raw_member_name)?;
+            Self::apply_symlink_times(fh, out_path)?;
+            Ok(0)
+        }
+
+        #[cfg(unix)]
+        {
+            let _ = reparse_target;
+            let target = std::ffi::OsStr::new(safety_target);
+            std::os::unix::fs::symlink(target, out_path).map_err(RarError::Io)?;
+            Self::apply_symlink_times(fh, out_path)?;
+            if options.restore_owners {
+                Self::apply_unix_owner(owner, out_path, false)?;
+            }
+            Ok(0)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = fh;
+            let _ = owner;
+            let _ = options;
+            let _ = reparse_target;
+            let _ = out_path;
+            Err(RarError::UnsupportedLinkType {
+                member: raw_member_name.to_string(),
+                link_type: "WindowsJunction".to_string(),
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction_reparse_point(
+        target: &str,
+        out_path: &std::path::Path,
+        member: &str,
+    ) -> RarResult<()> {
+        Self::ensure_safe_windows_reparse_target(target, member)?;
+        let buffer = Self::windows_junction_reparse_buffer(target)?;
+        Self::create_windows_reparse_point(out_path, true, buffer)
+    }
+
+    #[cfg(windows)]
+    fn create_windows_symlink_reparse_point(
+        target: &str,
+        out_path: &std::path::Path,
+        is_directory: bool,
+    ) -> RarResult<()> {
+        let buffer = Self::windows_symlink_reparse_buffer(target)?;
+        Self::create_windows_reparse_point(out_path, is_directory, buffer)
+    }
+
+    #[cfg(any(windows, test))]
+    fn ensure_safe_windows_reparse_target(target: &str, member: &str) -> RarResult<()> {
+        if Self::windows_reparse_target_is_absolute(target) {
+            return Err(RarError::UnsafeLinkTarget {
+                member: member.to_string(),
+                target: target.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_reparse_target_is_absolute(target: &str) -> bool {
+        target.starts_with('\\')
+            || target.starts_with('/')
+            || (target.len() >= 3
+                && target.as_bytes()[0].is_ascii_alphabetic()
+                && target.as_bytes()[1] == b':'
+                && matches!(target.as_bytes()[2], b'\\' | b'/'))
+    }
+
+    #[cfg(windows)]
+    fn create_windows_reparse_point(
+        out_path: &std::path::Path,
+        is_directory: bool,
+        buffer: Vec<u8>,
+    ) -> RarResult<()> {
+        Self::ensure_windows_reparse_privileges();
+
+        if is_directory {
+            Self::create_windows_reparse_directory_placeholder(out_path)?;
+        } else {
+            Self::create_windows_reparse_file_placeholder(out_path)?;
+        }
+
+        let handle = Self::open_windows_file_with_long_path_fallback(
+            out_path,
+            windows_sys::Win32::Foundation::GENERIC_READ
+                | windows_sys::Win32::Foundation::GENERIC_WRITE,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            Self::remove_failed_windows_reparse_placeholder(out_path, is_directory);
+            return Err(RarError::Io(err));
+        }
+
+        struct Handle(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Handle {
+            fn drop(&mut self) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
+        }
+        let handle = Handle(handle);
+
+        let mut returned = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(
+                handle.0,
+                windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                buffer.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            drop(handle);
+            Self::remove_failed_windows_reparse_placeholder(out_path, is_directory);
+            return Err(RarError::Io(err));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn create_windows_reparse_directory_placeholder(out_path: &std::path::Path) -> RarResult<()> {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(
+                path.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        };
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(
+                long_path.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn create_windows_reparse_file_placeholder(out_path: &std::path::Path) -> RarResult<()> {
+        let handle = Self::create_windows_file_with_long_path_fallback(
+            out_path,
+            windows_sys::Win32::Foundation::GENERIC_WRITE,
+            0,
+            windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn ensure_windows_reparse_privileges() {
+        static ENABLED: OnceLock<()> = OnceLock::new();
+        ENABLED.get_or_init(|| {
+            // Mirrors UnRAR's best-effort SetPrivilege calls before creating
+            // Windows symlink or junction reparse points. Missing privileges
+            // are reported by the later FSCTL_SET_REPARSE_POINT call.
+            Self::try_enable_windows_privilege(windows_sys::Win32::Security::SE_RESTORE_NAME);
+            Self::try_enable_windows_privilege(
+                windows_sys::Win32::Security::SE_CREATE_SYMBOLIC_LINK_NAME,
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    fn try_enable_windows_privilege(privilege_name: windows_sys::core::PCWSTR) {
+        let mut token = windows_sys::Win32::Foundation::HANDLE::default();
+        let opened = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcessToken(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                windows_sys::Win32::Security::TOKEN_ADJUST_PRIVILEGES,
+                &mut token,
+            )
+        };
+        if opened == 0 {
+            return;
+        }
+
+        struct TokenHandle(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for TokenHandle {
+            fn drop(&mut self) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
+        }
+        let token = TokenHandle(token);
+
+        let mut privileges = windows_sys::Win32::Security::TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [windows_sys::Win32::Security::LUID_AND_ATTRIBUTES {
+                Luid: windows_sys::Win32::Foundation::LUID {
+                    LowPart: 0,
+                    HighPart: 0,
+                },
+                Attributes: windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        let looked_up = unsafe {
+            windows_sys::Win32::Security::LookupPrivilegeValueW(
+                std::ptr::null(),
+                privilege_name,
+                &mut privileges.Privileges[0].Luid,
+            )
+        };
+        if looked_up == 0 {
+            return;
+        }
+
+        unsafe {
+            windows_sys::Win32::Security::AdjustTokenPrivileges(
+                token.0,
+                0,
+                &privileges,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn remove_failed_windows_reparse_placeholder(out_path: &std::path::Path, is_directory: bool) {
+        let _ = if is_directory {
+            Self::remove_output_dir(out_path)
+        } else {
+            Self::remove_output_file(out_path)
+        };
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_junction_reparse_buffer(target: &str) -> RarResult<Vec<u8>> {
+        let substitute_name = Self::windows_junction_substitute_name(target);
+        let print_name = Self::windows_reparse_print_name(&substitute_name);
+        let substitute = Self::windows_string_to_wide_nul(&substitute_name);
+        let print = Self::windows_string_to_wide_nul(&print_name);
+
+        let substitute_len = (substitute.len().saturating_sub(1))
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows junction target is too long".into(),
+            })?;
+        let print_offset = substitute
+            .len()
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows junction target is too long".into(),
+            })?;
+        let print_len = (print.len().saturating_sub(1))
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows junction target is too long".into(),
+            })?;
+
+        let path_bytes = substitute
+            .len()
+            .checked_add(print.len())
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows junction target is too long".into(),
+            })?;
+        let reparse_data_len = u16::try_from(8usize.checked_add(path_bytes).ok_or_else(|| {
+            RarError::CorruptArchive {
+                detail: "RAR5: Windows junction target is too long".into(),
+            }
+        })?)
+        .map_err(|_| RarError::CorruptArchive {
+            detail: "RAR5: Windows junction target is too long".into(),
+        })?;
+
+        let mut buffer = Vec::with_capacity(8 + usize::from(reparse_data_len));
+        buffer.extend_from_slice(&WINDOWS_IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buffer.extend_from_slice(&reparse_data_len.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&substitute_len.to_le_bytes());
+        buffer.extend_from_slice(&print_offset.to_le_bytes());
+        buffer.extend_from_slice(&print_len.to_le_bytes());
+        for unit in substitute.iter().chain(print.iter()) {
+            buffer.extend_from_slice(&unit.to_le_bytes());
+        }
+        Ok(buffer)
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_symlink_reparse_buffer(target: &str) -> RarResult<Vec<u8>> {
+        let substitute_name = target.replace('/', "\\");
+        let print_name = Self::windows_reparse_print_name(&substitute_name);
+        let substitute = Self::windows_string_to_wide_nul(&substitute_name);
+        let print = Self::windows_string_to_wide_nul(&print_name);
+
+        let substitute_len = (substitute.len().saturating_sub(1))
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows symlink target is too long".into(),
+            })?;
+        let print_offset = substitute
+            .len()
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows symlink target is too long".into(),
+            })?;
+        let print_len = (print.len().saturating_sub(1))
+            .checked_mul(2)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows symlink target is too long".into(),
+            })?;
+
+        let path_bytes = substitute
+            .len()
+            .checked_add(print.len())
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| RarError::CorruptArchive {
+                detail: "RAR5: Windows symlink target is too long".into(),
+            })?;
+        let reparse_data_len = u16::try_from(12usize.checked_add(path_bytes).ok_or_else(|| {
+            RarError::CorruptArchive {
+                detail: "RAR5: Windows symlink target is too long".into(),
+            }
+        })?)
+        .map_err(|_| RarError::CorruptArchive {
+            detail: "RAR5: Windows symlink target is too long".into(),
+        })?;
+
+        let flags = if Self::windows_reparse_target_is_absolute(&substitute_name) {
+            0
+        } else {
+            WINDOWS_SYMLINK_FLAG_RELATIVE
+        };
+
+        let mut buffer = Vec::with_capacity(8 + usize::from(reparse_data_len));
+        buffer.extend_from_slice(&WINDOWS_IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+        buffer.extend_from_slice(&reparse_data_len.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        buffer.extend_from_slice(&substitute_len.to_le_bytes());
+        buffer.extend_from_slice(&print_offset.to_le_bytes());
+        buffer.extend_from_slice(&print_len.to_le_bytes());
+        buffer.extend_from_slice(&flags.to_le_bytes());
+        for unit in substitute.iter().chain(print.iter()) {
+            buffer.extend_from_slice(&unit.to_le_bytes());
+        }
+        Ok(buffer)
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_junction_substitute_name(target: &str) -> String {
+        if let Some(rest) = target.strip_prefix("/??/") {
+            format!("\\??\\{}", rest.replace('/', "\\"))
+        } else {
+            target.replace('/', "\\")
+        }
+    }
+
+    #[cfg(test)]
+    fn windows_junction_print_name(substitute_name: &str) -> String {
+        Self::windows_reparse_print_name(substitute_name)
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_reparse_print_name(substitute_name: &str) -> String {
+        let print = substitute_name
+            .strip_prefix("\\??\\")
+            .unwrap_or(substitute_name);
+        if let Some(rest) = print.strip_prefix("UNC\\") {
+            format!("\\{rest}")
+        } else {
+            print.to_string()
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_string_to_wide_nul(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(windows)]
+    fn windows_path_to_wide_nul(path: &std::path::Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn open_windows_file_with_long_path_fallback(
+        out_path: &std::path::Path,
+        desired_access: u32,
+        share_mode: u32,
+        flags_and_attributes: u32,
+    ) -> windows_sys::Win32::Foundation::HANDLE {
+        Self::create_windows_file_with_long_path_fallback(
+            out_path,
+            desired_access,
+            share_mode,
+            windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+            flags_and_attributes,
+        )
+    }
+
+    #[cfg(windows)]
+    fn create_windows_file_with_long_path_fallback(
+        out_path: &std::path::Path,
+        desired_access: u32,
+        share_mode: u32,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+    ) -> windows_sys::Win32::Foundation::HANDLE {
+        let path = Self::windows_path_to_wide_nul(out_path);
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                path.as_ptr(),
+                desired_access,
+                share_mode,
+                std::ptr::null(),
+                creation_disposition,
+                flags_and_attributes,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return handle;
+        }
+
+        let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+            return handle;
+        };
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                long_path.as_ptr(),
+                desired_access,
+                share_mode,
+                std::ptr::null(),
+                creation_disposition,
+                flags_and_attributes,
+                std::ptr::null_mut(),
+            )
         }
     }
 
@@ -862,52 +2140,222 @@ impl RarArchive {
         }
     }
 
+    #[cfg(unix)]
+    fn apply_symlink_times(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
+        if let Some((atime, mtime)) =
+            Self::unix_regular_file_times(fh.mtime, fh.atime, std::time::SystemTime::now())
+        {
+            // Scryer's Unix support is Darwin and Linux; filetime maps both to
+            // the platform no-follow symlink timestamp APIs.
+            if let Err(error) = filetime::set_symlink_file_times(out_path, atime, mtime) {
+                debug!(
+                    path = %out_path.display(),
+                    ?error,
+                    "failed to restore symlink timestamps"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn apply_symlink_times(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
         let has_mtime = fh.mtime.is_some();
         let has_atime = fh.atime.is_some();
-        if !has_mtime && !has_atime {
+        let has_ctime = fh.ctime.is_some();
+        if !has_mtime && !has_atime && !has_ctime {
             return Ok(());
         }
 
-        #[cfg(unix)]
-        {
-            let mtime = fh
-                .mtime
-                .map(filetime::FileTime::from_system_time)
-                .unwrap_or_else(filetime::FileTime::now);
-            let atime = fh
-                .atime
-                .map(filetime::FileTime::from_system_time)
-                .unwrap_or_else(filetime::FileTime::now);
-            filetime::set_symlink_file_times(out_path, atime, mtime).map_err(RarError::Io)
+        let to_filetime = |time: std::time::SystemTime| -> RarResult<_> {
+            let intervals = Self::windows_filetime_intervals(time)?;
+            Ok(windows_sys::Win32::Foundation::FILETIME {
+                dwLowDateTime: intervals as u32,
+                dwHighDateTime: (intervals >> 32) as u32,
+            })
+        };
+        let ctime = fh.ctime.map(to_filetime).transpose()?;
+        let atime = fh.atime.map(to_filetime).transpose()?;
+        let mtime = fh.mtime.map(to_filetime).transpose()?;
+
+        let handle = Self::open_windows_file_with_long_path_fallback(
+            out_path,
+            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
         }
 
-        #[cfg(not(unix))]
-        {
-            let _ = fh;
-            let _ = out_path;
-            Ok(())
+        struct Handle(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Handle {
+            fn drop(&mut self) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
         }
+        let handle = Handle(handle);
+
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileTime(
+                handle.0,
+                ctime
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value as *const _),
+                atime
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value as *const _),
+                mtime
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value as *const _),
+            )
+        };
+        if ok == 0 {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     fn apply_output_times(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
-        match (fh.mtime, fh.atime) {
-            (Some(mtime), Some(atime)) => filetime::set_file_times(
-                out_path,
-                filetime::FileTime::from_system_time(atime),
-                filetime::FileTime::from_system_time(mtime),
-            )
-            .map_err(RarError::Io),
-            (Some(mtime), None) => {
-                filetime::set_file_mtime(out_path, filetime::FileTime::from_system_time(mtime))
-                    .map_err(RarError::Io)
+        #[cfg(unix)]
+        {
+            if let Some((atime, mtime)) =
+                Self::unix_regular_file_times(fh.mtime, fh.atime, std::time::SystemTime::now())
+            {
+                filetime::set_file_times(out_path, atime, mtime).map_err(RarError::Io)?;
             }
-            (None, Some(atime)) => {
-                filetime::set_file_atime(out_path, filetime::FileTime::from_system_time(atime))
-                    .map_err(RarError::Io)
-            }
-            (None, None) => Ok(()),
         }
+
+        #[cfg(windows)]
+        {
+            match (fh.mtime, fh.atime) {
+                (Some(mtime), Some(atime)) => filetime::set_file_times(
+                    out_path,
+                    filetime::FileTime::from_system_time(atime),
+                    filetime::FileTime::from_system_time(mtime),
+                )
+                .map_err(RarError::Io),
+                (Some(mtime), None) => {
+                    filetime::set_file_mtime(out_path, filetime::FileTime::from_system_time(mtime))
+                        .map_err(RarError::Io)
+                }
+                (None, Some(atime)) => {
+                    filetime::set_file_atime(out_path, filetime::FileTime::from_system_time(atime))
+                        .map_err(RarError::Io)
+                }
+                (None, None) => Ok(()),
+            }?;
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = fh;
+            let _ = out_path;
+        }
+
+        Self::apply_creation_time(fh.ctime, out_path)
+    }
+
+    #[cfg(any(unix, test))]
+    fn unix_regular_file_times(
+        mtime: Option<std::time::SystemTime>,
+        atime: Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+    ) -> Option<(filetime::FileTime, filetime::FileTime)> {
+        if mtime.is_none() && atime.is_none() {
+            return None;
+        }
+
+        let atime = atime.unwrap_or(now);
+        let mtime = mtime.unwrap_or(now);
+        Some((
+            filetime::FileTime::from_system_time(atime),
+            filetime::FileTime::from_system_time(mtime),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn apply_creation_time(
+        ctime: Option<std::time::SystemTime>,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        let Some(ctime) = ctime else {
+            return Ok(());
+        };
+        let intervals = Self::windows_filetime_intervals(ctime)?;
+        let creation = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: intervals as u32,
+            dwHighDateTime: (intervals >> 32) as u32,
+        };
+
+        let handle = Self::open_windows_file_with_long_path_fallback(
+            out_path,
+            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+
+        struct Handle(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Handle {
+            fn drop(&mut self) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(self.0);
+                }
+            }
+        }
+        let handle = Handle(handle);
+
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileTime(
+                handle.0,
+                &creation,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(RarError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn apply_creation_time(
+        ctime: Option<std::time::SystemTime>,
+        out_path: &std::path::Path,
+    ) -> RarResult<()> {
+        let _ = ctime;
+        let _ = out_path;
+        Ok(())
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_filetime_intervals(time: std::time::SystemTime) -> RarResult<u64> {
+        const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+        let windows_epoch =
+            std::time::UNIX_EPOCH - std::time::Duration::from_secs(WINDOWS_TO_UNIX_EPOCH_SECS);
+        let duration =
+            time.duration_since(windows_epoch)
+                .map_err(|_| RarError::CorruptArchive {
+                    detail: "RAR timestamp predates Windows FILETIME epoch".into(),
+                })?;
+        duration
+            .as_secs()
+            .checked_mul(10_000_000)
+            .and_then(|value| value.checked_add(u64::from(duration.subsec_nanos() / 100)))
+            .ok_or_else(|| RarError::ResourceLimit {
+                detail: "RAR timestamp overflows Windows FILETIME".into(),
+            })
     }
 
     fn apply_unix_permissions(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
@@ -933,6 +2381,42 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(any(windows, test))]
+    fn windows_output_attributes(fh: &FileHeader) -> u32 {
+        match fh.host_os {
+            crate::types::HostOs::Windows => fh.attributes.0 as u32,
+            // Scryer only maps Windows, Unix/Linux, and Darwin behavior. On
+            // Windows, UnRAR converts non-Windows archive origins to normal
+            // Win32 directory/file attributes instead of treating their mode
+            // bits as native Windows flags.
+            crate::types::HostOs::Unix
+            | crate::types::HostOs::Darwin
+            | crate::types::HostOs::Unknown(_) => {
+                if fh.is_directory {
+                    WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+                }
+            }
+        }
+    }
+
+    fn apply_windows_attributes(fh: &FileHeader, out_path: &std::path::Path) -> RarResult<()> {
+        #[cfg(windows)]
+        {
+            let attributes = Self::windows_output_attributes(fh);
+            Self::set_windows_file_attributes(out_path, attributes)?;
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = fh;
+            let _ = out_path;
+        }
+
+        Ok(())
+    }
+
     fn apply_unix_owner(
         owner: Option<&crate::types::UnixOwnerInfo>,
         out_path: &std::path::Path,
@@ -946,9 +2430,11 @@ impl RarArchive {
             let Some((uid, gid)) = Self::resolve_unix_owner(owner)? else {
                 return Ok(());
             };
-            if Self::path_owner_matches(out_path, uid, gid, follow_links)? {
+            let chown_follows_links = Self::unix_owner_chown_follows_links(follow_links);
+            if Self::path_owner_matches(out_path, uid, gid, chown_follows_links)? {
                 return Ok(());
             }
+            let original_mode = Self::unix_followed_mode(out_path);
 
             use std::os::unix::ffi::OsStrExt;
 
@@ -961,7 +2447,7 @@ impl RarArchive {
             let uid_arg = uid.unwrap_or(!0 as libc::uid_t);
             let gid_arg = gid.unwrap_or(!0 as libc::gid_t);
             let result = unsafe {
-                if follow_links {
+                if chown_follows_links {
                     libc::chown(path.as_ptr(), uid_arg, gid_arg)
                 } else {
                     libc::lchown(path.as_ptr(), uid_arg, gid_arg)
@@ -969,6 +2455,15 @@ impl RarArchive {
             };
             if result != 0 {
                 return Err(RarError::Io(std::io::Error::last_os_error()));
+            }
+            if let Some(mode) = original_mode
+                && let Err(error) = Self::restore_unix_followed_mode(out_path, mode)
+            {
+                debug!(
+                    path = %out_path.display(),
+                    error = %error,
+                    "failed to restore Unix mode after owner restore"
+                );
             }
         }
 
@@ -980,6 +2475,50 @@ impl RarArchive {
         }
 
         Ok(())
+    }
+
+    #[cfg(any(unix, test))]
+    fn unix_owner_chown_follows_links(follow_links: bool) -> bool {
+        follow_links || cfg!(target_vendor = "apple")
+    }
+
+    #[cfg(any(unix, test))]
+    fn unix_followed_mode(out_path: &std::path::Path) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::metadata(out_path)
+                .ok()
+                .map(|metadata| metadata.permissions().mode())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = out_path;
+            None
+        }
+    }
+
+    #[cfg(any(unix, test))]
+    fn restore_unix_followed_mode(out_path: &std::path::Path, mode: u32) -> RarResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(out_path)
+                .map_err(RarError::Io)?
+                .permissions();
+            permissions.set_mode(mode);
+            std::fs::set_permissions(out_path, permissions).map_err(RarError::Io)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = out_path;
+            let _ = mode;
+            Ok(())
+        }
     }
 
     #[cfg(unix)]
@@ -1073,11 +2612,16 @@ impl RarArchive {
         Ok(uid_matches && gid_matches)
     }
 
+    #[cfg(unix)]
     fn unix_output_mode(fh: &FileHeader) -> Option<u32> {
         match fh.host_os {
             crate::types::HostOs::Unix => {
                 let mode = fh.attributes.unix_mode() & 0o7777;
-                (mode != 0).then_some(mode)
+                Some(mode)
+            }
+            crate::types::HostOs::Darwin if !fh.compression.format.is_rar4_family() => {
+                let mode = fh.attributes.unix_mode() & 0o7777;
+                Some(mode)
             }
             crate::types::HostOs::Windows => {
                 let mode = if fh.is_directory || fh.attributes.is_directory_attr() {
@@ -1089,7 +2633,11 @@ impl RarArchive {
                 };
                 Some(mode & !current_umask())
             }
-            crate::types::HostOs::Unknown(_) => {
+            crate::types::HostOs::Darwin | crate::types::HostOs::Unknown(_) => {
+                // RAR4 `HSYS_MACOS` is a legacy Mac marker, not POSIX mode
+                // storage. Official UnRAR's Unix `ConvertAttributes` treats
+                // it like other non-Unix legacy hosts, so only real Unix
+                // archive origins preserve raw mode bits here.
                 let mode = if fh.is_directory { 0o777 } else { 0o666 };
                 Some(mode & !current_umask())
             }
@@ -1106,7 +2654,8 @@ impl RarArchive {
             Self::apply_unix_owner(owner, out_path, true)?;
         }
         Self::apply_output_times(fh, out_path)?;
-        Self::apply_unix_permissions(fh, out_path)
+        Self::apply_unix_permissions(fh, out_path)?;
+        Self::apply_windows_attributes(fh, out_path)
     }
 
     fn create_hardlink_output(
@@ -1121,7 +2670,10 @@ impl RarArchive {
         Self::remove_existing_link_output(out_path)?;
         let target_path = Self::redirection_target_path(member_name, target, out_path);
         std::fs::hard_link(&target_path, out_path).map_err(RarError::Io)?;
+        // UnRAR sets attributes for hardlinks after creation because deleting
+        // or replacing the output link can affect the shared target metadata.
         Self::apply_unix_permissions(fh, out_path)?;
+        Self::apply_windows_attributes(fh, out_path)?;
         Ok(0)
     }
 
@@ -1236,20 +2788,20 @@ impl RarArchive {
         let temp_path = Self::unique_filecopy_temp_path(out_path, index);
         let extract_result = self.extract_member_to_file(source_index, options, None, &temp_path);
         if let Err(error) = extract_result {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = Self::remove_output_file(&temp_path);
             return Err(error);
         }
 
         Self::remove_existing_link_output(out_path)?;
         let copy_result = Self::copy_existing_filecopy_source(&temp_path, out_path);
-        let remove_result = std::fs::remove_file(&temp_path);
+        let remove_result = Self::remove_output_file(&temp_path);
         match (copy_result, remove_result) {
             (Ok(written), Ok(())) => {
                 Self::apply_output_metadata(fh, owner, options, out_path)?;
                 Ok(written)
             }
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(RarError::Io(error)),
+            (Ok(_), Err(error)) => Err(error),
         }
     }
 
@@ -1273,16 +2825,29 @@ impl RarArchive {
                 None
             };
             return match redir.redir_type {
-                header::RedirectionType::UnixSymlink
-                | header::RedirectionType::WindowsSymlink
-                | header::RedirectionType::WindowsJunction => Self::create_symlink_output(
+                header::RedirectionType::UnixSymlink | header::RedirectionType::WindowsSymlink => {
+                    Self::create_symlink_output(
+                        fh,
+                        owner,
+                        options,
+                        &member_name,
+                        &fh.name,
+                        &target,
+                        target_raw,
+                        &redir.target,
+                        redir.target_is_directory,
+                        out_path,
+                    )
+                    .map(Some)
+                }
+                header::RedirectionType::WindowsJunction => Self::create_windows_junction_output(
                     fh,
                     owner,
                     options,
                     &member_name,
                     &fh.name,
                     &target,
-                    target_raw,
+                    &redir.target,
                     out_path,
                 )
                 .map(Some),
@@ -1706,6 +3271,12 @@ impl RarArchive {
                 key.zeroize();
                 iv.zeroize();
                 decrypting_reader
+            }
+            legacy
+                if fh.compression.format == ArchiveFormat::Rar4
+                    && matches!(fh.host_os, crate::types::HostOs::Unknown(0)) =>
+            {
+                crate::crypto::DecryptingReader::new_rar4_legacy_dos(reader, legacy, password)
             }
             legacy => crate::crypto::DecryptingReader::new_rar4_legacy(reader, legacy, password),
         };
@@ -2545,8 +4116,7 @@ impl RarArchive {
         }
 
         if fh.is_directory {
-            Self::ensure_output_parent_dir_for_member(&member_name, out_path)?;
-            std::fs::create_dir_all(out_path).map_err(RarError::Io)?;
+            Self::ensure_output_directory_for_member(&member_name, out_path)?;
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, 0);
@@ -2573,6 +4143,7 @@ impl RarArchive {
         // Create output file with buffered writer.
         Self::ensure_output_parent_dir_for_member(&member_name, out_path)?;
         Self::remove_existing_regular_output_symlink(out_path)?;
+        Self::clear_windows_readonly_before_overwrite(out_path)?;
         let file = std::fs::File::create(out_path).map_err(RarError::Io)?;
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
@@ -2679,6 +4250,8 @@ impl RarArchive {
 
             writer.flush().map_err(RarError::Io)?;
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+            self.restore_ntfs_acl_for_member(index, options, out_path)?;
+            self.restore_ntfs_streams_for_member(index, options, out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, written);
                 p.on_member_complete(mi, &Ok(()));
@@ -2760,6 +4333,8 @@ impl RarArchive {
             )?;
 
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+            self.restore_ntfs_acl_for_member(index, options, out_path)?;
+            self.restore_ntfs_streams_for_member(index, options, out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, unpacked_size);
                 p.on_member_complete(mi, &Ok(()));
@@ -2842,6 +4417,8 @@ impl RarArchive {
             Self::verify_member_blake2(&fh.name, expected_blake, actual_blake, false, None)?;
 
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+            self.restore_ntfs_acl_for_member(index, options, out_path)?;
+            self.restore_ntfs_streams_for_member(index, options, out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, written);
                 p.on_member_complete(mi, &Ok(()));
@@ -2952,6 +4529,8 @@ impl RarArchive {
             self.solid_next_index = index + 1;
 
             Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+            self.restore_ntfs_acl_for_member(index, options, out_path)?;
+            self.restore_ntfs_streams_for_member(index, options, out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, written);
                 p.on_member_complete(mi, &Ok(()));
@@ -4630,14 +6209,14 @@ impl RarArchive {
 }
 
 /// Writer wrapper that updates a shared CRC hasher.
-struct HashingWriter<'a, W: Write> {
+struct HashingWriter<'a, W: Write + ?Sized> {
     inner: &'a mut W,
     crc: Option<crc32fast::Hasher>,
     rar14: Option<u16>,
     blake2: Option<Blake2spHasher>,
 }
 
-impl<'a, W: Write> HashingWriter<'a, W> {
+impl<'a, W: Write + ?Sized> HashingWriter<'a, W> {
     fn new(inner: &'a mut W, compute_crc: bool, compute_blake2: bool) -> Self {
         Self {
             inner,
@@ -4685,7 +6264,7 @@ impl<'a, W: Write> HashingWriter<'a, W> {
     }
 }
 
-impl<W: Write> Write for HashingWriter<'_, W> {
+impl<W: Write + ?Sized> Write for HashingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(buf)?;
         if let Some(ref mut hasher) = self.crc {
@@ -5446,6 +7025,411 @@ mod tests {
     }
 
     #[test]
+    fn rar5_windows_absolute_symlink_is_relative_after_unix_normalization_like_unrar() {
+        let target = RarArchive::normalized_rar5_redirection_target(
+            header::RedirectionType::WindowsSymlink,
+            "\\??\\C:\\target",
+        );
+
+        assert!(crate::path::is_safe_symlink_target_for_archive_member(
+            ArchiveFormat::Rar5,
+            "link",
+            "link",
+            &target,
+        ));
+        assert!(
+            matches!(
+                RarArchive::ensure_safe_windows_reparse_target("\\??\\C:\\target", "link"),
+                Err(RarError::UnsafeLinkTarget { .. })
+            ),
+            "raw Windows reparse creation still rejects absolute targets by default"
+        );
+    }
+
+    #[test]
+    fn rar5_windows_junction_reparse_names_match_unrar_prefix_rules() {
+        let substitute = RarArchive::windows_junction_substitute_name("/??/UNC/server/share");
+        assert_eq!(substitute, "\\??\\UNC\\server\\share");
+        assert_eq!(
+            RarArchive::windows_junction_print_name(&substitute),
+            "\\server\\share"
+        );
+
+        let relative = RarArchive::windows_junction_substitute_name("dir/target");
+        assert_eq!(relative, "dir\\target");
+        assert_eq!(
+            RarArchive::windows_junction_print_name(&relative),
+            "dir\\target"
+        );
+    }
+
+    #[test]
+    fn rar5_windows_junction_reparse_buffer_matches_unrar_layout() {
+        let buffer = RarArchive::windows_junction_reparse_buffer("dir/target").unwrap();
+
+        assert_eq!(
+            u32::from_le_bytes(buffer[0..4].try_into().unwrap()),
+            WINDOWS_IO_REPARSE_TAG_MOUNT_POINT
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[4..6].try_into().unwrap())),
+            buffer.len() - 8
+        );
+        assert_eq!(u16::from_le_bytes(buffer[6..8].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(buffer[8..10].try_into().unwrap()), 0);
+
+        let substitute = "dir\\target";
+        let substitute_bytes = substitute.encode_utf16().count() * 2;
+        let print_offset = (substitute.encode_utf16().count() + 1) * 2;
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[10..12].try_into().unwrap())),
+            substitute_bytes
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[12..14].try_into().unwrap())),
+            print_offset
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[14..16].try_into().unwrap())),
+            substitute_bytes
+        );
+    }
+
+    #[test]
+    fn rar5_windows_reparse_absolute_targets_are_blocked_like_unrar_default() {
+        for target in [
+            "\\??\\C:\\target",
+            "\\?\\C:\\target",
+            "\\.\\C:\\target",
+            "\\rooted",
+            "/??/UNC/server/share",
+            "/?/C:/target",
+            "/rooted",
+            "C:\\target",
+            "C:/target",
+            "\\\\server\\share",
+            "//server/share",
+        ] {
+            assert!(RarArchive::windows_reparse_target_is_absolute(target));
+            assert!(
+                matches!(
+                    RarArchive::ensure_safe_windows_reparse_target(target, "link"),
+                    Err(RarError::UnsafeLinkTarget { .. })
+                ),
+                "expected {target:?} to be rejected"
+            );
+        }
+
+        for target in [
+            "C:relative",
+            "dir\\target",
+            "dir/target",
+            ".\\target",
+            "./target",
+        ] {
+            assert!(!RarArchive::windows_reparse_target_is_absolute(target));
+            RarArchive::ensure_safe_windows_reparse_target(target, "link").unwrap();
+        }
+    }
+
+    #[test]
+    fn rar5_windows_symlink_reparse_buffer_matches_unrar_layout() {
+        let buffer = RarArchive::windows_symlink_reparse_buffer("dir/target").unwrap();
+
+        assert_eq!(
+            u32::from_le_bytes(buffer[0..4].try_into().unwrap()),
+            WINDOWS_IO_REPARSE_TAG_SYMLINK
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[4..6].try_into().unwrap())),
+            buffer.len() - 8
+        );
+        assert_eq!(u16::from_le_bytes(buffer[6..8].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(buffer[8..10].try_into().unwrap()), 0);
+
+        let substitute = "dir\\target";
+        let substitute_bytes = substitute.encode_utf16().count() * 2;
+        let print_offset = (substitute.encode_utf16().count() + 1) * 2;
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[10..12].try_into().unwrap())),
+            substitute_bytes
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[12..14].try_into().unwrap())),
+            print_offset
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes(buffer[14..16].try_into().unwrap())),
+            substitute_bytes
+        );
+        assert_eq!(
+            u32::from_le_bytes(buffer[16..20].try_into().unwrap()),
+            WINDOWS_SYMLINK_FLAG_RELATIVE
+        );
+    }
+
+    #[test]
+    fn windows_filetime_interval_conversion_matches_unrar_epoch() {
+        assert_eq!(
+            RarArchive::windows_filetime_intervals(std::time::UNIX_EPOCH).unwrap(),
+            116_444_736_000_000_000
+        );
+        assert_eq!(
+            RarArchive::windows_filetime_intervals(
+                std::time::UNIX_EPOCH + std::time::Duration::new(1, 987_654_321)
+            )
+            .unwrap(),
+            116_444_736_019_876_543
+        );
+    }
+
+    #[test]
+    fn unix_output_mode_preserves_supported_unix_and_darwin_modes() {
+        let mut fh = test_rar3_symlink_header(None);
+        fh.is_directory = false;
+
+        fh.host_os = HostOs::Unix;
+        fh.attributes = FileAttributes(0o100755);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o755));
+
+        fh.host_os = HostOs::Darwin;
+        fh.compression.format = ArchiveFormat::Rar5;
+        fh.attributes = FileAttributes(0o120700);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o700));
+
+        fh.attributes = FileAttributes(0);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0));
+    }
+
+    #[test]
+    fn unix_output_mode_converts_windows_attributes_like_unrar() {
+        let mask = current_umask();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Windows;
+
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0x10);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+
+        fh.is_directory = false;
+        fh.attributes = FileAttributes(0x01);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o444 & !mask));
+
+        fh.attributes = FileAttributes(0x20);
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+    }
+
+    #[test]
+    fn unix_output_mode_uses_unrar_default_for_unsupported_hosts() {
+        let mask = current_umask();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unknown(0);
+
+        fh.is_directory = false;
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+
+        fh.is_directory = true;
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o777 & !mask));
+
+        fh.host_os = HostOs::Darwin;
+        fh.compression.format = ArchiveFormat::Rar4;
+        fh.attributes = FileAttributes(0o100750);
+        fh.is_directory = false;
+        assert_eq!(RarArchive::unix_output_mode(&fh), Some(0o666 & !mask));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_unix_permissions_uses_supported_os_conversion_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mode.bin");
+        std::fs::write(&path, b"mode").unwrap();
+
+        let mut fh = test_rar3_symlink_header(None);
+        fh.host_os = HostOs::Unix;
+        fh.attributes = FileAttributes(0o100750);
+        fh.is_directory = false;
+
+        RarArchive::apply_unix_permissions(&fh, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+
+        fh.host_os = HostOs::Windows;
+        fh.attributes = FileAttributes(0x01);
+        RarArchive::apply_unix_permissions(&fh, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444 & !current_umask()
+        );
+
+        let dir = temp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        fh.is_directory = true;
+        fh.attributes = FileAttributes(0x10);
+        RarArchive::apply_unix_permissions(&fh, &dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o777 & !current_umask()
+        );
+    }
+
+    #[test]
+    fn windows_output_attributes_map_only_supported_os_behavior() {
+        let mut fh = test_rar3_symlink_header(None);
+        fh.attributes = FileAttributes(0o100755);
+        fh.host_os = HostOs::Unix;
+        fh.is_directory = false;
+        assert_eq!(
+            RarArchive::windows_output_attributes(&fh),
+            WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        );
+
+        fh.host_os = HostOs::Darwin;
+        fh.is_directory = true;
+        assert_eq!(
+            RarArchive::windows_output_attributes(&fh),
+            WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+        );
+
+        fh.host_os = HostOs::Unknown(0);
+        fh.is_directory = false;
+        assert_eq!(
+            RarArchive::windows_output_attributes(&fh),
+            WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        );
+
+        fh.host_os = HostOs::Windows;
+        fh.attributes = FileAttributes(u64::from(
+            WINDOWS_FILE_ATTRIBUTE_READONLY
+                | WINDOWS_FILE_ATTRIBUTE_HIDDEN
+                | WINDOWS_FILE_ATTRIBUTE_ARCHIVE,
+        ));
+        assert_eq!(
+            RarArchive::windows_output_attributes(&fh),
+            WINDOWS_FILE_ATTRIBUTE_READONLY
+                | WINDOWS_FILE_ATTRIBUTE_HIDDEN
+                | WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        );
+    }
+
+    #[test]
+    fn windows_stream_restore_clears_only_readonly_before_ads_write() {
+        let attributes = WINDOWS_FILE_ATTRIBUTE_READONLY
+            | WINDOWS_FILE_ATTRIBUTE_HIDDEN
+            | WINDOWS_FILE_ATTRIBUTE_ARCHIVE;
+        assert_eq!(
+            RarArchive::windows_attributes_without_readonly(attributes),
+            WINDOWS_FILE_ATTRIBUTE_HIDDEN | WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        );
+    }
+
+    #[test]
+    fn windows_overwrite_prepare_allows_missing_path_like_unrar_replace_flow() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.bin");
+        RarArchive::clear_windows_readonly_before_overwrite(&missing).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_replaces_final_symlink_before_metadata_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("marker"), b"keep").unwrap();
+        let out_path = temp.path().join("dir");
+        std::os::unix::fs::symlink(&outside, &out_path).unwrap();
+
+        RarArchive::ensure_output_directory_for_member("dir", &out_path).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&out_path).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_replaces_parent_symlink_before_creating_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("marker"), b"keep").unwrap();
+        let parent = temp.path().join("parent");
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        let out_path = parent.join("child");
+
+        RarArchive::ensure_output_directory_for_member("parent/child", &out_path).unwrap();
+
+        let parent_metadata = std::fs::symlink_metadata(&parent).unwrap();
+        assert!(parent_metadata.is_dir());
+        assert!(!parent_metadata.file_type().is_symlink());
+        assert!(out_path.is_dir());
+        assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn unix_owner_chown_link_following_matches_unrar_platform_branch() {
+        assert!(RarArchive::unix_owner_chown_follows_links(true));
+        assert_eq!(
+            RarArchive::unix_owner_chown_follows_links(false),
+            cfg!(target_vendor = "apple")
+        );
+    }
+
+    #[test]
+    fn unix_regular_file_times_use_now_for_missing_counterpart_like_unrar() {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3_000);
+
+        let (actual_atime, actual_mtime) =
+            RarArchive::unix_regular_file_times(Some(mtime), None, now).unwrap();
+        assert_eq!(actual_atime, filetime::FileTime::from_system_time(now));
+        assert_eq!(actual_mtime, filetime::FileTime::from_system_time(mtime));
+
+        let (actual_atime, actual_mtime) =
+            RarArchive::unix_regular_file_times(None, Some(atime), now).unwrap();
+        assert_eq!(actual_atime, filetime::FileTime::from_system_time(atime));
+        assert_eq!(actual_mtime, filetime::FileTime::from_system_time(now));
+
+        let (actual_atime, actual_mtime) =
+            RarArchive::unix_regular_file_times(Some(mtime), Some(atime), now).unwrap();
+        assert_eq!(actual_atime, filetime::FileTime::from_system_time(atime));
+        assert_eq!(actual_mtime, filetime::FileTime::from_system_time(mtime));
+
+        assert!(RarArchive::unix_regular_file_times(None, None, now).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_owner_mode_restore_round_trips_followed_mode_like_unrar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mode.bin");
+        std::fs::write(&path, b"mode").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o640);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let original = RarArchive::unix_followed_mode(&path).unwrap();
+        let mut changed = std::fs::metadata(&path).unwrap().permissions();
+        changed.set_mode(0o600);
+        std::fs::set_permissions(&path, changed).unwrap();
+
+        RarArchive::restore_unix_followed_mode(&path, original).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
     fn rar5_hardlink_target_keeps_prefix_after_slash_to_native_like_unrar() {
         assert_eq!(
             RarArchive::normalized_rar5_redirection_target(
@@ -5453,6 +7437,37 @@ mod tests {
                 "\\??\\C:\\target"
             ),
             "??/C:/target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_output_restores_shared_inode_attributes_like_unrar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.bin");
+        let out_path = temp.path().join("copy.bin");
+        std::fs::write(&source, b"linked bytes").unwrap();
+        let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&source, permissions).unwrap();
+
+        let mut fh = test_rar3_symlink_header(None);
+        fh.attributes = FileAttributes(0o777);
+        fh.host_os = HostOs::Unix;
+
+        RarArchive::create_hardlink_output(&fh, "copy.bin", "copy.bin", "source.bin", &out_path)
+            .unwrap();
+
+        assert_eq!(std::fs::read(&out_path).unwrap(), b"linked bytes");
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777,
+            0o777
         );
     }
 
@@ -5502,7 +7517,7 @@ mod tests {
         let mut archive = empty_rar5_archive();
         let mut fh = test_rar3_symlink_header(None);
         fh.name = "copy.bin".to_string();
-        fh.attributes = FileAttributes(0);
+        fh.attributes = FileAttributes(0o100644);
         fh.host_os = HostOs::Unix;
         fh.compression.format = ArchiveFormat::Rar5;
 
@@ -5560,6 +7575,43 @@ mod tests {
         assert_eq!(written, Some(0));
         let link = std::fs::read_link(out_path).unwrap();
         assert_eq!(link.as_os_str().as_bytes(), b"safe\xed\xa0\x80target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rar5_windows_junction_extracts_as_symlink_on_unix_like_unrar() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("junction");
+
+        let mut archive = empty_rar5_archive();
+        let mut fh = test_rar3_symlink_header(None);
+        fh.name = "junction".to_string();
+        fh.attributes = FileAttributes(0);
+        fh.host_os = HostOs::Windows;
+        fh.compression.format = ArchiveFormat::Rar5;
+        fh.is_directory = true;
+
+        let written = archive
+            .extract_link_member_to_file(
+                0,
+                &ExtractOptions::default(),
+                &fh,
+                None,
+                Some(header::Redirection {
+                    redir_type: header::RedirectionType::WindowsJunction,
+                    target: "safe\\target".to_string(),
+                    target_raw: Some(b"safe\\target".to_vec()),
+                    target_is_directory: true,
+                }),
+                &out_path,
+            )
+            .unwrap();
+
+        assert_eq!(written, Some(0));
+        let link = std::fs::read_link(out_path).unwrap();
+        assert_eq!(link.as_os_str().as_bytes(), b"safe/target");
     }
 
     fn empty_rar5_archive() -> RarArchive {
@@ -5626,8 +7678,174 @@ mod tests {
             file_encryption: None,
             hash: None,
             comment_crc16: None,
+            ntfs_stream_name: None,
             segments: vec![DataSegment::new(0, 0, data_size)],
         }
+    }
+
+    fn archive_with_single_volume(data: &[u8]) -> RarArchive {
+        let mut archive = empty_rar5_archive();
+        archive.volumes = vec![Some(VolumeData {
+            reader: Box::new(Cursor::new(data.to_vec())),
+        })];
+        archive
+    }
+
+    #[test]
+    fn ntfs_stream_name_rules_match_unrar() {
+        assert!(RarArchive::is_allowed_ntfs_stream_name(":Zone.Identifier"));
+        assert!(RarArchive::is_allowed_ntfs_stream_name(":stream"));
+
+        assert!(!RarArchive::is_allowed_ntfs_stream_name("stream"));
+        assert!(RarArchive::is_broken_ntfs_stream_name("stream"));
+        assert!(!RarArchive::is_allowed_ntfs_stream_name(":dir/stream"));
+        assert!(RarArchive::is_broken_ntfs_stream_name(":dir/stream"));
+        assert!(!RarArchive::is_allowed_ntfs_stream_name(":dir\\stream"));
+        assert!(RarArchive::is_broken_ntfs_stream_name(":dir\\stream"));
+
+        assert!(!RarArchive::is_allowed_ntfs_stream_name(
+            ":Zone.Identifier:$DATA"
+        ));
+        assert!(RarArchive::is_prohibited_ntfs_stream_name(
+            ":Zone.Identifier:$DATA"
+        ));
+        assert!(RarArchive::is_prohibited_ntfs_stream_name("::$DATA"));
+
+        let mut service = test_rar5_service("STM", 0, 0);
+        service.file_header.service_subdata = Some(b":safe\0ignored".to_vec());
+        assert_eq!(
+            RarArchive::ntfs_stream_name_from_service(&service).as_deref(),
+            Some(":safe")
+        );
+
+        service.file_header.service_subdata = None;
+        service.ntfs_stream_name = Some(":old-stream".to_string());
+        assert_eq!(
+            RarArchive::ntfs_stream_name_from_service(&service).as_deref(),
+            Some(":old-stream")
+        );
+    }
+
+    #[test]
+    fn broken_ntfs_stream_name_policy_matches_unrar_windows_scope() {
+        assert_eq!(
+            RarArchive::broken_ntfs_stream_name_is_fatal(),
+            cfg!(windows)
+        );
+
+        let err = RarArchive::broken_ntfs_stream_name_error("file.txt", ":dir/stream");
+        assert!(matches!(err, RarError::CorruptArchive { ref detail }
+            if detail.contains("broken NTFS alternate stream name")
+                && detail.contains("file.txt")
+                && detail.contains(":dir/stream")));
+    }
+
+    #[test]
+    fn ntfs_stream_service_payload_streams_and_verifies_crc() {
+        let payload = b"alternate stream bytes";
+        let mut archive = archive_with_single_volume(payload);
+        let mut service = test_rar5_service("STM", payload.len() as u64, payload.len() as u64);
+        service.file_header.service_subdata = Some(b":stream".to_vec());
+        service.file_header.data_crc32 = Some(crc32fast::hash(payload));
+
+        let mut out = Vec::new();
+        let written = archive
+            .write_service_subdata_to_writer(&service, &ExtractOptions::default(), &mut out)
+            .unwrap();
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn ntfs_stream_service_payload_crc_mismatch_fails() {
+        let payload = b"alternate stream bytes";
+        let mut archive = archive_with_single_volume(payload);
+        let mut service = test_rar5_service("STM", payload.len() as u64, payload.len() as u64);
+        service.file_header.service_subdata = Some(b":stream".to_vec());
+        service.file_header.data_crc32 = Some(0xDEAD_BEEF);
+
+        let mut out = Vec::new();
+        let err = archive
+            .write_service_subdata_to_writer(&service, &ExtractOptions::default(), &mut out)
+            .unwrap_err();
+
+        assert!(matches!(err, RarError::DataCrcMismatch { .. }));
+    }
+
+    #[test]
+    fn ntfs_acl_service_payload_streams_and_verifies_crc() {
+        let payload = b"self-relative security descriptor bytes";
+        let mut archive = archive_with_single_volume(payload);
+        let mut service = test_rar5_service("ACL", payload.len() as u64, payload.len() as u64);
+        service.file_header.data_crc32 = Some(crc32fast::hash(payload));
+
+        let mut out = Vec::new();
+        let written = archive
+            .write_service_subdata_to_writer(&service, &ExtractOptions::default(), &mut out)
+            .unwrap();
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn ntfs_acl_security_information_matches_unrar_privilege_gate() {
+        let base = WINDOWS_OWNER_SECURITY_INFORMATION
+            | WINDOWS_GROUP_SECURITY_INFORMATION
+            | WINDOWS_DACL_SECURITY_INFORMATION;
+        assert_eq!(RarArchive::ntfs_acl_security_information(false), base);
+        assert_eq!(
+            RarArchive::ntfs_acl_security_information(true),
+            base | WINDOWS_SACL_SECURITY_INFORMATION
+        );
+    }
+
+    #[test]
+    fn ntfs_acl_long_path_fallback_matches_unrar_get_win_long_path() {
+        assert_eq!(
+            RarArchive::windows_long_path_string("C:/deep/path/file.txt", "D:\\extract"),
+            Some("\\\\?\\C:\\deep\\path\\file.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string("\\\\server/share/file.txt", "D:\\extract"),
+            Some("\\\\?\\UNC\\server\\share\\file.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string("\\rooted\\file.txt", "D:\\extract"),
+            Some("\\\\?\\D:\\rooted\\file.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string(".\\nested\\file.txt", "D:\\extract"),
+            Some("\\\\?\\D:\\extract\\nested\\file.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string("nested\\file.txt", "D:\\extract\\"),
+            Some("\\\\?\\D:\\extract\\nested\\file.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string("\\\\?\\C:\\already\\long.txt", "D:\\extract"),
+            Some("\\\\?\\C:\\already\\long.txt".to_string())
+        );
+        assert_eq!(
+            RarArchive::windows_long_path_string("", "D:\\extract"),
+            None
+        );
+    }
+
+    #[test]
+    fn ntfs_acl_service_payload_crc_mismatch_fails() {
+        let payload = b"self-relative security descriptor bytes";
+        let mut archive = archive_with_single_volume(payload);
+        let mut service = test_rar5_service("ACL", payload.len() as u64, payload.len() as u64);
+        service.file_header.data_crc32 = Some(0xDEAD_BEEF);
+
+        let mut out = Vec::new();
+        let err = archive
+            .write_service_subdata_to_writer(&service, &ExtractOptions::default(), &mut out)
+            .unwrap_err();
+
+        assert!(matches!(err, RarError::DataCrcMismatch { .. }));
     }
 
     #[test]
@@ -5747,13 +7965,9 @@ mod tests {
         let fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
 
         let decoded =
-            RarArchive::decode_rar3_unix_link_target_payload(
-                &fh,
-                b"safe/target\0ignored",
-                true,
-            )
-            .unwrap()
-            .safety_target;
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe/target\0ignored", true)
+                .unwrap()
+                .safety_target;
 
         assert_eq!(decoded, "safe/target");
     }
@@ -5824,12 +8038,43 @@ mod tests {
         assert_eq!(actual.as_os_str().as_bytes(), b"\xc1\x81-target");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rar3_symlink_output_restores_symlink_mtime_like_unrar() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_path = temp.path().join("link");
+        let expected_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123_456);
+        let mut fh = test_rar3_symlink_header(None);
+        fh.mtime = Some(expected_mtime);
+        let target = Rar3UnixLinkTarget {
+            raw: b"target".to_vec(),
+            safety_target: "target".to_string(),
+        };
+
+        RarArchive::create_rar3_unix_symlink_output(
+            &fh,
+            None,
+            &ExtractOptions::default(),
+            "link",
+            "link",
+            &target,
+            &out_path,
+        )
+        .unwrap();
+
+        let actual_mtime = std::fs::symlink_metadata(&out_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(actual_mtime, expected_mtime);
+    }
+
     #[test]
     fn rar3_symlink_target_rejects_empty_target_like_unrar() {
         let fh = test_rar3_symlink_header(None);
 
-        let err = RarArchive::decode_rar3_unix_link_target_payload(&fh, b"\0ignored", false)
-            .unwrap_err();
+        let err =
+            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"\0ignored", false).unwrap_err();
 
         assert!(
             matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("empty")),
@@ -5841,9 +8086,8 @@ mod tests {
     fn rar3_symlink_target_rejects_invalid_utf8_like_unrar_safe_char_to_wide() {
         let fh = test_rar3_symlink_header(None);
 
-        let err =
-            RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe/\xfftarget", false)
-                .unwrap_err();
+        let err = RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe/\xfftarget", false)
+            .unwrap_err();
 
         assert!(
             matches!(err, RarError::CorruptArchive { ref detail } if detail.contains("valid UTF-8")),

@@ -24,7 +24,7 @@ use crate::types::{
 use types::*;
 
 /// Parsed RAR4 volume contents.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rar4ParsedVolume {
     pub archive_header: Rar4ArchiveHeader,
     pub files: Vec<Rar4FileHeader>,
@@ -222,7 +222,15 @@ pub(crate) fn parse_rar4_headers_with_kdf_cache<R: Read + Seek>(
                 );
                 comments.push(comment);
             }
-            Rar4HeaderType::Extra | Rar4HeaderType::Sub => {
+            Rar4HeaderType::Extra | Rar4HeaderType::Sub | Rar4HeaderType::Sign => {
+                if matches!(
+                    raw.header_type,
+                    Rar4HeaderType::Extra | Rar4HeaderType::Sign
+                ) && let Some(header) = archive_header.as_mut()
+                {
+                    header.has_authenticity_verification = true;
+                }
+
                 if raw.header_type == Rar4HeaderType::Sub {
                     let old_service = header::parse_old_service_header(&raw)?;
                     debug!(
@@ -421,10 +429,15 @@ pub fn to_member_info_with_archive_solid(
     archive_solid: bool,
 ) -> MemberInfo {
     let host_os = match fh.host_os {
-        Rar4HostOs::Unix | Rar4HostOs::BeOs => HostOs::Unix,
-        Rar4HostOs::Windows | Rar4HostOs::MsDos | Rar4HostOs::Os2 | Rar4HostOs::MacOs => {
-            HostOs::Windows
-        }
+        Rar4HostOs::Windows => HostOs::Windows,
+        Rar4HostOs::Unix => HostOs::Unix,
+        Rar4HostOs::MacOs => HostOs::Darwin,
+        // Scryer only supports Darwin/macOS, Linux/Unix, and Windows
+        // extraction behavior; the remaining RAR4 host ids are intentionally
+        // unmapped.
+        Rar4HostOs::MsDos => HostOs::Unknown(0),
+        Rar4HostOs::Os2 => HostOs::Unknown(1),
+        Rar4HostOs::BeOs => HostOs::Unknown(5),
         Rar4HostOs::Unknown(v) => HostOs::Unknown(v as u64),
     };
 
@@ -496,27 +509,98 @@ pub(crate) fn dos_datetime_to_system_time(dos_dt: u32) -> Option<std::time::Syst
         return None;
     }
 
-    // Calculate days since Unix epoch (1970-01-01).
-    // Simplified: count days using a basic year/month calculation.
-    let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = |y: u32| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    local_datetime_to_system_time(year, month, day, hour, minute, second)
+}
 
-    let mut total_days: i64 = 0;
-    for y in 1970..year {
-        total_days += if is_leap(y) { 366 } else { 365 };
+#[cfg(not(windows))]
+fn local_datetime_to_system_time(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<std::time::SystemTime> {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    local.tm_sec = second as i32;
+    local.tm_min = minute as i32;
+    local.tm_hour = hour as i32;
+    local.tm_mday = day as i32;
+    local.tm_mon = month as i32 - 1;
+    local.tm_year = year as i32 - 1900;
+    local.tm_isdst = -1;
+
+    let timestamp = unsafe { libc::mktime(&mut local) };
+    if timestamp < 0 {
+        return None;
     }
-    for m in 1..month {
-        total_days += days_in_month[m as usize] as i64;
-        if m == 2 && is_leap(year) {
-            total_days += 1;
-        }
+
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
+}
+
+#[cfg(windows)]
+fn local_datetime_to_system_time(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<std::time::SystemTime> {
+    let local = windows_sys::Win32::Foundation::SYSTEMTIME {
+        wYear: u16::try_from(year).ok()?,
+        wMonth: u16::try_from(month).ok()?,
+        wDayOfWeek: 0,
+        wDay: u16::try_from(day).ok()?,
+        wHour: u16::try_from(hour).ok()?,
+        wMinute: u16::try_from(minute).ok()?,
+        wSecond: u16::try_from(second).ok()?,
+        wMilliseconds: 0,
+    };
+    let mut utc = windows_sys::Win32::Foundation::SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    let converted = unsafe {
+        windows_sys::Win32::System::Time::TzSpecificLocalTimeToSystemTime(
+            std::ptr::null(),
+            &local,
+            &mut utc,
+        )
+    };
+    if converted == 0 {
+        return None;
     }
-    total_days += (day - 1) as i64;
 
-    let total_seconds =
-        total_days * 86400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+    let mut file_time = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let converted =
+        unsafe { windows_sys::Win32::System::Time::SystemTimeToFileTime(&utc, &mut file_time) };
+    if converted == 0 {
+        return None;
+    }
 
-    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_seconds as u64))
+    const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
+    const UNIX_EPOCH_AS_WINDOWS_TICKS: u64 = 116_444_736_000_000_000;
+    let windows_ticks =
+        (u64::from(file_time.dwHighDateTime) << 32) | u64::from(file_time.dwLowDateTime);
+    let unix_ticks = windows_ticks.checked_sub(UNIX_EPOCH_AS_WINDOWS_TICKS)?;
+    let seconds = unix_ticks / WINDOWS_TICKS_PER_SECOND;
+    let nanos = (unix_ticks % WINDOWS_TICKS_PER_SECOND) * 100;
+
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(seconds)
+            + std::time::Duration::from_nanos(nanos),
+    )
 }
 
 /// Extract a stored (method 0x30) RAR4 file from its data segment.
@@ -845,19 +929,22 @@ mod tests {
             owner: None,
         };
 
-        for host in [
-            Rar4HostOs::MsDos,
-            Rar4HostOs::Os2,
-            Rar4HostOs::Windows,
-            Rar4HostOs::MacOs,
+        fh.host_os = Rar4HostOs::Windows;
+        assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Windows);
+
+        fh.host_os = Rar4HostOs::Unix;
+        assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Unix);
+
+        fh.host_os = Rar4HostOs::MacOs;
+        assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Darwin);
+
+        for (host, expected) in [
+            (Rar4HostOs::MsDos, 0),
+            (Rar4HostOs::Os2, 1),
+            (Rar4HostOs::BeOs, 5),
         ] {
             fh.host_os = host;
-            assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Windows);
-        }
-
-        for host in [Rar4HostOs::Unix, Rar4HostOs::BeOs] {
-            fh.host_os = host;
-            assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Unix);
+            assert_eq!(to_member_info(&fh, 0).host_os, HostOs::Unknown(expected));
         }
 
         fh.host_os = Rar4HostOs::Unknown(42);

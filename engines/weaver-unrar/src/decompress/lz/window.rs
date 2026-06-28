@@ -12,11 +12,377 @@ use crate::error::{RarError, RarResult};
 
 /// Matches unrar's PackDef::MAX_INC_LZ_MATCH.
 const MAX_INC_LZ_MATCH: usize = 0x1004;
+/// Matches unrar's fragmented dictionary cutoff.
+#[cfg_attr(not(target_pointer_width = "32"), allow(dead_code))]
+const FRAGMENTED_MIN_WINDOW: usize = 0x1000000;
+/// Matches unrar's minimum fragmented allocation attempt.
+#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+const FRAGMENTED_BLOCK_SIZE: usize = 0x400000;
+/// Matches unrar's FragmentedWindow::MAX_MEM_BLOCKS.
+#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+const FRAGMENTED_MAX_BLOCKS: usize = 32;
+
+#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+enum WindowStorage {
+    Contiguous(Vec<u8>),
+    Fragmented(FragmentedWindow),
+}
+
+impl WindowStorage {
+    fn try_contiguous(len: usize) -> Result<Self, std::collections::TryReserveError> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)?;
+        buf.resize(len, 0);
+        Ok(Self::Contiguous(buf))
+    }
+
+    #[cfg_attr(not(target_pointer_width = "32"), allow(dead_code))]
+    fn try_fragmented(len: usize) -> RarResult<Self> {
+        Ok(Self::Fragmented(FragmentedWindow::try_new(
+            len,
+            FRAGMENTED_BLOCK_SIZE,
+        )?))
+    }
+
+    #[cfg(test)]
+    fn fragmented_for_test(len: usize, block_size: usize) -> RarResult<Self> {
+        Ok(Self::Fragmented(FragmentedWindow::try_new_fixed_blocks(
+            len, block_size,
+        )?))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Contiguous(buf) => buf.len(),
+            Self::Fragmented(buf) => buf.len(),
+        }
+    }
+
+    fn is_fragmented(&self) -> bool {
+        matches!(self, Self::Fragmented(_))
+    }
+
+    fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        match self {
+            Self::Contiguous(buf) => Some(buf.as_mut_slice()),
+            Self::Fragmented(_) => None,
+        }
+    }
+
+    fn get(&self, idx: usize) -> u8 {
+        match self {
+            Self::Contiguous(buf) => buf[idx],
+            Self::Fragmented(buf) => buf.get(idx),
+        }
+    }
+
+    fn set(&mut self, idx: usize, value: u8) {
+        match self {
+            Self::Contiguous(buf) => buf[idx] = value,
+            Self::Fragmented(buf) => buf.set(idx, value),
+        }
+    }
+
+    fn copy_from_slice(&mut self, start: usize, bytes: &[u8]) {
+        match self {
+            Self::Contiguous(buf) => buf[start..start + bytes.len()].copy_from_slice(bytes),
+            Self::Fragmented(buf) => buf.copy_from_slice(start, bytes),
+        }
+    }
+
+    fn fill(&mut self, start: usize, len: usize, value: u8) {
+        match self {
+            Self::Contiguous(buf) => buf[start..start + len].fill(value),
+            Self::Fragmented(buf) => buf.fill(start, len, value),
+        }
+    }
+
+    fn fill_all(&mut self, value: u8) {
+        match self {
+            Self::Contiguous(buf) => buf.fill(value),
+            Self::Fragmented(buf) => buf.fill_all(value),
+        }
+    }
+
+    fn extend_from_range(&self, start: usize, len: usize, out: &mut Vec<u8>) {
+        match self {
+            Self::Contiguous(buf) => out.extend_from_slice(&buf[start..start + len]),
+            Self::Fragmented(buf) => buf.extend_from_range(start, len, out),
+        }
+    }
+
+    fn write_range_to_writer<W: Write + ?Sized>(
+        &self,
+        start: usize,
+        len: usize,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Contiguous(buf) => writer.write_all(&buf[start..start + len]),
+            Self::Fragmented(buf) => buf.write_range_to_writer(start, len, writer),
+        }
+    }
+}
+
+#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+struct FragmentedWindow {
+    blocks: Vec<Box<[u8]>>,
+    cumulative_ends: Vec<usize>,
+    len: usize,
+}
+
+#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+impl FragmentedWindow {
+    fn try_new(len: usize, min_block_size: usize) -> RarResult<Self> {
+        if len == 0 || min_block_size == 0 {
+            return Err(RarError::DictionaryTooLarge {
+                size: len as u64,
+                max: 0,
+            });
+        }
+
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(FRAGMENTED_MAX_BLOCKS)
+            .map_err(|err| RarError::ResourceLimit {
+                detail: format!(
+                    "failed to reserve fragmented RAR dictionary block table for {len} bytes: {err}"
+                ),
+            })?;
+        let mut cumulative_ends = Vec::new();
+        cumulative_ends
+            .try_reserve_exact(FRAGMENTED_MAX_BLOCKS)
+            .map_err(|err| RarError::ResourceLimit {
+                detail: format!(
+                    "failed to reserve fragmented RAR dictionary bounds for {len} bytes: {err}"
+                ),
+            })?;
+
+        let mut allocated = 0usize;
+        while allocated < len && blocks.len() < FRAGMENTED_MAX_BLOCKS {
+            let remaining = len - allocated;
+            let min_chunk = Self::unrar_min_block_size(remaining, blocks.len(), min_block_size)?;
+            let mut chunk = remaining;
+            let block = loop {
+                match Self::try_zeroed_block(chunk) {
+                    Ok(block) => break block,
+                    Err(err) if chunk > min_chunk => {
+                        let reduced = chunk.saturating_sub((chunk / 32).max(1));
+                        chunk = reduced.max(min_chunk);
+                        if chunk == remaining {
+                            return Err(RarError::ResourceLimit {
+                                detail: format!(
+                                    "failed to allocate {chunk} byte RAR fragmented dictionary block: {err}"
+                                ),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        return Err(RarError::ResourceLimit {
+                            detail: format!(
+                                "failed to allocate at least {min_chunk} bytes for RAR fragmented dictionary block: {err}"
+                            ),
+                        });
+                    }
+                }
+            };
+            allocated += block.len();
+            blocks.push(block);
+            cumulative_ends.push(allocated);
+        }
+
+        if allocated < len {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "failed to allocate {len} byte fragmented RAR dictionary within {FRAGMENTED_MAX_BLOCKS} blocks"
+                ),
+            });
+        }
+
+        Ok(Self {
+            blocks,
+            cumulative_ends,
+            len,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_new_fixed_blocks(len: usize, block_size: usize) -> RarResult<Self> {
+        if len == 0 || block_size == 0 {
+            return Err(RarError::DictionaryTooLarge {
+                size: len as u64,
+                max: 0,
+            });
+        }
+
+        let block_count = len.div_ceil(block_size);
+        if block_count > FRAGMENTED_MAX_BLOCKS {
+            return Err(RarError::ResourceLimit {
+                detail: format!(
+                    "failed to allocate {len} byte fragmented RAR dictionary: requires {block_count} blocks, maximum {FRAGMENTED_MAX_BLOCKS}"
+                ),
+            });
+        }
+
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(block_count)
+            .map_err(|err| RarError::ResourceLimit {
+                detail: format!(
+                    "failed to reserve fragmented RAR dictionary block table for {len} bytes: {err}"
+                ),
+            })?;
+        let mut cumulative_ends = Vec::new();
+        cumulative_ends
+            .try_reserve_exact(block_count)
+            .map_err(|err| RarError::ResourceLimit {
+                detail: format!(
+                    "failed to reserve fragmented RAR dictionary bounds for {len} bytes: {err}"
+                ),
+            })?;
+
+        let mut allocated = 0usize;
+        while allocated < len {
+            let chunk = block_size.min(len - allocated);
+            let mut block = Vec::new();
+            block
+                .try_reserve_exact(chunk)
+                .map_err(|err| RarError::ResourceLimit {
+                    detail: format!(
+                        "failed to allocate {chunk} byte RAR fragmented dictionary block: {err}"
+                    ),
+                })?;
+            block.resize(chunk, 0);
+            allocated += chunk;
+            blocks.push(block.into_boxed_slice());
+            cumulative_ends.push(allocated);
+        }
+
+        Ok(Self {
+            blocks,
+            cumulative_ends,
+            len,
+        })
+    }
+
+    fn unrar_min_block_size(
+        remaining: usize,
+        block_num: usize,
+        min_block_size: usize,
+    ) -> RarResult<usize> {
+        let attempts_left = FRAGMENTED_MAX_BLOCKS
+            .checked_sub(block_num)
+            .ok_or_else(|| RarError::ResourceLimit {
+                detail: format!(
+                    "RAR fragmented dictionary exceeded {FRAGMENTED_MAX_BLOCKS} blocks"
+                ),
+            })?;
+        if attempts_left == 0 {
+            return Err(RarError::ResourceLimit {
+                detail: "RAR fragmented dictionary has no remaining block slots".to_string(),
+            });
+        }
+
+        Ok((remaining / attempts_left).max(min_block_size))
+    }
+
+    fn try_zeroed_block(len: usize) -> Result<Box<[u8]>, std::collections::TryReserveError> {
+        let mut block = Vec::new();
+        block.try_reserve_exact(len)?;
+        block.resize(len, 0);
+        Ok(block.into_boxed_slice())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn locate(&self, idx: usize) -> (usize, usize) {
+        debug_assert!(idx < self.len);
+        let block = self
+            .cumulative_ends
+            .partition_point(|&block_end| block_end <= idx);
+        let block_start = if block == 0 {
+            0
+        } else {
+            self.cumulative_ends[block - 1]
+        };
+        (block, idx - block_start)
+    }
+
+    fn contiguous_len(&self, idx: usize, len: usize) -> usize {
+        let (block, offset) = self.locate(idx);
+        let block_len = self.blocks[block].len();
+        (block_len - offset).min(len)
+    }
+
+    fn get(&self, idx: usize) -> u8 {
+        let (block, offset) = self.locate(idx);
+        self.blocks[block][offset]
+    }
+
+    fn set(&mut self, idx: usize, value: u8) {
+        let (block, offset) = self.locate(idx);
+        self.blocks[block][offset] = value;
+    }
+
+    fn copy_from_slice(&mut self, mut start: usize, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let chunk = self.contiguous_len(start, bytes.len());
+            let (block, offset) = self.locate(start);
+            self.blocks[block][offset..offset + chunk].copy_from_slice(&bytes[..chunk]);
+            start += chunk;
+            bytes = &bytes[chunk..];
+        }
+    }
+
+    fn fill(&mut self, mut start: usize, mut len: usize, value: u8) {
+        while len > 0 {
+            let chunk = self.contiguous_len(start, len);
+            let (block, offset) = self.locate(start);
+            self.blocks[block][offset..offset + chunk].fill(value);
+            start += chunk;
+            len -= chunk;
+        }
+    }
+
+    fn fill_all(&mut self, value: u8) {
+        for block in &mut self.blocks {
+            block.fill(value);
+        }
+    }
+
+    fn extend_from_range(&self, mut start: usize, mut len: usize, out: &mut Vec<u8>) {
+        while len > 0 {
+            let chunk = self.contiguous_len(start, len);
+            let (block, offset) = self.locate(start);
+            out.extend_from_slice(&self.blocks[block][offset..offset + chunk]);
+            start += chunk;
+            len -= chunk;
+        }
+    }
+
+    fn write_range_to_writer<W: Write + ?Sized>(
+        &self,
+        mut start: usize,
+        mut len: usize,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        while len > 0 {
+            let chunk = self.contiguous_len(start, len);
+            let (block, offset) = self.locate(start);
+            writer.write_all(&self.blocks[block][offset..offset + chunk])?;
+            start += chunk;
+            len -= chunk;
+        }
+        Ok(())
+    }
+}
 
 /// Sliding window ring buffer used during LZ decompression.
 pub struct Window {
     /// The ring buffer.
-    buf: Vec<u8>,
+    buf: WindowStorage,
     /// Current write position (wraps at buf.len()).
     pos: usize,
     /// Total number of bytes ever written (monotonically increasing).
@@ -46,12 +412,25 @@ impl Window {
             return Err(RarError::DictionaryTooLarge { size: 0, max: 0 });
         }
 
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(dict_size)
-            .map_err(|err| RarError::ResourceLimit {
-                detail: format!("failed to allocate {dict_size} byte RAR dictionary: {err}"),
-            })?;
-        buf.resize(dict_size, 0);
+        let buf = match WindowStorage::try_contiguous(dict_size) {
+            Ok(buf) => buf,
+            Err(err) => {
+                #[cfg(target_pointer_width = "32")]
+                if dict_size >= FRAGMENTED_MIN_WINDOW {
+                    return Ok(Self {
+                        buf: WindowStorage::try_fragmented(dict_size)?,
+                        pos: 0,
+                        total_written: 0,
+                        total_flushed: 0,
+                        visible_ranges: VecDeque::new(),
+                    });
+                }
+
+                return Err(RarError::ResourceLimit {
+                    detail: format!("failed to allocate {dict_size} byte RAR dictionary: {err}"),
+                });
+            }
+        };
 
         Ok(Self {
             buf,
@@ -60,6 +439,18 @@ impl Window {
             total_flushed: 0,
             visible_ranges: VecDeque::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn new_fragmented_for_test(dict_size: usize, block_size: usize) -> Self {
+        Self {
+            buf: WindowStorage::fragmented_for_test(dict_size, block_size)
+                .expect("fragmented window allocation failed"),
+            pos: 0,
+            total_written: 0,
+            total_flushed: 0,
+            visible_ranges: VecDeque::new(),
+        }
     }
 
     fn push_visible_range(&mut self, start_total: u64, len: usize) {
@@ -81,7 +472,7 @@ impl Window {
     #[inline]
     pub fn put_byte(&mut self, b: u8) {
         let start_total = self.total_written;
-        self.buf[self.pos] = b;
+        self.buf.set(self.pos, b);
         self.pos += 1;
         if self.pos >= self.buf.len() {
             self.pos = 0;
@@ -103,16 +494,16 @@ impl Window {
         let length = bytes.len();
 
         if dst + length <= dict_size {
-            self.buf[dst..dst + length].copy_from_slice(bytes);
+            self.buf.copy_from_slice(dst, bytes);
             self.pos = dst + length;
             if self.pos == dict_size {
                 self.pos = 0;
             }
         } else {
             let first = dict_size - dst;
-            self.buf[dst..].copy_from_slice(&bytes[..first]);
+            self.buf.copy_from_slice(dst, &bytes[..first]);
             let second = length - first;
-            self.buf[..second].copy_from_slice(&bytes[first..]);
+            self.buf.copy_from_slice(0, &bytes[first..]);
             self.pos = second;
         }
 
@@ -123,11 +514,15 @@ impl Window {
     #[inline]
     fn copy_no_wrap_fast(&mut self, src: usize, distance: usize, length: usize) {
         let dst = self.pos;
+        let buf = self
+            .buf
+            .as_mut_slice()
+            .expect("no-wrap fast copy requires contiguous window storage");
 
         unsafe {
-            let buf = self.buf.as_mut_ptr();
-            let src_ptr = buf.add(src);
-            let dst_ptr = buf.add(dst);
+            let buf_ptr = buf.as_mut_ptr();
+            let src_ptr = buf_ptr.add(src);
+            let dst_ptr = buf_ptr.add(dst);
 
             if distance >= length {
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
@@ -179,10 +574,10 @@ impl Window {
 
         // Fast path: distance=1 is byte-fill (very common RLE pattern).
         if distance == 1 {
-            let byte = self.buf[src];
+            let byte = self.buf.get(src);
             let dst = self.pos;
             if dst + length <= dict_size {
-                self.buf[dst..dst + length].fill(byte);
+                self.buf.fill(dst, length, byte);
                 self.pos = dst + length;
                 if self.pos >= dict_size {
                     self.pos = 0;
@@ -191,7 +586,7 @@ impl Window {
                 let mut remaining = length;
                 while remaining > 0 {
                     let chunk = remaining.min(dict_size - self.pos);
-                    self.buf[self.pos..self.pos + chunk].fill(byte);
+                    self.buf.fill(self.pos, chunk, byte);
                     self.pos += chunk;
                     if self.pos == dict_size {
                         self.pos = 0;
@@ -207,7 +602,11 @@ impl Window {
         // from the end of the window, CopyString can avoid wrap handling for
         // the maximum legal match length, not just for this specific length.
         let fast_limit = dict_size.saturating_sub(MAX_INC_LZ_MATCH);
-        if length <= MAX_INC_LZ_MATCH && src < fast_limit && self.pos < fast_limit {
+        if !self.buf.is_fragmented()
+            && length <= MAX_INC_LZ_MATCH
+            && src < fast_limit
+            && self.pos < fast_limit
+        {
             self.copy_no_wrap_fast(src, distance, length);
             return Ok(());
         }
@@ -219,7 +618,8 @@ impl Window {
         let mut remaining = length;
 
         while remaining > 0 {
-            self.buf[dst] = self.buf[src];
+            let byte = self.buf.get(src);
+            self.buf.set(dst, byte);
             src += 1;
             if src == dict_size {
                 src = 0;
@@ -291,7 +691,7 @@ impl Window {
         let mut remaining = length;
         while remaining > 0 {
             let chunk = remaining.min(dict_size - self.pos);
-            self.buf[self.pos..self.pos + chunk].fill(0);
+            self.buf.fill(self.pos, chunk, 0);
             self.pos += chunk;
             if self.pos == dict_size {
                 self.pos = 0;
@@ -318,7 +718,7 @@ impl Window {
         } else {
             dict_size - (distance - self.pos)
         };
-        self.buf[idx]
+        self.buf.get(idx)
     }
 
     /// Total number of bytes ever written to the window.
@@ -379,7 +779,7 @@ impl Window {
         let mut remaining = len;
         while remaining > 0 {
             let contig = (dict_size - idx).min(remaining);
-            result.extend_from_slice(&self.buf[idx..idx + contig]);
+            self.buf.extend_from_range(idx, contig, &mut result);
             idx = (idx + contig) % dict_size;
             remaining -= contig;
         }
@@ -421,6 +821,73 @@ impl Window {
 
         self.total_flushed = self.total_written;
         Ok(unflushed)
+    }
+
+    /// Flush visible output up to `up_to`, advancing across hidden dictionary
+    /// bytes without emitting them.
+    pub(crate) fn flush_visible_until<W: Write + ?Sized>(
+        &mut self,
+        up_to: u64,
+        writer: &mut W,
+    ) -> std::io::Result<u64> {
+        let target = up_to.min(self.total_written);
+        if target <= self.total_flushed {
+            return Ok(0);
+        }
+
+        let mut written = 0u64;
+        while let Some((start_total, len)) = self.visible_ranges.pop_front() {
+            let end_total = start_total.saturating_add(len as u64);
+
+            if end_total <= self.total_flushed {
+                continue;
+            }
+            if start_total >= target {
+                self.visible_ranges.push_front((start_total, len));
+                break;
+            }
+
+            let write_start = start_total.max(self.total_flushed);
+            let write_end = end_total.min(target);
+            if write_end > write_start {
+                let write_len = (write_end - write_start) as usize;
+                self.write_range_to_writer(write_start, write_len, writer)?;
+                written += write_len as u64;
+            }
+
+            if end_total > target {
+                self.visible_ranges
+                    .push_front((target, (end_total - target) as usize));
+                break;
+            }
+        }
+
+        self.total_flushed = target;
+        Ok(written)
+    }
+
+    /// Return visible subranges within `[start_total, start_total + len)`.
+    ///
+    /// Each tuple is `(offset_inside_range, visible_len)`. Hidden bytes are
+    /// dictionary-only advancement and must not be emitted to callers.
+    pub(crate) fn visible_subranges(&self, start_total: u64, len: usize) -> Vec<(usize, usize)> {
+        let end_total = start_total.saturating_add(len as u64);
+        let mut ranges = Vec::new();
+
+        for &(visible_start, visible_len) in &self.visible_ranges {
+            let visible_end = visible_start.saturating_add(visible_len as u64);
+            let overlap_start = visible_start.max(start_total);
+            let overlap_end = visible_end.min(end_total);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            ranges.push((
+                (overlap_start - start_total) as usize,
+                (overlap_end - overlap_start) as usize,
+            ));
+        }
+
+        ranges
     }
 
     /// Number of unflushed bytes currently in the window.
@@ -486,7 +953,7 @@ impl Window {
         let mut remaining = len;
         while remaining > 0 {
             let contig = (dict_size - idx).min(remaining);
-            writer.write_all(&self.buf[idx..idx + contig])?;
+            self.buf.write_range_to_writer(idx, contig, writer)?;
             idx = (idx + contig) % dict_size;
             remaining -= contig;
         }
@@ -518,7 +985,7 @@ impl Window {
 
     /// Reset the window for a new file (non-solid mode).
     pub fn reset(&mut self) {
-        self.buf.fill(0);
+        self.buf.fill_all(0);
         self.pos = 0;
         self.total_written = 0;
         self.total_flushed = 0;
@@ -547,6 +1014,80 @@ mod tests {
             panic!("usize::MAX dictionary unexpectedly succeeded");
         };
         assert!(matches!(err, RarError::ResourceLimit { .. }));
+    }
+
+    #[test]
+    fn fragmented_window_matches_contiguous_copy_and_flush() {
+        let mut contiguous = Window::new(16);
+        let mut fragmented = Window::new_fragmented_for_test(16, 5);
+
+        for window in [&mut contiguous, &mut fragmented] {
+            window.put_bytes(b"ABCDEF");
+            window.copy(4, 5).unwrap();
+            window.copy_with_visible_len(3, 4, 2).unwrap();
+            window.put_bytes(b"Z");
+        }
+
+        assert_eq!(contiguous.total_written(), fragmented.total_written());
+        assert_eq!(contiguous.position(), fragmented.position());
+        for distance in 1..=16 {
+            assert_eq!(
+                contiguous.get_byte(distance),
+                fragmented.get_byte(distance),
+                "distance {distance}"
+            );
+        }
+
+        let mut contiguous_out = Vec::new();
+        let mut fragmented_out = Vec::new();
+        assert_eq!(
+            contiguous.flush_to_writer(&mut contiguous_out).unwrap(),
+            fragmented.flush_to_writer(&mut fragmented_out).unwrap()
+        );
+        assert_eq!(contiguous_out, fragmented_out);
+    }
+
+    #[test]
+    fn fragmented_window_writes_ranges_across_storage_blocks() {
+        let mut window = Window::new_fragmented_for_test(12, 5);
+        window.put_bytes(b"ABCDEFGHIJKL");
+
+        let mut out = Vec::new();
+        window.write_range_to_writer(3, 7, &mut out).unwrap();
+
+        assert_eq!(out, b"DEFGHIJ");
+        assert_eq!(window.try_copy_output(2, 8).unwrap(), b"CDEFGHIJ");
+    }
+
+    #[test]
+    fn fragmented_window_enforces_unrar_block_count_limit() {
+        let Err(err) = WindowStorage::fragmented_for_test(FRAGMENTED_MAX_BLOCKS + 1, 1) else {
+            panic!("fragmented window unexpectedly exceeded UnRAR block count limit");
+        };
+
+        assert!(matches!(err, RarError::ResourceLimit { .. }));
+    }
+
+    #[test]
+    fn unrar_fragmented_window_min_block_size_is_not_a_128mib_cap() {
+        let len = FRAGMENTED_BLOCK_SIZE * FRAGMENTED_MAX_BLOCKS + FRAGMENTED_MAX_BLOCKS;
+
+        let min_first =
+            FragmentedWindow::unrar_min_block_size(len, 0, FRAGMENTED_BLOCK_SIZE).unwrap();
+
+        assert_eq!(min_first, len / FRAGMENTED_MAX_BLOCKS);
+        assert!(min_first > FRAGMENTED_BLOCK_SIZE);
+    }
+
+    #[test]
+    fn fragmented_window_reset_zeroes_all_storage_blocks() {
+        let mut window = Window::new_fragmented_for_test(10, 3);
+        window.put_bytes(b"ABCDEFGHIJ");
+        window.reset();
+
+        window.copy(5, 5).unwrap();
+
+        assert_eq!(window.copy_output(0, 5), b"\0\0\0\0\0");
     }
 
     #[test]
@@ -862,6 +1403,38 @@ mod tests {
         let mut emitted = Vec::new();
         assert_eq!(w.flush_to_writer(&mut emitted).unwrap(), 3);
         assert_eq!(emitted, b"ABZ");
+        assert_eq!(w.total_flushed(), w.total_written());
+    }
+
+    #[test]
+    fn visible_subranges_reports_only_visible_parts_inside_range() {
+        let mut w = Window::new(16);
+        w.put_bytes(b"ABCD");
+        w.mark_flushed(4);
+        w.copy_with_visible_len(4, 4, 2).unwrap();
+        w.put_bytes(b"Z");
+
+        assert_eq!(w.visible_subranges(4, 5), vec![(0, 2), (4, 1)]);
+        assert_eq!(w.visible_subranges(6, 3), vec![(2, 1)]);
+        assert!(w.visible_subranges(6, 2).is_empty());
+    }
+
+    #[test]
+    fn flush_visible_until_stops_before_hidden_gap_boundary() {
+        let mut w = Window::new(16);
+        w.put_bytes(b"ABCD");
+        w.mark_flushed(4);
+        w.copy_with_visible_len(4, 4, 2).unwrap();
+        w.put_bytes(b"Z");
+
+        let mut emitted = Vec::new();
+        assert_eq!(w.flush_visible_until(6, &mut emitted).unwrap(), 2);
+        assert_eq!(emitted, b"AB");
+        assert_eq!(w.total_flushed(), 6);
+
+        let mut tail = Vec::new();
+        assert_eq!(w.flush_to_writer(&mut tail).unwrap(), 1);
+        assert_eq!(tail, b"Z");
         assert_eq!(w.total_flushed(), w.total_written());
     }
 

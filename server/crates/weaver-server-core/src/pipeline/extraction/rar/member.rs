@@ -95,7 +95,7 @@ fn current_umask() -> u32 {
 
 fn rar_member_unix_output_mode(member: &weaver_unrar::MemberInfo) -> Option<u32> {
     match member.host_os {
-        weaver_unrar::HostOs::Unix => {
+        weaver_unrar::HostOs::Unix | weaver_unrar::HostOs::Darwin => {
             let mode = member.attributes.unix_mode() & 0o7777;
             (mode != 0).then_some(mode)
         }
@@ -895,6 +895,7 @@ mod tests {
         weaver_unrar::MemberInfo {
             name: name.to_string(),
             raw_name: name.to_string(),
+            raw_name_bytes: Some(name.as_bytes().to_vec()),
             unpacked_size: Some(0),
             compressed_size: 0,
             is_directory,
@@ -923,6 +924,7 @@ mod tests {
             is_hardlink: false,
             is_file_copy: false,
             link_target: None,
+            link_target_bytes: None,
         }
     }
 
@@ -997,6 +999,15 @@ mod tests {
         let unix_without_mode =
             metadata_test_member("empty-mode", weaver_unrar::HostOs::Unix, 0, false, None);
         assert_eq!(rar_member_unix_output_mode(&unix_without_mode), None);
+
+        let darwin_mode = metadata_test_member(
+            "darwin-mode",
+            weaver_unrar::HostOs::Darwin,
+            0o100640,
+            false,
+            None,
+        );
+        assert_eq!(rar_member_unix_output_mode(&darwin_mode), Some(0o640));
     }
 
     #[test]

@@ -79,6 +79,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 feed-rs = { version = "2.3", default-features = false }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 regex = { version = "1.11", default-features = false, features = ["std", "perf", "unicode"] }
+unicode-normalization = { version = "0.1.25", default-features = false }
 tar = { version = "0.4", default-features = false }
 zip = { version = "8", default-features = false, features = ["aes-crypto", "deflate64", "deflate-flate2-zlib-rs", "bzip2", "time"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

@@ -148,6 +148,8 @@ pub struct CachedService {
     pub host_os: u64,
     #[serde(default)]
     pub service_subdata: Option<Vec<u8>>,
+    #[serde(default)]
+    pub ntfs_stream_name: Option<String>,
     pub segments: Vec<CachedSegment>,
 }
 
@@ -272,7 +274,7 @@ impl From<LegacyCachedMember> for CachedMember {
 }
 
 fn default_host_os_code() -> u64 {
-    1
+    CACHED_HOST_OS_UNIX
 }
 
 fn decode_cached_headers(data: &[u8]) -> Result<CachedArchiveHeaders, rmp_serde::decode::Error> {
@@ -315,18 +317,35 @@ fn encode_redirection_type(redirection: &RedirectionType) -> u64 {
     }
 }
 
+const CACHED_HOST_OS_WINDOWS: u64 = u64::MAX - 3;
+const CACHED_HOST_OS_UNIX: u64 = u64::MAX - 2;
+const CACHED_HOST_OS_DARWIN: u64 = u64::MAX - 1;
+const CACHED_HOST_OS_UNKNOWN_FLAG: u64 = 1 << 63;
+
 fn encode_host_os(host_os: HostOs) -> u64 {
     match host_os {
-        HostOs::Windows => 0,
-        HostOs::Unix => 1,
-        HostOs::Unknown(value) => value,
+        HostOs::Windows => CACHED_HOST_OS_WINDOWS,
+        HostOs::Unix => CACHED_HOST_OS_UNIX,
+        HostOs::Darwin => CACHED_HOST_OS_DARWIN,
+        // Scryer only maps supported extraction targets: Darwin/macOS,
+        // Linux/Unix, and Windows. Older RAR4 origins are not supported
+        // targets, and the cache uses a private marker so raw IDs like
+        // 0 (MS-DOS) do not round-trip as supported Windows.
+        HostOs::Unknown(value) => CACHED_HOST_OS_UNKNOWN_FLAG | value,
     }
 }
 
 fn decode_host_os(host_os: u64) -> HostOs {
     match host_os {
+        // Legacy caches encoded RAR5 Windows/Unix directly.
         0 => HostOs::Windows,
         1 => HostOs::Unix,
+        CACHED_HOST_OS_WINDOWS => HostOs::Windows,
+        CACHED_HOST_OS_UNIX => HostOs::Unix,
+        CACHED_HOST_OS_DARWIN => HostOs::Darwin,
+        value if (value & CACHED_HOST_OS_UNKNOWN_FLAG) != 0 => {
+            HostOs::Unknown(value & !CACHED_HOST_OS_UNKNOWN_FLAG)
+        }
         value => HostOs::Unknown(value),
     }
 }
@@ -500,6 +519,7 @@ impl RarArchive {
                     attributes: service.file_header.attributes.0,
                     host_os: encode_host_os(service.file_header.host_os),
                     service_subdata: service.file_header.service_subdata.clone(),
+                    ntfs_stream_name: service.ntfs_stream_name.clone(),
                     segments: cached_segments(&service.segments),
                 })
                 .collect(),
@@ -646,6 +666,7 @@ impl RarArchive {
                     file_encryption: service.encryption.map(file_encryption),
                     hash: service.blake2_hash.map(FileHash::Blake2sp),
                     comment_crc16: service.comment_crc16,
+                    ntfs_stream_name: service.ntfs_stream_name,
                     segments: data_segments(service.segments),
                 }
             })
@@ -953,6 +974,7 @@ mod tests {
                 attributes: 0x20,
                 host_os: encode_host_os(HostOs::Unix),
                 service_subdata: Some(vec![1, 2, 3]),
+                ntfs_stream_name: Some(":stream".to_string()),
                 segments: vec![CachedSegment {
                     volume_index: 3,
                     data_offset: 4096,
@@ -970,10 +992,7 @@ mod tests {
 
         assert_eq!(service.header_offset, 0x1234);
         assert_eq!(service.file_header.name, "CMT");
-        assert_eq!(
-            service.file_header.name_raw.as_deref(),
-            Some(&b"CMT"[..])
-        );
+        assert_eq!(service.file_header.name_raw.as_deref(), Some(&b"CMT"[..]));
         assert_eq!(service.file_header.unpacked_size, Some(12));
         assert_eq!(service.file_header.data_crc32, Some(0xA1B2_C3D4));
         assert_eq!(
@@ -987,6 +1006,7 @@ mod tests {
         );
         assert_eq!(service.hash, Some(FileHash::Blake2sp(blake2_hash)));
         assert_eq!(service.comment_crc16, Some(0x4567));
+        assert_eq!(service.ntfs_stream_name.as_deref(), Some(":stream"));
         assert!(service.is_encrypted);
         assert!(
             service
@@ -1047,7 +1067,7 @@ mod tests {
                 redirection_target_raw: Some(b"a\xed\xa0\x80b".to_vec()),
                 redirection_target_is_directory: false,
                 attributes: 0,
-                host_os: default_host_os_code(),
+                host_os: encode_host_os(HostOs::Darwin),
                 owner_user_name: Some("al\u{fffd}ice".to_string()),
                 owner_group_name: Some("gr\u{fffd}up".to_string()),
                 owner_user_name_raw: Some(b"al\xffice".to_vec()),
@@ -1067,6 +1087,7 @@ mod tests {
             archive.members[0].file_header.name_raw.as_deref(),
             Some(&b"file.txt"[..])
         );
+        assert_eq!(archive.members[0].file_header.host_os, HostOs::Darwin);
         assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));
         assert_eq!(owner.group_name_raw.as_deref(), Some(&b"gr\xf0up"[..]));
         let redirection = archive.members[0]
@@ -1078,6 +1099,27 @@ mod tests {
             redirection.target_raw.as_deref(),
             Some(&b"a\xed\xa0\x80b"[..])
         );
+    }
+
+    #[test]
+    fn cached_host_os_codec_maps_only_scryer_supported_os_targets() {
+        for host_os in [
+            HostOs::Windows,
+            HostOs::Unix,
+            HostOs::Darwin,
+            HostOs::Unknown(0),
+            HostOs::Unknown(1),
+            HostOs::Unknown(5),
+            HostOs::Unknown(42),
+        ] {
+            assert_eq!(decode_host_os(encode_host_os(host_os)), host_os);
+        }
+    }
+
+    #[test]
+    fn cached_host_os_decode_accepts_legacy_windows_and_unix_codes() {
+        assert_eq!(decode_host_os(0), HostOs::Windows);
+        assert_eq!(decode_host_os(1), HostOs::Unix);
     }
 
     #[test]

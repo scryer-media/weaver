@@ -5,7 +5,9 @@
 //! [`detect_encryption`] on the first downloaded segment to determine
 //! if a password is needed before downloading the remaining volumes.
 
-use crate::signature::{RAR4_SIGNATURE, RAR5_SIGNATURE};
+use crate::signature::{
+    DEFAULT_SFX_MAX_SCAN, RAR4_SIGNATURE, RAR5_SIGNATURE, RAR14_SFX_MARKER, RAR14_SIGNATURE,
+};
 use crate::vint;
 
 /// Result of early encryption detection.
@@ -33,20 +35,115 @@ pub enum EncryptionStatus {
 /// - **RAR5 file encryption**: file header extra records with encryption type
 /// - **RAR4 header encryption**: archive header `ENCRYPTED_HEADERS` flag (0x0080)
 /// - **RAR4 file encryption**: file header `ENCRYPTED` flag (0x0004)
+/// - **RAR14 file encryption**: file header `LHD_PASSWORD` flag (0x0004)
 ///
 /// Returns [`EncryptionStatus::Insufficient`] if the buffer is too small to
 /// make a determination — the caller should retry with more data.
 pub fn detect_encryption(data: &[u8]) -> EncryptionStatus {
-    // Try RAR5 first (8-byte signature), then RAR4 (7-byte).
-    if data.len() >= 8 && data[..8] == RAR5_SIGNATURE {
-        detect_rar5_encryption(&data[8..])
-    } else if data.len() >= 7 && data[..7] == RAR4_SIGNATURE {
-        detect_rar4_encryption(&data[7..])
+    if let Some(signature) = find_rar_signature(data) {
+        let status = match signature.format {
+            EarlyArchiveFormat::Rar5 => {
+                detect_rar5_encryption(&data[signature.offset + RAR5_SIGNATURE.len()..])
+            }
+            EarlyArchiveFormat::Rar4 => {
+                detect_rar4_encryption(&data[signature.offset + RAR4_SIGNATURE.len()..])
+            }
+            EarlyArchiveFormat::Rar14 => {
+                detect_rar14_encryption(&data[signature.offset + RAR14_SIGNATURE.len()..])
+            }
+        };
+        add_signature_offset(status, signature.offset)
     } else if data.len() < 8 {
         EncryptionStatus::Insufficient { min_bytes: 8 }
     } else {
         EncryptionStatus::NotRar
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyArchiveFormat {
+    Rar14,
+    Rar4,
+    Rar5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EarlySignature {
+    format: EarlyArchiveFormat,
+    offset: usize,
+}
+
+fn add_signature_offset(status: EncryptionStatus, offset: usize) -> EncryptionStatus {
+    match status {
+        EncryptionStatus::Insufficient { min_bytes } if offset != 0 => {
+            EncryptionStatus::Insufficient {
+                min_bytes: min_bytes.saturating_add(offset),
+            }
+        }
+        other => other,
+    }
+}
+
+fn find_rar_signature(data: &[u8]) -> Option<EarlySignature> {
+    if data.len() >= RAR5_SIGNATURE.len() && data[..RAR5_SIGNATURE.len()] == RAR5_SIGNATURE {
+        return Some(EarlySignature {
+            format: EarlyArchiveFormat::Rar5,
+            offset: 0,
+        });
+    }
+    if data.len() >= RAR4_SIGNATURE.len() && data[..RAR4_SIGNATURE.len()] == RAR4_SIGNATURE {
+        return Some(EarlySignature {
+            format: EarlyArchiveFormat::Rar4,
+            offset: 0,
+        });
+    }
+    if data.len() >= RAR14_SIGNATURE.len() && data[..RAR14_SIGNATURE.len()] == RAR14_SIGNATURE {
+        return Some(EarlySignature {
+            format: EarlyArchiveFormat::Rar14,
+            offset: 0,
+        });
+    }
+
+    // Match UnRAR's SFX probe for modern RAR signatures: after the initial
+    // 7-byte mark read fails, scan the bounded SFX window while reserving the
+    // last 16 bytes of MAXSFXSIZE.
+    let scan_start = RAR4_SIGNATURE.len();
+    let scan_len = DEFAULT_SFX_MAX_SCAN.saturating_sub(16) as usize;
+    let scan_end = data.len().min(scan_start.saturating_add(scan_len));
+    if scan_start >= scan_end {
+        return None;
+    }
+
+    let mut found = None;
+    for offset in scan_start..scan_end {
+        let format = if data[offset..].starts_with(&RAR5_SIGNATURE) {
+            EarlyArchiveFormat::Rar5
+        } else if data[offset..].starts_with(&RAR4_SIGNATURE) {
+            EarlyArchiveFormat::Rar4
+        } else if data[offset..].starts_with(&RAR14_SIGNATURE)
+            && rar14_sfx_candidate_allowed(data, offset, scan_start)
+        {
+            EarlyArchiveFormat::Rar14
+        } else {
+            continue;
+        };
+        found = Some(EarlySignature { format, offset });
+        break;
+    }
+    found
+}
+
+fn rar14_sfx_candidate_allowed(data: &[u8], offset: usize, scan_start: usize) -> bool {
+    if offset <= scan_start {
+        return true;
+    }
+
+    let marker_start = 28usize;
+    let marker_end = marker_start + RAR14_SFX_MARKER.len();
+    if scan_start >= marker_start || data.len() < marker_end {
+        return true;
+    }
+    data[marker_start..marker_end] == RAR14_SFX_MARKER
 }
 
 /// Detect encryption in RAR5 data (positioned after the 8-byte signature).
@@ -257,6 +354,40 @@ fn detect_rar4_encryption(data: &[u8]) -> EncryptionStatus {
     EncryptionStatus::None
 }
 
+/// Detect encryption in RAR14 data (positioned after the 4-byte signature).
+fn detect_rar14_encryption(data: &[u8]) -> EncryptionStatus {
+    // RAR14 main header after the 4-byte marker: HeadSize(2) + flags(1).
+    if data.len() < 3 {
+        return EncryptionStatus::Insufficient {
+            min_bytes: RAR14_SIGNATURE.len() + 3,
+        };
+    }
+
+    let main_header_size = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if main_header_size < 7 {
+        return EncryptionStatus::None;
+    }
+    let main_body_after_signature = main_header_size.saturating_sub(RAR14_SIGNATURE.len());
+    if data.len() < main_body_after_signature + 21 {
+        return EncryptionStatus::Insufficient {
+            min_bytes: main_header_size + 21,
+        };
+    }
+
+    let file_data = &data[main_body_after_signature..];
+    let file_header_size = u16::from_le_bytes([file_data[10], file_data[11]]) as usize;
+    if file_header_size < 21 {
+        return EncryptionStatus::None;
+    }
+
+    // LHD_PASSWORD flag.
+    if file_data[17] & 0x04 != 0 {
+        return EncryptionStatus::FileEncrypted;
+    }
+
+    EncryptionStatus::None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +549,19 @@ mod tests {
     }
 
     #[test]
+    fn sfx_rar5_file_encrypted() {
+        let stub = b"MZ small self-extracting stub";
+        let mut data = stub.to_vec();
+        data.extend_from_slice(&RAR5_SIGNATURE);
+        let main_header = build_rar5_header(1, 0, &encode_vint(0));
+        let file_header = build_rar5_encrypted_file_header();
+        data.extend_from_slice(&main_header);
+        data.extend_from_slice(&file_header);
+
+        assert_eq!(detect_encryption(&data), EncryptionStatus::FileEncrypted);
+    }
+
+    #[test]
     fn rar5_insufficient_data() {
         // Just the signature, no headers
         let data = RAR5_SIGNATURE.to_vec();
@@ -425,6 +569,20 @@ mod tests {
             detect_encryption(&data),
             EncryptionStatus::Insufficient { .. }
         ));
+    }
+
+    #[test]
+    fn sfx_rar5_insufficient_data_adds_stub_offset() {
+        let stub = b"MZ encrypted SFX stub";
+        let mut data = stub.to_vec();
+        data.extend_from_slice(&RAR5_SIGNATURE);
+
+        match detect_encryption(&data) {
+            EncryptionStatus::Insufficient { min_bytes } => {
+                assert!(min_bytes > stub.len() + RAR5_SIGNATURE.len());
+            }
+            other => panic!("expected Insufficient, got {other:?}"),
+        }
     }
 
     #[test]
@@ -474,9 +632,42 @@ mod tests {
         buf
     }
 
+    fn build_rar14_archive_header(flags: u8) -> Vec<u8> {
+        let mut buf = RAR14_SIGNATURE.to_vec();
+        buf.extend_from_slice(&7u16.to_le_bytes());
+        buf.push(flags);
+        buf
+    }
+
+    fn build_rar14_file_header(flags: u8) -> Vec<u8> {
+        let name = b"old.dat";
+        let head_size = 21u16 + name.len() as u16;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // packed size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // unpacked size
+        buf.extend_from_slice(&0u16.to_le_bytes()); // checksum
+        buf.extend_from_slice(&head_size.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // DOS time
+        buf.push(0x20); // attributes
+        buf.push(flags);
+        buf.push(2); // RAR 1.3-compatible unpack version
+        buf.push(name.len() as u8);
+        buf.push(0x30); // method = Store
+        buf.extend_from_slice(name);
+        buf
+    }
+
     #[test]
     fn rar4_header_encrypted() {
         let mut data = RAR4_SIGNATURE.to_vec();
+        data.extend_from_slice(&build_rar4_archive_header(0x0080)); // ENCRYPTED_HEADERS
+        assert_eq!(detect_encryption(&data), EncryptionStatus::HeaderEncrypted);
+    }
+
+    #[test]
+    fn sfx_rar4_header_encrypted() {
+        let mut data = b"MZ legacy self-extracting stub".to_vec();
+        data.extend_from_slice(&RAR4_SIGNATURE);
         data.extend_from_slice(&build_rar4_archive_header(0x0080)); // ENCRYPTED_HEADERS
         assert_eq!(detect_encryption(&data), EncryptionStatus::HeaderEncrypted);
     }
@@ -504,6 +695,46 @@ mod tests {
             detect_encryption(&data),
             EncryptionStatus::Insufficient { .. }
         ));
+    }
+
+    #[test]
+    fn rar14_file_encrypted() {
+        let mut data = build_rar14_archive_header(0);
+        data.extend_from_slice(&build_rar14_file_header(0x04)); // LHD_PASSWORD
+        assert_eq!(detect_encryption(&data), EncryptionStatus::FileEncrypted);
+    }
+
+    #[test]
+    fn rar14_not_encrypted() {
+        let mut data = build_rar14_archive_header(0);
+        data.extend_from_slice(&build_rar14_file_header(0));
+        assert_eq!(detect_encryption(&data), EncryptionStatus::None);
+    }
+
+    #[test]
+    fn rar14_insufficient_data() {
+        let data = RAR14_SIGNATURE.to_vec();
+        assert!(matches!(
+            detect_encryption(&data),
+            EncryptionStatus::Insufficient { .. }
+        ));
+    }
+
+    #[test]
+    fn sfx_rar14_file_encrypted_requires_rsfx_marker_like_unrar() {
+        let mut data = vec![0xAAu8; 64];
+        data[28..32].copy_from_slice(&RAR14_SFX_MARKER);
+        data.extend_from_slice(&build_rar14_archive_header(0));
+        data.extend_from_slice(&build_rar14_file_header(0x04)); // LHD_PASSWORD
+        assert_eq!(detect_encryption(&data), EncryptionStatus::FileEncrypted);
+    }
+
+    #[test]
+    fn sfx_rar14_without_rsfx_marker_is_ignored_like_unrar() {
+        let mut data = vec![0xAAu8; 64];
+        data.extend_from_slice(&build_rar14_archive_header(0));
+        data.extend_from_slice(&build_rar14_file_header(0x04)); // LHD_PASSWORD
+        assert_eq!(detect_encryption(&data), EncryptionStatus::NotRar);
     }
 
     // ---- General tests ----

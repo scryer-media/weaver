@@ -890,8 +890,7 @@ pub fn parse_file_extra_records(raw: &RawHeader) -> RarResult<Vec<extra::ExtraRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::Aes256;
-    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    use crate::crypto::encrypt_aes256_cbc_for_test;
 
     const RAR5_SIGNATURE: &[u8; 8] = b"Rar!\x1a\x07\x01\0";
 
@@ -1086,16 +1085,9 @@ mod tests {
     }
 
     fn encrypt_first_cbc_block(key: &[u8; 32], iv: &[u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
-        let cipher = Aes256::new(key.into());
-        let mut block = plaintext;
-        for (byte, iv_byte) in block.iter_mut().zip(iv.iter()) {
-            *byte ^= iv_byte;
-        }
-        let mut block_ref = aes::Block::default();
-        block_ref.copy_from_slice(&block);
-        cipher.encrypt_block(&mut block_ref);
-        block.copy_from_slice(&block_ref);
-        block
+        encrypt_aes256_cbc_for_test(key, iv, &plaintext)
+            .try_into()
+            .expect("single AES block encrypt returns one block")
     }
 
     fn encrypt_cbc_blocks(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
@@ -1104,22 +1096,9 @@ mod tests {
         } else {
             plaintext.len().div_ceil(16) * 16
         };
-        let mut encrypted = plaintext.to_vec();
-        encrypted.resize(padded_len, 0);
-
-        let cipher = Aes256::new(key.into());
-        let mut previous = *iv;
-        for chunk in encrypted.chunks_exact_mut(16) {
-            for (byte, previous_byte) in chunk.iter_mut().zip(previous.iter()) {
-                *byte ^= previous_byte;
-            }
-            let mut block_ref = aes::Block::default();
-            block_ref.copy_from_slice(chunk);
-            cipher.encrypt_block(&mut block_ref);
-            chunk.copy_from_slice(&block_ref);
-            previous.copy_from_slice(chunk);
-        }
-        encrypted
+        let mut padded = plaintext.to_vec();
+        padded.resize(padded_len, 0);
+        encrypt_aes256_cbc_for_test(key, iv, &padded)
     }
 
     #[test]

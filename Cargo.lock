@@ -4996,30 +4996,26 @@ dependencies = [
 name = "weaver-unrar"
 version = "0.6.9"
 dependencies = [
- "aes 0.9.1",
  "aws-lc-rs",
  "aws-lc-sys",
  "blake2s_simd",
- "cbc 0.2.1",
  "crc32fast",
  "criterion",
  "filetime",
- "hmac 0.12.1",
  "libc",
  "memchr",
  "memmap2",
- "pbkdf2 0.12.2",
  "rayon",
  "rmp-serde",
  "serde",
- "sha1 0.11.0",
- "sha2 0.10.9",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "weaver-reed-solomon",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
